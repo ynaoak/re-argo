@@ -381,20 +381,10 @@ impl Architecture for X86Arch {
         address: u64,
     ) -> Result<DecodedInstruction, DisasmError> {
         let mut buf = [0u8; 15];
-        let read_len = buf.len().min(
-            memory
-                .blocks()
-                .filter(|b| b.contains(address))
-                .map(|b| (b.start + b.size - address) as usize)
-                .next()
-                .unwrap_or(0),
-        );
+        let read_len = memory.read_instruction_bytes(address, &mut buf);
         if read_len == 0 {
             return Err(DisasmError::UnreadableAddress(address));
         }
-        memory
-            .read_bytes(address, &mut buf[..read_len])
-            .map_err(|_| DisasmError::UnreadableAddress(address))?;
         self.decode_with_iced(&buf[..read_len], address)
     }
 

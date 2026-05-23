@@ -754,20 +754,10 @@ impl PcodeLift for X86Lifter {
         address: u64,
     ) -> Result<LiftedInstruction, LiftError> {
         let mut buf = [0u8; 15];
-        let read_len = buf.len().min(
-            memory
-                .blocks()
-                .filter(|b| b.contains(address))
-                .map(|b| (b.start + b.size - address) as usize)
-                .next()
-                .unwrap_or(0),
-        );
+        let read_len = memory.read_instruction_bytes(address, &mut buf);
         if read_len == 0 {
             return Err(LiftError::UnreadableAddress(address));
         }
-        memory
-            .read_bytes(address, &mut buf[..read_len])
-            .map_err(|_| LiftError::UnreadableAddress(address))?;
 
         let bitness = if self.is_64 { 64 } else { 32 };
         let mut decoder =

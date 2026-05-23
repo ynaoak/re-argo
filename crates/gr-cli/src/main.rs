@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use gr_analysis::{AnalysisManager, CallGraph};
 use gr_arch::arch::create_architecture;
-use gr_decompile::decompile;
 use gr_lift::x86::X86Lifter;
 use gr_lift::PcodeLift;
 use gr_loader::{BinaryLoader, SymbolKind};
@@ -366,12 +365,15 @@ fn cmd_registers(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
     let mut program = Program::from_binary(path)?;
     let manager = AnalysisManager::new();
-    let results = manager.run_all(&mut program)?;
+    let results = manager.run_all(&mut program);
     for r in &results {
-        eprintln!(
-            "[{}] {} functions, {} refs, {} instructions",
-            r.analyzer_name, r.functions_found, r.references_found, r.instructions_decoded
-        );
+        match r {
+            Ok(r) => eprintln!(
+                "[{}] {} functions, {} refs, {} instructions",
+                r.analyzer_name, r.functions_found, r.references_found, r.instructions_decoded
+            ),
+            Err(e) => eprintln!("[ERROR] {}", e),
+        }
     }
     Ok(program)
 }
@@ -510,10 +512,10 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dy
 }
 
 fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let info = BinaryLoader::load(path)?;
+    let program = analyze_binary(path)?;
 
-    let is_64 = info.bits == 64;
-    let lifter: Box<dyn PcodeLift> = match info.arch {
+    let is_64 = program.info.bits == 64;
+    let lifter: Box<dyn PcodeLift> = match program.info.arch {
         gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
             if is_64 {
                 Box::new(X86Lifter::new_64())
@@ -527,15 +529,9 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool) -> Result<()
         }
     };
 
-    let entry = address.unwrap_or(info.entry_point);
-    let func_name = info
-        .symbols
-        .iter()
-        .find(|s| s.address == entry)
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| format!("FUN_{:x}", entry));
+    let entry = address.unwrap_or(program.entry_point());
 
-    let result = decompile(lifter.as_ref(), &info.memory, entry, &func_name, 500)
+    let result = gr_decompile::decompile_function(lifter.as_ref(), &program, entry)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     if show_ssa {

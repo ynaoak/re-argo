@@ -5,4 +5,4 @@ pub mod pipeline;
 pub mod ssa;
 pub mod structure;
 
-pub use pipeline::decompile;
+pub use pipeline::{decompile, decompile_function, DecompileResult, DecompileStats};

@@ -7,6 +7,7 @@ use crate::structure::StructuredBlock;
 pub struct CEmitter {
     indent: usize,
     output: String,
+    symbol_names: std::collections::BTreeMap<u64, String>,
 }
 
 impl CEmitter {
@@ -14,6 +15,15 @@ impl CEmitter {
         Self {
             indent: 0,
             output: String::new(),
+            symbol_names: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn with_symbols(symbols: std::collections::BTreeMap<u64, String>) -> Self {
+        Self {
+            indent: 0,
+            output: String::new(),
+            symbol_names: symbols,
         }
     }
 
@@ -243,8 +253,17 @@ impl CEmitter {
                 Some(format!("*({}*){} = {};", size_to_type(size), addr, val))
             }
             OpCode::Call => {
-                let target = self.input_expr(func, op, 0);
-                Some(format!("call({});", target))
+                let target_expr = self.input_expr(func, op, 0);
+                let call_name = if let Some(target_vn) = op.inputs.first() {
+                    let addr = func.varnodes[*target_vn as usize].data.offset;
+                    self.symbol_names
+                        .get(&addr)
+                        .cloned()
+                        .unwrap_or(target_expr)
+                } else {
+                    target_expr
+                };
+                Some(format!("{}();", call_name))
             }
             OpCode::Return => {
                 let val = self.input_expr(func, op, 0);

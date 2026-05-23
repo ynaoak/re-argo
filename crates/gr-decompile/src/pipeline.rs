@@ -1,5 +1,6 @@
 use gr_lift::{LiftedInstruction, PcodeLift};
 use gr_loader::Memory;
+use gr_program::Program;
 
 use crate::cfg::ControlFlowGraph;
 use crate::emit::CEmitter;
@@ -37,9 +38,64 @@ pub fn decompile(
     }
 
     let terminated = trim_to_return(&lifted);
+    let empty_symbols = std::collections::BTreeMap::new();
+    build_decompile_result(&terminated, func_name, entry, &empty_symbols)
+}
 
-    let total_pcode: usize = terminated.iter().map(|i| i.ops.len()).sum();
-    let cfg = ControlFlowGraph::build(&terminated);
+pub fn decompile_function(
+    lifter: &dyn PcodeLift,
+    program: &Program,
+    func_entry: u64,
+) -> Result<DecompileResult, String> {
+    let func = program.listing.get_function(func_entry);
+    let func_name = func
+        .map(|f| f.name.clone())
+        .unwrap_or_else(|| program.function_name_at(func_entry));
+
+    let max_insns = func
+        .map(|f| {
+            f.body
+                .ranges()
+                .map(|r| r.size as usize)
+                .sum::<usize>()
+                .max(100)
+        })
+        .unwrap_or(500);
+
+    let lifted = lifter
+        .lift_range(&program.info.memory, func_entry, max_insns)
+        .map_err(|e| e.to_string())?;
+
+    if lifted.is_empty() {
+        return Err(format!("no instructions at 0x{:x}", func_entry));
+    }
+
+    let terminated = if func.is_some() {
+        trim_to_function_body(&lifted, func_entry, func)
+    } else {
+        trim_to_return(&lifted)
+    };
+
+    let symbols: std::collections::BTreeMap<u64, String> = program
+        .symbol_table
+        .iter()
+        .map(|s| (s.address, s.name.clone()))
+        .collect();
+    build_decompile_result(&terminated, &func_name, func_entry, &symbols)
+}
+
+fn build_decompile_result(
+    instructions: &[LiftedInstruction],
+    func_name: &str,
+    entry: u64,
+    symbols: &std::collections::BTreeMap<u64, String>,
+) -> Result<DecompileResult, String> {
+    if instructions.is_empty() {
+        return Err(format!("no instructions at 0x{:x}", entry));
+    }
+
+    let total_pcode: usize = instructions.iter().map(|i| i.ops.len()).sum();
+    let cfg = ControlFlowGraph::build(instructions);
     let block_count = cfg.block_count();
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
@@ -49,20 +105,47 @@ pub fn decompile(
     let live_ops = ssa.live_op_count();
 
     let structured = structure_cfg(&ssa.cfg);
-    let mut emitter = CEmitter::new();
+    let mut emitter = CEmitter::with_symbols(symbols.clone());
     let c_code = emitter.emit_function(&ssa, &structured);
 
     Ok(DecompileResult {
         c_code,
         ssa_dump,
         stats: DecompileStats {
-            instructions_lifted: terminated.len(),
+            instructions_lifted: instructions.len(),
             pcode_ops: total_pcode,
             basic_blocks: block_count,
             optimization: opt_stats,
             live_ops_after: live_ops,
         },
     })
+}
+
+fn trim_to_function_body(
+    instructions: &[LiftedInstruction],
+    entry: u64,
+    func: Option<&gr_program::Function>,
+) -> Vec<LiftedInstruction> {
+    if let Some(f) = func {
+        let body_addrs = &f.body;
+        let filtered: Vec<LiftedInstruction> = instructions
+            .iter()
+            .filter(|insn| {
+                body_addrs.contains(&gr_core::address::Address::new(
+                    gr_core::address::SpaceId(1),
+                    insn.address,
+                )) || insn.address == entry
+            })
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
+            trim_to_return(instructions)
+        } else {
+            filtered
+        }
+    } else {
+        trim_to_return(instructions)
+    }
 }
 
 fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> {

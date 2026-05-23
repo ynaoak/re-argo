@@ -127,6 +127,18 @@ impl Memory {
         })
     }
 
+    pub fn read_instruction_bytes(&self, address: u64, buf: &mut [u8; 15]) -> usize {
+        let available = self
+            .find_block(address)
+            .map(|b| (b.start + b.size - address) as usize)
+            .unwrap_or(0);
+        let read_len = buf.len().min(available);
+        if read_len > 0 {
+            let _ = self.read_bytes(address, &mut buf[..read_len]);
+        }
+        read_len
+    }
+
     pub fn blocks(&self) -> impl Iterator<Item = &MemoryBlock> {
         self.blocks.values()
     }

@@ -9,5 +9,6 @@ description = "Decompiler core: SSA, optimization, control flow structuring, C o
 gr-core = { workspace = true }
 gr-loader = { workspace = true }
 gr-lift = { workspace = true }
+gr-program = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
