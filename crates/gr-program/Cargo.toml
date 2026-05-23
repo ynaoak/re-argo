@@ -10,3 +10,6 @@ gr-core = { workspace = true }
 gr-loader = { workspace = true }
 gr-arch = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+gr-lift = { workspace = true }

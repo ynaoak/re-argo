@@ -34,7 +34,7 @@ pub struct SsaFunction {
     pub ops: Vec<SsaOp>,
     pub cfg: ControlFlowGraph,
     next_var_id: VarId,
-    var_versions: BTreeMap<(u64, u32), u32>,
+    var_versions: BTreeMap<(u32, u64, u32), u32>,
 }
 
 impl SsaFunction {
@@ -99,7 +99,7 @@ impl SsaFunction {
     }
 
     fn get_or_create_var(&mut self, vn: &VarnodeData) -> VarId {
-        let key = (vn.offset, vn.size);
+        let key = (vn.space.0, vn.offset, vn.size);
         if vn.space == gr_core::address::SpaceId(0) {
             let id = self.next_var_id;
             self.next_var_id += 1;
@@ -126,7 +126,7 @@ impl SsaFunction {
     }
 
     fn create_new_version(&mut self, vn: &VarnodeData) -> VarId {
-        let key = (vn.offset, vn.size);
+        let key = (vn.space.0, vn.offset, vn.size);
         let version = self.var_versions.entry(key).or_insert(0);
         *version += 1;
         let cur_version = *version;

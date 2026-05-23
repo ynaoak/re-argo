@@ -376,7 +376,11 @@ impl AddressSet {
     }
 
     pub fn contains(&self, addr: &Address) -> bool {
-        self.ranges.iter().any(|r| r.contains(addr))
+        let probe = AddressRange::new(*addr, u64::MAX);
+        self.ranges
+            .range(..=probe)
+            .next_back()
+            .is_some_and(|r| r.contains(addr))
     }
 
     pub fn ranges(&self) -> impl Iterator<Item = &AddressRange> {

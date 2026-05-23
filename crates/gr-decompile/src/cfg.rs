@@ -99,17 +99,25 @@ impl ControlFlowGraph {
         }
 
         let leader_vec: Vec<u64> = leaders.iter().copied().collect();
+        let leader_set: BTreeSet<u64> = leaders.clone();
         let mut blocks = Vec::new();
         let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
 
+        let mut insn_iter = instructions.iter().peekable();
         for (idx, &leader_addr) in leader_vec.iter().enumerate() {
             let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u64::MAX);
             let mut block_insns = Vec::new();
 
-            for insn in instructions {
-                if insn.address >= leader_addr && insn.address < next_leader {
-                    block_insns.push(insn.clone());
+            while let Some(&insn) = insn_iter.peek() {
+                if insn.address < leader_addr {
+                    insn_iter.next();
+                    continue;
                 }
+                if insn.address >= next_leader {
+                    break;
+                }
+                block_insns.push(insn.clone());
+                insn_iter.next();
             }
 
             if block_insns.is_empty() {
@@ -126,6 +134,7 @@ impl ControlFlowGraph {
                 predecessors: Vec::new(),
             });
         }
+        let _ = leader_set;
 
         let block_count = blocks.len();
         #[allow(clippy::needless_range_loop)]

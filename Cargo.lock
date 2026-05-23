@@ -259,6 +259,7 @@ version = "0.1.0"
 dependencies = [
  "gr-arch",
  "gr-core",
+ "gr-lift",
  "gr-loader",
  "thiserror",
 ]

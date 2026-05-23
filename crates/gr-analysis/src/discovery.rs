@@ -39,8 +39,6 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             }
         }
 
-        let mut discovered_calls: Vec<u64> = Vec::new();
-
         while let Some(func_entry) = work_queue.pop_front() {
             if visited.contains(&func_entry) {
                 continue;
@@ -76,42 +74,14 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                     functions_found += 1;
 
                     for call_target in &discovery.call_targets {
-                        if !visited.contains(call_target) {
-                            discovered_calls.push(*call_target);
+                        if !visited.contains(call_target)
+                            && !program.listing.has_function(*call_target)
+                        {
+                            work_queue.push_back(*call_target);
                         }
                     }
                 }
                 Err(_) => continue,
-            }
-        }
-
-        for target in discovered_calls {
-            if program.listing.has_function(target) {
-                continue;
-            }
-            if visited.contains(&target) {
-                continue;
-            }
-
-            let result = disassemble_function(program, target, &mut visited);
-            if let Ok(discovery) = result {
-                instructions_decoded += discovery.instruction_count;
-                references_found += discovery.references.len();
-
-                for r in &discovery.references {
-                    program.references.add(*r);
-                }
-
-                let mut func = if let Some(sym) = program.symbol_table.primary_at(target) {
-                    Function::new(target, sym.name.clone())
-                } else {
-                    Function::new(target, format!("FUN_{:08x}", target))
-                };
-                func.body = discovery.body;
-                func.call_targets = discovery.call_targets;
-
-                program.listing.add_function(func);
-                functions_found += 1;
             }
         }
 

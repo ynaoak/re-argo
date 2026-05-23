@@ -98,10 +98,17 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
 
         if let Some(val) = result {
             let out_id = func.ops[i].output.unwrap();
-            func.varnodes[out_id as usize].data.space = gr_core::address::SpaceId(0);
-            func.varnodes[out_id as usize].data.offset = val;
+            let out_size = func.varnodes[out_id as usize].data.size;
+            let const_id = func.varnodes.len() as u32;
+            func.varnodes.push(crate::ssa::SsaVarnode {
+                id: const_id,
+                data: gr_core::pcode::VarnodeData::new(gr_core::address::SpaceId(0), val, out_size),
+                version: 0,
+                def_op: None,
+                uses: vec![i],
+            });
             func.ops[i].opcode = OpCode::Copy;
-            func.ops[i].inputs = vec![out_id];
+            func.ops[i].inputs = vec![const_id];
             folded += 1;
         }
     }

@@ -109,22 +109,43 @@ pub struct ArmArch {
     is_64: bool,
     registers: Vec<RegisterInfo>,
     calling_conventions: Vec<CallingConvention>,
+    cs: capstone::Capstone,
 }
+
+// Capstone's C library is thread-safe for independent instances
+unsafe impl Send for ArmArch {}
+unsafe impl Sync for ArmArch {}
 
 impl ArmArch {
     pub fn new_arm32() -> Self {
+        use capstone::prelude::*;
+        let cs = Capstone::new()
+            .arm()
+            .mode(arch::arm::ArchMode::Arm)
+            .detail(true)
+            .build()
+            .expect("failed to create ARM capstone");
         Self {
             is_64: false,
             registers: arm32_registers(),
             calling_conventions: arm32_calling_conventions(),
+            cs,
         }
     }
 
     pub fn new_aarch64() -> Self {
+        use capstone::prelude::*;
+        let cs = Capstone::new()
+            .arm64()
+            .mode(arch::arm64::ArchMode::Arm)
+            .detail(true)
+            .build()
+            .expect("failed to create AArch64 capstone");
         Self {
             is_64: true,
             registers: aarch64_registers(),
             calling_conventions: aarch64_calling_conventions(),
+            cs,
         }
     }
 }
@@ -167,30 +188,12 @@ impl Architecture for ArmArch {
         memory: &Memory,
         address: u64,
     ) -> Result<DecodedInstruction, DisasmError> {
-        use capstone::prelude::*;
-
         let mut buf = vec![0u8; 4];
         memory
             .read_bytes(address, &mut buf)
             .map_err(|_| DisasmError::UnreadableAddress(address))?;
 
-        let cs = if self.is_64 {
-            Capstone::new()
-                .arm64()
-                .mode(arch::arm64::ArchMode::Arm)
-                .detail(true)
-                .build()
-                .map_err(|e| DisasmError::EngineError(e.to_string()))?
-        } else {
-            Capstone::new()
-                .arm()
-                .mode(arch::arm::ArchMode::Arm)
-                .detail(true)
-                .build()
-                .map_err(|e| DisasmError::EngineError(e.to_string()))?
-        };
-
-        let insns = cs
+        let insns = self.cs
             .disasm_count(&buf, address, 1)
             .map_err(|e| DisasmError::DecodeError {
                 address,
