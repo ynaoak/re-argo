@@ -1,5 +1,6 @@
 pub mod context;
 pub mod decision;
+pub mod instruction;
 pub mod packed;
 pub mod pcode_template;
 pub mod sla;

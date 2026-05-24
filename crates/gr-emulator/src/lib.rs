@@ -1,6 +1,7 @@
 pub mod breakpoint;
 pub mod debugger;
 pub mod emulator;
+pub mod hooks;
 pub mod session;
 pub mod state;
 pub mod trace;
