@@ -19,6 +19,7 @@ use crate::noreturn_prop::{DuplicateCodeAnalyzer, NoReturnPropagationAnalyzer};
 use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
 use crate::signatures::SignatureApplierAnalyzer;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
+use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
 use crate::vtable::VTableAnalyzer;
 use crate::xref_report::{CrossReferenceReportAnalyzer, UnreferencedFunctionAnalyzer};
 
@@ -63,6 +64,8 @@ impl AnalysisManager {
             Box::new(IndirectCallAnalyzer),
             Box::new(StringReferenceAnalyzer),
             Box::new(CoverageAnalyzer),
+            Box::new(TypeRecoveryAnalyzer),
+            Box::new(DataTypeAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }

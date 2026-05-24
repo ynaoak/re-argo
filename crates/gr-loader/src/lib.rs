@@ -1,5 +1,6 @@
 pub mod coff;
 pub mod dwarf;
+pub mod dwarf_types;
 pub mod error;
 pub mod loader;
 pub mod memory;
