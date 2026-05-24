@@ -1,0 +1,131 @@
+use gr_arch::FlowType;
+use gr_program::reference::{RefType, Reference};
+use gr_program::Program;
+
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+
+pub struct SwitchTableAnalyzer;
+
+impl Analyzer for SwitchTableAnalyzer {
+    fn name(&self) -> &str {
+        "Switch Table"
+    }
+    fn description(&self) -> &str {
+        "Detects jump tables for switch statements and creates references"
+    }
+    fn priority(&self) -> u32 {
+        550
+    }
+    fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let mut refs_found = 0;
+        let ptr_size = (program.info.bits / 8) as u64;
+
+        let indirect_jumps: Vec<u64> = program
+            .listing
+            .instructions()
+            .filter(|i| i.flow_type == FlowType::IndirectJump)
+            .map(|i| i.address)
+            .collect();
+
+        let valid_code_ranges: Vec<(u64, u64)> = program
+            .info
+            .sections
+            .iter()
+            .filter(|s| s.flags.contains(gr_loader::SectionFlags::EXECUTE))
+            .map(|s| (s.address, s.address + s.size))
+            .collect();
+
+        for &jmp_addr in &indirect_jumps {
+            for offset in 0..64u64 {
+                let table_entry = jmp_addr.wrapping_add(16 + offset * ptr_size);
+                let target = if ptr_size == 8 {
+                    program.info.memory.read_u64(table_entry).ok()
+                } else {
+                    program.info.memory.read_u32(table_entry).ok().map(|v| v as u64)
+                };
+
+                if let Some(target_addr) = target {
+                    if is_valid_code_addr(target_addr, &valid_code_ranges) {
+                        program.references.add(Reference::new(
+                            jmp_addr,
+                            target_addr,
+                            RefType::IndirectJump,
+                        ));
+                        refs_found += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(AnalysisResult {
+            analyzer_name: self.name().into(),
+            functions_found: 0,
+            references_found: refs_found,
+            instructions_decoded: 0,
+        })
+    }
+}
+
+fn is_valid_code_addr(addr: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges.iter().any(|&(start, end)| addr >= start && addr < end)
+}
+
+pub struct TailCallAnalyzer;
+
+impl Analyzer for TailCallAnalyzer {
+    fn name(&self) -> &str {
+        "Tail Call"
+    }
+    fn description(&self) -> &str {
+        "Detects tail calls (unconditional jumps to other functions)"
+    }
+    fn priority(&self) -> u32 {
+        560
+    }
+    fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let mut tail_calls = 0;
+
+        let jumps: Vec<(u64, Option<u64>)> = program
+            .listing
+            .instructions()
+            .filter(|i| i.flow_type == FlowType::UnconditionalJump)
+            .map(|i| (i.address, i.branch_target))
+            .collect();
+
+        for (jmp_addr, target) in &jumps {
+            if let Some(target_addr) = target {
+                let jmp_in_func = program.listing.function_containing(*jmp_addr);
+                let target_is_func = program.listing.has_function(*target_addr);
+                let target_in_different_func = jmp_in_func
+                    .map(|f| f.entry_point != *target_addr)
+                    .unwrap_or(true);
+
+                if target_is_func && target_in_different_func
+                    && !program
+                        .references
+                        .get_refs_from(*jmp_addr)
+                        .iter()
+                        .any(|r| r.ref_type.is_call())
+                    {
+                        program.references.add(Reference::new(
+                            *jmp_addr,
+                            *target_addr,
+                            RefType::UnconditionalCall,
+                        ));
+                        tail_calls += 1;
+                    }
+            }
+        }
+
+        Ok(AnalysisResult {
+            analyzer_name: self.name().into(),
+            functions_found: 0,
+            references_found: tail_calls,
+            instructions_decoded: 0,
+        })
+    }
+}

@@ -3,12 +3,16 @@ pub mod callgraph;
 pub mod dataref;
 pub mod demangle;
 pub mod discovery;
+pub mod ehframe;
+pub mod filler;
 pub mod manager;
 pub mod propagation;
 pub mod references;
 pub mod stack;
 pub mod strings;
+pub mod switches;
 pub mod thunk;
+pub mod vtable;
 
 pub use analyzer::Analyzer;
 pub use callgraph::CallGraph;

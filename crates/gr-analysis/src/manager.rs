@@ -4,11 +4,15 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::dataref::DataReferenceAnalyzer;
 use crate::demangle::DemangleAnalyzer;
 use crate::discovery::FunctionDiscoveryAnalyzer;
+use crate::ehframe::EhFrameAnalyzer;
+use crate::filler::FillerBytesAnalyzer;
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::strings::StringSearchAnalyzer;
+use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
+use crate::vtable::VTableAnalyzer;
 
 pub struct AnalysisManager {
     analyzers: Vec<Box<dyn Analyzer>>,
@@ -25,7 +29,9 @@ impl AnalysisManager {
         let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
             Box::new(EntryPointAnalyzer),
             Box::new(DemangleAnalyzer),
+            Box::new(EhFrameAnalyzer),
             Box::new(FunctionDiscoveryAnalyzer),
+            Box::new(FillerBytesAnalyzer),
             Box::new(StringSearchAnalyzer),
             Box::new(NoReturnAnalyzer),
             Box::new(ScalarReferenceAnalyzer),
@@ -33,6 +39,9 @@ impl AnalysisManager {
             Box::new(StackFrameAnalyzer),
             Box::new(ThunkDetectorAnalyzer),
             Box::new(DataReferenceAnalyzer),
+            Box::new(SwitchTableAnalyzer),
+            Box::new(TailCallAnalyzer),
+            Box::new(VTableAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }
