@@ -154,28 +154,27 @@ impl Analyzer for NoReturnAnalyzer {
             "panic", "__assert_fail", "err", "errx",
         ];
 
-        let no_return_addrs: Vec<u64> = program
+        let plt_variants: Vec<String> = no_return_names.iter()
+            .map(|n| format!("{}@plt", n))
+            .collect();
+
+        let no_return_addrs: std::collections::BTreeSet<u64> = program
             .symbol_table
             .iter()
-            .filter(|sym| no_return_names.iter().any(|&n| sym.name == n || sym.name.ends_with(&"@plt".to_string())))
-            .filter(|sym| no_return_names.iter().any(|&n| {
-                sym.name == n || sym.name == format!("{}@plt", n)
-            }))
+            .filter(|sym| {
+                no_return_names.contains(&sym.name.as_str())
+                    || plt_variants.contains(&sym.name)
+            })
             .map(|sym| sym.address)
             .collect();
 
         let mut detected = 0;
         let func_entries: Vec<u64> = program.listing.functions().map(|f| f.entry_point).collect();
         for entry in func_entries {
-            if let Some(func) = program.listing.get_function(entry) {
-                let calls_noreturn = func
-                    .call_targets
-                    .iter()
-                    .any(|t| no_return_addrs.contains(t));
-                if calls_noreturn {
+            if let Some(func) = program.listing.get_function(entry)
+                && func.call_targets.iter().any(|t| no_return_addrs.contains(t)) {
                     detected += 1;
                 }
-            }
         }
 
         Ok(AnalysisResult {
