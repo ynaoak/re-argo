@@ -35,6 +35,13 @@ pub fn compute_liveness(func: &SsaFunction) -> LivenessInfo {
         }
     }
 
+    let cached_defs: Vec<BTreeSet<VarId>> = (0..block_count)
+        .map(|b| defs.get(&b).cloned().unwrap_or_default())
+        .collect();
+    let cached_uses: Vec<BTreeSet<VarId>> = (0..block_count)
+        .map(|b| uses.get(&b).cloned().unwrap_or_default())
+        .collect();
+
     let mut changed = true;
     while changed {
         changed = false;
@@ -42,13 +49,11 @@ pub fn compute_liveness(func: &SsaFunction) -> LivenessInfo {
             let mut new_out = BTreeSet::new();
             for &succ in &func.cfg.blocks[b].successors {
                 if let Some(li) = info.live_in.get(&succ) {
-                    new_out = new_out.union(li).copied().collect();
+                    new_out.extend(li);
                 }
             }
-            let block_defs = defs.get(&b).cloned().unwrap_or_default();
-            let block_uses = uses.get(&b).cloned().unwrap_or_default();
-            let new_in: BTreeSet<VarId> = block_uses.union(
-                &new_out.difference(&block_defs).copied().collect()
+            let new_in: BTreeSet<VarId> = cached_uses[b].union(
+                &new_out.difference(&cached_defs[b]).copied().collect()
             ).copied().collect();
 
             if new_in != *info.live_in.get(&b).unwrap() || new_out != *info.live_out.get(&b).unwrap() {

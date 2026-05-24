@@ -68,10 +68,6 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                         Function::new(func_entry, format!("FUN_{:08x}", func_entry))
                     };
                     func.body = discovery.body;
-                    func.call_targets = discovery.call_targets.clone();
-
-                    program.listing.add_function(func);
-                    functions_found += 1;
 
                     for call_target in &discovery.call_targets {
                         if !visited.contains(call_target)
@@ -80,6 +76,10 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                             work_queue.push_back(*call_target);
                         }
                     }
+
+                    func.call_targets = discovery.call_targets;
+                    program.listing.add_function(func);
+                    functions_found += 1;
                 }
                 Err(_) => continue,
             }
