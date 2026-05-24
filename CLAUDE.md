@@ -10,40 +10,47 @@ cargo test
 cargo clippy
 ```
 
-## CLI Usage
+## CLI Commands
 
 ```bash
 cargo run -- info <binary>
 cargo run -- sections <binary>
 cargo run -- symbols <binary> [--kind func|data|import|export]
-cargo run -- hexdump <binary> <hex-address> [length]
 cargo run -- disasm <binary> [--start <hex-addr>] [-n <count>]
 cargo run -- registers <binary>
+cargo run -- hexdump <binary> <hex-address> [length]
+cargo run -- analyze <binary>
+cargo run -- functions <binary>
+cargo run -- xrefs <binary> <hex-address>
+cargo run -- callgraph <binary> [--dot]
+cargo run -- pcode <binary> [--start <hex-addr>] [-n <count>]
+cargo run -- decompile <binary> [--address <hex-addr>] [--ssa]
+cargo run -- export <binary> [-o <output.json>]
+cargo run -- export-xml <binary> [-o <output.xml>]
+cargo run -- emulate <binary> [--start <hex-addr>] [-n <steps>] [--break <hex-addr>]
 ```
 
 ## Workspace Structure
 
 | Crate | Purpose |
 |-------|---------|
-| `gr-core` | Address model, P-code IR (74 opcodes), data types |
-| `gr-loader` | ELF/PE/Mach-O loading via goblin |
-| `gr-arch` | Architecture trait, x86/x64 (iced-x86), ARM/AArch64 (capstone) |
-| `gr-cli` | CLI binary (`ghidra-rust`) |
+| `gr-core` | Address model (Segmented/Overlay/Map), P-code IR (74 opcodes), 31+ data types, SpaceId constants |
+| `gr-loader` | ELF/PE/Mach-O/COFF/raw binary, DWARF, PDB, FLIRT, relocations, source map, hashing |
+| `gr-arch` | 6 architectures (x86/ARM/RISC-V/MIPS/PPC/SPARC), .cspec/.pspec/.ldefs parsers, register overlap map, assembler |
+| `gr-program` | Program model, symbols, references, comments, bookmarks, undo/redo, diff, SARIF, metadata, history |
+| `gr-analysis` | 30 analyzers (function discovery, strings, stack, VTable, calling convention, coverage, ...) |
+| `gr-lift` | x86 → P-code lifter (30+ instructions, memory operands, EFLAGS) |
+| `gr-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP, syscalls, hooks |
+| `gr-decompile` | CFG/SSA/dominator/dataflow, 10 optimization rules, type inference, C/Rust output, SARIF |
+| `gr-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
+| `gr-cli` | 15 CLI commands |
 
 ## Architecture Decisions
 
-- **SpaceId (u32 index)** instead of pointers for address space references — avoids lifetime complexity
-- **SmallVec<[VarnodeData; 3]>** for PcodeOp inputs — most ops have 1-3 inputs
-- **bitflags** for SpaceFlags, SectionFlags, MemoryFlags
-- **goblin** for binary parsing — production-ready, zero-copy capable
-- **iced-x86** for x86/x64 disassembly — 250+ MB/s decode speed
-- **capstone** for ARM/AArch64 disassembly — multi-arch support
-- **Architecture trait** as the extension point for new ISAs (feature-gated)
+- **SpaceId::CONST/RAM/REGISTER/UNIQUE** constants — no magic numbers
+- **SmallVec<[VarnodeData; 3]>** for PcodeOp inputs
+- **Arena-based SSA** with VarId/OpIdx type aliases
+- **goblin** for binary parsing, **iced-x86** for x86, **capstone** for ARM/MIPS/PPC/SPARC/RISC-V
+- **gimli** for DWARF, **quick-xml** for Ghidra XML specs, **flate2** for .sla decompression
+- **serde** for JSON/SARIF serialization
 - Edition 2024, `thiserror` for error types
-
-## Ghidra Reference
-
-The `ghidra/` submodule contains the original NSA Ghidra source for reference. Key files:
-- `Ghidra/Features/Decompiler/src/decompile/cpp/opcodes.hh` — P-code opcode definitions
-- `Ghidra/Features/Decompiler/src/decompile/cpp/space.hh` — address space model
-- `Ghidra/Features/Decompiler/src/decompile/cpp/pcoderaw.hh` — VarnodeData/PcodeOp structs
