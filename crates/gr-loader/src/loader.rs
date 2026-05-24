@@ -94,6 +94,15 @@ pub struct ImportEntry {
     pub got_address: u64,
 }
 
+#[derive(Debug, Clone)]
+#[derive(Default)]
+pub struct DynamicInfo {
+    pub needed_libs: Vec<String>,
+    pub soname: Option<String>,
+    pub rpath: Option<String>,
+}
+
+
 #[derive(Debug)]
 pub struct BinaryInfo {
     pub format: BinaryFormat,
@@ -106,6 +115,8 @@ pub struct BinaryInfo {
     pub imports: Vec<ImportEntry>,
     pub memory: Memory,
     pub dwarf: DwarfInfo,
+    pub dynamic: DynamicInfo,
+    pub address_map: gr_core::address::AddressMap,
 }
 
 pub struct BinaryLoader;
@@ -279,6 +290,27 @@ impl BinaryLoader {
             }
         }
 
+        let mut dynamic = DynamicInfo::default();
+        if let Some(ref dyns) = elf.dynamic {
+            for d in &dyns.dyns {
+                if d.d_tag == goblin::elf::dynamic::DT_NEEDED
+                    && let Some(name) = elf.dynstrtab.get_at(d.d_val as usize) {
+                        dynamic.needed_libs.push(name.to_string());
+                    }
+                if d.d_tag == goblin::elf::dynamic::DT_SONAME
+                    && let Some(name) = elf.dynstrtab.get_at(d.d_val as usize) {
+                        dynamic.soname = Some(name.to_string());
+                    }
+            }
+        }
+
+        let mut address_map = gr_core::address::AddressMap::new();
+        for ph in &elf.program_headers {
+            if ph.p_type == goblin::elf::program_header::PT_LOAD && ph.p_filesz > 0 {
+                address_map.add_mapping(ph.p_offset, ph.p_vaddr, ph.p_filesz);
+            }
+        }
+
         Ok(BinaryInfo {
             format: BinaryFormat::Elf,
             arch,
@@ -290,6 +322,8 @@ impl BinaryLoader {
             imports,
             memory,
             dwarf: DwarfInfo::default(),
+            dynamic,
+            address_map,
         })
     }
 
@@ -425,6 +459,8 @@ impl BinaryLoader {
             imports: Vec::new(),
             memory,
             dwarf: DwarfInfo::default(),
+            dynamic: DynamicInfo::default(),
+            address_map: gr_core::address::AddressMap::new(),
         })
     }
 
@@ -543,6 +579,8 @@ impl BinaryLoader {
             imports: Vec::new(),
             memory,
             dwarf: DwarfInfo::default(),
+            dynamic: DynamicInfo::default(),
+            address_map: gr_core::address::AddressMap::new(),
         })
     }
 
