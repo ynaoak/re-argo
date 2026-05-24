@@ -17,3 +17,4 @@ thiserror = { workspace = true }
 smallvec = { workspace = true }
 iced-x86 = { workspace = true, optional = true }
 capstone = { workspace = true, optional = true }
+quick-xml = { workspace = true }

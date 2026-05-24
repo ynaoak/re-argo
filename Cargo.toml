@@ -36,3 +36,4 @@ bitflags = "2"
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "intel", "gas", "nasm", "instr_info"] }
 capstone = "0.13"
 petgraph = "0.7"
+quick-xml = "0.37"
