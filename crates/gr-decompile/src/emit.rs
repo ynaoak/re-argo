@@ -140,6 +140,55 @@ impl CEmitter {
                     self.get_branch_condition(func, *condition_block)
                 ));
             }
+            StructuredBlock::ForLoop {
+                init_block,
+                condition_block,
+                update_block,
+                body,
+            } => {
+                self.emit_basic_block_no_branch(func, *init_block);
+                self.line(&format!(
+                    "for (; {}; ) {{",
+                    self.get_branch_condition(func, *condition_block)
+                ));
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.emit_basic_block_no_branch(func, *update_block);
+                self.indent -= 1;
+                self.line("}");
+            }
+            StructuredBlock::ShortCircuitAnd {
+                left_block,
+                right_block,
+                body,
+            } => {
+                self.emit_basic_block_no_branch(func, *left_block);
+                self.line(&format!(
+                    "if ({} && {}) {{",
+                    self.get_branch_condition(func, *left_block),
+                    self.get_branch_condition(func, *right_block)
+                ));
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.indent -= 1;
+                self.line("}");
+            }
+            StructuredBlock::ShortCircuitOr {
+                left_block,
+                right_block,
+                body,
+            } => {
+                self.emit_basic_block_no_branch(func, *left_block);
+                self.line(&format!(
+                    "if ({} || {}) {{",
+                    self.get_branch_condition(func, *left_block),
+                    self.get_branch_condition(func, *right_block)
+                ));
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.indent -= 1;
+                self.line("}");
+            }
             StructuredBlock::Switch {
                 condition_block,
                 cases,

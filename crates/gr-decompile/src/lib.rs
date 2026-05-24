@@ -1,3 +1,4 @@
+pub mod action;
 pub mod cfg;
 pub mod dominator;
 pub mod emit;

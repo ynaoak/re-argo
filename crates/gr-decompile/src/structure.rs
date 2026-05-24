@@ -26,6 +26,22 @@ pub enum StructuredBlock {
         header: BlockId,
         body: Box<StructuredBlock>,
     },
+    ForLoop {
+        init_block: BlockId,
+        condition_block: BlockId,
+        update_block: BlockId,
+        body: Box<StructuredBlock>,
+    },
+    ShortCircuitAnd {
+        left_block: BlockId,
+        right_block: BlockId,
+        body: Box<StructuredBlock>,
+    },
+    ShortCircuitOr {
+        left_block: BlockId,
+        right_block: BlockId,
+        body: Box<StructuredBlock>,
+    },
     Switch {
         condition_block: BlockId,
         cases: Vec<(u64, StructuredBlock)>,

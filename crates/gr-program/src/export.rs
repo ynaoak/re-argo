@@ -43,7 +43,6 @@ pub fn export_ghidra_xml(program: &Program) -> String {
             "    <REF FROM=\"0x{:x}\" TO=\"0x{:x}\" TYPE=\"{}\" />\n",
             r.from, r.to, r.ref_type
         ));
-        ref_count += 1;
     }
     xml.push_str("  </REFERENCES>\n");
 

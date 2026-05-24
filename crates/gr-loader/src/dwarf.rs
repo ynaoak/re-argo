@@ -47,11 +47,20 @@ pub enum DwarfTypeKind {
     Void,
 }
 
+#[derive(Debug, Clone)]
+pub struct DwarfLineEntry {
+    pub address: u64,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct DwarfInfo {
     pub functions: Vec<DwarfFunctionInfo>,
     pub types: Vec<DwarfTypeInfo>,
     pub compile_units: Vec<String>,
+    pub line_table: Vec<DwarfLineEntry>,
 }
 
 impl DwarfInfo {
@@ -59,6 +68,12 @@ impl DwarfInfo {
         self.functions
             .iter()
             .find(|f| addr >= f.low_pc && addr < f.high_pc)
+    }
+
+    pub fn line_at(&self, addr: u64) -> Option<&DwarfLineEntry> {
+        self.line_table
+            .iter()
+            .rfind(|e| e.address <= addr)
     }
 
     pub fn is_empty(&self) -> bool {

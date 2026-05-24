@@ -55,6 +55,26 @@ fn is_mangled(name: &str) -> bool {
         || name.starts_with("__Z")
         || name.starts_with("?")
         || name.starts_with("_R")
+        || is_go_symbol(name)
+}
+
+fn is_go_symbol(name: &str) -> bool {
+    name.contains(".") && (name.starts_with("main.") || name.starts_with("runtime.") || name.starts_with("go."))
+}
+
+fn demangle_go(name: &str) -> Option<String> {
+    if !is_go_symbol(name) {
+        return None;
+    }
+    let cleaned = name
+        .replace("%2e", ".")
+        .replace("%2f", "/")
+        .replace("%25", "%");
+    if cleaned != name {
+        Some(cleaned)
+    } else {
+        None
+    }
 }
 
 pub fn try_demangle(name: &str) -> Option<String> {
@@ -70,6 +90,10 @@ pub fn try_demangle(name: &str) -> Option<String> {
     let demangled = rustc_demangle::demangle(name).to_string();
     if demangled != name {
         return Some(demangled);
+    }
+
+    if let Some(go) = demangle_go(name) {
+        return Some(go);
     }
 
     None

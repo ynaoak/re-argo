@@ -139,6 +139,47 @@ impl BinaryLoader {
         Ok(info)
     }
 
+    pub fn load_raw(data: &[u8], base_address: u64, arch: Architecture, endian: Endian) -> BinaryInfo {
+        let ram_space = SpaceId::RAM;
+        let mut memory = Memory::new(ram_space, endian);
+        memory.add_block(MemoryBlock {
+            name: ".raw".into(),
+            start: base_address,
+            size: data.len() as u64,
+            flags: MemoryFlags::READ | MemoryFlags::WRITE | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(data)),
+        });
+
+        let bits = match arch {
+            Architecture::X86 | Architecture::Arm | Architecture::Mips
+            | Architecture::PowerPc | Architecture::Riscv32 => 32,
+            _ => 64,
+        };
+
+        let mut address_map = gr_core::address::AddressMap::new();
+        address_map.add_mapping(0, base_address, data.len() as u64);
+
+        BinaryInfo {
+            format: BinaryFormat::Unknown,
+            arch,
+            endian,
+            bits,
+            entry_point: base_address,
+            sections: vec![Section {
+                name: ".raw".into(),
+                address: base_address,
+                size: data.len() as u64,
+                flags: SectionFlags::READ | SectionFlags::WRITE | SectionFlags::EXECUTE,
+            }],
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            memory,
+            dwarf: DwarfInfo::default(),
+            dynamic: DynamicInfo::default(),
+            address_map,
+        }
+    }
+
     fn load_elf(elf: &goblin::elf::Elf, data: &[u8]) -> Result<BinaryInfo, LoaderError> {
         let endian = if elf.little_endian {
             Endian::Little
