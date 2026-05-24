@@ -1,4 +1,5 @@
 pub mod comments;
+pub mod diff;
 pub mod export;
 pub mod undo;
 pub mod function;

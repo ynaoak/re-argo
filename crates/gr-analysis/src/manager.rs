@@ -8,6 +8,7 @@ use crate::demangle::DemangleAnalyzer;
 use crate::discovery::FunctionDiscoveryAnalyzer;
 use crate::ehframe::EhFrameAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
+use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
@@ -58,6 +59,8 @@ impl AnalysisManager {
             Box::new(CallingConventionAnalyzer),
             Box::new(CrossReferenceReportAnalyzer),
             Box::new(UnreferencedFunctionAnalyzer),
+            Box::new(IndirectCallAnalyzer),
+            Box::new(StringReferenceAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }
