@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use petgraph::graph::{DiGraph, NodeIndex};
 
@@ -6,7 +6,7 @@ use gr_program::Program;
 
 pub struct CallGraph {
     pub graph: DiGraph<CallNode, ()>,
-    addr_to_node: BTreeMap<u64, NodeIndex>,
+    addr_to_node: HashMap<u64, NodeIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,7 +18,7 @@ pub struct CallNode {
 impl CallGraph {
     pub fn build(program: &Program) -> Self {
         let mut graph = DiGraph::new();
-        let mut addr_to_node: BTreeMap<u64, NodeIndex> = BTreeMap::new();
+        let mut addr_to_node: HashMap<u64, NodeIndex> = HashMap::new();
 
         for func in program.listing.functions() {
             let idx = graph.add_node(CallNode {

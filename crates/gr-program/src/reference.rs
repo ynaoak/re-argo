@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefType {
@@ -79,8 +79,8 @@ impl std::fmt::Display for Reference {
 
 #[derive(Debug, Default)]
 pub struct ReferenceManager {
-    refs_from: BTreeMap<u64, Vec<Reference>>,
-    refs_to: BTreeMap<u64, Vec<Reference>>,
+    refs_from: HashMap<u64, Vec<Reference>>,
+    refs_to: HashMap<u64, Vec<Reference>>,
 }
 
 impl ReferenceManager {

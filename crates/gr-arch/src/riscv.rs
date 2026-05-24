@@ -125,10 +125,10 @@ impl Architecture for RiscVArch {
     }
 
     fn register_by_name(&self, name: &str) -> Option<&RegisterInfo> {
-        let lower = name.to_lowercase();
+        
         self.registers.iter().find(|r| {
-            r.name.to_lowercase() == lower
-                || r.aliases.iter().any(|a| a.to_lowercase() == lower)
+            r.name.eq_ignore_ascii_case(name)
+                || r.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
         })
     }
 

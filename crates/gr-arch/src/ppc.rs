@@ -90,8 +90,8 @@ impl Architecture for PpcArch {
     fn default_space(&self) -> SpaceId { RAM_SPACE }
     fn registers(&self) -> &[RegisterInfo] { &self.registers }
     fn register_by_name(&self, name: &str) -> Option<&RegisterInfo> {
-        let lower = name.to_lowercase();
-        self.registers.iter().find(|r| r.name == lower || r.aliases.iter().any(|a| a.to_lowercase() == lower))
+        
+        self.registers.iter().find(|r| r.name.eq_ignore_ascii_case(name) || r.aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
     }
     fn decode_instruction(&self, memory: &Memory, address: u64) -> Result<DecodedInstruction, DisasmError> {
         let mut buf = vec![0u8; 4];
