@@ -107,6 +107,25 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Export analysis results as Ghidra-compatible XML
+    ExportXml {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Output XML file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Emulate instructions from an address
+    Emulate {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Start address (hex). Defaults to entry point
+        #[arg(short, long, value_parser = parse_hex)]
+        start: Option<u64>,
+        /// Max steps to execute
+        #[arg(short = 'n', long, default_value = "100")]
+        steps: u64,
+    },
     /// Hex dump at a given address
     Hexdump {
         /// Path to the binary file
@@ -156,6 +175,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => cmd_pcode(&file, start, count),
         Commands::Decompile { file, address, ssa } => cmd_decompile(&file, address, ssa),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
+        Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
+        Commands::Emulate { file, start, steps } => cmd_emulate(&file, start, steps),
         Commands::Hexdump {
             file,
             address,
@@ -580,6 +601,81 @@ fn cmd_export(path: &Path, output: Option<&Path>) -> Result<(), Box<dyn std::err
     println!("  References: {}", summary.references_count);
     if summary.has_dwarf {
         println!("  DWARF:      {} functions", summary.dwarf_functions);
+    }
+    Ok(())
+}
+
+fn cmd_export_xml(path: &Path, output: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    let xml = gr_program::export::export_ghidra_xml(&program);
+
+    let out_path = output
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            PathBuf::from(format!("{}.xml", stem))
+        });
+
+    std::fs::write(&out_path, &xml)?;
+    println!("Exported XML to: {} ({} bytes)", out_path.display(), xml.len());
+    Ok(())
+}
+
+fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    let is_64 = info.bits == 64;
+    let lifter: Box<dyn PcodeLift> = match info.arch {
+        gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
+            if is_64 { Box::new(X86Lifter::new_64()) } else { Box::new(X86Lifter::new_32()) }
+        }
+        other => {
+            eprintln!("Emulation not yet supported for {}", other);
+            return Ok(());
+        }
+    };
+
+    let entry = start.unwrap_or(info.entry_point);
+    let mut emu = gr_emulator::Emulator::new();
+
+    for block in info.memory.blocks() {
+        if let Some(data) = &block.data {
+            emu.state.load_memory_bytes(block.start, data);
+        }
+    }
+
+    emu.state.write_register(0x20, if is_64 { 8 } else { 4 }, if is_64 { 0x7FFF_FFFF_FFF0 } else { 0xFFFF_FFF0 });
+
+    println!("Emulating from 0x{:x} (max {} steps)\n", entry, max_steps);
+
+    let mut addr = entry;
+    let mut total_steps = 0u64;
+
+    while total_steps < max_steps {
+        let lifted = match lifter.lift_instruction(&info.memory, addr) {
+            Ok(l) => l,
+            Err(e) => { println!("  [0x{:x}] decode error: {}", addr, e); break; }
+        };
+        let next_addr = addr + lifted.length as u64;
+        let mut branched = false;
+
+        print!("  0x{:08x}  {}", addr, lifted.mnemonic);
+        for op in &lifted.ops {
+            match emu.execute_op(op) {
+                Ok(()) => {}
+                Err(gr_emulator::emulator::EmulatorError::Branch(t)) => { println!(" -> branch 0x{:x}", t); addr = t; branched = true; break; }
+                Err(gr_emulator::emulator::EmulatorError::Call(t)) => { println!(" -> call 0x{:x}", t); addr = next_addr; branched = true; break; }
+                Err(gr_emulator::emulator::EmulatorError::Return(v)) => { println!(" -> return 0x{:x}\nReturned after {} steps", v, total_steps+1); return Ok(()); }
+                Err(e) => { println!(" -> error: {}", e); return Ok(()); }
+            }
+        }
+        if !branched { println!(); addr = next_addr; }
+        total_steps += 1;
+    }
+
+    println!("\nStopped after {} steps at 0x{:x}", total_steps, addr);
+    for (name, val) in emu.state.dump_registers() {
+        if val != 0 { println!("  {:<6} = 0x{:016x}", name, val); }
     }
     Ok(())
 }

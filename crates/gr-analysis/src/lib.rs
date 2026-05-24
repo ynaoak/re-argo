@@ -11,6 +11,7 @@ pub mod references;
 pub mod stack;
 pub mod strings;
 pub mod switches;
+pub mod patterns;
 pub mod signatures;
 pub mod thunk;
 pub mod vtable;

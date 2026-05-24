@@ -185,6 +185,8 @@ pub fn create_architecture(
         gr_loader::Architecture::PowerPc => Ok(Box::new(crate::ppc::PpcArch::new(false))),
         #[cfg(feature = "arm")]
         gr_loader::Architecture::PowerPc64 => Ok(Box::new(crate::ppc::PpcArch::new(true))),
+        #[cfg(feature = "arm")]
+        gr_loader::Architecture::Sparc => Ok(Box::new(crate::sparc::SparcArch::new(false))),
         other => Err(DisasmError::UnsupportedArch(format!("{}", other))),
     }
 }

@@ -12,6 +12,8 @@ pub mod mips;
 pub mod ppc;
 #[cfg(feature = "arm")]
 pub mod riscv;
+#[cfg(feature = "arm")]
+pub mod sparc;
 #[cfg(feature = "x86")]
 pub mod x86;
 
