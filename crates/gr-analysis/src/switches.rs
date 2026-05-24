@@ -55,7 +55,7 @@ impl Analyzer for SwitchTableAnalyzer {
                         program.info.memory.read_u32(table_entry).ok().map(|v| v as u64)
                     };
                     match target {
-                        Some(target_addr) if is_valid_code_addr(target_addr, &valid_code_ranges) => {
+                        Some(target_addr) if crate::utils::is_valid_address(target_addr, &valid_code_ranges) => {
                             out.push((jmp_addr, target_addr));
                         }
                         _ => break,
@@ -77,10 +77,6 @@ impl Analyzer for SwitchTableAnalyzer {
             instructions_decoded: 0,
         })
     }
-}
-
-fn is_valid_code_addr(addr: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges.iter().any(|&(start, end)| addr >= start && addr < end)
 }
 
 pub struct TailCallAnalyzer;

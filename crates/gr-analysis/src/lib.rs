@@ -20,6 +20,7 @@ pub mod patterns;
 pub mod signatures;
 pub mod thunk;
 pub mod typerecovery;
+pub mod utils;
 pub mod vtable;
 pub mod xref_report;
 

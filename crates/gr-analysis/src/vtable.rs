@@ -55,7 +55,7 @@ impl Analyzer for VTableAnalyzer {
                     };
 
                     if let Some(val) = ptr_val {
-                        if is_code_ptr(val, &code_ranges) {
+                        if crate::utils::is_valid_address(val, &code_ranges) {
                             consecutive_code_ptrs += 1;
                         } else {
                             break;
@@ -105,9 +105,3 @@ impl Analyzer for VTableAnalyzer {
     }
 }
 
-fn is_code_ptr(val: u64, ranges: &[(u64, u64)]) -> bool {
-    if val < 0x1000 {
-        return false;
-    }
-    ranges.iter().any(|&(start, end)| val >= start && val < end)
-}
