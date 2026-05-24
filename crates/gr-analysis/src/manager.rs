@@ -11,6 +11,7 @@ use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::strings::StringSearchAnalyzer;
 use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
+use crate::signatures::SignatureApplierAnalyzer;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
 use crate::vtable::VTableAnalyzer;
 
@@ -42,6 +43,7 @@ impl AnalysisManager {
             Box::new(SwitchTableAnalyzer),
             Box::new(TailCallAnalyzer),
             Box::new(VTableAnalyzer),
+            Box::new(SignatureApplierAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }

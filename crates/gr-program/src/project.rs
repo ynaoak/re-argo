@@ -19,7 +19,7 @@ pub struct ProjectSummary {
     pub dwarf_functions: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionSummary {
     pub address: u64,
     pub name: String,
@@ -28,7 +28,7 @@ pub struct FunctionSummary {
     pub stack_size: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolSummary {
     pub address: u64,
     pub name: String,
@@ -81,10 +81,29 @@ impl ProjectSummary {
         std::fs::write(path, json).map_err(|e| format!("write: {}", e))
     }
 
+    pub fn save_compact(&self, path: &Path) -> Result<(), String> {
+        let json = serde_json::to_string(self)
+            .map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(path, json).map_err(|e| format!("write: {}", e))
+    }
+
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
-        let json = std::fs::read_to_string(path)
-            .map_err(|e| format!("read: {}", e))?;
-        serde_json::from_str(&json).map_err(|e| format!("deserialize: {}", e))
+        let data = std::fs::read(path).map_err(|e| format!("read: {}", e))?;
+        let json = std::str::from_utf8(&data).map_err(|e| format!("utf8: {}", e))?;
+        serde_json::from_str(json).map_err(|e| format!("deserialize: {}", e))
+    }
+
+    pub fn merge(&mut self, other: &ProjectSummary) {
+        for func in &other.functions {
+            if !self.functions.iter().any(|f| f.address == func.address) {
+                self.functions.push(func.clone());
+            }
+        }
+        for sym in &other.symbols {
+            if !self.symbols.iter().any(|s| s.address == sym.address && s.name == sym.name) {
+                self.symbols.push(sym.clone());
+            }
+        }
     }
 }
 
