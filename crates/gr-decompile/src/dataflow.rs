@@ -56,7 +56,9 @@ pub fn compute_liveness(func: &SsaFunction) -> LivenessInfo {
                 &new_out.difference(&cached_defs[b]).copied().collect()
             ).copied().collect();
 
-            if new_in != *info.live_in.get(&b).unwrap() || new_out != *info.live_out.get(&b).unwrap() {
+            let old_in = info.live_in.get(&b).cloned().unwrap_or_default();
+            let old_out = info.live_out.get(&b).cloned().unwrap_or_default();
+            if new_in != old_in || new_out != old_out {
                 info.live_in.insert(b, new_in);
                 info.live_out.insert(b, new_out);
                 changed = true;

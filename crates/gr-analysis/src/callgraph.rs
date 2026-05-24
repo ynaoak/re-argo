@@ -84,7 +84,7 @@ impl CallGraph {
             ));
         }
         for edge in self.graph.edge_indices() {
-            let (src, dst) = self.graph.edge_endpoints(edge).unwrap();
+            let Some((src, dst)) = self.graph.edge_endpoints(edge) else { continue };
             out.push_str(&format!("    n{} -> n{};\n", src.index(), dst.index()));
         }
         out.push_str("}\n");
