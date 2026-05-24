@@ -13,6 +13,7 @@ pub mod sla;
 pub mod symbol;
 pub mod token;
 pub mod userops;
+pub mod walker;
 
 pub use decision::DecisionNode;
 pub use packed::PackedReader;
