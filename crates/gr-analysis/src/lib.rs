@@ -18,6 +18,7 @@ pub mod patterns;
 pub mod signatures;
 pub mod thunk;
 pub mod vtable;
+pub mod xref_report;
 
 pub use analyzer::Analyzer;
 pub use callgraph::CallGraph;

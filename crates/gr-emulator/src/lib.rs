@@ -5,6 +5,7 @@ pub mod hooks;
 pub mod session;
 pub mod snapshot;
 pub mod state;
+pub mod watchpoint;
 pub mod trace;
 
 pub use breakpoint::{BreakCondition, Breakpoint, BreakpointManager};

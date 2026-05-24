@@ -7,6 +7,7 @@ pub mod packed;
 pub mod pcode_template;
 pub mod sla;
 pub mod symbol;
+pub mod token;
 
 pub use decision::DecisionNode;
 pub use packed::PackedReader;

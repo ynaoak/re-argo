@@ -18,6 +18,7 @@ use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
 use crate::signatures::SignatureApplierAnalyzer;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
 use crate::vtable::VTableAnalyzer;
+use crate::xref_report::{CrossReferenceReportAnalyzer, UnreferencedFunctionAnalyzer};
 
 pub struct AnalysisManager {
     analyzers: Vec<Box<dyn Analyzer>>,
@@ -55,6 +56,8 @@ impl AnalysisManager {
             Box::new(FunctionBoundaryAnalyzer),
             Box::new(VariadicFunctionAnalyzer),
             Box::new(CallingConventionAnalyzer),
+            Box::new(CrossReferenceReportAnalyzer),
+            Box::new(UnreferencedFunctionAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }
