@@ -71,13 +71,12 @@ impl Analyzer for StringSearchAnalyzer {
 }
 
 pub fn is_data_section(name: &str) -> bool {
-    let n = name.to_lowercase();
-    n.contains(".rodata")
-        || n.contains(".rdata")
-        || n.contains(".data")
-        || n.contains("__cstring")
-        || n.contains("__const")
-        || n.contains("__TEXT.__cstring")
+    let patterns = [".rodata", ".rdata", ".data", "__cstring", "__const", "__TEXT.__cstring"];
+    patterns.iter().any(|p| {
+        name.len() >= p.len()
+            && name.as_bytes().windows(p.len()).any(|w|
+                w.eq_ignore_ascii_case(p.as_bytes()))
+    })
 }
 
 pub fn find_strings(data: &[u8], base_addr: u64) -> Vec<(u64, String)> {
