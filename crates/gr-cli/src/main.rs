@@ -667,10 +667,17 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
 
     if show_ssa {
         print!("{}", result.ssa_dump);
-    } else if show_rust {
-        print!("{}", result.rust_code);
     } else {
-        print!("{}", result.c_code);
+        if !result.recovered_structs.is_empty() {
+            for def in &result.recovered_structs {
+                println!("{}\n", def);
+            }
+        }
+        if show_rust {
+            print!("{}", result.rust_code);
+        } else {
+            print!("{}", result.c_code);
+        }
     }
 
     eprintln!(

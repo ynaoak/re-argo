@@ -13,6 +13,8 @@ pub struct DecompileResult {
     pub c_code: String,
     pub rust_code: String,
     pub ssa_dump: String,
+    /// C definitions of structs recovered from memory access patterns.
+    pub recovered_structs: Vec<String>,
     pub stats: DecompileStats,
 }
 
@@ -134,6 +136,17 @@ fn build_decompile_result(
     let opt_stats = run_optimization_passes(&mut ssa);
     let live_ops = ssa.live_op_count();
 
+    // Recover struct/array layouts from memory access patterns.
+    let mut type_engine = crate::typeinfer::TypeInferenceEngine::new();
+    type_engine.infer(&ssa);
+    type_engine.recover_aggregates(&ssa);
+    let recovered_structs: Vec<String> = type_engine
+        .structs()
+        .values()
+        .enumerate()
+        .map(|(i, s)| s.to_c_definition(&format!("recovered_{}", i)))
+        .collect();
+
     let structured = structure_cfg(&ssa.cfg);
     let mut c_emitter = CEmitter::with_symbols(symbols.clone());
     c_emitter.set_string_literals(string_literals.clone());
@@ -149,6 +162,7 @@ fn build_decompile_result(
         c_code,
         rust_code,
         ssa_dump,
+        recovered_structs,
         stats: DecompileStats {
             instructions_lifted: instructions.len(),
             pcode_ops: total_pcode,
