@@ -67,7 +67,7 @@ impl ProgramDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{FunctionSummary, ProjectSummary, ReferenceSummary, SymbolSummary};
+    use crate::project::{FunctionSummary, ProjectSummary};
 
     fn make_summary(funcs: Vec<(u64, &str)>) -> ProjectSummary {
         ProjectSummary {

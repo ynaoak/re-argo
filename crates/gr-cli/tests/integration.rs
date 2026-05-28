@@ -99,12 +99,12 @@ fn emulator_float_ops() {
 
     let add = PcodeOp::new(OpCode::FloatAdd, seq)
         .with_output(VarnodeData::new(SpaceId::REGISTER, 0, 8))
-        .with_input(VarnodeData::new(SpaceId::CONST, 3.14f64.to_bits(), 8))
-        .with_input(VarnodeData::new(SpaceId::CONST, 2.86f64.to_bits(), 8));
+        .with_input(VarnodeData::new(SpaceId::CONST, 1.5f64.to_bits(), 8))
+        .with_input(VarnodeData::new(SpaceId::CONST, 2.5f64.to_bits(), 8));
 
     emu.execute_op(&add).unwrap();
     let result = f64::from_bits(emu.state.read_register(0, 8));
-    assert!((result - 6.0).abs() < 0.001);
+    assert!((result - 4.0).abs() < 0.001);
 }
 
 #[test]

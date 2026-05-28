@@ -514,12 +514,11 @@ mod tests {
         let xor_ops: Vec<_> = ssa.ops.iter()
             .filter(|op| !op.dead && op.opcode == OpCode::IntXor)
             .collect();
-        if let Some(xor_op) = xor_ops.first() {
-            if xor_op.inputs.len() == 2 && xor_op.inputs[0] == xor_op.inputs[1] {
-                let simplified = algebraic_simplification(&mut ssa);
-                assert!(simplified > 0);
-                return;
-            }
+        if let Some(xor_op) = xor_ops.first()
+            && xor_op.inputs.len() == 2 && xor_op.inputs[0] == xor_op.inputs[1]
+        {
+            let simplified = algebraic_simplification(&mut ssa);
+            assert!(simplified > 0);
         }
         // If SSA renamed them differently, the optimization correctly doesn't fire
     }

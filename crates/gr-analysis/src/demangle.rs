@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn demangle_rust_v0() {
         let result = try_demangle("_RNvCs1234_5hello4main");
-        assert!(result.is_some() || true);
+        let _ = result;
     }
 
     #[test]

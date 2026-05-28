@@ -121,7 +121,7 @@ mod tests {
         let path = Path::new("ghidra/Ghidra/Processors/x86");
         if path.exists() {
             let files = find_sla_files(path);
-            assert!(!files.is_empty() || true);
+            let _ = &files;
         }
     }
 }
