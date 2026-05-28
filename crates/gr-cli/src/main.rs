@@ -5,6 +5,7 @@ use gr_analysis::{AnalysisManager, CallGraph};
 use gr_analysis::strings::{find_strings, is_data_section};
 use gr_arch::arch::create_architecture;
 use gr_lift::aarch64::Aarch64Lifter;
+use gr_lift::mips::MipsLifter;
 use gr_lift::x86::X86Lifter;
 use gr_lift::PcodeLift;
 use gr_loader::{BinaryLoader, Memory, SectionFlags, SymbolKind};
@@ -509,12 +510,17 @@ fn cmd_registers(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn create_lifter(arch: gr_loader::Architecture, bits: u32) -> Option<Box<dyn PcodeLift>> {
+fn create_lifter(
+    arch: gr_loader::Architecture,
+    bits: u32,
+    endian: gr_core::address::Endian,
+) -> Option<Box<dyn PcodeLift>> {
     match arch {
         gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
             if bits == 64 { Some(Box::new(X86Lifter::new_64())) } else { Some(Box::new(X86Lifter::new_32())) }
         }
         gr_loader::Architecture::Arm64 => Some(Box::new(Aarch64Lifter::new())),
+        gr_loader::Architecture::Mips => Some(Box::new(MipsLifter::new_32(endian))),
         _ => None,
     }
 }
@@ -640,7 +646,7 @@ fn cmd_callgraph(path: &Path, dot: bool) -> Result<(), Box<dyn std::error::Error
 fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
 
-    let lifter = match create_lifter(info.arch, info.bits) {
+    let lifter = match create_lifter(info.arch, info.bits, info.endian) {
         Some(l) => l,
         None => {
             eprintln!("P-code lifting not yet supported for {}", info.arch);
@@ -664,7 +670,7 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dy
 fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
-    let lifter = match create_lifter(program.info.arch, program.info.bits) {
+    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian) {
         Some(l) => l,
         None => {
             eprintln!("Decompilation not yet supported for {}", program.info.arch);
@@ -706,7 +712,7 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
 fn cmd_taint(path: &Path, address: Option<u64>, params: usize) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
-    let lifter = match create_lifter(program.info.arch, program.info.bits) {
+    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian) {
         Some(l) => l,
         None => {
             eprintln!("Taint analysis not yet supported for {}", program.info.arch);
@@ -787,7 +793,7 @@ fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u
     let info = BinaryLoader::load(path)?;
 
     let is_64 = info.bits == 64;
-    let lifter = match create_lifter(info.arch, info.bits) {
+    let lifter = match create_lifter(info.arch, info.bits, info.endian) {
         Some(l) => l,
         None => {
             eprintln!("Emulation not yet supported for {}", info.arch);
@@ -922,7 +928,7 @@ fn build_emulator_target(
     info: gr_loader::BinaryInfo,
     entry: u64,
 ) -> Option<EmulatorTarget> {
-    let lifter = create_lifter(info.arch, info.bits)?;
+    let lifter = create_lifter(info.arch, info.bits, info.endian)?;
     let is_64 = info.bits == 64;
     let mut emu = gr_emulator::Emulator::new();
     for block in info.memory.blocks() {
@@ -1495,7 +1501,7 @@ fn cmd_script(path: &Path, script_path: &Path) -> Result<(), Box<dyn std::error:
                 }
             }
             "decompile" => {
-                if let Some(lifter) = create_lifter(info.arch, info.bits) {
+                if let Some(lifter) = create_lifter(info.arch, info.bits, info.endian) {
                     let addr = parse_hex(args).unwrap_or(info.entry_point);
                     match gr_decompile::decompile_function(lifter.as_ref(), &program, addr) {
                         Ok(result) => print!("{}", result.c_code),
