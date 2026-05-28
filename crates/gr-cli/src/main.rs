@@ -6,6 +6,7 @@ use gr_analysis::strings::{find_strings, is_data_section};
 use gr_arch::arch::create_architecture;
 use gr_lift::aarch64::Aarch64Lifter;
 use gr_lift::mips::MipsLifter;
+use gr_lift::riscv::RiscVLifter;
 use gr_lift::x86::X86Lifter;
 use gr_lift::PcodeLift;
 use gr_loader::{BinaryLoader, Memory, SectionFlags, SymbolKind};
@@ -521,6 +522,7 @@ fn create_lifter(
         }
         gr_loader::Architecture::Arm64 => Some(Box::new(Aarch64Lifter::new())),
         gr_loader::Architecture::Mips => Some(Box::new(MipsLifter::new_32(endian))),
+        gr_loader::Architecture::Riscv32 => Some(Box::new(RiscVLifter::new_rv32())),
         _ => None,
     }
 }
