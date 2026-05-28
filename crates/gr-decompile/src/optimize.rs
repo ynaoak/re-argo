@@ -151,6 +151,99 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
     propagated
 }
 
+/// SSA value identity: the simplified SSA allocates a fresh varnode per read,
+/// so the same value is correlated by (space, offset, size, version).
+type ValueKey = (u32, u64, u32, u32);
+
+fn value_key(func: &SsaFunction, var_id: u32) -> ValueKey {
+    let vn = &func.varnodes[var_id as usize];
+    (vn.data.space.0, vn.data.offset, vn.data.size, vn.version)
+}
+
+fn is_cse_pure(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::IntAdd | OpCode::IntSub | OpCode::IntMult
+            | OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor
+            | OpCode::IntLeft | OpCode::IntRight | OpCode::IntSRight
+            | OpCode::IntNegate | OpCode::Int2Comp
+            | OpCode::IntEqual | OpCode::IntNotEqual
+            | OpCode::IntLess | OpCode::IntLessEqual
+            | OpCode::IntSLess | OpCode::IntSLessEqual
+            | OpCode::IntZExt | OpCode::IntSExt
+            | OpCode::IntDiv | OpCode::IntSDiv | OpCode::IntRem | OpCode::IntSRem
+    )
+}
+
+fn is_commutative(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::IntAdd | OpCode::IntMult | OpCode::IntAnd
+            | OpCode::IntOr | OpCode::IntXor
+            | OpCode::IntEqual | OpCode::IntNotEqual
+    )
+}
+
+/// Rewrite every varnode identifying value `from` to identify value `to`,
+/// redirecting all reads of `from` onto `to`.
+fn redirect_value(func: &mut SsaFunction, from: ValueKey, to: ValueKey) {
+    let new_data = gr_core::pcode::VarnodeData::new(
+        gr_core::address::SpaceId(to.0),
+        to.1,
+        to.2,
+    );
+    for vn in &mut func.varnodes {
+        if (vn.data.space.0, vn.data.offset, vn.data.size, vn.version) == from {
+            vn.data = new_data;
+            vn.version = to.3;
+        }
+    }
+}
+
+/// Local common subexpression elimination.
+///
+/// Within each basic block, a pure op that recomputes a value already produced
+/// by an earlier pure op (same opcode and inputs by value identity) is removed,
+/// and its uses are redirected to the earlier result. Restricting to a single
+/// block keeps the rewrite safe without dominator analysis.
+pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
+    let mut eliminated = 0;
+    // (block, opcode name, input value keys) -> output value key
+    let mut seen: std::collections::BTreeMap<(usize, &'static str, Vec<ValueKey>), ValueKey> =
+        std::collections::BTreeMap::new();
+
+    for i in 0..func.ops.len() {
+        if func.ops[i].dead {
+            continue;
+        }
+        let opcode = func.ops[i].opcode;
+        if !is_cse_pure(opcode) {
+            continue;
+        }
+        let Some(out_id) = func.ops[i].output else { continue };
+        if func.ops[i].inputs.is_empty() {
+            continue;
+        }
+
+        let mut in_keys: Vec<ValueKey> =
+            func.ops[i].inputs.iter().map(|&id| value_key(func, id)).collect();
+        if is_commutative(opcode) {
+            in_keys.sort();
+        }
+        let key = (func.ops[i].block, opcode.name(), in_keys);
+        let out_key = value_key(func, out_id);
+
+        if let Some(&existing) = seen.get(&key) {
+            redirect_value(func, out_key, existing);
+            func.ops[i].dead = true;
+            eliminated += 1;
+        } else {
+            seen.insert(key, out_key);
+        }
+    }
+    eliminated
+}
+
 pub fn strength_reduction(func: &mut SsaFunction) -> usize {
     let mut reduced = 0;
     let const_space = gr_core::address::SpaceId::CONST;
@@ -325,13 +418,15 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
         let cp = copy_propagation(func);
         let sr = strength_reduction(func);
         let alg = algebraic_simplification(func);
+        let cse = common_subexpression_elimination(func);
         let dce = dead_code_elimination(func);
         stats.constants_folded += cf;
         stats.copies_propagated += cp;
         stats.strength_reduced += sr;
         stats.algebraic_simplified += alg;
+        stats.cse_eliminated += cse;
         stats.dead_ops_removed += dce;
-        if cf == 0 && cp == 0 && dce == 0 && sr == 0 && alg == 0 {
+        if cf == 0 && cp == 0 && dce == 0 && sr == 0 && alg == 0 && cse == 0 {
             break;
         }
     }
@@ -345,15 +440,16 @@ pub struct OptimizationStats {
     pub copies_propagated: usize,
     pub strength_reduced: usize,
     pub algebraic_simplified: usize,
+    pub cse_eliminated: usize,
 }
 
 impl std::fmt::Display for OptimizationStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "folded={}, propagated={}, dce={}, strength={}, algebra={}",
+            "folded={}, propagated={}, dce={}, strength={}, algebra={}, cse={}",
             self.constants_folded, self.copies_propagated, self.dead_ops_removed,
-            self.strength_reduced, self.algebraic_simplified
+            self.strength_reduced, self.algebraic_simplified, self.cse_eliminated
         )
     }
 }
@@ -551,5 +647,97 @@ mod tests {
         assert!(simplified > 0);
         let copy_op = ssa.ops.iter().find(|op| !op.dead && op.opcode == OpCode::Copy);
         assert!(copy_op.is_some());
+    }
+
+    #[test]
+    fn cse_eliminates_duplicate_expression() {
+        // rax = rdi + rsi; rbx = rdi + rsi (duplicate)
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rbx = VarnodeData::new(SpaceId(2), 0x18, 8);
+        let rdi = VarnodeData::new(SpaceId(2), 0x38, 8);
+        let rsi = VarnodeData::new(SpaceId(2), 0x30, 8);
+
+        let insns = vec![make_lifted(0x1000, vec![
+            PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq: seq(0x1000, 0),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[rdi, rsi]),
+            },
+            PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq: seq(0x1000, 1),
+                output: Some(rbx),
+                inputs: SmallVec::from_slice(&[rdi, rsi]),
+            },
+        ])];
+
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let eliminated = common_subexpression_elimination(&mut ssa);
+        assert_eq!(eliminated, 1, "duplicate add should be eliminated");
+        let live_adds = ssa.ops.iter().filter(|op| !op.dead && op.opcode == OpCode::IntAdd).count();
+        assert_eq!(live_adds, 1);
+    }
+
+    #[test]
+    fn cse_commutative_match() {
+        // rax = rdi + rsi; rbx = rsi + rdi (commutative duplicate)
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rbx = VarnodeData::new(SpaceId(2), 0x18, 8);
+        let rdi = VarnodeData::new(SpaceId(2), 0x38, 8);
+        let rsi = VarnodeData::new(SpaceId(2), 0x30, 8);
+
+        let insns = vec![make_lifted(0x1000, vec![
+            PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq: seq(0x1000, 0),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[rdi, rsi]),
+            },
+            PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq: seq(0x1000, 1),
+                output: Some(rbx),
+                inputs: SmallVec::from_slice(&[rsi, rdi]),
+            },
+        ])];
+
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let eliminated = common_subexpression_elimination(&mut ssa);
+        assert_eq!(eliminated, 1, "commutative duplicate should be eliminated");
+    }
+
+    #[test]
+    fn cse_keeps_distinct_expressions() {
+        // rax = rdi + rsi; rbx = rdi - rsi (different opcode, not a duplicate)
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rbx = VarnodeData::new(SpaceId(2), 0x18, 8);
+        let rdi = VarnodeData::new(SpaceId(2), 0x38, 8);
+        let rsi = VarnodeData::new(SpaceId(2), 0x30, 8);
+
+        let insns = vec![make_lifted(0x1000, vec![
+            PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq: seq(0x1000, 0),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[rdi, rsi]),
+            },
+            PcodeOp {
+                opcode: OpCode::IntSub,
+                seq: seq(0x1000, 1),
+                output: Some(rbx),
+                inputs: SmallVec::from_slice(&[rdi, rsi]),
+            },
+        ])];
+
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let eliminated = common_subexpression_elimination(&mut ssa);
+        assert_eq!(eliminated, 0, "different opcodes must not be merged");
     }
 }

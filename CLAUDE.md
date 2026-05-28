@@ -50,7 +50,7 @@ cargo run -- script <binary> <script.grs>
 | `gr-analysis` | 30 analyzers (function discovery, strings, stack, VTable, calling convention, coverage, ...) |
 | `gr-lift` | x86/AArch64 → P-code lifter (30+ instructions, memory operands, EFLAGS/NZCV) |
 | `gr-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP client+server, syscalls, hooks |
-| `gr-decompile` | CFG/SSA/dominator/dataflow, 5 optimization passes (DCE/fold/propagate/strength/algebra), type inference, C/Rust output, SARIF |
+| `gr-decompile` | CFG/SSA/dominator/dataflow, 6 optimization passes (DCE/fold/propagate/strength/algebra/CSE), struct/array type recovery, C/Rust output, SARIF |
 | `gr-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
 | `gr-cli` | 24 CLI commands |
 
