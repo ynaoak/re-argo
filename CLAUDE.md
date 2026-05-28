@@ -49,7 +49,7 @@ cargo run -- script <binary> <script.grs>
 | `gr-arch` | 6 architectures (x86/ARM/RISC-V/MIPS/PPC/SPARC), .cspec/.pspec/.ldefs parsers, register overlap map, assembler |
 | `gr-program` | Program model, symbols, references, comments, bookmarks, undo/redo, diff, SARIF, metadata, history |
 | `gr-analysis` | 30 analyzers (function discovery, strings, stack, VTable, calling convention, coverage, ...) |
-| `gr-lift` | x86/AArch64/MIPS32/RV32IMC → P-code lifter (memory operands, EFLAGS/NZCV, branches, compressed insns) |
+| `gr-lift` | x86/AArch64/ARM32/MIPS32/RV32IMC/PPC32 → P-code lifter (memory operands, flags/conditions, branches, compressed insns) |
 | `gr-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP client+server, syscalls, hooks |
 | `gr-decompile` | CFG/SSA/dominator/dataflow, 6 optimization passes (DCE/fold/propagate/strength/algebra/CSE), struct/array type recovery, taint analysis, C/Rust output, SARIF |
 | `gr-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
