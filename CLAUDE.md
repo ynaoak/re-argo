@@ -24,10 +24,17 @@ cargo run -- functions <binary>
 cargo run -- xrefs <binary> <hex-address>
 cargo run -- callgraph <binary> [--dot]
 cargo run -- pcode <binary> [--start <hex-addr>] [-n <count>]
-cargo run -- decompile <binary> [--address <hex-addr>] [--ssa]
+cargo run -- decompile <binary> [--address <hex-addr>] [--ssa] [--rust]
 cargo run -- export <binary> [-o <output.json>]
 cargo run -- export-xml <binary> [-o <output.xml>]
 cargo run -- emulate <binary> [--start <hex-addr>] [-n <steps>] [--break <hex-addr>]
+cargo run -- strings <binary> [--min-length <n>] [--all]
+cargo run -- diff <binary_a> <binary_b>
+cargo run -- imports <binary> [--exports]
+cargo run -- coverage <binary>
+cargo run -- search <binary> [--hex "48 8b ?? 24"] [--text "password"]
+cargo run -- patch <binary> <hex-addr> --bytes "90 90 90" [-o <output>]
+cargo run -- script <binary> <script.grs>
 ```
 
 ## Workspace Structure
@@ -39,11 +46,11 @@ cargo run -- emulate <binary> [--start <hex-addr>] [-n <steps>] [--break <hex-ad
 | `gr-arch` | 6 architectures (x86/ARM/RISC-V/MIPS/PPC/SPARC), .cspec/.pspec/.ldefs parsers, register overlap map, assembler |
 | `gr-program` | Program model, symbols, references, comments, bookmarks, undo/redo, diff, SARIF, metadata, history |
 | `gr-analysis` | 30 analyzers (function discovery, strings, stack, VTable, calling convention, coverage, ...) |
-| `gr-lift` | x86 → P-code lifter (30+ instructions, memory operands, EFLAGS) |
+| `gr-lift` | x86/AArch64 → P-code lifter (30+ instructions, memory operands, EFLAGS/NZCV) |
 | `gr-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP, syscalls, hooks |
-| `gr-decompile` | CFG/SSA/dominator/dataflow, 10 optimization rules, type inference, C/Rust output, SARIF |
+| `gr-decompile` | CFG/SSA/dominator/dataflow, 5 optimization passes (DCE/fold/propagate/strength/algebra), type inference, C/Rust output, SARIF |
 | `gr-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
-| `gr-cli` | 15 CLI commands |
+| `gr-cli` | 22 CLI commands |
 
 ## Architecture Decisions
 

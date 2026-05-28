@@ -17,4 +17,5 @@ pub use listing::Listing;
 pub use program::Program;
 pub use reference::{RefType, Reference, ReferenceManager};
 pub use project::ProjectSummary;
+pub use diff::ProgramDiff;
 pub use symbol::{Symbol, SymbolTable, SymbolType};

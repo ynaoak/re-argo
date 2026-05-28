@@ -11,3 +11,4 @@ gr-loader = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 iced-x86 = { workspace = true }
+capstone = { workspace = true }

@@ -1,3 +1,4 @@
+pub mod aarch64;
 pub mod lift;
 pub mod x86;
 

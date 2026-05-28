@@ -4,12 +4,14 @@ use gr_program::Program;
 
 use crate::cfg::ControlFlowGraph;
 use crate::emit::CEmitter;
+use crate::rust_emit::RustEmitter;
 use crate::optimize::{run_optimization_passes, OptimizationStats};
 use crate::ssa::SsaFunction;
 use crate::structure::structure_cfg;
 
 pub struct DecompileResult {
     pub c_code: String,
+    pub rust_code: String,
     pub ssa_dump: String,
     pub stats: DecompileStats,
 }
@@ -133,13 +135,19 @@ fn build_decompile_result(
     let live_ops = ssa.live_op_count();
 
     let structured = structure_cfg(&ssa.cfg);
-    let mut emitter = CEmitter::with_symbols(symbols.clone());
-    emitter.set_string_literals(string_literals.clone());
-    emitter.set_stack_vars(stack_vars.clone());
-    let c_code = emitter.emit_function(&ssa, &structured);
+    let mut c_emitter = CEmitter::with_symbols(symbols.clone());
+    c_emitter.set_string_literals(string_literals.clone());
+    c_emitter.set_stack_vars(stack_vars.clone());
+    let c_code = c_emitter.emit_function(&ssa, &structured);
+
+    let mut rust_emitter = RustEmitter::with_symbols(symbols.clone());
+    rust_emitter.set_string_literals(string_literals.clone());
+    rust_emitter.set_stack_vars(stack_vars.clone());
+    let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
     Ok(DecompileResult {
         c_code,
+        rust_code,
         ssa_dump,
         stats: DecompileStats {
             instructions_lifted: instructions.len(),

@@ -70,7 +70,7 @@ impl Analyzer for StringSearchAnalyzer {
     }
 }
 
-fn is_data_section(name: &str) -> bool {
+pub fn is_data_section(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains(".rodata")
         || n.contains(".rdata")
@@ -80,7 +80,7 @@ fn is_data_section(name: &str) -> bool {
         || n.contains("__TEXT.__cstring")
 }
 
-fn find_strings(data: &[u8], base_addr: u64) -> Vec<(u64, String)> {
+pub fn find_strings(data: &[u8], base_addr: u64) -> Vec<(u64, String)> {
     let mut results = Vec::new();
     let mut i = 0;
 
