@@ -233,12 +233,11 @@ impl LanguageDefFile {
                         _ => {}
                     }
                 }
-                Ok(Event::End(e)) => {
-                    if std::str::from_utf8(e.name().as_ref()).unwrap_or("") == "language" {
+                Ok(Event::End(e))
+                    if std::str::from_utf8(e.name().as_ref()).unwrap_or("") == "language" => {
                         in_language = false;
                         file.languages.push(current_lang.clone());
                     }
-                }
                 Err(e) => return Err(format!("XML: {}", e)),
                 _ => {}
             }

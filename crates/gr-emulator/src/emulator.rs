@@ -410,25 +410,25 @@ impl Emulator {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_DIV".into()))?;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, if b != 0 { a / b } else { 0 });
+                self.state.write_varnode(out, a.checked_div(b).unwrap_or(0));
             }
             OpCode::IntSDiv => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SDIV".into()))?;
                 let a = self.read_input(op, 0)? as i64;
                 let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, if b != 0 { (a / b) as u64 } else { 0 });
+                self.state.write_varnode(out, a.checked_div(b).unwrap_or(0) as u64);
             }
             OpCode::IntRem => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_REM".into()))?;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, if b != 0 { a % b } else { 0 });
+                self.state.write_varnode(out, a.checked_rem(b).unwrap_or(0));
             }
             OpCode::IntSRem => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SREM".into()))?;
                 let a = self.read_input(op, 0)? as i64;
                 let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, if b != 0 { (a % b) as u64 } else { 0 });
+                self.state.write_varnode(out, a.checked_rem(b).unwrap_or(0) as u64);
             }
             OpCode::Insert => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INSERT".into()))?;

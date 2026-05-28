@@ -103,8 +103,8 @@ impl TypeInferenceEngine {
                         }
                     }
                 }
-                OpCode::Store => {
-                    if op.inputs.len() >= 2 {
+                OpCode::Store
+                    if op.inputs.len() >= 2 => {
                         let addr_id = op.inputs[1];
                         let vn = &func.varnodes[addr_id as usize];
                         if vn.data.space != SpaceId::CONST {
@@ -116,7 +116,6 @@ impl TypeInferenceEngine {
                             self.set_type(addr_id, InferredType::Pointer { pointee_size: store_size });
                         }
                     }
-                }
                 OpCode::PtrAdd | OpCode::PtrSub => {
                     if let Some(out_id) = op.output {
                         self.set_type(out_id, InferredType::Pointer { pointee_size: None });
