@@ -7,9 +7,9 @@
 //! disassembly text. SPARC is big-endian with fixed 4-byte instructions; `%g0`
 //! reads as 0 and discards writes.
 //!
-//! Simplifications: branch delay slots are not reordered (each instruction is
-//! lifted independently); SAVE/RESTORE model only the pointer arithmetic, not
-//! the register-window rotation; the carry-in of ADDX/SUBX is ignored.
+//! ADDX/SUBX use the icc carry. Simplifications: branch delay slots are not
+//! reordered (each instruction is lifted independently); SAVE/RESTORE model
+//! only the pointer arithmetic, not the register-window rotation.
 
 use gr_core::address::{Address, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -182,8 +182,10 @@ impl SparcLifter {
         // Compute the result into a temp so flags can read it even when rd=%g0.
         let res = unique(0x510, 4);
         match base {
-            0x0 | 0x8 => self.push(ops, s, OpCode::IntAdd, Some(res), &[a, b], address),  // ADD / ADDX
-            0x4 | 0xC => self.push(ops, s, OpCode::IntSub, Some(res), &[a, b], address),  // SUB / SUBX
+            0x0 => self.push(ops, s, OpCode::IntAdd, Some(res), &[a, b], address),        // ADD
+            0x4 => self.push(ops, s, OpCode::IntSub, Some(res), &[a, b], address),        // SUB
+            0x8 => self.emit_addx(res, a, b, ops, s, address),                            // ADDX: a + b + C
+            0xC => self.emit_subx(res, a, b, ops, s, address),                            // SUBX: a - b - C
             0x1 => self.push(ops, s, OpCode::IntAnd, Some(res), &[a, b], address),        // AND
             0x2 => self.push(ops, s, OpCode::IntOr, Some(res), &[a, b], address),         // OR
             0x3 => self.push(ops, s, OpCode::IntXor, Some(res), &[a, b], address),        // XOR
@@ -214,6 +216,24 @@ impl SparcLifter {
         let nb = unique(0x520, 4);
         self.push(ops, s, OpCode::IntNegate, Some(nb), &[b], address);
         self.push(ops, s, op, Some(res), &[a, nb], address);
+    }
+
+    /// ADDX: `res = a + b + C` (icc carry).
+    fn emit_addx(&self, res: VarnodeData, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let t = unique(0x528, 4);
+        self.push(ops, s, OpCode::IntAdd, Some(t), &[a, b], address);
+        let cin = unique(0x530, 4);
+        self.push(ops, s, OpCode::IntZExt, Some(cin), &[flag(ICC_C)], address);
+        self.push(ops, s, OpCode::IntAdd, Some(res), &[t, cin], address);
+    }
+
+    /// SUBX: `res = a - b - C` (icc carry).
+    fn emit_subx(&self, res: VarnodeData, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let t = unique(0x528, 4);
+        self.push(ops, s, OpCode::IntSub, Some(t), &[a, b], address);
+        let cin = unique(0x530, 4);
+        self.push(ops, s, OpCode::IntZExt, Some(cin), &[flag(ICC_C)], address);
+        self.push(ops, s, OpCode::IntSub, Some(res), &[t, cin], address);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -466,6 +486,23 @@ mod tests {
         let ops = lift(f3(0x14, 0, 8, 9));
         assert!(ops.iter().any(|o| o.output.map(|v| v.offset == ICC_Z).unwrap_or(false)));
         assert!(ops.iter().any(|o| o.output.map(|v| v.offset == ICC_C).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_addx_uses_carry() {
+        // addx %o0, %o1, %o2 : op3=0x08
+        let ops = lift(f3(0x08, 10, 8, 9));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntZExt && o.inputs[0].offset == ICC_C));
+        // a+b then +carry => two IntAdd
+        assert!(ops.iter().filter(|o| o.opcode == OpCode::IntAdd).count() >= 2);
+    }
+
+    #[test]
+    fn lift_subx_uses_carry() {
+        // subx %o0, %o1, %o2 : op3=0x0C
+        let ops = lift(f3(0x0C, 10, 8, 9));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntZExt && o.inputs[0].offset == ICC_C));
+        assert!(ops.iter().filter(|o| o.opcode == OpCode::IntSub).count() >= 2);
     }
 
     #[test]

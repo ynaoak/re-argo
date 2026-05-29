@@ -3,12 +3,13 @@
 //! Decodes the common encodings directly into P-code: data processing
 //! (immediate and simple shifted-register operand2), single load/store,
 //! block load/store (push/pop), multiply, and branches. Capstone supplies the
-//! disassembly text. Condition codes are honoured for branches (via NZCV flags
-//! computed by cmp/cmn/tst/teq). Conditional (non-AL) A32 data-processing that
-//! writes a register is modelled branch-free via a select on the condition,
-//! since the emulator/CFG do not support intra-instruction p-code branches.
-//! Conditional compares and conditional load/store are left unconditional, and
-//! Thumb IT-block predication is not modelled (the lifter is stateless).
+//! disassembly text. The S bit sets NZCV for register-writing data-processing
+//! (N/Z from the result, arithmetic C/V from the operands; the shifter
+//! carry-out is not modelled for logical ops). ADC/SBC/RSC use the carry flag.
+//! Conditional (non-AL) A32 data-processing that writes a register is modelled
+//! branch-free via a select on the condition, since the emulator/CFG do not
+//! support intra-instruction p-code branches. Conditional compares/load-store
+//! and Thumb IT-block predication are not modelled (the lifter is stateless).
 
 use gr_core::address::{Address, Endian, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -755,8 +756,9 @@ impl Arm32Lifter {
             0x2 => self.dp_binop(OpCode::IntSub, rd, rn_v, op2, ops, s, address),       // SUB
             0x3 => self.dp_binop_rev(OpCode::IntSub, rd, op2, rn_v, ops, s, address),   // RSB
             0x4 => self.dp_binop(OpCode::IntAdd, rd, rn_v, op2, ops, s, address),       // ADD
-            0x5 => self.dp_binop(OpCode::IntAdd, rd, rn_v, op2, ops, s, address),       // ADC (carry ignored)
-            0x6 => self.dp_binop(OpCode::IntSub, rd, rn_v, op2, ops, s, address),       // SBC (carry ignored)
+            0x5 => self.dp_adc(rd, rn_v, op2, ops, s, address),                         // ADC: rn + op2 + C
+            0x6 => self.dp_sbc(rd, rn_v, op2, ops, s, address),                         // SBC: rn - op2 - !C
+            0x7 => self.dp_sbc(rd, op2, rn_v, ops, s, address),                         // RSC: op2 - rn - !C
             0x8 if set_flags => self.emit_cmp_flags(true, rn_v, op2, ops, s, address), // TST (AND flags)
             0x9 if set_flags => self.emit_cmp_flags(true, rn_v, op2, ops, s, address), // TEQ (EOR flags)
             0xA => self.emit_cmp_flags(false, rn_v, op2, ops, s, address),              // CMP
@@ -786,10 +788,77 @@ impl Arm32Lifter {
             _ => {}
         }
 
+        // S-bit: register-writing data-processing updates NZCV. N/Z come from
+        // the result; arithmetic C/V from the operands. Logical ops update only
+        // N/Z here (the shifter carry-out for C is not modelled, V is unchanged).
+        if set_flags && writes_reg {
+            self.set_nz(reg(rd), ops, s, address);
+            match opcode {
+                0x4 | 0x5 => {
+                    ops.push(PcodeOp { opcode: OpCode::IntCarry, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[rn_v, op2]) });
+                    *s += 1;
+                    ops.push(PcodeOp { opcode: OpCode::IntSCarry, seq: seq(*s), output: Some(flag(V_FLAG)), inputs: SmallVec::from_slice(&[rn_v, op2]) });
+                    *s += 1;
+                }
+                0x2 | 0x6 => self.set_sub_cv(rn_v, op2, ops, s, address),  // SUB/SBC
+                0x3 | 0x7 => self.set_sub_cv(op2, rn_v, ops, s, address),  // RSB/RSC: op2 - rn
+                _ => {}
+            }
+        }
+
         if let Some(old) = cond_old {
             let c = self.emit_cond(cond, ops, s, address);
             self.emit_cond_select(c, reg(rd), old, ops, s, address);
         }
+    }
+
+    /// ADC: `rd = a + b + C`.
+    fn dp_adc(&self, rd: u32, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let Some(out) = self.rd_out(rd) else { return };
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        let t = unique(0x728, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
+        let cin = unique(0x730, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(cin), inputs: SmallVec::from_slice(&[flag(C_FLAG)]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(&[t, cin]) });
+        *s += 1;
+    }
+
+    /// SBC: `rd = a - b - !C = a - b + C - 1`.
+    fn dp_sbc(&self, rd: u32, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let Some(out) = self.rd_out(rd) else { return };
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        let t = unique(0x728, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntSub, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
+        let cin = unique(0x730, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(cin), inputs: SmallVec::from_slice(&[flag(C_FLAG)]) });
+        *s += 1;
+        let t2 = unique(0x738, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(*s), output: Some(t2), inputs: SmallVec::from_slice(&[t, cin]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntSub, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(&[t2, constant(1, 4)]) });
+        *s += 1;
+    }
+
+    /// Set N and Z from a result varnode.
+    fn set_nz(&self, res: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        ops.push(PcodeOp { opcode: OpCode::IntEqual, seq: seq(*s), output: Some(flag(Z_FLAG)), inputs: SmallVec::from_slice(&[res, constant(0, 4)]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntSLess, seq: seq(*s), output: Some(flag(N_FLAG)), inputs: SmallVec::from_slice(&[res, constant(0, 4)]) });
+        *s += 1;
+    }
+
+    /// Set C (no-borrow) and V from a subtraction `a - b`.
+    fn set_sub_cv(&self, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        ops.push(PcodeOp { opcode: OpCode::IntLessEqual, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[b, a]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntSBorrow, seq: seq(*s), output: Some(flag(V_FLAG)), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
     }
 
     /// Branch-free conditional write: `dst = c ? dst : old`, where `dst` already
@@ -1398,6 +1467,63 @@ mod tests {
         assert!(ops.iter().any(|o| o.opcode == OpCode::Load));
         // signed byte -> sign extend
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntSExt));
+    }
+
+    #[test]
+    fn lift_adds_sets_nzcv() {
+        // adds r0, r1, r2 => 0xE0910002 (S bit set, ADD)
+        let ops = lift(0xE091_0002);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd && o.output.map(|v| v.offset == 0).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == N_FLAG).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntCarry && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntSCarry && o.output.map(|v| v.offset == V_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_subs_sets_carry_as_no_borrow() {
+        // subs r0, r1, r2 => 0xE0510002
+        let ops = lift(0xE051_0002);
+        // C = no borrow = r2 <=u r1  (IntLessEqual b,a)
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntLessEqual && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntSBorrow && o.output.map(|v| v.offset == V_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_add_without_s_sets_no_flags() {
+        // add r0, r1, r2 => 0xE0810002 (no S)
+        let ops = lift(0xE081_0002);
+        assert!(!ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_adc_uses_carry() {
+        // adc r0, r1, r2 => 0xE0A10002 (ADC, no S)
+        let ops = lift(0xE0A1_0002);
+        // reads C flag via zero-extend, then two adds (a+b, +carry)
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntZExt && o.inputs[0].offset == C_FLAG));
+        assert_eq!(ops.iter().filter(|o| o.opcode == OpCode::IntAdd).count(), 2);
+    }
+
+    #[test]
+    fn lift_sbc_uses_carry() {
+        // sbc r0, r1, r2 => 0xE0C10002 ; rd = r1 - r2 + C - 1
+        let ops = lift(0xE0C1_0002);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntZExt && o.inputs[0].offset == C_FLAG));
+        // final op subtracts 1
+        let last = ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::IntSub);
+        assert_eq!(last.inputs[1].offset, 1);
+    }
+
+    #[test]
+    fn lift_rsc() {
+        // rsc r0, r1, r2 => 0xE0E10002 ; rd = r2 - r1 + C - 1
+        let ops = lift(0xE0E1_0002);
+        // first subtract is op2(r2) - rn(r1)
+        let sub = ops.iter().find(|o| o.opcode == OpCode::IntSub).unwrap();
+        assert_eq!(sub.inputs[0].offset, 8); // r2
+        assert_eq!(sub.inputs[1].offset, 4); // r1
     }
 
     #[test]
