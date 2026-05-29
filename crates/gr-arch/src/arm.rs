@@ -107,6 +107,7 @@ fn aarch64_calling_conventions() -> Vec<CallingConvention> {
 
 pub struct ArmArch {
     is_64: bool,
+    thumb: bool,
     registers: Vec<RegisterInfo>,
     calling_conventions: Vec<CallingConvention>,
     cs: capstone::Capstone,
@@ -127,6 +128,24 @@ impl ArmArch {
             .expect("failed to create ARM capstone");
         Self {
             is_64: false,
+            thumb: false,
+            registers: arm32_registers(),
+            calling_conventions: arm32_calling_conventions(),
+            cs,
+        }
+    }
+
+    pub fn new_arm32_thumb() -> Self {
+        use capstone::prelude::*;
+        let cs = Capstone::new()
+            .arm()
+            .mode(arch::arm::ArchMode::Thumb)
+            .detail(true)
+            .build()
+            .expect("failed to create Thumb capstone");
+        Self {
+            is_64: false,
+            thumb: true,
             registers: arm32_registers(),
             calling_conventions: arm32_calling_conventions(),
             cs,
@@ -143,6 +162,7 @@ impl ArmArch {
             .expect("failed to create AArch64 capstone");
         Self {
             is_64: true,
+            thumb: false,
             registers: aarch64_registers(),
             calling_conventions: aarch64_calling_conventions(),
             cs,
@@ -152,7 +172,13 @@ impl ArmArch {
 
 impl Architecture for ArmArch {
     fn name(&self) -> &str {
-        if self.is_64 { "AArch64" } else { "ARM" }
+        if self.is_64 {
+            "AArch64"
+        } else if self.thumb {
+            "Thumb"
+        } else {
+            "ARM"
+        }
     }
 
     fn bits(&self) -> u32 {
@@ -188,10 +214,19 @@ impl Architecture for ArmArch {
         memory: &Memory,
         address: u64,
     ) -> Result<DecodedInstruction, DisasmError> {
-        let mut buf = vec![0u8; 4];
-        memory
-            .read_bytes(address, &mut buf)
-            .map_err(|_| DisasmError::UnreadableAddress(address))?;
+        // Thumb instructions are 2 or 4 bytes; read up to 4 but tolerate a
+        // 2-byte tail at the end of a section.
+        let mut buf: Vec<u8> = Vec::with_capacity(4);
+        for i in 0..4u64 {
+            match memory.read_byte(address + i) {
+                Some(b) => buf.push(b),
+                None => break,
+            }
+        }
+        let min_len = if self.thumb { 2 } else { 4 };
+        if buf.len() < min_len {
+            return Err(DisasmError::UnreadableAddress(address));
+        }
 
         let insns = self.cs
             .disasm_count(&buf, address, 1)
@@ -334,6 +369,33 @@ mod tests {
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
         assert_eq!(insn.mnemonic, "mov");
         assert_eq!(insn.length, 4);
+    }
+
+    #[test]
+    fn thumb_decodes_16bit() {
+        let arch = ArmArch::new_arm32_thumb();
+        assert_eq!(arch.name(), "Thumb");
+        // movs r0, #5 => 0x2005 (little-endian: 05 20)
+        let mem = make_memory(&[0x05, 0x20], 0x1000, Endian::Little);
+        let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(insn.length, 2);
+        assert_eq!(insn.mnemonic, "movs");
+    }
+
+    #[test]
+    fn thumb_linear_mixed_lengths() {
+        let arch = ArmArch::new_arm32_thumb();
+        // movs r0,#5 (2 bytes) ; bl #x (4 bytes, 0xF000 0xF800) ; bx lr (2 bytes, 0x4770)
+        let mem = make_memory(
+            &[0x05, 0x20, 0x00, 0xf0, 0x00, 0xf8, 0x70, 0x47],
+            0x1000,
+            Endian::Little,
+        );
+        let insns = arch.decode_linear(&mem, 0x1000, 3).unwrap();
+        assert_eq!(insns.len(), 3);
+        assert_eq!(insns[0].length, 2);
+        assert_eq!(insns[1].length, 4); // bl is 32-bit
+        assert_eq!(insns[2].address, 0x1006);
     }
 
     #[test]

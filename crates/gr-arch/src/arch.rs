@@ -164,13 +164,26 @@ pub trait Architecture: Send + Sync {
 pub fn create_architecture(
     arch: gr_loader::Architecture,
 ) -> Result<Box<dyn Architecture>, DisasmError> {
+    create_architecture_with_options(arch, false)
+}
+
+/// Like [`create_architecture`], but `thumb` selects Thumb (T16/T32) decoding
+/// for the ARM architecture. The flag is ignored for non-ARM targets.
+pub fn create_architecture_with_options(
+    arch: gr_loader::Architecture,
+    thumb: bool,
+) -> Result<Box<dyn Architecture>, DisasmError> {
     match arch {
         #[cfg(feature = "x86")]
         gr_loader::Architecture::X86 => Ok(Box::new(crate::x86::X86Arch::new_32())),
         #[cfg(feature = "x86")]
         gr_loader::Architecture::X86_64 => Ok(Box::new(crate::x86::X86Arch::new_64())),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::Arm => Ok(Box::new(crate::arm::ArmArch::new_arm32())),
+        gr_loader::Architecture::Arm => Ok(Box::new(if thumb {
+            crate::arm::ArmArch::new_arm32_thumb()
+        } else {
+            crate::arm::ArmArch::new_arm32()
+        })),
         #[cfg(feature = "arm")]
         gr_loader::Architecture::Arm64 => Ok(Box::new(crate::arm::ArmArch::new_aarch64())),
         #[cfg(feature = "arm")]

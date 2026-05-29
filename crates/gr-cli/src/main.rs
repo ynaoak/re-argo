@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use gr_analysis::{AnalysisManager, CallGraph};
 use gr_analysis::strings::{find_strings, is_data_section};
-use gr_arch::arch::create_architecture;
+use gr_arch::arch::{create_architecture, create_architecture_with_options};
 use gr_lift::aarch64::Aarch64Lifter;
 use gr_lift::arm32::Arm32Lifter;
 use gr_lift::mips::MipsLifter;
@@ -276,7 +276,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             start,
             count,
-        } => cmd_disasm(&file, start, count),
+        } => cmd_disasm(&file, start, count, cli.thumb),
         Commands::Registers { file } => cmd_registers(&file),
         Commands::Analyze { file } => cmd_analyze(&file),
         Commands::Functions { file } => cmd_functions(&file),
@@ -455,9 +455,9 @@ fn cmd_hexdump(
     Ok(())
 }
 
-fn cmd_disasm(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
-    let arch = create_architecture(info.arch)?;
+    let arch = create_architecture_with_options(info.arch, thumb)?;
     let address = start.unwrap_or(info.entry_point);
 
     println!(
