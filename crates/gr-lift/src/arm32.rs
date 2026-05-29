@@ -4,8 +4,9 @@
 //! (immediate and simple shifted-register operand2), single load/store,
 //! block load/store (push/pop), multiply, and branches. Capstone supplies the
 //! disassembly text. The S bit sets NZCV for register-writing data-processing
-//! (N/Z from the result, arithmetic C/V from the operands; the shifter
-//! carry-out is not modelled for logical ops). ADC/SBC/RSC use the carry flag.
+//! (N/Z from the result, arithmetic C/V from the operands, and for logical ops
+//! C from the shifter carry-out of immediate/immediate-shift operand2 — a
+//! shift-by-register carry is left unchanged). ADC/SBC/RSC use the carry flag.
 //! Conditional (non-AL) A32 data-processing that writes a register is modelled
 //! branch-free via a select on the condition, since the emulator/CFG do not
 //! support intra-instruction p-code branches. Thumb IT blocks are handled via a
@@ -702,15 +703,42 @@ impl Arm32Lifter {
         let cond = word >> 28;
 
         // Resolve operand2.
+        // Shifter carry-out for logical-op flag setting (None = C unchanged).
+        let mut shifter_carry: Option<VarnodeData> = None;
         let op2 = if i_bit {
             let imm8 = word & 0xFF;
             let rot = ((word >> 8) & 0xF) * 2;
-            constant(imm8.rotate_right(rot) as u64, 4)
+            let val = imm8.rotate_right(rot);
+            // A rotated modified-immediate sets C to bit 31 of the result.
+            if rot != 0 {
+                shifter_carry = Some(constant(((val >> 31) & 1) as u64, 1));
+            }
+            constant(val as u64, 4)
         } else {
             let rm = word & 0xF;
             let shift_amt = (word >> 7) & 0x1F;
             let shift_type = (word >> 5) & 0x3;
             let reg_shift = (word >> 4) & 1 == 1;
+            // Carry-out bit of Rm for immediate shifts (shift-by-register and
+            // LSL #0 leave C unchanged).
+            if !(reg_shift || (shift_type == 0 && shift_amt == 0)) {
+                let k = match shift_type {
+                    0 => 32 - shift_amt,                 // LSL #n: bit 32-n
+                    3 if shift_amt == 0 => 0,            // RRX: bit 0
+                    _ if shift_amt == 0 => 31,           // LSR/ASR #32: bit 31
+                    _ => shift_amt - 1,                  // LSR/ASR/ROR #n: bit n-1
+                };
+                let ct = unique(0x748, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(ct), inputs: SmallVec::from_slice(&[reg(rm), constant(k as u64, 4)]) });
+                *s += 1;
+                let cm = unique(0x74C, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(cm), inputs: SmallVec::from_slice(&[ct, constant(1, 4)]) });
+                *s += 1;
+                let cb = unique(0x750, 1);
+                ops.push(PcodeOp { opcode: OpCode::IntNotEqual, seq: seq(*s), output: Some(cb), inputs: SmallVec::from_slice(&[cm, constant(0, 4)]) });
+                *s += 1;
+                shifter_carry = Some(cb);
+            }
             if reg_shift || (shift_type == 0 && shift_amt == 0) {
                 reg(rm)
             } else if shift_type == 3 {
@@ -805,7 +833,14 @@ impl Arm32Lifter {
                 }
                 0x2 | 0x6 => self.set_sub_cv(rn_v, op2, ops, s, address),  // SUB/SBC
                 0x3 | 0x7 => self.set_sub_cv(op2, rn_v, ops, s, address),  // RSB/RSC: op2 - rn
-                _ => {}
+                _ => {
+                    // Logical (AND/EOR/ORR/MOV/MVN/BIC): C from the shifter
+                    // carry-out (V unchanged).
+                    if let Some(sc) = shifter_carry {
+                        ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[sc]) });
+                        *s += 1;
+                    }
+                }
             }
         }
 
@@ -1661,6 +1696,37 @@ mod tests {
         let sub = ops.iter().find(|o| o.opcode == OpCode::IntSub).unwrap();
         assert_eq!(sub.inputs[0].offset, 8); // r2
         assert_eq!(sub.inputs[1].offset, 4); // r1
+    }
+
+    #[test]
+    fn lift_movs_lsl_sets_shifter_carry() {
+        // movs r0, r1, lsl #1 => 0xE1B00081 (MOV, S=1, LSL #1)
+        let ops = lift(0xE1B0_0081);
+        // carry-out computed: a right-shift of r1, AND 1, != 0, copied to C
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntNotEqual));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        // N/Z still set
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_movs_lsl0_leaves_carry() {
+        // movs r0, r1 (lsl #0) => 0xE1B00001 : C unchanged, no carry machinery
+        let ops = lift(0xE1B0_0001);
+        assert!(!ops.iter().any(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        // but N/Z are still set
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == N_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_ands_imm_rotate_sets_constant_carry() {
+        // ands r0, r1, #0xF0000000 : imm8=0xF, rot field=2 (ror by 4) -> 0xF0000000, bit31=1
+        // word = 0xE2110000 | (2<<8) | 0xF = 0xE211020F
+        let ops = lift(0xE211_020F);
+        // C set from a constant (bit 31 of the rotated immediate = 1)
+        let c = ops.iter().find(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)).unwrap();
+        assert_eq!(c.inputs[0].space, CoreSpace::CONST);
+        assert_eq!(c.inputs[0].offset, 1);
     }
 
     #[test]
