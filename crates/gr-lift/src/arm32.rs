@@ -1,12 +1,12 @@
 //! ARM32 (A32) and Thumb (T16/T32) → P-code lifter.
 //!
 //! Decodes the common encodings directly into P-code: data processing
-//! (immediate and simple shifted-register operand2), single load/store,
-//! block load/store (push/pop), multiply, and branches. Capstone supplies the
-//! disassembly text. The S bit sets NZCV for register-writing data-processing
-//! (N/Z from the result, arithmetic C/V from the operands, and for logical ops
-//! C from the shifter carry-out of immediate/immediate-shift operand2 — a
-//! shift-by-register carry is left unchanged). ADC/SBC/RSC use the carry flag.
+//! (immediate, immediate-shift, and register-specified-shift operand2), single
+//! load/store, block load/store (push/pop), multiply, and branches. Capstone
+//! supplies the disassembly text. The S bit sets NZCV for register-writing
+//! data-processing (N/Z from the result, arithmetic C/V from the operands, and
+//! for logical ops C from the shifter carry-out — including register-specified
+//! shifts, with a shift-amount-of-zero guard). ADC/SBC/RSC use the carry flag.
 //! Conditional (non-AL) A32 data-processing that writes a register is modelled
 //! branch-free via a select on the condition, since the emulator/CFG do not
 //! support intra-instruction p-code branches. Thumb IT blocks are handled via a
@@ -693,6 +693,93 @@ impl Arm32Lifter {
         ops
     }
 
+    /// Operand2 value for a register-specified shift `Rm <type> (amt)`.
+    fn emit_reg_shift_value(&self, shift_type: u32, rm: u32, amt: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) -> VarnodeData {
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+        match shift_type {
+            0..=2 => {
+                let op = match shift_type {
+                    0 => OpCode::IntLeft,
+                    1 => OpCode::IntRight,
+                    _ => OpCode::IntSRight,
+                };
+                let t = unique(0x758, 4);
+                ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[reg(rm), amt]) });
+                *s += 1;
+                t
+            }
+            _ => {
+                // ROR by register: (Rm >> amt) | (Rm << (32 - amt))
+                let hi = unique(0x758, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(hi), inputs: SmallVec::from_slice(&[reg(rm), amt]) });
+                *s += 1;
+                let sub = unique(0x75C, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntSub, seq: seq(*s), output: Some(sub), inputs: SmallVec::from_slice(&[constant(32, 4), amt]) });
+                *s += 1;
+                let lo = unique(0x764, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntLeft, seq: seq(*s), output: Some(lo), inputs: SmallVec::from_slice(&[reg(rm), sub]) });
+                *s += 1;
+                let t = unique(0x768, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[hi, lo]) });
+                *s += 1;
+                t
+            }
+        }
+    }
+
+    /// Shifter carry-out for a register-specified shift, with a shift-amount-of-
+    /// zero guard (the carry is unchanged when the amount is 0). The shift-out
+    /// bit index is `32-amt` (LSL), `amt-1` (LSR/ASR), or `(amt-1) & 31` (ROR),
+    /// which also yields C=0 for amounts > 32 via P-code's shift semantics.
+    fn emit_reg_shift_carry(&self, shift_type: u32, rm: u32, amt: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) -> VarnodeData {
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+        let push = |ops: &mut Vec<PcodeOp>, s: &mut u32, op: OpCode, out: VarnodeData, ins: &[VarnodeData]| {
+            ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(ins) });
+            *s += 1;
+        };
+        // Carry-out bit index.
+        let index = match shift_type {
+            0 => {
+                let t = unique(0x7B8, 4);
+                push(ops, s, OpCode::IntSub, t, &[constant(32, 4), amt]);
+                t
+            }
+            3 => {
+                let x = unique(0x7B8, 4);
+                push(ops, s, OpCode::IntSub, x, &[amt, constant(1, 4)]);
+                let a = unique(0x7BC, 4);
+                push(ops, s, OpCode::IntAnd, a, &[x, constant(31, 4)]);
+                a
+            }
+            _ => {
+                let t = unique(0x7B8, 4);
+                push(ops, s, OpCode::IntSub, t, &[amt, constant(1, 4)]);
+                t
+            }
+        };
+        // bit = (Rm >> index) & 1 != 0
+        let sh = unique(0x7C0, 4);
+        push(ops, s, OpCode::IntRight, sh, &[reg(rm), index]);
+        let m = unique(0x7C4, 4);
+        push(ops, s, OpCode::IntAnd, m, &[sh, constant(1, 4)]);
+        let bit = unique(0x7C8, 1);
+        push(ops, s, OpCode::IntNotEqual, bit, &[m, constant(0, 4)]);
+        // Guard: result = (amt == 0) ? old_C : bit
+        let iszero = unique(0x7CC, 1);
+        push(ops, s, OpCode::IntEqual, iszero, &[amt, constant(0, 4)]);
+        let mask = unique(0x7D0, 1);
+        push(ops, s, OpCode::Int2Comp, mask, &[iszero]); // 0x00 or 0xFF
+        let keep = unique(0x7D4, 1);
+        push(ops, s, OpCode::IntAnd, keep, &[flag(C_FLAG), mask]); // old C when amt==0
+        let nmask = unique(0x7D8, 1);
+        push(ops, s, OpCode::IntNegate, nmask, &[mask]);
+        let take = unique(0x7DC, 1);
+        push(ops, s, OpCode::IntAnd, take, &[bit, nmask]); // new bit otherwise
+        let out = unique(0x7B0, 1);
+        push(ops, s, OpCode::IntOr, out, &[keep, take]);
+        out
+    }
+
     fn lift_data_processing(&self, word: u32, address: u64, ops: &mut Vec<PcodeOp>, s: &mut u32) {
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
         let i_bit = (word >> 25) & 1 == 1;
@@ -701,6 +788,8 @@ impl Arm32Lifter {
         let rn = (word >> 16) & 0xF;
         let rd = (word >> 12) & 0xF;
         let cond = word >> 28;
+        // The shifter carry-out is only consumed by logical ops with the S bit.
+        let need_carry = set_flags && matches!(opcode, 0x0 | 0x1 | 0xC | 0xD | 0xE | 0xF);
 
         // Resolve operand2.
         // Shifter carry-out for logical-op flag setting (None = C unchanged).
@@ -710,59 +799,70 @@ impl Arm32Lifter {
             let rot = ((word >> 8) & 0xF) * 2;
             let val = imm8.rotate_right(rot);
             // A rotated modified-immediate sets C to bit 31 of the result.
-            if rot != 0 {
+            if need_carry && rot != 0 {
                 shifter_carry = Some(constant(((val >> 31) & 1) as u64, 1));
             }
             constant(val as u64, 4)
         } else {
             let rm = word & 0xF;
-            let shift_amt = (word >> 7) & 0x1F;
             let shift_type = (word >> 5) & 0x3;
             let reg_shift = (word >> 4) & 1 == 1;
-            // Carry-out bit of Rm for immediate shifts (shift-by-register and
-            // LSL #0 leave C unchanged).
-            if !(reg_shift || (shift_type == 0 && shift_amt == 0)) {
-                let k = match shift_type {
-                    0 => 32 - shift_amt,                 // LSL #n: bit 32-n
-                    3 if shift_amt == 0 => 0,            // RRX: bit 0
-                    _ if shift_amt == 0 => 31,           // LSR/ASR #32: bit 31
-                    _ => shift_amt - 1,                  // LSR/ASR/ROR #n: bit n-1
-                };
-                let ct = unique(0x748, 4);
-                ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(ct), inputs: SmallVec::from_slice(&[reg(rm), constant(k as u64, 4)]) });
+            if reg_shift {
+                // Register-specified shift: amount = Rs[7:0].
+                let rs = (word >> 8) & 0xF;
+                let amt = unique(0x754, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(amt), inputs: SmallVec::from_slice(&[reg(rs), constant(0xFF, 4)]) });
                 *s += 1;
-                let cm = unique(0x74C, 4);
-                ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(cm), inputs: SmallVec::from_slice(&[ct, constant(1, 4)]) });
-                *s += 1;
-                let cb = unique(0x750, 1);
-                ops.push(PcodeOp { opcode: OpCode::IntNotEqual, seq: seq(*s), output: Some(cb), inputs: SmallVec::from_slice(&[cm, constant(0, 4)]) });
-                *s += 1;
-                shifter_carry = Some(cb);
-            }
-            if reg_shift || (shift_type == 0 && shift_amt == 0) {
-                reg(rm)
-            } else if shift_type == 3 {
-                // ROR #n  ==  (Rm >> n) | (Rm << (32 - n))
-                let hi = unique(0x700, 4);
-                ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(hi), inputs: SmallVec::from_slice(&[reg(rm), constant(shift_amt as u64, 4)]) });
-                *s += 1;
-                let lo = unique(0x708, 4);
-                ops.push(PcodeOp { opcode: OpCode::IntLeft, seq: seq(*s), output: Some(lo), inputs: SmallVec::from_slice(&[reg(rm), constant((32 - shift_amt) as u64, 4)]) });
-                *s += 1;
-                let t = unique(0x710, 4);
-                ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[hi, lo]) });
-                *s += 1;
-                t
+                if need_carry {
+                    shifter_carry = Some(self.emit_reg_shift_carry(shift_type, rm, amt, ops, s, address));
+                }
+                self.emit_reg_shift_value(shift_type, rm, amt, ops, s, address)
             } else {
-                let op = match shift_type {
-                    0 => OpCode::IntLeft,
-                    1 => OpCode::IntRight,
-                    _ => OpCode::IntSRight,
-                };
-                let t = unique(0x700, 4);
-                ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[reg(rm), constant(shift_amt as u64, 4)]) });
-                *s += 1;
-                t
+                let shift_amt = (word >> 7) & 0x1F;
+                // Carry-out bit of Rm for immediate shifts (LSL #0 leaves C).
+                if need_carry && !(shift_type == 0 && shift_amt == 0) {
+                    let k = match shift_type {
+                        0 => 32 - shift_amt,                 // LSL #n: bit 32-n
+                        3 if shift_amt == 0 => 0,            // RRX: bit 0
+                        _ if shift_amt == 0 => 31,           // LSR/ASR #32: bit 31
+                        _ => shift_amt - 1,                  // LSR/ASR/ROR #n: bit n-1
+                    };
+                    let ct = unique(0x748, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(ct), inputs: SmallVec::from_slice(&[reg(rm), constant(k as u64, 4)]) });
+                    *s += 1;
+                    let cm = unique(0x74C, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(cm), inputs: SmallVec::from_slice(&[ct, constant(1, 4)]) });
+                    *s += 1;
+                    let cb = unique(0x750, 1);
+                    ops.push(PcodeOp { opcode: OpCode::IntNotEqual, seq: seq(*s), output: Some(cb), inputs: SmallVec::from_slice(&[cm, constant(0, 4)]) });
+                    *s += 1;
+                    shifter_carry = Some(cb);
+                }
+                if shift_type == 0 && shift_amt == 0 {
+                    reg(rm)
+                } else if shift_type == 3 {
+                    // ROR #n  ==  (Rm >> n) | (Rm << (32 - n))
+                    let hi = unique(0x700, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(hi), inputs: SmallVec::from_slice(&[reg(rm), constant(shift_amt as u64, 4)]) });
+                    *s += 1;
+                    let lo = unique(0x708, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntLeft, seq: seq(*s), output: Some(lo), inputs: SmallVec::from_slice(&[reg(rm), constant((32 - shift_amt) as u64, 4)]) });
+                    *s += 1;
+                    let t = unique(0x710, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[hi, lo]) });
+                    *s += 1;
+                    t
+                } else {
+                    let op = match shift_type {
+                        0 => OpCode::IntLeft,
+                        1 => OpCode::IntRight,
+                        _ => OpCode::IntSRight,
+                    };
+                    let t = unique(0x700, 4);
+                    ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[reg(rm), constant(shift_amt as u64, 4)]) });
+                    *s += 1;
+                    t
+                }
             }
         };
 
@@ -1696,6 +1796,41 @@ mod tests {
         let sub = ops.iter().find(|o| o.opcode == OpCode::IntSub).unwrap();
         assert_eq!(sub.inputs[0].offset, 8); // r2
         assert_eq!(sub.inputs[1].offset, 4); // r1
+    }
+
+    #[test]
+    fn lift_mov_reg_shift_applies_shift() {
+        // mov r0, r1, lsl r2 => 0xE1A00211 (register-specified LSL, no S)
+        let ops = lift(0xE1A0_0211);
+        // amount = r2 & 0xFF
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAnd && o.inputs[0].offset == 8 && o.inputs[1].offset == 0xFF));
+        // value = r1 << amount (the shift is no longer ignored)
+        let shl = ops.iter().find(|o| o.opcode == OpCode::IntLeft).unwrap();
+        assert_eq!(shl.inputs[0].offset, 4); // r1
+        assert_eq!(shl.inputs[1].space, CoreSpace::UNIQUE); // the masked amount
+        // result copied to r0
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.space == CoreSpace::REGISTER && v.offset == 0).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_movs_reg_shift_sets_carry_with_zero_guard() {
+        // movs r0, r1, lsl r2 => 0xE1B00211 (S=1, logical -> shifter carry-out)
+        let ops = lift(0xE1B0_0211);
+        // shift-amount-of-zero guard (amt == 0)
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntEqual && o.inputs[0].space == CoreSpace::UNIQUE));
+        // C flag committed and N/Z set
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_adds_reg_shift_applies_shift() {
+        // adds r0, r1, r2, lsl r3 => 0xE0910312 (arithmetic+S; value shifted)
+        let ops = lift(0xE091_0312);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntLeft)); // r2 << r3
+        // arithmetic C/V come from the operands, not the shifter
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntCarry));
     }
 
     #[test]

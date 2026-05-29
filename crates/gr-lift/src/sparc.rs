@@ -12,11 +12,11 @@
 //! following (delay-slot) instruction, whose effects run first, and the branch
 //! condition is snapshotted before the slot. For an annulling conditional
 //! branch the delay slot runs only when taken, so its register writes are
-//! predicated on the condition; `ba,a` stays inline (its annulled slot is
-//! skipped). The stateless `lift_instruction` path still emits the transfer
-//! inline. Remaining simplifications: guarded delay-slot stores and `bn,a` are
-//! not annulled, and SAVE/RESTORE model only the pointer arithmetic, not the
-//! register-window rotation.
+//! predicated on the condition and a store is guarded by writing back the
+//! loaded value when not taken; `ba,a` stays inline and `bn,a` jumps over its
+//! squashed slot. The stateless `lift_instruction` path still emits the
+//! transfer inline. The remaining simplification is SAVE/RESTORE, which model
+//! only the pointer arithmetic, not the register-window rotation.
 
 use gr_core::address::{Address, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -425,12 +425,17 @@ impl SparcLifter {
         Some(u32::from_be_bytes(buf))
     }
 
-    /// Predicate a delay-slot instruction's register writes on `cond`
-    /// (branch-free), for annulling conditional branches. Stores are not
-    /// guarded (rare in delay slots; documented).
+    /// Predicate a delay-slot instruction's effects on `cond` (branch-free),
+    /// for annulling conditional branches. Register writes are committed via a
+    /// select; a store is guarded by writing back the loaded value when the
+    /// branch is not taken (`store(ea, cond ? value : *ea)`).
     fn predicate_delay_slot(&self, ops: Vec<PcodeOp>, cond: VarnodeData, address: u64) -> Vec<PcodeOp> {
         let mut regs: Vec<VarnodeData> = Vec::new();
+        let mut has_store = false;
         for op in &ops {
+            if op.opcode == OpCode::Store {
+                has_store = true;
+            }
             if let Some(out) = op.output
                 && out.space == REG_SPACE
                 && !regs.iter().any(|r| r.offset == out.offset && r.size == out.size)
@@ -438,7 +443,7 @@ impl SparcLifter {
                 regs.push(out);
             }
         }
-        if regs.is_empty() {
+        if regs.is_empty() && !has_store {
             return ops;
         }
         let mut out: Vec<PcodeOp> = Vec::new();
@@ -449,10 +454,26 @@ impl SparcLifter {
             self.push(&mut out, &mut s, OpCode::Copy, Some(o), &[*r], address);
             olds.push(o);
         }
-        for mut op in ops {
-            op.seq = SeqNum::new(Address::new(RAM_SPACE, address), s);
-            s += 1;
-            out.push(op);
+        for op in ops {
+            if op.opcode == OpCode::Store && op.inputs.len() == 3 {
+                // store(space, ea, value) => only commit when taken:
+                //   cur = load(space, ea); sel = cond ? value : cur; store(space, ea, sel)
+                let space = op.inputs[0];
+                let ea = op.inputs[1];
+                let value = op.inputs[2];
+                let size = value.size;
+                let cur = unique(0x820, size);
+                self.push(&mut out, &mut s, OpCode::Load, Some(cur), &[space, ea], address);
+                let sel = unique(0x828, size);
+                self.push(&mut out, &mut s, OpCode::Copy, Some(sel), &[value], address);
+                self.emit_select(cond, sel, cur, &mut out, &mut s, address);
+                self.push(&mut out, &mut s, OpCode::Store, None, &[space, ea, sel], address);
+            } else {
+                let mut op = op;
+                op.seq = SeqNum::new(Address::new(RAM_SPACE, address), s);
+                s += 1;
+                out.push(op);
+            }
         }
         for (r, old) in regs.iter().zip(olds.iter()) {
             self.emit_select(cond, *r, *old, &mut out, &mut s, address);
@@ -519,6 +540,18 @@ impl PcodeLift for SparcLifter {
         // A control-transfer instruction defers its trailing op past the delay
         // slot (see cti_decision).
         if let Some(word) = self.read_word_be(memory, address) {
+            // bn,a (branch never, annul) squashes its delay slot: model it as a
+            // jump over the slot to the next instruction.
+            if word >> 30 == 0
+                && (word >> 22) & 7 == 2
+                && (word >> 25) & 0xF == 0
+                && (word >> 29) & 1 == 1
+            {
+                let target = address.wrapping_add(8) & 0xFFFF_FFFF;
+                let seq = SeqNum::new(Address::new(RAM_SPACE, address), li.ops.len() as u32);
+                li.ops.push(PcodeOp { opcode: OpCode::Branch, seq, output: None, inputs: SmallVec::from_slice(&[ram(target)]) });
+                return Ok(li);
+            }
             let (defer, annul) = Self::cti_decision(word);
             if defer && li.ops.last().map(|o| is_control(o.opcode)).unwrap_or(false) {
                 let mut ctrl = li.ops.pop().unwrap();
@@ -873,5 +906,33 @@ mod tests {
         assert_eq!(a.last().unwrap().opcode, OpCode::Branch);
         // No transfer is appended to the following instruction.
         assert!(!b.iter().any(|o| matches!(o.opcode, OpCode::Branch | OpCode::CBranch)));
+    }
+
+    #[test]
+    fn bn_annul_skips_delay_slot() {
+        // bn,a +8 : delay slot squashed -> modelled as a jump to A+8.
+        // (cond field = 0 = BN)
+        let bna = (1 << 29) | (2 << 22) | 2;
+        let add = f3i(0x00, 8, 8, 1);
+        let (a, _b) = lift_ctx_two(bna, add);
+        let br = a.last().unwrap();
+        assert_eq!(br.opcode, OpCode::Branch);
+        assert_eq!(br.inputs[0].offset, 0x1008); // 0x1000 + 8, over the slot
+    }
+
+    #[test]
+    fn delay_slot_annulling_guards_store() {
+        // be,a +8 ; delay slot: st %o1, [%o0]  (store only commits if taken)
+        let bea = (1 << 29) | (1 << 25) | (2 << 22) | 2;
+        let st = (3 << 30) | (9 << 25) | (0x04 << 19) | (8 << 14);
+        let (_a, b) = lift_ctx_two(bea, st);
+        // The store is guarded: load current, select, store; plus the branch.
+        assert!(b.iter().any(|o| o.opcode == OpCode::Load));   // read-back of *ea
+        assert!(b.iter().any(|o| o.opcode == OpCode::Int2Comp)); // select mask
+        assert!(b.iter().any(|o| o.opcode == OpCode::Store));
+        assert_eq!(b.last().unwrap().opcode, OpCode::CBranch);
+        // The store now writes the selected value (a unique), not %o1 directly.
+        let store = b.iter().find(|o| o.opcode == OpCode::Store).unwrap();
+        assert_eq!(store.inputs[2].space, CoreSpace::UNIQUE);
     }
 }
