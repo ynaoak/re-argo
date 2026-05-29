@@ -444,7 +444,18 @@ impl PcodeLift for SparcLifter {
             && Self::is_nonannul_cti(word)
             && li.ops.last().map(|o| is_control(o.opcode)).unwrap_or(false)
         {
-            let ctrl = li.ops.pop().unwrap();
+            let mut ctrl = li.ops.pop().unwrap();
+            // SPARC evaluates a branch condition before the delay slot. Snapshot
+            // it into a stable temp at the branch so the deferred CBranch is not
+            // affected by a delay slot that updates the icc flags.
+            if ctrl.opcode == OpCode::CBranch
+                && let Some(cond) = ctrl.inputs.get(1).copied()
+            {
+                let snap = unique(0x540, cond.size);
+                let seq = SeqNum::new(Address::new(RAM_SPACE, address), li.ops.len() as u32);
+                li.ops.push(PcodeOp { opcode: OpCode::Copy, seq, output: Some(snap), inputs: SmallVec::from_slice(&[cond]) });
+                ctrl.inputs[1] = snap;
+            }
             ctx.delay = Some(DelaySlot { op: ctrl, addr: address + 4 });
         }
         Ok(li)
@@ -713,10 +724,18 @@ mod tests {
         let add = f3i(0x00, 8, 8, 1);
         let (a, b) = lift_ctx_two(be, add);
         assert!(!a.iter().any(|o| o.opcode == OpCode::CBranch));
-        // delay slot's add runs, then the conditional branch last.
+        // The condition (Z flag) is snapshotted into a temp at the branch...
+        let snap = a.iter().find(|o| o.opcode == OpCode::Copy && o.output.map(|v| v.space == CoreSpace::UNIQUE).unwrap_or(false)).unwrap();
+        assert_eq!(snap.inputs[0].offset, ICC_Z);
+        let snap_vn = snap.output.unwrap();
+        // delay slot's add runs, then the conditional branch last...
         assert!(b.iter().any(|o| o.opcode == OpCode::IntAdd));
-        assert_eq!(b.last().unwrap().opcode, OpCode::CBranch);
-        assert_eq!(b.last().unwrap().inputs[0].offset, 0x1008);
+        let cbr = b.last().unwrap();
+        assert_eq!(cbr.opcode, OpCode::CBranch);
+        assert_eq!(cbr.inputs[0].offset, 0x1008);
+        // ...reading the pre-delay-slot snapshot, not the live flag.
+        assert_eq!(cbr.inputs[1].space, CoreSpace::UNIQUE);
+        assert_eq!(cbr.inputs[1].offset, snap_vn.offset);
     }
 
     #[test]
