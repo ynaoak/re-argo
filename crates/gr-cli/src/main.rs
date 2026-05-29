@@ -17,6 +17,9 @@ use gr_program::{Program, ProgramDiff, ProjectSummary};
 #[derive(Parser)]
 #[command(name = "ghidra-rust", version, about = "Binary analysis tool powered by ghidra-rust")]
 struct Cli {
+    /// Decode ARM code in Thumb (T16/T32) mode instead of A32
+    #[arg(long, global = true)]
+    thumb: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -283,14 +286,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             start,
             count,
-        } => cmd_pcode(&file, start, count),
-        Commands::Decompile { file, address, ssa, rust } => cmd_decompile(&file, address, ssa, rust),
-        Commands::Taint { file, address, params } => cmd_taint(&file, address, params),
+        } => cmd_pcode(&file, start, count, cli.thumb),
+        Commands::Decompile { file, address, ssa, rust } => cmd_decompile(&file, address, ssa, rust, cli.thumb),
+        Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
-        Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints),
-        Commands::Gdbserver { file, start, listen } => cmd_gdbserver(&file, start, &listen),
-        Commands::Debug { file, start } => cmd_debug(&file, start),
+        Commands::Emulate { file, start, steps, breakpoints } => cmd_emulate(&file, start, steps, &breakpoints, cli.thumb),
+        Commands::Gdbserver { file, start, listen } => cmd_gdbserver(&file, start, &listen, cli.thumb),
+        Commands::Debug { file, start } => cmd_debug(&file, start, cli.thumb),
         Commands::Hexdump {
             file,
             address,
@@ -300,7 +303,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Diff { file_a, file_b } => cmd_diff(&file_a, &file_b),
         Commands::Imports { file, exports } => cmd_imports(&file, exports),
         Commands::Coverage { file } => cmd_coverage(&file),
-        Commands::Script { file, script } => cmd_script(&file, &script),
+        Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
     }
@@ -517,13 +520,18 @@ fn create_lifter(
     arch: gr_loader::Architecture,
     bits: u32,
     endian: gr_core::address::Endian,
+    thumb: bool,
 ) -> Option<Box<dyn PcodeLift>> {
     match arch {
         gr_loader::Architecture::X86 | gr_loader::Architecture::X86_64 => {
             if bits == 64 { Some(Box::new(X86Lifter::new_64())) } else { Some(Box::new(X86Lifter::new_32())) }
         }
         gr_loader::Architecture::Arm64 => Some(Box::new(Aarch64Lifter::new())),
-        gr_loader::Architecture::Arm => Some(Box::new(Arm32Lifter::new(endian))),
+        gr_loader::Architecture::Arm => Some(Box::new(if thumb {
+            Arm32Lifter::new_thumb(endian)
+        } else {
+            Arm32Lifter::new(endian)
+        })),
         gr_loader::Architecture::Mips => Some(Box::new(MipsLifter::new_32(endian))),
         gr_loader::Architecture::Riscv32 => Some(Box::new(RiscVLifter::new_rv32())),
         gr_loader::Architecture::PowerPc => Some(Box::new(PpcLifter::new_32(endian))),
@@ -649,10 +657,10 @@ fn cmd_callgraph(path: &Path, dot: bool) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_pcode(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
 
-    let lifter = match create_lifter(info.arch, info.bits, info.endian) {
+    let lifter = match create_lifter(info.arch, info.bits, info.endian, thumb) {
         Some(l) => l,
         None => {
             eprintln!("P-code lifting not yet supported for {}", info.arch);
@@ -673,10 +681,10 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize) -> Result<(), Box<dy
     Ok(())
 }
 
-fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
-    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian) {
+    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian, thumb) {
         Some(l) => l,
         None => {
             eprintln!("Decompilation not yet supported for {}", program.info.arch);
@@ -715,10 +723,10 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
     Ok(())
 }
 
-fn cmd_taint(path: &Path, address: Option<u64>, params: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_taint(path: &Path, address: Option<u64>, params: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
-    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian) {
+    let lifter = match create_lifter(program.info.arch, program.info.bits, program.info.endian, thumb) {
         Some(l) => l,
         None => {
             eprintln!("Taint analysis not yet supported for {}", program.info.arch);
@@ -795,11 +803,11 @@ fn cmd_export_xml(path: &Path, output: Option<&Path>) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_emulate(path: &Path, start: Option<u64>, max_steps: u64, breakpoints: &[u64], thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
 
     let is_64 = info.bits == 64;
-    let lifter = match create_lifter(info.arch, info.bits, info.endian) {
+    let lifter = match create_lifter(info.arch, info.bits, info.endian, thumb) {
         Some(l) => l,
         None => {
             eprintln!("Emulation not yet supported for {}", info.arch);
@@ -933,8 +941,9 @@ impl EmulatorTarget {
 fn build_emulator_target(
     info: gr_loader::BinaryInfo,
     entry: u64,
+    thumb: bool,
 ) -> Option<EmulatorTarget> {
-    let lifter = create_lifter(info.arch, info.bits, info.endian)?;
+    let lifter = create_lifter(info.arch, info.bits, info.endian, thumb)?;
     let is_64 = info.bits == 64;
     let mut emu = gr_emulator::Emulator::new();
     for block in info.memory.blocks() {
@@ -1000,12 +1009,12 @@ impl gr_emulator::DebugTarget for EmulatorTarget {
     }
 }
 
-fn cmd_gdbserver(path: &Path, start: Option<u64>, listen: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_gdbserver(path: &Path, start: Option<u64>, listen: &str, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
     let arch = info.arch;
     let entry = start.unwrap_or(info.entry_point);
 
-    let target = match build_emulator_target(info, entry) {
+    let target = match build_emulator_target(info, entry, thumb) {
         Some(t) => t,
         None => {
             eprintln!("Emulation not yet supported for {}", arch);
@@ -1020,7 +1029,7 @@ fn cmd_gdbserver(path: &Path, start: Option<u64>, listen: &str) -> Result<(), Bo
     Ok(())
 }
 
-fn cmd_debug(path: &Path, start: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_debug(path: &Path, start: Option<u64>, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
     use gr_emulator::DebugTarget as _;
     use gr_emulator::tui;
@@ -1029,7 +1038,7 @@ fn cmd_debug(path: &Path, start: Option<u64>) -> Result<(), Box<dyn std::error::
     let arch = info.arch;
     let entry = start.unwrap_or(info.entry_point);
 
-    let mut target = match build_emulator_target(info, entry) {
+    let mut target = match build_emulator_target(info, entry, thumb) {
         Some(t) => t,
         None => {
             eprintln!("Emulation not yet supported for {}", arch);
@@ -1447,7 +1456,7 @@ fn cmd_patch(
     Ok(())
 }
 
-fn cmd_script(path: &Path, script_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_script(path: &Path, script_path: &Path, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     let script = std::fs::read_to_string(script_path)
         .map_err(|e| format!("cannot read script: {}", e))?;
 
@@ -1507,7 +1516,7 @@ fn cmd_script(path: &Path, script_path: &Path) -> Result<(), Box<dyn std::error:
                 }
             }
             "decompile" => {
-                if let Some(lifter) = create_lifter(info.arch, info.bits, info.endian) {
+                if let Some(lifter) = create_lifter(info.arch, info.bits, info.endian, thumb) {
                     let addr = parse_hex(args).unwrap_or(info.entry_point);
                     match gr_decompile::decompile_function(lifter.as_ref(), &program, addr) {
                         Ok(result) => print!("{}", result.c_code),
