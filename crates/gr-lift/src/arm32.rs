@@ -437,7 +437,174 @@ impl Arm32Lifter {
             return ops;
         }
 
+        let mut s = 0u32;
+
+        // MOVW (move wide) / MOVT (move top): plain 16-bit immediate.
+        if (hw1 & 0xFBF0) == 0xF240 || (hw1 & 0xFBF0) == 0xF2C0 {
+            let movt = (hw1 & 0xFBF0) == 0xF2C0;
+            let imm4 = hw1 & 0xF;
+            let i = (hw1 >> 10) & 1;
+            let imm3 = (hw2 >> 12) & 7;
+            let imm8 = hw2 & 0xFF;
+            let rd = (hw2 >> 8) & 0xF;
+            let imm16 = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+            if movt {
+                // Rd = (Rd & 0x0000FFFF) | (imm16 << 16)
+                let low = unique(0x730, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(s), output: Some(low), inputs: SmallVec::from_slice(&[reg(rd), constant(0xFFFF, 4)]) });
+                s += 1;
+                ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[low, constant((imm16 << 16) as u64, 4)]) });
+            } else {
+                ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[constant(imm16 as u64, 4)]) });
+            }
+            return ops;
+        }
+
+        // Data processing (modified immediate): hw1[15:11]=11110, hw1[9]=0, hw2[15]=0.
+        if (hw1 >> 11) == 0x1E && (hw1 >> 9) & 1 == 0 && (hw2 >> 15) == 0 {
+            let opc = (hw1 >> 5) & 0xF;
+            let set_flags = (hw1 >> 4) & 1 == 1;
+            let rn = hw1 & 0xF;
+            let rd = (hw2 >> 8) & 0xF;
+            let imm12 = ((hw1 >> 10) & 1) << 11 | ((hw2 >> 12) & 7) << 8 | (hw2 & 0xFF);
+            let imm = constant(Self::thumb_expand_imm(imm12) as u64, 4);
+            self.thumb32_dp(opc, set_flags, rd, rn, imm, &mut ops, &mut s, address);
+            return ops;
+        }
+
+        // Data processing (shifted register): hw1[15:9] = 1110101.
+        if (hw1 >> 9) == 0x75 {
+            let opc = (hw1 >> 5) & 0xF;
+            let set_flags = (hw1 >> 4) & 1 == 1;
+            let rn = hw1 & 0xF;
+            let rd = (hw2 >> 8) & 0xF;
+            let rm = hw2 & 0xF;
+            let imm5 = ((hw2 >> 12) & 7) << 2 | ((hw2 >> 6) & 3);
+            let shift_type = (hw2 >> 4) & 3;
+            let op2 = if imm5 == 0 {
+                reg(rm)
+            } else {
+                let shop = match shift_type {
+                    0 => OpCode::IntLeft,
+                    1 => OpCode::IntRight,
+                    2 => OpCode::IntSRight,
+                    _ => OpCode::IntRight,
+                };
+                let t = unique(0x738, 4);
+                ops.push(PcodeOp { opcode: shop, seq: seq(s), output: Some(t), inputs: SmallVec::from_slice(&[reg(rm), constant(imm5 as u64, 4)]) });
+                s += 1;
+                t
+            };
+            self.thumb32_dp(opc, set_flags, rd, rn, op2, &mut ops, &mut s, address);
+            return ops;
+        }
+
+        // Load/store single data item (T2/T3 imm12 positive-offset forms).
+        let lsq = hw1 & 0xFFF0;
+        let ls = match lsq {
+            0xF8D0 => Some((true, 4u32, false)),
+            0xF8C0 => Some((false, 4, false)),
+            0xF890 => Some((true, 1, false)),
+            0xF880 => Some((false, 1, false)),
+            0xF8B0 => Some((true, 2, false)),
+            0xF8A0 => Some((false, 2, false)),
+            0xF990 => Some((true, 1, true)),
+            0xF9B0 => Some((true, 2, true)),
+            _ => None,
+        };
+        if let Some((load, size, signed)) = ls {
+            let rn = hw1 & 0xF;
+            let rt = (hw2 >> 12) & 0xF;
+            let imm12 = hw2 & 0xFFF;
+            if !(load && rt == PC_INDEX) {
+                let addr = unique(0x600, 4);
+                ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(s), output: Some(addr), inputs: SmallVec::from_slice(&[reg(rn), constant(imm12 as u64, 4)]) });
+                s += 1;
+                if load {
+                    if size == 4 {
+                        ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
+                    } else {
+                        let loaded = unique(0x610, size);
+                        ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
+                        s += 1;
+                        let ext = if signed { OpCode::IntSExt } else { OpCode::IntZExt };
+                        ops.push(PcodeOp { opcode: ext, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[loaded]) });
+                    }
+                } else {
+                    let value = if size == 4 { reg(rt) } else { VarnodeData::new(REG_SPACE, rt as u64 * 4, size) };
+                    ops.push(PcodeOp { opcode: OpCode::Store, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr, value]) });
+                }
+                return ops;
+            }
+        }
+
         ops
+    }
+
+    /// ARM's ThumbExpandImm: decode a 12-bit modified immediate to its 32-bit
+    /// value. All inputs are known at lift time, so this folds to a constant.
+    fn thumb_expand_imm(imm12: u32) -> u32 {
+        if (imm12 >> 10) & 3 == 0 {
+            let imm8 = imm12 & 0xFF;
+            match (imm12 >> 8) & 3 {
+                0 => imm8,
+                1 => (imm8 << 16) | imm8,
+                2 => (imm8 << 24) | (imm8 << 8),
+                _ => (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8,
+            }
+        } else {
+            let unrotated = 0x80 | (imm12 & 0x7F);
+            unrotated.rotate_right((imm12 >> 7) & 0x1F)
+        }
+    }
+
+    /// Shared T32 data-processing dispatch for the modified-immediate and
+    /// shifted-register encodings. `op2` is the already-resolved operand.
+    #[allow(clippy::too_many_arguments)]
+    fn thumb32_dp(&self, opc: u32, set_flags: bool, rd: u32, rn: u32, op2: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+        let rn_v = reg(rn);
+        let push = |ops: &mut Vec<PcodeOp>, s: &mut u32, op: OpCode, out: Option<VarnodeData>, ins: &[VarnodeData]| {
+            ops.push(PcodeOp { opcode: op, seq: seq(*s), output: out, inputs: SmallVec::from_slice(ins) });
+            *s += 1;
+        };
+        match opc {
+            0x0 => {
+                if rd == PC_INDEX && set_flags { self.emit_cmp_flags(true, rn_v, op2, ops, s, address); }
+                else { push(ops, s, OpCode::IntAnd, Some(reg(rd)), &[rn_v, op2]); }
+            }
+            0x1 => { // BIC: rn & ~op2
+                let n = unique(0x740, 4);
+                push(ops, s, OpCode::IntNegate, Some(n), &[op2]);
+                push(ops, s, OpCode::IntAnd, Some(reg(rd)), &[rn_v, n]);
+            }
+            0x2 => {
+                if rn == PC_INDEX { push(ops, s, OpCode::Copy, Some(reg(rd)), &[op2]); }       // MOV
+                else { push(ops, s, OpCode::IntOr, Some(reg(rd)), &[rn_v, op2]); }             // ORR
+            }
+            0x3 => { // ORN / MVN
+                let n = unique(0x740, 4);
+                push(ops, s, OpCode::IntNegate, Some(n), &[op2]);
+                if rn == PC_INDEX { push(ops, s, OpCode::Copy, Some(reg(rd)), &[n]); }
+                else { push(ops, s, OpCode::IntOr, Some(reg(rd)), &[rn_v, n]); }
+            }
+            0x4 => {
+                if rd == PC_INDEX && set_flags { self.emit_cmp_flags(true, rn_v, op2, ops, s, address); } // TEQ
+                else { push(ops, s, OpCode::IntXor, Some(reg(rd)), &[rn_v, op2]); }
+            }
+            0x8 => {
+                if rd == PC_INDEX && set_flags { self.emit_cmn_flags(rn_v, op2, ops, s, address); }       // CMN
+                else { push(ops, s, OpCode::IntAdd, Some(reg(rd)), &[rn_v, op2]); }
+            }
+            0xA => push(ops, s, OpCode::IntAdd, Some(reg(rd)), &[rn_v, op2]), // ADC (carry ignored)
+            0xB => push(ops, s, OpCode::IntSub, Some(reg(rd)), &[rn_v, op2]), // SBC (carry ignored)
+            0xD => {
+                if rd == PC_INDEX && set_flags { self.emit_cmp_flags(false, rn_v, op2, ops, s, address); } // CMP
+                else { push(ops, s, OpCode::IntSub, Some(reg(rd)), &[rn_v, op2]); }
+            }
+            0xE => push(ops, s, OpCode::IntSub, Some(reg(rd)), &[op2, rn_v]), // RSB: op2 - rn
+            _ => {}
+        }
     }
 
     fn lift_word(&self, word: u32, address: u64) -> Vec<PcodeOp> {
@@ -1245,6 +1412,69 @@ mod tests {
         let li = lift_thumb(&[0xF000, 0xF800]);
         assert_eq!(li.length, 4);
         assert_eq!(li.ops[0].opcode, OpCode::Call);
+    }
+
+    #[test]
+    fn thumb_movw() {
+        // movw r0, #0x1234 => [0xF241, 0x2034]
+        let li = lift_thumb(&[0xF241, 0x2034]);
+        assert_eq!(li.length, 4);
+        assert_eq!(li.ops[0].opcode, OpCode::Copy);
+        assert_eq!(li.ops[0].output.unwrap().offset, 0);
+        assert_eq!(li.ops[0].inputs[0].offset, 0x1234);
+    }
+
+    #[test]
+    fn thumb_movt() {
+        // movt r0, #0xABCD => [0xF6CA, 0x30CD]
+        let li = lift_thumb(&[0xF6CA, 0x30CD]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntAnd));
+        let or = li.ops.iter().find(|o| o.opcode == OpCode::IntOr).unwrap();
+        assert_eq!(or.inputs[1].offset, 0xABCD << 16);
+    }
+
+    #[test]
+    fn thumb_add_w_imm() {
+        // add.w r0, r1, #0x10 => [0xF101, 0x0010]
+        let li = lift_thumb(&[0xF101, 0x0010]);
+        let add = li.ops.iter().find(|o| o.opcode == OpCode::IntAdd).unwrap();
+        assert_eq!(add.output.unwrap().offset, 0);   // r0
+        assert_eq!(add.inputs[0].offset, 4);          // r1
+        assert_eq!(add.inputs[1].offset, 0x10);
+    }
+
+    #[test]
+    fn thumb_add_w_reg() {
+        // add.w r0, r1, r2 => [0xEB01, 0x0002]
+        let li = lift_thumb(&[0xEB01, 0x0002]);
+        let add = li.ops.iter().find(|o| o.opcode == OpCode::IntAdd).unwrap();
+        assert_eq!(add.inputs[0].offset, 4); // r1
+        assert_eq!(add.inputs[1].space, CoreSpace::REGISTER);
+        assert_eq!(add.inputs[1].offset, 8); // r2
+    }
+
+    #[test]
+    fn thumb_ldr_w() {
+        // ldr.w r0, [r1, #8] => [0xF8D1, 0x0008]
+        let li = lift_thumb(&[0xF8D1, 0x0008]);
+        assert_eq!(li.length, 4);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::Load));
+    }
+
+    #[test]
+    fn thumb_cmp_w_imm_sets_flags() {
+        // cmp.w r1, #0 => data-proc modified imm, opc=1101(SUB/CMP), S=1, Rd=PC
+        // hw1 = 0xF1B1 (opc=D, S=1, Rn=1), hw2 = 0x0F00 (Rd=PC=15, imm8=0)
+        let li = lift_thumb(&[0xF1B1, 0x0F00]);
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn thumb_expand_imm_values() {
+        assert_eq!(Arm32Lifter::thumb_expand_imm(0x010), 0x10);          // plain imm8
+        assert_eq!(Arm32Lifter::thumb_expand_imm(0x1FF), 0x00FF_00FF);   // pattern 01
+        assert_eq!(Arm32Lifter::thumb_expand_imm(0x2FF), 0xFF00_FF00);   // pattern 10
+        assert_eq!(Arm32Lifter::thumb_expand_imm(0x3FF), 0xFFFF_FFFF);   // pattern 11
     }
 
     #[test]
