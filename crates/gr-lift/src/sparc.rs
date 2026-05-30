@@ -927,12 +927,21 @@ mod tests {
         let st = (3 << 30) | (9 << 25) | (0x04 << 19) | (8 << 14);
         let (_a, b) = lift_ctx_two(bea, st);
         // The store is guarded: load current, select, store; plus the branch.
-        assert!(b.iter().any(|o| o.opcode == OpCode::Load));   // read-back of *ea
+        assert!(b.iter().any(|o| o.opcode == OpCode::Load));    // read-back of *ea
         assert!(b.iter().any(|o| o.opcode == OpCode::Int2Comp)); // select mask
         assert!(b.iter().any(|o| o.opcode == OpCode::Store));
         assert_eq!(b.last().unwrap().opcode, OpCode::CBranch);
         // The store now writes the selected value (a unique), not %o1 directly.
         let store = b.iter().find(|o| o.opcode == OpCode::Store).unwrap();
         assert_eq!(store.inputs[2].space, CoreSpace::UNIQUE);
+        // The load reads the same effective address the store writes to.
+        let load = b.iter().find(|o| o.opcode == OpCode::Load).unwrap();
+        assert_eq!(load.inputs[1].offset, store.inputs[1].offset);
+        assert_eq!(load.inputs[1].space, store.inputs[1].space);
+        // Order: load before select before store.
+        let i_load = b.iter().position(|o| o.opcode == OpCode::Load).unwrap();
+        let i_sel = b.iter().position(|o| o.opcode == OpCode::Int2Comp).unwrap();
+        let i_store = b.iter().position(|o| o.opcode == OpCode::Store).unwrap();
+        assert!(i_load < i_sel && i_sel < i_store);
     }
 }

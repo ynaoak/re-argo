@@ -840,6 +840,21 @@ impl Arm32Lifter {
                 }
                 if shift_type == 0 && shift_amt == 0 {
                     reg(rm)
+                } else if shift_type == 3 && shift_amt == 0 {
+                    // RRX: rotate right through carry by 1 = (C << 31) | (Rm >> 1).
+                    let cz = unique(0x700, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(cz), inputs: SmallVec::from_slice(&[flag(C_FLAG)]) });
+                    *s += 1;
+                    let ch = unique(0x708, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntLeft, seq: seq(*s), output: Some(ch), inputs: SmallVec::from_slice(&[cz, constant(31, 4)]) });
+                    *s += 1;
+                    let rs = unique(0x70C, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(rs), inputs: SmallVec::from_slice(&[reg(rm), constant(1, 4)]) });
+                    *s += 1;
+                    let t = unique(0x710, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[ch, rs]) });
+                    *s += 1;
+                    t
                 } else if shift_type == 3 {
                     // ROR #n  ==  (Rm >> n) | (Rm << (32 - n))
                     let hi = unique(0x700, 4);
@@ -1386,9 +1401,13 @@ impl Arm32Lifter {
             return out;
         }
 
-        // Distinct register outputs to predicate (general registers and flags).
+        // Distinct register outputs to predicate and detect stores to guard.
         let mut regs: Vec<VarnodeData> = Vec::new();
+        let mut has_store = false;
         for op in &ops {
+            if op.opcode == OpCode::Store {
+                has_store = true;
+            }
             if let Some(out) = op.output
                 && out.space == REG_SPACE
                 && !regs.iter().any(|r| r.offset == out.offset && r.size == out.size)
@@ -1396,7 +1415,7 @@ impl Arm32Lifter {
                 regs.push(out);
             }
         }
-        if regs.is_empty() {
+        if regs.is_empty() && !has_store {
             return ops;
         }
 
@@ -1410,14 +1429,38 @@ impl Arm32Lifter {
             s += 1;
             olds.push(o);
         }
-        // Original ops, re-stamped to run after the saves.
-        for mut op in ops {
-            op.seq = seq(s);
-            s += 1;
-            out.push(op);
+        // Evaluate the condition BEFORE the ops run and snapshot it, so neither
+        // the store guard nor the final selects see post-op flag updates if the
+        // predicated instruction itself modifies NZCV.
+        let c_raw = self.emit_cond(cond, &mut out, &mut s, address);
+        let c = unique(0x7B0, 1);
+        out.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(c), inputs: SmallVec::from_slice(&[c_raw]) });
+        s += 1;
+        // Original ops, with each Store transformed into a guarded
+        // load-select-store so it only commits when the condition holds.
+        for op in ops {
+            if op.opcode == OpCode::Store && op.inputs.len() == 3 {
+                let space = op.inputs[0];
+                let ea = op.inputs[1];
+                let value = op.inputs[2];
+                let size = value.size;
+                let cur = unique(0x820, size);
+                out.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(cur), inputs: SmallVec::from_slice(&[space, ea]) });
+                s += 1;
+                let sel = unique(0x828, size);
+                out.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(sel), inputs: SmallVec::from_slice(&[value]) });
+                s += 1;
+                self.emit_cond_select_sized(c, sel, cur, &mut out, &mut s, address);
+                out.push(PcodeOp { opcode: OpCode::Store, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[space, ea, sel]) });
+                s += 1;
+            } else {
+                let mut op = op;
+                op.seq = seq(s);
+                s += 1;
+                out.push(op);
+            }
         }
-        // Evaluate the condition, then select new vs. old for each register.
-        let c = self.emit_cond(cond, &mut out, &mut s, address);
+        // Select new vs. old for each predicated register.
         for (r, old) in regs.iter().zip(olds.iter()) {
             self.emit_cond_select_sized(c, *r, *old, &mut out, &mut s, address);
         }
@@ -1831,6 +1874,80 @@ mod tests {
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntLeft)); // r2 << r3
         // arithmetic C/V come from the operands, not the shifter
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntCarry));
+    }
+
+    #[test]
+    fn lift_mov_reg_shift_lsr() {
+        // mov r0, r1, lsr r2 => 0xE1A00231
+        let ops = lift(0xE1A0_0231);
+        let shr = ops.iter().find(|o| o.opcode == OpCode::IntRight).unwrap();
+        assert_eq!(shr.inputs[0].offset, 4); // r1
+        assert_eq!(shr.inputs[1].space, CoreSpace::UNIQUE); // masked amount
+    }
+
+    #[test]
+    fn lift_mov_reg_shift_asr() {
+        // mov r0, r1, asr r2 => 0xE1A00251
+        let ops = lift(0xE1A0_0251);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntSRight));
+    }
+
+    #[test]
+    fn lift_mov_reg_shift_ror_expands() {
+        // mov r0, r1, ror r2 => 0xE1A00271
+        let ops = lift(0xE1A0_0271);
+        // (Rm >> amt) | (Rm << (32 - amt))
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntRight));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntSub
+            && o.inputs[0].space == CoreSpace::CONST && o.inputs[0].offset == 32));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntLeft));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntOr));
+    }
+
+    #[test]
+    fn lift_rrx_uses_carry_bit() {
+        // mov r0, r1, rrx => 0xE1A00061 (immediate ROR #0 = RRX)
+        // encoding: I=0, opcode=MOV(0xD), S=0, rd=0, rm=1, type=ROR(3), amt=0
+        let ops = lift(0xE1A0_0061);
+        // Reads the carry flag, shifts it to bit 31, ORs with (Rm >> 1).
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntZExt && o.inputs[0].offset == C_FLAG));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntLeft
+            && o.inputs[1].space == CoreSpace::CONST && o.inputs[1].offset == 31));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntRight
+            && o.inputs[0].offset == 4 // r1
+            && o.inputs[1].space == CoreSpace::CONST && o.inputs[1].offset == 1));
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntOr));
+    }
+
+    #[test]
+    fn it_block_guards_store() {
+        // it eq        => 0xBF08
+        // streq r0,[r1]  (Thumb str r0,[r1] = 0x6008, guarded by EQ via IT)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xBF08u16.to_le_bytes());
+        bytes.extend_from_slice(&0x6008u16.to_le_bytes());
+        let mut mem = Memory::new(CoreSpace(1), Endian::Little);
+        mem.add_block(MemoryBlock {
+            name: ".text".into(),
+            start: 0x1000,
+            size: bytes.len() as u64,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(bytes.as_slice())),
+        });
+        let lifter = Arm32Lifter::new_thumb(Endian::Little);
+        let mut ctx = LiftContext::default();
+        lifter.lift_instruction_ctx(&mem, 0x1000, &mut ctx).unwrap(); // IT
+        let guarded = lifter.lift_instruction_ctx(&mem, 0x1002, &mut ctx).unwrap();
+        // Guarded store: load current, select, store with the selected value.
+        assert!(guarded.ops.iter().any(|o| o.opcode == OpCode::Load));
+        assert!(guarded.ops.iter().any(|o| o.opcode == OpCode::Int2Comp));
+        let store = guarded.ops.iter().find(|o| o.opcode == OpCode::Store).unwrap();
+        // Store now writes a unique (the selected value), not r0 directly.
+        assert_eq!(store.inputs[2].space, CoreSpace::UNIQUE);
+        // The load's effective-address input matches the store's.
+        let load = guarded.ops.iter().find(|o| o.opcode == OpCode::Load).unwrap();
+        assert_eq!(load.inputs[1].offset, store.inputs[1].offset);
+        assert_eq!(load.inputs[1].space, store.inputs[1].space);
     }
 
     #[test]
