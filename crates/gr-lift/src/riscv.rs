@@ -267,7 +267,19 @@ impl RiscVLifter {
                             _ => return ops,
                         }
                     };
-                    push(&mut ops, &mut s, op, Some(out), &[xin(rs1), xin(rs2)]);
+                    // Variable shifts (sll/srl/sra) use only rs2's low 5 bits;
+                    // mask so a shift amount >= 32 doesn't collapse to 0 under
+                    // P-code's at-width shift semantics. The M-extension ops
+                    // (funct7 == 0x01) reuse funct3 1/5 for mulh/divu, so only
+                    // mask for the base integer shifts.
+                    let is_shift = funct7 != 0x01 && matches!(funct3, 1 | 5);
+                    if is_shift {
+                        let amt = unique(0x108, 4);
+                        push(&mut ops, &mut s, OpCode::IntAnd, Some(amt), &[xin(rs2), constant(0x1F, 4)]);
+                        push(&mut ops, &mut s, op, Some(out), &[xin(rs1), amt]);
+                    } else {
+                        push(&mut ops, &mut s, op, Some(out), &[xin(rs1), xin(rs2)]);
+                    }
                 }
             }
             // FENCE (0x0F) and SYSTEM (0x73) produce no data-flow P-code here.
@@ -561,6 +573,35 @@ mod tests {
         assert_eq!(lifted.ops[0].opcode, OpCode::IntAdd);
         assert_eq!(lifted.ops[0].output.unwrap().offset, 10 * 4); // a0
         assert_eq!(lifted.ops[0].inputs[1].offset, 5); // imm
+    }
+
+    #[test]
+    fn lift_sll_masks_shift_amount() {
+        // sll a0, a1, a2 => opcode=0x33 rd=10 rs1=11 rs2=12 funct3=1 funct7=0
+        // (rd = rs1 << (rs2 & 0x1F))
+        let word = (12 << 20) | (11 << 15) | (1 << 12) | (10 << 7) | 0x33;
+        let lifter = RiscVLifter::new_rv32();
+        let mem = make_memory(&le32(word), 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // First op masks rs2 to 5 bits; second shifts.
+        assert_eq!(lifted.ops[0].opcode, OpCode::IntAnd);
+        assert_eq!(lifted.ops[0].inputs[0].offset, 12 * 4); // rs2 = a2
+        assert_eq!(lifted.ops[0].inputs[1].offset, 0x1F);
+        assert_eq!(lifted.ops[1].opcode, OpCode::IntLeft);
+        assert_eq!(lifted.ops[1].inputs[0].offset, 11 * 4); // rs1 = a1
+        assert_eq!(lifted.ops[1].inputs[1].space, CoreSpace::UNIQUE); // masked amt
+    }
+
+    #[test]
+    fn lift_sra_masks_but_mulh_does_not() {
+        // mulh (M-ext, funct7=1, funct3=1) must NOT be treated as a shift.
+        let word = (1 << 25) | (12 << 20) | (11 << 15) | (1 << 12) | (10 << 7) | 0x33;
+        let lifter = RiscVLifter::new_rv32();
+        let mem = make_memory(&le32(word), 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(!lifted.ops.iter().any(|o| o.opcode == OpCode::IntAnd
+            && o.inputs.get(1).map(|v| v.offset == 0x1F).unwrap_or(false)),
+            "mulh must not get the shift-amount mask");
     }
 
     #[test]

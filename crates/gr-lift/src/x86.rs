@@ -186,7 +186,8 @@ impl X86Lifter {
             }
 
             Add | Sub | And | Or | Xor | Shl | Shr | Sar => {
-                let opcode = match insn.mnemonic() {
+                let mnem = insn.mnemonic();
+                let opcode = match mnem {
                     Add => OpCode::IntAdd,
                     Sub => OpCode::IntSub,
                     And => OpCode::IntAnd,
@@ -198,11 +199,29 @@ impl X86Lifter {
                     _ => unreachable!(),
                 };
                 let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
+                let shift_src = if matches!(mnem, Shl | Shr | Sar) {
+                    // x86 masks the shift count to 5 bits for operands up to
+                    // 32-bit and 6 bits for 64-bit; without this a `shl r, cl`
+                    // with cl >= width collapses to 0 under P-code at-width
+                    // shift semantics instead of wrapping the count.
+                    let mask = if dst.size >= 8 { 0x3F } else { 0x1F };
+                    let amt = VarnodeData::new(UNIQUE_SPACE, 0x340, dst.size);
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntAnd,
+                        seq: seq(seq_base),
+                        output: Some(amt),
+                        inputs: SmallVec::from_slice(&[src, VarnodeData::new(CONST_SPACE, mask, dst.size)]),
+                    });
+                    seq_base += 1;
+                    amt
+                } else {
+                    src
+                };
                 ops.push(PcodeOp {
                     opcode,
                     seq: seq(seq_base),
                     output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]),
+                    inputs: SmallVec::from_slice(&[dst, shift_src]),
                 });
                 seq_base += 1;
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;

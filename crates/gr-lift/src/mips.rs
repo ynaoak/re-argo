@@ -156,9 +156,23 @@ impl MipsLifter {
                     0x00 => binop_rd(&mut ops, &mut s, OpCode::IntLeft, reg_in(rt), constant(shamt as u64, 4)),  // sll
                     0x02 => binop_rd(&mut ops, &mut s, OpCode::IntRight, reg_in(rt), constant(shamt as u64, 4)), // srl
                     0x03 => binop_rd(&mut ops, &mut s, OpCode::IntSRight, reg_in(rt), constant(shamt as u64, 4)),// sra
-                    0x04 => binop_rd(&mut ops, &mut s, OpCode::IntLeft, reg_in(rt), reg_in(rs)),  // sllv
-                    0x06 => binop_rd(&mut ops, &mut s, OpCode::IntRight, reg_in(rt), reg_in(rs)), // srlv
-                    0x07 => binop_rd(&mut ops, &mut s, OpCode::IntSRight, reg_in(rt), reg_in(rs)),// srav
+                    // Variable shifts use only the low 5 bits of rs; mask it so
+                    // a shift amount >= 32 does not collapse to 0 (P-code shift
+                    // semantics zero at/above the operand width).
+                    0x04 | 0x06 | 0x07 => {
+                        if let Some(out) = reg_out(rd) {
+                            let amt = unique(0x108, 4);
+                            ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(s), output: Some(amt), inputs: SmallVec::from_slice(&[reg_in(rs), constant(0x1F, 4)]) });
+                            s += 1;
+                            let op = match funct {
+                                0x04 => OpCode::IntLeft,   // sllv
+                                0x06 => OpCode::IntRight,  // srlv
+                                _ => OpCode::IntSRight,    // srav
+                            };
+                            ops.push(PcodeOp { opcode: op, seq: seq(s), output: Some(out), inputs: SmallVec::from_slice(&[reg_in(rt), amt]) });
+                            s += 1;
+                        }
+                    }
                     0x08 => {
                         // jr rs
                         if rs == RA_INDEX {
@@ -399,6 +413,23 @@ mod tests {
         assert_eq!(lifted.ops[0].opcode, OpCode::IntAdd);
         // output is $a0 = reg 4 => offset 16
         assert_eq!(lifted.ops[0].output.unwrap().offset, 16);
+    }
+
+    #[test]
+    fn lift_sllv_masks_shift_amount() {
+        // sllv $a0, $a1, $a2  => op=0 rs=6 rt=5 rd=4 funct=0x04
+        // (rd = rt << (rs & 0x1F))
+        let word = (6 << 21) | (5 << 16) | (4 << 11) | 0x04;
+        let lifter = MipsLifter::new_32(Endian::Big);
+        let mem = make_memory(&[word], 0x1000, true);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // First op masks the shift amount (rs) to 5 bits; second is the shift.
+        assert_eq!(lifted.ops[0].opcode, OpCode::IntAnd);
+        assert_eq!(lifted.ops[0].inputs[0].offset, 6 * 4); // rs = $a2
+        assert_eq!(lifted.ops[0].inputs[1].offset, 0x1F);
+        assert_eq!(lifted.ops[1].opcode, OpCode::IntLeft);
+        assert_eq!(lifted.ops[1].inputs[1].space, CoreSpace::UNIQUE); // masked amt
+        assert_eq!(lifted.ops[1].output.unwrap().offset, 4 * 4); // rd = $a0
     }
 
     #[test]
