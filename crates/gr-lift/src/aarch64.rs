@@ -717,15 +717,21 @@ impl Aarch64Lifter {
             }
 
             // =============================================================
-            // RET {Xn}  -- defaults to X30 / LR
+            // RET {Xn}  -- defaults to X30 / LR. An explicit Xn (e.g.
+            // `ret x16` from a PLT thunk) returns to that register; reading
+            // LR there would feed the decompiler the wrong return target.
             // =============================================================
             cs_insn::RET => {
-                let lr = reg(30 * 8, 8);
+                let target = if operands.is_empty() {
+                    reg(30 * 8, 8)
+                } else {
+                    self.resolve_operand(&operands[0], address).unwrap_or_else(|_| reg(30 * 8, 8))
+                };
                 ops.push(PcodeOp {
                     opcode: OpCode::Return,
                     seq: seq(s),
                     output: None,
-                    inputs: SmallVec::from_slice(&[lr]),
+                    inputs: SmallVec::from_slice(&[target]),
                 });
             }
 
@@ -804,6 +810,60 @@ impl Aarch64Lifter {
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[src]),
                 });
+            }
+
+            // =============================================================
+            // Fallback: TBZ / TBNZ aren't exposed as named cs_insn constants
+            // in this binding; detect them by mnemonic so the CFG sees a real
+            // branch (otherwise they fall through to CallOther and a switch's
+            // jump-table dispatch silently chains into the next instruction).
+            // TBZ  Rt, #imm, label  -> branch if Rt[imm] == 0
+            // TBNZ Rt, #imm, label  -> branch if Rt[imm] != 0
+            // =============================================================
+            _ if matches!(insn.mnemonic(), Some("tbz") | Some("tbnz")) => {
+                if operands.len() >= 3 {
+                    let test_reg = self.resolve_operand(&operands[0], address)?;
+                    let bit_pos = self.resolve_operand(&operands[1], address)?;
+                    let target = self
+                        .extract_branch_target(&operands[2..])
+                        .unwrap_or(address + insn_len);
+                    // bit = (Rt >> imm) & 1
+                    let shifted = unique(s as u64 * 0x10 + 0x900, test_reg.size);
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntRight,
+                        seq: seq(s),
+                        output: Some(shifted),
+                        inputs: SmallVec::from_slice(&[test_reg, bit_pos]),
+                    });
+                    s += 1;
+                    let masked = unique(s as u64 * 0x10 + 0x900, test_reg.size);
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntAnd,
+                        seq: seq(s),
+                        output: Some(masked),
+                        inputs: SmallVec::from_slice(&[shifted, constant(1, test_reg.size)]),
+                    });
+                    s += 1;
+                    let cond = unique(s as u64 * 0x10 + 0x900, 1);
+                    let cmp = if insn.mnemonic() == Some("tbz") {
+                        OpCode::IntEqual
+                    } else {
+                        OpCode::IntNotEqual
+                    };
+                    ops.push(PcodeOp {
+                        opcode: cmp,
+                        seq: seq(s),
+                        output: Some(cond),
+                        inputs: SmallVec::from_slice(&[masked, constant(0, test_reg.size)]),
+                    });
+                    s += 1;
+                    ops.push(PcodeOp {
+                        opcode: OpCode::CBranch,
+                        seq: seq(s),
+                        output: None,
+                        inputs: SmallVec::from_slice(&[ram(target, 8), cond]),
+                    });
+                }
             }
 
             // =============================================================
@@ -1016,7 +1076,11 @@ impl Aarch64Lifter {
     // NZCV flag helpers
     // -------------------------------------------------------------------
 
-    /// Emit a simplified NZCV update: Z (result == 0), N (result < 0).
+    /// Emit a simplified NZCV update: write the architectural NZCV register
+    /// (Z at bit 30, N at bit 31; C and V left as 0). Previously this wrote
+    /// to local `unique` slots that nothing else read, so `emit_condition_check`
+    /// (which reads the real NZCV register) saw stale flags and conditional
+    /// branches after adds/subs took the wrong path.
     fn emit_nzcv_update(
         &self,
         result: VarnodeData,
@@ -1026,7 +1090,7 @@ impl Aarch64Lifter {
     ) {
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
 
-        // Z flag
+        // is_zero (1 byte): result == 0
         let zf = unique(0xA00, 1);
         ops.push(PcodeOp {
             opcode: OpCode::IntEqual,
@@ -1035,14 +1099,54 @@ impl Aarch64Lifter {
             inputs: SmallVec::from_slice(&[result, constant(0, result.size)]),
         });
         *s += 1;
-
-        // N flag
-        let nf = unique(0xA10, 1);
+        // is_neg (1 byte): result <s 0
+        let nf = unique(0xA01, 1);
         ops.push(PcodeOp {
             opcode: OpCode::IntSLess,
             seq: seq(*s),
             output: Some(nf),
             inputs: SmallVec::from_slice(&[result, constant(0, result.size)]),
+        });
+        *s += 1;
+        // Pack into NZCV at the correct bit positions: zext to 4 bytes, shift,
+        // OR. emit_condition_check expects Z at bit 30 and N at bit 31.
+        let z32 = unique(0xA04, 4);
+        ops.push(PcodeOp {
+            opcode: OpCode::IntZExt,
+            seq: seq(*s),
+            output: Some(z32),
+            inputs: SmallVec::from_slice(&[zf]),
+        });
+        *s += 1;
+        let z_shifted = unique(0xA08, 4);
+        ops.push(PcodeOp {
+            opcode: OpCode::IntLeft,
+            seq: seq(*s),
+            output: Some(z_shifted),
+            inputs: SmallVec::from_slice(&[z32, constant(30, 4)]),
+        });
+        *s += 1;
+        let n32 = unique(0xA0C, 4);
+        ops.push(PcodeOp {
+            opcode: OpCode::IntZExt,
+            seq: seq(*s),
+            output: Some(n32),
+            inputs: SmallVec::from_slice(&[nf]),
+        });
+        *s += 1;
+        let n_shifted = unique(0xA10, 4);
+        ops.push(PcodeOp {
+            opcode: OpCode::IntLeft,
+            seq: seq(*s),
+            output: Some(n_shifted),
+            inputs: SmallVec::from_slice(&[n32, constant(31, 4)]),
+        });
+        *s += 1;
+        ops.push(PcodeOp {
+            opcode: OpCode::IntOr,
+            seq: seq(*s),
+            output: Some(nzcv()),
+            inputs: SmallVec::from_slice(&[z_shifted, n_shifted]),
         });
         *s += 1;
     }
@@ -1431,5 +1535,57 @@ mod tests {
             lifted.ops.iter().any(|op| op.opcode == OpCode::IntEqual),
             "CMP should produce IntEqual for Z flag"
         );
+    }
+
+    #[test]
+    fn lift_cmp_writes_nzcv_register() {
+        // Without the fix, emit_nzcv_update wrote to local unique slots that
+        // emit_condition_check never read, so flags set by adds/cmp were
+        // invisible to b.eq / b.ne and conditional branches took the wrong path.
+        let lifter = Aarch64Lifter::new();
+        // CMP X0, X1 = 0xEB01001F
+        let mem = make_memory(&[0x1f, 0x00, 0x01, 0xeb], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // The final OR producing the packed NZCV must write the architectural
+        // register at REG_SPACE offset 0x200, not a unique.
+        let nzcv_writer = lifted.ops.iter().find(|op|
+            op.opcode == OpCode::IntOr
+                && op.output.map(|v| v.space == SpaceId::REGISTER && v.offset == 0x200).unwrap_or(false));
+        assert!(nzcv_writer.is_some(),
+            "CMP must commit Z/N into the NZCV register so B.cond sees them");
+    }
+
+    #[test]
+    fn lift_tbz_emits_cbranch() {
+        // TBZ W0, #3, +0x10 from 0x1000 = 0x36180080
+        // (bit 11:5 = imm14 = 2 (target 0x1010 / 4 = 2 instructions ahead -> imm * 4 = 8))
+        // Hand-assembled: TBZ Rt, #imm, label encoding 0011 0110 ...
+        // TBZ x5 (Rt=5) bit #3, +8 bytes -> Capstone decodes from raw bytes.
+        // Use a known TBZ encoding: TBZ w0, #0, .+0 = 0x36000000
+        let lifter = Aarch64Lifter::new();
+        let mem = make_memory(&[0x00, 0x00, 0x00, 0x36], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.length, 4);
+        // Must emit a CBranch (not CallOther). The previous code fell into the
+        // fallback and silently produced CallOther, breaking the CFG split.
+        assert!(lifted.ops.iter().any(|op| op.opcode == OpCode::CBranch),
+            "TBZ should produce CBranch, got ops: {:?}",
+            lifted.ops.iter().map(|o| o.opcode).collect::<Vec<_>>());
+        assert!(!lifted.ops.iter().any(|op| op.opcode == OpCode::CallOther),
+            "TBZ should no longer fall through to CallOther");
+    }
+
+    #[test]
+    fn lift_ret_xn_uses_operand_not_lr() {
+        // RET X16 = 0xD65F0200. Without the fix, RET hard-coded the LR (X30)
+        // register, so a PLT thunk's `ret x16` would return to the wrong target.
+        let lifter = Aarch64Lifter::new();
+        let mem = make_memory(&[0x00, 0x02, 0x5f, 0xd6], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let ret = lifted.ops.iter().find(|op| op.opcode == OpCode::Return)
+            .expect("expected Return");
+        // Inputs[0] should be X16 (offset 16*8 = 128), not X30 (240).
+        assert_eq!(ret.inputs[0].offset, 16 * 8,
+            "RET X16 must read X16, not the default LR");
     }
 }
