@@ -783,4 +783,127 @@ mod tests {
         let eliminated = common_subexpression_elimination(&mut ssa);
         assert_eq!(eliminated, 0, "different opcodes must not be merged");
     }
+
+    /// DCE must not delete a Copy that defines a register subsequently
+    /// read by Return. Pre-fix the SSA builder minted a fresh varnode for
+    /// every read, so the def-side `uses` list stayed empty and DCE
+    /// flagged the live Copy as dead.
+    #[test]
+    fn dce_keeps_live_def_used_by_return() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let imm = VarnodeData::new(SpaceId(0), 42, 8);
+
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::Copy,
+                seq: seq(0x1000),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[imm]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001),
+                output: None,
+                inputs: SmallVec::from_slice(&[rax]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let removed = dead_code_elimination(&mut ssa);
+        assert_eq!(removed, 0, "Copy of rax is live (Return reads rax)");
+        let copy_live = ssa.ops.iter().any(|op| !op.dead && op.opcode == OpCode::Copy);
+        assert!(copy_live, "the live Copy must survive DCE: {:?}", ssa.ops);
+    }
+
+    /// copy_propagation pushes a constant Copy's value through to the
+    /// consuming op. Pre-fix the input ids never coincided with the
+    /// output id, so the `*inp == out_id` substitution never fired.
+    #[test]
+    fn copy_propagation_replaces_const_use_downstream() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rbx = VarnodeData::new(SpaceId(2), 0x18, 8);
+        let imm_99 = VarnodeData::new(SpaceId(0), 99, 8);
+        let imm_2 = VarnodeData::new(SpaceId(0), 2, 8);
+
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::Copy,
+                seq: seq(0x1000),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[imm_99]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::IntMult,
+                seq: seq(0x1001),
+                output: Some(rbx),
+                inputs: SmallVec::from_slice(&[rax, imm_2]),
+            }]),
+            make_lifted(0x1002, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1002),
+                output: None,
+                inputs: SmallVec::from_slice(&[rbx]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let propagated = copy_propagation(&mut ssa);
+        assert!(propagated > 0, "rax=99 should propagate into the IntMult");
+        let mult_op = ssa
+            .ops
+            .iter()
+            .find(|op| !op.dead && op.opcode == OpCode::IntMult)
+            .expect("IntMult op must still be present");
+        let all_const = mult_op
+            .inputs
+            .iter()
+            .all(|&id| ssa.varnodes[id as usize].data.space == SpaceId::CONST);
+        assert!(
+            all_const,
+            "after propagation, IntMult inputs must all be CONST: {:?}",
+            mult_op
+        );
+    }
+
+    /// Same SSA value read twice (e.g., `xor rax, rax` after rax is set)
+    /// must yield matching input VarIds so algebraic_simplification can
+    /// fold `x ^ x` to 0. Pre-fix the two reads minted distinct varnodes
+    /// and the optimization was silently skipped.
+    #[test]
+    fn xor_self_simplifies_after_def() {
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let imm = VarnodeData::new(SpaceId(0), 42, 8);
+
+        let insns = vec![make_lifted(0x1000, vec![
+            PcodeOp {
+                opcode: OpCode::Copy,
+                seq: seq(0x1000, 0),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[imm]),
+            },
+            PcodeOp {
+                opcode: OpCode::IntXor,
+                seq: seq(0x1000, 1),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[rax, rax]),
+            },
+        ])];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let xor = ssa
+            .ops
+            .iter()
+            .find(|op| op.opcode == OpCode::IntXor)
+            .expect("IntXor op present");
+        assert_eq!(
+            xor.inputs[0], xor.inputs[1],
+            "both reads of rax at the same version must share a VarId: {:?}",
+            xor
+        );
+        let simplified = algebraic_simplification(&mut ssa);
+        assert!(simplified > 0, "x ^ x should fold to 0");
+    }
 }
