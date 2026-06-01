@@ -192,20 +192,22 @@ fn is_commutative(op: OpCode) -> bool {
     )
 }
 
-/// Rewrite every varnode identifying value `from` to identify value `to`,
-/// redirecting all reads of `from` onto `to`.
-fn redirect_value(func: &mut SsaFunction, from: ValueKey, to: ValueKey) {
-    let new_data = gr_core::pcode::VarnodeData::new(
-        gr_core::address::SpaceId(to.0),
-        to.1,
-        to.2,
-    );
-    for vn in &mut func.varnodes {
-        if (vn.data.space.0, vn.data.offset, vn.data.size, vn.version) == from {
-            vn.data = new_data;
-            vn.version = to.3;
+/// Follow a chain of redirects to the canonical target. Caps the
+/// chain length defensively so a cyclic redirect map (which the CSE
+/// loop is structured not to produce) can't loop forever.
+fn resolve_redirect(
+    redirects: &std::collections::BTreeMap<ValueKey, ValueKey>,
+    mut k: ValueKey,
+) -> ValueKey {
+    let mut steps = 0;
+    while let Some(&next) = redirects.get(&k) {
+        if next == k || steps > 64 {
+            break;
         }
+        k = next;
+        steps += 1;
     }
+    k
 }
 
 /// Local common subexpression elimination.
@@ -214,10 +216,20 @@ fn redirect_value(func: &mut SsaFunction, from: ValueKey, to: ValueKey) {
 /// by an earlier pure op (same opcode and inputs by value identity) is removed,
 /// and its uses are redirected to the earlier result. Restricting to a single
 /// block keeps the rewrite safe without dominator analysis.
+///
+/// Previously each CSE hit called `redirect_value`, which linearly scanned
+/// every varnode in the function and rewrote any matching one. For a
+/// function with N CSE eliminations and V varnodes that was O(N*V).
+/// We now collect the redirects into a BTreeMap during the loop and
+/// apply them in a single linear pass over varnodes at the end --
+/// O(N + V). Subsequent ops in the same pass consult the in-progress
+/// redirect map via `resolve_redirect` so cascading eliminations
+/// (the result of one CSE feeding into another) still fire.
 pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     let mut eliminated = 0;
-    // (block, opcode name, input value keys) -> output value key
     let mut seen: std::collections::BTreeMap<(usize, &'static str, Vec<ValueKey>), ValueKey> =
+        std::collections::BTreeMap::new();
+    let mut redirects: std::collections::BTreeMap<ValueKey, ValueKey> =
         std::collections::BTreeMap::new();
 
     for i in 0..func.ops.len() {
@@ -233,22 +245,42 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             continue;
         }
 
-        let mut in_keys: Vec<ValueKey> =
-            func.ops[i].inputs.iter().map(|&id| value_key(func, id)).collect();
+        let mut in_keys: Vec<ValueKey> = func.ops[i]
+            .inputs
+            .iter()
+            .map(|&id| resolve_redirect(&redirects, value_key(func, id)))
+            .collect();
         if is_commutative(opcode) {
             in_keys.sort();
         }
         let key = (func.ops[i].block, opcode.name(), in_keys);
-        let out_key = value_key(func, out_id);
+        let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
         if let Some(&existing) = seen.get(&key) {
-            redirect_value(func, out_key, existing);
+            redirects.insert(out_key, existing);
             func.ops[i].dead = true;
             eliminated += 1;
         } else {
             seen.insert(key, out_key);
         }
     }
+
+    // Apply all redirects in a single pass over the varnode arena.
+    if !redirects.is_empty() {
+        for vn in &mut func.varnodes {
+            let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            let to = resolve_redirect(&redirects, key);
+            if to != key {
+                vn.data = gr_core::pcode::VarnodeData::new(
+                    gr_core::address::SpaceId(to.0),
+                    to.1,
+                    to.2,
+                );
+                vn.version = to.3;
+            }
+        }
+    }
+
     eliminated
 }
 
