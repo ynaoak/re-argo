@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 
 use gr_core::pcode::{OpCode, VarnodeData};
 
@@ -35,7 +35,12 @@ pub struct SsaFunction {
     pub ops: Vec<SsaOp>,
     pub cfg: ControlFlowGraph,
     next_var_id: VarId,
-    var_versions: BTreeMap<(u32, u64, u32), u32>,
+    /// FxHashMap rather than BTreeMap: keys are integer triples and
+    /// every read/write of a register or RAM slot in `build_ssa` hits
+    /// these maps, so a constant-time hash (FxHash specialises well on
+    /// integer-only keys) beats BTreeMap's per-step comparison for
+    /// any function with more than a handful of distinct slots.
+    var_versions: FxHashMap<(u32, u64, u32), u32>,
     /// Canonical varnode id for the *current* version of each
     /// (space, offset, size). Set by `create_new_version` whenever a
     /// register/RAM slot is rewritten, and read by `get_or_create_var`
@@ -45,7 +50,7 @@ pub struct SsaFunction {
     /// op whose output was actually live (because uses had been pushed
     /// onto the unrelated read-side varnodes), and copy_propagation
     /// couldn't match `*inp == out_id` because the ids never coincided.
-    current_var: BTreeMap<(u32, u64, u32), VarId>,
+    current_var: FxHashMap<(u32, u64, u32), VarId>,
 }
 
 impl SsaFunction {
@@ -57,8 +62,8 @@ impl SsaFunction {
             ops: Vec::new(),
             cfg,
             next_var_id: 0,
-            var_versions: BTreeMap::new(),
-            current_var: BTreeMap::new(),
+            var_versions: FxHashMap::default(),
+            current_var: FxHashMap::default(),
         };
         func.build_ssa();
         func

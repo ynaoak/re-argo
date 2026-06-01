@@ -196,7 +196,7 @@ fn is_commutative(op: OpCode) -> bool {
 /// chain length defensively so a cyclic redirect map (which the CSE
 /// loop is structured not to produce) can't loop forever.
 fn resolve_redirect(
-    redirects: &std::collections::BTreeMap<ValueKey, ValueKey>,
+    redirects: &rustc_hash::FxHashMap<ValueKey, ValueKey>,
     mut k: ValueKey,
 ) -> ValueKey {
     let mut steps = 0;
@@ -227,10 +227,10 @@ fn resolve_redirect(
 /// (the result of one CSE feeding into another) still fire.
 pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     let mut eliminated = 0;
-    let mut seen: std::collections::BTreeMap<(usize, &'static str, Vec<ValueKey>), ValueKey> =
-        std::collections::BTreeMap::new();
-    let mut redirects: std::collections::BTreeMap<ValueKey, ValueKey> =
-        std::collections::BTreeMap::new();
+    let mut seen: rustc_hash::FxHashMap<(usize, &'static str, Vec<ValueKey>), ValueKey> =
+        rustc_hash::FxHashMap::default();
+    let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
+        rustc_hash::FxHashMap::default();
 
     for i in 0..func.ops.len() {
         if func.ops[i].dead {
