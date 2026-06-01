@@ -15,8 +15,15 @@
 //! predicated on the condition and a store is guarded by writing back the
 //! loaded value when not taken; `ba,a` stays inline and `bn,a` jumps over its
 //! squashed slot. The stateless `lift_instruction` path still emits the
-//! transfer inline. The remaining simplification is SAVE/RESTORE, which model
-//! only the pointer arithmetic, not the register-window rotation.
+//! transfer inline. SAVE/RESTORE model the register-window rotation via the
+//! `o`<->`i` aliasing: at SAVE the caller's `o` registers are copied to the
+//! callee's `i` registers (so parameter reads resolve back to the caller),
+//! and at RESTORE the callee's `i` registers are copied to the caller's `o`
+//! registers (so the return-value flow lands in the caller). The caller's
+//! locals are not spilled to a save area, which is correct for
+//! single-function decompilation (nested calls are abstracted) but means a
+//! sub-callee's writes to `l` registers are not preserved across the call in
+//! flat emulation.
 
 use gr_core::address::{Address, SpaceId};
 use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -166,12 +173,8 @@ impl SparcLifter {
                     self.push(ops, s, OpCode::BranchInd, None, &[target], address);
                 }
             }
-            0x3C | 0x3D => {
-                // SAVE / RESTORE: model only rd = rs1 + b (ignore window rotation).
-                if let Some(out) = rd_out(rd) {
-                    self.push(ops, s, OpCode::IntAdd, Some(out), &[a, b], address);
-                }
-            }
+            0x3C => self.lift_save(rd, a, b, ops, s, address),
+            0x3D => self.lift_restore(rd, a, b, ops, s, address),
             0x25 => self.alu_simple(OpCode::IntLeft, rd, a, b, ops, s, address),   // SLL
             0x26 => self.alu_simple(OpCode::IntRight, rd, a, b, ops, s, address),  // SRL
             0x27 => self.alu_simple(OpCode::IntSRight, rd, a, b, ops, s, address), // SRA
@@ -241,6 +244,38 @@ impl SparcLifter {
         let cin = unique(0x530, 4);
         self.push(ops, s, OpCode::IntZExt, Some(cin), &[flag(ICC_C)], address);
         self.push(ops, s, OpCode::IntSub, Some(res), &[t, cin], address);
+    }
+
+    /// SAVE: compute `rs1 + b` in the OLD (caller's) window, rotate the window
+    /// (callee's `i` = caller's `o`), then write `rd` in the NEW (callee's)
+    /// window. Models only the o<->i aliasing; the caller's locals are not
+    /// spilled (a known limitation — single-function decompilation is unaffected
+    /// because nested calls are abstracted).
+    fn lift_save(&self, rd: u32, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let new = unique(0x550, 4);
+        self.push(ops, s, OpCode::IntAdd, Some(new), &[a, b], address);
+        // Window rotation: callee's i = caller's o.
+        for i in 0..8u32 {
+            self.push(ops, s, OpCode::Copy, Some(reg(24 + i)), &[reg(8 + i)], address);
+        }
+        if let Some(out) = rd_out(rd) {
+            self.push(ops, s, OpCode::Copy, Some(out), &[new], address);
+        }
+    }
+
+    /// RESTORE: compute `rs1 + b` in the OLD (callee's) window, rotate the
+    /// window back (caller's `o` = callee's `i`), then write `rd` in the NEW
+    /// (caller's) window.
+    fn lift_restore(&self, rd: u32, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let new = unique(0x550, 4);
+        self.push(ops, s, OpCode::IntAdd, Some(new), &[a, b], address);
+        // Window rotation: caller's o = callee's i (return value flow).
+        for i in 0..8u32 {
+            self.push(ops, s, OpCode::Copy, Some(reg(8 + i)), &[reg(24 + i)], address);
+        }
+        if let Some(out) = rd_out(rd) {
+            self.push(ops, s, OpCode::Copy, Some(out), &[new], address);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -798,6 +833,64 @@ mod tests {
         // jmpl %o0, %o7 : op=2 op3=0x38 rd=15(o7) rs1=8
         let ops = lift(f3(0x38, O7_INDEX, 8, 0));
         assert!(ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+
+    // ---- Register window rotation ----
+
+    #[test]
+    fn save_rotates_outs_to_ins() {
+        // save %sp, -96, %sp : op3=0x3C, rd=14(o6/sp), rs1=14, simm13=0x1FA0 (-96)
+        let ops = lift(f3i(0x3C, 14, 14, 0x1FA0));
+        // Pointer arithmetic (new sp) computed first into a temp.
+        assert_eq!(ops[0].opcode, OpCode::IntAdd);
+        // o0..o7 copied to i0..i7 (callee's ins = caller's outs).
+        for i in 0..8u64 {
+            assert!(ops.iter().any(|o| o.opcode == OpCode::Copy
+                && o.output.map(|v| v.offset == (24 + i) * 4).unwrap_or(false)
+                && o.inputs[0].offset == (8 + i) * 4));
+        }
+        // i6 specifically holds the caller's old sp (= %fp convention).
+        let i6_copy = ops.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == 30 * 4).unwrap_or(false)).unwrap();
+        assert_eq!(i6_copy.inputs[0].offset, 14 * 4);
+        // rd is written last with the new sp.
+        let last = ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::Copy);
+        assert_eq!(last.output.unwrap().offset, 14 * 4);
+        assert_eq!(last.inputs[0].space, CoreSpace::UNIQUE);
+    }
+
+    #[test]
+    fn restore_rotates_ins_to_outs() {
+        // restore (no args) = restore %g0, %g0, %g0 : op3=0x3D, rd=0, rs1=0, rs2=0
+        let ops = lift(f3(0x3D, 0, 0, 0));
+        // i0..i7 copied to o0..o7 (caller's outs = callee's ins).
+        for i in 0..8u64 {
+            assert!(ops.iter().any(|o| o.opcode == OpCode::Copy
+                && o.output.map(|v| v.offset == (8 + i) * 4).unwrap_or(false)
+                && o.inputs[0].offset == (24 + i) * 4));
+        }
+        // rd=g0 -> no rd write (only IntAdd into a temp and the 8 rotation copies).
+        assert!(!ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == 0).unwrap_or(false)));
+    }
+
+    #[test]
+    fn restore_carries_return_value_to_caller_o0() {
+        // restore %i0, %g0, %o0 : callee's i0 (return value) -> caller's o0
+        // rd=8(o0), rs1=24(i0), rs2=0(g0)
+        let ops = lift(f3(0x3D, 8, 24, 0));
+        // new = i0 + 0  (precomputed before rotation, captures pre-rotation i0)
+        let add = ops.iter().find(|o| o.opcode == OpCode::IntAdd).unwrap();
+        assert_eq!(add.inputs[0].offset, 24 * 4); // i0
+        // Rotation present (i0 -> o0).
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == 8 * 4).unwrap_or(false)
+            && o.inputs[0].offset == 24 * 4));
+        // Final rd write: o0 = new (which captured the pre-rotation i0).
+        let last = ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::Copy);
+        assert_eq!(last.output.unwrap().offset, 8 * 4);
     }
 
     // ---- Delay slots (Stage 1: non-annulling) ----

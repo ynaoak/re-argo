@@ -107,24 +107,51 @@ impl Emulator {
             }
 
             OpCode::IntLeft => {
+                // P-code semantics: shift by amount >= operand bitwidth gives 0
+                // (Rust's wrapping_shl wraps mod 64, which would mis-shift for
+                // amounts >= bitwidth on operands smaller than 64 bits, and
+                // wraps for amounts >= 64 even on 64-bit operands).
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_LEFT".into()))?;
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let bits = (size * 8) as u64;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, a.wrapping_shl(b as u32));
+                let result = if b >= bits { 0 } else { a.wrapping_shl(b as u32) };
+                self.state.write_varnode(out, result);
             }
 
             OpCode::IntRight => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_RIGHT".into()))?;
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let bits = (size * 8) as u64;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, a.wrapping_shr(b as u32));
+                let result = if b >= bits { 0 } else { a.wrapping_shr(b as u32) };
+                self.state.write_varnode(out, result);
             }
 
             OpCode::IntSRight => {
+                // Arithmetic shift: shift by >= bitwidth replicates the sign bit
+                // (all-ones if negative at the operand width, otherwise 0).
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SRIGHT".into()))?;
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let bits = (size * 8) as u64;
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, (a as i64).wrapping_shr(b as u32) as u64);
+                let result = if b >= bits {
+                    let sign_bit = (a >> (bits - 1)) & 1;
+                    if sign_bit == 1 {
+                        if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
+                    } else {
+                        0
+                    }
+                } else {
+                    // Sign-extend a from `bits` to 64, then arithmetic shift.
+                    let extend = 64 - bits as u32;
+                    let signed_a = ((a << extend) as i64) >> extend;
+                    signed_a.wrapping_shr(b as u32) as u64
+                };
+                self.state.write_varnode(out, result);
             }
 
             OpCode::IntEqual => {
@@ -149,10 +176,18 @@ impl Emulator {
             }
 
             OpCode::IntSLess => {
+                // Signed compare at the operand width: read_input zero-extends
+                // a sub-word value, so casting to i64 directly would treat a
+                // 32-bit 0xFFFFFFFF (= -1 as i32) as positive. Sign-extend
+                // from the input size first.
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SLESS".into()))?;
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let extend = 64 - (size * 8);
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, if (a as i64) < (b as i64) { 1 } else { 0 });
+                let sa = ((a << extend) as i64) >> extend;
+                let sb = ((b << extend) as i64) >> extend;
+                self.state.write_varnode(out, if sa < sb { 1 } else { 0 });
             }
 
             OpCode::IntZExt => {
@@ -228,7 +263,10 @@ impl Emulator {
                 let lo_vn = op.input(1).ok_or_else(|| EmulatorError::MissingInput { op: "PIECE".into(), index: 1 })?;
                 let hi = self.state.read_varnode(hi_vn);
                 let lo = self.state.read_varnode(lo_vn);
-                let result = (hi << (lo_vn.size * 8)) | lo;
+                // Shift by 64 would panic in debug; if lo already fills the
+                // word, only lo contributes.
+                let shift = lo_vn.size * 8;
+                let result = if shift >= 64 { lo } else { (hi << shift) | lo };
                 self.state.write_varnode(out, result);
             }
 
@@ -236,7 +274,9 @@ impl Emulator {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SUBPIECE".into()))?;
                 let a = self.read_input(op, 0)?;
                 let truncate = self.read_input(op, 1)?;
-                self.state.write_varnode(out, a >> (truncate * 8));
+                let shift = truncate.saturating_mul(8);
+                let result = if shift >= 64 { 0 } else { a >> shift };
+                self.state.write_varnode(out, result);
             }
 
             OpCode::PopCount => {
@@ -377,22 +417,41 @@ impl Emulator {
                 self.state.write_varnode(out, a.round() as i64 as u64);
             }
             OpCode::IntCarry => {
+                // Detect unsigned overflow at the operand size, not u64.
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_CARRY".into()))?;
-                let a = self.read_input(op, 0)?;
-                let b = self.read_input(op, 1)?;
-                self.state.write_varnode(out, if a.checked_add(b).is_none() { 1 } else { 0 });
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8);
+                let mask = if size >= 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
+                let a = self.read_input(op, 0)? & mask;
+                let b = self.read_input(op, 1)? & mask;
+                let sum = a.wrapping_add(b) & mask;
+                self.state.write_varnode(out, if sum < a { 1 } else { 0 });
             }
             OpCode::IntSCarry => {
+                // Detect signed overflow at the operand size, not i64.
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SCARRY".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, if a.checked_add(b).is_none() { 1 } else { 0 });
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8);
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                let overflow = match size {
+                    1 => (a as i8).checked_add(b as i8).is_none(),
+                    2 => (a as i16).checked_add(b as i16).is_none(),
+                    4 => (a as i32).checked_add(b as i32).is_none(),
+                    _ => (a as i64).checked_add(b as i64).is_none(),
+                };
+                self.state.write_varnode(out, if overflow { 1 } else { 0 });
             }
             OpCode::IntSBorrow => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SBORROW".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, if a.checked_sub(b).is_none() { 1 } else { 0 });
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8);
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                let overflow = match size {
+                    1 => (a as i8).checked_sub(b as i8).is_none(),
+                    2 => (a as i16).checked_sub(b as i16).is_none(),
+                    4 => (a as i32).checked_sub(b as i32).is_none(),
+                    _ => (a as i64).checked_sub(b as i64).is_none(),
+                };
+                self.state.write_varnode(out, if overflow { 1 } else { 0 });
             }
             OpCode::IntLessEqual => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_LESSEQUAL".into()))?;
@@ -402,9 +461,13 @@ impl Emulator {
             }
             OpCode::IntSLessEqual => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SLESSEQUAL".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, if a <= b { 1 } else { 0 });
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let extend = 64 - (size * 8);
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                let sa = ((a << extend) as i64) >> extend;
+                let sb = ((b << extend) as i64) >> extend;
+                self.state.write_varnode(out, if sa <= sb { 1 } else { 0 });
             }
             OpCode::IntDiv => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_DIV".into()))?;
@@ -413,10 +476,17 @@ impl Emulator {
                 self.state.write_varnode(out, a.checked_div(b).unwrap_or(0));
             }
             OpCode::IntSDiv => {
+                // Signed divide at the operand width — sign-extend before
+                // dividing, otherwise sdiv(-10, 2) on a 32-bit operand becomes
+                // sdiv(0xFFFFFFF6, 2) = +2147483643 instead of -5.
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SDIV".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, a.checked_div(b).unwrap_or(0) as u64);
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let extend = 64 - (size * 8);
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                let sa = ((a << extend) as i64) >> extend;
+                let sb = ((b << extend) as i64) >> extend;
+                self.state.write_varnode(out, sa.checked_div(sb).unwrap_or(0) as u64);
             }
             OpCode::IntRem => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_REM".into()))?;
@@ -426,9 +496,13 @@ impl Emulator {
             }
             OpCode::IntSRem => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_SREM".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                let b = self.read_input(op, 1)? as i64;
-                self.state.write_varnode(out, a.checked_rem(b).unwrap_or(0) as u64);
+                let size = op.inputs.first().map(|v| v.size).unwrap_or(8).min(8);
+                let extend = 64 - (size * 8);
+                let a = self.read_input(op, 0)?;
+                let b = self.read_input(op, 1)?;
+                let sa = ((a << extend) as i64) >> extend;
+                let sb = ((b << extend) as i64) >> extend;
+                self.state.write_varnode(out, sa.checked_rem(sb).unwrap_or(0) as u64);
             }
             OpCode::Insert => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INSERT".into()))?;
@@ -515,6 +589,202 @@ mod tests {
 
     fn seq() -> SeqNum {
         SeqNum::new(Address::new(SpaceId(1), 0x1000), 0)
+    }
+
+    #[test]
+    fn emu_int_left_zero_for_shift_at_or_above_width() {
+        // Per P-code spec, shift by amount >= operand bitwidth returns 0,
+        // not the wrap-around result Rust's wrapping_shl would produce.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0x0000_00FF);
+        // 4-byte operand shifted by 65: previously the emulator's u64 wrap
+        // gave (a << 1) instead of 0.
+        emu.state.write_register(0x08, 4, 65);
+        let op = PcodeOp {
+            opcode: OpCode::IntLeft,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+        // Exact-width shift (32) should also be 0.
+        emu.state.write_register(0x08, 4, 32);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+        // In-range shift still works.
+        emu.state.write_register(0x08, 4, 4);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0xFF0);
+    }
+
+    #[test]
+    fn emu_int_right_zero_for_shift_at_or_above_width() {
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFF00_0000);
+        emu.state.write_register(0x08, 4, 64);
+        let op = PcodeOp {
+            opcode: OpCode::IntRight,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+    }
+
+    #[test]
+    fn emu_int_sright_replicates_sign_bit_above_width() {
+        // ASR by >= bitwidth replicates the sign bit at the operand width.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFF); // -1 as i32
+        emu.state.write_register(0x08, 4, 40);
+        let op = PcodeOp {
+            opcode: OpCode::IntSRight,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0xFFFF_FFFF);
+        // Non-negative: result = 0.
+        emu.state.write_register(0x00, 4, 0x7000_0000);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0);
+    }
+
+    #[test]
+    fn emu_int_sright_sign_extends_at_operand_width() {
+        // ASR of a 32-bit -2 by 1 must give 32-bit -1, not 0x7FFFFFFF
+        // (which would happen if the source were treated as u64 positive).
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFE);
+        emu.state.write_register(0x08, 4, 1);
+        let op = PcodeOp {
+            opcode: OpCode::IntSRight,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x08, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn emu_int_sless_respects_operand_size() {
+        // -1 < 1 at 32-bit width must be true. Previously this used
+        // (u64 as i64) directly, treating 0xFFFFFFFF (= -1 as i32) as the
+        // positive i64 4294967295, so the comparison returned false and the
+        // N flag was wrong throughout the ARM lifter.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFF); // -1 as i32
+        emu.state.write_register(0x04, 4, 1);
+        let op = PcodeOp {
+            opcode: OpCode::IntSLess,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 1)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x04, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 1);
+    }
+
+    #[test]
+    fn emu_int_slessequal_respects_operand_size() {
+        // -1 <= -1 at 32-bit width is true.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFF);
+        emu.state.write_register(0x04, 4, 0xFFFF_FFFF);
+        let op = PcodeOp {
+            opcode: OpCode::IntSLessEqual,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 1)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x04, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 1);
+    }
+
+    #[test]
+    fn emu_int_sdiv_respects_operand_size() {
+        // sdiv(-10, 2) at 32-bit width = -5 = 0xFFFFFFFB.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFF6); // -10 as i32
+        emu.state.write_register(0x04, 4, 2);
+        let op = PcodeOp {
+            opcode: OpCode::IntSDiv,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x04, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0xFFFF_FFFB);
+    }
+
+    #[test]
+    fn emu_int_carry_respects_operand_size() {
+        // 0xFFFFFFFF + 1 at 4-byte width should carry. Previously the
+        // emulator checked u64 overflow which never triggered, breaking
+        // every flag computation built on IntCarry for 32-bit ARM/SPARC.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0xFFFF_FFFF);
+        emu.state.write_register(0x04, 4, 1);
+        let op = PcodeOp {
+            opcode: OpCode::IntCarry,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 1)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x04, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 1);
+
+        // 0x0FFFFFFF + 1 should NOT carry at 32-bit width.
+        emu.state.write_register(0x00, 4, 0x0FFF_FFFF);
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 0);
+    }
+
+    #[test]
+    fn emu_int_scarry_respects_operand_size() {
+        // INT_MAX_32 + 1 overflows signed at 32-bit width.
+        let mut emu = Emulator::new();
+        emu.state.write_register(0x00, 4, 0x7FFF_FFFF);
+        emu.state.write_register(0x04, 4, 1);
+        let op = PcodeOp {
+            opcode: OpCode::IntSCarry,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 1)),
+            inputs: SmallVec::from_slice(&[
+                VarnodeData::new(REG, 0x00, 4),
+                VarnodeData::new(REG, 0x04, 4),
+            ]),
+        };
+        emu.execute_op(&op).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 1), 1);
     }
 
     #[test]

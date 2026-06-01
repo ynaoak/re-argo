@@ -12,3 +12,5 @@ gr-lift = { workspace = true }
 gr-program = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
+rustc-hash = { workspace = true }
+rayon = { workspace = true }

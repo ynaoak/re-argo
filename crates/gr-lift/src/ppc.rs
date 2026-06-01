@@ -132,10 +132,19 @@ impl PpcLifter {
                 let v = (uimm << 16) & 0xFFFF_FFFF;
                 push(&mut ops, &mut s, OpCode::IntXor, Some(reg(ra)), &[reg(rt), constant(v, 4)]);
             }
-            28 => push(&mut ops, &mut s, OpCode::IntAnd, Some(reg(ra)), &[reg(rt), constant(uimm, 4)]),
+            28 => {
+                // andi. -- the `.` is implicit in the mnemonic; the
+                // instruction *always* records the result into CR0.
+                // Previously the CR0 update was missing, so a following
+                // `beq cr0` would branch on the previous compare.
+                push(&mut ops, &mut s, OpCode::IntAnd, Some(reg(ra)), &[reg(rt), constant(uimm, 4)]);
+                self.emit_cr0_record(reg(ra), &mut ops, &mut s, address);
+            }
             29 => {
+                // andis. -- same Rc=1 implicit semantics as andi.
                 let v = (uimm << 16) & 0xFFFF_FFFF;
                 push(&mut ops, &mut s, OpCode::IntAnd, Some(reg(ra)), &[reg(rt), constant(v, 4)]);
+                self.emit_cr0_record(reg(ra), &mut ops, &mut s, address);
             }
             11 => self.emit_cmp(ra, constant(simm, 4), true, &mut ops, &mut s, address),  // cmpwi
             10 => self.emit_cmp(ra, constant(uimm, 4), false, &mut ops, &mut s, address), // cmplwi
@@ -154,6 +163,7 @@ impl PpcLifter {
                 let d = (((word & 0x03FF_FFFC) << 6) as i32 >> 6) as i64;
                 let target = if aa { (d as u64) & 0xFFFF_FFFF } else { address.wrapping_add(d as u64) & 0xFFFF_FFFF };
                 if lk {
+                    self.emit_link_lr(&mut ops, &mut s, address);
                     push(&mut ops, &mut s, OpCode::Call, None, &[ram(target)]);
                 } else {
                     push(&mut ops, &mut s, OpCode::Branch, None, &[ram(target)]);
@@ -162,10 +172,18 @@ impl PpcLifter {
             16 => {
                 // bc  (B-form conditional)
                 let aa = (word >> 1) & 1 == 1;
+                let lk = word & 1 == 1;
                 let bo = (word >> 21) & 0x1F;
                 let bi = (word >> 16) & 0x1F;
                 let d = (((word & 0x0000_FFFC) << 16) as i32 >> 16) as i64;
                 let target = if aa { (d as u64) & 0xFFFF_FFFF } else { address.wrapping_add(d as u64) & 0xFFFF_FFFF };
+                // bcl always writes LR = PC + 4 (linkage happens regardless
+                // of whether the branch is taken). Previously the lk bit
+                // was ignored entirely, so `bcl` lifted as plain bc and
+                // every later `blr` returned to a stale LR.
+                if lk {
+                    self.emit_link_lr(&mut ops, &mut s, address);
+                }
                 if let Some(cond) = self.emit_bc_condition(bo, bi, &mut ops, &mut s, address) {
                     push(&mut ops, &mut s, OpCode::CBranch, None, &[ram(target), cond]);
                 } else {
@@ -179,16 +197,26 @@ impl PpcLifter {
                 let lk = word & 1 == 1;
                 match xo {
                     16 => {
-                        // bclr (blr = return)
+                        // bclr (blr = return). blrl is bclr with LK=1 --
+                        // we need to overwrite LR with PC+4 *after*
+                        // capturing the old LR as the indirect target,
+                        // otherwise the CallInd reads the freshly-linked
+                        // value and loops back to PC+4.
                         if lk {
-                            push(&mut ops, &mut s, OpCode::CallInd, None, &[lr()]);
+                            let saved = unique(0x780, 4);
+                            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(saved), inputs: SmallVec::from_slice(&[lr()]) });
+                            s += 1;
+                            self.emit_link_lr(&mut ops, &mut s, address);
+                            push(&mut ops, &mut s, OpCode::CallInd, None, &[saved]);
                         } else {
                             push(&mut ops, &mut s, OpCode::Return, None, &[lr()]);
                         }
                     }
                     528 => {
-                        // bcctr (bctr / bctrl)
+                        // bcctr (bctr / bctrl). bctrl links LR = PC+4
+                        // before the indirect call.
                         if lk {
+                            self.emit_link_lr(&mut ops, &mut s, address);
                             push(&mut ops, &mut s, OpCode::CallInd, None, &[ctr()]);
                         } else {
                             push(&mut ops, &mut s, OpCode::BranchInd, None, &[ctr()]);
@@ -289,25 +317,43 @@ impl PpcLifter {
         let ra = (word >> 16) & 0x1F;
         let rb = (word >> 11) & 0x1F;
         let xo = (word >> 1) & 0x3FF;
+        // Rc (record condition) is bit 31 (LSB) of the instruction word.
+        // When set, the result is reflected into CR0 -- without this every
+        // `add.` / `or.` / `subf.` etc. left CR0 holding the previous
+        // compare's bits and a following `beq cr0` branched on stale data.
+        let rc = (word & 1) == 1;
 
         let push = |ops: &mut Vec<PcodeOp>, s: &mut u32, op: OpCode, out: VarnodeData, a: VarnodeData, b: VarnodeData| {
             ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(&[a, b]) });
             *s += 1;
         };
 
+        // For ops whose Rc-record dest is `rt` (arithmetic dest).
+        let record_rt = |this: &Self, ops: &mut Vec<PcodeOp>, s: &mut u32| {
+            if rc {
+                this.emit_cr0_record(reg(rt), ops, s, address);
+            }
+        };
+        // For ops whose Rc-record dest is `ra` (logical dest).
+        let record_ra = |this: &Self, ops: &mut Vec<PcodeOp>, s: &mut u32| {
+            if rc {
+                this.emit_cr0_record(reg(ra), ops, s, address);
+            }
+        };
+
         match xo {
-            266 => push(ops, s, OpCode::IntAdd, reg(rt), reg(ra), reg(rb)),    // add
-            40 => push(ops, s, OpCode::IntSub, reg(rt), reg(rb), reg(ra)),     // subf: rt = rb - ra
-            235 => push(ops, s, OpCode::IntMult, reg(rt), reg(ra), reg(rb)),   // mullw
-            491 => push(ops, s, OpCode::IntSDiv, reg(rt), reg(ra), reg(rb)),   // divw
-            459 => push(ops, s, OpCode::IntDiv, reg(rt), reg(ra), reg(rb)),    // divwu
+            266 => { push(ops, s, OpCode::IntAdd, reg(rt), reg(ra), reg(rb)); record_rt(self, ops, s); }
+            40 => { push(ops, s, OpCode::IntSub, reg(rt), reg(rb), reg(ra)); record_rt(self, ops, s); } // subf
+            235 => { push(ops, s, OpCode::IntMult, reg(rt), reg(ra), reg(rb)); record_rt(self, ops, s); } // mullw
+            491 => { push(ops, s, OpCode::IntSDiv, reg(rt), reg(ra), reg(rb)); record_rt(self, ops, s); } // divw
+            459 => { push(ops, s, OpCode::IntDiv, reg(rt), reg(ra), reg(rb)); record_rt(self, ops, s); }  // divwu
             // logical X-form: dest = ra, sources rt(=rs) and rb
-            28 => push(ops, s, OpCode::IntAnd, reg(ra), reg(rt), reg(rb)),     // and
-            444 => push(ops, s, OpCode::IntOr, reg(ra), reg(rt), reg(rb)),     // or (mr = or rt,rs,rs)
-            316 => push(ops, s, OpCode::IntXor, reg(ra), reg(rt), reg(rb)),    // xor
-            24 => push(ops, s, OpCode::IntLeft, reg(ra), reg(rt), reg(rb)),    // slw
-            536 => push(ops, s, OpCode::IntRight, reg(ra), reg(rt), reg(rb)),  // srw
-            792 => push(ops, s, OpCode::IntSRight, reg(ra), reg(rt), reg(rb)), // sraw
+            28 => { push(ops, s, OpCode::IntAnd, reg(ra), reg(rt), reg(rb)); record_ra(self, ops, s); }
+            444 => { push(ops, s, OpCode::IntOr, reg(ra), reg(rt), reg(rb)); record_ra(self, ops, s); } // or / mr
+            316 => { push(ops, s, OpCode::IntXor, reg(ra), reg(rt), reg(rb)); record_ra(self, ops, s); }
+            24 => { push(ops, s, OpCode::IntLeft, reg(ra), reg(rt), reg(rb)); record_ra(self, ops, s); }
+            536 => { push(ops, s, OpCode::IntRight, reg(ra), reg(rt), reg(rb)); record_ra(self, ops, s); }
+            792 => { push(ops, s, OpCode::IntSRight, reg(ra), reg(rt), reg(rb)); record_ra(self, ops, s); }
             124 => {
                 // nor: ra = ~(rt | rb)
                 let t = unique(0x720, 4);
@@ -315,6 +361,7 @@ impl PpcLifter {
                 *s += 1;
                 ops.push(PcodeOp { opcode: OpCode::IntNegate, seq: seq(*s), output: Some(reg(ra)), inputs: SmallVec::from_slice(&[t]) });
                 *s += 1;
+                record_ra(self, ops, s);
             }
             0 => self.emit_cmp(ra, reg(rb), true, ops, s, address),   // cmpw
             32 => self.emit_cmp(ra, reg(rb), false, ops, s, address), // cmplw
@@ -338,6 +385,31 @@ impl PpcLifter {
             }
             _ => {}
         }
+    }
+
+    /// Write LR = PC + 4, used by every link-form branch.
+    fn emit_link_lr(&self, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = SeqNum::new(Address::new(RAM_SPACE, address), *s);
+        ops.push(PcodeOp {
+            opcode: OpCode::Copy,
+            seq,
+            output: Some(lr()),
+            inputs: SmallVec::from_slice(&[constant((address + 4) & 0xFFFF_FFFF, 4)]),
+        });
+        *s += 1;
+    }
+
+    /// Reflect a 32-bit result into CR0 by recomputing LT/GT/EQ against 0.
+    /// This is the Rc=1 / `andi.` / `andis.` semantics.
+    fn emit_cr0_record(&self, result: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        let zero = constant(0, result.size);
+        ops.push(PcodeOp { opcode: OpCode::IntSLess, seq: seq(*s), output: Some(flag(CR0_LT)), inputs: SmallVec::from_slice(&[result, zero]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntSLess, seq: seq(*s), output: Some(flag(CR0_GT)), inputs: SmallVec::from_slice(&[zero, result]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntEqual, seq: seq(*s), output: Some(flag(CR0_EQ)), inputs: SmallVec::from_slice(&[result, zero]) });
+        *s += 1;
     }
 
     fn disasm_text(&self, bytes: &[u8], address: u64, word: u32) -> String {
@@ -472,10 +544,17 @@ mod tests {
         assert_eq!(ops[0].opcode, OpCode::Branch);
         assert_eq!(ops[0].inputs[0].offset, 0x1100);
 
-        // bl +0x100 => LK=1
+        // bl +0x100 => LK=1. bl now also writes LR = PC + 4 before
+        // transferring control, so the Call is no longer the first op.
         let word_bl = (18 << 26) | 0x100 | 1;
         let ops_bl = lift(word_bl);
-        assert_eq!(ops_bl[0].opcode, OpCode::Call);
+        let call = ops_bl.iter().find(|o| o.opcode == OpCode::Call)
+            .expect("bl must emit a Call");
+        assert_eq!(call.inputs[0].offset, 0x1100);
+        let link = ops_bl.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == LR_OFFSET).unwrap_or(false))
+            .expect("bl must link LR = PC + 4");
+        assert_eq!(link.inputs[0].offset, 0x1004);
     }
 
     #[test]
@@ -519,5 +598,82 @@ mod tests {
         let word = 24 << 26;
         let ops = lift(word);
         assert!(ops.is_empty());
+    }
+
+    /// bctrl links LR = PC + 4 before the indirect call through CTR.
+    /// Pre-fix the link was missing entirely, so any callee using `blr`
+    /// after `bctrl` returned to the wrong address.
+    #[test]
+    fn lift_bctrl_links_lr() {
+        let word = 0x4E80_0421u32; // bctrl
+        let ops = lift(word);
+        let link = ops.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == LR_OFFSET).unwrap_or(false))
+            .expect("bctrl must link LR");
+        assert_eq!(link.inputs[0].offset, 0x1004);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+
+    /// blrl (bclr with LK=1) must overwrite LR with PC + 4 *after*
+    /// reading the old LR as the indirect target. Without saving the
+    /// old LR first, the CallInd would jump to the freshly-linked PC+4.
+    #[test]
+    fn lift_blrl_saves_old_lr_before_link() {
+        // blrl = bclr BO=20 LK=1 => 0x4E80_0021
+        let word = 0x4E80_0021u32;
+        let ops = lift(word);
+        let link = ops.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == LR_OFFSET).unwrap_or(false))
+            .expect("blrl must link LR");
+        let saved_copy = ops.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.space == CoreSpace::UNIQUE).unwrap_or(false)
+            && o.inputs.first().map(|v| v.space == CoreSpace::REGISTER && v.offset == LR_OFFSET).unwrap_or(false))
+            .expect("blrl must save old LR to a unique before overwriting it");
+        // Saved-LR copy must come before the LR overwrite to avoid the
+        // CallInd reading the freshly-linked value.
+        let saved_pos = ops.iter().position(|o| std::ptr::eq(o, saved_copy)).unwrap();
+        let link_pos = ops.iter().position(|o| std::ptr::eq(o, link)).unwrap();
+        assert!(saved_pos < link_pos,
+            "old-LR save must precede the new LR write: {:?}", ops);
+        // CallInd reads the saved unique, not LR.
+        let callind = ops.iter().find(|o| o.opcode == OpCode::CallInd)
+            .expect("blrl must end with CallInd");
+        assert_eq!(callind.inputs[0].space, CoreSpace::UNIQUE);
+    }
+
+    /// `andi.` always records its result into CR0. Pre-fix the CR0
+    /// flags weren't touched, so `andi. r3, r4, mask; beq cr0, L`
+    /// branched on whatever was in CR0 from a previous compare.
+    #[test]
+    fn lift_andi_updates_cr0() {
+        // andi. r3, r4, 0xFF => opcd=28 rs=4 ra=3 uimm=0xFF
+        let word = (28u32 << 26) | (4 << 21) | (3 << 16) | 0xFF;
+        let ops = lift(word);
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == CR0_LT).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == CR0_GT).unwrap_or(false)));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == CR0_EQ).unwrap_or(false)));
+    }
+
+    /// X-form ops with Rc=1 (e.g. `add.`) must record CR0. Pre-fix the
+    /// Rc bit was ignored everywhere in the X-form decoder.
+    #[test]
+    fn lift_add_dot_updates_cr0() {
+        // add. r3, r4, r5 => opcd=31 rt=3 ra=4 rb=5 xo=266 Rc=1
+        let word = (31u32 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (266 << 1) | 1;
+        let ops = lift(word);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd));
+        assert!(ops.iter().any(|o| o.output.map(|v| v.offset == CR0_EQ).unwrap_or(false)),
+            "add. must record CR0_EQ: {:?}", ops);
+    }
+
+    /// X-form with Rc=0 must NOT update CR0 -- the pre-fix code would
+    /// have always emitted the same op set regardless. Pin the behavior.
+    #[test]
+    fn lift_plain_add_does_not_update_cr0() {
+        // add r3, r4, r5 (Rc=0)
+        let word = (31u32 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (266 << 1);
+        let ops = lift(word);
+        assert!(!ops.iter().any(|o| o.output.map(|v| matches!(v.offset, CR0_LT | CR0_GT | CR0_EQ)).unwrap_or(false)),
+            "plain add must not touch CR0: {:?}", ops);
     }
 }

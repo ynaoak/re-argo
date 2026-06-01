@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 
 use gr_core::pcode::{OpCode, VarnodeData};
 
@@ -35,7 +35,22 @@ pub struct SsaFunction {
     pub ops: Vec<SsaOp>,
     pub cfg: ControlFlowGraph,
     next_var_id: VarId,
-    var_versions: BTreeMap<(u32, u64, u32), u32>,
+    /// FxHashMap rather than BTreeMap: keys are integer triples and
+    /// every read/write of a register or RAM slot in `build_ssa` hits
+    /// these maps, so a constant-time hash (FxHash specialises well on
+    /// integer-only keys) beats BTreeMap's per-step comparison for
+    /// any function with more than a handful of distinct slots.
+    var_versions: FxHashMap<(u32, u64, u32), u32>,
+    /// Canonical varnode id for the *current* version of each
+    /// (space, offset, size). Set by `create_new_version` whenever a
+    /// register/RAM slot is rewritten, and read by `get_or_create_var`
+    /// so every read of the same SSA value shares a single SsaVarnode
+    /// entry. Without this, every read minted a fresh varnode and the
+    /// def's `uses` list was never populated — DCE then dropped any
+    /// op whose output was actually live (because uses had been pushed
+    /// onto the unrelated read-side varnodes), and copy_propagation
+    /// couldn't match `*inp == out_id` because the ids never coincided.
+    current_var: FxHashMap<(u32, u64, u32), VarId>,
 }
 
 impl SsaFunction {
@@ -47,7 +62,8 @@ impl SsaFunction {
             ops: Vec::new(),
             cfg,
             next_var_id: 0,
-            var_versions: BTreeMap::new(),
+            var_versions: FxHashMap::default(),
+            current_var: FxHashMap::default(),
         };
         func.build_ssa();
         func
@@ -102,6 +118,9 @@ impl SsaFunction {
     fn get_or_create_var(&mut self, vn: &VarnodeData) -> VarId {
         let key = (vn.space.0, vn.offset, vn.size);
         if vn.space == gr_core::address::SpaceId::CONST {
+            // Constants stay fresh-per-use: each literal in the P-code
+            // is its own occurrence, and downstream passes compare
+            // constants by data, not by VarId.
             let id = self.next_var_id;
             self.next_var_id += 1;
             self.varnodes.push(SsaVarnode {
@@ -113,6 +132,17 @@ impl SsaFunction {
             });
             return id;
         }
+        // For register/RAM/UNIQUE slots: reuse the canonical varnode for
+        // the current version so every read points at the same entry as
+        // the corresponding def. Without this, def_op was set on one
+        // SsaVarnode and uses landed on a different one, breaking
+        // def-use entirely.
+        if let Some(&existing) = self.current_var.get(&key) {
+            return existing;
+        }
+        // First reference to this slot in the function — model it as a
+        // version-0 "incoming" value (function parameter, callee-saved
+        // register on entry, etc.) with no defining op.
         let version = self.var_versions.get(&key).copied().unwrap_or(0);
         let id = self.next_var_id;
         self.next_var_id += 1;
@@ -123,6 +153,7 @@ impl SsaFunction {
             def_op: None,
             uses: Vec::new(),
         });
+        self.current_var.insert(key, id);
         id
     }
 
@@ -141,6 +172,9 @@ impl SsaFunction {
             def_op: None,
             uses: Vec::new(),
         });
+        // Subsequent reads of this slot resolve to this varnode until
+        // the next def rotates `current_var` again.
+        self.current_var.insert(key, id);
         id
     }
 

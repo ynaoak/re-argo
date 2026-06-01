@@ -40,7 +40,17 @@ impl BasicBlock {
         self.instructions.last().and_then(|i| {
             i.ops.iter().rev().find_map(|op| {
                 if matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::Call) {
-                    op.inputs.first().map(|vn| vn.offset)
+                    // Only a RAM-space operand is a real code address; the
+                    // leader pass applies the same guard, so successor wiring
+                    // must too, or a constant/register operand whose offset
+                    // happens to equal a block start would create a bogus edge.
+                    op.inputs.first().and_then(|vn| {
+                        if vn.space == gr_core::address::SpaceId::RAM {
+                            Some(vn.offset)
+                        } else {
+                            None
+                        }
+                    })
                 } else {
                     None
                 }
@@ -77,22 +87,23 @@ impl ControlFlowGraph {
 
         for insn in instructions {
             let has_branch = insn.ops.iter().any(|op| {
-                matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
+                matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd)
             });
             let has_return = insn.ops.iter().any(|op| op.opcode == OpCode::Return);
 
-            if has_branch {
+            if has_branch || has_return {
+                // Anything after a transfer is the start of the next block,
+                // including the unreachable instruction right after a Return
+                // or an indirect jump (the decompiler may still encounter it
+                // via a different path).
                 for op in &insn.ops {
                     if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
                         && let Some(target_vn) = op.inputs.first()
-                            && target_vn.space == gr_core::address::SpaceId::RAM {
-                                leaders.insert(target_vn.offset);
-                            }
+                        && target_vn.space == gr_core::address::SpaceId::RAM
+                    {
+                        leaders.insert(target_vn.offset);
+                    }
                 }
-                let fall = insn.address + insn.length as u64;
-                leaders.insert(fall);
-            }
-            if has_return {
                 let fall = insn.address + insn.length as u64;
                 leaders.insert(fall);
             }
@@ -149,8 +160,13 @@ impl ControlFlowGraph {
             let has_return = last_insn.is_some_and(|insn| {
                 insn.ops.iter().any(|op| op.opcode == OpCode::Return)
             });
+            let has_branch_ind = last_insn.is_some_and(|insn| {
+                insn.ops.iter().any(|op| op.opcode == OpCode::BranchInd)
+            });
 
-            if has_return {
+            // Return and indirect branch both terminate the block with no
+            // statically-known successor.
+            if has_return || has_branch_ind {
                 continue;
             }
 
@@ -331,5 +347,27 @@ mod tests {
         let cfg = ControlFlowGraph::build(&insns);
         let doms = cfg.dominators();
         assert!(doms[cfg.entry_block].contains(&cfg.entry_block));
+    }
+
+    fn branch_ind_insn(addr: u64) -> LiftedInstruction {
+        make_insn(addr, 4, vec![PcodeOp {
+            opcode: OpCode::BranchInd,
+            seq: SeqNum::new(Address::new(SpaceId(1), addr), 0),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId(3), 0, 4)]),
+        }])
+    }
+
+    #[test]
+    fn branch_ind_ends_block_without_falling_through() {
+        // `ldr pc, [...]` (now lifted to BranchInd) must end the block
+        // and NOT chain into the following instruction.
+        let insns = vec![branch_ind_insn(0x1000), nop_insn(0x1004), ret_insn(0x1005)];
+        let cfg = ControlFlowGraph::build(&insns);
+        // The BranchInd block must have no successor (target unknown).
+        let bi_block = cfg.block_at(0x1000).unwrap();
+        assert!(bi_block.successors.is_empty());
+        // The following address starts its own block.
+        assert!(cfg.block_at(0x1004).is_some());
     }
 }

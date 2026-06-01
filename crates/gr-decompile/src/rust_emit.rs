@@ -349,10 +349,21 @@ impl RustEmitter {
                 Some(format!("{} = {} != {};", dst, a, b))
             }
             OpCode::IntSLess => {
+                // Sign-extend at the source width before casting to i64: a
+                // 32-bit value held in u64 as 0xFFFFFFFF must compare as -1,
+                // not as +4294967295.
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = ({} as i64) < ({} as i64);", dst, a, b))
+                let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({} as {} as i64) < ({} as {} as i64);", dst, a, ty, b, ty))
+            }
+            OpCode::IntSLessEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({} as {} as i64) <= ({} as {} as i64);", dst, a, ty, b, ty))
             }
             OpCode::IntLess => {
                 let dst = out_name?;
@@ -360,15 +371,83 @@ impl RustEmitter {
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {} < {};", dst, a, b))
             }
-            OpCode::IntZExt => {
+            OpCode::IntLessEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = {} as u64;", dst, a))
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} <= {};", dst, a, b))
+            }
+            OpCode::IntSRight => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = (({} as {}) >> {}) as u64;", dst, a, ty, b))
+            }
+            OpCode::IntDiv => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} / {};", dst, a, b))
+            }
+            OpCode::IntSDiv => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = (({} as {}) / ({} as {})) as u64;", dst, a, ty, b, ty))
+            }
+            OpCode::IntRem => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} % {};", dst, a, b))
+            }
+            OpCode::IntSRem => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = (({} as {}) % ({} as {})) as u64;", dst, a, ty, b, ty))
+            }
+            OpCode::BoolAnd => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} != 0 && {} != 0;", dst, a, b))
+            }
+            OpCode::BoolOr => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} != 0 || {} != 0;", dst, a, b))
+            }
+            OpCode::BoolXor => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = ({} != 0) != ({} != 0);", dst, a, b))
+            }
+            OpCode::BoolNegate => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = {} == 0;", dst, a))
+            }
+            OpCode::IntZExt => {
+                // Mask to the source width before widening so high bits of the
+                // u64 storage cell don't leak through.
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let src_ty = size_to_rust_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({} as {}) as u64;", dst, a, src_ty))
             }
             OpCode::IntSExt => {
+                // Sign-extend from the source width — not from i64 — so a
+                // 1-byte 0xFF widens to -1, not +255.
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = {} as i64 as u64;", dst, a))
+                let src_ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({} as {} as i64) as u64;", dst, a, src_ty))
             }
             OpCode::Load => {
                 let dst = out_name?;
@@ -582,6 +661,16 @@ fn size_to_rust_type(size: u32) -> &'static str {
     }
 }
 
+fn size_to_rust_signed_type(size: u32) -> &'static str {
+    match size {
+        1 => "i8",
+        2 => "i16",
+        4 => "i32",
+        8 => "i64",
+        _ => "i64",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,5 +835,65 @@ mod tests {
             "Should not contain C types, got:\n{}",
             output
         );
+    }
+
+    #[test]
+    fn emit_int_sext_sign_extends_from_source_width() {
+        // Previously `IntSExt` rendered as `{} as i64 as u64`, which
+        // sign-extends from i64 — the source's high bits in the u64 cell
+        // already poisoned it. A 1-byte 0xFF should widen to -1, not 255.
+        // Verify the source's signed type is in the cast chain.
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let byte_reg = VarnodeData::new(SpaceId(2), 0x00, 1);
+        let wide_reg = VarnodeData::new(SpaceId(2), 0x08, 8);
+        let zero = VarnodeData::new(SpaceId(0), 0, 8);
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::IntSExt,
+                seq: seq(0x1000), output: Some(wide_reg),
+                inputs: SmallVec::from_slice(&[byte_reg]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001), output: None,
+                inputs: SmallVec::from_slice(&[zero]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let ssa = SsaFunction::from_cfg("sext".into(), 0x1000, cfg);
+        let structured = structure_cfg(&ssa.cfg);
+        let output = RustEmitter::new().emit_function(&ssa, &structured);
+        assert!(output.contains("as i8"),
+            "1-byte IntSExt must sign-extend via i8 (not bare i64):\n{}", output);
+    }
+
+    #[test]
+    fn emit_int_sless_sign_extends_from_source_width() {
+        // For 4-byte operands, `(a as i64) < (b as i64)` would treat a u32
+        // 0xFFFFFFFF as +4294967295 instead of -1. The fix sign-extends at
+        // the source width first.
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let reg32 = VarnodeData::new(SpaceId(2), 0x00, 4);
+        let zero4 = VarnodeData::new(SpaceId(0), 0, 4);
+        let flag = VarnodeData::new(SpaceId(2), 0x20, 1);
+        let zero8 = VarnodeData::new(SpaceId(0), 0, 8);
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::IntSLess,
+                seq: seq(0x1000), output: Some(flag),
+                inputs: SmallVec::from_slice(&[reg32, zero4]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001), output: None,
+                inputs: SmallVec::from_slice(&[zero8]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let ssa = SsaFunction::from_cfg("sless".into(), 0x1000, cfg);
+        let structured = structure_cfg(&ssa.cfg);
+        let output = RustEmitter::new().emit_function(&ssa, &structured);
+        assert!(output.contains("as i32 as i64"),
+            "4-byte IntSLess must sign-extend via i32 before widening:\n{}", output);
     }
 }

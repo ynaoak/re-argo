@@ -342,7 +342,18 @@ impl CEmitter {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = (int){} < (int){};", dst, a, b))
+                // Use a width-correct signed type, not bare `(int)` (which is
+                // implementation-defined width and would silently truncate
+                // 64-bit operands to 32 bits).
+                let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({}){} < ({}){};", dst, ty, a, ty, b))
+            }
+            OpCode::IntSLessEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({}){} <= ({}){};", dst, ty, a, ty, b))
             }
             OpCode::IntLess => {
                 let dst = out_name?;
@@ -350,11 +361,85 @@ impl CEmitter {
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {} < {};", dst, a, b))
             }
-            OpCode::IntZExt | OpCode::IntSExt => {
+            OpCode::IntLessEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                let cast = if op.opcode == OpCode::IntSExt { "(int64_t)" } else { "(uint64_t)" };
-                Some(format!("{} = {}{};", dst, cast, a))
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} <= {};", dst, a, b))
+            }
+            OpCode::IntSRight => {
+                // Signed shift requires casting the LHS to the size-matched
+                // signed type so the compiler emits an arithmetic shift.
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({}){} >> {};", dst, ty, a, b))
+            }
+            OpCode::IntDiv => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} / {};", dst, a, b))
+            }
+            OpCode::IntSDiv => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({}){} / ({}){};", dst, ty, a, ty, b))
+            }
+            OpCode::IntRem => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} % {};", dst, a, b))
+            }
+            OpCode::IntSRem => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                Some(format!("{} = ({}){} % ({}){};", dst, ty, a, ty, b))
+            }
+            OpCode::BoolAnd => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} && {};", dst, a, b))
+            }
+            OpCode::BoolOr => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} || {};", dst, a, b))
+            }
+            OpCode::BoolXor => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = !{} != !{};", dst, a, b))
+            }
+            OpCode::BoolNegate => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = !{};", dst, a))
+            }
+            OpCode::IntZExt => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                // Cast through the source's unsigned type so a non-MSB-set
+                // value isn't accidentally sign-extended by C's promotion.
+                let src_ty = size_to_type(func.varnodes[op.inputs[0] as usize].data.size);
+                let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
+            }
+            OpCode::IntSExt => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let src_ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                let dst_ty = size_to_signed_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
             }
             OpCode::Load => {
                 let dst = out_name?;
@@ -556,6 +641,16 @@ fn size_to_type(size: u32) -> &'static str {
     }
 }
 
+fn size_to_signed_type(size: u32) -> &'static str {
+    match size {
+        1 => "int8_t",
+        2 => "int16_t",
+        4 => "int32_t",
+        8 => "int64_t",
+        _ => "int64_t",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +696,73 @@ mod tests {
         assert!(output.contains("my_func(void)"));
         assert!(output.contains("rax = 0x2a"));
         assert!(output.contains("return"));
+    }
+
+    #[test]
+    fn emit_int_sless_uses_width_correct_signed_cast() {
+        // For 4-byte operands the previous `(int)` cast had implementation-
+        // defined width; for 8-byte operands it would silently truncate to
+        // 32 bits and compare the wrong values. Verify the size-matched
+        // signed type is used.
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let reg32 = VarnodeData::new(SpaceId(2), 0x00, 4);
+        let reg64 = VarnodeData::new(SpaceId(2), 0x10, 8);
+        let flag = VarnodeData::new(SpaceId(2), 0x20, 1);
+        let zero4 = VarnodeData::new(SpaceId(0), 0, 4);
+        let zero8 = VarnodeData::new(SpaceId(0), 0, 8);
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::IntSLess,
+                seq: seq(0x1000), output: Some(flag),
+                inputs: SmallVec::from_slice(&[reg32, zero4]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::IntSLess,
+                seq: seq(0x1001), output: Some(flag),
+                inputs: SmallVec::from_slice(&[reg64, zero8]),
+            }]),
+            make_lifted(0x1002, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1002), output: None,
+                inputs: SmallVec::from_slice(&[zero8]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let ssa = SsaFunction::from_cfg("cmp".into(), 0x1000, cfg);
+        let structured = structure_cfg(&ssa.cfg);
+        let output = CEmitter::new().emit_function(&ssa, &structured);
+        assert!(output.contains("(int32_t)"), "4-byte SLess must use int32_t cast:\n{}", output);
+        assert!(output.contains("(int64_t)"), "8-byte SLess must use int64_t cast:\n{}", output);
+        assert!(!output.contains("(int)"), "bare (int) cast leaks implementation-defined width:\n{}", output);
+    }
+
+    #[test]
+    fn emit_int_sright_casts_to_signed_for_arithmetic_shift() {
+        // Plain `a >> b` on an unsigned C type is a logical shift; the
+        // previous fallback printed `op_name(...)` and lost the arithmetic
+        // shift meaning. Verify the operand is cast to the size-matched
+        // signed type so the C compiler emits an arithmetic shift.
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let reg32 = VarnodeData::new(SpaceId(2), 0x00, 4);
+        let imm = VarnodeData::new(SpaceId(0), 3, 4);
+        let zero8 = VarnodeData::new(SpaceId(0), 0, 8);
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::IntSRight,
+                seq: seq(0x1000), output: Some(reg32),
+                inputs: SmallVec::from_slice(&[reg32, imm]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001), output: None,
+                inputs: SmallVec::from_slice(&[zero8]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let ssa = SsaFunction::from_cfg("asr".into(), 0x1000, cfg);
+        let structured = structure_cfg(&ssa.cfg);
+        let output = CEmitter::new().emit_function(&ssa, &structured);
+        assert!(output.contains("(int32_t)") && output.contains(">> 3"),
+            "ASR must cast LHS to int32_t and use >>:\n{}", output);
     }
 }

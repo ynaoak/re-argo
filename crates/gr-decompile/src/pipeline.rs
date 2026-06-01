@@ -1,6 +1,7 @@
 use gr_lift::{LiftedInstruction, PcodeLift};
 use gr_loader::Memory;
 use gr_program::Program;
+use rayon::prelude::*;
 
 use crate::cfg::ControlFlowGraph;
 use crate::emit::CEmitter;
@@ -112,6 +113,29 @@ pub fn decompile_function(
         .unwrap_or_default();
 
     build_decompile_result(&terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
+}
+
+/// Decompile every function the program knows about, in parallel.
+///
+/// Each function decompiles independently (no shared mutable state
+/// between functions), so the work fans out to rayon's thread pool
+/// and the wall-clock cost is ~`sum / threads` rather than `sum`.
+/// Results come back in (entry_point, Result) pairs so a single
+/// failed function doesn't abort the whole batch.
+pub fn decompile_all(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+) -> Vec<(u64, Result<DecompileResult, String>)> {
+    let entries: Vec<u64> = program
+        .listing
+        .functions()
+        .map(|f| f.entry_point)
+        .collect();
+
+    entries
+        .par_iter()
+        .map(|&entry| (entry, decompile_function(lifter, program, entry)))
+        .collect()
 }
 
 /// Result of taint-tracking a function from its parameters.
@@ -251,19 +275,49 @@ fn trim_to_function_body(
     }
 }
 
+/// Trim the lifted-instruction stream to just the part reachable from
+/// the entry instruction along statically-known control flow.
+///
+/// The previous implementation cut at the *first* Return op encountered
+/// in address order. That dropped every function with an early return:
+/// in the canonical `if cond return; ... return;` shape, the branch
+/// target lives at a higher address than the early `ret`, so cutting
+/// at the early ret discarded the JE-reached half of the function and
+/// the decompiler emitted only one of the two return paths.
+///
+/// CFG reachability is the right boundary: a block is in the function
+/// if it's reachable from entry along Branch/CBranch/fall-through
+/// edges. Blocks the lifter included but that no in-range edge reaches
+/// (padding, the next function's prelude) are dropped.
 fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> {
-    let mut result = Vec::new();
-    for insn in instructions {
-        let is_ret = insn
-            .ops
-            .iter()
-            .any(|op| op.opcode == gr_core::pcode::OpCode::Return);
-        result.push(insn.clone());
-        if is_ret {
-            break;
+    if instructions.is_empty() {
+        return Vec::new();
+    }
+    let cfg = ControlFlowGraph::build(instructions);
+    let n = cfg.blocks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut visited = vec![false; n];
+    let mut stack = vec![cfg.entry_block];
+    while let Some(b) = stack.pop() {
+        if visited[b] {
+            continue;
+        }
+        visited[b] = true;
+        for &s in &cfg.blocks[b].successors {
+            stack.push(s);
         }
     }
-    result
+    let reachable: std::collections::BTreeSet<u64> = (0..n)
+        .filter(|&b| visited[b])
+        .flat_map(|b| cfg.blocks[b].instructions.iter().map(|i| i.address))
+        .collect();
+    instructions
+        .iter()
+        .filter(|insn| reachable.contains(&insn.address))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -310,5 +364,33 @@ mod tests {
         let result = decompile(&lifter, &mem, 0x1000, "stack_func", 100).unwrap();
         assert!(result.c_code.contains("void stack_func(void)"));
         assert!(result.stats.instructions_lifted == 3);
+    }
+
+    /// Pre-fix `trim_to_return` cut at the first Return op in address
+    /// order, so functions with an early return lost every instruction
+    /// after that early `ret` -- including the JE target and the second
+    /// return path. Now the trim follows CFG reachability and both
+    /// halves of the function are preserved.
+    #[test]
+    fn decompile_keeps_je_target_past_early_return() {
+        let lifter = X86Lifter::new_64();
+        // 0x1000: cmp eax, 0       (83 f8 00)
+        // 0x1003: je +6            (74 06)  -> 0x100B
+        // 0x1005: mov eax, 1       (b8 01 00 00 00)
+        // 0x100A: ret              (c3)
+        // 0x100B: mov eax, 2       (b8 02 00 00 00)
+        // 0x1010: ret              (c3)
+        let code = [
+            0x83, 0xf8, 0x00, 0x74, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3,
+            0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let result = decompile(&lifter, &mem, 0x1000, "early_ret", 100).unwrap();
+        // Six instructions, three basic blocks (header / then / else).
+        // Pre-fix this was 4 instructions, 2 blocks because the JE target
+        // (0x100B onwards) was dropped.
+        assert_eq!(result.stats.instructions_lifted, 6,
+            "all reachable instructions must survive trim: {:?}", result.stats.basic_blocks);
+        assert_eq!(result.stats.basic_blocks, 3);
     }
 }

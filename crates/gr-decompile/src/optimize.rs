@@ -99,10 +99,18 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
         if let Some(val) = result {
             let out_id = func.ops[i].output.unwrap();
             let out_size = func.varnodes[out_id as usize].data.size;
+            // Truncate to the operand width: a folded 32-bit `0xFFFFFFFF + 1`
+            // must be 0, not 0x1_0000_0000. The constant is emitted from its
+            // raw offset, so an unmasked value would print (and re-fold) wrong.
+            let masked = if out_size >= 8 {
+                val
+            } else {
+                val & ((1u64 << (out_size * 8)) - 1)
+            };
             let const_id = func.varnodes.len() as u32;
             func.varnodes.push(crate::ssa::SsaVarnode {
                 id: const_id,
-                data: gr_core::pcode::VarnodeData::new(gr_core::address::SpaceId::CONST, val, out_size),
+                data: gr_core::pcode::VarnodeData::new(gr_core::address::SpaceId::CONST, masked, out_size),
                 version: 0,
                 def_op: None,
                 uses: vec![i],
@@ -184,20 +192,22 @@ fn is_commutative(op: OpCode) -> bool {
     )
 }
 
-/// Rewrite every varnode identifying value `from` to identify value `to`,
-/// redirecting all reads of `from` onto `to`.
-fn redirect_value(func: &mut SsaFunction, from: ValueKey, to: ValueKey) {
-    let new_data = gr_core::pcode::VarnodeData::new(
-        gr_core::address::SpaceId(to.0),
-        to.1,
-        to.2,
-    );
-    for vn in &mut func.varnodes {
-        if (vn.data.space.0, vn.data.offset, vn.data.size, vn.version) == from {
-            vn.data = new_data;
-            vn.version = to.3;
+/// Follow a chain of redirects to the canonical target. Caps the
+/// chain length defensively so a cyclic redirect map (which the CSE
+/// loop is structured not to produce) can't loop forever.
+fn resolve_redirect(
+    redirects: &rustc_hash::FxHashMap<ValueKey, ValueKey>,
+    mut k: ValueKey,
+) -> ValueKey {
+    let mut steps = 0;
+    while let Some(&next) = redirects.get(&k) {
+        if next == k || steps > 64 {
+            break;
         }
+        k = next;
+        steps += 1;
     }
+    k
 }
 
 /// Local common subexpression elimination.
@@ -206,11 +216,21 @@ fn redirect_value(func: &mut SsaFunction, from: ValueKey, to: ValueKey) {
 /// by an earlier pure op (same opcode and inputs by value identity) is removed,
 /// and its uses are redirected to the earlier result. Restricting to a single
 /// block keeps the rewrite safe without dominator analysis.
+///
+/// Previously each CSE hit called `redirect_value`, which linearly scanned
+/// every varnode in the function and rewrote any matching one. For a
+/// function with N CSE eliminations and V varnodes that was O(N*V).
+/// We now collect the redirects into a BTreeMap during the loop and
+/// apply them in a single linear pass over varnodes at the end --
+/// O(N + V). Subsequent ops in the same pass consult the in-progress
+/// redirect map via `resolve_redirect` so cascading eliminations
+/// (the result of one CSE feeding into another) still fire.
 pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     let mut eliminated = 0;
-    // (block, opcode name, input value keys) -> output value key
-    let mut seen: std::collections::BTreeMap<(usize, &'static str, Vec<ValueKey>), ValueKey> =
-        std::collections::BTreeMap::new();
+    let mut seen: rustc_hash::FxHashMap<(usize, &'static str, Vec<ValueKey>), ValueKey> =
+        rustc_hash::FxHashMap::default();
+    let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
+        rustc_hash::FxHashMap::default();
 
     for i in 0..func.ops.len() {
         if func.ops[i].dead {
@@ -225,22 +245,42 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             continue;
         }
 
-        let mut in_keys: Vec<ValueKey> =
-            func.ops[i].inputs.iter().map(|&id| value_key(func, id)).collect();
+        let mut in_keys: Vec<ValueKey> = func.ops[i]
+            .inputs
+            .iter()
+            .map(|&id| resolve_redirect(&redirects, value_key(func, id)))
+            .collect();
         if is_commutative(opcode) {
             in_keys.sort();
         }
         let key = (func.ops[i].block, opcode.name(), in_keys);
-        let out_key = value_key(func, out_id);
+        let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
         if let Some(&existing) = seen.get(&key) {
-            redirect_value(func, out_key, existing);
+            redirects.insert(out_key, existing);
             func.ops[i].dead = true;
             eliminated += 1;
         } else {
             seen.insert(key, out_key);
         }
     }
+
+    // Apply all redirects in a single pass over the varnode arena.
+    if !redirects.is_empty() {
+        for vn in &mut func.varnodes {
+            let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            let to = resolve_redirect(&redirects, key);
+            if to != key {
+                vn.data = gr_core::pcode::VarnodeData::new(
+                    gr_core::address::SpaceId(to.0),
+                    to.1,
+                    to.2,
+                );
+                vn.version = to.3;
+            }
+        }
+    }
+
     eliminated
 }
 
@@ -545,6 +585,41 @@ mod tests {
     }
 
     #[test]
+    fn constant_folding_truncates_to_operand_width() {
+        // 32-bit 0xFFFFFFFF + 1 must fold to 0, not 0x1_0000_0000.
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let reg = VarnodeData::new(SpaceId(2), 0x00, 4); // 4-byte result
+        let a = VarnodeData::new(SpaceId(0), 0xFFFF_FFFF, 4);
+        let b = VarnodeData::new(SpaceId(0), 1, 4);
+
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::IntAdd,
+                seq: seq(0x1000),
+                output: Some(reg),
+                inputs: SmallVec::from_slice(&[a, b]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001),
+                output: None,
+                inputs: SmallVec::from_slice(&[reg]),
+            }]),
+        ];
+
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        assert!(constant_fold(&mut ssa) > 0);
+        // The folded op is now a Copy of a CONST whose value is masked to 4 bytes.
+        let folded_const = ssa.ops.iter()
+            .find(|o| o.opcode == OpCode::Copy && !o.dead)
+            .and_then(|o| o.inputs.first().copied())
+            .map(|id| ssa.varnodes[id as usize].data.offset)
+            .expect("expected a folded Copy of a constant");
+        assert_eq!(folded_const, 0, "0xFFFFFFFF + 1 at 4 bytes must wrap to 0");
+    }
+
+    #[test]
     fn strength_reduce_multiply_by_power_of_two() {
         let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
         let reg_rax = VarnodeData::new(SpaceId(2), 0x00, 8);
@@ -739,5 +814,128 @@ mod tests {
         let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
         let eliminated = common_subexpression_elimination(&mut ssa);
         assert_eq!(eliminated, 0, "different opcodes must not be merged");
+    }
+
+    /// DCE must not delete a Copy that defines a register subsequently
+    /// read by Return. Pre-fix the SSA builder minted a fresh varnode for
+    /// every read, so the def-side `uses` list stayed empty and DCE
+    /// flagged the live Copy as dead.
+    #[test]
+    fn dce_keeps_live_def_used_by_return() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let imm = VarnodeData::new(SpaceId(0), 42, 8);
+
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::Copy,
+                seq: seq(0x1000),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[imm]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001),
+                output: None,
+                inputs: SmallVec::from_slice(&[rax]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let removed = dead_code_elimination(&mut ssa);
+        assert_eq!(removed, 0, "Copy of rax is live (Return reads rax)");
+        let copy_live = ssa.ops.iter().any(|op| !op.dead && op.opcode == OpCode::Copy);
+        assert!(copy_live, "the live Copy must survive DCE: {:?}", ssa.ops);
+    }
+
+    /// copy_propagation pushes a constant Copy's value through to the
+    /// consuming op. Pre-fix the input ids never coincided with the
+    /// output id, so the `*inp == out_id` substitution never fired.
+    #[test]
+    fn copy_propagation_replaces_const_use_downstream() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rbx = VarnodeData::new(SpaceId(2), 0x18, 8);
+        let imm_99 = VarnodeData::new(SpaceId(0), 99, 8);
+        let imm_2 = VarnodeData::new(SpaceId(0), 2, 8);
+
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::Copy,
+                seq: seq(0x1000),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[imm_99]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::IntMult,
+                seq: seq(0x1001),
+                output: Some(rbx),
+                inputs: SmallVec::from_slice(&[rax, imm_2]),
+            }]),
+            make_lifted(0x1002, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1002),
+                output: None,
+                inputs: SmallVec::from_slice(&[rbx]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let propagated = copy_propagation(&mut ssa);
+        assert!(propagated > 0, "rax=99 should propagate into the IntMult");
+        let mult_op = ssa
+            .ops
+            .iter()
+            .find(|op| !op.dead && op.opcode == OpCode::IntMult)
+            .expect("IntMult op must still be present");
+        let all_const = mult_op
+            .inputs
+            .iter()
+            .all(|&id| ssa.varnodes[id as usize].data.space == SpaceId::CONST);
+        assert!(
+            all_const,
+            "after propagation, IntMult inputs must all be CONST: {:?}",
+            mult_op
+        );
+    }
+
+    /// Same SSA value read twice (e.g., `xor rax, rax` after rax is set)
+    /// must yield matching input VarIds so algebraic_simplification can
+    /// fold `x ^ x` to 0. Pre-fix the two reads minted distinct varnodes
+    /// and the optimization was silently skipped.
+    #[test]
+    fn xor_self_simplifies_after_def() {
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let imm = VarnodeData::new(SpaceId(0), 42, 8);
+
+        let insns = vec![make_lifted(0x1000, vec![
+            PcodeOp {
+                opcode: OpCode::Copy,
+                seq: seq(0x1000, 0),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[imm]),
+            },
+            PcodeOp {
+                opcode: OpCode::IntXor,
+                seq: seq(0x1000, 1),
+                output: Some(rax),
+                inputs: SmallVec::from_slice(&[rax, rax]),
+            },
+        ])];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        let xor = ssa
+            .ops
+            .iter()
+            .find(|op| op.opcode == OpCode::IntXor)
+            .expect("IntXor op present");
+        assert_eq!(
+            xor.inputs[0], xor.inputs[1],
+            "both reads of rax at the same version must share a VarId: {:?}",
+            xor
+        );
+        let simplified = algebraic_simplification(&mut ssa);
+        assert!(simplified > 0, "x ^ x should fold to 0");
     }
 }

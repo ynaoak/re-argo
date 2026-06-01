@@ -4,12 +4,17 @@
 //! (immediate, immediate-shift, and register-specified-shift operand2), single
 //! load/store, block load/store (push/pop), multiply, and branches. Capstone
 //! supplies the disassembly text. The S bit sets NZCV for register-writing
-//! data-processing (N/Z from the result, arithmetic C/V from the operands, and
-//! for logical ops C from the shifter carry-out — including register-specified
-//! shifts, with a shift-amount-of-zero guard). ADC/SBC/RSC use the carry flag.
+//! data-processing (N/Z from the result, arithmetic C/V from the operands —
+//! ADCS/SBCS/RSCS correctly include the carry-in via the partial-sum
+//! intermediates — and for logical ops C from the shifter carry-out, including
+//! register-specified shifts with a shift-amount-of-zero guard). ADC/SBC/RSC
+//! use the carry flag.
 //! Conditional (non-AL) A32 data-processing that writes a register is modelled
-//! branch-free via a select on the condition, since the emulator/CFG do not
-//! support intra-instruction p-code branches. Thumb IT blocks are handled via a
+//! branch-free via a select on the condition (evaluated against pre-op flag
+//! values), with both the register write and any S-bit flag updates predicated,
+//! since the emulator/CFG do not support intra-instruction p-code branches.
+//! T16 ALU ops always set the flags ARM specifies (NZCV for adds/subs/negs,
+//! NZ for logical/multiply, NZC for shifts). Thumb IT blocks are handled via a
 //! `LiftContext` threaded through a contiguous lift: the IT instruction arms the
 //! state and each guarded instruction is predicated branch-free (register writes
 //! committed by select, guarded stores committed via load-select-store, a
@@ -146,19 +151,42 @@ impl Arm32Lifter {
 
         match top5 {
             0x00..=0x02 => {
-                // LSL / LSR / ASR by immediate
+                // LSL / LSR / ASR by immediate. T16 always sets NZ; C from
+                // shifter carry-out (LSL #0 leaves C unchanged).
                 let rd = h & 7;
                 let rm = (h >> 3) & 7;
                 let imm5 = (h >> 6) & 0x1F;
-                if top5 == 0x00 && imm5 == 0 {
-                    emit(&mut ops, &mut s, OpCode::Copy, Some(reg(rd)), &[reg(rm)]);
-                } else {
-                    let op = match top5 { 0x00 => OpCode::IntLeft, 0x01 => OpCode::IntRight, _ => OpCode::IntSRight };
-                    emit(&mut ops, &mut s, op, Some(reg(rd)), &[reg(rm), constant(imm5 as u64, 4)]);
+                match top5 {
+                    0x00 if imm5 == 0 => {
+                        // LSL #0 = movs Rd, Rm (no shift). C unchanged.
+                        emit(&mut ops, &mut s, OpCode::Copy, Some(reg(rd)), &[reg(rm)]);
+                    }
+                    0x00 => {
+                        // LSL #imm5 (imm5 > 0): C = Rm[32 - imm5].
+                        self.set_imm_shift_carry_constant(rm, 32 - imm5, &mut ops, &mut s, address);
+                        emit(&mut ops, &mut s, OpCode::IntLeft, Some(reg(rd)), &[reg(rm), constant(imm5 as u64, 4)]);
+                    }
+                    0x01 | 0x02 if imm5 == 0 => {
+                        // LSR/ASR #0 encodes #32 in T16: C = Rm[31], result = 0
+                        // (LSR) or sign-extension of Rm (ASR).
+                        self.set_imm_shift_carry_constant(rm, 31, &mut ops, &mut s, address);
+                        if top5 == 0x01 {
+                            emit(&mut ops, &mut s, OpCode::Copy, Some(reg(rd)), &[constant(0, 4)]);
+                        } else {
+                            emit(&mut ops, &mut s, OpCode::IntSRight, Some(reg(rd)), &[reg(rm), constant(31, 4)]);
+                        }
+                    }
+                    _ => {
+                        // LSR/ASR #imm5 (imm5 > 0): C = Rm[imm5 - 1].
+                        self.set_imm_shift_carry_constant(rm, imm5 - 1, &mut ops, &mut s, address);
+                        let op = if top5 == 0x01 { OpCode::IntRight } else { OpCode::IntSRight };
+                        emit(&mut ops, &mut s, op, Some(reg(rd)), &[reg(rm), constant(imm5 as u64, 4)]);
+                    }
                 }
+                self.set_nz(reg(rd), &mut ops, &mut s, address);
             }
             0x03 => {
-                // ADD/SUB register or 3-bit immediate
+                // ADD/SUB register or 3-bit immediate. T16 always sets NZCV.
                 let rd = h & 7;
                 let rn = (h >> 3) & 7;
                 let m = (h >> 6) & 7;
@@ -169,12 +197,22 @@ impl Arm32Lifter {
                     2 => (OpCode::IntAdd, constant(m as u64, 4)),
                     _ => (OpCode::IntSub, constant(m as u64, 4)),
                 };
-                emit(&mut ops, &mut s, op, Some(reg(rd)), &[reg(rn), rhs]);
+                let rn_v = reg(rn);
+                // C/V computed from pre-op operands (read before the op writes Rd).
+                if op == OpCode::IntAdd {
+                    self.set_add_cv(rn_v, rhs, &mut ops, &mut s, address);
+                } else {
+                    self.set_sub_cv(rn_v, rhs, &mut ops, &mut s, address);
+                }
+                emit(&mut ops, &mut s, op, Some(reg(rd)), &[rn_v, rhs]);
+                self.set_nz(reg(rd), &mut ops, &mut s, address);
             }
             0x04 => {
-                // MOV Rd, #imm8
+                // MOV Rd, #imm8 (T16 movs sets N/Z; C, V unchanged).
                 let rd = (h >> 8) & 7;
-                emit(&mut ops, &mut s, OpCode::Copy, Some(reg(rd)), &[constant((h & 0xFF) as u64, 4)]);
+                let imm = constant((h & 0xFF) as u64, 4);
+                emit(&mut ops, &mut s, OpCode::Copy, Some(reg(rd)), &[imm]);
+                self.set_nz(reg(rd), &mut ops, &mut s, address);
             }
             0x05 => {
                 // CMP Rn, #imm8
@@ -182,14 +220,22 @@ impl Arm32Lifter {
                 self.emit_cmp_flags(false, reg(rn), constant((h & 0xFF) as u64, 4), &mut ops, &mut s, address);
             }
             0x06 => {
-                // ADD Rd, #imm8
+                // ADD Rd, #imm8: sets NZCV.
                 let rd = (h >> 8) & 7;
-                emit(&mut ops, &mut s, OpCode::IntAdd, Some(reg(rd)), &[reg(rd), constant((h & 0xFF) as u64, 4)]);
+                let imm = constant((h & 0xFF) as u64, 4);
+                let rd_v = reg(rd);
+                self.set_add_cv(rd_v, imm, &mut ops, &mut s, address);
+                emit(&mut ops, &mut s, OpCode::IntAdd, Some(rd_v), &[rd_v, imm]);
+                self.set_nz(rd_v, &mut ops, &mut s, address);
             }
             0x07 => {
-                // SUB Rd, #imm8
+                // SUB Rd, #imm8: sets NZCV.
                 let rd = (h >> 8) & 7;
-                emit(&mut ops, &mut s, OpCode::IntSub, Some(reg(rd)), &[reg(rd), constant((h & 0xFF) as u64, 4)]);
+                let imm = constant((h & 0xFF) as u64, 4);
+                let rd_v = reg(rd);
+                self.set_sub_cv(rd_v, imm, &mut ops, &mut s, address);
+                emit(&mut ops, &mut s, OpCode::IntSub, Some(rd_v), &[rd_v, imm]);
+                self.set_nz(rd_v, &mut ops, &mut s, address);
             }
             _ => {
                 self.lift_thumb16_wide(h, address, pc_next, &mut ops, &mut s);
@@ -229,19 +275,39 @@ impl Arm32Lifter {
                 *s += 1;
                 return;
             }
+            // Compares return early (the helpers set all relevant flags).
             match op4 {
-                0x0 => ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
-                0x1 => ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
                 0x8 => { self.emit_cmp_flags(true, reg(rd), reg(rm), ops, s, address); return; }   // TST
                 0xA => { self.emit_cmp_flags(false, reg(rd), reg(rm), ops, s, address); return; }  // CMP
                 0xB => { self.emit_cmn_flags(reg(rd), reg(rm), ops, s, address); return; }         // CMN
-                0xC => ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
-                0xD => ops.push(PcodeOp { opcode: OpCode::IntMult, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
-                0xF => ops.push(PcodeOp { opcode: OpCode::IntNegate, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rm)]) }),
-                0x9 => ops.push(PcodeOp { opcode: OpCode::Int2Comp, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rm)]) }), // NEG
                 _ => {}
             }
+            // Logical/multiply ops: write Rd then set N/Z (C/V unchanged).
+            match op4 {
+                0x0 => ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
+                0x1 => ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
+                0xC => ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
+                0xD => ops.push(PcodeOp { opcode: OpCode::IntMult, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), reg(rm)]) }),
+                0xE => {
+                    // BIC: Rd = Rd & ~Rm  (was missing entirely)
+                    let nrm = unique(0x720, 4);
+                    ops.push(PcodeOp { opcode: OpCode::IntNegate, seq: seq(*s), output: Some(nrm), inputs: SmallVec::from_slice(&[reg(rm)]) });
+                    *s += 1;
+                    ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rd), nrm]) });
+                }
+                0xF => ops.push(PcodeOp { opcode: OpCode::IntNegate, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rm)]) }),
+                0x9 => {
+                    // NEG = RSBS Rd, Rm, #0: sets NZCV like a subtract.
+                    self.set_sub_cv(constant(0, 4), reg(rm), ops, s, address);
+                    ops.push(PcodeOp { opcode: OpCode::Int2Comp, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[reg(rm)]) });
+                }
+                _ => {
+                    *s += 1;
+                    return;
+                }
+            }
             *s += 1;
+            self.set_nz(reg(rd), ops, s, address);
             return;
         }
 
@@ -546,26 +612,30 @@ impl Arm32Lifter {
             let rn = hw1 & 0xF;
             let rt = (hw2 >> 12) & 0xF;
             let imm12 = hw2 & 0xFFF;
-            if !(load && rt == PC_INDEX) {
-                let addr = unique(0x600, 4);
-                ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(s), output: Some(addr), inputs: SmallVec::from_slice(&[reg(rn), constant(imm12 as u64, 4)]) });
-                s += 1;
-                if load {
-                    if size == 4 {
-                        ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
-                    } else {
-                        let loaded = unique(0x610, size);
-                        ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
-                        s += 1;
-                        let ext = if signed { OpCode::IntSExt } else { OpCode::IntZExt };
-                        ops.push(PcodeOp { opcode: ext, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[loaded]) });
-                    }
+            let addr = unique(0x600, 4);
+            ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(s), output: Some(addr), inputs: SmallVec::from_slice(&[reg(rn), constant(imm12 as u64, 4)]) });
+            s += 1;
+            if load {
+                if size == 4 && rt == PC_INDEX {
+                    // ldr.w pc, [...] -> indirect branch
+                    let t = unique(0x612, 4);
+                    ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(t), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
+                    s += 1;
+                    ops.push(PcodeOp { opcode: OpCode::BranchInd, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[t]) });
+                } else if size == 4 {
+                    ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
                 } else {
-                    let value = if size == 4 { reg(rt) } else { VarnodeData::new(REG_SPACE, rt as u64 * 4, size) };
-                    ops.push(PcodeOp { opcode: OpCode::Store, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr, value]) });
+                    let loaded = unique(0x610, size);
+                    ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
+                    s += 1;
+                    let ext = if signed { OpCode::IntSExt } else { OpCode::IntZExt };
+                    ops.push(PcodeOp { opcode: ext, seq: seq(s), output: Some(reg(rt)), inputs: SmallVec::from_slice(&[loaded]) });
                 }
-                return ops;
+            } else {
+                let value = if size == 4 { reg(rt) } else { VarnodeData::new(REG_SPACE, rt as u64 * 4, size) };
+                ops.push(PcodeOp { opcode: OpCode::Store, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr, value]) });
             }
+            return ops;
         }
 
         ops
@@ -925,15 +995,47 @@ impl Arm32Lifter {
         };
 
         // Conditional (non-AL) data-processing that writes a register is
-        // modelled branch-free: save the old Rd, compute unconditionally, then
-        // select old vs. new on the condition. Compares (opcodes 8-B) and PC
-        // writes are left as-is.
+        // modelled branch-free: save the old Rd (and old flags when S is set),
+        // evaluate the condition using PRE-OP flag values and snapshot it,
+        // compute unconditionally, then select old vs. new on the condition.
+        // Compares (opcodes 8-B) and PC writes are left as-is.
         let writes_reg = !(0x8..=0xB).contains(&opcode) && rd != PC_INDEX;
         let cond_old = if cond != COND_AL && writes_reg {
             let o = unique(0x778, 4);
             ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(o), inputs: SmallVec::from_slice(&[reg(rd)]) });
             *s += 1;
             Some(o)
+        } else {
+            None
+        };
+        // Save old N/Z/C/V so flag updates are predicated too when this is a
+        // conditional S-bit op (ARM only updates flags if the instruction
+        // actually executes).
+        let cond_old_flags = if cond != COND_AL && set_flags && writes_reg {
+            let ns = unique(0x7C0, 1);
+            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(ns), inputs: SmallVec::from_slice(&[flag(N_FLAG)]) });
+            *s += 1;
+            let zs = unique(0x7C1, 1);
+            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(zs), inputs: SmallVec::from_slice(&[flag(Z_FLAG)]) });
+            *s += 1;
+            let cs = unique(0x7C2, 1);
+            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(cs), inputs: SmallVec::from_slice(&[flag(C_FLAG)]) });
+            *s += 1;
+            let vs = unique(0x7C3, 1);
+            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(vs), inputs: SmallVec::from_slice(&[flag(V_FLAG)]) });
+            *s += 1;
+            Some((ns, zs, cs, vs))
+        } else {
+            None
+        };
+        // Snapshot the condition now (reads PRE-OP flag values) so the
+        // subsequent flag writes don't perturb the predication choice.
+        let cond_snap = if cond != COND_AL && writes_reg {
+            let c_raw = self.emit_cond(cond, ops, s, address);
+            let snap = unique(0x7C4, 1);
+            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(snap), inputs: SmallVec::from_slice(&[c_raw]) });
+            *s += 1;
+            Some(snap)
         } else {
             None
         };
@@ -954,7 +1056,15 @@ impl Arm32Lifter {
             0xB => self.emit_cmn_flags(rn_v, op2, ops, s, address),                     // CMN
             0xC => self.dp_binop(OpCode::IntOr, rd, rn_v, op2, ops, s, address),        // ORR
             0xD => { // MOV
-                if let Some(out) = self.rd_out(rd) {
+                if rd == PC_INDEX && cond == COND_AL {
+                    // mov pc, X = indirect branch; if X is exactly LR it's a
+                    // return. Conditional movXX pc, ... isn't modelled
+                    // (intra-instruction p-code branches unsupported).
+                    let is_lr = op2.space == REG_SPACE && op2.offset == LR_INDEX as u64 * 4 && op2.size == 4;
+                    let opc = if is_lr { OpCode::Return } else { OpCode::BranchInd };
+                    ops.push(PcodeOp { opcode: opc, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[op2]) });
+                    *s += 1;
+                } else if let Some(out) = self.rd_out(rd) {
                     ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(&[op2]) });
                     *s += 1;
                 }
@@ -983,14 +1093,12 @@ impl Arm32Lifter {
         if set_flags && writes_reg {
             self.set_nz(reg(rd), ops, s, address);
             match opcode {
-                0x4 | 0x5 => {
-                    ops.push(PcodeOp { opcode: OpCode::IntCarry, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[rn_v, op2]) });
-                    *s += 1;
-                    ops.push(PcodeOp { opcode: OpCode::IntSCarry, seq: seq(*s), output: Some(flag(V_FLAG)), inputs: SmallVec::from_slice(&[rn_v, op2]) });
-                    *s += 1;
-                }
-                0x2 | 0x6 => self.set_sub_cv(rn_v, op2, ops, s, address),  // SUB/SBC
-                0x3 | 0x7 => self.set_sub_cv(op2, rn_v, ops, s, address),  // RSB/RSC: op2 - rn
+                0x4 => self.set_add_cv(rn_v, op2, ops, s, address),                 // ADD
+                0x5 => self.set_addc_cv(rn_v, op2, ops, s, address),                // ADC: include carry-in
+                0x2 => self.set_sub_cv(rn_v, op2, ops, s, address),                 // SUB
+                0x6 => self.set_subc_cv(rn_v, op2, ops, s, address),                // SBC: include carry-in
+                0x3 => self.set_sub_cv(op2, rn_v, ops, s, address),                 // RSB
+                0x7 => self.set_subc_cv(op2, rn_v, ops, s, address),                // RSC: include carry-in
                 _ => {
                     // Logical (AND/EOR/ORR/MOV/MVN/BIC): C from the shifter
                     // carry-out (V unchanged).
@@ -1003,8 +1111,18 @@ impl Arm32Lifter {
         }
 
         if let Some(old) = cond_old {
-            let c = self.emit_cond(cond, ops, s, address);
+            // cond_snap is Some whenever cond_old is Some (same trigger).
+            let c = cond_snap.expect("cond snapshot captured when cond_old is set");
             self.emit_cond_select(c, reg(rd), old, ops, s, address);
+            // Predicate the flag updates too when this was a conditional S-bit
+            // op — without this, flags would update even when the condition
+            // was false.
+            if let Some((ns, zs, cs, vs)) = cond_old_flags {
+                self.emit_cond_select_sized(c, flag(N_FLAG), ns, ops, s, address);
+                self.emit_cond_select_sized(c, flag(Z_FLAG), zs, ops, s, address);
+                self.emit_cond_select_sized(c, flag(C_FLAG), cs, ops, s, address);
+                self.emit_cond_select_sized(c, flag(V_FLAG), vs, ops, s, address);
+            }
         }
     }
 
@@ -1022,20 +1140,23 @@ impl Arm32Lifter {
         *s += 1;
     }
 
-    /// SBC: `rd = a - b - !C = a - b + C - 1`.
+    /// SBC: canonical form `rd = a + ~b + C`, equivalent to `a - b - !C`.
+    /// The canonical form lets the S-bit flag block reuse the intermediates
+    /// (`~b` at 0x738, partial sum at 0x728, carry-in at 0x730) to compute
+    /// C/V that correctly include the carry-in.
     fn dp_sbc(&self, rd: u32, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
         let Some(out) = self.rd_out(rd) else { return };
         let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
-        let t = unique(0x728, 4);
-        ops.push(PcodeOp { opcode: OpCode::IntSub, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[a, b]) });
+        let nb = unique(0x738, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntNegate, seq: seq(*s), output: Some(nb), inputs: SmallVec::from_slice(&[b]) });
         *s += 1;
         let cin = unique(0x730, 4);
         ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(cin), inputs: SmallVec::from_slice(&[flag(C_FLAG)]) });
         *s += 1;
-        let t2 = unique(0x738, 4);
-        ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(*s), output: Some(t2), inputs: SmallVec::from_slice(&[t, cin]) });
+        let t = unique(0x728, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[a, nb]) });
         *s += 1;
-        ops.push(PcodeOp { opcode: OpCode::IntSub, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(&[t2, constant(1, 4)]) });
+        ops.push(PcodeOp { opcode: OpCode::IntAdd, seq: seq(*s), output: Some(out), inputs: SmallVec::from_slice(&[t, cin]) });
         *s += 1;
     }
 
@@ -1054,6 +1175,81 @@ impl Arm32Lifter {
         ops.push(PcodeOp { opcode: OpCode::IntLessEqual, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[b, a]) });
         *s += 1;
         ops.push(PcodeOp { opcode: OpCode::IntSBorrow, seq: seq(*s), output: Some(flag(V_FLAG)), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
+    }
+
+    /// Set C (carry) and V from an addition `a + b`.
+    fn set_add_cv(&self, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        ops.push(PcodeOp { opcode: OpCode::IntCarry, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntSCarry, seq: seq(*s), output: Some(flag(V_FLAG)), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
+    }
+
+    /// Set C/V for `a + b + Cin` (ADCS), reading the partial sum (at 0x728)
+    /// and carry-in (at 0x730) that `dp_adc` left in place. C is the OR of the
+    /// two unsigned carries; V is the XOR of the two signed-overflow flags
+    /// (so a partial overflow followed by an un-overflow cancels out).
+    fn set_addc_cv(&self, a: VarnodeData, b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        let t = unique(0x728, 4);
+        let cin = unique(0x730, 4);
+        let cp = unique(0x7E0, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntCarry, seq: seq(*s), output: Some(cp), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
+        let cc = unique(0x7E1, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntCarry, seq: seq(*s), output: Some(cc), inputs: SmallVec::from_slice(&[t, cin]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[cp, cc]) });
+        *s += 1;
+        let vp = unique(0x7E2, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntSCarry, seq: seq(*s), output: Some(vp), inputs: SmallVec::from_slice(&[a, b]) });
+        *s += 1;
+        let vc = unique(0x7E3, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntSCarry, seq: seq(*s), output: Some(vc), inputs: SmallVec::from_slice(&[t, cin]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(*s), output: Some(flag(V_FLAG)), inputs: SmallVec::from_slice(&[vp, vc]) });
+        *s += 1;
+    }
+
+    /// Set C/V for `a + ~b + Cin` (SBCS / RSCS — canonical SBC form).
+    /// Reads `~b` at 0x738 and partial sum / carry-in that `dp_sbc` left
+    /// in place (a's operand is taken as-is; the negated `b` is at 0x738).
+    fn set_subc_cv(&self, a: VarnodeData, _b: VarnodeData, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        let nb = unique(0x738, 4);
+        let t = unique(0x728, 4);
+        let cin = unique(0x730, 4);
+        let cp = unique(0x7E0, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntCarry, seq: seq(*s), output: Some(cp), inputs: SmallVec::from_slice(&[a, nb]) });
+        *s += 1;
+        let cc = unique(0x7E1, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntCarry, seq: seq(*s), output: Some(cc), inputs: SmallVec::from_slice(&[t, cin]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[cp, cc]) });
+        *s += 1;
+        let vp = unique(0x7E2, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntSCarry, seq: seq(*s), output: Some(vp), inputs: SmallVec::from_slice(&[a, nb]) });
+        *s += 1;
+        let vc = unique(0x7E3, 1);
+        ops.push(PcodeOp { opcode: OpCode::IntSCarry, seq: seq(*s), output: Some(vc), inputs: SmallVec::from_slice(&[t, cin]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(*s), output: Some(flag(V_FLAG)), inputs: SmallVec::from_slice(&[vp, vc]) });
+        *s += 1;
+    }
+
+    /// Set the C flag from a constant-amount shifter carry-out: `C = Rm[k]`.
+    /// Used by T16 immediate-shift ops where the bit index is known at decode.
+    fn set_imm_shift_carry_constant(&self, rm: u32, k: u32, ops: &mut Vec<PcodeOp>, s: &mut u32, address: u64) {
+        let seq = |o: u32| SeqNum::new(Address::new(RAM_SPACE, address), o);
+        let t = unique(0x748, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[reg(rm), constant(k as u64, 4)]) });
+        *s += 1;
+        let m = unique(0x74C, 4);
+        ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(*s), output: Some(m), inputs: SmallVec::from_slice(&[t, constant(1, 4)]) });
+        *s += 1;
+        ops.push(PcodeOp { opcode: OpCode::IntNotEqual, seq: seq(*s), output: Some(flag(C_FLAG)), inputs: SmallVec::from_slice(&[m, constant(0, 4)]) });
         *s += 1;
     }
 
@@ -1146,8 +1342,13 @@ impl Arm32Lifter {
         let c = flag(C_FLAG);
         let v = flag(V_FLAG);
 
+        // A fixed scratch slot: at most one `not` result is live per emit_cond
+        // call, and it never overlaps the condition's own 0x760/0x768 temps.
+        // (The previous `0x740 + 2*s` scheme grew unboundedly with the op count
+        // and could land on fixed caller slots like cond_old at 0x778 for
+        // register-shifted, flag-setting, conditional data-processing.)
         let not = |ops: &mut Vec<PcodeOp>, s: &mut u32, x: VarnodeData| -> VarnodeData {
-            let t = unique(0x740 + *s as u64 * 2, 1);
+            let t = unique(0x76C, 1);
             ops.push(PcodeOp { opcode: OpCode::BoolNegate, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[x]) });
             *s += 1;
             t
@@ -1248,15 +1449,22 @@ impl Arm32Lifter {
         }
 
         let size = if byte { 1 } else { 4 };
+        // `ldr pc, [...]` is an indirect branch; the loaded value still needs
+        // to flow through writeback before the transfer, so route the load
+        // through a temp and emit a BranchInd at the end.
+        let load_into_pc = load && !byte && rd == PC_INDEX;
+        let pc_target = if load_into_pc { Some(unique(0x612, 4)) } else { None };
         if load {
-            if rd == PC_INDEX {
-                return; // load into PC = control flow, skip
-            }
             if byte {
                 let loaded = unique(0x610, 1);
                 ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
                 *s += 1;
-                ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[loaded]) });
+                if rd != PC_INDEX {
+                    ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[loaded]) });
+                    *s += 1;
+                }
+            } else if let Some(t) = pc_target {
+                ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(t), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
                 *s += 1;
             } else {
                 ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(reg(rd)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr]) });
@@ -1277,6 +1485,20 @@ impl Arm32Lifter {
         if !pre || writeback {
             let off = if i_bit { reg(word & 0xF) } else { constant((word & 0xFFF) as u64, 4) };
             ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(reg(rn)), inputs: SmallVec::from_slice(&[reg(rn), off]) });
+            *s += 1;
+        }
+        // ldr pc, [...] -> indirect branch after the writeback has committed.
+        // Only an unconditional `ldr pc` becomes a transfer: a conditional
+        // `ldrXX pc` (e.g. the `ldrls pc, [pc, rN, lsl #2]` jump-table idiom)
+        // would otherwise be emitted as an *unconditional* BranchInd, dropping
+        // its fall-through path. Conditional control transfers can't be modelled
+        // here (no intra-instruction predicated branch), so the loaded PC is
+        // left dead and the load/writeback side effects are preserved.
+        let cond = word >> 28;
+        if let Some(t) = pc_target
+            && cond == COND_AL
+        {
+            ops.push(PcodeOp { opcode: OpCode::BranchInd, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[t]) });
             *s += 1;
         }
         let _ = size;
@@ -1362,6 +1584,10 @@ impl Arm32Lifter {
             -(4 * count as i64) + if pre { 0 } else { 4 }
         };
 
+        // Pop {pc}: load the PC value into a temp, do the loop's other loads,
+        // do the writeback (so SP updates), THEN emit Return. Previously the
+        // Return was pushed mid-loop and any subsequent writeback was dead.
+        let mut pc_loaded: Option<VarnodeData> = None;
         for i in 0..16u32 {
             if reg_list & (1 << i) == 0 {
                 continue;
@@ -1375,12 +1601,10 @@ impl Arm32Lifter {
             *s += 1;
             if load {
                 if i == PC_INDEX {
-                    // pop pc => return
                     let loaded = unique(0x690 + *s as u64, 4);
                     ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(loaded), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), ea]) });
                     *s += 1;
-                    ops.push(PcodeOp { opcode: OpCode::Return, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[loaded]) });
-                    *s += 1;
+                    pc_loaded = Some(loaded);
                 } else {
                     ops.push(PcodeOp { opcode: OpCode::Load, seq: seq(*s), output: Some(reg(i)), inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), ea]) });
                     *s += 1;
@@ -1397,6 +1621,12 @@ impl Arm32Lifter {
             let delta = 4 * count as u64;
             let op = if up { OpCode::IntAdd } else { OpCode::IntSub };
             ops.push(PcodeOp { opcode: op, seq: seq(*s), output: Some(base), inputs: SmallVec::from_slice(&[base, constant(delta, 4)]) });
+            *s += 1;
+        }
+        // Pop {pc} returns; emit the Return after the writeback so SP is
+        // updated before control transfers.
+        if let Some(loaded_pc) = pc_loaded {
+            ops.push(PcodeOp { opcode: OpCode::Return, seq: seq(*s), output: None, inputs: SmallVec::from_slice(&[loaded_pc]) });
             *s += 1;
         }
     }
@@ -1868,23 +2098,54 @@ mod tests {
 
     #[test]
     fn lift_sbc_uses_carry() {
-        // sbc r0, r1, r2 => 0xE0C10002 ; rd = r1 - r2 + C - 1
+        // sbc r0, r1, r2 => 0xE0C10002 ; canonical form: rd = r1 + ~r2 + C
         let ops = lift(0xE0C1_0002);
+        // ~r2 computed
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntNegate
+            && o.inputs[0].offset == 8)); // r2
+        // C flag zero-extended
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntZExt && o.inputs[0].offset == C_FLAG));
-        // final op subtracts 1
-        let last = ops.last().unwrap();
-        assert_eq!(last.opcode, OpCode::IntSub);
-        assert_eq!(last.inputs[1].offset, 1);
+        // Two adds: (a + ~b), then partial + cin
+        assert!(ops.iter().filter(|o| o.opcode == OpCode::IntAdd).count() >= 2);
     }
 
     #[test]
     fn lift_rsc() {
-        // rsc r0, r1, r2 => 0xE0E10002 ; rd = r2 - r1 + C - 1
+        // rsc r0, r1, r2 => 0xE0E10002 ; canonical form: rd = r2 + ~r1 + C
         let ops = lift(0xE0E1_0002);
-        // first subtract is op2(r2) - rn(r1)
-        let sub = ops.iter().find(|o| o.opcode == OpCode::IntSub).unwrap();
-        assert_eq!(sub.inputs[0].offset, 8); // r2
-        assert_eq!(sub.inputs[1].offset, 4); // r1
+        // ~r1 computed
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntNegate
+            && o.inputs[0].offset == 4)); // r1
+        // partial sum = r2 + ~r1
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd
+            && o.inputs[0].offset == 8 // r2
+            && o.inputs[1].space == CoreSpace::UNIQUE));
+    }
+
+    #[test]
+    fn lift_adcs_carry_in_propagates_to_c_flag() {
+        // adcs r0, r1, r2 => 0xE0B10002 (ADC + S)
+        // C should be the OR of IntCarry(r1, r2) and IntCarry(partial, cin),
+        // not just IntCarry(r1, r2) — the previous behavior ignored carry-in.
+        let ops = lift(0xE0B1_0002);
+        // Two IntCarry ops (partial and cin)
+        assert_eq!(ops.iter().filter(|o| o.opcode == OpCode::IntCarry).count(), 2);
+        // OR combines them into C_FLAG
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntOr
+            && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        // V uses two IntSCarry ops XORed
+        assert_eq!(ops.iter().filter(|o| o.opcode == OpCode::IntSCarry).count(), 2);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntXor
+            && o.output.map(|v| v.offset == V_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_sbcs_carry_in_propagates_to_c_flag() {
+        // sbcs r0, r1, r2 => 0xE0D10002 (SBC + S)
+        let ops = lift(0xE0D1_0002);
+        assert_eq!(ops.iter().filter(|o| o.opcode == OpCode::IntCarry).count(), 2);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntOr
+            && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
     }
 
     #[test]
@@ -1997,6 +2258,97 @@ mod tests {
     }
 
     #[test]
+    fn thumb_format1_subs_sets_nzcv() {
+        // subs r0, r1, #1 => 0x1E48 (format1 opc=11, imm3=1, rn=1, rd=0)
+        let li = lift_thumb(&[0x1E48]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntSub));
+        // N/Z/C/V all set on T16 subs
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == N_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntLessEqual
+            && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntSBorrow));
+    }
+
+    #[test]
+    fn thumb_format2_movs_sets_nz() {
+        // movs r0, #5 (already covered) — verify N/Z flags now also set
+        let li = lift_thumb(&[0x2005]);
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == N_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn thumb_format2_adds_imm_sets_nzcv() {
+        // adds r0, #1 => 0x3001 (format2 add imm)
+        let li = lift_thumb(&[0x3001]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntCarry));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntSCarry));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn thumb_format4_ands_sets_nz() {
+        // ands r0, r1 (format4 op=0) = 0x4008
+        let li = lift_thumb(&[0x4008]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntAnd));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == N_FLAG).unwrap_or(false)));
+        // Logical op: no C/V touch
+        assert!(!li.ops.iter().any(|o| o.opcode == OpCode::IntCarry));
+    }
+
+    #[test]
+    fn thumb_format4_bics_decoded() {
+        // bics r0, r1 (format4 op=0xE) = 0x4388 (was previously unrecognized)
+        let li = lift_thumb(&[0x4388]);
+        // BIC = r0 & ~r1: negate then AND
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntNegate));
+        let and = li.ops.iter().find(|o| o.opcode == OpCode::IntAnd
+            && o.output.map(|v| v.offset == 0).unwrap_or(false)).unwrap();
+        assert_eq!(and.inputs[0].offset, 0); // r0
+        // Flags set
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn thumb_format4_negs_sets_nzcv() {
+        // negs r0, r1 (format4 op=0x9 = rsbs r0, r1, #0) = 0x4248
+        let li = lift_thumb(&[0x4248]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::Int2Comp));
+        // NEG = 0 - Rm: C and V come from subtraction.
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntLessEqual
+            && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntSBorrow));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn thumb_lsl_imm_sets_shifter_carry() {
+        // lsls r0, r1, #3 (format1 imm-shift) = 0x00C8
+        let li = lift_thumb(&[0x00C8]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntLeft));
+        // C set from Rm[32-3] = Rm[29] (bit-29 of r1)
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntNotEqual
+            && o.output.map(|v| v.offset == C_FLAG).unwrap_or(false)));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
+    }
+
+    #[test]
+    fn thumb_lsr_imm0_means_32_and_zeroes_result() {
+        // lsrs r0, r1, #0 in T16 encodes #32 (was previously emitting Rm >> 0 = Rm, wrong)
+        // 0b00001 00000 001 000 = 0x0808
+        let li = lift_thumb(&[0x0808]);
+        // Result = 0, written as a Copy from constant 0.
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == 0).unwrap_or(false)
+            && o.inputs[0].space == CoreSpace::CONST && o.inputs[0].offset == 0));
+        // C = Rm[31]
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntRight
+            && o.inputs[1].offset == 31));
+    }
+
+    #[test]
     fn thumb_rors_by_register_uses_rotate() {
         // rors r0, r1 (T16 format-4 ALU op=7) = 0x41C8
         let li = lift_thumb(&[0x41C8]);
@@ -2096,6 +2448,50 @@ mod tests {
     }
 
     #[test]
+    fn lift_conditional_s_predicates_flag_writes() {
+        // addnes r0, r1, r2 => 0x10910002 (cond=NE, ADD with S)
+        // Flags must be predicated on the condition (ARM only updates flags
+        // when the instruction executes); without this fix, NZCV would update
+        // even when the branch was not taken.
+        let ops = lift(0x1091_0002);
+        // r0 is selected via mask (IntOr writing to r0 = offset 0)
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntOr
+            && o.output.map(|v| v.space == CoreSpace::REGISTER && v.offset == 0).unwrap_or(false)));
+        // Each flag is also predicated: there's an IntOr writing each flag too.
+        for &flag_off in &[N_FLAG, Z_FLAG, C_FLAG, V_FLAG] {
+            assert!(ops.iter().any(|o| o.opcode == OpCode::IntOr
+                && o.output.map(|v| v.offset == flag_off).unwrap_or(false)),
+                "expected predicated select committing flag at offset 0x{:x}", flag_off);
+        }
+    }
+
+    #[test]
+    fn emit_cond_scratch_does_not_clobber_saved_rd() {
+        // andnes r0, r1, r2, asr r3 => conditional (NE), S-bit, logical,
+        // register-shifted: the longest operand2 + cond-save path. The NE
+        // condition's BoolNegate scratch must not land on the saved-old-Rd
+        // slot (0x778) regardless of how many ops precede it. Verify the
+        // saved Rd Copy at 0x778 is never overwritten by a later BoolNegate.
+        // andnes r0,r1,r2,asr r3: cond=NE(1), I=0, opcode=BIC(0xE)? no — AND=0x0
+        // ands with reg-shift asr-by-reg: 0x10110052 | shift... build it:
+        // cond=1, 00, I=0, AND=0000, S=1, Rn=1, Rd=0, Rs=3, 0,asr=10,1,Rm=2
+        // = 0001 000 0000 1 0001 0000 0011 0 10 1 0010 = 0x10110352
+        let ops = lift(0x1011_0352);
+        // The 0x778 save (Copy of old r0 into unique 0x778) must be present and
+        // never overwritten by a BoolNegate (the emit_cond scratch).
+        let saves_778 = ops.iter().filter(|o|
+            o.output.map(|v| v.space == CoreSpace::UNIQUE && v.offset == 0x778).unwrap_or(false));
+        for o in saves_778 {
+            assert_eq!(o.opcode, OpCode::Copy,
+                "0x778 (saved Rd) must only be written by the save Copy, not clobbered by emit_cond scratch");
+        }
+        // The BoolNegate (NE = !Z) writes the fixed 0x76C slot, not 0x778.
+        if let Some(bn) = ops.iter().find(|o| o.opcode == OpCode::BoolNegate) {
+            assert_ne!(bn.output.unwrap().offset, 0x778);
+        }
+    }
+
+    #[test]
     fn lift_ldr_post_index_writeback() {
         // ldr r0, [r1], #4 => post-indexed: 0xE4910004
         let ops = lift(0xE491_0004);
@@ -2103,6 +2499,75 @@ mod tests {
         // base r1 should be written back (IntAdd into r1)
         assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd
             && o.output.map(|v| v.offset == 4).unwrap_or(false)));
+    }
+
+    #[test]
+    fn lift_ldr_pc_branches_indirect() {
+        // ldr pc, [r1, #4]! (pre-index with writeback) = 0xE5B1F004
+        // Previously the lifter returned early on rd==PC, dropping both the
+        // load and the writeback. Should now: Load -> writeback r1 -> BranchInd.
+        let ops = lift(0xE5B1_F004);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Load));
+        // r1 written back
+        assert!(ops.iter().any(|o| o.opcode == OpCode::IntAdd
+            && o.output.map(|v| v.offset == 4).unwrap_or(false)));
+        // BranchInd is last
+        let last = ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::BranchInd);
+        assert_eq!(last.inputs[0].space, CoreSpace::UNIQUE);
+    }
+
+    #[test]
+    fn lift_conditional_ldr_pc_no_unconditional_branch() {
+        // ldrls pc, [r1, #4] (cond=LS=9) = 0x95B1F004 — a conditional load to
+        // PC must NOT become an unconditional BranchInd (that would drop the
+        // fall-through). The load/writeback side effects are kept; no transfer.
+        let ops = lift(0x95B1_F004);
+        assert!(ops.iter().any(|o| o.opcode == OpCode::Load));
+        assert!(!ops.iter().any(|o| o.opcode == OpCode::BranchInd),
+            "conditional ldr pc must not emit an unconditional indirect branch");
+    }
+
+    #[test]
+    fn lift_mov_pc_lr_is_return() {
+        // mov pc, lr => 0xE1A0F00E (the classic ARM return idiom)
+        let ops = lift(0xE1A0_F00E);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::Return);
+    }
+
+    #[test]
+    fn lift_mov_pc_reg_is_branch_ind() {
+        // mov pc, r3 => 0xE1A0F003 (computed/indirect branch to r3)
+        let ops = lift(0xE1A0_F003);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::BranchInd);
+        assert_eq!(ops[0].inputs[0].offset, 12); // r3
+    }
+
+    #[test]
+    fn lift_thumb_ldr_w_pc_branches_indirect() {
+        // ldr.w pc, [r1, #4] = [0xF8D1, 0xF004]
+        let li = lift_thumb(&[0xF8D1, 0xF004]);
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::Load));
+        let last = li.ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::BranchInd);
+        assert_eq!(last.inputs[0].space, CoreSpace::UNIQUE);
+    }
+
+    #[test]
+    fn lift_pop_pc_emits_return_after_writeback() {
+        // pop {r0, pc} = ldmia sp!, {r0, pc} = 0xE8BD8001
+        // Previously the Return was emitted mid-loop and the writeback (sp += 8)
+        // never ran. Now writeback comes before the Return.
+        let ops = lift(0xE8BD_8001);
+        // Find IntAdd into sp (offset = 13*4 = 52)
+        let sp_writeback_idx = ops.iter().position(|o| o.opcode == OpCode::IntAdd
+            && o.output.map(|v| v.offset == 13 * 4).unwrap_or(false)).expect("expected sp writeback");
+        let return_idx = ops.iter().position(|o| o.opcode == OpCode::Return)
+            .expect("expected Return op");
+        assert!(sp_writeback_idx < return_idx,
+            "writeback (idx {}) must come before Return (idx {})", sp_writeback_idx, return_idx);
     }
 
     // ---- Thumb (T16/T32) ----
@@ -2143,19 +2608,25 @@ mod tests {
     fn thumb_add_imm3() {
         // adds r0, r1, #2 => format1 opc=10: 0b0001110_010_001_000 = 0x1C88
         let li = lift_thumb(&[0x1C88]);
-        assert_eq!(li.ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(li.ops[0].output.unwrap().offset, 0); // r0
-        assert_eq!(li.ops[0].inputs[0].offset, 4); // r1
-        assert_eq!(li.ops[0].inputs[1].offset, 2); // imm3
+        let add = li.ops.iter().find(|o| o.opcode == OpCode::IntAdd
+            && o.output.map(|v| v.offset == 0).unwrap_or(false)).unwrap();
+        assert_eq!(add.inputs[0].offset, 4); // r1
+        assert_eq!(add.inputs[1].offset, 2); // imm3
+        // T16 always sets NZCV.
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntCarry));
+        assert!(li.ops.iter().any(|o| o.output.map(|v| v.offset == Z_FLAG).unwrap_or(false)));
     }
 
     #[test]
     fn thumb_add_reg() {
         // adds r0, r1, r2 => opc=00: 0b0001100_010_001_000 = 0x1888
         let li = lift_thumb(&[0x1888]);
-        assert_eq!(li.ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(li.ops[0].inputs[1].space, CoreSpace::REGISTER);
-        assert_eq!(li.ops[0].inputs[1].offset, 8); // r2
+        let add = li.ops.iter().find(|o| o.opcode == OpCode::IntAdd
+            && o.output.map(|v| v.offset == 0).unwrap_or(false)).unwrap();
+        assert_eq!(add.inputs[1].space, CoreSpace::REGISTER);
+        assert_eq!(add.inputs[1].offset, 8); // r2
+        // T16 always sets NZCV.
+        assert!(li.ops.iter().any(|o| o.opcode == OpCode::IntCarry));
     }
 
     #[test]
@@ -2347,11 +2818,11 @@ mod tests {
 
         // The next instruction (movs r0,#5) is predicated on EQ (the Z flag).
         let guarded = lifter.lift_instruction_ctx(&mem, 0x1002, &mut ctx).unwrap();
-        // Predication saves old r0, runs the copy, evaluates cond, then selects.
+        // Predication saves old reg values, evaluates cond, runs ops, selects.
         assert!(guarded.ops.iter().any(|o| o.opcode == OpCode::Int2Comp)); // mask from cond
-        let last = guarded.ops.last().unwrap();
-        assert_eq!(last.opcode, OpCode::IntOr);   // select committed into r0
-        assert_eq!(last.output.unwrap().offset, 0);
+        // r0 is committed via a select (IntOr writing to r0 = offset 0).
+        assert!(guarded.ops.iter().any(|o| o.opcode == OpCode::IntOr
+            && o.output.map(|v| v.space == CoreSpace::REGISTER && v.offset == 0).unwrap_or(false)));
         // Block had one instruction; state cleared afterward.
         assert!(ctx.it.is_none());
     }

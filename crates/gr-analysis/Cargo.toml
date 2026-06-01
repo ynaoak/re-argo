@@ -15,3 +15,4 @@ thiserror = { workspace = true }
 petgraph = { workspace = true }
 cpp_demangle = { workspace = true }
 rustc-demangle = { workspace = true }
+rayon = { workspace = true }

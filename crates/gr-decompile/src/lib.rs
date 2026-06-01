@@ -17,7 +17,7 @@ pub mod token;
 pub mod typeinfer;
 pub mod varrecovery;
 
-pub use pipeline::{analyze_taint, decompile, decompile_function, DecompileResult, DecompileStats, TaintReport};
+pub use pipeline::{analyze_taint, decompile, decompile_all, decompile_function, DecompileResult, DecompileStats, TaintReport};
 pub use taint::{TaintEngine, TaintSink, TaintSinkKind};
 pub use token::{Token, TokenDocument, TokenLine, TokenType};
 pub use typeinfer::{InferredType, TypeInferenceEngine};
