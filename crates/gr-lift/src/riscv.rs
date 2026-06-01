@@ -137,8 +137,15 @@ impl RiscVLifter {
                 }
             }
             0x6F => {
-                // JAL
+                // JAL: rd = PC + 4; branch to PC + j_imm. The link write
+                // is what differentiates JAL from a plain branch -- if rd
+                // is x0 the assembler form is `j`. Without it, every
+                // callee's `ret` returned to a stale value.
                 let target = address.wrapping_add(j_imm) & 0xFFFF_FFFF;
+                if let Some(link) = xout(rd) {
+                    push(&mut ops, &mut s, OpCode::Copy, Some(link),
+                        &[constant((address + 4) & 0xFFFF_FFFF, 4)]);
+                }
                 if rd == 0 {
                     push(&mut ops, &mut s, OpCode::Branch, None, &[ram(target)]);
                 } else {
@@ -146,17 +153,28 @@ impl RiscVLifter {
                 }
             }
             0x67 => {
-                // JALR
-                let target = if i_imm == 0 {
-                    xin(rs1)
+                // JALR rd, imm(rs1): target = (rs1 + imm) & ~1;
+                //                    rd = PC + 4.
+                // Always materialise the target into a unique BEFORE
+                // writing the link so the rs1 == rd case (e.g.
+                // `jalr ra, 0(ra)`) reads the pre-link value. The
+                // previous code captured `xin(rs1)` directly when
+                // imm == 0 and never linked, so a tail-call-style
+                // `jalr` left rd stale.
+                let target = unique(0x400, 4);
+                if i_imm == 0 {
+                    push(&mut ops, &mut s, OpCode::Copy, Some(target), &[xin(rs1)]);
                 } else {
-                    let t = unique(0x400, 4);
-                    push(&mut ops, &mut s, OpCode::IntAdd, Some(t), &[xin(rs1), constant(i_imm, 4)]);
-                    t
-                };
+                    push(&mut ops, &mut s, OpCode::IntAdd, Some(target),
+                        &[xin(rs1), constant(i_imm, 4)]);
+                }
+                if let Some(link) = xout(rd) {
+                    push(&mut ops, &mut s, OpCode::Copy, Some(link),
+                        &[constant((address + 4) & 0xFFFF_FFFF, 4)]);
+                }
                 if rd == 0 {
                     if rs1 == RA_INDEX && i_imm == 0 {
-                        push(&mut ops, &mut s, OpCode::Return, None, &[xin(rs1)]);
+                        push(&mut ops, &mut s, OpCode::Return, None, &[target]);
                     } else {
                         push(&mut ops, &mut s, OpCode::BranchInd, None, &[target]);
                     }
@@ -252,7 +270,16 @@ impl RiscVLifter {
                             5 => OpCode::IntDiv,   // divu
                             6 => OpCode::IntSRem,  // rem
                             7 => OpCode::IntRem,   // remu
-                            _ => return ops,
+                            // mulh / mulhsu / mulhu need a high-half
+                            // multiply that P-code doesn't model with a
+                            // single op. Surface them as CallOther so the
+                            // emulator can flag the gap instead of
+                            // silently producing an empty op list.
+                            _ => {
+                                push(&mut ops, &mut s, OpCode::CallOther, None,
+                                    &[constant(0x3300 | (funct3 as u64), 4)]);
+                                return ops;
+                            }
                         }
                     } else {
                         match funct3 {
@@ -282,8 +309,25 @@ impl RiscVLifter {
                     }
                 }
             }
-            // FENCE (0x0F) and SYSTEM (0x73) produce no data-flow P-code here.
-            _ => {}
+            // FENCE (0x0F) is a memory-ordering barrier; SYSTEM (0x73)
+            // covers ECALL / EBREAK / CSR*. None of these have ordinary
+            // data-flow semantics, but silently dropping them hid every
+            // ecall site from analysis. Emit CallOther so the emulator
+            // and downstream passes see the boundary.
+            0x0F => {
+                push(&mut ops, &mut s, OpCode::CallOther, None,
+                    &[constant(0x0F, 4)]);
+            }
+            0x73 => {
+                push(&mut ops, &mut s, OpCode::CallOther, None,
+                    &[constant(0x73_00 | (funct3 as u64), 4)]);
+            }
+            _ => {
+                // Truly unrecognised opcode bits. Same rationale --
+                // surface, don't swallow.
+                push(&mut ops, &mut s, OpCode::CallOther, None,
+                    &[constant(opcode as u64, 4)]);
+            }
         }
 
         let _ = s;
@@ -342,9 +386,15 @@ impl RiscVLifter {
                 }
             }
             (1, 1) => {
-                // c.jal (RV32): call address + imm
+                // c.jal (RV32): ra = PC + 2; call address + imm.
+                // Compressed instructions are 2 bytes, so the link is
+                // PC + 2 (not PC + 4 as for the 32-bit JAL).
                 let imm = cj_imm(w);
                 let target = address.wrapping_add(imm) & 0xFFFF_FFFF;
+                if let Some(link) = xout(RA_INDEX) {
+                    push(&mut ops, &mut s, OpCode::Copy, Some(link),
+                        &[constant((address + 2) & 0xFFFF_FFFF, 4)]);
+                }
                 push(&mut ops, &mut s, OpCode::Call, None, &[ram(target)]);
             }
             (1, 2) => {
@@ -462,10 +512,26 @@ impl RiscVLifter {
                     }
                 } else if rs2 == 0 {
                     if rd != 0 {
-                        // c.jalr rd
-                        push(&mut ops, &mut s, OpCode::CallInd, None, &[xin(rd)]);
+                        // c.jalr rd: ra = PC + 2; CallInd via rd-register.
+                        // Snapshot the indirect target first so the link
+                        // write (ra = PC + 2) can't clobber it when the
+                        // source register IS ra. The previous code
+                        // produced CallInd without any link, so a callee
+                        // returning via `ret` jumped to a stale ra.
+                        let target = unique(0x420, 4);
+                        push(&mut ops, &mut s, OpCode::Copy, Some(target), &[xin(rd)]);
+                        if let Some(link) = xout(RA_INDEX) {
+                            push(&mut ops, &mut s, OpCode::Copy, Some(link),
+                                &[constant((address + 2) & 0xFFFF_FFFF, 4)]);
+                        }
+                        push(&mut ops, &mut s, OpCode::CallInd, None, &[target]);
+                    } else {
+                        // rd == 0 with bit12=1 and rs2=0 is c.ebreak --
+                        // surface it as CallOther so the boundary is
+                        // visible.
+                        push(&mut ops, &mut s, OpCode::CallOther, None,
+                            &[constant(0x9002, 4)]);
                     }
-                    // rd == 0 => c.ebreak (no ops)
                 } else if let Some(out) = xout(rd) {
                     // c.add rd += rs2
                     push(&mut ops, &mut s, OpCode::IntAdd, Some(out), &[xin(rd), xin(rs2)]);
@@ -648,11 +714,14 @@ mod tests {
     #[test]
     fn lift_jalr_ret() {
         // ret = jalr x0, 0(ra) => opcode=0x67 rd=0 rs1=1 imm=0
+        // JALR now snapshots the target into a unique before any link,
+        // so the Return op is no longer the first op of the lift.
         let word = (1 << 15) | 0x67;
         let lifter = RiscVLifter::new_rv32();
         let mem = make_memory(&le32(word), 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops[0].opcode, OpCode::Return);
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Return),
+            "ret must produce a Return op: {:?}", lifted.ops);
     }
 
     #[test]
@@ -664,8 +733,9 @@ mod tests {
         let lifter = RiscVLifter::new_rv32();
         let mem = make_memory(&le32(word), 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops[0].opcode, OpCode::Call);
-        assert_eq!(lifted.ops[0].inputs[0].offset, 0x1008);
+        let call = lifted.ops.iter().find(|o| o.opcode == OpCode::Call)
+            .expect("jal must emit Call");
+        assert_eq!(call.inputs[0].offset, 0x1008);
     }
 
     #[test]
@@ -736,5 +806,87 @@ mod tests {
         let mem = make_memory(&le32(word), 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
         assert!(lifted.ops.is_empty());
+    }
+
+    /// JAL must link rd = PC + 4 before transferring control. Without
+    /// the link, every callee's `ret` returned to a stale ra.
+    #[test]
+    fn lift_jal_links_rd() {
+        // jal ra, +8: rd=1, j_imm=8
+        let word = (1 << 23) | (1 << 7) | 0x6F;
+        let lifter = RiscVLifter::new_rv32();
+        let mem = make_memory(&le32(word), 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let ra_off = RA_INDEX as u64 * 4;
+        let link = lifted.ops.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == ra_off && v.space == CoreSpace::REGISTER).unwrap_or(false))
+            .expect("jal must link ra");
+        assert_eq!(link.inputs[0].offset, 0x1004);
+    }
+
+    /// JALR must link rd = PC + 4 and the indirect target must come
+    /// from a unique snapshot taken BEFORE the link write (so that
+    /// `jalr ra, 0(ra)` reads the pre-link ra).
+    #[test]
+    fn lift_jalr_links_rd_via_unique_target() {
+        // jalr ra, 0(ra): rd=1 rs1=1 imm=0  (self-jalr edge case)
+        let word = (1 << 15) | (1 << 7) | 0x67;
+        let lifter = RiscVLifter::new_rv32();
+        let mem = make_memory(&le32(word), 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // Indirect target must be a UNIQUE, not REGISTER ra (which would
+        // be the linked value).
+        let callind = lifted.ops.iter().find(|o| o.opcode == OpCode::CallInd)
+            .expect("CallInd present");
+        assert_eq!(callind.inputs[0].space, CoreSpace::UNIQUE,
+            "JALR target must be a snapshot UNIQUE, not the just-linked ra: {:?}", lifted.ops);
+        // The link copy must precede the CallInd.
+        let link_pos = lifted.ops.iter().position(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == RA_INDEX as u64 * 4 && v.space == CoreSpace::REGISTER).unwrap_or(false))
+            .expect("link Copy present");
+        let snapshot_pos = lifted.ops.iter().position(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.space == CoreSpace::UNIQUE).unwrap_or(false))
+            .expect("target snapshot Copy present");
+        assert!(snapshot_pos < link_pos,
+            "target snapshot must run before the link write: {:?}", lifted.ops);
+    }
+
+    /// c.jal (RV32 compressed) must link ra = PC + 2.
+    #[test]
+    fn lift_c_jal_links_ra_pc_plus_2() {
+        // c.jal +0x100 ; quadrant=1, funct3=001
+        let half: u16 = (1 << 13) | (1 << 9) | 0b01;
+        let lifter = RiscVLifter::new_rv32();
+        let mem = make_memory(&half.to_le_bytes(), 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let link = lifted.ops.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == RA_INDEX as u64 * 4 && v.space == CoreSpace::REGISTER).unwrap_or(false))
+            .expect("c.jal must link ra");
+        assert_eq!(link.inputs[0].offset, 0x1002);
+    }
+
+    /// ECALL must surface as CallOther so the syscall site is visible
+    /// instead of disappearing as an empty op list.
+    #[test]
+    fn lift_ecall_emits_call_other() {
+        let word = 0x73u32;
+        let lifter = RiscVLifter::new_rv32();
+        let mem = make_memory(&le32(word), 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::CallOther);
+    }
+
+    /// MULH (M-ext high-half multiply) is not directly modellable as a
+    /// single P-code op, but it must not silently disappear.
+    #[test]
+    fn lift_mulh_emits_call_other() {
+        // mulh a0, a1, a2: funct7=1 funct3=1
+        let word = (1u32 << 25) | (12 << 20) | (11 << 15) | (1 << 12) | (10 << 7) | 0x33;
+        let lifter = RiscVLifter::new_rv32();
+        let mem = make_memory(&le32(word), 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::CallOther),
+            "mulh must emit CallOther: {:?}", lifted.ops);
     }
 }
