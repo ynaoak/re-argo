@@ -38,7 +38,7 @@ impl ProcessEmulator {
         self.session.state = SessionState::Running;
         let addr = self.session.current_address;
 
-        if self.session.breakpoints.check(addr) {
+        if self.session.breakpoints.check_with_state(addr, Some(&self.session.emulator.state)) {
             self.session.state = SessionState::Breakpoint(addr);
             return StepResult::Breakpoint(addr);
         }
