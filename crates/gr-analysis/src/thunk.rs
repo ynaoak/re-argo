@@ -1,5 +1,6 @@
 use gr_arch::FlowType;
 use gr_program::Program;
+use rayon::prelude::*;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -19,32 +20,45 @@ impl Analyzer for ThunkDetectorAnalyzer {
     }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut thunks_found = 0;
-
         let func_entries: Vec<u64> = program
             .listing
             .functions()
             .map(|f| f.entry_point)
             .collect();
 
-        for entry in func_entries {
-            let insns: Vec<_> = program
-                .listing
-                .instructions_in_range(entry, entry + 16)
-                .collect();
-
-            if insns.len() == 1 {
+        // Phase 1: detect thunk shape in parallel. Each function is
+        // inspected against an immutable Program view (one
+        // instruction-range read plus a couple of bools), so this
+        // scales linearly with cores.
+        let detected: Vec<(u64, u64)> = func_entries
+            .par_iter()
+            .filter_map(|&entry| {
+                let insns: Vec<_> = program
+                    .listing
+                    .instructions_in_range(entry, entry + 16)
+                    .collect();
+                if insns.len() != 1 {
+                    return None;
+                }
                 let insn = insns[0];
                 let is_jmp = insn.is_unconditional_jump()
                     || insn.flow_type == FlowType::UnconditionalJump;
+                if !is_jmp {
+                    return None;
+                }
+                insn.branch_target.map(|target| (entry, target))
+            })
+            .collect();
 
-                if is_jmp
-                    && let Some(target) = insn.branch_target
-                        && let Some(func) = program.listing.get_function_mut(entry) {
-                            func.is_thunk = true;
-                            func.thunk_target = Some(target);
-                            thunks_found += 1;
-                        }
+        // Phase 2: apply serially -- each (entry, target) pair targets
+        // a distinct function, so the listing converges to the same
+        // state regardless of the parallel scan's order.
+        let mut thunks_found = 0;
+        for (entry, target) in detected {
+            if let Some(func) = program.listing.get_function_mut(entry) {
+                func.is_thunk = true;
+                func.thunk_target = Some(target);
+                thunks_found += 1;
             }
         }
 
