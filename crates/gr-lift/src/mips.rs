@@ -182,8 +182,49 @@ impl MipsLifter {
                         }
                     }
                     0x09 => {
-                        // jalr rs (link defaults to $ra)
+                        // jalr rd, rs: rd = PC + 8 (skip delay slot), then
+                        // CallInd through rs. The assembler-default form
+                        // `jalr rs` encodes rd = $ra. Without the link the
+                        // callee's `jr $ra` returns to garbage.
+                        if let Some(link) = reg_out(rd) {
+                            ops.push(PcodeOp {
+                                opcode: OpCode::Copy,
+                                seq: seq(s),
+                                output: Some(link),
+                                inputs: SmallVec::from_slice(&[constant(address + 8, 4)]),
+                            });
+                            s += 1;
+                        }
                         ops.push(PcodeOp { opcode: OpCode::CallInd, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[reg_in(rs)]) });
+                    }
+                    0x0C => {
+                        // syscall — surface to the emulator instead of
+                        // silently swallowing the instruction.
+                        ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(0x0C, 4)]) });
+                    }
+                    0x0D => {
+                        // break
+                        ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(0x0D, 4)]) });
+                    }
+                    0x10 => {
+                        // mfhi rd
+                        if let Some(out) = reg_out(rd) {
+                            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(out), inputs: SmallVec::from_slice(&[hi_reg()]) });
+                        }
+                    }
+                    0x11 => {
+                        // mthi rs (HI = rs)
+                        ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(hi_reg()), inputs: SmallVec::from_slice(&[reg_in(rs)]) });
+                    }
+                    0x12 => {
+                        // mflo rd
+                        if let Some(out) = reg_out(rd) {
+                            ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(out), inputs: SmallVec::from_slice(&[lo_reg()]) });
+                        }
+                    }
+                    0x13 => {
+                        // mtlo rs (LO = rs)
+                        ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(lo_reg()), inputs: SmallVec::from_slice(&[reg_in(rs)]) });
                     }
                     0x18 | 0x19 => {
                         // mult/multu — low product into lo (hi ignored)
@@ -201,27 +242,62 @@ impl MipsLifter {
                         s += 1;
                         ops.push(PcodeOp { opcode: OpCode::IntRem, seq: seq(s), output: Some(hi_reg()), inputs: SmallVec::from_slice(&[reg_in(rs), reg_in(rt)]) });
                     }
-                    _ => {}
+                    _ => {
+                        // Unrecognised SPECIAL funct: surface as CallOther
+                        // so the emulator reports the gap instead of
+                        // silently no-op'ing (which previously made
+                        // unimplemented instructions invisible).
+                        ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(funct as u64, 4)]) });
+                    }
                 }
             }
             0x01 => {
-                // REGIMM — rt field selects condition (bltz=0, bgez=1)
-                let cond = unique(0x200, 1);
-                let (op, a, b) = if rt == 0 {
-                    (OpCode::IntSLess, reg_in(rs), constant(0, 4)) // bltz: rs < 0
+                // REGIMM — rt field is the sub-opcode, not a register. The
+                // four families are bltz/bgez/bltzl/bgezl (no link) and
+                // bltzal/bgezal/bltzall/bgezall (link $ra = PC + 8). Any
+                // other rt is reserved; previously we silently treated
+                // every rt >= 1 as bgez, which mis-lifted bltzal/bgezal
+                // as bgez AND dropped the link.
+                let is_link = matches!(rt, 0x10..=0x13);
+                let is_lt = matches!(rt, 0x00 | 0x02 | 0x10 | 0x12);
+                let is_ge = matches!(rt, 0x01 | 0x03 | 0x11 | 0x13);
+                if !is_lt && !is_ge {
+                    ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(0x01_00 | rt as u64, 4)]) });
                 } else {
-                    (OpCode::IntSLessEqual, constant(0, 4), reg_in(rs)) // bgez: 0 <= rs
-                };
-                ops.push(PcodeOp { opcode: op, seq: seq(s), output: Some(cond), inputs: SmallVec::from_slice(&[a, b]) });
-                s += 1;
-                ops.push(PcodeOp { opcode: OpCode::CBranch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(branch_target), cond]) });
+                    if is_link
+                        && let Some(link) = reg_out(RA_INDEX)
+                    {
+                        ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(s), output: Some(link), inputs: SmallVec::from_slice(&[constant(address + 8, 4)]) });
+                        s += 1;
+                    }
+                    let cond = unique(0x200, 1);
+                    let (op, a, b) = if is_lt {
+                        (OpCode::IntSLess, reg_in(rs), constant(0, 4)) // rs < 0
+                    } else {
+                        (OpCode::IntSLessEqual, constant(0, 4), reg_in(rs)) // 0 <= rs
+                    };
+                    ops.push(PcodeOp { opcode: op, seq: seq(s), output: Some(cond), inputs: SmallVec::from_slice(&[a, b]) });
+                    s += 1;
+                    ops.push(PcodeOp { opcode: OpCode::CBranch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(branch_target), cond]) });
+                }
             }
             0x02 => {
                 // j target
                 ops.push(PcodeOp { opcode: OpCode::Branch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(jump_target)]) });
             }
             0x03 => {
-                // jal target
+                // jal target: $ra = PC + 8 (delay-slot insn still runs on
+                // real hardware), then Call. Without the link, returning
+                // through `jr $ra` reads a stale or zero value.
+                if let Some(link) = reg_out(RA_INDEX) {
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Copy,
+                        seq: seq(s),
+                        output: Some(link),
+                        inputs: SmallVec::from_slice(&[constant(address + 8, 4)]),
+                    });
+                    s += 1;
+                }
                 ops.push(PcodeOp { opcode: OpCode::Call, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(jump_target)]) });
             }
             0x04 | 0x05 => {
@@ -330,7 +406,12 @@ impl MipsLifter {
                 };
                 ops.push(PcodeOp { opcode: OpCode::Store, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr, value]) });
             }
-            _ => {}
+            _ => {
+                // Unknown top-level opcode (COP*, SPECIAL2/3, unaligned
+                // loads, etc.): emit CallOther carrying the opcode so the
+                // emulator can flag it instead of silently skipping.
+                ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[constant((opcode as u64) << 26, 4)]) });
+            }
         }
 
         let _ = s;
@@ -521,5 +602,104 @@ mod tests {
         let mem = make_memory(&[word], 0x1000, false);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
         assert_eq!(lifted.ops[0].opcode, OpCode::IntAdd);
+    }
+
+    /// JAL must link $ra = PC + 8 before transferring control; without
+    /// the link, the callee's `jr $ra` returned to a stale value.
+    #[test]
+    fn lift_jal_writes_link_register() {
+        // jal 0x400: op=3, target word index 0x100 -> 0x400.
+        let word = (0x03u32 << 26) | 0x100;
+        let lifter = MipsLifter::new_32(Endian::Big);
+        let mem = make_memory(&[word], 0x1000, true);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let ra_off = RA_INDEX as u64 * 4;
+        let link = lifted.ops.iter().find(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.space == CoreSpace::REGISTER && v.offset == ra_off).unwrap_or(false))
+            .unwrap_or_else(|| panic!("JAL must link $ra: {:?}", lifted.ops));
+        // Link value is PC + 8 (skipping the delay slot).
+        assert_eq!(link.inputs[0].space, CoreSpace::CONST);
+        assert_eq!(link.inputs[0].offset, 0x1008);
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Call));
+    }
+
+    /// JALR with the canonical assembler form `jalr rd=$ra, rs` must link
+    /// $ra before the indirect call.
+    #[test]
+    fn lift_jalr_writes_link_register() {
+        // jalr $ra, $t9: rs=25 ($t9), rd=31 ($ra), funct=9
+        let word = (25u32 << 21) | (31 << 11) | 0x09;
+        let lifter = MipsLifter::new_32(Endian::Big);
+        let mem = make_memory(&[word], 0x1000, true);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let ra_off = RA_INDEX as u64 * 4;
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == ra_off).unwrap_or(false)),
+            "JALR with rd=$ra must link $ra: {:?}", lifted.ops);
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+
+    /// BLTZAL is REGIMM rt=0x10. Previously every rt != 0 was treated as
+    /// BGEZ with no link — so this lifted with the wrong direction AND
+    /// dropped the return-address write.
+    #[test]
+    fn lift_bltzal_links_and_compares_lt() {
+        // bltzal $a0, +4: op=1, rs=4, rt=0x10, imm=1
+        let word = (0x01u32 << 26) | (4 << 21) | (0x10 << 16) | 1;
+        let lifter = MipsLifter::new_32(Endian::Big);
+        let mem = make_memory(&[word], 0x1000, true);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let ra_off = RA_INDEX as u64 * 4;
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.map(|v| v.offset == ra_off).unwrap_or(false)),
+            "BLTZAL must link $ra: {:?}", lifted.ops);
+        // Condition is rs < 0 (IntSLess, not IntSLessEqual)
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::IntSLess),
+            "BLTZAL must compute rs < 0: {:?}", lifted.ops);
+    }
+
+    /// REGIMM with an unallocated rt (e.g. 5) used to be silently lifted
+    /// as BGEZ. It must now surface as CallOther so the gap is visible.
+    #[test]
+    fn lift_regimm_unknown_rt_emits_call_other() {
+        let word = (0x01u32 << 26) | (4 << 21) | (5 << 16) | 1;
+        let lifter = MipsLifter::new_32(Endian::Big);
+        let mem = make_memory(&[word], 0x1000, true);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::CallOther);
+        // No CBranch, no IntSLess/IntSLessEqual.
+        assert!(!lifted.ops.iter().any(|o| matches!(o.opcode,
+            OpCode::CBranch | OpCode::IntSLess | OpCode::IntSLessEqual)));
+    }
+
+    /// MFHI/MFLO must copy HI/LO into rd. Previously they emitted no ops
+    /// at all, so multiplication and division results were unreadable
+    /// downstream.
+    #[test]
+    fn lift_mfhi_copies_hi_to_rd() {
+        // mfhi $a0: rd=4, funct=0x10
+        let word = (4u32 << 11) | 0x10;
+        let lifter = MipsLifter::new_32(Endian::Big);
+        let mem = make_memory(&[word], 0x1000, true);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::Copy);
+        // dest = $a0 = reg offset 16
+        assert_eq!(lifted.ops[0].output.unwrap().offset, 16);
+        // source = HI register
+        assert_eq!(lifted.ops[0].inputs[0].offset, 33 * 4);
+    }
+
+    /// Unknown top-level opcodes (e.g. COP2 stores) previously
+    /// disappeared into an empty op list. Surface them as CallOther.
+    #[test]
+    fn lift_unknown_opcode_emits_call_other() {
+        let word = 0xF800_0000u32; // op=0x3E, no defined instruction here
+        let lifter = MipsLifter::new_32(Endian::Big);
+        let mem = make_memory(&[word], 0x1000, true);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::CallOther);
     }
 }
