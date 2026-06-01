@@ -115,7 +115,15 @@ fn rust_type(c_type: &str) -> String {
         "double" => "f64".into(),
         "bool" | "_Bool" => "bool".into(),
         "size_t" => "usize".into(),
-        s if s.ends_with('*') => format!("*mut {}", rust_type(s.trim_end_matches('*').trim())),
+        // Strip ONE trailing '*' and recurse so each pointer level
+        // wraps the next in `*mut`. The previous version used
+        // `trim_end_matches('*')`, which strips every trailing '*'
+        // greedily -- `char**` collapsed to `rust_type("char")` and
+        // came out as `*mut i8` instead of `*mut *mut i8`.
+        s if s.ends_with('*') => {
+            let inner = s.strip_suffix('*').unwrap_or(s).trim_end();
+            format!("*mut {}", rust_type(inner))
+        }
         other => other.to_string(),
     }
 }
@@ -159,5 +167,15 @@ mod tests {
         assert_eq!(rust_type("double"), "f64");
         assert_eq!(rust_type("void"), "()");
         assert_eq!(rust_type("size_t"), "usize");
+    }
+
+    /// Double / triple pointers must preserve each pointer level.
+    /// Pre-fix `trim_end_matches('*')` stripped greedily and collapsed
+    /// `char**` to `*mut i8` instead of `*mut *mut i8`.
+    #[test]
+    fn rust_type_preserves_pointer_depth() {
+        assert_eq!(rust_type("char*"), "*mut i8");
+        assert_eq!(rust_type("char**"), "*mut *mut i8");
+        assert_eq!(rust_type("int***"), "*mut *mut *mut i32");
     }
 }
