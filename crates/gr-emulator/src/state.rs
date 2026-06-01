@@ -8,32 +8,111 @@ pub struct EmulatorState {
     spaces: BTreeMap<u32, SpaceData>,
 }
 
+/// 4 KiB pages: the BTreeMap holds page-aligned addresses, each mapping
+/// to a fixed-size byte array. Reads/writes that fit within a single
+/// page (the overwhelming majority of P-code accesses, since varnodes
+/// are 1/2/4/8 bytes and addresses are usually word-aligned) go through
+/// the fast path -- one BTreeMap lookup plus a single `from_le_bytes`
+/// / `to_le_bytes` call instead of the previous N per-byte lookups.
+const PAGE_SHIFT: u32 = 12;
+const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+const PAGE_MASK: u64 = (PAGE_SIZE as u64) - 1;
+
 #[derive(Debug, Clone)]
 struct SpaceData {
-    data: BTreeMap<u64, u8>,
+    pages: BTreeMap<u64, Box<[u8; PAGE_SIZE]>>,
 }
 
 impl SpaceData {
     fn new() -> Self {
         Self {
-            data: BTreeMap::new(),
+            pages: BTreeMap::new(),
         }
     }
 
+    /// Read up to 8 bytes little-endian starting at `offset`. Sizes
+    /// larger than 8 are clamped (P-code reads through this API are
+    /// always <= 8 bytes; bigger varnodes are handled via Subpiece /
+    /// Piece on the IR side).
     fn read(&self, offset: u64, size: u32) -> u64 {
-        let mut result: u64 = 0;
-        for i in 0..size as u64 {
-            if let Some(&byte) = self.data.get(&(offset + i)) {
-                result |= (byte as u64) << (i * 8);
+        let size = (size as usize).min(8);
+        let page_addr = offset & !PAGE_MASK;
+        let page_off = (offset & PAGE_MASK) as usize;
+
+        // Fast path: the access fits in one page.
+        if page_off + size <= PAGE_SIZE {
+            return self
+                .pages
+                .get(&page_addr)
+                .map(|page| {
+                    let mut buf = [0u8; 8];
+                    buf[..size].copy_from_slice(&page[page_off..page_off + size]);
+                    u64::from_le_bytes(buf)
+                })
+                .unwrap_or(0);
+        }
+
+        // Slow path: the read crosses a page boundary. Walk byte-by-byte
+        // so the unmapped-page-as-zero semantics still hold per byte.
+        let mut buf = [0u8; 8];
+        for (i, slot) in buf.iter_mut().enumerate().take(size) {
+            let addr = offset.wrapping_add(i as u64);
+            let page_addr = addr & !PAGE_MASK;
+            let page_off = (addr & PAGE_MASK) as usize;
+            if let Some(page) = self.pages.get(&page_addr) {
+                *slot = page[page_off];
             }
         }
-        result
+        u64::from_le_bytes(buf)
     }
 
+    /// Write up to 8 bytes little-endian. Allocates one page on demand
+    /// per page touched.
     fn write(&mut self, offset: u64, size: u32, value: u64) {
-        for i in 0..size as u64 {
-            let byte = ((value >> (i * 8)) & 0xFF) as u8;
-            self.data.insert(offset + i, byte);
+        let size = (size as usize).min(8);
+        let bytes = value.to_le_bytes();
+        let page_addr = offset & !PAGE_MASK;
+        let page_off = (offset & PAGE_MASK) as usize;
+
+        if page_off + size <= PAGE_SIZE {
+            let page = self
+                .pages
+                .entry(page_addr)
+                .or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
+            page[page_off..page_off + size].copy_from_slice(&bytes[..size]);
+            return;
+        }
+
+        // Slow path: the write crosses a page boundary.
+        for (i, &b) in bytes.iter().enumerate().take(size) {
+            let addr = offset.wrapping_add(i as u64);
+            let page_addr = addr & !PAGE_MASK;
+            let page_off = (addr & PAGE_MASK) as usize;
+            let page = self
+                .pages
+                .entry(page_addr)
+                .or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
+            page[page_off] = b;
+        }
+    }
+
+    /// Bulk-copy a byte slice into the space. Pages are allocated as
+    /// needed and the slice is split at page boundaries so each page
+    /// gets one `copy_from_slice` rather than per-byte writes.
+    fn write_bytes(&mut self, offset: u64, data: &[u8]) {
+        let mut written = 0usize;
+        while written < data.len() {
+            let addr = offset.wrapping_add(written as u64);
+            let page_addr = addr & !PAGE_MASK;
+            let page_off = (addr & PAGE_MASK) as usize;
+            let chunk = (PAGE_SIZE - page_off).min(data.len() - written);
+            let page = self
+                .pages
+                .entry(page_addr)
+                .or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
+            page[page_off..page_off + chunk]
+                .copy_from_slice(&data[written..written + chunk]);
+            written += chunk;
         }
     }
 }
@@ -88,9 +167,11 @@ impl EmulatorState {
     }
 
     pub fn load_memory_bytes(&mut self, address: u64, data: &[u8]) {
-        for (i, &byte) in data.iter().enumerate() {
-            self.write_memory(address + i as u64, 1, byte as u64);
-        }
+        // Page-batched bulk write: pre-fix this looped one byte at a
+        // time through `write_memory`, paying a BTreeMap lookup per
+        // byte. Loading a 1 MiB image now allocates ~256 pages and
+        // does ~256 BTreeMap lookups instead of ~1 million.
+        self.get_space_mut(SpaceId::RAM).write_bytes(address, data);
     }
 
     pub fn dump_registers(&self) -> Vec<(String, u64)> {
@@ -146,5 +227,57 @@ mod tests {
         let mut state = EmulatorState::new();
         state.load_memory_bytes(0x2000, &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(state.read_memory(0x2000, 4), 0x04030201);
+    }
+
+    /// A read that straddles two pages must still combine the bytes
+    /// from each side in little-endian order. The fast path can't
+    /// take this case, so the slow per-byte path has to be correct.
+    #[test]
+    fn read_spans_page_boundary() {
+        let mut state = EmulatorState::new();
+        // Page 0 ends at 0x1000; place 4 bytes from 0x0FFE..0x1002 so
+        // the read crosses 0x1000.
+        state.write_memory(0x0FFE, 4, 0xDEADBEEF);
+        assert_eq!(state.read_memory(0x0FFE, 4), 0xDEADBEEF);
+        // Per-byte reads from each side should also match.
+        assert_eq!(state.read_memory(0x0FFE, 1), 0xEF);
+        assert_eq!(state.read_memory(0x1001, 1), 0xDE);
+    }
+
+    /// Writes that straddle a page boundary must allocate both pages
+    /// and split the bytes correctly between them.
+    #[test]
+    fn write_spans_page_boundary() {
+        let mut state = EmulatorState::new();
+        state.write_memory(0x0FFC, 8, 0x0123456789ABCDEF);
+        assert_eq!(state.read_memory(0x0FFC, 8), 0x0123456789ABCDEF);
+        // The first page holds the low half, the second page the high half.
+        assert_eq!(state.read_memory(0x0FFC, 4), 0x89ABCDEF);
+        assert_eq!(state.read_memory(0x1000, 4), 0x01234567);
+    }
+
+    /// Bulk load via `load_memory_bytes` must round-trip across page
+    /// boundaries. Pre-fix this looped one byte at a time and was
+    /// merely correct-but-slow; this test pins correctness so the
+    /// page-batched fast path can't regress it.
+    #[test]
+    fn load_memory_bytes_across_pages() {
+        let mut state = EmulatorState::new();
+        let payload: Vec<u8> = (0..(PAGE_SIZE + 16) as u8).cycle().take(PAGE_SIZE + 16).collect();
+        state.load_memory_bytes(0x0FF0, &payload);
+        // First byte at 0x0FF0, last byte at 0x0FF0 + len - 1.
+        let last = 0x0FF0 + (payload.len() as u64) - 1;
+        assert_eq!(state.read_memory(0x0FF0, 1), payload[0] as u64);
+        assert_eq!(state.read_memory(last, 1), payload[payload.len() - 1] as u64);
+        // Middle: somewhere in the second page.
+        let mid = 0x0FF0 + 100;
+        assert_eq!(state.read_memory(mid, 1), payload[100] as u64);
+    }
+
+    /// Reads from an entirely unmapped page must read as zero.
+    #[test]
+    fn unmapped_page_reads_zero() {
+        let state = EmulatorState::new();
+        assert_eq!(state.read_memory(0x5_0000_0000, 8), 0);
     }
 }
