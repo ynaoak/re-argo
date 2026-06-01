@@ -1,6 +1,7 @@
 use gr_lift::{LiftedInstruction, PcodeLift};
 use gr_loader::Memory;
 use gr_program::Program;
+use rayon::prelude::*;
 
 use crate::cfg::ControlFlowGraph;
 use crate::emit::CEmitter;
@@ -112,6 +113,29 @@ pub fn decompile_function(
         .unwrap_or_default();
 
     build_decompile_result(&terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
+}
+
+/// Decompile every function the program knows about, in parallel.
+///
+/// Each function decompiles independently (no shared mutable state
+/// between functions), so the work fans out to rayon's thread pool
+/// and the wall-clock cost is ~`sum / threads` rather than `sum`.
+/// Results come back in (entry_point, Result) pairs so a single
+/// failed function doesn't abort the whole batch.
+pub fn decompile_all(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+) -> Vec<(u64, Result<DecompileResult, String>)> {
+    let entries: Vec<u64> = program
+        .listing
+        .functions()
+        .map(|f| f.entry_point)
+        .collect();
+
+    entries
+        .par_iter()
+        .map(|&entry| (entry, decompile_function(lifter, program, entry)))
+        .collect()
 }
 
 /// Result of taint-tracking a function from its parameters.
