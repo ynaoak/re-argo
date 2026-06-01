@@ -14,6 +14,7 @@ const UNIQUE_SPACE: SpaceId = SpaceId::UNIQUE;
 const ZF_OFFSET: u64 = 0x206;
 const SF_OFFSET: u64 = 0x207;
 const CF_OFFSET: u64 = 0x201;
+const OF_OFFSET: u64 = 0x20B;
 
 fn reg(offset: u64, size: u32) -> VarnodeData {
     VarnodeData::new(REG_SPACE, offset, size)
@@ -217,6 +218,15 @@ impl X86Lifter {
                 } else {
                     src
                 };
+                // For Add/Sub, CF/OF are derived from the *pre-op* operands,
+                // so compute them before the operation overwrites `dst`.
+                // Without these, `sub eax, eax; je L` never branched (ZF
+                // stayed stale) and `add reg, reg; jc L` misread CF.
+                match mnem {
+                    Add => self.emit_add_carry_flags(dst, shift_src, &mut ops, &mut seq_base, address),
+                    Sub => self.emit_sub_carry_flags(dst, shift_src, &mut ops, &mut seq_base, address),
+                    _ => {}
+                }
                 ops.push(PcodeOp {
                     opcode,
                     seq: seq(seq_base),
@@ -224,6 +234,20 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[dst, shift_src]),
                 });
                 seq_base += 1;
+                match mnem {
+                    Add | Sub => {
+                        self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
+                    }
+                    And | Or | Xor => {
+                        // Logical ops set ZF/SF from the result and clear
+                        // CF/OF unconditionally (x86 manual). Shifts have
+                        // CF/OF semantics that depend on the count and are
+                        // intentionally not modelled here yet.
+                        self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
+                        self.emit_clear_cf_of(&mut ops, &mut seq_base, address);
+                    }
+                    _ => {}
+                }
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
@@ -264,26 +288,46 @@ impl X86Lifter {
             }
 
             Inc => {
+                // INC sets OF/SF/ZF (and PF/AF) but leaves CF unchanged.
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let one = constant(1, dst.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntSCarry,
+                    seq: seq(seq_base),
+                    output: Some(reg(OF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[dst, one]),
+                });
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntAdd,
                     seq: seq(seq_base),
                     output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, constant(1, dst.size)]),
+                    inputs: SmallVec::from_slice(&[dst, one]),
                 });
                 seq_base += 1;
+                self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
             Dec => {
+                // DEC sets OF/SF/ZF (and PF/AF) but leaves CF unchanged.
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let one = constant(1, dst.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntSBorrow,
+                    seq: seq(seq_base),
+                    output: Some(reg(OF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[dst, one]),
+                });
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::IntSub,
                     seq: seq(seq_base),
                     output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, constant(1, dst.size)]),
+                    inputs: SmallVec::from_slice(&[dst, one]),
                 });
                 seq_base += 1;
+                self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
@@ -318,6 +362,16 @@ impl X86Lifter {
                     opcode: OpCode::IntLess,
                     seq: seq(seq_base),
                     output: Some(cf),
+                    inputs: SmallVec::from_slice(&[left, right]),
+                });
+                seq_base += 1;
+                // OF for CMP: signed-borrow of (left - right). Without
+                // this, JL / JGE silently flipped on signed overflow (the
+                // canonical `cmp INT_MIN, 1; jl L` failure mode).
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntSBorrow,
+                    seq: seq(seq_base),
+                    output: Some(reg(OF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[left, right]),
                 });
             }
@@ -478,32 +532,31 @@ impl X86Lifter {
             }
 
             Jl => {
+                // JL: SF != OF. Without OF, this previously emitted CBranch
+                // on plain SF — wrong whenever the comparison's
+                // subtraction signed-overflowed.
                 let target = insn.near_branch_target();
-                let sf = reg(SF_OFFSET, 1);
+                let cond = self.emit_sf_xor_of(&mut ops, &mut seq_base, address);
                 ops.push(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
-                    inputs: SmallVec::from_slice(&[ram(target, ps), sf]),
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
                 });
             }
 
             Jge => {
+                // JGE: SF == OF
                 let target = insn.near_branch_target();
-                let sf = reg(SF_OFFSET, 1);
-                let not_sf = unique(0x420, 1);
-                ops.push(PcodeOp {
-                    opcode: OpCode::BoolNegate,
-                    seq: seq(seq_base),
-                    output: Some(not_sf),
-                    inputs: SmallVec::from_slice(&[sf]),
-                });
-                seq_base += 1;
+                let cond = self.emit_not(
+                    self.emit_sf_xor_of(&mut ops, &mut seq_base, address),
+                    0x424, &mut ops, &mut seq_base, address,
+                );
                 ops.push(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
-                    inputs: SmallVec::from_slice(&[ram(target, ps), not_sf]),
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
                 });
             }
 
@@ -520,32 +573,148 @@ impl X86Lifter {
 
             Jae => {
                 let target = insn.near_branch_target();
-                let cf = reg(CF_OFFSET, 1);
-                let not_cf = unique(0x430, 1);
+                let cond = self.emit_not(reg(CF_OFFSET, 1), 0x430, &mut ops, &mut seq_base, address);
                 ops.push(PcodeOp {
-                    opcode: OpCode::BoolNegate,
+                    opcode: OpCode::CBranch,
                     seq: seq(seq_base),
-                    output: Some(not_cf),
-                    inputs: SmallVec::from_slice(&[cf]),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
+                });
+            }
+
+            // Sign-flag jumps used the wrong flag entirely (ZF instead of
+            // SF). After this fix `js`/`jns` branch on the sign of the
+            // last result, matching x86 semantics.
+            Js => {
+                let target = insn.near_branch_target();
+                let sf = reg(SF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), sf]),
+                });
+            }
+            Jns => {
+                let target = insn.near_branch_target();
+                let cond = self.emit_not(reg(SF_OFFSET, 1), 0x440, &mut ops, &mut seq_base, address);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
+                });
+            }
+
+            // Overflow-flag jumps need OF, which Cmp/Sub/Add/Inc/Dec now
+            // populate. They previously misread ZF.
+            Jo => {
+                let target = insn.near_branch_target();
+                let of = reg(OF_OFFSET, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), of]),
+                });
+            }
+            Jno => {
+                let target = insn.near_branch_target();
+                let cond = self.emit_not(reg(OF_OFFSET, 1), 0x450, &mut ops, &mut seq_base, address);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
+                });
+            }
+
+            // Unsigned-pair: JA = !CF & !ZF, JBE = CF | ZF.
+            Ja => {
+                let target = insn.near_branch_target();
+                // !(CF | ZF) == (!CF & !ZF) by De Morgan.
+                let cf_or_zf = unique(0x460, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolOr,
+                    seq: seq(seq_base),
+                    output: Some(cf_or_zf),
+                    inputs: SmallVec::from_slice(&[reg(CF_OFFSET, 1), reg(ZF_OFFSET, 1)]),
+                });
+                seq_base += 1;
+                let cond = self.emit_not(cf_or_zf, 0x464, &mut ops, &mut seq_base, address);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
+                });
+            }
+            Jbe => {
+                let target = insn.near_branch_target();
+                let cond = unique(0x468, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolOr,
+                    seq: seq(seq_base),
+                    output: Some(cond),
+                    inputs: SmallVec::from_slice(&[reg(CF_OFFSET, 1), reg(ZF_OFFSET, 1)]),
                 });
                 seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
-                    inputs: SmallVec::from_slice(&[ram(target, ps), not_cf]),
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
                 });
             }
 
-            Jle | Jg | Ja | Jbe
-            | Js | Jns | Jo | Jno | Jp | Jnp => {
+            // Signed-pair: JLE = ZF | (SF != OF), JG = !JLE.
+            Jle => {
                 let target = insn.near_branch_target();
-                let zf = reg(ZF_OFFSET, 1);
+                let sf_xor_of = self.emit_sf_xor_of(&mut ops, &mut seq_base, address);
+                let cond = unique(0x470, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolOr,
+                    seq: seq(seq_base),
+                    output: Some(cond),
+                    inputs: SmallVec::from_slice(&[reg(ZF_OFFSET, 1), sf_xor_of]),
+                });
+                seq_base += 1;
                 ops.push(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
-                    inputs: SmallVec::from_slice(&[ram(target, ps), zf]),
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
+                });
+            }
+            Jg => {
+                let target = insn.near_branch_target();
+                let sf_xor_of = self.emit_sf_xor_of(&mut ops, &mut seq_base, address);
+                let zf_or_sxo = unique(0x478, 1);
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolOr,
+                    seq: seq(seq_base),
+                    output: Some(zf_or_sxo),
+                    inputs: SmallVec::from_slice(&[reg(ZF_OFFSET, 1), sf_xor_of]),
+                });
+                seq_base += 1;
+                let cond = self.emit_not(zf_or_sxo, 0x47c, &mut ops, &mut seq_base, address);
+                ops.push(PcodeOp {
+                    opcode: OpCode::CBranch,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
+                });
+            }
+
+            // Parity-flag jumps are not modelled (no PF tracking yet);
+            // emit a CallOther so the emulator surfaces the gap instead
+            // of silently branching on whatever was in ZF.
+            Jp | Jnp => {
+                ops.push(PcodeOp {
+                    opcode: OpCode::CallOther,
+                    seq: seq(seq_base),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[constant(0, 4)]),
                 });
             }
 
@@ -570,6 +739,150 @@ impl X86Lifter {
 
         let _ = seq_base;
         Ok(ops)
+    }
+
+    /// Set ZF/SF from a result varnode. Used by Add/Sub/Inc/Dec and by
+    /// the logical ops, which (per Intel manual) clear CF/OF separately.
+    fn emit_zf_sf_from(
+        &self,
+        result: VarnodeData,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) {
+        let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
+        let zero = constant(0, result.size);
+        ops.push(PcodeOp {
+            opcode: OpCode::IntEqual,
+            seq: seq_at(*seq_base),
+            output: Some(reg(ZF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[result, zero]),
+        });
+        *seq_base += 1;
+        ops.push(PcodeOp {
+            opcode: OpCode::IntSLess,
+            seq: seq_at(*seq_base),
+            output: Some(reg(SF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[result, zero]),
+        });
+        *seq_base += 1;
+    }
+
+    /// AND/OR/XOR clear CF and OF unconditionally.
+    fn emit_clear_cf_of(
+        &self,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) {
+        let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
+        ops.push(PcodeOp {
+            opcode: OpCode::Copy,
+            seq: seq_at(*seq_base),
+            output: Some(reg(CF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[constant(0, 1)]),
+        });
+        *seq_base += 1;
+        ops.push(PcodeOp {
+            opcode: OpCode::Copy,
+            seq: seq_at(*seq_base),
+            output: Some(reg(OF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[constant(0, 1)]),
+        });
+        *seq_base += 1;
+    }
+
+    /// CF/OF for ADD computed from the pre-op operands.
+    fn emit_add_carry_flags(
+        &self,
+        a: VarnodeData,
+        b: VarnodeData,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) {
+        let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
+        ops.push(PcodeOp {
+            opcode: OpCode::IntCarry,
+            seq: seq_at(*seq_base),
+            output: Some(reg(CF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[a, b]),
+        });
+        *seq_base += 1;
+        ops.push(PcodeOp {
+            opcode: OpCode::IntSCarry,
+            seq: seq_at(*seq_base),
+            output: Some(reg(OF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[a, b]),
+        });
+        *seq_base += 1;
+    }
+
+    /// CF/OF for SUB computed from the pre-op operands. CF is `a <u b`
+    /// (unsigned borrow). OF is signed-borrow.
+    fn emit_sub_carry_flags(
+        &self,
+        a: VarnodeData,
+        b: VarnodeData,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) {
+        let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
+        ops.push(PcodeOp {
+            opcode: OpCode::IntLess,
+            seq: seq_at(*seq_base),
+            output: Some(reg(CF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[a, b]),
+        });
+        *seq_base += 1;
+        ops.push(PcodeOp {
+            opcode: OpCode::IntSBorrow,
+            seq: seq_at(*seq_base),
+            output: Some(reg(OF_OFFSET, 1)),
+            inputs: SmallVec::from_slice(&[a, b]),
+        });
+        *seq_base += 1;
+    }
+
+    /// Compute and return a fresh varnode holding `SF XOR OF` (the
+    /// signed-less-than predicate). Each Jcc allocates its own unique
+    /// to keep these from colliding within a single lifted instruction.
+    fn emit_sf_xor_of(
+        &self,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> VarnodeData {
+        let out = unique(0x480, 1);
+        ops.push(PcodeOp {
+            opcode: OpCode::BoolXor,
+            seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
+            output: Some(out),
+            inputs: SmallVec::from_slice(&[reg(SF_OFFSET, 1), reg(OF_OFFSET, 1)]),
+        });
+        *seq_base += 1;
+        out
+    }
+
+    /// BoolNegate helper: write `!src` into a unique at the given offset.
+    fn emit_not(
+        &self,
+        src: VarnodeData,
+        unique_offset: u64,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> VarnodeData {
+        let out = unique(unique_offset, 1);
+        ops.push(PcodeOp {
+            opcode: OpCode::BoolNegate,
+            seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
+            output: Some(out),
+            inputs: SmallVec::from_slice(&[src]),
+        });
+        *seq_base += 1;
+        out
     }
 
     fn lift_operand(
@@ -873,8 +1186,17 @@ mod tests {
         // sub rsp, 0x28 = 48 83 ec 28
         let mem = make_memory(&[0x48, 0x83, 0xec, 0x28], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops.len(), 1);
-        assert_eq!(lifted.ops[0].opcode, OpCode::IntSub);
+        // Sub now emits CF, OF (pre-op), IntSub, ZF, SF (post-op).
+        // The pre-op flags must use the original `rsp` value, not the
+        // post-decrement one.
+        assert!(lifted.ops.iter().any(|op| op.opcode == OpCode::IntSub));
+        let writes_to = |off: u64| lifted.ops.iter().any(|op|
+            op.output.map(|v| v.space == REG_SPACE && v.offset == off).unwrap_or(false)
+        );
+        assert!(writes_to(ZF_OFFSET), "sub must set ZF: {:?}", lifted.ops);
+        assert!(writes_to(SF_OFFSET), "sub must set SF: {:?}", lifted.ops);
+        assert!(writes_to(CF_OFFSET), "sub must set CF: {:?}", lifted.ops);
+        assert!(writes_to(OF_OFFSET), "sub must set OF: {:?}", lifted.ops);
     }
 
     #[test]
@@ -883,8 +1205,15 @@ mod tests {
         // xor eax, eax = 31 c0
         let mem = make_memory(&[0x31, 0xc0], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops.len(), 1);
-        assert_eq!(lifted.ops[0].opcode, OpCode::IntXor);
+        // Logical ops set ZF/SF from the result and clear CF/OF.
+        assert!(lifted.ops.iter().any(|op| op.opcode == OpCode::IntXor));
+        let writes_to = |off: u64| lifted.ops.iter().any(|op|
+            op.output.map(|v| v.space == REG_SPACE && v.offset == off).unwrap_or(false)
+        );
+        assert!(writes_to(ZF_OFFSET), "xor must set ZF: {:?}", lifted.ops);
+        assert!(writes_to(SF_OFFSET));
+        assert!(writes_to(CF_OFFSET), "xor must clear CF: {:?}", lifted.ops);
+        assert!(writes_to(OF_OFFSET), "xor must clear OF: {:?}", lifted.ops);
     }
 
     #[test]
@@ -917,11 +1246,16 @@ mod tests {
         // cmp eax, 0 = 83 f8 00
         let mem = make_memory(&[0x83, 0xf8, 0x00], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops.len(), 4);
+        // Cmp produces IntSub (to a unique), then ZF/SF/CF/OF.
+        // Without OF (added in this round), JL/JGE silently
+        // flipped on signed overflow of (left - right).
+        assert_eq!(lifted.ops.len(), 5);
         assert_eq!(lifted.ops[0].opcode, OpCode::IntSub);
         assert_eq!(lifted.ops[1].opcode, OpCode::IntEqual);
         assert_eq!(lifted.ops[2].opcode, OpCode::IntSLess);
         assert_eq!(lifted.ops[3].opcode, OpCode::IntLess);
+        assert_eq!(lifted.ops[4].opcode, OpCode::IntSBorrow);
+        assert_eq!(lifted.ops[4].output.unwrap().offset, OF_OFFSET);
     }
 
     #[test]
@@ -945,5 +1279,80 @@ mod tests {
         assert!(lifted[0].mnemonic.contains("push"));
         assert!(lifted[1].mnemonic.contains("mov"));
         assert!(lifted[2].mnemonic.contains("sub"));
+    }
+
+    /// Find the CBranch op and return the second input (the predicate).
+    fn cbranch_predicate(lifted: &LiftedInstruction) -> &VarnodeData {
+        let op = lifted.ops.iter().find(|o| o.opcode == OpCode::CBranch)
+            .expect("CBranch op present");
+        op.inputs.get(1).expect("CBranch has a predicate input")
+    }
+
+    /// Find the op whose output writes the given register offset.
+    fn op_writing(lifted: &LiftedInstruction, off: u64) -> &PcodeOp {
+        lifted.ops.iter().find(|o|
+            o.output.map(|v| v.space == REG_SPACE && v.offset == off).unwrap_or(false)
+        ).unwrap_or_else(|| panic!("no op writes reg offset 0x{:x} in {:?}", off, lifted.ops))
+    }
+
+    #[test]
+    fn js_branches_on_sf_not_zf() {
+        // 78 10 = js +0x10. Previously *every* non-Je/Jne/Jl/Jge/Jb/Jae
+        // conditional jump fell into one match arm that read ZF —
+        // including JS, which should test SF.
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x78, 0x10], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let pred = cbranch_predicate(&lifted);
+        assert_eq!(pred.space, REG_SPACE);
+        assert_eq!(pred.offset, SF_OFFSET, "JS must read SF, not ZF (was 0x{:x}): {:?}", pred.offset, lifted.ops);
+    }
+
+    #[test]
+    fn jbe_branches_on_cf_or_zf() {
+        // 76 10 = jbe +0x10. Semantics: CF | ZF.
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x76, 0x10], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // Must contain a BoolOr of CF and ZF feeding into CBranch.
+        let bool_or = lifted.ops.iter().find(|o| o.opcode == OpCode::BoolOr)
+            .expect("JBE must compute CF | ZF, not test ZF alone: {lifted.ops:?}");
+        let in0 = bool_or.inputs[0];
+        let in1 = bool_or.inputs[1];
+        let touches_cf = (in0.space, in0.offset) == (REG_SPACE, CF_OFFSET)
+            || (in1.space, in1.offset) == (REG_SPACE, CF_OFFSET);
+        let touches_zf = (in0.space, in0.offset) == (REG_SPACE, ZF_OFFSET)
+            || (in1.space, in1.offset) == (REG_SPACE, ZF_OFFSET);
+        assert!(touches_cf && touches_zf, "JBE's BoolOr must combine CF and ZF: {:?}", lifted.ops);
+    }
+
+    #[test]
+    fn sub_self_updates_zf_so_je_branches() {
+        // 29 c0 = sub eax, eax. Without flag updates, the canonical
+        // `sub r, r; je L` idiom would never branch (ZF stayed stale).
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x29, 0xc0], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let zf_op = op_writing(&lifted, ZF_OFFSET);
+        assert_eq!(zf_op.opcode, OpCode::IntEqual);
+    }
+
+    #[test]
+    fn jl_uses_sf_xor_of_not_plain_sf() {
+        // 7c 10 = jl +0x10. Semantics: SF != OF. Before this fix the
+        // CBranch read SF directly, so `cmp INT_MIN, 1; jl L` failed
+        // to branch on signed overflow.
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x7c, 0x10], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let bool_xor = lifted.ops.iter().find(|o| o.opcode == OpCode::BoolXor)
+            .unwrap_or_else(|| panic!("JL must compute SF XOR OF: {:?}", lifted.ops));
+        let in0 = bool_xor.inputs[0];
+        let in1 = bool_xor.inputs[1];
+        let touches_sf = (in0.space, in0.offset) == (REG_SPACE, SF_OFFSET)
+            || (in1.space, in1.offset) == (REG_SPACE, SF_OFFSET);
+        let touches_of = (in0.space, in0.offset) == (REG_SPACE, OF_OFFSET)
+            || (in1.space, in1.offset) == (REG_SPACE, OF_OFFSET);
+        assert!(touches_sf && touches_of, "JL's BoolXor must combine SF and OF: {:?}", lifted.ops);
     }
 }
