@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use gr_core::address::SpaceId;
 use gr_core::pcode::VarnodeData;
@@ -9,18 +10,27 @@ pub struct EmulatorState {
 }
 
 /// 4 KiB pages: the BTreeMap holds page-aligned addresses, each mapping
-/// to a fixed-size byte array. Reads/writes that fit within a single
-/// page (the overwhelming majority of P-code accesses, since varnodes
-/// are 1/2/4/8 bytes and addresses are usually word-aligned) go through
-/// the fast path -- one BTreeMap lookup plus a single `from_le_bytes`
-/// / `to_le_bytes` call instead of the previous N per-byte lookups.
+/// to a reference-counted fixed-size byte array. Reads/writes that fit
+/// within a single page (the overwhelming majority of P-code accesses,
+/// since varnodes are 1/2/4/8 bytes and addresses are usually
+/// word-aligned) go through the fast path -- one BTreeMap lookup plus a
+/// single `from_le_bytes` / `to_le_bytes` call instead of N per-byte
+/// lookups.
+///
+/// Pages are wrapped in `Arc` so `EmulatorState::clone()` is
+/// copy-on-write: a snapshot taken with `.clone()` shares every page
+/// with the live state until either side actually writes, at which
+/// point `Arc::make_mut` lazily forks the touched page. A naive
+/// snapshot of a 64 MiB emulation used to memcpy the whole image
+/// (~16k page copies); it now costs roughly the BTreeMap clone plus
+/// one Arc refcount bump per page.
 const PAGE_SHIFT: u32 = 12;
 const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 const PAGE_MASK: u64 = (PAGE_SIZE as u64) - 1;
 
 #[derive(Debug, Clone)]
 struct SpaceData {
-    pages: BTreeMap<u64, Box<[u8; PAGE_SIZE]>>,
+    pages: BTreeMap<u64, Arc<[u8; PAGE_SIZE]>>,
 }
 
 impl SpaceData {
@@ -66,8 +76,19 @@ impl SpaceData {
         u64::from_le_bytes(buf)
     }
 
-    /// Write up to 8 bytes little-endian. Allocates one page on demand
-    /// per page touched.
+    /// Get a mutable reference to a page, lazily forking it (Arc::make_mut)
+    /// if it's shared with another EmulatorState clone. Allocates a new
+    /// zero page if none exists.
+    fn page_mut(&mut self, page_addr: u64) -> &mut [u8; PAGE_SIZE] {
+        let entry = self
+            .pages
+            .entry(page_addr)
+            .or_insert_with(|| Arc::new([0u8; PAGE_SIZE]));
+        Arc::make_mut(entry)
+    }
+
+    /// Write up to 8 bytes little-endian. Forks the touched page on
+    /// demand if it is shared with another snapshot.
     fn write(&mut self, offset: u64, size: u32, value: u64) {
         let size = (size as usize).min(8);
         let bytes = value.to_le_bytes();
@@ -75,10 +96,7 @@ impl SpaceData {
         let page_off = (offset & PAGE_MASK) as usize;
 
         if page_off + size <= PAGE_SIZE {
-            let page = self
-                .pages
-                .entry(page_addr)
-                .or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
+            let page = self.page_mut(page_addr);
             page[page_off..page_off + size].copy_from_slice(&bytes[..size]);
             return;
         }
@@ -88,16 +106,13 @@ impl SpaceData {
             let addr = offset.wrapping_add(i as u64);
             let page_addr = addr & !PAGE_MASK;
             let page_off = (addr & PAGE_MASK) as usize;
-            let page = self
-                .pages
-                .entry(page_addr)
-                .or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
+            let page = self.page_mut(page_addr);
             page[page_off] = b;
         }
     }
 
-    /// Bulk-copy a byte slice into the space. Pages are allocated as
-    /// needed and the slice is split at page boundaries so each page
+    /// Bulk-copy a byte slice into the space. Pages are forked on
+    /// demand and the slice is split at page boundaries so each page
     /// gets one `copy_from_slice` rather than per-byte writes.
     fn write_bytes(&mut self, offset: u64, data: &[u8]) {
         let mut written = 0usize;
@@ -106,10 +121,7 @@ impl SpaceData {
             let page_addr = addr & !PAGE_MASK;
             let page_off = (addr & PAGE_MASK) as usize;
             let chunk = (PAGE_SIZE - page_off).min(data.len() - written);
-            let page = self
-                .pages
-                .entry(page_addr)
-                .or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
+            let page = self.page_mut(page_addr);
             page[page_off..page_off + chunk]
                 .copy_from_slice(&data[written..written + chunk]);
             written += chunk;
@@ -279,5 +291,41 @@ mod tests {
     fn unmapped_page_reads_zero() {
         let state = EmulatorState::new();
         assert_eq!(state.read_memory(0x5_0000_0000, 8), 0);
+    }
+
+    /// A cloned state must observe the same values until either side
+    /// writes. After a write the clone diverges only on the pages it
+    /// actually touched.
+    #[test]
+    fn clone_is_copy_on_write() {
+        let mut original = EmulatorState::new();
+        original.write_memory(0x1000, 8, 0xAABBCCDDEEFF0011);
+        original.write_memory(0x2000, 8, 0xDEADBEEFCAFEBABE);
+
+        // Snapshot: identical contents, no allocation per page.
+        let snap = original.clone();
+        assert_eq!(snap.read_memory(0x1000, 8), 0xAABBCCDDEEFF0011);
+        assert_eq!(snap.read_memory(0x2000, 8), 0xDEADBEEFCAFEBABE);
+
+        // Mutate the live state: 0x1000 forks, 0x2000 stays shared.
+        original.write_memory(0x1000, 8, 0x9999);
+        assert_eq!(original.read_memory(0x1000, 8), 0x9999);
+        // Snapshot still sees the pre-write value.
+        assert_eq!(snap.read_memory(0x1000, 8), 0xAABBCCDDEEFF0011);
+        assert_eq!(snap.read_memory(0x2000, 8), 0xDEADBEEFCAFEBABE);
+    }
+
+    /// Mutating the *snapshot* side must not bleed back into the
+    /// original (CoW must be symmetric).
+    #[test]
+    fn snapshot_writes_do_not_bleed_into_original() {
+        let mut original = EmulatorState::new();
+        original.write_memory(0x1000, 8, 0xAAAA);
+
+        let mut snap = original.clone();
+        snap.write_memory(0x1000, 8, 0xBBBB);
+
+        assert_eq!(original.read_memory(0x1000, 8), 0xAAAA);
+        assert_eq!(snap.read_memory(0x1000, 8), 0xBBBB);
     }
 }
