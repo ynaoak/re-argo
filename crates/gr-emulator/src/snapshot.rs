@@ -28,9 +28,16 @@ impl SnapshotManager {
     }
 
     pub fn capture(&mut self, state: &crate::state::EmulatorState, step: u64, address: u64) {
+        // The previous implementation filtered out registers whose
+        // *current* value happened to be zero. Restore-after-capture
+        // then couldn't reset those registers back to zero -- the
+        // snapshot entries simply weren't there, and a later state
+        // holding e.g. `rax = 0x5555` would keep that value through
+        // a restore that should have reset rax to 0. Capture every
+        // recognised register regardless of value; drop only the
+        // unrecognised-name sentinel (offset == 0xFF).
         let regs = state.dump_registers()
             .into_iter()
-            .filter(|(_, v)| *v != 0)
             .map(|(name, val)| {
                 let offset = match name.as_str() {
                     "RAX" => 0x00, "RCX" => 0x08, "RDX" => 0x10, "RBX" => 0x18,
@@ -41,6 +48,7 @@ impl SnapshotManager {
                 };
                 (offset, val)
             })
+            .filter(|&(offset, _)| offset != 0xFF)
             .collect();
 
         if self.snapshots.len() >= self.max_snapshots && self.max_snapshots > 0 {
@@ -71,10 +79,10 @@ impl SnapshotManager {
     }
 
     pub fn restore(&self, state: &mut crate::state::EmulatorState, snapshot: &StateSnapshot) {
+        // Capture already drops the unrecognised-name sentinel, so any
+        // offset present here is a real register slot.
         for (&offset, &val) in &snapshot.registers {
-            if offset != 0xFF {
-                state.write_register(offset, 8, val);
-            }
+            state.write_register(offset, 8, val);
         }
         for region in &snapshot.memory_regions {
             state.load_memory_bytes(region.address, &region.data);
@@ -117,5 +125,27 @@ mod tests {
         }
         assert_eq!(mgr.len(), 3);
         assert_eq!(mgr.get(0).unwrap().step, 2);
+    }
+
+    /// Zero-valued registers must round-trip through capture/restore.
+    /// Pre-fix the capture filtered out registers whose current value
+    /// was zero, so restoring into a state where the same register held
+    /// a non-zero value left that stale value in place.
+    #[test]
+    fn restore_resets_register_that_was_zero_at_capture() {
+        let mut state_a = EmulatorState::new();
+        state_a.write_register(0x00, 8, 0); // rax = 0 at capture time
+        state_a.write_register(0x20, 8, 0xDEAD); // rsp anchor
+
+        let mut mgr = SnapshotManager::new(10);
+        mgr.capture(&state_a, 0, 0x1000);
+
+        let mut state_b = EmulatorState::new();
+        state_b.write_register(0x00, 8, 0x5555); // rax non-zero in state_b
+        mgr.restore(&mut state_b, mgr.latest().unwrap());
+
+        assert_eq!(state_b.read_register(0x00, 8), 0,
+            "restore must reset rax to its captured zero value");
+        assert_eq!(state_b.read_register(0x20, 8), 0xDEAD);
     }
 }
