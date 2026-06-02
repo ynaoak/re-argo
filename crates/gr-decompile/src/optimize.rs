@@ -630,6 +630,7 @@ fn resolve_redirect(
 /// redirect map via `resolve_redirect` so cascading eliminations
 /// (the result of one CSE feeding into another) still fire.
 pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
+    use smallvec::SmallVec;
     let mut eliminated = 0;
     // Pre-size both hash maps. Without this they started at zero
     // capacity and rehashed N/4 -> N/2 -> N as ops were inserted.
@@ -637,7 +638,13 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     // pure ops into `seen`; oversizing to N/2 lands snug and avoids
     // the per-rehash copy of every existing entry.
     let approx = func.ops.len() / 2 + 16;
-    let mut seen: rustc_hash::FxHashMap<(usize, &'static str, Vec<ValueKey>), ValueKey> =
+    // The CSE key holds an input-key vector. Most P-code ops have
+    // 1-3 inputs (lifters use SmallVec<[VarnodeData; 3]> on the
+    // upstream side), so a `SmallVec<[ValueKey; 3]>` inline-stores
+    // the entire key for the typical case and skips the heap alloc
+    // that a plain `Vec<ValueKey>` paid for every candidate op.
+    type InKeys = SmallVec<[ValueKey; 3]>;
+    let mut seen: rustc_hash::FxHashMap<(usize, &'static str, InKeys), ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx, Default::default());
     let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx / 2, Default::default());
@@ -655,7 +662,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             continue;
         }
 
-        let mut in_keys: Vec<ValueKey> = func.ops[i]
+        let mut in_keys: InKeys = func.ops[i]
             .inputs
             .iter()
             .map(|&id| resolve_redirect(&redirects, value_key(func, id)))
