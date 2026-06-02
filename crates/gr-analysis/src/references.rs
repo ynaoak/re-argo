@@ -1,6 +1,7 @@
 use gr_program::reference::{RefType, Reference};
 use gr_program::symbol::{SourceType, Symbol, SymbolType};
 use gr_program::Program;
+use rayon::prelude::*;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -30,12 +31,27 @@ impl Analyzer for ScalarReferenceAnalyzer {
             .map(|s| (s.address, s.address + s.size))
             .collect();
 
-        let instructions: Vec<(u64, Vec<u64>)> = program
+        // Phase 1: scan each instruction's bytes for pointer-shaped
+        // 32-bit words in parallel. Window scanning is the dominant
+        // cost (millions of windows in a real binary) and is pure
+        // function-local against immutable inputs (insn.bytes,
+        // valid_ranges), so rayon's parallel iterator gives
+        // near-linear speed-up on multi-core machines.
+        //
+        // Materialise the instruction snapshot into a Vec first
+        // because `program.listing.instructions()` is a serial
+        // iterator; collecting once and then `par_iter`ing is cheaper
+        // than locking on every step.
+        let insn_snapshot: Vec<_> = program
             .listing
             .instructions()
-            .map(|insn| {
-                let constants: Vec<u64> = insn
-                    .bytes
+            .map(|insn| (insn.address, insn.bytes.clone()))
+            .collect();
+
+        let instructions: Vec<(u64, Vec<u64>)> = insn_snapshot
+            .par_iter()
+            .map(|(addr, bytes)| {
+                let constants: Vec<u64> = bytes
                     .windows(4)
                     .filter_map(|w| {
                         let val = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as u64;
@@ -46,7 +62,7 @@ impl Analyzer for ScalarReferenceAnalyzer {
                         }
                     })
                     .collect();
-                (insn.address, constants)
+                (*addr, constants)
             })
             .filter(|(_, c)| !c.is_empty())
             .collect();

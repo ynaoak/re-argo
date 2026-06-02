@@ -70,48 +70,75 @@ impl SsaFunction {
     }
 
     fn build_ssa(&mut self) {
+        // Count ops once so the arenas can be sized correctly. Without
+        // this the inner pushes triggered Vec re-allocations as the
+        // ops/varnodes lists grew through their default doubling
+        // schedule; for a function with N ops we'd reallocate
+        // O(log N) times for each arena, copying every entry.
+        let total_ops: usize = self
+            .cfg
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .map(|i| i.ops.len())
+            .sum();
+        self.ops.reserve(total_ops);
+        // Heuristic: ~3 varnodes per op (inputs + output), which lands
+        // close to the actual ratio for x86 / ARM lifters and is
+        // cheap if it overshoots.
+        self.varnodes.reserve(total_ops * 3);
+
+        // Snapshot the per-op metadata before mutating self: the inner
+        // loop needs `&mut self` (for get_or_create_var /
+        // create_new_version), and we can't simultaneously hold an
+        // immutable borrow of `self.cfg.blocks`. Tuple-collecting
+        // avoids the borrow conflict; it's an extra small Vec but the
+        // savings from the in-place op build (no `input_ids.clone()`,
+        // no Vec growth) dominate.
         #[allow(clippy::type_complexity)]
-        let all_ops: Vec<(BlockId, u64, gr_core::pcode::OpCode, Option<VarnodeData>, Vec<VarnodeData>)> = {
-            let mut ops = Vec::new();
+        let all_ops: Vec<(BlockId, u64, gr_core::pcode::OpCode, Option<VarnodeData>, smallvec::SmallVec<[VarnodeData; 3]>)> = {
+            let mut ops = Vec::with_capacity(total_ops);
             for (block_id, block) in self.cfg.blocks.iter().enumerate() {
                 for insn in &block.instructions {
                     for pcode_op in &insn.ops {
-                        let inputs: Vec<VarnodeData> = pcode_op.inputs.iter().copied().collect();
-                        ops.push((block_id, insn.address, pcode_op.opcode, pcode_op.output, inputs));
+                        // pcode_op.inputs is already a SmallVec<[_; 3]>;
+                        // clone copies inline when possible.
+                        ops.push((block_id, insn.address, pcode_op.opcode, pcode_op.output, pcode_op.inputs.clone()));
                     }
                 }
             }
             ops
         };
 
-        for (block_id, address, opcode, output, inputs) in &all_ops {
-            let mut input_ids = Vec::new();
-            for inp in inputs {
-                let var_id = self.get_or_create_var(inp);
-                input_ids.push(var_id);
+        for (block_id, address, opcode, output, inputs) in all_ops {
+            let mut input_ids: Vec<VarId> = Vec::with_capacity(inputs.len());
+            for inp in &inputs {
+                input_ids.push(self.get_or_create_var(inp));
             }
 
-            let output_id = output.as_ref().map(|out| {
-                self.create_new_version(out)
-            });
+            let output_id = output.map(|out| self.create_new_version(&out));
 
             let op_idx = self.ops.len();
-            self.ops.push(SsaOp {
-                index: op_idx,
-                opcode: *opcode,
-                output: output_id,
-                inputs: input_ids.clone(),
-                block: *block_id,
-                address: *address,
-                dead: false,
-            });
 
+            // Update varnode def/use sides BEFORE pushing the SsaOp,
+            // so we can move `input_ids` into the op instead of
+            // cloning it.
             if let Some(out_id) = output_id {
                 self.varnodes[out_id as usize].def_op = Some(op_idx);
             }
             for &inp_id in &input_ids {
                 self.varnodes[inp_id as usize].uses.push(op_idx);
             }
+
+            self.ops.push(SsaOp {
+                index: op_idx,
+                opcode,
+                output: output_id,
+                inputs: input_ids,
+                block: block_id,
+                address,
+                dead: false,
+            });
         }
     }
 

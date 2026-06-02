@@ -1,42 +1,98 @@
+use std::collections::VecDeque;
+
 use gr_core::pcode::OpCode;
 
 use crate::ssa::SsaFunction;
 
+fn is_side_effecting(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::Call
+            | OpCode::CallInd
+            | OpCode::CallOther
+            | OpCode::Store
+            | OpCode::Return
+            | OpCode::Branch
+            | OpCode::CBranch
+            | OpCode::BranchInd
+    )
+}
+
+/// Worklist-driven dead-code elimination.
+///
+/// The previous implementation ran an outer `while changed` fixpoint
+/// over a full N-op scan. For deeply-cascading dead chains (an
+/// algebraic-simplification pass tends to produce long ones) it
+/// re-scanned the whole op array once per chain link, costing
+/// O(N * depth).
+///
+/// A worklist visits each op O(1) times on average:
+///   1. Seed the queue with every candidate op (live, has output,
+///      not side-effecting).
+///   2. Pop one; if all its uses are dead, mark it dead and enqueue
+///      the *defining* ops of its inputs -- they just lost a use and
+///      may have become dead themselves.
+///   3. Terminate when the queue drains.
+///
+/// Total work is O(N + dead_ops) instead of O(N * depth), and the
+/// observable behaviour (set of dead ops, count returned) is
+/// identical to the fixpoint version.
 pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
+    let n = func.ops.len();
+    let mut on_queue = vec![false; n];
+    let mut queue: VecDeque<usize> = VecDeque::with_capacity(n);
+
+    for (i, slot) in on_queue.iter_mut().enumerate().take(n) {
+        if func.ops[i].dead {
+            continue;
+        }
+        if func.ops[i].output.is_none() {
+            continue;
+        }
+        if is_side_effecting(func.ops[i].opcode) {
+            continue;
+        }
+        queue.push_back(i);
+        *slot = true;
+    }
+
     let mut removed = 0;
-    let mut changed = true;
+    while let Some(i) = queue.pop_front() {
+        on_queue[i] = false;
+        if func.ops[i].dead {
+            continue;
+        }
 
-    while changed {
-        changed = false;
-        for i in 0..func.ops.len() {
-            if func.ops[i].dead {
-                continue;
-            }
-            if func.ops[i].output.is_none() {
-                continue;
-            }
-            if matches!(
-                func.ops[i].opcode,
-                OpCode::Call | OpCode::CallInd | OpCode::CallOther
-                    | OpCode::Store | OpCode::Return
-                    | OpCode::Branch | OpCode::CBranch | OpCode::BranchInd
-            ) {
-                continue;
-            }
+        let out_id = func.ops[i].output.unwrap();
+        let has_live_use = func.varnodes[out_id as usize]
+            .uses
+            .iter()
+            .any(|&use_idx| !func.ops[use_idx].dead);
 
-            let out_id = func.ops[i].output.unwrap();
-            let has_live_use = func.varnodes[out_id as usize]
-                .uses
-                .iter()
-                .any(|&use_idx| !func.ops[use_idx].dead);
+        if has_live_use {
+            continue;
+        }
 
-            if !has_live_use {
-                func.ops[i].dead = true;
-                removed += 1;
-                changed = true;
+        func.ops[i].dead = true;
+        removed += 1;
+
+        // The newly-dead op's inputs each just lost a use. Re-queue
+        // the defining op of any input that itself is a DCE
+        // candidate -- it may now have no live uses either.
+        let inputs = func.ops[i].inputs.clone();
+        for inp_id in inputs {
+            if let Some(def_idx) = func.varnodes[inp_id as usize].def_op
+                && !func.ops[def_idx].dead
+                && func.ops[def_idx].output.is_some()
+                && !is_side_effecting(func.ops[def_idx].opcode)
+                && !on_queue[def_idx]
+            {
+                queue.push_back(def_idx);
+                on_queue[def_idx] = true;
             }
         }
     }
+
     removed
 }
 

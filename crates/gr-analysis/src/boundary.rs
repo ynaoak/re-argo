@@ -1,5 +1,6 @@
 use gr_arch::FlowType;
 use gr_program::Program;
+use rayon::prelude::*;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -16,27 +17,30 @@ impl Analyzer for FunctionBoundaryAnalyzer {
         850
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut fixes = 0;
-
         let func_entries: Vec<u64> = program.listing.functions().map(|f| f.entry_point).collect();
 
-        for &entry in &func_entries {
-            let has_ret = program
-                .listing
-                .instructions_in_range(entry, entry + 4096)
-                .any(|insn| insn.flow_type == FlowType::Return);
+        // Each entry's body is scanned independently against an
+        // immutable Program view (`instructions_in_range` reads the
+        // listing; we don't mutate). par_iter gives a near-linear
+        // speed-up for binaries with hundreds of functions.
+        let fixes: usize = func_entries
+            .par_iter()
+            .filter(|&&entry| {
+                let has_ret = program
+                    .listing
+                    .instructions_in_range(entry, entry + 4096)
+                    .any(|insn| insn.flow_type == FlowType::Return);
 
-            if !has_ret {
+                if has_ret {
+                    return false;
+                }
                 let has_jmp = program
                     .listing
                     .instructions_in_range(entry, entry + 4096)
                     .any(|insn| insn.flow_type == FlowType::UnconditionalJump);
-
-                if !has_jmp {
-                    fixes += 1;
-                }
-            }
-        }
+                !has_jmp
+            })
+            .count();
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
