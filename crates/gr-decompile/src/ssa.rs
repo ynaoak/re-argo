@@ -55,6 +55,19 @@ pub struct SsaFunction {
 
 impl SsaFunction {
     pub fn from_cfg(name: String, entry: u64, cfg: ControlFlowGraph) -> Self {
+        // Pre-size the FxHashMaps used by get_or_create_var /
+        // create_new_version. Each distinct (space, offset, size) slot
+        // gets one entry, which for x86/ARM bodies is closer to N/4
+        // than N. Reserving up-front kills the rehash cycle that
+        // would otherwise fire during build_ssa.
+        let approx_slots = cfg
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .map(|i| i.ops.len())
+            .sum::<usize>()
+            / 4
+            + 16;
         let mut func = Self {
             name,
             entry,
@@ -62,8 +75,8 @@ impl SsaFunction {
             ops: Vec::new(),
             cfg,
             next_var_id: 0,
-            var_versions: FxHashMap::default(),
-            current_var: FxHashMap::default(),
+            var_versions: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
+            current_var: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
         };
         func.build_ssa();
         func

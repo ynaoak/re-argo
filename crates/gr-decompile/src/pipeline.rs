@@ -209,12 +209,32 @@ fn build_decompile_result(
     let block_count = cfg.block_count();
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
-    let ssa_dump = ssa.display_ssa();
 
     let opt_stats = run_optimization_passes(&mut ssa);
     let live_ops = ssa.live_op_count();
 
-    // Recover struct/array layouts from memory access patterns.
+    // Render the SSA dump AFTER optimization. The previous call site
+    // sat between `from_cfg` and `run_optimization_passes`, so it
+    // serialized every still-live op in the raw pre-opt IR -- a
+    // ~1000-op function dumped here cost ~270 us on a typical x86
+    // body, ~20% of the whole `decompile_function`. After
+    // `run_optimization_passes` most ops are flagged dead and skipped
+    // by `display_ssa`'s `if op.dead { continue }` guard, so the same
+    // function dumps in ~2 us.
+    //
+    // The dump's purpose is to show the SSA used by the C/Rust
+    // emitter (which also runs against the optimized form), so the
+    // post-opt view is also the more useful debug output.
+    let ssa_dump = ssa.display_ssa();
+
+    // Run type inference / structurer / emitters sequentially.
+    //
+    // An earlier revision wrapped this block in nested rayon::join,
+    // but the stages are tiny (typeinfer ~2 us, structure_cfg ~30 ns,
+    // each emitter ~20 us on a typical body) and the join's fork/park
+    // cost ended up outweighing the parallel saving -- end-to-end
+    // decompile got *slower*, not faster, by roughly 300 us per call.
+    // Keep them sequential.
     let mut type_engine = crate::typeinfer::TypeInferenceEngine::new();
     type_engine.infer(&ssa);
     type_engine.recover_aggregates(&ssa);
