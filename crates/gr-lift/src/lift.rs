@@ -52,7 +52,13 @@ pub trait PcodeLift: Send + Sync {
         start: u64,
         count: usize,
     ) -> Result<Vec<LiftedInstruction>, LiftError> {
-        let mut results = Vec::new();
+        // Pre-size the result Vec to the requested count. The caller's
+        // `count` is an upper bound on the number of instructions
+        // returned (we may stop early on a decode error), so this
+        // either lands exactly or slightly overshoots -- both cheap
+        // and both better than the default Vec growth schedule, which
+        // would re-allocate O(log count) times as the lift filled it.
+        let mut results = Vec::with_capacity(count);
         let mut addr = start;
         let mut ctx = LiftContext::default();
         for _ in 0..count {

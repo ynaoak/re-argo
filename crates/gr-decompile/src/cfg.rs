@@ -3,6 +3,103 @@ use std::collections::{BTreeMap, BTreeSet};
 use gr_core::pcode::OpCode;
 use gr_lift::LiftedInstruction;
 
+fn empty_cfg() -> ControlFlowGraph {
+    ControlFlowGraph {
+        blocks: vec![BasicBlock {
+            id: 0,
+            start_addr: 0,
+            instructions: Vec::new(),
+            successors: Vec::new(),
+            predecessors: Vec::new(),
+        }],
+        entry_block: 0,
+        addr_to_block: BTreeMap::new(),
+    }
+}
+
+fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
+    let mut leaders: BTreeSet<u64> = BTreeSet::new();
+    leaders.insert(instructions[0].address);
+    for insn in instructions {
+        let has_branch = insn.ops.iter().any(|op| {
+            matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd)
+        });
+        let has_return = insn.ops.iter().any(|op| op.opcode == OpCode::Return);
+        if has_branch || has_return {
+            for op in &insn.ops {
+                if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
+                    && let Some(target_vn) = op.inputs.first()
+                    && target_vn.space == gr_core::address::SpaceId::RAM
+                {
+                    leaders.insert(target_vn.offset);
+                }
+            }
+            let fall = insn.address + insn.length as u64;
+            leaders.insert(fall);
+        }
+    }
+    leaders.into_iter().collect()
+}
+
+fn finalize_cfg(
+    mut blocks: Vec<BasicBlock>,
+    addr_to_block: BTreeMap<u64, BlockId>,
+    entry_addr: u64,
+) -> ControlFlowGraph {
+    let block_count = blocks.len();
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..block_count {
+        let last_insn = blocks[i].instructions.last();
+        let has_unconditional_branch =
+            last_insn.is_some_and(|insn| insn.ops.iter().any(|op| op.opcode == OpCode::Branch));
+        let has_cbranch =
+            last_insn.is_some_and(|insn| insn.ops.iter().any(|op| op.opcode == OpCode::CBranch));
+        let has_return =
+            last_insn.is_some_and(|insn| insn.ops.iter().any(|op| op.opcode == OpCode::Return));
+        let has_branch_ind = last_insn
+            .is_some_and(|insn| insn.ops.iter().any(|op| op.opcode == OpCode::BranchInd));
+        if has_return || has_branch_ind {
+            continue;
+        }
+        if has_unconditional_branch && !has_cbranch {
+            if let Some(target) = blocks[i].branch_target()
+                && let Some(&target_id) = addr_to_block.get(&target)
+            {
+                blocks[i].successors.push(target_id);
+            }
+        } else if has_cbranch {
+            if let Some(target) = blocks[i].branch_target()
+                && let Some(&target_id) = addr_to_block.get(&target)
+            {
+                blocks[i].successors.push(target_id);
+            }
+            let fall = blocks[i].end_addr();
+            if let Some(&fall_id) = addr_to_block.get(&fall) {
+                blocks[i].successors.push(fall_id);
+            }
+        } else {
+            let fall = blocks[i].end_addr();
+            if let Some(&fall_id) = addr_to_block.get(&fall) {
+                blocks[i].successors.push(fall_id);
+            }
+        }
+    }
+    for i in 0..block_count {
+        let succs: Vec<BlockId> = blocks[i].successors.clone();
+        for s in succs {
+            if !blocks[s].predecessors.contains(&i) {
+                blocks[s].predecessors.push(i);
+            }
+        }
+    }
+    let entry_block = *addr_to_block.get(&entry_addr).unwrap_or(&0);
+    ControlFlowGraph {
+        blocks,
+        entry_block,
+        addr_to_block,
+    }
+}
+
 pub type BlockId = usize;
 
 #[derive(Debug, Clone)]
@@ -68,73 +165,49 @@ pub struct ControlFlowGraph {
 
 impl ControlFlowGraph {
     pub fn build(instructions: &[LiftedInstruction]) -> Self {
+        // Borrow form: clone each instruction into its block. Kept
+        // around for tests and other call sites that don't have
+        // ownership of the lifted Vec. The decompile hot path uses
+        // `build_owned` to skip the clones entirely.
+        Self::build_inner(instructions, |i: &LiftedInstruction| i.clone())
+    }
+
+    /// Like `build`, but consumes the instruction Vec so each
+    /// `LiftedInstruction` can be *moved* into its block instead of
+    /// cloned. Each `LiftedInstruction` owns a `String` mnemonic and
+    /// a `Vec<PcodeOp>`; the borrow form does a deep clone per
+    /// instruction (heap copy of mnemonic + heap copy of every
+    /// PcodeOp), which is the dominant cost in CFG::build on real
+    /// binaries. `build_owned` borrows once for the leader scan and
+    /// then `IntoIter`s the original Vec straight into the blocks.
+    pub fn build_owned(instructions: Vec<LiftedInstruction>) -> Self {
         if instructions.is_empty() {
-            return Self {
-                blocks: vec![BasicBlock {
-                    id: 0,
-                    start_addr: 0,
-                    instructions: Vec::new(),
-                    successors: Vec::new(),
-                    predecessors: Vec::new(),
-                }],
-                entry_block: 0,
-                addr_to_block: BTreeMap::new(),
-            };
+            return empty_cfg();
         }
+        let leader_vec = compute_leaders(&instructions);
+        let entry_addr = instructions[0].address;
 
-        let mut leaders: BTreeSet<u64> = BTreeSet::new();
-        leaders.insert(instructions[0].address);
-
-        for insn in instructions {
-            let has_branch = insn.ops.iter().any(|op| {
-                matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd)
-            });
-            let has_return = insn.ops.iter().any(|op| op.opcode == OpCode::Return);
-
-            if has_branch || has_return {
-                // Anything after a transfer is the start of the next block,
-                // including the unreachable instruction right after a Return
-                // or an indirect jump (the decompiler may still encounter it
-                // via a different path).
-                for op in &insn.ops {
-                    if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
-                        && let Some(target_vn) = op.inputs.first()
-                        && target_vn.space == gr_core::address::SpaceId::RAM
-                    {
-                        leaders.insert(target_vn.offset);
-                    }
-                }
-                let fall = insn.address + insn.length as u64;
-                leaders.insert(fall);
-            }
-        }
-
-        let leader_vec: Vec<u64> = leaders.iter().copied().collect();
-        let leader_set: BTreeSet<u64> = leaders.clone();
         let mut blocks = Vec::new();
         let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
+        let mut iter = instructions.into_iter().peekable();
 
-        let mut insn_iter = instructions.iter().peekable();
         for (idx, &leader_addr) in leader_vec.iter().enumerate() {
             let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u64::MAX);
             let mut block_insns = Vec::new();
-
-            while let Some(&insn) = insn_iter.peek() {
+            while let Some(insn) = iter.peek() {
                 if insn.address < leader_addr {
-                    insn_iter.next();
+                    iter.next();
                     continue;
                 }
                 if insn.address >= next_leader {
                     break;
                 }
-                block_insns.push(insn.clone());
-                insn_iter.next();
+                // Move out of the iterator -- no clone.
+                block_insns.push(iter.next().unwrap());
             }
-
             if block_insns.is_empty() {
                 continue;
             }
-
             let block_id = blocks.len();
             addr_to_block.insert(leader_addr, block_id);
             blocks.push(BasicBlock {
@@ -145,72 +218,52 @@ impl ControlFlowGraph {
                 predecessors: Vec::new(),
             });
         }
-        let _ = leader_set;
+        finalize_cfg(blocks, addr_to_block, entry_addr)
+    }
 
-        let block_count = blocks.len();
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..block_count {
-            let last_insn = blocks[i].instructions.last();
-            let has_unconditional_branch = last_insn.is_some_and(|insn| {
-                insn.ops.iter().any(|op| op.opcode == OpCode::Branch)
-            });
-            let has_cbranch = last_insn.is_some_and(|insn| {
-                insn.ops.iter().any(|op| op.opcode == OpCode::CBranch)
-            });
-            let has_return = last_insn.is_some_and(|insn| {
-                insn.ops.iter().any(|op| op.opcode == OpCode::Return)
-            });
-            let has_branch_ind = last_insn.is_some_and(|insn| {
-                insn.ops.iter().any(|op| op.opcode == OpCode::BranchInd)
-            });
-
-            // Return and indirect branch both terminate the block with no
-            // statically-known successor.
-            if has_return || has_branch_ind {
+    fn build_inner(
+        instructions: &[LiftedInstruction],
+        mut take: impl FnMut(&LiftedInstruction) -> LiftedInstruction,
+    ) -> Self {
+        if instructions.is_empty() {
+            return empty_cfg();
+        }
+        let leader_vec = compute_leaders(instructions);
+        let mut blocks = Vec::new();
+        let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
+        let mut insn_iter = instructions.iter().peekable();
+        for (idx, &leader_addr) in leader_vec.iter().enumerate() {
+            let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u64::MAX);
+            let mut block_insns = Vec::new();
+            while let Some(&insn) = insn_iter.peek() {
+                if insn.address < leader_addr {
+                    insn_iter.next();
+                    continue;
+                }
+                if insn.address >= next_leader {
+                    break;
+                }
+                block_insns.push(take(insn));
+                insn_iter.next();
+            }
+            if block_insns.is_empty() {
                 continue;
             }
-
-            if has_unconditional_branch && !has_cbranch {
-                if let Some(target) = blocks[i].branch_target()
-                    && let Some(&target_id) = addr_to_block.get(&target) {
-                        blocks[i].successors.push(target_id);
-                    }
-            } else if has_cbranch {
-                if let Some(target) = blocks[i].branch_target()
-                    && let Some(&target_id) = addr_to_block.get(&target) {
-                        blocks[i].successors.push(target_id);
-                    }
-                let fall = blocks[i].end_addr();
-                if let Some(&fall_id) = addr_to_block.get(&fall) {
-                    blocks[i].successors.push(fall_id);
-                }
-            } else {
-                let fall = blocks[i].end_addr();
-                if let Some(&fall_id) = addr_to_block.get(&fall) {
-                    blocks[i].successors.push(fall_id);
-                }
-            }
+            let block_id = blocks.len();
+            addr_to_block.insert(leader_addr, block_id);
+            blocks.push(BasicBlock {
+                id: block_id,
+                start_addr: leader_addr,
+                instructions: block_insns,
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+            });
         }
-
-        for i in 0..block_count {
-            let succs: Vec<BlockId> = blocks[i].successors.clone();
-            for s in succs {
-                if !blocks[s].predecessors.contains(&i) {
-                    blocks[s].predecessors.push(i);
-                }
-            }
-        }
-
-        let entry_block = *addr_to_block
-            .get(&instructions[0].address)
-            .unwrap_or(&0);
-
-        Self {
-            blocks,
-            entry_block,
-            addr_to_block,
-        }
+        let entry_addr = instructions[0].address;
+        finalize_cfg(blocks, addr_to_block, entry_addr)
     }
+
+
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()

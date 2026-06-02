@@ -45,7 +45,7 @@ pub fn decompile(
     let terminated = trim_to_return(&lifted);
     let empty_u64: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let empty_i64: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(&terminated, func_name, entry, &empty_u64, &empty_u64, &empty_i64)
+    build_decompile_result(terminated, func_name, entry, &empty_u64, &empty_u64, &empty_i64)
 }
 
 pub fn decompile_function(
@@ -112,7 +112,7 @@ pub fn decompile_function(
         })
         .unwrap_or_default();
 
-    build_decompile_result(&terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
+    build_decompile_result(terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
 }
 
 /// Decompile every function the program knows about, in parallel.
@@ -190,7 +190,7 @@ pub fn analyze_taint(
 }
 
 fn build_decompile_result(
-    instructions: &[LiftedInstruction],
+    instructions: Vec<LiftedInstruction>,
     func_name: &str,
     entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
@@ -201,8 +201,11 @@ fn build_decompile_result(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
 
+    // Collect summary metrics *before* moving `instructions` into the
+    // CFG, since `build_owned` consumes them.
     let total_pcode: usize = instructions.iter().map(|i| i.ops.len()).sum();
-    let cfg = ControlFlowGraph::build(instructions);
+    let instructions_lifted = instructions.len();
+    let cfg = ControlFlowGraph::build_owned(instructions);
     let block_count = cfg.block_count();
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
@@ -239,7 +242,7 @@ fn build_decompile_result(
         ssa_dump,
         recovered_structs,
         stats: DecompileStats {
-            instructions_lifted: instructions.len(),
+            instructions_lifted,
             pcode_ops: total_pcode,
             basic_blocks: block_count,
             optimization: opt_stats,
