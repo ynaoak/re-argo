@@ -43,15 +43,60 @@ pub fn decompile(
     }
 
     let terminated = trim_to_return(&lifted);
-    let empty_u64: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    let empty_i64: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(terminated, func_name, entry, &empty_u64, &empty_u64, &empty_i64)
+    let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    build_decompile_result(terminated, func_name, entry, &empty, &empty)
 }
 
 pub fn decompile_function(
     lifter: &dyn PcodeLift,
     program: &Program,
     func_entry: u64,
+) -> Result<DecompileResult, String> {
+    let (symbols, string_literals) = build_program_maps(program);
+    decompile_function_with_maps(lifter, program, func_entry, &symbols, &string_literals)
+}
+
+/// Iterate `program.symbol_table` once and return the two
+/// per-program lookup maps the emitter needs: `address -> symbol
+/// name`, and the subset where names follow Ghidra's `s_<text>_<id>`
+/// string-literal convention. Pulled out of `decompile_function` so
+/// `decompile_all` can build them once and share them across the
+/// entire function batch instead of rebuilding per call.
+pub fn build_program_maps(
+    program: &Program,
+) -> (
+    std::collections::BTreeMap<u64, String>,
+    std::collections::BTreeMap<u64, String>,
+) {
+    let mut symbols = std::collections::BTreeMap::new();
+    let mut string_literals = std::collections::BTreeMap::new();
+    for sym in program.symbol_table.iter() {
+        symbols.insert(sym.address, sym.name.clone());
+        if let Some(rest) = sym.name.strip_prefix("s_")
+            && let Some((text, _)) = rest.rsplit_once('_')
+        {
+            let lit = text.replace('_', " ");
+            if !lit.is_empty() {
+                string_literals.insert(sym.address, lit);
+            }
+        }
+    }
+    (symbols, string_literals)
+}
+
+/// Decompile a single function reusing program-level lookup maps
+/// built by the caller (see `build_program_maps`).
+///
+/// `decompile_function` is the convenience entry point that builds
+/// the maps itself; `decompile_all` builds them once for the whole
+/// program and calls this directly so the per-function fan-out
+/// doesn't re-iterate `program.symbol_table` N times.
+pub fn decompile_function_with_maps(
+    lifter: &dyn PcodeLift,
+    program: &Program,
+    func_entry: u64,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    string_literals: &std::collections::BTreeMap<u64, String>,
 ) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
     let func_name = func
@@ -82,37 +127,7 @@ pub fn decompile_function(
         trim_to_return(&lifted)
     };
 
-    let symbols: std::collections::BTreeMap<u64, String> = program
-        .symbol_table
-        .iter()
-        .map(|s| (s.address, s.name.clone()))
-        .collect();
-
-    let mut string_literals = std::collections::BTreeMap::new();
-    for sym in program.symbol_table.iter() {
-        if sym.name.starts_with("s_") {
-            let lit = sym.name
-                .strip_prefix("s_")
-                .and_then(|s| s.rsplit_once('_'))
-                .map(|(text, _)| text.replace('_', " "))
-                .unwrap_or_default();
-            if !lit.is_empty() {
-                string_literals.insert(sym.address, lit);
-            }
-        }
-    }
-
-    let stack_vars: std::collections::BTreeMap<i64, String> = func
-        .map(|f| {
-            f.stack_frame
-                .variables
-                .iter()
-                .map(|(offset, var)| (*offset, var.name.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    build_decompile_result(terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
+    build_decompile_result(terminated, &func_name, func_entry, symbols, string_literals)
 }
 
 /// Decompile every function the program knows about, in parallel.
@@ -132,9 +147,29 @@ pub fn decompile_all(
         .map(|f| f.entry_point)
         .collect();
 
+    // Build the program-wide lookup maps once and share them across
+    // every function decompile. Previously each parallel
+    // `decompile_function` call rebuilt the same maps from
+    // `program.symbol_table` -- O(N) per call, where N is the symbol
+    // count, multiplied by M parallel functions == O(N*M) redundant
+    // work. `decompile_function_with_maps` is the same code path
+    // minus the rebuild.
+    let (symbols, string_literals) = build_program_maps(program);
+
     entries
         .par_iter()
-        .map(|&entry| (entry, decompile_function(lifter, program, entry)))
+        .map(|&entry| {
+            (
+                entry,
+                decompile_function_with_maps(
+                    lifter,
+                    program,
+                    entry,
+                    &symbols,
+                    &string_literals,
+                ),
+            )
+        })
         .collect()
 }
 
@@ -195,7 +230,6 @@ fn build_decompile_result(
     entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
     string_literals: &std::collections::BTreeMap<u64, String>,
-    stack_vars: &std::collections::BTreeMap<i64, String>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -247,11 +281,9 @@ fn build_decompile_result(
 
     let structured = structure_cfg(&ssa.cfg);
     // Both emitters borrow the same two maps -- the previous API took
-    // owned BTreeMaps and forced six clones per decompile call (three
+    // owned BTreeMaps and forced four clones per decompile call (two
     // maps * two emitters). The borrow-based `with_maps` API is
-    // zero-clone. `stack_vars` was historically passed through but
-    // never read by either emitter; it's now omitted.
-    let _ = stack_vars;
+    // zero-clone.
     let mut c_emitter = CEmitter::with_maps(symbols, string_literals);
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
