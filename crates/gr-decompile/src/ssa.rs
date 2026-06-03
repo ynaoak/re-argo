@@ -101,58 +101,53 @@ impl SsaFunction {
         // cheap if it overshoots.
         self.varnodes.reserve(total_ops * 3);
 
-        // Snapshot the per-op metadata before mutating self: the inner
-        // loop needs `&mut self` (for get_or_create_var /
-        // create_new_version), and we can't simultaneously hold an
-        // immutable borrow of `self.cfg.blocks`. Tuple-collecting
-        // avoids the borrow conflict; it's an extra small Vec but the
-        // savings from the in-place op build (no `input_ids.clone()`,
-        // no Vec growth) dominate.
-        #[allow(clippy::type_complexity)]
-        let all_ops: Vec<(BlockId, u64, gr_core::pcode::OpCode, Option<VarnodeData>, smallvec::SmallVec<[VarnodeData; 3]>)> = {
-            let mut ops = Vec::with_capacity(total_ops);
-            for (block_id, block) in self.cfg.blocks.iter().enumerate() {
-                for insn in &block.instructions {
-                    for pcode_op in &insn.ops {
-                        // pcode_op.inputs is already a SmallVec<[_; 3]>;
-                        // clone copies inline when possible.
-                        ops.push((block_id, insn.address, pcode_op.opcode, pcode_op.output, pcode_op.inputs.clone()));
+        // Temporarily move the CFG out of `self` so the inner loop can
+        // hold an immutable borrow of `cfg.blocks` *and* call the
+        // `&mut self` helpers (get_or_create_var / create_new_version)
+        // at the same time. Without this the borrow checker forced an
+        // intermediate `all_ops: Vec<tuple>` snapshot, which on a
+        // ~1000-op function cost ~100KB of allocation and a per-op
+        // SmallVec clone -- both pure overhead. `mem::take` here is
+        // O(1) (just moves the Vec headers) thanks to Default on
+        // ControlFlowGraph, and the trailing `self.cfg = cfg` puts
+        // the same CFG back; no observable change to the public state.
+        let cfg = std::mem::take(&mut self.cfg);
+
+        for (block_id, block) in cfg.blocks.iter().enumerate() {
+            for insn in &block.instructions {
+                for pcode_op in &insn.ops {
+                    let mut input_ids: Vec<VarId> = Vec::with_capacity(pcode_op.inputs.len());
+                    for inp in &pcode_op.inputs {
+                        input_ids.push(self.get_or_create_var(inp));
                     }
+
+                    let output_id = pcode_op.output.map(|out| self.create_new_version(&out));
+
+                    let op_idx = self.ops.len();
+
+                    // Update varnode def/use sides BEFORE pushing the
+                    // SsaOp so we can move `input_ids` into the op.
+                    if let Some(out_id) = output_id {
+                        self.varnodes[out_id as usize].def_op = Some(op_idx);
+                    }
+                    for &inp_id in &input_ids {
+                        self.varnodes[inp_id as usize].uses.push(op_idx);
+                    }
+
+                    self.ops.push(SsaOp {
+                        index: op_idx,
+                        opcode: pcode_op.opcode,
+                        output: output_id,
+                        inputs: input_ids,
+                        block: block_id,
+                        address: insn.address,
+                        dead: false,
+                    });
                 }
             }
-            ops
-        };
-
-        for (block_id, address, opcode, output, inputs) in all_ops {
-            let mut input_ids: Vec<VarId> = Vec::with_capacity(inputs.len());
-            for inp in &inputs {
-                input_ids.push(self.get_or_create_var(inp));
-            }
-
-            let output_id = output.map(|out| self.create_new_version(&out));
-
-            let op_idx = self.ops.len();
-
-            // Update varnode def/use sides BEFORE pushing the SsaOp,
-            // so we can move `input_ids` into the op instead of
-            // cloning it.
-            if let Some(out_id) = output_id {
-                self.varnodes[out_id as usize].def_op = Some(op_idx);
-            }
-            for &inp_id in &input_ids {
-                self.varnodes[inp_id as usize].uses.push(op_idx);
-            }
-
-            self.ops.push(SsaOp {
-                index: op_idx,
-                opcode,
-                output: output_id,
-                inputs: input_ids,
-                block: block_id,
-                address,
-                dead: false,
-            });
         }
+
+        self.cfg = cfg;
     }
 
     fn get_or_create_var(&mut self, vn: &VarnodeData) -> VarId {

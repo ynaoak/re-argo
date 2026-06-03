@@ -4,6 +4,259 @@ use gr_core::pcode::OpCode;
 
 use crate::ssa::SsaFunction;
 
+const CONST_SPACE: gr_core::address::SpaceId = gr_core::address::SpaceId::CONST;
+
+/// Rewrite `func.ops[i]` if every input is a constant. Returns true
+/// if the op was folded into a `Copy const`. Pulled out of
+/// `constant_fold` so the fused walk in `const_alg_strength` can
+/// share it.
+fn try_constant_fold_op(func: &mut SsaFunction, i: usize) -> bool {
+    if func.ops[i].inputs.is_empty() {
+        return false;
+    }
+    let all_const = func.ops[i]
+        .inputs
+        .iter()
+        .all(|&id| func.varnodes[id as usize].data.space == CONST_SPACE);
+    if !all_const {
+        return false;
+    }
+
+    let inputs = &func.ops[i].inputs;
+    let result = match func.ops[i].opcode {
+        OpCode::IntAdd => {
+            if inputs.len() < 2 { return false; }
+            let a = func.varnodes[inputs[0] as usize].data.offset;
+            let b = func.varnodes[inputs[1] as usize].data.offset;
+            Some(a.wrapping_add(b))
+        }
+        OpCode::IntSub => {
+            if inputs.len() < 2 { return false; }
+            let a = func.varnodes[inputs[0] as usize].data.offset;
+            let b = func.varnodes[inputs[1] as usize].data.offset;
+            Some(a.wrapping_sub(b))
+        }
+        OpCode::IntAnd => {
+            if inputs.len() < 2 { return false; }
+            let a = func.varnodes[inputs[0] as usize].data.offset;
+            let b = func.varnodes[inputs[1] as usize].data.offset;
+            Some(a & b)
+        }
+        OpCode::IntOr => {
+            if inputs.len() < 2 { return false; }
+            let a = func.varnodes[inputs[0] as usize].data.offset;
+            let b = func.varnodes[inputs[1] as usize].data.offset;
+            Some(a | b)
+        }
+        OpCode::IntXor => {
+            if inputs.len() < 2 { return false; }
+            let a = func.varnodes[inputs[0] as usize].data.offset;
+            let b = func.varnodes[inputs[1] as usize].data.offset;
+            Some(a ^ b)
+        }
+        OpCode::IntEqual => {
+            if inputs.len() < 2 { return false; }
+            let a = func.varnodes[inputs[0] as usize].data.offset;
+            let b = func.varnodes[inputs[1] as usize].data.offset;
+            Some(if a == b { 1 } else { 0 })
+        }
+        OpCode::IntMult => {
+            if inputs.len() < 2 { return false; }
+            let a = func.varnodes[inputs[0] as usize].data.offset;
+            let b = func.varnodes[inputs[1] as usize].data.offset;
+            Some(a.wrapping_mul(b))
+        }
+        _ => None,
+    };
+
+    let Some(val) = result else { return false; };
+    let out_id = func.ops[i].output.unwrap();
+    let out_size = func.varnodes[out_id as usize].data.size;
+    let masked = if out_size >= 8 {
+        val
+    } else {
+        val & ((1u64 << (out_size * 8)) - 1)
+    };
+    let const_id = func.varnodes.len() as u32;
+    func.varnodes.push(crate::ssa::SsaVarnode {
+        id: const_id,
+        data: gr_core::pcode::VarnodeData::new(CONST_SPACE, masked, out_size),
+        version: 0,
+        def_op: None,
+        uses: vec![i],
+    });
+    func.ops[i].opcode = OpCode::Copy;
+    func.ops[i].inputs = vec![const_id];
+    true
+}
+
+/// Apply identity-style rewrites to `func.ops[i]` (`x+0=x`, `x*1=x`,
+/// `x*0=0`, `x&0=0`, `x|0=x`, `x-x=0`, `x^x=0`). Returns true on
+/// rewrite. Extracted from `algebraic_simplification` for fusion.
+fn try_algebraic_simplify_op(func: &mut SsaFunction, i: usize) -> bool {
+    if func.ops[i].inputs.len() < 2 {
+        return false;
+    }
+    let in0 = func.ops[i].inputs[0];
+    let in1 = func.ops[i].inputs[1];
+
+    let rewrite_to_zero = |func: &mut SsaFunction, i: usize| {
+        let out_size = func.varnodes[func.ops[i].output.unwrap() as usize].data.size;
+        let zero_id = func.varnodes.len() as u32;
+        func.varnodes.push(crate::ssa::SsaVarnode {
+            id: zero_id,
+            data: gr_core::pcode::VarnodeData::new(CONST_SPACE, 0, out_size),
+            version: 0,
+            def_op: None,
+            uses: vec![i],
+        });
+        func.ops[i].opcode = OpCode::Copy;
+        func.ops[i].inputs = vec![zero_id];
+    };
+
+    match func.ops[i].opcode {
+        OpCode::IntSub | OpCode::IntXor if in0 == in1 => {
+            rewrite_to_zero(func, i);
+            true
+        }
+        OpCode::IntAdd | OpCode::IntOr => {
+            for side in 0..2 {
+                let id = if side == 0 { in0 } else { in1 };
+                let vn = &func.varnodes[id as usize];
+                if vn.data.space == CONST_SPACE && vn.data.offset == 0 {
+                    let keep = func.ops[i].inputs[1 - side];
+                    func.ops[i].opcode = OpCode::Copy;
+                    func.ops[i].inputs = vec![keep];
+                    return true;
+                }
+            }
+            false
+        }
+        OpCode::IntMult => {
+            for side in 0..2 {
+                let id = if side == 0 { in0 } else { in1 };
+                let vn = &func.varnodes[id as usize];
+                if vn.data.space == CONST_SPACE {
+                    if vn.data.offset == 1 {
+                        let keep = func.ops[i].inputs[1 - side];
+                        func.ops[i].opcode = OpCode::Copy;
+                        func.ops[i].inputs = vec![keep];
+                        return true;
+                    } else if vn.data.offset == 0 {
+                        rewrite_to_zero(func, i);
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        OpCode::IntAnd => {
+            for side in 0..2 {
+                let id = if side == 0 { in0 } else { in1 };
+                let vn = &func.varnodes[id as usize];
+                if vn.data.space == CONST_SPACE && vn.data.offset == 0 {
+                    rewrite_to_zero(func, i);
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Convert `IntMult x, p2_const` / `IntDiv x, p2_const` into a left
+/// or right shift. Returns true on rewrite. Extracted from
+/// `strength_reduction` for fusion.
+fn try_strength_reduce_op(func: &mut SsaFunction, i: usize) -> bool {
+    match func.ops[i].opcode {
+        OpCode::IntMult => {
+            if func.ops[i].inputs.len() < 2 { return false; }
+            for side in 0..2 {
+                let other = 1 - side;
+                let id = func.ops[i].inputs[side];
+                let vn = &func.varnodes[id as usize];
+                if vn.data.space != CONST_SPACE { continue; }
+                let val = vn.data.offset;
+                if val != 0 && val.is_power_of_two() {
+                    let shift_amt = val.trailing_zeros() as u64;
+                    let out_size = func.varnodes[func.ops[i].output.unwrap() as usize].data.size;
+                    let shift_id = func.varnodes.len() as u32;
+                    func.varnodes.push(crate::ssa::SsaVarnode {
+                        id: shift_id,
+                        data: gr_core::pcode::VarnodeData::new(CONST_SPACE, shift_amt, out_size),
+                        version: 0,
+                        def_op: None,
+                        uses: vec![i],
+                    });
+                    let kept = func.ops[i].inputs[other];
+                    func.ops[i].opcode = OpCode::IntLeft;
+                    func.ops[i].inputs = vec![kept, shift_id];
+                    return true;
+                }
+            }
+            false
+        }
+        OpCode::IntDiv => {
+            if func.ops[i].inputs.len() < 2 { return false; }
+            let id = func.ops[i].inputs[1];
+            let vn = &func.varnodes[id as usize];
+            if vn.data.space != CONST_SPACE { return false; }
+            let val = vn.data.offset;
+            if val == 0 || !val.is_power_of_two() { return false; }
+            let shift_amt = val.trailing_zeros() as u64;
+            let out_size = func.varnodes[func.ops[i].output.unwrap() as usize].data.size;
+            let shift_id = func.varnodes.len() as u32;
+            func.varnodes.push(crate::ssa::SsaVarnode {
+                id: shift_id,
+                data: gr_core::pcode::VarnodeData::new(CONST_SPACE, shift_amt, out_size),
+                version: 0,
+                def_op: None,
+                uses: vec![i],
+            });
+            let dividend = func.ops[i].inputs[0];
+            func.ops[i].opcode = OpCode::IntRight;
+            func.ops[i].inputs = vec![dividend, shift_id];
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Fused walk that runs constant-fold, algebraic-simplify, and
+/// strength-reduce in priority order on every op in a single pass.
+///
+/// The three were previously three separate `for i in 0..ops.len()`
+/// walks; each iteration of the outer optimizer fixpoint scanned the
+/// op array three times. Since each rewrite changes the op's opcode
+/// away from the next pass's matchable set (a folded op becomes
+/// `Copy`, an algebraic identity becomes `Copy`, a strength-reduced
+/// op becomes `IntLeft/Right`), it's safe to try them in sequence on
+/// each op: on rewrite, the next pass's predicate won't match anyway.
+///
+/// Returns `(folded, simplified, reduced)` so the outer fixpoint can
+/// still update its per-pass counters.
+pub fn const_alg_strength(func: &mut SsaFunction) -> (usize, usize, usize) {
+    let (mut folded, mut simplified, mut reduced) = (0usize, 0usize, 0usize);
+    for i in 0..func.ops.len() {
+        if func.ops[i].dead || func.ops[i].output.is_none() {
+            continue;
+        }
+        if try_constant_fold_op(func, i) {
+            folded += 1;
+            continue;
+        }
+        if try_algebraic_simplify_op(func, i) {
+            simplified += 1;
+            continue;
+        }
+        if try_strength_reduce_op(func, i) {
+            reduced += 1;
+        }
+    }
+    (folded, simplified, reduced)
+}
+
 fn is_side_effecting(op: OpCode) -> bool {
     matches!(
         op,
@@ -510,10 +763,12 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
     let mut stats = OptimizationStats::default();
 
     for _ in 0..10 {
-        let cf = constant_fold(func);
+        // Three formerly-separate passes (constant_fold,
+        // algebraic_simplification, strength_reduction) are now fused
+        // into a single walk. See `const_alg_strength` for the
+        // ordering argument.
+        let (cf, alg, sr) = const_alg_strength(func);
         let cp = copy_propagation(func);
-        let sr = strength_reduction(func);
-        let alg = algebraic_simplification(func);
         let cse = common_subexpression_elimination(func);
         let dce = dead_code_elimination(func);
         stats.constants_folded += cf;

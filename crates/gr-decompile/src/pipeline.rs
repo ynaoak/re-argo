@@ -308,38 +308,95 @@ fn trim_to_function_body(
 /// at the early ret discarded the JE-reached half of the function and
 /// the decompiler emitted only one of the two return paths.
 ///
-/// CFG reachability is the right boundary: a block is in the function
-/// if it's reachable from entry along Branch/CBranch/fall-through
-/// edges. Blocks the lifter included but that no in-range edge reaches
-/// (padding, the next function's prelude) are dropped.
+/// CFG reachability is the right boundary: an instruction is in the
+/// function if it's reachable from entry along Branch / CBranch /
+/// fall-through edges. Instructions the lifter included but that no
+/// in-range edge reaches (padding, the next function's prelude) are
+/// dropped.
+///
+/// An earlier version of this function called `ControlFlowGraph::build`
+/// just for the reachability traversal and then threw the CFG away,
+/// only for `build_decompile_result` to rebuild the same CFG seconds
+/// later. That doubled the CFG construction cost on every decompile
+/// call (the build clones every LiftedInstruction into its block).
+///
+/// Walk reachability directly over the instruction array instead:
+/// build a flat `addr -> idx` map, DFS through it following each
+/// instruction's Branch / CBranch / fall-through targets, and filter.
+/// No CFG, no per-instruction clones for the traversal itself; the
+/// only clones we still pay are the `cloned()` in the final filter
+/// (the caller needs an owned Vec).
 fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> {
+    use rustc_hash::FxHashMap;
+    use gr_core::pcode::OpCode;
+
     if instructions.is_empty() {
         return Vec::new();
     }
-    let cfg = ControlFlowGraph::build(instructions);
-    let n = cfg.blocks.len();
-    if n == 0 {
-        return Vec::new();
-    }
+
+    let n = instructions.len();
+    let addr_to_idx: FxHashMap<u64, usize> = instructions
+        .iter()
+        .enumerate()
+        .map(|(idx, insn)| (insn.address, idx))
+        .collect();
+
     let mut visited = vec![false; n];
-    let mut stack = vec![cfg.entry_block];
-    while let Some(b) = stack.pop() {
-        if visited[b] {
+    let mut stack = vec![0usize];
+
+    while let Some(idx) = stack.pop() {
+        if visited[idx] {
             continue;
         }
-        visited[b] = true;
-        for &s in &cfg.blocks[b].successors {
-            stack.push(s);
+        visited[idx] = true;
+        let insn = &instructions[idx];
+
+        // Push statically-known branch targets.
+        let mut has_unconditional_transfer = false;
+        let mut has_return_or_indjmp = false;
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Branch => {
+                    has_unconditional_transfer = true;
+                    if let Some(tgt) = op.inputs.first()
+                        && tgt.space == gr_core::address::SpaceId::RAM
+                        && let Some(&t_idx) = addr_to_idx.get(&tgt.offset)
+                    {
+                        stack.push(t_idx);
+                    }
+                }
+                OpCode::CBranch => {
+                    if let Some(tgt) = op.inputs.first()
+                        && tgt.space == gr_core::address::SpaceId::RAM
+                        && let Some(&t_idx) = addr_to_idx.get(&tgt.offset)
+                    {
+                        stack.push(t_idx);
+                    }
+                }
+                OpCode::Return | OpCode::BranchInd => {
+                    has_return_or_indjmp = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Fall-through edge unless terminated by Return / indirect
+        // branch / unconditional Branch (whose target we already
+        // pushed). CBranch and "normal" instructions both fall
+        // through.
+        if !has_return_or_indjmp && !has_unconditional_transfer {
+            let fall = insn.address + insn.length as u64;
+            if let Some(&f_idx) = addr_to_idx.get(&fall) {
+                stack.push(f_idx);
+            }
         }
     }
-    let reachable: std::collections::BTreeSet<u64> = (0..n)
-        .filter(|&b| visited[b])
-        .flat_map(|b| cfg.blocks[b].instructions.iter().map(|i| i.address))
-        .collect();
+
     instructions
         .iter()
-        .filter(|insn| reachable.contains(&insn.address))
-        .cloned()
+        .enumerate()
+        .filter(|(idx, _)| visited[*idx])
+        .map(|(_, insn)| insn.clone())
         .collect()
 }
 
