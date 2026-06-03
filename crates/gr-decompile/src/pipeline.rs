@@ -246,14 +246,16 @@ fn build_decompile_result(
         .collect();
 
     let structured = structure_cfg(&ssa.cfg);
-    let mut c_emitter = CEmitter::with_symbols(symbols.clone());
-    c_emitter.set_string_literals(string_literals.clone());
-    c_emitter.set_stack_vars(stack_vars.clone());
+    // Both emitters borrow the same two maps -- the previous API took
+    // owned BTreeMaps and forced six clones per decompile call (three
+    // maps * two emitters). The borrow-based `with_maps` API is
+    // zero-clone. `stack_vars` was historically passed through but
+    // never read by either emitter; it's now omitted.
+    let _ = stack_vars;
+    let mut c_emitter = CEmitter::with_maps(symbols, string_literals);
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
-    let mut rust_emitter = RustEmitter::with_symbols(symbols.clone());
-    rust_emitter.set_string_literals(string_literals.clone());
-    rust_emitter.set_stack_vars(stack_vars.clone());
+    let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
     let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
     Ok(DecompileResult {

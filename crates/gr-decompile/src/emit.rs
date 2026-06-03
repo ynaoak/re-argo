@@ -1,44 +1,70 @@
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use gr_core::address::SpaceId;
 use gr_core::pcode::OpCode;
 
 use crate::ssa::SsaFunction;
 use crate::structure::StructuredBlock;
 
-pub struct CEmitter {
-    indent: usize,
-    output: String,
-    symbol_names: std::collections::BTreeMap<u64, String>,
-    string_literals: std::collections::BTreeMap<u64, String>,
-    stack_var_names: std::collections::BTreeMap<i64, String>,
+/// Cached empty maps used as the default for `CEmitter::new()` and
+/// for the symbol/string/stack inputs of `with_symbols`. Sharing the
+/// same static `BTreeMap::new()` here means the no-symbol code path
+/// pays zero allocation, vs. constructing a fresh empty BTreeMap on
+/// every emitter (six per `decompile` call before round 7).
+fn empty_u64_map() -> &'static BTreeMap<u64, String> {
+    static M: OnceLock<BTreeMap<u64, String>> = OnceLock::new();
+    M.get_or_init(BTreeMap::new)
 }
 
-impl CEmitter {
+pub struct CEmitter<'a> {
+    indent: usize,
+    output: String,
+    symbol_names: &'a BTreeMap<u64, String>,
+    string_literals: &'a BTreeMap<u64, String>,
+}
+
+impl Default for CEmitter<'static> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CEmitter<'static> {
     pub fn new() -> Self {
         Self {
             indent: 0,
             output: String::new(),
-            symbol_names: std::collections::BTreeMap::new(),
-            string_literals: std::collections::BTreeMap::new(),
-            stack_var_names: std::collections::BTreeMap::new(),
+            symbol_names: empty_u64_map(),
+            string_literals: empty_u64_map(),
         }
     }
+}
 
-    pub fn with_symbols(symbols: std::collections::BTreeMap<u64, String>) -> Self {
+impl<'a> CEmitter<'a> {
+    /// Construct an emitter that borrows its lookup maps from the
+    /// caller. Replaces the previous `with_symbols` /
+    /// `set_string_literals` / `set_stack_vars` triple, each of which
+    /// took an owned `BTreeMap` and forced a clone at the pipeline
+    /// call site. Each `decompile` call used to clone the symbol /
+    /// string maps once per emitter (four clones total for a C+Rust
+    /// pair); the reference form pays zero clones.
+    ///
+    /// The previous `stack_var_names` field was wired through both
+    /// emitters' constructors but never read by either, so it has
+    /// been dropped here too; if a future change wants to surface
+    /// stack-variable names, add the parameter and the read sites
+    /// together so the data path is end-to-end honest.
+    pub fn with_maps(
+        symbol_names: &'a BTreeMap<u64, String>,
+        string_literals: &'a BTreeMap<u64, String>,
+    ) -> Self {
         Self {
             indent: 0,
             output: String::new(),
-            symbol_names: symbols,
-            string_literals: std::collections::BTreeMap::new(),
-            stack_var_names: std::collections::BTreeMap::new(),
+            symbol_names,
+            string_literals,
         }
-    }
-
-    pub fn set_string_literals(&mut self, strings: std::collections::BTreeMap<u64, String>) {
-        self.string_literals = strings;
-    }
-
-    pub fn set_stack_vars(&mut self, vars: std::collections::BTreeMap<i64, String>) {
-        self.stack_var_names = vars;
     }
 
     pub fn emit_function(
@@ -521,11 +547,6 @@ impl CEmitter {
     }
 }
 
-impl Default for CEmitter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 struct FunctionSignature {
     return_type: &'static str,
