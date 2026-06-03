@@ -132,7 +132,7 @@ impl Rule for RuleXorSelfZero {
                     uses: vec![op_idx],
                 });
                 func.ops[op_idx].opcode = OpCode::Copy;
-                func.ops[op_idx].inputs = vec![const_id];
+                func.ops[op_idx].inputs = smallvec::smallvec![const_id];
                 return true;
             }
         false
@@ -155,7 +155,7 @@ impl Rule for RuleAddZero {
             if inp.data.space == SpaceId::CONST && inp.data.offset == 0 {
                 let other = op.inputs[1 - i];
                 func.ops[op_idx].opcode = OpCode::Copy;
-                func.ops[op_idx].inputs = vec![other];
+                func.ops[op_idx].inputs = smallvec::smallvec![other];
                 return true;
             }
         }
@@ -179,7 +179,7 @@ impl Rule for RuleMultOne {
             if inp.data.space == SpaceId::CONST && inp.data.offset == 1 {
                 let other = op.inputs[1 - i];
                 func.ops[op_idx].opcode = OpCode::Copy;
-                func.ops[op_idx].inputs = vec![other];
+                func.ops[op_idx].inputs = smallvec::smallvec![other];
                 return true;
             }
         }
@@ -202,7 +202,7 @@ impl Rule for RuleDoubleNeg {
             && func.ops[def_idx].opcode == OpCode::Int2Comp && func.ops[def_idx].inputs.len() == 1 {
                 let original = func.ops[def_idx].inputs[0];
                 func.ops[op_idx].opcode = OpCode::Copy;
-                func.ops[op_idx].inputs = vec![original];
+                func.ops[op_idx].inputs = smallvec::smallvec![original];
                 return true;
             }
         false
@@ -228,7 +228,7 @@ impl Rule for RuleAndSelf {
             && vn_a.data.space != SpaceId::CONST
         {
             func.ops[op_idx].opcode = OpCode::Copy;
-            func.ops[op_idx].inputs = vec![a];
+            func.ops[op_idx].inputs = smallvec::smallvec![a];
             return true;
         }
         false
@@ -254,7 +254,7 @@ impl Rule for RuleOrSelf {
             && vn_a.data.space != SpaceId::CONST
         {
             func.ops[op_idx].opcode = OpCode::Copy;
-            func.ops[op_idx].inputs = vec![a];
+            func.ops[op_idx].inputs = smallvec::smallvec![a];
             return true;
         }
         false
@@ -274,7 +274,7 @@ impl Rule for RuleShiftZero {
         if shift.data.space == SpaceId::CONST && shift.data.offset == 0 {
             let src = op.inputs[0];
             func.ops[op_idx].opcode = OpCode::Copy;
-            func.ops[op_idx].inputs = vec![src];
+            func.ops[op_idx].inputs = smallvec::smallvec![src];
             return true;
         }
         false
@@ -291,7 +291,7 @@ impl Rule for RuleSubZero {
         if b.data.space == SpaceId::CONST && b.data.offset == 0 {
             let src = op.inputs[0];
             func.ops[op_idx].opcode = OpCode::Copy;
-            func.ops[op_idx].inputs = vec![src];
+            func.ops[op_idx].inputs = smallvec::smallvec![src];
             return true;
         }
         false
@@ -312,7 +312,7 @@ impl Rule for RuleAndAllOnes {
                 if inp.data.offset == all_ones {
                     let other = op.inputs[1 - i];
                     func.ops[op_idx].opcode = OpCode::Copy;
-                    func.ops[op_idx].inputs = vec![other];
+                    func.ops[op_idx].inputs = smallvec::smallvec![other];
                     return true;
                 }
             }
@@ -332,7 +332,7 @@ impl Rule for RuleOrZero {
             if inp.data.space == SpaceId::CONST && inp.data.offset == 0 {
                 let other = op.inputs[1 - i];
                 func.ops[op_idx].opcode = OpCode::Copy;
-                func.ops[op_idx].inputs = vec![other];
+                func.ops[op_idx].inputs = smallvec::smallvec![other];
                 return true;
             }
         }

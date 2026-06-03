@@ -86,7 +86,7 @@ fn try_constant_fold_op(func: &mut SsaFunction, i: usize) -> bool {
         uses: vec![i],
     });
     func.ops[i].opcode = OpCode::Copy;
-    func.ops[i].inputs = vec![const_id];
+    func.ops[i].inputs = smallvec::smallvec![const_id];
     true
 }
 
@@ -111,7 +111,7 @@ fn try_algebraic_simplify_op(func: &mut SsaFunction, i: usize) -> bool {
             uses: vec![i],
         });
         func.ops[i].opcode = OpCode::Copy;
-        func.ops[i].inputs = vec![zero_id];
+        func.ops[i].inputs = smallvec::smallvec![zero_id];
     };
 
     match func.ops[i].opcode {
@@ -126,7 +126,7 @@ fn try_algebraic_simplify_op(func: &mut SsaFunction, i: usize) -> bool {
                 if vn.data.space == CONST_SPACE && vn.data.offset == 0 {
                     let keep = func.ops[i].inputs[1 - side];
                     func.ops[i].opcode = OpCode::Copy;
-                    func.ops[i].inputs = vec![keep];
+                    func.ops[i].inputs = smallvec::smallvec![keep];
                     return true;
                 }
             }
@@ -140,7 +140,7 @@ fn try_algebraic_simplify_op(func: &mut SsaFunction, i: usize) -> bool {
                     if vn.data.offset == 1 {
                         let keep = func.ops[i].inputs[1 - side];
                         func.ops[i].opcode = OpCode::Copy;
-                        func.ops[i].inputs = vec![keep];
+                        func.ops[i].inputs = smallvec::smallvec![keep];
                         return true;
                     } else if vn.data.offset == 0 {
                         rewrite_to_zero(func, i);
@@ -191,7 +191,7 @@ fn try_strength_reduce_op(func: &mut SsaFunction, i: usize) -> bool {
                     });
                     let kept = func.ops[i].inputs[other];
                     func.ops[i].opcode = OpCode::IntLeft;
-                    func.ops[i].inputs = vec![kept, shift_id];
+                    func.ops[i].inputs = smallvec::smallvec![kept, shift_id];
                     return true;
                 }
             }
@@ -216,7 +216,7 @@ fn try_strength_reduce_op(func: &mut SsaFunction, i: usize) -> bool {
             });
             let dividend = func.ops[i].inputs[0];
             func.ops[i].opcode = OpCode::IntRight;
-            func.ops[i].inputs = vec![dividend, shift_id];
+            func.ops[i].inputs = smallvec::smallvec![dividend, shift_id];
             true
         }
         _ => false,
@@ -425,7 +425,7 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
                 uses: vec![i],
             });
             func.ops[i].opcode = OpCode::Copy;
-            func.ops[i].inputs = vec![const_id];
+            func.ops[i].inputs = smallvec::smallvec![const_id];
             folded += 1;
         }
     }
@@ -641,7 +641,7 @@ pub fn strength_reduction(func: &mut SsaFunction) -> usize {
                             uses: vec![i],
                         });
                         func.ops[i].opcode = OpCode::IntLeft;
-                        func.ops[i].inputs = vec![func.ops[i].inputs[other], shift_id];
+                        func.ops[i].inputs = smallvec::smallvec![func.ops[i].inputs[other], shift_id];
                         reduced += 1;
                         break;
                     }
@@ -664,7 +664,7 @@ pub fn strength_reduction(func: &mut SsaFunction) -> usize {
                         uses: vec![i],
                     });
                     func.ops[i].opcode = OpCode::IntRight;
-                    func.ops[i].inputs = vec![func.ops[i].inputs[0], shift_id];
+                    func.ops[i].inputs = smallvec::smallvec![func.ops[i].inputs[0], shift_id];
                     reduced += 1;
                 }
             }
@@ -701,7 +701,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                     version: 0, def_op: None, uses: vec![i],
                 });
                 func.ops[i].opcode = OpCode::Copy;
-                func.ops[i].inputs = vec![zero_id];
+                func.ops[i].inputs = smallvec::smallvec![zero_id];
                 simplified += 1;
             }
             OpCode::IntAdd => {
@@ -710,7 +710,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                     if vn.data.space == const_space && vn.data.offset == 0 {
                         let keep = func.ops[i].inputs[1 - side];
                         func.ops[i].opcode = OpCode::Copy;
-                        func.ops[i].inputs = vec![keep];
+                        func.ops[i].inputs = smallvec::smallvec![keep];
                         simplified += 1;
                         break;
                     }
@@ -723,7 +723,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                         if vn.data.offset == 1 {
                             let keep = func.ops[i].inputs[1 - side];
                             func.ops[i].opcode = OpCode::Copy;
-                            func.ops[i].inputs = vec![keep];
+                            func.ops[i].inputs = smallvec::smallvec![keep];
                             simplified += 1;
                             break;
                         } else if vn.data.offset == 0 {
@@ -735,7 +735,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                                 version: 0, def_op: None, uses: vec![i],
                             });
                             func.ops[i].opcode = OpCode::Copy;
-                            func.ops[i].inputs = vec![zero_id];
+                            func.ops[i].inputs = smallvec::smallvec![zero_id];
                             simplified += 1;
                             break;
                         }
@@ -754,7 +754,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                             version: 0, def_op: None, uses: vec![i],
                         });
                         func.ops[i].opcode = OpCode::Copy;
-                        func.ops[i].inputs = vec![zero_id];
+                        func.ops[i].inputs = smallvec::smallvec![zero_id];
                         simplified += 1;
                         break;
                     }
@@ -766,7 +766,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                     if vn.data.space == const_space && vn.data.offset == 0 {
                         let keep = func.ops[i].inputs[1 - side];
                         func.ops[i].opcode = OpCode::Copy;
-                        func.ops[i].inputs = vec![keep];
+                        func.ops[i].inputs = smallvec::smallvec![keep];
                         simplified += 1;
                         break;
                     }

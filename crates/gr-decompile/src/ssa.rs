@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use gr_core::pcode::{OpCode, VarnodeData};
 
@@ -6,6 +7,14 @@ use crate::cfg::{BlockId, ControlFlowGraph};
 
 pub type VarId = u32;
 pub type OpIdx = usize;
+
+/// Inline-friendly Vec of input varnode ids. Most P-code ops have
+/// 1-3 inputs (lift.rs uses the same `[VarnodeData; 3]` inline cap),
+/// so `SmallVec<[VarId; 3]>` skips the per-op heap allocation in
+/// `build_ssa` that `Vec<VarId>` paid for every op. Spills to the
+/// heap transparently for the rare 4+ input ops (e.g. wide PHI
+/// joins).
+pub type InputVec = SmallVec<[VarId; 3]>;
 
 #[derive(Debug, Clone)]
 pub struct SsaVarnode {
@@ -21,7 +30,7 @@ pub struct SsaOp {
     pub index: OpIdx,
     pub opcode: OpCode,
     pub output: Option<VarId>,
-    pub inputs: Vec<VarId>,
+    pub inputs: InputVec,
     pub block: BlockId,
     pub address: u64,
     pub dead: bool,
@@ -116,7 +125,7 @@ impl SsaFunction {
         for (block_id, block) in cfg.blocks.iter().enumerate() {
             for insn in &block.instructions {
                 for pcode_op in &insn.ops {
-                    let mut input_ids: Vec<VarId> = Vec::with_capacity(pcode_op.inputs.len());
+                    let mut input_ids: InputVec = InputVec::with_capacity(pcode_op.inputs.len());
                     for inp in &pcode_op.inputs {
                         input_ids.push(self.get_or_create_var(inp));
                     }
