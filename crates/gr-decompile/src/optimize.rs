@@ -232,61 +232,10 @@ fn try_strength_reduce_op(func: &mut SsaFunction, i: usize) -> bool {
 /// away from the next pass's matchable set (a folded op becomes
 /// `Copy`, an algebraic identity becomes `Copy`, a strength-reduced
 /// op becomes `IntLeft/Right`), it's safe to try them in sequence on
-/// Propagate a `Copy const` at `func.ops[i]` into every use of its
-/// output: each `inputs[j] == out_id` becomes `src_id` (the constant
-/// varnode). Returns the number of (op, input-slot) pairs rewritten.
+/// each op: on rewrite, the next pass's predicate won't match anyway.
 ///
-/// Behaviour matches the standalone `copy_propagation` pass exactly:
-/// only `Copy` ops whose source is a CONST varnode are propagated,
-/// and the use-list bookkeeping is intentionally left alone (the
-/// stale entries do no harm; downstream passes check liveness via
-/// `func.ops[use_idx].dead`).
-fn try_copy_propagate_op(func: &mut SsaFunction, i: usize) -> usize {
-    if func.ops[i].opcode != OpCode::Copy {
-        return 0;
-    }
-    if func.ops[i].output.is_none() || func.ops[i].inputs.is_empty() {
-        return 0;
-    }
-    let out_id = func.ops[i].output.unwrap();
-    let src_id = func.ops[i].inputs[0];
-    if func.varnodes[src_id as usize].data.space != CONST_SPACE {
-        return 0;
-    }
-
-    let mut propagated = 0;
-    let uses: Vec<usize> = func.varnodes[out_id as usize].uses.clone();
-    for use_idx in uses {
-        if func.ops[use_idx].dead {
-            continue;
-        }
-        for inp in &mut func.ops[use_idx].inputs {
-            if *inp == out_id {
-                *inp = src_id;
-                propagated += 1;
-            }
-        }
-    }
-    propagated
-}
-
-/// Fused walk that runs constant-fold, algebraic-simplify,
-/// strength-reduce, *and* copy-propagation in priority order on every
-/// op in a single pass.
-///
-/// Previously these four passes were each their own `for i in
-/// 0..ops.len()` walk. Per outer fixpoint iteration the op array was
-/// therefore scanned four times. Fusion drops it to one scan, and
-/// also turns "fold then propagate" into a same-iteration sequence:
-/// when `try_constant_fold_op` rewrites `func.ops[i]` to `Copy
-/// const`, the call to `try_copy_propagate_op` right below it pushes
-/// the new constant straight through to every downstream use --
-/// without waiting for the next outer iteration.
-///
-/// The four `pub fn` entry points (`constant_fold`,
-/// `algebraic_simplification`, `strength_reduction`,
-/// `copy_propagation`) are kept so existing tests and any external
-/// caller continue to work.
+/// Returns `(folded, simplified, reduced)` so the outer fixpoint can
+/// still update its per-pass counters.
 pub fn const_alg_strength(func: &mut SsaFunction) -> (usize, usize, usize) {
     let (mut folded, mut simplified, mut reduced) = (0usize, 0usize, 0usize);
     for i in 0..func.ops.len() {
@@ -306,44 +255,6 @@ pub fn const_alg_strength(func: &mut SsaFunction) -> (usize, usize, usize) {
         }
     }
     (folded, simplified, reduced)
-}
-
-/// Fused four-pass walk: `(folded, simplified, reduced, propagated)`.
-/// See `const_alg_strength` for the rationale.
-pub fn const_alg_strength_cp(func: &mut SsaFunction) -> (usize, usize, usize, usize) {
-    let (mut folded, mut simplified, mut reduced, mut propagated) = (0usize, 0usize, 0usize, 0usize);
-    for i in 0..func.ops.len() {
-        if func.ops[i].dead || func.ops[i].output.is_none() {
-            continue;
-        }
-        if try_constant_fold_op(func, i) {
-            folded += 1;
-            // The fold rewrote this op to `Copy const`. Propagate the
-            // new constant to every use in the same iteration.
-            propagated += try_copy_propagate_op(func, i);
-            continue;
-        }
-        if try_algebraic_simplify_op(func, i) {
-            simplified += 1;
-            // alg can also produce `Copy const` (e.g., x-x -> 0,
-            // x*0 -> 0). Try the propagation on the rewrite.
-            propagated += try_copy_propagate_op(func, i);
-            continue;
-        }
-        if try_strength_reduce_op(func, i) {
-            reduced += 1;
-            continue;
-        }
-        // Pre-existing `Copy const` ops (from the lifter, or carried
-        // over from a previous outer iteration): propagate them.
-        // Without this, a Copy const that wasn't rewritten this
-        // pass would only get propagated next iteration via
-        // `copy_propagation`, defeating the fusion.
-        if func.ops[i].opcode == OpCode::Copy {
-            propagated += try_copy_propagate_op(func, i);
-        }
-    }
-    (folded, simplified, reduced, propagated)
 }
 
 fn is_side_effecting(op: OpCode) -> bool {
@@ -876,14 +787,14 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
         // `const_alg_strength` for the ordering argument.
         //
         // We tried also fusing copy_propagation into the same walk
-        // (an earlier revision of this file had a
-        // `const_alg_strength_cp` that pipelined `cf -> cp` inside
-        // each op visit). Microbenched and the fused form was
-        // consistently ~40% slower end-to-end -- the per-fold inner
-        // cp call paid an extra Vec clone + iteration that
-        // standalone `copy_propagation`'s single batched walk
-        // amortises better. Left the fused variant around for now
-        // but `run_optimization_passes` uses the simpler split form.
+        // (an earlier revision pipelined `cf -> cp` inside each op
+        // visit). Microbenched and the fused form was consistently
+        // ~40% slower end-to-end -- the per-fold inner cp call
+        // paid an extra Vec clone + iteration that standalone
+        // `copy_propagation`'s single batched walk amortises better.
+        // The fused variant has been removed; this comment is the
+        // only record so the next person reaching for the same
+        // optimisation doesn't re-do it without knowing the result.
         let (cf, alg, sr) = const_alg_strength(func);
         let cp = copy_propagation(func);
         let cse = common_subexpression_elimination(func);
