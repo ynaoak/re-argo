@@ -42,7 +42,7 @@ pub fn decompile(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
 
-    let terminated = trim_to_return(&lifted);
+    let terminated = trim_to_return(lifted);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     build_decompile_result(terminated, func_name, entry, &empty, &empty)
 }
@@ -122,9 +122,9 @@ pub fn decompile_function_with_maps(
     }
 
     let terminated = if func.is_some() {
-        trim_to_function_body(&lifted, func_entry, func)
+        trim_to_function_body(lifted, func_entry, func)
     } else {
-        trim_to_return(&lifted)
+        trim_to_return(lifted)
     };
 
     build_decompile_result(terminated, &func_name, func_entry, symbols, string_literals)
@@ -203,9 +203,9 @@ pub fn analyze_taint(
     }
 
     let terminated = if func.is_some() {
-        trim_to_function_body(&lifted, func_entry, func)
+        trim_to_function_body(lifted, func_entry, func)
     } else {
-        trim_to_return(&lifted)
+        trim_to_return(lifted)
     };
 
     let cfg = ControlFlowGraph::build(&terminated);
@@ -306,30 +306,36 @@ fn build_decompile_result(
 }
 
 fn trim_to_function_body(
-    instructions: &[LiftedInstruction],
+    instructions: Vec<LiftedInstruction>,
     entry: u64,
     func: Option<&gr_program::Function>,
 ) -> Vec<LiftedInstruction> {
-    if let Some(f) = func {
-        let body_addrs = &f.body;
-        let filtered: Vec<LiftedInstruction> = instructions
-            .iter()
-            .filter(|insn| {
-                body_addrs.contains(&gr_core::address::Address::new(
-                    gr_core::address::SpaceId::RAM,
-                    insn.address,
-                )) || insn.address == entry
-            })
-            .cloned()
-            .collect();
-        if filtered.is_empty() {
-            trim_to_return(instructions)
-        } else {
-            filtered
-        }
-    } else {
-        trim_to_return(instructions)
+    let Some(f) = func else {
+        return trim_to_return(instructions);
+    };
+    let body_addrs = &f.body;
+    // Pre-test the predicate so we know whether to keep filtering on
+    // body_addrs or fall back to the CFG-reachability trim. The
+    // input is moved either way -- we just need to decide which path
+    // BEFORE consuming.
+    let keep: Vec<bool> = instructions
+        .iter()
+        .map(|insn| {
+            body_addrs.contains(&gr_core::address::Address::new(
+                gr_core::address::SpaceId::RAM,
+                insn.address,
+            )) || insn.address == entry
+        })
+        .collect();
+    if keep.iter().all(|&k| !k) {
+        // No body-address overlap -- fall back to flat reachability.
+        return trim_to_return(instructions);
     }
+    instructions
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(insn, k)| k.then_some(insn))
+        .collect()
 }
 
 /// Trim the lifted-instruction stream to just the part reachable from
@@ -360,7 +366,25 @@ fn trim_to_function_body(
 /// No CFG, no per-instruction clones for the traversal itself; the
 /// only clones we still pay are the `cloned()` in the final filter
 /// (the caller needs an owned Vec).
-fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> {
+fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<LiftedInstruction> {
+    let visited = reachability(&instructions);
+    if visited.is_empty() {
+        return instructions;
+    }
+    // Move the reachable instructions out of the input Vec by index.
+    // The borrow form of this function used `.cloned()` to materialise
+    // an owned Vec, paying a String + Vec<PcodeOp> clone per kept
+    // instruction. By consuming `instructions` and filtering with
+    // `into_iter().zip(...)` we move each kept LiftedInstruction
+    // straight into the result -- zero clones.
+    instructions
+        .into_iter()
+        .zip(visited)
+        .filter_map(|(insn, keep)| keep.then_some(insn))
+        .collect()
+}
+
+fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
     use rustc_hash::FxHashMap;
     use gr_core::pcode::OpCode;
 
@@ -385,7 +409,6 @@ fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> 
         visited[idx] = true;
         let insn = &instructions[idx];
 
-        // Push statically-known branch targets.
         let mut has_unconditional_transfer = false;
         let mut has_return_or_indjmp = false;
         for op in &insn.ops {
@@ -414,10 +437,6 @@ fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> 
             }
         }
 
-        // Fall-through edge unless terminated by Return / indirect
-        // branch / unconditional Branch (whose target we already
-        // pushed). CBranch and "normal" instructions both fall
-        // through.
         if !has_return_or_indjmp && !has_unconditional_transfer {
             let fall = insn.address + insn.length as u64;
             if let Some(&f_idx) = addr_to_idx.get(&fall) {
@@ -426,12 +445,7 @@ fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> 
         }
     }
 
-    instructions
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| visited[*idx])
-        .map(|(_, insn)| insn.clone())
-        .collect()
+    visited
 }
 
 #[cfg(test)]
