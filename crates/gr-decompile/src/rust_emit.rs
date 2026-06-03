@@ -1,44 +1,53 @@
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use gr_core::address::SpaceId;
 use gr_core::pcode::OpCode;
 
 use crate::ssa::SsaFunction;
 use crate::structure::StructuredBlock;
 
-pub struct RustEmitter {
-    indent: usize,
-    output: String,
-    symbol_names: std::collections::BTreeMap<u64, String>,
-    string_literals: std::collections::BTreeMap<u64, String>,
-    stack_var_names: std::collections::BTreeMap<i64, String>,
+fn empty_u64_map() -> &'static BTreeMap<u64, String> {
+    static M: OnceLock<BTreeMap<u64, String>> = OnceLock::new();
+    M.get_or_init(BTreeMap::new)
 }
 
-impl RustEmitter {
+pub struct RustEmitter<'a> {
+    indent: usize,
+    output: String,
+    symbol_names: &'a BTreeMap<u64, String>,
+    string_literals: &'a BTreeMap<u64, String>,
+}
+
+impl Default for RustEmitter<'static> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RustEmitter<'static> {
     pub fn new() -> Self {
         Self {
             indent: 0,
             output: String::new(),
-            symbol_names: std::collections::BTreeMap::new(),
-            string_literals: std::collections::BTreeMap::new(),
-            stack_var_names: std::collections::BTreeMap::new(),
+            symbol_names: empty_u64_map(),
+            string_literals: empty_u64_map(),
         }
     }
+}
 
-    pub fn with_symbols(symbols: std::collections::BTreeMap<u64, String>) -> Self {
+impl<'a> RustEmitter<'a> {
+    /// Borrow form of the constructor -- see `CEmitter::with_maps`.
+    pub fn with_maps(
+        symbol_names: &'a BTreeMap<u64, String>,
+        string_literals: &'a BTreeMap<u64, String>,
+    ) -> Self {
         Self {
             indent: 0,
             output: String::new(),
-            symbol_names: symbols,
-            string_literals: std::collections::BTreeMap::new(),
-            stack_var_names: std::collections::BTreeMap::new(),
+            symbol_names,
+            string_literals,
         }
-    }
-
-    pub fn set_string_literals(&mut self, strings: std::collections::BTreeMap<u64, String>) {
-        self.string_literals = strings;
-    }
-
-    pub fn set_stack_vars(&mut self, vars: std::collections::BTreeMap<i64, String>) {
-        self.stack_var_names = vars;
     }
 
     pub fn emit_function(
@@ -538,11 +547,6 @@ impl RustEmitter {
     }
 }
 
-impl Default for RustEmitter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 struct RustFunctionSignature {
     return_type: Option<&'static str>,

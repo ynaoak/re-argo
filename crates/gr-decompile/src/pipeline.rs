@@ -42,16 +42,61 @@ pub fn decompile(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
 
-    let terminated = trim_to_return(&lifted);
-    let empty_u64: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    let empty_i64: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(terminated, func_name, entry, &empty_u64, &empty_u64, &empty_i64)
+    let terminated = trim_to_return(lifted);
+    let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    build_decompile_result(terminated, func_name, entry, &empty, &empty)
 }
 
 pub fn decompile_function(
     lifter: &dyn PcodeLift,
     program: &Program,
     func_entry: u64,
+) -> Result<DecompileResult, String> {
+    let (symbols, string_literals) = build_program_maps(program);
+    decompile_function_with_maps(lifter, program, func_entry, &symbols, &string_literals)
+}
+
+/// Iterate `program.symbol_table` once and return the two
+/// per-program lookup maps the emitter needs: `address -> symbol
+/// name`, and the subset where names follow Ghidra's `s_<text>_<id>`
+/// string-literal convention. Pulled out of `decompile_function` so
+/// `decompile_all` can build them once and share them across the
+/// entire function batch instead of rebuilding per call.
+pub fn build_program_maps(
+    program: &Program,
+) -> (
+    std::collections::BTreeMap<u64, String>,
+    std::collections::BTreeMap<u64, String>,
+) {
+    let mut symbols = std::collections::BTreeMap::new();
+    let mut string_literals = std::collections::BTreeMap::new();
+    for sym in program.symbol_table.iter() {
+        symbols.insert(sym.address, sym.name.clone());
+        if let Some(rest) = sym.name.strip_prefix("s_")
+            && let Some((text, _)) = rest.rsplit_once('_')
+        {
+            let lit = text.replace('_', " ");
+            if !lit.is_empty() {
+                string_literals.insert(sym.address, lit);
+            }
+        }
+    }
+    (symbols, string_literals)
+}
+
+/// Decompile a single function reusing program-level lookup maps
+/// built by the caller (see `build_program_maps`).
+///
+/// `decompile_function` is the convenience entry point that builds
+/// the maps itself; `decompile_all` builds them once for the whole
+/// program and calls this directly so the per-function fan-out
+/// doesn't re-iterate `program.symbol_table` N times.
+pub fn decompile_function_with_maps(
+    lifter: &dyn PcodeLift,
+    program: &Program,
+    func_entry: u64,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    string_literals: &std::collections::BTreeMap<u64, String>,
 ) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
     let func_name = func
@@ -77,42 +122,12 @@ pub fn decompile_function(
     }
 
     let terminated = if func.is_some() {
-        trim_to_function_body(&lifted, func_entry, func)
+        trim_to_function_body(lifted, func_entry, func)
     } else {
-        trim_to_return(&lifted)
+        trim_to_return(lifted)
     };
 
-    let symbols: std::collections::BTreeMap<u64, String> = program
-        .symbol_table
-        .iter()
-        .map(|s| (s.address, s.name.clone()))
-        .collect();
-
-    let mut string_literals = std::collections::BTreeMap::new();
-    for sym in program.symbol_table.iter() {
-        if sym.name.starts_with("s_") {
-            let lit = sym.name
-                .strip_prefix("s_")
-                .and_then(|s| s.rsplit_once('_'))
-                .map(|(text, _)| text.replace('_', " "))
-                .unwrap_or_default();
-            if !lit.is_empty() {
-                string_literals.insert(sym.address, lit);
-            }
-        }
-    }
-
-    let stack_vars: std::collections::BTreeMap<i64, String> = func
-        .map(|f| {
-            f.stack_frame
-                .variables
-                .iter()
-                .map(|(offset, var)| (*offset, var.name.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    build_decompile_result(terminated, &func_name, func_entry, &symbols, &string_literals, &stack_vars)
+    build_decompile_result(terminated, &func_name, func_entry, symbols, string_literals)
 }
 
 /// Decompile every function the program knows about, in parallel.
@@ -132,9 +147,29 @@ pub fn decompile_all(
         .map(|f| f.entry_point)
         .collect();
 
+    // Build the program-wide lookup maps once and share them across
+    // every function decompile. Previously each parallel
+    // `decompile_function` call rebuilt the same maps from
+    // `program.symbol_table` -- O(N) per call, where N is the symbol
+    // count, multiplied by M parallel functions == O(N*M) redundant
+    // work. `decompile_function_with_maps` is the same code path
+    // minus the rebuild.
+    let (symbols, string_literals) = build_program_maps(program);
+
     entries
         .par_iter()
-        .map(|&entry| (entry, decompile_function(lifter, program, entry)))
+        .map(|&entry| {
+            (
+                entry,
+                decompile_function_with_maps(
+                    lifter,
+                    program,
+                    entry,
+                    &symbols,
+                    &string_literals,
+                ),
+            )
+        })
         .collect()
 }
 
@@ -168,9 +203,9 @@ pub fn analyze_taint(
     }
 
     let terminated = if func.is_some() {
-        trim_to_function_body(&lifted, func_entry, func)
+        trim_to_function_body(lifted, func_entry, func)
     } else {
-        trim_to_return(&lifted)
+        trim_to_return(lifted)
     };
 
     let cfg = ControlFlowGraph::build(&terminated);
@@ -195,7 +230,6 @@ fn build_decompile_result(
     entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
     string_literals: &std::collections::BTreeMap<u64, String>,
-    stack_vars: &std::collections::BTreeMap<i64, String>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -246,14 +280,14 @@ fn build_decompile_result(
         .collect();
 
     let structured = structure_cfg(&ssa.cfg);
-    let mut c_emitter = CEmitter::with_symbols(symbols.clone());
-    c_emitter.set_string_literals(string_literals.clone());
-    c_emitter.set_stack_vars(stack_vars.clone());
+    // Both emitters borrow the same two maps -- the previous API took
+    // owned BTreeMaps and forced four clones per decompile call (two
+    // maps * two emitters). The borrow-based `with_maps` API is
+    // zero-clone.
+    let mut c_emitter = CEmitter::with_maps(symbols, string_literals);
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
-    let mut rust_emitter = RustEmitter::with_symbols(symbols.clone());
-    rust_emitter.set_string_literals(string_literals.clone());
-    rust_emitter.set_stack_vars(stack_vars.clone());
+    let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
     let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
     Ok(DecompileResult {
@@ -272,30 +306,36 @@ fn build_decompile_result(
 }
 
 fn trim_to_function_body(
-    instructions: &[LiftedInstruction],
+    instructions: Vec<LiftedInstruction>,
     entry: u64,
     func: Option<&gr_program::Function>,
 ) -> Vec<LiftedInstruction> {
-    if let Some(f) = func {
-        let body_addrs = &f.body;
-        let filtered: Vec<LiftedInstruction> = instructions
-            .iter()
-            .filter(|insn| {
-                body_addrs.contains(&gr_core::address::Address::new(
-                    gr_core::address::SpaceId::RAM,
-                    insn.address,
-                )) || insn.address == entry
-            })
-            .cloned()
-            .collect();
-        if filtered.is_empty() {
-            trim_to_return(instructions)
-        } else {
-            filtered
-        }
-    } else {
-        trim_to_return(instructions)
+    let Some(f) = func else {
+        return trim_to_return(instructions);
+    };
+    let body_addrs = &f.body;
+    // Pre-test the predicate so we know whether to keep filtering on
+    // body_addrs or fall back to the CFG-reachability trim. The
+    // input is moved either way -- we just need to decide which path
+    // BEFORE consuming.
+    let keep: Vec<bool> = instructions
+        .iter()
+        .map(|insn| {
+            body_addrs.contains(&gr_core::address::Address::new(
+                gr_core::address::SpaceId::RAM,
+                insn.address,
+            )) || insn.address == entry
+        })
+        .collect();
+    if keep.iter().all(|&k| !k) {
+        // No body-address overlap -- fall back to flat reachability.
+        return trim_to_return(instructions);
     }
+    instructions
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(insn, k)| k.then_some(insn))
+        .collect()
 }
 
 /// Trim the lifted-instruction stream to just the part reachable from
@@ -326,7 +366,25 @@ fn trim_to_function_body(
 /// No CFG, no per-instruction clones for the traversal itself; the
 /// only clones we still pay are the `cloned()` in the final filter
 /// (the caller needs an owned Vec).
-fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> {
+fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<LiftedInstruction> {
+    let visited = reachability(&instructions);
+    if visited.is_empty() {
+        return instructions;
+    }
+    // Move the reachable instructions out of the input Vec by index.
+    // The borrow form of this function used `.cloned()` to materialise
+    // an owned Vec, paying a String + Vec<PcodeOp> clone per kept
+    // instruction. By consuming `instructions` and filtering with
+    // `into_iter().zip(...)` we move each kept LiftedInstruction
+    // straight into the result -- zero clones.
+    instructions
+        .into_iter()
+        .zip(visited)
+        .filter_map(|(insn, keep)| keep.then_some(insn))
+        .collect()
+}
+
+fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
     use rustc_hash::FxHashMap;
     use gr_core::pcode::OpCode;
 
@@ -351,7 +409,6 @@ fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> 
         visited[idx] = true;
         let insn = &instructions[idx];
 
-        // Push statically-known branch targets.
         let mut has_unconditional_transfer = false;
         let mut has_return_or_indjmp = false;
         for op in &insn.ops {
@@ -380,10 +437,6 @@ fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> 
             }
         }
 
-        // Fall-through edge unless terminated by Return / indirect
-        // branch / unconditional Branch (whose target we already
-        // pushed). CBranch and "normal" instructions both fall
-        // through.
         if !has_return_or_indjmp && !has_unconditional_transfer {
             let fall = insn.address + insn.length as u64;
             if let Some(&f_idx) = addr_to_idx.get(&fall) {
@@ -392,12 +445,7 @@ fn trim_to_return(instructions: &[LiftedInstruction]) -> Vec<LiftedInstruction> 
         }
     }
 
-    instructions
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| visited[*idx])
-        .map(|(_, insn)| insn.clone())
-        .collect()
+    visited
 }
 
 #[cfg(test)]
