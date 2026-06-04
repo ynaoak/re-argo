@@ -1,8 +1,27 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use gr_core::address::SpaceId;
 use gr_core::pcode::OpCode;
+
+/// Emit one indented line into the C emitter's output buffer.
+///
+/// Replaces the `linef!(self, "...", args)` pattern that paid
+/// a heap allocation per line for the intermediate `String`. The
+/// macro writes the indent prefix and the formatted body directly
+/// into `self.output` via `write!`, then appends the newline, with
+/// no temporary allocation. About a dozen call sites in this file
+/// use it.
+macro_rules! linef {
+    ($self:expr, $($arg:tt)*) => {{
+        for _ in 0..$self.indent {
+            $self.output.push_str("    ");
+        }
+        write!($self.output, $($arg)*).unwrap();
+        $self.output.push('\n');
+    }};
+}
 
 use crate::ssa::SsaFunction;
 use crate::structure::StructuredBlock;
@@ -92,7 +111,7 @@ impl<'a> CEmitter<'a> {
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
                     let var_name = reg_name(vn.data.offset, vn.data.size);
-                    self.line(&format!("{} {};", type_name, var_name));
+                    linef!(self, "{} {};", type_name, var_name);
                 }
             }
         }
@@ -116,7 +135,7 @@ impl<'a> CEmitter<'a> {
                 then_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!("if ({}) {{", self.get_branch_condition(func, *condition_block)));
+                linef!(self, "if ({}) {{", self.get_branch_condition(func, *condition_block));
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -128,7 +147,7 @@ impl<'a> CEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!("if ({}) {{", self.get_branch_condition(func, *condition_block)));
+                linef!(self, "if ({}) {{", self.get_branch_condition(func, *condition_block));
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -143,10 +162,8 @@ impl<'a> CEmitter<'a> {
                 body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!(
-                    "while ({}) {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "while ({}) {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.indent -= 1;
@@ -161,10 +178,8 @@ impl<'a> CEmitter<'a> {
                 self.emit_block(func, body);
                 self.emit_basic_block_no_branch(func, *condition_block);
                 self.indent -= 1;
-                self.line(&format!(
-                    "}} while ({});",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "}} while ({});", self.get_branch_condition(func, *condition_block)
+                );
             }
             StructuredBlock::ForLoop {
                 init_block,
@@ -173,10 +188,8 @@ impl<'a> CEmitter<'a> {
                 body,
             } => {
                 self.emit_basic_block_no_branch(func, *init_block);
-                self.line(&format!(
-                    "for (; {}; ) {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "for (; {}; ) {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.emit_basic_block_no_branch(func, *update_block);
@@ -189,11 +202,9 @@ impl<'a> CEmitter<'a> {
                 body,
             } => {
                 self.emit_basic_block_no_branch(func, *left_block);
-                self.line(&format!(
-                    "if ({} && {}) {{",
-                    self.get_branch_condition(func, *left_block),
+                linef!(self, "if ({} && {}) {{", self.get_branch_condition(func, *left_block),
                     self.get_branch_condition(func, *right_block)
-                ));
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.indent -= 1;
@@ -205,11 +216,9 @@ impl<'a> CEmitter<'a> {
                 body,
             } => {
                 self.emit_basic_block_no_branch(func, *left_block);
-                self.line(&format!(
-                    "if ({} || {}) {{",
-                    self.get_branch_condition(func, *left_block),
+                linef!(self, "if ({} || {}) {{", self.get_branch_condition(func, *left_block),
                     self.get_branch_condition(func, *right_block)
-                ));
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.indent -= 1;
@@ -221,13 +230,11 @@ impl<'a> CEmitter<'a> {
                 default,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!(
-                    "switch ({}) {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "switch ({}) {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 for (val, body) in cases {
-                    self.line(&format!("case 0x{:x}:", val));
+                    linef!(self, "case 0x{:x}:", val);
                     self.indent += 1;
                     self.emit_block(func, body);
                     self.line("break;");
@@ -252,10 +259,7 @@ impl<'a> CEmitter<'a> {
                 self.line("}");
             }
             StructuredBlock::Goto(target) => {
-                self.line(&format!(
-                    "goto label_{:x};",
-                    func.cfg.blocks[*target].start_addr
-                ));
+                linef!(self, "goto label_{:x};", func.cfg.blocks[*target].start_addr);
             }
         }
     }

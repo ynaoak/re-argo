@@ -1,8 +1,22 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use gr_core::address::SpaceId;
 use gr_core::pcode::OpCode;
+
+/// Same `linef!` pattern as emit.rs -- write indent + formatted body
+/// directly into `self.output`, skipping the intermediate `String`
+/// allocation that `self.line(&format!(...))` paid per call.
+macro_rules! linef {
+    ($self:expr, $($arg:tt)*) => {{
+        for _ in 0..$self.indent {
+            $self.output.push_str("    ");
+        }
+        write!($self.output, $($arg)*).unwrap();
+        $self.output.push('\n');
+    }};
+}
 
 use crate::ssa::SsaFunction;
 use crate::structure::StructuredBlock;
@@ -75,7 +89,7 @@ impl<'a> RustEmitter<'a> {
                 if declared.insert(key) {
                     let type_name = size_to_rust_type(vn.data.size);
                     let var_name = reg_name(vn.data.offset, vn.data.size);
-                    self.line(&format!("let mut {}: {};", var_name, type_name));
+                    linef!(self, "let mut {}: {};", var_name, type_name);
                 }
             }
         }
@@ -99,10 +113,8 @@ impl<'a> RustEmitter<'a> {
                 then_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!(
-                    "if {} {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "if {} {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -114,10 +126,8 @@ impl<'a> RustEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!(
-                    "if {} {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "if {} {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -132,10 +142,8 @@ impl<'a> RustEmitter<'a> {
                 body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!(
-                    "while {} {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "while {} {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.indent -= 1;
@@ -150,10 +158,8 @@ impl<'a> RustEmitter<'a> {
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!(
-                    "if !({}) {{ break; }}",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "if !({}) {{ break; }}", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent -= 1;
                 self.line("}");
             }
@@ -165,10 +171,8 @@ impl<'a> RustEmitter<'a> {
             } => {
                 // Rust has no C-style for-loop; emit as while
                 self.emit_basic_block_no_branch(func, *init_block);
-                self.line(&format!(
-                    "while {} {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "while {} {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.emit_basic_block_no_branch(func, *update_block);
@@ -181,11 +185,9 @@ impl<'a> RustEmitter<'a> {
                 body,
             } => {
                 self.emit_basic_block_no_branch(func, *left_block);
-                self.line(&format!(
-                    "if {} && {} {{",
-                    self.get_branch_condition(func, *left_block),
+                linef!(self, "if {} && {} {{", self.get_branch_condition(func, *left_block),
                     self.get_branch_condition(func, *right_block)
-                ));
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.indent -= 1;
@@ -197,11 +199,9 @@ impl<'a> RustEmitter<'a> {
                 body,
             } => {
                 self.emit_basic_block_no_branch(func, *left_block);
-                self.line(&format!(
-                    "if {} || {} {{",
-                    self.get_branch_condition(func, *left_block),
+                linef!(self, "if {} || {} {{", self.get_branch_condition(func, *left_block),
                     self.get_branch_condition(func, *right_block)
-                ));
+                );
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.indent -= 1;
@@ -213,13 +213,11 @@ impl<'a> RustEmitter<'a> {
                 default,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                self.line(&format!(
-                    "match {} {{",
-                    self.get_branch_condition(func, *condition_block)
-                ));
+                linef!(self, "match {} {{", self.get_branch_condition(func, *condition_block)
+                );
                 self.indent += 1;
                 for (val, body) in cases {
-                    self.line(&format!("0x{:x} => {{", val));
+                    linef!(self, "0x{:x} => {{", val);
                     self.indent += 1;
                     self.emit_block(func, body);
                     self.indent -= 1;
@@ -245,10 +243,7 @@ impl<'a> RustEmitter<'a> {
             }
             StructuredBlock::Goto(target) => {
                 // Rust does not have goto; emit as a comment-annotated break/continue placeholder
-                self.line(&format!(
-                    "// goto label_{:x}; (unsupported in Rust)",
-                    func.cfg.blocks[*target].start_addr
-                ));
+                linef!(self, "// goto label_{:x}; (unsupported in Rust)", func.cfg.blocks[*target].start_addr);
             }
         }
     }
