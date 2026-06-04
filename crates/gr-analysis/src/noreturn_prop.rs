@@ -15,21 +15,36 @@ impl Analyzer for NoReturnPropagationAnalyzer {
         750
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        use rustc_hash::FxHashSet;
         let propagated = 0;
+
+        // Build the set of known function entry points ONCE. The
+        // previous code re-iterated `program.listing.functions()`
+        // inside the outer `filter`, giving an O(K * N) walk where
+        // K is the number of one-call-target candidates and N is
+        // the function count -- nominal for small binaries, O(N^2)
+        // in the worst case.
+        let entry_points: FxHashSet<u64> = program
+            .listing
+            .functions()
+            .map(|f| f.entry_point)
+            .collect();
+
         let no_return_funcs: Vec<u64> = program
             .listing
             .functions()
             .filter(|f| {
                 f.call_targets.len() == 1
                     && f.body.len() <= 3
-                    && program
-                        .listing
-                        .functions()
-                        .any(|target| f.call_targets.contains(&target.entry_point))
+                    && f.call_targets.iter().any(|t| entry_points.contains(t))
             })
             .map(|f| f.entry_point)
             .collect();
 
+        // The actual no-return propagation is still TODO -- this
+        // analyzer currently only collects candidates. Once the
+        // propagation logic lands the candidate set is the input
+        // and `propagated` will be its size.
         let _ = no_return_funcs;
         let _ = propagated;
 
