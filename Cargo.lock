@@ -264,6 +264,8 @@ dependencies = [
  "petgraph",
  "rayon",
  "rustc-demangle",
+ "rustc-hash",
+ "smallvec",
  "thiserror",
 ]
 
