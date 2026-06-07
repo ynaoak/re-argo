@@ -21,6 +21,7 @@ gr-decompile = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 gr-sleigh = { workspace = true }

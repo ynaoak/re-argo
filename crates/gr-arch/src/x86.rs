@@ -368,10 +368,9 @@ impl Architecture for X86Arch {
     }
 
     fn register_by_name(&self, name: &str) -> Option<&RegisterInfo> {
-        let upper = name.to_uppercase();
         self.registers.iter().find(|r| {
-            r.name.to_uppercase() == upper
-                || r.aliases.iter().any(|a| a.to_uppercase() == upper)
+            r.name.eq_ignore_ascii_case(name)
+                || r.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
         })
     }
 

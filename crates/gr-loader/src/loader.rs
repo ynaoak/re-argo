@@ -474,12 +474,19 @@ impl BinaryLoader {
                 });
             }
         }
+        let mut imports = Vec::new();
         for import in &pe.imports {
+            let addr = import.rva as u64 + image_base;
             symbols.push(LoadSymbol {
                 name: import.name.to_string(),
-                address: import.rva as u64 + image_base,
+                address: addr,
                 size: 0,
                 kind: SymbolKind::Import,
+            });
+            imports.push(ImportEntry {
+                name: import.name.to_string(),
+                plt_address: addr,
+                got_address: import.rva as u64 + image_base,
             });
         }
 
@@ -497,7 +504,7 @@ impl BinaryLoader {
             entry_point: entry,
             sections,
             symbols,
-            imports: Vec::new(),
+            imports,
             memory,
             dwarf: DwarfInfo::default(),
             dynamic: DynamicInfo::default(),

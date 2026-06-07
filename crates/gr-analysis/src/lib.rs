@@ -1,4 +1,6 @@
 pub mod analyzer;
+#[cfg(test)]
+mod testutil;
 pub mod boundary;
 pub mod callingconv;
 pub mod callgraph;
@@ -20,6 +22,7 @@ pub mod patterns;
 pub mod signatures;
 pub mod thunk;
 pub mod typerecovery;
+pub mod utils;
 pub mod vtable;
 pub mod xref_report;
 

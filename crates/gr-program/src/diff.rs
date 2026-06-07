@@ -20,11 +20,14 @@ impl ProgramDiff {
         let added_functions: Vec<u64> = new_funcs.difference(&old_funcs).copied().collect();
         let removed_functions: Vec<u64> = old_funcs.difference(&new_funcs).copied().collect();
 
+        let old_map: std::collections::HashMap<u64, &crate::project::FunctionSummary> =
+            old.functions.iter().map(|f| (f.address, f)).collect();
+        let new_map: std::collections::HashMap<u64, &crate::project::FunctionSummary> =
+            new.functions.iter().map(|f| (f.address, f)).collect();
+
         let mut modified_functions = Vec::new();
         for addr in old_funcs.intersection(&new_funcs) {
-            let old_f = old.functions.iter().find(|f| f.address == *addr);
-            let new_f = new.functions.iter().find(|f| f.address == *addr);
-            if let (Some(o), Some(n)) = (old_f, new_f)
+            if let (Some(o), Some(n)) = (old_map.get(addr), new_map.get(addr))
                 && (o.name != n.name || o.block_count != n.block_count) {
                     modified_functions.push((*addr, format!("{} -> {}", o.name, n.name)));
                 }

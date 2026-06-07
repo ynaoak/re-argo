@@ -77,7 +77,7 @@ impl AnalysisManager {
     }
 
     pub fn run_all(&self, program: &mut Program) -> Vec<Result<AnalysisResult, AnalysisError>> {
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(self.analyzers.len());
         for analyzer in &self.analyzers {
             results.push(analyzer.analyze(program));
         }

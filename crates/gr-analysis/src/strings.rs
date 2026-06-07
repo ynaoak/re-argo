@@ -1,5 +1,6 @@
 use gr_program::symbol::{SourceType, Symbol, SymbolType};
 use gr_program::Program;
+use rayon::prelude::*;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -22,8 +23,6 @@ impl Analyzer for StringSearchAnalyzer {
     }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut strings_found = 0;
-
         let data_sections: Vec<(String, u64, u64)> = program
             .info
             .sections
@@ -32,13 +31,28 @@ impl Analyzer for StringSearchAnalyzer {
             .map(|s| (s.name.clone(), s.address, s.size))
             .collect();
 
-        for (section_name, addr, size) in &data_sections {
-            let mut buf = vec![0u8; *size as usize];
-            if program.info.memory.read_bytes(*addr, &mut buf).is_err() {
-                continue;
-            }
+        // Phase 1: scan each data section independently in parallel.
+        // The memory read + linear printable-ASCII walk is read-only
+        // against an immutable Program view, so per-section work fans
+        // out cleanly to rayon. The bigger gain isn't section count
+        // (typically 1-3) but that the dominant cost -- the byte
+        // scan itself -- now runs on multiple cores when there ARE
+        // multiple sections.
+        type SectionStrings = (String, u64, Vec<(u64, String)>);
+        let per_section: Vec<SectionStrings> = data_sections
+            .par_iter()
+            .filter_map(|(name, addr, size)| {
+                let mut buf = vec![0u8; *size as usize];
+                program.info.memory.read_bytes(*addr, &mut buf).ok()?;
+                let found = find_strings(&buf, *addr);
+                Some((name.clone(), *size, found))
+            })
+            .collect();
 
-            let found = find_strings(&buf, *addr);
+        // Phase 2: apply serially -- symbol table inserts and the
+        // per-section log line.
+        let mut strings_found = 0;
+        for (section_name, size, found) in per_section {
             for (string_addr, string_val) in &found {
                 let label = sanitize_string_label(string_val);
                 program.symbol_table.add(Symbol::new(
@@ -49,7 +63,6 @@ impl Analyzer for StringSearchAnalyzer {
                 ));
                 strings_found += 1;
             }
-
             if !found.is_empty() {
                 eprintln!(
                     "  [{}] {} strings in {} ({} bytes)",
@@ -71,13 +84,12 @@ impl Analyzer for StringSearchAnalyzer {
 }
 
 pub fn is_data_section(name: &str) -> bool {
-    let n = name.to_lowercase();
-    n.contains(".rodata")
-        || n.contains(".rdata")
-        || n.contains(".data")
-        || n.contains("__cstring")
-        || n.contains("__const")
-        || n.contains("__TEXT.__cstring")
+    let patterns = [".rodata", ".rdata", ".data", "__cstring", "__const", "__TEXT.__cstring"];
+    patterns.iter().any(|p| {
+        name.len() >= p.len()
+            && name.as_bytes().windows(p.len()).any(|w|
+                w.eq_ignore_ascii_case(p.as_bytes()))
+    })
 }
 
 pub fn find_strings(data: &[u8], base_addr: u64) -> Vec<(u64, String)> {

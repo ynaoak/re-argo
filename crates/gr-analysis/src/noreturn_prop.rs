@@ -71,7 +71,7 @@ impl Analyzer for DuplicateCodeAnalyzer {
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let mut duplicates = 0;
-        let mut seen_hashes: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        let mut seen_hashes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
 
         let func_entries: Vec<u64> = program.listing.functions().map(|f| f.entry_point).collect();
 

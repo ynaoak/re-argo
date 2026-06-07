@@ -122,13 +122,17 @@ impl ProjectSummary {
     }
 
     pub fn merge(&mut self, other: &ProjectSummary) {
+        let existing_funcs: std::collections::HashSet<u64> =
+            self.functions.iter().map(|f| f.address).collect();
         for func in &other.functions {
-            if !self.functions.iter().any(|f| f.address == func.address) {
+            if !existing_funcs.contains(&func.address) {
                 self.functions.push(func.clone());
             }
         }
+        let existing_syms: std::collections::HashSet<u64> =
+            self.symbols.iter().map(|s| s.address).collect();
         for sym in &other.symbols {
-            if !self.symbols.iter().any(|s| s.address == sym.address && s.name == sym.name) {
+            if !existing_syms.contains(&sym.address) {
                 self.symbols.push(sym.clone());
             }
         }

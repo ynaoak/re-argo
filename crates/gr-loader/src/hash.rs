@@ -40,7 +40,12 @@ pub fn function_hash(bytes: &[u8], max_bytes: usize) -> u64 {
 }
 
 pub fn hex_string(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write;
+    let mut s = String::with_capacity(data.len() * 2);
+    for &b in data {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 #[cfg(test)]

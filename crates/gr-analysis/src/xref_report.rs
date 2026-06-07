@@ -1,4 +1,6 @@
 use gr_program::Program;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -10,15 +12,20 @@ impl Analyzer for CrossReferenceReportAnalyzer {
     fn priority(&self) -> u32 { 950 }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut max_refs_to = 0usize;
-        let mut hot_addresses = 0;
-
-        let all_targets: Vec<u64> = program.references.all_refs().map(|r| r.to).collect();
-        let mut target_counts: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
-        for addr in &all_targets {
-            *target_counts.entry(*addr).or_default() += 1;
+        // Tally reference targets via FxHashMap rather than BTreeMap.
+        // The keys are integer addresses with no need for ordered
+        // iteration -- we only fold over `values()` to compute the
+        // max and hot count -- so the BTreeMap's per-insert O(log N)
+        // walk was pure overhead vs the FxHash table's amortised O(1)
+        // insert.
+        let mut target_counts: FxHashMap<u64, usize> =
+            FxHashMap::with_capacity_and_hasher(1024, Default::default());
+        for r in program.references.all_refs() {
+            *target_counts.entry(r.to).or_default() += 1;
         }
 
+        let mut max_refs_to = 0usize;
+        let mut hot_addresses = 0;
         for &count in target_counts.values() {
             if count > max_refs_to {
                 max_refs_to = count;
@@ -45,18 +52,20 @@ impl Analyzer for UnreferencedFunctionAnalyzer {
     fn priority(&self) -> u32 { 960 }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut unreferenced = 0;
         let entry = program.entry_point();
+        let entries: Vec<u64> = program
+            .listing
+            .functions()
+            .map(|f| f.entry_point)
+            .collect();
 
-        for func in program.listing.functions() {
-            if func.entry_point == entry {
-                continue;
-            }
-            let refs_to = program.references.call_refs_to(func.entry_point);
-            if refs_to.is_empty() {
-                unreferenced += 1;
-            }
-        }
+        // Per-function `call_refs_to` lookup is read-only against an
+        // immutable Program view and embarrassingly parallel; the
+        // result is just a count so no apply phase is needed.
+        let unreferenced: usize = entries
+            .par_iter()
+            .filter(|&&ep| ep != entry && program.references.call_refs_to(ep).is_empty())
+            .count();
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

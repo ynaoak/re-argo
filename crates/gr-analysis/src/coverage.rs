@@ -1,27 +1,7 @@
-// Code coverage analysis: tracks which addresses have been analyzed.
+// Code coverage analysis.
 
-use std::collections::BTreeSet;
 use gr_program::Program;
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
-
-#[derive(Debug, Default)]
-pub struct CoverageMap {
-    analyzed: BTreeSet<u64>,
-    total_code_bytes: u64,
-}
-
-impl CoverageMap {
-    pub fn new() -> Self { Self::default() }
-
-    pub fn mark(&mut self, address: u64) { self.analyzed.insert(address); }
-    pub fn is_analyzed(&self, address: u64) -> bool { self.analyzed.contains(&address) }
-    pub fn analyzed_count(&self) -> usize { self.analyzed.len() }
-
-    pub fn coverage_percent(&self) -> f64 {
-        if self.total_code_bytes == 0 { return 0.0; }
-        (self.analyzed.len() as f64 / self.total_code_bytes as f64) * 100.0
-    }
-}
 
 pub struct CoverageAnalyzer;
 

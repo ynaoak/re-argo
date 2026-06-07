@@ -35,23 +35,31 @@ pub fn compute_liveness(func: &SsaFunction) -> LivenessInfo {
         }
     }
 
+    let cached_defs: Vec<BTreeSet<VarId>> = (0..block_count)
+        .map(|b| defs.get(&b).cloned().unwrap_or_default())
+        .collect();
+    let cached_uses: Vec<BTreeSet<VarId>> = (0..block_count)
+        .map(|b| uses.get(&b).cloned().unwrap_or_default())
+        .collect();
+
     let mut changed = true;
+    let mut scratch_diff = BTreeSet::new();
     while changed {
         changed = false;
         for b in (0..block_count).rev() {
             let mut new_out = BTreeSet::new();
             for &succ in &func.cfg.blocks[b].successors {
                 if let Some(li) = info.live_in.get(&succ) {
-                    new_out = new_out.union(li).copied().collect();
+                    new_out.extend(li.iter().copied());
                 }
             }
-            let block_defs = defs.get(&b).cloned().unwrap_or_default();
-            let block_uses = uses.get(&b).cloned().unwrap_or_default();
-            let new_in: BTreeSet<VarId> = block_uses.union(
-                &new_out.difference(&block_defs).copied().collect()
-            ).copied().collect();
+            scratch_diff.clear();
+            for v in new_out.difference(&cached_defs[b]) {
+                scratch_diff.insert(*v);
+            }
+            let new_in: BTreeSet<VarId> = cached_uses[b].union(&scratch_diff).copied().collect();
 
-            if new_in != *info.live_in.get(&b).unwrap() || new_out != *info.live_out.get(&b).unwrap() {
+            if info.live_in.get(&b) != Some(&new_in) || info.live_out.get(&b) != Some(&new_out) {
                 info.live_in.insert(b, new_in);
                 info.live_out.insert(b, new_out);
                 changed = true;

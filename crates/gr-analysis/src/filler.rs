@@ -34,9 +34,8 @@ impl Analyzer for FillerBytesAnalyzer {
                 }
                 let byte = program.info.memory.read_byte(current);
                 match byte {
-                    Some(0xCC) | Some(0x90) | Some(0x00) => {
+                    Some(filler_byte @ (0xCC | 0x90 | 0x00)) => {
                         let start = current;
-                        let filler_byte = byte.unwrap();
                         let mut end = current + 1;
                         while end < addr + size {
                             if program.info.memory.read_byte(end) != Some(filler_byte) {

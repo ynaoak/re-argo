@@ -42,52 +42,40 @@ fn rsi(sz: u32) -> VarnodeData { reg(0x30, sz) }
 fn rdi(sz: u32) -> VarnodeData { reg(0x38, sz) }
 
 fn iced_reg_to_varnode(r: iced_x86::Register) -> Option<VarnodeData> {
+    use std::sync::OnceLock;
+    use std::collections::HashMap;
     use iced_x86::Register;
-    if r == Register::RAX { return Some(rax(8)); }
-    if r == Register::EAX { return Some(rax(4)); }
-    if r == Register::AX { return Some(rax(2)); }
-    if r == Register::AL { return Some(rax(1)); }
-    if r == Register::RCX { return Some(rcx(8)); }
-    if r == Register::ECX { return Some(rcx(4)); }
-    if r == Register::CX { return Some(rcx(2)); }
-    if r == Register::CL { return Some(rcx(1)); }
-    if r == Register::RDX { return Some(rdx(8)); }
-    if r == Register::EDX { return Some(rdx(4)); }
-    if r == Register::DX { return Some(rdx(2)); }
-    if r == Register::DL { return Some(rdx(1)); }
-    if r == Register::RBX { return Some(rbx(8)); }
-    if r == Register::EBX { return Some(rbx(4)); }
-    if r == Register::BX { return Some(rbx(2)); }
-    if r == Register::BL { return Some(rbx(1)); }
-    if r == Register::RSP { return Some(rsp(8)); }
-    if r == Register::ESP { return Some(rsp(4)); }
-    if r == Register::SP { return Some(rsp(2)); }
-    if r == Register::RBP { return Some(rbp(8)); }
-    if r == Register::EBP { return Some(rbp(4)); }
-    if r == Register::BP { return Some(rbp(2)); }
-    if r == Register::RSI { return Some(rsi(8)); }
-    if r == Register::ESI { return Some(rsi(4)); }
-    if r == Register::SI { return Some(rsi(2)); }
-    if r == Register::RDI { return Some(rdi(8)); }
-    if r == Register::EDI { return Some(rdi(4)); }
-    if r == Register::DI { return Some(rdi(2)); }
-    if r == Register::R8 { return Some(reg(0x80, 8)); }
-    if r == Register::R8D { return Some(reg(0x80, 4)); }
-    if r == Register::R9 { return Some(reg(0x88, 8)); }
-    if r == Register::R9D { return Some(reg(0x88, 4)); }
-    if r == Register::R10 { return Some(reg(0x90, 8)); }
-    if r == Register::R10D { return Some(reg(0x90, 4)); }
-    if r == Register::R11 { return Some(reg(0x98, 8)); }
-    if r == Register::R11D { return Some(reg(0x98, 4)); }
-    if r == Register::R12 { return Some(reg(0xA0, 8)); }
-    if r == Register::R12D { return Some(reg(0xA0, 4)); }
-    if r == Register::R13 { return Some(reg(0xA8, 8)); }
-    if r == Register::R13D { return Some(reg(0xA8, 4)); }
-    if r == Register::R14 { return Some(reg(0xB0, 8)); }
-    if r == Register::R14D { return Some(reg(0xB0, 4)); }
-    if r == Register::R15 { return Some(reg(0xB8, 8)); }
-    if r == Register::R15D { return Some(reg(0xB8, 4)); }
-    None
+
+    static REG_MAP: OnceLock<HashMap<Register, VarnodeData>> = OnceLock::new();
+    let map = REG_MAP.get_or_init(|| {
+        let mut m = HashMap::with_capacity(48);
+        m.insert(Register::RAX, rax(8)); m.insert(Register::EAX, rax(4));
+        m.insert(Register::AX, rax(2)); m.insert(Register::AL, rax(1));
+        m.insert(Register::RCX, rcx(8)); m.insert(Register::ECX, rcx(4));
+        m.insert(Register::CX, rcx(2)); m.insert(Register::CL, rcx(1));
+        m.insert(Register::RDX, rdx(8)); m.insert(Register::EDX, rdx(4));
+        m.insert(Register::DX, rdx(2)); m.insert(Register::DL, rdx(1));
+        m.insert(Register::RBX, rbx(8)); m.insert(Register::EBX, rbx(4));
+        m.insert(Register::BX, rbx(2)); m.insert(Register::BL, rbx(1));
+        m.insert(Register::RSP, rsp(8)); m.insert(Register::ESP, rsp(4));
+        m.insert(Register::SP, rsp(2));
+        m.insert(Register::RBP, rbp(8)); m.insert(Register::EBP, rbp(4));
+        m.insert(Register::BP, rbp(2));
+        m.insert(Register::RSI, rsi(8)); m.insert(Register::ESI, rsi(4));
+        m.insert(Register::SI, rsi(2));
+        m.insert(Register::RDI, rdi(8)); m.insert(Register::EDI, rdi(4));
+        m.insert(Register::DI, rdi(2));
+        m.insert(Register::R8, reg(0x80, 8)); m.insert(Register::R8D, reg(0x80, 4));
+        m.insert(Register::R9, reg(0x88, 8)); m.insert(Register::R9D, reg(0x88, 4));
+        m.insert(Register::R10, reg(0x90, 8)); m.insert(Register::R10D, reg(0x90, 4));
+        m.insert(Register::R11, reg(0x98, 8)); m.insert(Register::R11D, reg(0x98, 4));
+        m.insert(Register::R12, reg(0xA0, 8)); m.insert(Register::R12D, reg(0xA0, 4));
+        m.insert(Register::R13, reg(0xA8, 8)); m.insert(Register::R13D, reg(0xA8, 4));
+        m.insert(Register::R14, reg(0xB0, 8)); m.insert(Register::R14D, reg(0xB0, 4));
+        m.insert(Register::R15, reg(0xB8, 8)); m.insert(Register::R15D, reg(0xB8, 4));
+        m
+    });
+    map.get(&r).copied()
 }
 
 pub struct X86Lifter {
@@ -1104,9 +1092,19 @@ impl PcodeLift for X86Lifter {
             });
         }
 
-        let mut fmt = iced_x86::IntelFormatter::new();
-        let mut mnemonic = String::new();
-        fmt.format(&insn, &mut mnemonic);
+        let mnemonic = {
+            use std::cell::RefCell;
+            thread_local! {
+                static FMT: RefCell<(iced_x86::IntelFormatter, String)> =
+                    RefCell::new((iced_x86::IntelFormatter::new(), String::with_capacity(32)));
+            }
+            FMT.with(|cell| {
+                let (fmt, buf) = &mut *cell.borrow_mut();
+                buf.clear();
+                fmt.format(&insn, buf);
+                buf.clone()
+            })
+        };
 
         let pcode_ops = self.lift_iced(&insn, address)?;
 
