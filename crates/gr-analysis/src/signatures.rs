@@ -87,7 +87,9 @@ impl Analyzer for SignatureApplierAnalyzer {
         700
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let db = SignatureDatabase::new();
+        use std::sync::OnceLock;
+        static DB: OnceLock<SignatureDatabase> = OnceLock::new();
+        let db = DB.get_or_init(SignatureDatabase::new);
         let mut applied = 0;
 
         let symbol_names: Vec<(u64, String)> = program

@@ -112,6 +112,24 @@ enum Commands {
         #[arg(long)]
         rust: bool,
     },
+    /// Decompile every discovered function in parallel
+    DecompileAll {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Output directory. Each function becomes
+        /// `<dir>/<name>.c` (and `.rs` if --rust is set).
+        /// If omitted, results are streamed to stdout with
+        /// "// === <name> @ 0x<addr> ===" headers.
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+        /// Also emit Rust-style pseudocode alongside C
+        #[arg(long)]
+        rust: bool,
+        /// Skip empty / unimplemented function decompiles instead of
+        /// writing an error file
+        #[arg(long)]
+        skip_errors: bool,
+    },
     /// Taint analysis: track parameters to dangerous sinks
     Taint {
         /// Path to the binary file
@@ -307,6 +325,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             count,
         } => cmd_pcode(&file, start, count, cli.thumb),
         Commands::Decompile { file, address, ssa, rust } => cmd_decompile(&file, address, ssa, rust, cli.thumb),
+        Commands::DecompileAll { file, output_dir, rust, skip_errors } => cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb),
         Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
@@ -773,6 +792,104 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
         result.stats.optimization,
     );
     Ok(())
+}
+
+fn cmd_decompile_all(
+    path: &Path,
+    output_dir: Option<&Path>,
+    show_rust: bool,
+    skip_errors: bool,
+    thumb: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let lifter = match make_lifter(&program.info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("Decompilation not yet supported for {}", program.info.arch);
+            return Ok(());
+        }
+    };
+
+    if let Some(dir) = output_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let results = gr_decompile::decompile_all(lifter.as_ref(), &program);
+
+    let mut ok = 0usize;
+    let mut err = 0usize;
+    for (entry, result) in &results {
+        let name = program.function_name_at(*entry);
+        match result {
+            Ok(r) => {
+                ok += 1;
+                match output_dir {
+                    Some(dir) => {
+                        // Sanitize: file names should not contain
+                        // path separators or shell-hostile chars.
+                        // The function name might be something like
+                        // `std::vec::Vec<T>::push` -- replace `<>:`
+                        // etc. with `_` so the resulting file name is
+                        // valid on every platform CI runs on.
+                        let safe = sanitize_filename(&name);
+                        let stem = format!("{}_{:08x}", safe, entry);
+                        let c_path = dir.join(format!("{}.c", stem));
+                        std::fs::write(&c_path, &r.c_code)?;
+                        if show_rust {
+                            let rs_path = dir.join(format!("{}.rs", stem));
+                            std::fs::write(&rs_path, &r.rust_code)?;
+                        }
+                    }
+                    None => {
+                        println!("// === {} @ 0x{:x} ===", name, entry);
+                        print!("{}", r.c_code);
+                        if show_rust {
+                            println!("// --- rust ---");
+                            print!("{}", r.rust_code);
+                        }
+                        println!();
+                    }
+                }
+            }
+            Err(e) => {
+                err += 1;
+                if !skip_errors {
+                    eprintln!("// decompile failed @ 0x{:x} ({}): {}", entry, name, e);
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "// decompile-all: {} ok, {} errors, {} total in {}",
+        ok,
+        err,
+        results.len(),
+        match output_dir {
+            Some(d) => d.display().to_string(),
+            None => "stdout".to_string(),
+        }
+    );
+    Ok(())
+}
+
+/// Filename-safe form of a function name: replace anything that's
+/// not `[A-Za-z0-9_.-]` with `_`. Conservative across Linux / macOS
+/// / Windows file systems.
+fn sanitize_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("anon");
+    }
+    out
 }
 
 fn cmd_taint(path: &Path, address: Option<u64>, params: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {

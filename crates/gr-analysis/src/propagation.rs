@@ -159,7 +159,7 @@ fn analyse_function(
                 for inp in &op.inputs {
                     if inp.space == SpaceId::REGISTER
                         && let Some(&val) = reg_values.get(&inp.offset)
-                        && is_valid_addr(val, valid_ranges)
+                        && crate::utils::is_valid_address(val, valid_ranges)
                     {
                         found.push((insn.address, val));
                     }
@@ -186,11 +186,4 @@ fn analyse_function(
     }
 
     found
-}
-
-fn is_valid_addr(val: u64, ranges: &[(u64, u64)]) -> bool {
-    if val < 0x1000 {
-        return false;
-    }
-    ranges.iter().any(|&(start, end)| val >= start && val < end)
 }

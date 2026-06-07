@@ -14,14 +14,11 @@ pub struct SparcArch {
     is_64: bool,
     registers: Vec<RegisterInfo>,
     calling_conventions: Vec<CallingConvention>,
-    cs: capstone::Capstone,
+    cs: crate::capstone_wrapper::SafeCapstone,
 }
 
-unsafe impl Send for SparcArch {}
-unsafe impl Sync for SparcArch {}
-
 impl SparcArch {
-    pub fn new(is_64: bool) -> Self {
+    pub fn new(is_64: bool) -> Result<Self, DisasmError> {
         use capstone::prelude::*;
         let mode = if is_64 {
             arch::sparc::ArchMode::V9
@@ -32,7 +29,7 @@ impl SparcArch {
             .sparc()
             .mode(mode)
             .build()
-            .expect("failed to create SPARC capstone");
+            .map_err(|e| DisasmError::EngineError(format!("SPARC capstone init: {}", e)))?;
         let sz = if is_64 { 8u32 } else { 4 };
         let mut registers = Vec::new();
         for i in 0..8u64 {
@@ -68,7 +65,7 @@ impl SparcArch {
             varnode: VarnodeData::new(REGISTER_SPACE, 32 * sz as u64, sz),
             aliases: Vec::new(),
         });
-        Self {
+        Ok(Self {
             is_64,
             registers,
             calling_conventions: vec![CallingConvention {
@@ -78,8 +75,8 @@ impl SparcArch {
                 callee_saved: (16..32).map(|i: u64| VarnodeData::new(REGISTER_SPACE, i * sz as u64, sz)).collect(),
                 stack_pointer: VarnodeData::new(REGISTER_SPACE, 14 * sz as u64, sz),
             }],
-            cs,
-        }
+            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+        })
     }
 }
 
@@ -91,14 +88,13 @@ impl Architecture for SparcArch {
     fn default_space(&self) -> SpaceId { RAM_SPACE }
     fn registers(&self) -> &[RegisterInfo] { &self.registers }
     fn register_by_name(&self, name: &str) -> Option<&RegisterInfo> {
-        let lower = name.to_lowercase();
-        self.registers.iter().find(|r| r.name == lower || r.aliases.iter().any(|a| a.to_lowercase() == lower))
+        
+        self.registers.iter().find(|r| r.name.eq_ignore_ascii_case(name) || r.aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
     }
     fn decode_instruction(&self, memory: &Memory, address: u64) -> Result<DecodedInstruction, DisasmError> {
         let mut buf = vec![0u8; 4];
         memory.read_bytes(address, &mut buf).map_err(|_| DisasmError::UnreadableAddress(address))?;
-        let insns = self.cs.disasm_count(&buf, address, 1)
-            .map_err(|e| DisasmError::DecodeError { address, reason: e.to_string() })?;
+        let insns = self.cs.disasm_count(&buf, address, 1)?;
         let insn = insns.iter().next().ok_or(DisasmError::DecodeError { address, reason: "no instruction".into() })?;
         let mn = insn.mnemonic().unwrap_or("???").to_string();
         let ops = insn.op_str().unwrap_or("").to_string();
@@ -125,7 +121,7 @@ mod tests {
     use super::*;
     #[test]
     fn sparc32_registers() {
-        let arch = SparcArch::new(false);
+        let arch = SparcArch::new(false).unwrap();
         assert_eq!(arch.bits(), 32);
         assert!(arch.register_by_name("sp").is_some());
         assert!(arch.register_by_name("g0").is_some());
