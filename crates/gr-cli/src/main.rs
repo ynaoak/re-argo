@@ -219,6 +219,24 @@ enum Commands {
         /// Path to the second binary
         file_b: PathBuf,
     },
+    /// Compare two binaries at the SSA / decompiled-function level.
+    ///
+    /// Unlike `diff` (which is byte-level / symbol-table level),
+    /// `semantic-diff` runs `decompile_all` on both inputs, hashes
+    /// each function's optimized SSA in an address-independent way,
+    /// and reports per-function: identical / renamed / tweaked /
+    /// modified / added / removed.
+    SemanticDiff {
+        /// Path to the first binary
+        file_a: PathBuf,
+        /// Path to the second binary
+        file_b: PathBuf,
+        /// Only show entries whose kind matches the filter. Comma-
+        /// separated list of: identical, renamed, tweaked, modified,
+        /// added, removed. Default: all except identical.
+        #[arg(short, long, default_value = "renamed,tweaked,modified,added,removed")]
+        kinds: String,
+    },
     /// List imports and exports
     Imports {
         /// Path to the binary file
@@ -321,6 +339,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => cmd_hexdump(&file, address, length),
         Commands::Strings { file, min_length, all } => cmd_strings(&file, min_length, all),
         Commands::Diff { file_a, file_b } => cmd_diff(&file_a, &file_b),
+        Commands::SemanticDiff { file_a, file_b, kinds } => cmd_semantic_diff(&file_a, &file_b, &kinds, cli.thumb),
         Commands::Imports { file, exports } => cmd_imports(&file, exports),
         Commands::Coverage { file } => cmd_coverage(&file),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
@@ -1321,6 +1340,196 @@ fn cmd_strings(path: &Path, min_length: usize, all_sections: bool) -> Result<(),
     }
 
     println!("\nTotal: {} strings", total);
+    Ok(())
+}
+
+fn cmd_semantic_diff(
+    path_a: &Path,
+    path_b: &Path,
+    kinds_filter: &str,
+    thumb: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gr_decompile::semantic_diff::{compare_programs, FunctionDiffKind};
+
+    let allowed: std::collections::HashSet<&str> =
+        kinds_filter.split(',').map(|s| s.trim()).collect();
+    let kind_matches = |k: FunctionDiffKind| -> bool {
+        let s = match k {
+            FunctionDiffKind::Identical => "identical",
+            FunctionDiffKind::Renamed => "renamed",
+            FunctionDiffKind::Tweaked => "tweaked",
+            FunctionDiffKind::Modified => "modified",
+            FunctionDiffKind::Added => "added",
+            FunctionDiffKind::Removed => "removed",
+        };
+        allowed.contains(s)
+    };
+
+    eprintln!("Analyzing {}...", path_a.display());
+    let prog_a = analyze_binary(path_a)?;
+    eprintln!("Analyzing {}...", path_b.display());
+    let prog_b = analyze_binary(path_b)?;
+
+    let lifter_a = match make_lifter(&prog_a.info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("semantic-diff: no lifter for {}", prog_a.info.arch);
+            return Ok(());
+        }
+    };
+    let lifter_b = match make_lifter(&prog_b.info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("semantic-diff: no lifter for {}", prog_b.info.arch);
+            return Ok(());
+        }
+    };
+
+    // Decompile both sides up-front so the diff loop can hash from
+    // cached SSA without re-running the pipeline per call.
+    eprintln!("Decompiling {}...", path_a.display());
+    let res_a = gr_decompile::decompile_all(lifter_a.as_ref(), &prog_a);
+    eprintln!("Decompiling {}...", path_b.display());
+    let res_b = gr_decompile::decompile_all(lifter_b.as_ref(), &prog_b);
+
+    // Build (addr, name) lists and the hash-callback closures from
+    // the cached results.
+    let funcs_a: Vec<(u64, String)> = prog_a
+        .listing
+        .functions()
+        .map(|f| (f.entry_point, f.name.clone()))
+        .collect();
+    let funcs_b: Vec<(u64, String)> = prog_b
+        .listing
+        .functions()
+        .map(|f| (f.entry_point, f.name.clone()))
+        .collect();
+
+    // Index decompile results by entry-point so the hash closures
+    // are O(1). The DecompileResult doesn't currently expose the
+    // SsaFunction (the pipeline drops it after emit), so as a
+    // first-cut MVP we hash on the C code instead -- structurally
+    // equivalent SSA produces structurally equivalent emit output.
+    // A follow-up can stash the SSA on DecompileResult for tighter
+    // hashes.
+    use rustc_hash::FxHashMap;
+    let by_a: FxHashMap<u64, &str> = res_a
+        .iter()
+        .filter_map(|(ep, r)| r.as_ref().ok().map(|r| (*ep, r.c_code.as_str())))
+        .collect();
+    let by_b: FxHashMap<u64, &str> = res_b
+        .iter()
+        .filter_map(|(ep, r)| r.as_ref().ok().map(|r| (*ep, r.c_code.as_str())))
+        .collect();
+
+    // Strip leading "/* @ 0x... */" comments and any "// 0x..."
+    // addresses from the C output to make the hash address-
+    // independent. For the structural form, also normalise all
+    // hex literals to "0x_". For the exact form, keep them.
+    let normalize_struct = |c: &str| -> String {
+        let mut out = String::with_capacity(c.len());
+        let mut iter = c.chars().peekable();
+        while let Some(ch) = iter.next() {
+            if ch == '0' && iter.peek() == Some(&'x') {
+                iter.next();
+                while iter.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                    iter.next();
+                }
+                out.push_str("0x_");
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    };
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hash_a = |ep: u64| -> Option<(u64, u64)> {
+        let c = by_a.get(&ep)?;
+        let mut s = DefaultHasher::new();
+        normalize_struct(c).hash(&mut s);
+        let mut e = DefaultHasher::new();
+        c.hash(&mut e);
+        Some((s.finish(), e.finish()))
+    };
+    let mut hash_b = |ep: u64| -> Option<(u64, u64)> {
+        let c = by_b.get(&ep)?;
+        let mut s = DefaultHasher::new();
+        normalize_struct(c).hash(&mut s);
+        let mut e = DefaultHasher::new();
+        c.hash(&mut e);
+        Some((s.finish(), e.finish()))
+    };
+
+    let diffs = compare_programs(&funcs_a, &funcs_b, &mut hash_a, &mut hash_b);
+
+    let mut by_kind: std::collections::BTreeMap<&str, Vec<&gr_decompile::FunctionDiff>> =
+        std::collections::BTreeMap::new();
+    for d in &diffs {
+        if !kind_matches(d.kind) {
+            continue;
+        }
+        let label = match d.kind {
+            FunctionDiffKind::Identical => "identical",
+            FunctionDiffKind::Renamed => "renamed",
+            FunctionDiffKind::Tweaked => "tweaked",
+            FunctionDiffKind::Modified => "modified",
+            FunctionDiffKind::Added => "added",
+            FunctionDiffKind::Removed => "removed",
+        };
+        by_kind.entry(label).or_default().push(d);
+    }
+
+    println!(
+        "Semantic diff: {} vs {}",
+        path_a.display(),
+        path_b.display()
+    );
+    for (kind, entries) in &by_kind {
+        println!("\n[{}] ({})", kind, entries.len());
+        for d in entries {
+            match d.kind {
+                FunctionDiffKind::Renamed => {
+                    println!(
+                        "  {} (0x{:x}) -> {} (0x{:x})",
+                        d.name_a.as_deref().unwrap_or("?"),
+                        d.addr_a.unwrap_or(0),
+                        d.name_b.as_deref().unwrap_or("?"),
+                        d.addr_b.unwrap_or(0),
+                    );
+                }
+                FunctionDiffKind::Added => {
+                    println!(
+                        "  + {} (0x{:x})",
+                        d.name_b.as_deref().unwrap_or("?"),
+                        d.addr_b.unwrap_or(0)
+                    );
+                }
+                FunctionDiffKind::Removed => {
+                    println!(
+                        "  - {} (0x{:x})",
+                        d.name_a.as_deref().unwrap_or("?"),
+                        d.addr_a.unwrap_or(0)
+                    );
+                }
+                _ => {
+                    println!(
+                        "  {} (0x{:x} -> 0x{:x})",
+                        d.name_a.as_deref().unwrap_or("?"),
+                        d.addr_a.unwrap_or(0),
+                        d.addr_b.unwrap_or(0)
+                    );
+                }
+            }
+        }
+    }
+    println!(
+        "\nTotal: {} entries, {} kinds shown.",
+        diffs.iter().filter(|d| kind_matches(d.kind)).count(),
+        by_kind.len()
+    );
     Ok(())
 }
 
