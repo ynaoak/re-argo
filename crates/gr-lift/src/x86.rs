@@ -1092,9 +1092,19 @@ impl PcodeLift for X86Lifter {
             });
         }
 
-        let mut fmt = iced_x86::IntelFormatter::new();
-        let mut mnemonic = String::new();
-        fmt.format(&insn, &mut mnemonic);
+        let mnemonic = {
+            use std::cell::RefCell;
+            thread_local! {
+                static FMT: RefCell<(iced_x86::IntelFormatter, String)> =
+                    RefCell::new((iced_x86::IntelFormatter::new(), String::with_capacity(32)));
+            }
+            FMT.with(|cell| {
+                let (fmt, buf) = &mut *cell.borrow_mut();
+                buf.clear();
+                fmt.format(&insn, buf);
+                buf.clone()
+            })
+        };
 
         let pcode_ops = self.lift_iced(&insn, address)?;
 

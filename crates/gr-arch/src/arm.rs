@@ -110,29 +110,25 @@ pub struct ArmArch {
     thumb: bool,
     registers: Vec<RegisterInfo>,
     calling_conventions: Vec<CallingConvention>,
-    cs: capstone::Capstone,
+    cs: crate::capstone_wrapper::SafeCapstone,
 }
 
-// Capstone's C library is thread-safe for independent instances
-unsafe impl Send for ArmArch {}
-unsafe impl Sync for ArmArch {}
-
 impl ArmArch {
-    pub fn new_arm32() -> Self {
+    pub fn new_arm32() -> Result<Self, DisasmError> {
         use capstone::prelude::*;
         let cs = Capstone::new()
             .arm()
             .mode(arch::arm::ArchMode::Arm)
             .detail(true)
             .build()
-            .expect("failed to create ARM capstone");
-        Self {
+            .map_err(|e| DisasmError::EngineError(format!("ARM capstone init: {}", e)))?;
+        Ok(Self {
             is_64: false,
             thumb: false,
             registers: arm32_registers(),
             calling_conventions: arm32_calling_conventions(),
-            cs,
-        }
+            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+        })
     }
 
     pub fn new_arm32_thumb() -> Self {
@@ -148,25 +144,25 @@ impl ArmArch {
             thumb: true,
             registers: arm32_registers(),
             calling_conventions: arm32_calling_conventions(),
-            cs,
+            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
         }
     }
 
-    pub fn new_aarch64() -> Self {
+    pub fn new_aarch64() -> Result<Self, DisasmError> {
         use capstone::prelude::*;
         let cs = Capstone::new()
             .arm64()
             .mode(arch::arm64::ArchMode::Arm)
             .detail(true)
             .build()
-            .expect("failed to create AArch64 capstone");
-        Self {
+            .map_err(|e| DisasmError::EngineError(format!("AArch64 capstone init: {}", e)))?;
+        Ok(Self {
             is_64: true,
             thumb: false,
             registers: aarch64_registers(),
             calling_conventions: aarch64_calling_conventions(),
-            cs,
-        }
+            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+        })
     }
 }
 
@@ -228,12 +224,7 @@ impl Architecture for ArmArch {
             return Err(DisasmError::UnreadableAddress(address));
         }
 
-        let insns = self.cs
-            .disasm_count(&buf, address, 1)
-            .map_err(|e| DisasmError::DecodeError {
-                address,
-                reason: e.to_string(),
-            })?;
+        let insns = self.cs.disasm_count(&buf, address, 1)?;
 
         let insn = insns.iter().next().ok_or_else(|| DisasmError::DecodeError {
             address,
@@ -343,7 +334,7 @@ mod tests {
 
     #[test]
     fn aarch64_nop() {
-        let arch = ArmArch::new_aarch64();
+        let arch = ArmArch::new_aarch64().unwrap();
         // NOP = 0xD503201F (little-endian)
         let mem = make_memory(&[0x1f, 0x20, 0x03, 0xd5], 0x1000, Endian::Little);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
@@ -353,7 +344,7 @@ mod tests {
 
     #[test]
     fn aarch64_ret() {
-        let arch = ArmArch::new_aarch64();
+        let arch = ArmArch::new_aarch64().unwrap();
         // RET = 0xD65F03C0 (little-endian)
         let mem = make_memory(&[0xc0, 0x03, 0x5f, 0xd6], 0x1000, Endian::Little);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
@@ -363,7 +354,7 @@ mod tests {
 
     #[test]
     fn arm32_mov() {
-        let arch = ArmArch::new_arm32();
+        let arch = ArmArch::new_arm32().unwrap();
         // MOV R0, #0 = 0xE3A00000 (little-endian)
         let mem = make_memory(&[0x00, 0x00, 0xa0, 0xe3], 0x1000, Endian::Little);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
@@ -400,7 +391,7 @@ mod tests {
 
     #[test]
     fn register_lookup_arm32() {
-        let arch = ArmArch::new_arm32();
+        let arch = ArmArch::new_arm32().unwrap();
         let sp = arch.register_by_name("sp").unwrap();
         assert_eq!(sp.varnode.size, 4);
         let r13 = arch.register_by_name("r13").unwrap();
@@ -409,7 +400,7 @@ mod tests {
 
     #[test]
     fn register_lookup_aarch64() {
-        let arch = ArmArch::new_aarch64();
+        let arch = ArmArch::new_aarch64().unwrap();
         let x0 = arch.register_by_name("x0").unwrap();
         assert_eq!(x0.varnode.size, 8);
         let w0 = arch.register_by_name("w0").unwrap();
@@ -418,7 +409,7 @@ mod tests {
 
     #[test]
     fn aarch64_stack_pointer() {
-        let arch = ArmArch::new_aarch64();
+        let arch = ArmArch::new_aarch64().unwrap();
         let sp = arch.stack_pointer().unwrap();
         assert_eq!(sp.name, "sp");
         assert_eq!(sp.varnode.size, 8);

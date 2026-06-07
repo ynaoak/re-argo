@@ -1,5 +1,7 @@
 pub mod arch;
 pub mod assembler;
+#[cfg(feature = "arm")]
+pub(crate) mod capstone_wrapper;
 pub mod cspec;
 pub mod error;
 pub mod pspec;

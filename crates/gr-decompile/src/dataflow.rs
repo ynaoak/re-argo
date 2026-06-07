@@ -43,22 +43,23 @@ pub fn compute_liveness(func: &SsaFunction) -> LivenessInfo {
         .collect();
 
     let mut changed = true;
+    let mut scratch_diff = BTreeSet::new();
     while changed {
         changed = false;
         for b in (0..block_count).rev() {
             let mut new_out = BTreeSet::new();
             for &succ in &func.cfg.blocks[b].successors {
                 if let Some(li) = info.live_in.get(&succ) {
-                    new_out.extend(li);
+                    new_out.extend(li.iter().copied());
                 }
             }
-            let new_in: BTreeSet<VarId> = cached_uses[b].union(
-                &new_out.difference(&cached_defs[b]).copied().collect()
-            ).copied().collect();
+            scratch_diff.clear();
+            for v in new_out.difference(&cached_defs[b]) {
+                scratch_diff.insert(*v);
+            }
+            let new_in: BTreeSet<VarId> = cached_uses[b].union(&scratch_diff).copied().collect();
 
-            let old_in = info.live_in.get(&b).cloned().unwrap_or_default();
-            let old_out = info.live_out.get(&b).cloned().unwrap_or_default();
-            if new_in != old_in || new_out != old_out {
+            if info.live_in.get(&b) != Some(&new_in) || info.live_out.get(&b) != Some(&new_out) {
                 info.live_in.insert(b, new_in);
                 info.live_out.insert(b, new_out);
                 changed = true;

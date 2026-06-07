@@ -36,6 +36,15 @@ impl Analyzer for SwitchTableAnalyzer {
             .map(|s| (s.address, s.address + s.size))
             .collect();
 
+        let read_only_ranges: Vec<(u64, u64)> = program
+            .info
+            .sections
+            .iter()
+            .filter(|s| s.flags.contains(gr_loader::SectionFlags::READ)
+                && !s.flags.contains(gr_loader::SectionFlags::EXECUTE))
+            .map(|s| (s.address, s.address + s.size))
+            .collect();
+
         // Phase 1: probe each indirect jump's putative table in
         // parallel against an immutable Program view (only memory
         // reads, no listing or reference mutation), producing
@@ -46,9 +55,31 @@ impl Analyzer for SwitchTableAnalyzer {
         let candidates: Vec<(u64, u64)> = indirect_jumps
             .par_iter()
             .flat_map_iter(|&jmp_addr| {
+                // Locate the jump-table base: prefer a read-only section
+                // that the jump's fall-through address lands in, else the
+                // nearest read-only section starting after the jump.
+                let insn_end = program
+                    .listing
+                    .instructions()
+                    .find(|i| i.address == jmp_addr)
+                    .map(|i| jmp_addr + i.bytes.len() as u64)
+                    .unwrap_or(jmp_addr + 8);
+                let table_base = if read_only_ranges
+                    .iter()
+                    .any(|&(s, e)| insn_end >= s && insn_end < e)
+                {
+                    insn_end
+                } else {
+                    read_only_ranges
+                        .iter()
+                        .filter(|&&(s, _)| s > jmp_addr)
+                        .map(|&(s, _)| s)
+                        .min()
+                        .unwrap_or(insn_end)
+                };
                 let mut out: Vec<(u64, u64)> = Vec::new();
                 for offset in 0..64u64 {
-                    let table_entry = jmp_addr.wrapping_add(16 + offset * ptr_size);
+                    let table_entry = table_base.wrapping_add(offset * ptr_size);
                     let target = if ptr_size == 8 {
                         program.info.memory.read_u64(table_entry).ok()
                     } else {

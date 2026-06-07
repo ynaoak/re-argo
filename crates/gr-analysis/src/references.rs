@@ -154,17 +154,17 @@ impl Analyzer for NoReturnAnalyzer {
             "panic", "__assert_fail", "err", "errx",
         ];
 
-        let plt_variants: Vec<String> = no_return_names.iter()
-            .map(|n| format!("{}@plt", n))
+        let mut name_set: std::collections::HashSet<String> = no_return_names.iter()
+            .map(|n| n.to_string())
             .collect();
+        for n in &no_return_names {
+            name_set.insert(format!("{}@plt", n));
+        }
 
         let no_return_addrs: std::collections::BTreeSet<u64> = program
             .symbol_table
             .iter()
-            .filter(|sym| {
-                no_return_names.contains(&sym.name.as_str())
-                    || plt_variants.contains(&sym.name)
-            })
+            .filter(|sym| name_set.contains(&sym.name))
             .map(|sym| sym.address)
             .collect();
 

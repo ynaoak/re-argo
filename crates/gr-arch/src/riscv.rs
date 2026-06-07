@@ -57,14 +57,11 @@ pub struct RiscVArch {
     is_64: bool,
     registers: Vec<RegisterInfo>,
     calling_conventions: Vec<CallingConvention>,
-    cs: capstone::Capstone,
+    cs: crate::capstone_wrapper::SafeCapstone,
 }
 
-unsafe impl Send for RiscVArch {}
-unsafe impl Sync for RiscVArch {}
-
 impl RiscVArch {
-    pub fn new_rv32() -> Self {
+    pub fn new_rv32() -> Result<Self, DisasmError> {
         use capstone::prelude::*;
         let cs = Capstone::new()
             .riscv()
@@ -72,16 +69,16 @@ impl RiscVArch {
             .extra_mode(std::iter::once(arch::riscv::ArchExtraMode::RiscVC))
             .detail(true)
             .build()
-            .expect("failed to create RISC-V 32 capstone");
-        Self {
+            .map_err(|e| DisasmError::EngineError(format!("RISC-V 32 capstone init: {}", e)))?;
+        Ok(Self {
             is_64: false,
             registers: riscv_registers(false),
             calling_conventions: riscv_calling_convention(false),
-            cs,
-        }
+            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+        })
     }
 
-    pub fn new_rv64() -> Self {
+    pub fn new_rv64() -> Result<Self, DisasmError> {
         use capstone::prelude::*;
         let cs = Capstone::new()
             .riscv()
@@ -89,13 +86,13 @@ impl RiscVArch {
             .extra_mode(std::iter::once(arch::riscv::ArchExtraMode::RiscVC))
             .detail(true)
             .build()
-            .expect("failed to create RISC-V 64 capstone");
-        Self {
+            .map_err(|e| DisasmError::EngineError(format!("RISC-V 64 capstone init: {}", e)))?;
+        Ok(Self {
             is_64: true,
             registers: riscv_registers(true),
             calling_conventions: riscv_calling_convention(true),
-            cs,
-        }
+            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+        })
     }
 }
 
@@ -142,12 +139,7 @@ impl Architecture for RiscVArch {
             .read_bytes(address, &mut buf)
             .map_err(|_| DisasmError::UnreadableAddress(address))?;
 
-        let insns = self.cs
-            .disasm_count(&buf, address, 1)
-            .map_err(|e| DisasmError::DecodeError {
-                address,
-                reason: e.to_string(),
-            })?;
+        let insns = self.cs.disasm_count(&buf, address, 1)?;
 
         let insn = insns.iter().next().ok_or_else(|| DisasmError::DecodeError {
             address,
@@ -236,7 +228,7 @@ mod tests {
 
     #[test]
     fn riscv64_registers() {
-        let arch = RiscVArch::new_rv64();
+        let arch = RiscVArch::new_rv64().unwrap();
         assert_eq!(arch.bits(), 64);
         let sp = arch.register_by_name("sp").unwrap();
         assert_eq!(sp.varnode.size, 8);
@@ -246,7 +238,7 @@ mod tests {
 
     #[test]
     fn riscv32_registers() {
-        let arch = RiscVArch::new_rv32();
+        let arch = RiscVArch::new_rv32().unwrap();
         assert_eq!(arch.bits(), 32);
         let a0 = arch.register_by_name("a0").unwrap();
         assert_eq!(a0.varnode.size, 4);

@@ -41,14 +41,11 @@ pub struct PpcArch {
     is_64: bool,
     registers: Vec<RegisterInfo>,
     calling_conventions: Vec<CallingConvention>,
-    cs: capstone::Capstone,
+    cs: crate::capstone_wrapper::SafeCapstone,
 }
 
-unsafe impl Send for PpcArch {}
-unsafe impl Sync for PpcArch {}
-
 impl PpcArch {
-    pub fn new(is_64: bool) -> Self {
+    pub fn new(is_64: bool) -> Result<Self, DisasmError> {
         use capstone::prelude::*;
         let mode = if is_64 {
             arch::ppc::ArchMode::Mode64
@@ -61,9 +58,9 @@ impl PpcArch {
             .endian(capstone::Endian::Big)
             .detail(true)
             .build()
-            .expect("failed to create PPC capstone");
+            .map_err(|e| DisasmError::EngineError(format!("PPC capstone init: {}", e)))?;
         let sz = if is_64 { 8u32 } else { 4 };
-        Self {
+        Ok(Self {
             is_64,
             registers: ppc_registers(is_64),
             calling_conventions: vec![CallingConvention {
@@ -77,8 +74,8 @@ impl PpcArch {
                     .collect(),
                 stack_pointer: VarnodeData::new(REGISTER_SPACE, sz as u64, sz),
             }],
-            cs,
-        }
+            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+        })
     }
 }
 
@@ -96,8 +93,7 @@ impl Architecture for PpcArch {
     fn decode_instruction(&self, memory: &Memory, address: u64) -> Result<DecodedInstruction, DisasmError> {
         let mut buf = vec![0u8; 4];
         memory.read_bytes(address, &mut buf).map_err(|_| DisasmError::UnreadableAddress(address))?;
-        let insns = self.cs.disasm_count(&buf, address, 1)
-            .map_err(|e| DisasmError::DecodeError { address, reason: e.to_string() })?;
+        let insns = self.cs.disasm_count(&buf, address, 1)?;
         let insn = insns.iter().next().ok_or(DisasmError::DecodeError { address, reason: "no instruction".into() })?;
         let mn = insn.mnemonic().unwrap_or("???").to_string();
         let ops = insn.op_str().unwrap_or("").to_string();
@@ -125,7 +121,7 @@ mod tests {
     use super::*;
     #[test]
     fn ppc32_registers() {
-        let arch = PpcArch::new(false);
+        let arch = PpcArch::new(false).unwrap();
         assert_eq!(arch.bits(), 32);
         let r1 = arch.register_by_name("r1").unwrap();
         assert_eq!(r1.varnode.size, 4);
