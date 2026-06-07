@@ -1,3 +1,5 @@
+mod mcp;
+
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -235,6 +237,17 @@ enum Commands {
         /// Path to the script file (.grs)
         script: PathBuf,
     },
+    /// Speak the Model Context Protocol (MCP) over stdio.
+    ///
+    /// Loads the binary, runs analysis, then sits on stdin reading
+    /// newline-delimited JSON-RPC 2.0 requests from an MCP client
+    /// (e.g. Claude Code) and answers them. Tools exposed include
+    /// list_functions, decompile_function, disassemble, find_xrefs,
+    /// list_symbols, get_program_info.
+    Mcp {
+        /// Path to the binary file
+        file: PathBuf,
+    },
     /// Patch a binary file
     Patch {
         /// Path to the binary file
@@ -305,6 +318,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Imports { file, exports } => cmd_imports(&file, exports),
         Commands::Coverage { file } => cmd_coverage(&file),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
+        Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
     }
