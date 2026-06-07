@@ -103,13 +103,19 @@ pub fn decompile_function_with_maps(
         .map(|f| f.name.clone())
         .unwrap_or_else(|| program.function_name_at(func_entry));
 
+    // Lift far enough past the function entry that the trim's
+    // reachability DFS has something to walk. The body's byte size
+    // is a lower bound (we get one instruction per byte at worst);
+    // floor at 500 so functions whose body discovery only reached
+    // the entry block still get enough lifted instructions to
+    // reach the real Return / end-of-function.
     let max_insns = func
         .map(|f| {
             f.body
                 .ranges()
                 .map(|r| r.size as usize)
                 .sum::<usize>()
-                .max(100)
+                .max(500)
         })
         .unwrap_or(500);
 
@@ -314,11 +320,28 @@ fn trim_to_function_body(
         return trim_to_return(instructions);
     };
     let body_addrs = &f.body;
-    // Pre-test the predicate so we know whether to keep filtering on
-    // body_addrs or fall back to the CFG-reachability trim. The
-    // input is moved either way -- we just need to decide which path
-    // BEFORE consuming.
-    let keep: Vec<bool> = instructions
+
+    // The previous trim only kept instructions present in the
+    // pre-existing discovered body (`f.body`). On stripped binaries
+    // discovery often stops at the first Call -- it only walked the
+    // entry block, so `body` contained ~5-20 addresses and the
+    // decompiler would print ~20 instructions and quit, ignoring the
+    // entire post-call function body that the lifter had already
+    // produced.
+    //
+    // Fix: union the body set with reachability over the lifted
+    // instructions. Anything discovery found stays in (so we don't
+    // accidentally drop unreachable-but-recorded slots like
+    // exception-handler landing pads); anything statically reachable
+    // from `entry` along Branch / CBranch / fall-through edges also
+    // stays in, even if discovery missed it. The DFS is the same
+    // one used by `trim_to_return`, so the two trims now agree on
+    // what "reachable" means.
+    let reach = reachability(&instructions);
+    // Pre-compute body membership; the AddressSet's `contains`
+    // walks an interval tree per call, so caching the bool per
+    // instruction keeps the inner loop hot.
+    let in_body: Vec<bool> = instructions
         .iter()
         .map(|insn| {
             body_addrs.contains(&gr_core::address::Address::new(
@@ -327,8 +350,16 @@ fn trim_to_function_body(
             )) || insn.address == entry
         })
         .collect();
+    let keep: Vec<bool> = in_body
+        .iter()
+        .zip(reach.iter().copied().chain(std::iter::repeat(false)))
+        .map(|(&b, r)| b || r)
+        .collect();
+    // Sanity: at least the entry must be kept. If neither body nor
+    // reachability matched anything (e.g. the lifted Vec covers a
+    // completely different region than expected), fall back to the
+    // pure reachability trim so we at least return *something*.
     if keep.iter().all(|&k| !k) {
-        // No body-address overlap -- fall back to flat reachability.
         return trim_to_return(instructions);
     }
     instructions
