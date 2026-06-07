@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolType {
@@ -44,8 +44,8 @@ impl std::fmt::Display for Symbol {
 
 #[derive(Debug, Default)]
 pub struct SymbolTable {
-    by_address: BTreeMap<u64, Vec<Symbol>>,
-    by_name: BTreeMap<String, Vec<u64>>,
+    by_address: HashMap<u64, Vec<Symbol>>,
+    by_name: HashMap<String, Vec<u64>>,
 }
 
 impl SymbolTable {

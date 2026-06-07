@@ -49,7 +49,7 @@ impl Analyzer for DataReferenceAnalyzer {
                         let val =
                             u32::from_le_bytes([window[0], window[1], window[2], window[3]])
                                 as u64;
-                        if is_valid_data_addr(val, &valid_ranges) {
+                        if crate::utils::is_valid_address(val, &valid_ranges) {
                             out.push((*addr, val));
                         }
                     }
@@ -82,11 +82,4 @@ impl Analyzer for DataReferenceAnalyzer {
             instructions_decoded: 0,
         })
     }
-}
-
-fn is_valid_data_addr(val: u64, ranges: &[(u64, u64)]) -> bool {
-    if val < 0x1000 {
-        return false;
-    }
-    ranges.iter().any(|&(start, end)| val >= start && val < end)
 }

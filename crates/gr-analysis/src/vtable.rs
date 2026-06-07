@@ -55,7 +55,7 @@ impl Analyzer for VTableAnalyzer {
                     };
 
                     if let Some(val) = ptr_val {
-                        if is_code_ptr(val, &code_ranges) {
+                        if crate::utils::is_valid_address(val, &code_ranges) {
                             consecutive_code_ptrs += 1;
                         } else {
                             break;
@@ -105,9 +105,39 @@ impl Analyzer for VTableAnalyzer {
     }
 }
 
-fn is_code_ptr(val: u64, ranges: &[(u64, u64)]) -> bool {
-    if val < 0x1000 {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::helpers::make_x86_64_program_with_data;
+
+    #[test]
+    fn detect_vtable_in_rodata() {
+        // .text: 4 tiny functions (just ret)
+        let code_addr = 0x1000u64;
+        let data_addr = 0x2000u64;
+        let code = [0xc3; 16]; // 16 bytes of ret
+
+        // .rodata: 4 consecutive 8-byte pointers into .text
+        let mut data = Vec::new();
+        for i in 0..4u64 {
+            data.extend_from_slice(&(code_addr + i).to_le_bytes());
+        }
+        // followed by a non-code value
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut program = make_x86_64_program_with_data(&code, &data, code_addr, data_addr);
+        let result = VTableAnalyzer.analyze(&mut program).unwrap();
+        assert!(result.functions_found >= 1);
+        assert!(program.symbol_table.primary_at(data_addr).is_some());
     }
-    ranges.iter().any(|&(start, end)| val >= start && val < end)
+
+    #[test]
+    fn no_vtable_without_code_pointers() {
+        let code = [0xc3; 4];
+        let data = [0u8; 64]; // all zeros
+        let mut program = make_x86_64_program_with_data(&code, &data, 0x1000, 0x2000);
+        let result = VTableAnalyzer.analyze(&mut program).unwrap();
+        assert_eq!(result.functions_found, 0);
+    }
 }
+

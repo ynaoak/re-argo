@@ -316,7 +316,7 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
             continue;
         }
 
-        let out_id = func.ops[i].output.unwrap();
+        let out_id = func.ops[i].output.expect("output checked above");
         let has_live_use = func.varnodes[out_id as usize]
             .uses
             .iter()
@@ -406,7 +406,7 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
         };
 
         if let Some(val) = result {
-            let out_id = func.ops[i].output.unwrap();
+            let out_id = func.ops[i].output.expect("output checked above");
             let out_size = func.varnodes[out_id as usize].data.size;
             // Truncate to the operand width: a folded 32-bit `0xFFFFFFFF + 1`
             // must be 0, not 0x1_0000_0000. The constant is emitted from its
@@ -443,7 +443,7 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
             continue;
         }
 
-        let out_id = func.ops[i].output.unwrap();
+        let out_id = func.ops[i].output.expect("output checked above");
         let src_id = func.ops[i].inputs[0];
 
         let src_is_const =

@@ -36,6 +36,15 @@ impl Analyzer for SwitchTableAnalyzer {
             .map(|s| (s.address, s.address + s.size))
             .collect();
 
+        let read_only_ranges: Vec<(u64, u64)> = program
+            .info
+            .sections
+            .iter()
+            .filter(|s| s.flags.contains(gr_loader::SectionFlags::READ)
+                && !s.flags.contains(gr_loader::SectionFlags::EXECUTE))
+            .map(|s| (s.address, s.address + s.size))
+            .collect();
+
         // Phase 1: probe each indirect jump's putative table in
         // parallel against an immutable Program view (only memory
         // reads, no listing or reference mutation), producing
@@ -46,16 +55,38 @@ impl Analyzer for SwitchTableAnalyzer {
         let candidates: Vec<(u64, u64)> = indirect_jumps
             .par_iter()
             .flat_map_iter(|&jmp_addr| {
+                // Locate the jump-table base: prefer a read-only section
+                // that the jump's fall-through address lands in, else the
+                // nearest read-only section starting after the jump.
+                let insn_end = program
+                    .listing
+                    .instructions()
+                    .find(|i| i.address == jmp_addr)
+                    .map(|i| jmp_addr + i.bytes.len() as u64)
+                    .unwrap_or(jmp_addr + 8);
+                let table_base = if read_only_ranges
+                    .iter()
+                    .any(|&(s, e)| insn_end >= s && insn_end < e)
+                {
+                    insn_end
+                } else {
+                    read_only_ranges
+                        .iter()
+                        .filter(|&&(s, _)| s > jmp_addr)
+                        .map(|&(s, _)| s)
+                        .min()
+                        .unwrap_or(insn_end)
+                };
                 let mut out: Vec<(u64, u64)> = Vec::new();
                 for offset in 0..64u64 {
-                    let table_entry = jmp_addr.wrapping_add(16 + offset * ptr_size);
+                    let table_entry = table_base.wrapping_add(offset * ptr_size);
                     let target = if ptr_size == 8 {
                         program.info.memory.read_u64(table_entry).ok()
                     } else {
                         program.info.memory.read_u32(table_entry).ok().map(|v| v as u64)
                     };
                     match target {
-                        Some(target_addr) if is_valid_code_addr(target_addr, &valid_code_ranges) => {
+                        Some(target_addr) if crate::utils::is_valid_address(target_addr, &valid_code_ranges) => {
                             out.push((jmp_addr, target_addr));
                         }
                         _ => break,
@@ -77,10 +108,6 @@ impl Analyzer for SwitchTableAnalyzer {
             instructions_decoded: 0,
         })
     }
-}
-
-fn is_valid_code_addr(addr: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges.iter().any(|&(start, end)| addr >= start && addr < end)
 }
 
 pub struct TailCallAnalyzer;
