@@ -474,7 +474,8 @@ impl<'a> CEmitter<'a> {
             OpCode::Load => {
                 let dst = out_name?;
                 let addr = self.input_expr(func, op, 1);
-                Some(format!("{} = *({}*){};", dst, size_to_type(func.varnodes[op.output.unwrap() as usize].data.size), addr))
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                Some(format!("{} = *({}*){};", dst, size_to_type(out_size), addr))
             }
             OpCode::Store => {
                 let addr = self.input_expr(func, op, 1);

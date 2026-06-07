@@ -39,7 +39,13 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             }
         }
 
+        const MAX_FUNCTIONS: usize = 50_000;
+        const MAX_INSTRUCTIONS: usize = 5_000_000;
+
         while let Some(func_entry) = work_queue.pop_front() {
+            if functions_found >= MAX_FUNCTIONS || instructions_decoded >= MAX_INSTRUCTIONS {
+                break;
+            }
             if visited.contains(&func_entry) {
                 continue;
             }
@@ -68,10 +74,6 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                         Function::new(func_entry, format!("FUN_{:08x}", func_entry))
                     };
                     func.body = discovery.body;
-                    func.call_targets = discovery.call_targets.clone();
-
-                    program.listing.add_function(func);
-                    functions_found += 1;
 
                     for call_target in &discovery.call_targets {
                         if !visited.contains(call_target)
@@ -80,6 +82,10 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                             work_queue.push_back(*call_target);
                         }
                     }
+
+                    func.call_targets = discovery.call_targets;
+                    program.listing.add_function(func);
+                    functions_found += 1;
                 }
                 Err(_) => continue,
             }
@@ -223,6 +229,7 @@ fn disassemble_function(
         }
     }
 
+    #[allow(clippy::absurd_extreme_comparisons)]
     if instruction_count == 0 {
         return Err(AnalysisError::Disassembly(format!(
             "no instructions at 0x{:x}",
@@ -236,4 +243,47 @@ fn disassemble_function(
         references,
         instruction_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::helpers::make_x86_64_program;
+
+    #[test]
+    fn discover_simple_function() {
+        // push rbp; mov rbp,rsp; xor eax,eax; pop rbp; ret
+        let code = [0x55, 0x48, 0x89, 0xe5, 0x31, 0xc0, 0x5d, 0xc3];
+        let mut program = make_x86_64_program(&code, 0x1000);
+        let analyzer = FunctionDiscoveryAnalyzer;
+        let result = analyzer.analyze(&mut program).unwrap();
+        assert!(result.functions_found >= 1);
+        assert!(result.instructions_decoded >= 4);
+        assert!(program.listing.has_function(0x1000));
+    }
+
+    #[test]
+    fn discover_with_call() {
+        // func1: call +5; ret
+        // func2: xor eax,eax; ret
+        let code = [
+            0xe8, 0x01, 0x00, 0x00, 0x00, // call 0x1006
+            0xc3,                           // ret
+            0x31, 0xc0,                     // xor eax,eax
+            0xc3,                           // ret
+        ];
+        let mut program = make_x86_64_program(&code, 0x1001);
+        let analyzer = FunctionDiscoveryAnalyzer;
+        let result = analyzer.analyze(&mut program).unwrap();
+        assert!(result.functions_found >= 1);
+        assert!(result.references_found > 0);
+    }
+
+    #[test]
+    fn empty_program_no_crash() {
+        let code = [0x00u8; 0]; // empty
+        let mut program = make_x86_64_program(&code, 0x1000);
+        let analyzer = FunctionDiscoveryAnalyzer;
+        let _result = analyzer.analyze(&mut program);
+    }
 }

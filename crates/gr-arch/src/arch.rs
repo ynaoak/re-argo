@@ -182,24 +182,24 @@ pub fn create_architecture_with_options(
         gr_loader::Architecture::Arm => Ok(Box::new(if thumb {
             crate::arm::ArmArch::new_arm32_thumb()
         } else {
-            crate::arm::ArmArch::new_arm32()
+            crate::arm::ArmArch::new_arm32()?
         })),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::Arm64 => Ok(Box::new(crate::arm::ArmArch::new_aarch64())),
+        gr_loader::Architecture::Arm64 => Ok(Box::new(crate::arm::ArmArch::new_aarch64()?)),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::Riscv32 => Ok(Box::new(crate::riscv::RiscVArch::new_rv32())),
+        gr_loader::Architecture::Riscv32 => Ok(Box::new(crate::riscv::RiscVArch::new_rv32()?)),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::Riscv64 => Ok(Box::new(crate::riscv::RiscVArch::new_rv64())),
+        gr_loader::Architecture::Riscv64 => Ok(Box::new(crate::riscv::RiscVArch::new_rv64()?)),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::Mips => Ok(Box::new(crate::mips::MipsArch::new(false, gr_core::address::Endian::Big))),
+        gr_loader::Architecture::Mips => Ok(Box::new(crate::mips::MipsArch::new(false, gr_core::address::Endian::Big)?)),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::Mips64 => Ok(Box::new(crate::mips::MipsArch::new(true, gr_core::address::Endian::Big))),
+        gr_loader::Architecture::Mips64 => Ok(Box::new(crate::mips::MipsArch::new(true, gr_core::address::Endian::Big)?)),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::PowerPc => Ok(Box::new(crate::ppc::PpcArch::new(false))),
+        gr_loader::Architecture::PowerPc => Ok(Box::new(crate::ppc::PpcArch::new(false)?)),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::PowerPc64 => Ok(Box::new(crate::ppc::PpcArch::new(true))),
+        gr_loader::Architecture::PowerPc64 => Ok(Box::new(crate::ppc::PpcArch::new(true)?)),
         #[cfg(feature = "arm")]
-        gr_loader::Architecture::Sparc => Ok(Box::new(crate::sparc::SparcArch::new(false))),
+        gr_loader::Architecture::Sparc => Ok(Box::new(crate::sparc::SparcArch::new(false)?)),
         other => Err(DisasmError::UnsupportedArch(format!("{}", other))),
     }
 }

@@ -54,7 +54,7 @@ fn intersect(idom: &[Option<BlockId>], mut a: BlockId, mut b: BlockId, entry: Bl
 
 pub fn compute_dominance_frontier(cfg: &ControlFlowGraph, idom: &[Option<BlockId>]) -> Vec<Vec<BlockId>> {
     let n = cfg.blocks.len();
-    let mut df: Vec<Vec<BlockId>> = vec![Vec::new(); n];
+    let mut df_sets: Vec<std::collections::BTreeSet<BlockId>> = vec![std::collections::BTreeSet::new(); n];
 
     for b in 0..n {
         let preds = &cfg.blocks[b].predecessors;
@@ -64,9 +64,7 @@ pub fn compute_dominance_frontier(cfg: &ControlFlowGraph, idom: &[Option<BlockId
         for &p in preds {
             let mut runner = p;
             while runner != idom[b].unwrap_or(b) {
-                if !df[runner].contains(&b) {
-                    df[runner].push(b);
-                }
+                df_sets[runner].insert(b);
                 runner = idom[runner].unwrap_or(runner);
                 if runner == idom[runner].unwrap_or(runner) {
                     break;
@@ -74,7 +72,7 @@ pub fn compute_dominance_frontier(cfg: &ControlFlowGraph, idom: &[Option<BlockId
             }
         }
     }
-    df
+    df_sets.into_iter().map(|s| s.into_iter().collect()).collect()
 }
 
 #[cfg(test)]
