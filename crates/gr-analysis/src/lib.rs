@@ -4,6 +4,7 @@ mod testutil;
 pub mod boundary;
 pub mod callingconv;
 pub mod callgraph;
+pub mod callsite;
 pub mod coverage;
 pub mod dataref;
 pub mod demangle;
