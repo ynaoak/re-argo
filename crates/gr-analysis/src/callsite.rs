@@ -82,80 +82,7 @@ pub fn resolve_call_sites(
     lifter: &(dyn PcodeLift + Sync),
     program: &Program,
 ) -> Result<Vec<CallSite>, AnalysisError> {
-    if !matches!(program.info.arch, gr_loader::Architecture::X86_64) {
-        return Ok(Vec::new());
-    }
-
-    // Many functions' lifted ranges overlap on stripped binaries
-    // (after round-9's body-union trim, in particular). Track which
-    // call_site addresses we've already recorded so the output
-    // doesn't list the same site under every overlapping caller.
-    // We keep the first occurrence and resolve the *true* caller
-    // via `function_containing` at the end.
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut out: Vec<CallSite> = Vec::new();
-    for func in program.listing.functions() {
-        let max_insns = func
-            .body
-            .ranges()
-            .map(|r| r.size as usize)
-            .sum::<usize>()
-            .max(500);
-        let Ok(lifted) = lifter.lift_range(&program.info.memory, func.entry_point, max_insns)
-        else {
-            continue;
-        };
-
-        // Tracking state: reg_offset -> last known constant. None
-        // means "written by something we can't resolve" (i.e., the
-        // entry is *not* in the map). We compare offset+size so a
-        // partial write (eax) doesn't pretend to determine rax.
-        let mut const_regs: FxHashMap<u64, u64> = FxHashMap::default();
-
-        for insn in &lifted {
-            for op in &insn.ops {
-                match op.opcode {
-                    OpCode::Call | OpCode::CallInd => {
-                        if seen.insert(insn.address) {
-                            let target = direct_call_target(op);
-                            // Resolve the *true* containing function
-                            // rather than blindly recording `func` --
-                            // overlapping lifted ranges (round-9 trim
-                            // union) can make `func` an outer caller
-                            // that doesn't actually own this address.
-                            let caller = program
-                                .listing
-                                .function_containing(insn.address)
-                                .map(|f| f.entry_point)
-                                .unwrap_or(func.entry_point);
-                            let args = X86_64_SYSV_ARG_REGS
-                                .iter()
-                                .map(|&(offset, name)| ResolvedArg {
-                                    reg_offset: offset,
-                                    reg_name: name,
-                                    value: const_regs.get(&offset).copied(),
-                                })
-                                .collect();
-                            out.push(CallSite {
-                                call_site: insn.address,
-                                caller_function: caller,
-                                call_target: target,
-                                args,
-                            });
-                        }
-                        // The callee may clobber every caller-
-                        // saved register. Drop the resolved map so
-                        // arguments to the NEXT call aren't carried
-                        // over stale.
-                        const_regs.clear();
-                    }
-                    _ => apply_write(op, &mut const_regs),
-                }
-            }
-        }
-    }
-
-    Ok(out)
+    resolve_inner(lifter, program, &ParamSummaries::default())
 }
 
 /// Per-function summary of values its parameter registers have ever
@@ -211,12 +138,25 @@ pub fn resolve_call_sites_with_summaries(
     program: &Program,
     summaries: &ParamSummaries,
 ) -> Result<Vec<CallSite>, AnalysisError> {
+    resolve_inner(lifter, program, summaries)
+}
+
+/// Shared per-function walk that powers both `resolve_call_sites`
+/// (intra-function only -- pass an empty `ParamSummaries`) and
+/// `resolve_call_sites_with_summaries` (inter-procedural propagation
+/// -- pass the rolled-up summaries from a previous round).
+fn resolve_inner(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    summaries: &ParamSummaries,
+) -> Result<Vec<CallSite>, AnalysisError> {
     if !matches!(program.info.arch, gr_loader::Architecture::X86_64) {
         return Ok(Vec::new());
     }
 
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut out: Vec<CallSite> = Vec::new();
+
     for func in program.listing.functions() {
         let max_insns = func
             .body
@@ -229,49 +169,49 @@ pub fn resolve_call_sites_with_summaries(
             continue;
         };
 
-        // Seed const_regs from this function's parameter summary:
-        // any param register whose summary set has exactly one
-        // value is a known constant on entry.
-        let mut const_regs: FxHashMap<u64, u64> = FxHashMap::default();
+        let mut tracker = Tracker::new();
         if let Some(summary) = summaries.get(&func.entry_point) {
-            for (i, set) in summary.iter().enumerate() {
-                if set.len() == 1
-                    && let Some(&v) = set.iter().next()
-                {
-                    const_regs.insert(X86_64_SYSV_ARG_REGS[i].0, v);
-                }
-            }
+            tracker.seed_from_summary(summary);
         }
 
         for insn in &lifted {
             for op in &insn.ops {
                 match op.opcode {
                     OpCode::Call | OpCode::CallInd => {
-                        if seen.insert(insn.address) {
+                        // Only record this call site if we're
+                        // actually walking the function that *owns*
+                        // it. Without this gate, an earlier
+                        // function whose lift_range bled past its
+                        // own body would record the call with
+                        // *its* tracker state (e.g. all
+                        // unresolved), and `seen` would block the
+                        // real owner from re-recording it with
+                        // the correct seeded state.
+                        let true_caller = program
+                            .listing
+                            .function_containing(insn.address)
+                            .map(|f| f.entry_point);
+                        let owns_this_call = true_caller == Some(func.entry_point);
+                        if owns_this_call && seen.insert(insn.address) {
                             let target = direct_call_target(op);
-                            let caller = program
-                                .listing
-                                .function_containing(insn.address)
-                                .map(|f| f.entry_point)
-                                .unwrap_or(func.entry_point);
                             let args = X86_64_SYSV_ARG_REGS
                                 .iter()
                                 .map(|&(offset, name)| ResolvedArg {
                                     reg_offset: offset,
                                     reg_name: name,
-                                    value: const_regs.get(&offset).copied(),
+                                    value: tracker.const_regs.get(&offset).copied(),
                                 })
                                 .collect();
                             out.push(CallSite {
                                 call_site: insn.address,
-                                caller_function: caller,
+                                caller_function: func.entry_point,
                                 call_target: target,
                                 args,
                             });
                         }
-                        const_regs.clear();
+                        tracker.clear_for_call();
                     }
-                    _ => apply_write(op, &mut const_regs),
+                    _ => tracker.apply(op),
                 }
             }
         }
@@ -310,47 +250,230 @@ fn count_known_args(sites: &[CallSite]) -> usize {
         .sum()
 }
 
-/// Update `const_regs` for `op`'s output, if any. A `Copy out = const`
-/// records the value; any other op that writes to a register
-/// invalidates it.
+/// Update `const_regs` for `op`'s output, if any. Wrapper around
+/// `Tracker::apply` kept so the existing unit tests can drive a
+/// single op without spinning up a full tracker.
+#[cfg(test)]
 fn apply_write(op: &gr_core::pcode::PcodeOp, const_regs: &mut FxHashMap<u64, u64>) {
-    let Some(out) = op.output else { return };
-    if out.space != SpaceId::REGISTER {
-        return;
+    let mut t = Tracker::new();
+    t.const_regs = std::mem::take(const_regs);
+    t.apply(op);
+    *const_regs = t.const_regs;
+}
+
+/// REGISTER-space offset of `rbp` on x86_64. After the standard
+/// `push rbp; mov rbp, rsp` prologue, this register is the
+/// frame anchor for the rest of the function and stack slots are
+/// addressed as `[rbp + signed_offset]`.
+const X86_64_RBP_OFFSET: u64 = 0x28;
+/// REGISTER-space offset of `rsp` on x86_64. Reserved for future
+/// frame-omitted (-fomit-frame-pointer) tracking; currently the
+/// tracker anchors stack slots on rbp only.
+#[allow(dead_code)]
+const X86_64_RSP_OFFSET: u64 = 0x20;
+
+/// Mini abstract-interpreter that tracks enough state to thread
+/// constants through gcc -O0's typical "spill to stack, reload"
+/// pattern:
+///
+///   mov [rbp-8], rdi          ; param spill
+///   ...
+///   mov rax, [rbp-8]          ; reload to rax
+///   mov rdi, rax              ; pass to next call
+///
+/// To follow the value across the spill/reload we have to track:
+///
+/// * `const_regs` -- known constants in REGISTER space.
+/// * `const_uniques` -- known constants in UNIQUE space (the
+///   lifter's temporaries between op steps).
+/// * `frame_offsets` -- UNIQUE varnodes that hold an `rbp + N`
+///   effective address.
+/// * `stack` -- known values stored to a stack slot (signed offset
+///   from rbp -> value).
+///
+/// This is deliberately NOT a full SSA / dataflow engine -- just
+/// enough state to catch the typical -O0 call-argument flow. Loads
+/// from memory not reachable from the frame pointer remain unknown;
+/// non-COPY arithmetic over UNIQUE varnodes is conservatively
+/// invalidated.
+struct Tracker {
+    const_regs: FxHashMap<u64, u64>,
+    const_uniques: FxHashMap<u64, u64>,
+    frame_offsets: FxHashMap<u64, i64>,
+    stack: FxHashMap<i64, u64>,
+}
+
+impl Tracker {
+    fn new() -> Self {
+        Self {
+            const_regs: FxHashMap::default(),
+            const_uniques: FxHashMap::default(),
+            frame_offsets: FxHashMap::default(),
+            stack: FxHashMap::default(),
+        }
     }
-    match op.opcode {
-        OpCode::Copy => {
-            if let Some(input) = op.inputs.first() {
-                match input.space {
-                    SpaceId::CONST => {
-                        // mov reg, imm
-                        const_regs.insert(out.offset, input.offset);
-                        return;
+
+    /// Wipe per-call caller-saved state but keep what survives a
+    /// call. Conservatively: clear every register and every UNIQUE
+    /// temp; stack slots persist because the callee can't write to
+    /// the caller's frame (modulo address-taken, which we don't
+    /// model). frame_offsets are also wiped -- the lifter mints new
+    /// UNIQUE addresses after each instruction.
+    fn clear_for_call(&mut self) {
+        self.const_regs.clear();
+        self.const_uniques.clear();
+        self.frame_offsets.clear();
+        // self.stack is intentionally preserved.
+    }
+
+    /// Look up the value of a varnode if it is statically known.
+    /// Handles CONST (literal), REGISTER (via const_regs), and
+    /// UNIQUE (via const_uniques) spaces.
+    fn read(&self, vn: &VarnodeData) -> Option<u64> {
+        match vn.space {
+            SpaceId::CONST => Some(vn.offset),
+            SpaceId::REGISTER => self.const_regs.get(&vn.offset).copied(),
+            SpaceId::UNIQUE => self.const_uniques.get(&vn.offset).copied(),
+            _ => None,
+        }
+    }
+
+    /// Apply one P-code op's effect to the tracker state.
+    fn apply(&mut self, op: &gr_core::pcode::PcodeOp) {
+        // Handle stores first -- they have no output but do mutate
+        // tracked state (stack slots).
+        if op.opcode == OpCode::Store {
+            // STORE space, addr, value -- inputs[0]=space-id,
+            // inputs[1]=address, inputs[2]=value.
+            if let (Some(addr), Some(value)) = (op.inputs.get(1), op.inputs.get(2))
+                && addr.space == SpaceId::UNIQUE
+                && let Some(&off) = self.frame_offsets.get(&addr.offset)
+            {
+                match self.read(value) {
+                    Some(v) => {
+                        self.stack.insert(off, v);
                     }
-                    SpaceId::REGISTER => {
-                        // mov reg, reg -- propagate the source's
-                        // known value when we have one. Critical
-                        // for the `lea rax, [&sym]; mov rdi, rax`
-                        // idiom that gcc uses for callback /
-                        // function-pointer arguments instead of a
-                        // direct `mov rdi, imm`; without this,
-                        // every register-laundered constant gets
-                        // dropped and inter-procedural propagation
-                        // never finds the callback target.
-                        if let Some(&src_val) = const_regs.get(&input.offset) {
-                            const_regs.insert(out.offset, src_val);
-                            return;
-                        }
+                    None => {
+                        self.stack.remove(&off);
                     }
-                    _ => {}
                 }
             }
-            const_regs.remove(&out.offset);
+            return;
         }
-        _ => {
-            const_regs.remove(&out.offset);
+
+        let Some(out) = op.output else { return };
+        match out.space {
+            SpaceId::REGISTER => self.write_register(op, &out),
+            SpaceId::UNIQUE => self.write_unique(op, &out),
+            _ => {}
         }
     }
+
+    fn write_register(&mut self, op: &gr_core::pcode::PcodeOp, out: &VarnodeData) {
+        if op.opcode == OpCode::Copy
+            && let Some(input) = op.inputs.first()
+            && let Some(v) = self.read(input)
+        {
+            self.const_regs.insert(out.offset, v);
+            return;
+        }
+        self.const_regs.remove(&out.offset);
+    }
+
+    fn write_unique(&mut self, op: &gr_core::pcode::PcodeOp, out: &VarnodeData) {
+        match op.opcode {
+            OpCode::Copy => {
+                if let Some(input) = op.inputs.first()
+                    && let Some(v) = self.read(input)
+                {
+                    self.const_uniques.insert(out.offset, v);
+                    return;
+                }
+                self.const_uniques.remove(&out.offset);
+                self.frame_offsets.remove(&out.offset);
+            }
+            OpCode::Load => {
+                // LOAD space, addr -- inputs[0]=space-id,
+                // inputs[1]=address.
+                if let Some(addr) = op.inputs.get(1)
+                    && addr.space == SpaceId::UNIQUE
+                    && let Some(&off) = self.frame_offsets.get(&addr.offset)
+                    && let Some(&v) = self.stack.get(&off)
+                {
+                    self.const_uniques.insert(out.offset, v);
+                    return;
+                }
+                self.const_uniques.remove(&out.offset);
+                self.frame_offsets.remove(&out.offset);
+            }
+            OpCode::IntAdd | OpCode::IntSub => {
+                // Recognise `unique = rbp + const` (frame
+                // address). Match on either order of the addend.
+                let mut is_frame_add = None;
+                if op.inputs.len() >= 2 {
+                    let a = &op.inputs[0];
+                    let b = &op.inputs[1];
+                    let frame_base = |vn: &VarnodeData| -> bool {
+                        vn.space == SpaceId::REGISTER && vn.offset == X86_64_RBP_OFFSET
+                    };
+                    if frame_base(a) && b.space == SpaceId::CONST {
+                        let mut off = b.offset as i64;
+                        if op.opcode == OpCode::IntSub {
+                            off = -off;
+                        }
+                        is_frame_add = Some(off);
+                    } else if frame_base(b) && a.space == SpaceId::CONST {
+                        // Sub isn't commutative; only Add takes
+                        // either order. For Sub we already covered
+                        // (rbp - const) above; (const - rbp)
+                        // doesn't yield a meaningful frame offset.
+                        if op.opcode == OpCode::IntAdd {
+                            is_frame_add = Some(a.offset as i64);
+                        }
+                    }
+                }
+                if let Some(off) = is_frame_add {
+                    self.frame_offsets.insert(out.offset, off);
+                    self.const_uniques.remove(&out.offset);
+                    return;
+                }
+                // Pure-constant fold for arithmetic over known
+                // values. `unique = const + const` shows up after
+                // the lifter folds rip-relative ops; cheap to handle.
+                if op.inputs.len() >= 2
+                    && let (Some(a), Some(b)) = (self.read(&op.inputs[0]), self.read(&op.inputs[1]))
+                {
+                    let v = match op.opcode {
+                        OpCode::IntAdd => a.wrapping_add(b),
+                        OpCode::IntSub => a.wrapping_sub(b),
+                        _ => unreachable!(),
+                    };
+                    self.const_uniques.insert(out.offset, v);
+                    self.frame_offsets.remove(&out.offset);
+                    return;
+                }
+                self.const_uniques.remove(&out.offset);
+                self.frame_offsets.remove(&out.offset);
+            }
+            _ => {
+                self.const_uniques.remove(&out.offset);
+                self.frame_offsets.remove(&out.offset);
+            }
+        }
+    }
+
+    /// Pre-seed register state from a function-entry summary built
+    /// by the inter-procedural propagator.
+    fn seed_from_summary(&mut self, summary: &[std::collections::HashSet<u64>]) {
+        for (i, set) in summary.iter().enumerate() {
+            if set.len() == 1
+                && let Some(&v) = set.iter().next()
+            {
+                self.const_regs.insert(X86_64_SYSV_ARG_REGS[i].0, v);
+            }
+        }
+    }
+
 }
 
 /// Extract the direct call target from a Call op. Returns `None`
