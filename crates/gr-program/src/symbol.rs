@@ -64,6 +64,37 @@ impl SymbolTable {
         self.by_address.get(&address).map_or(&[], |v| v.as_slice())
     }
 
+    /// Force `address`'s primary (first) symbol to `name`, as a
+    /// `UserDefined` symbol. Inserts a new symbol at the front if
+    /// none exists. Used by the user-override layer so a manual
+    /// rename wins over every analysis-supplied name and propagates
+    /// through `primary_at` / `function_name_at` everywhere.
+    pub fn set_primary(&mut self, address: u64, name: impl Into<String>, ty: SymbolType) {
+        let name = name.into();
+        self.by_name.entry(name.clone()).or_default().push(address);
+        let sym = Symbol::new(name, address, ty, SourceType::UserDefined);
+        let entry = self.by_address.entry(address).or_default();
+        // Front-insert so `primary_at` (which returns `.first()`)
+        // returns the user override.
+        entry.insert(0, sym);
+    }
+
+    /// Remove every symbol at `address`. Returns how many were
+    /// removed. Used to purge symbols for a function the user has
+    /// marked as not-a-function.
+    pub fn remove_at(&mut self, address: u64) -> usize {
+        if let Some(syms) = self.by_address.remove(&address) {
+            for s in &syms {
+                if let Some(addrs) = self.by_name.get_mut(&s.name) {
+                    addrs.retain(|&a| a != address);
+                }
+            }
+            syms.len()
+        } else {
+            0
+        }
+    }
+
     pub fn get_by_name(&self, name: &str) -> Option<&[u64]> {
         self.by_name.get(name).map(|v| v.as_slice())
     }

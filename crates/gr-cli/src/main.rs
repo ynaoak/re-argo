@@ -284,6 +284,39 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// Edit the persistent user-override sidecar (`<binary>.gra.json`).
+    ///
+    /// Corrections recorded here are re-applied automatically every
+    /// time the binary is analysed -- they survive re-analysis and
+    /// propagate to every command (decompile, functions, xrefs, ...).
+    /// This is the interactive manual-correction layer: fix what the
+    /// auto-analysis got wrong and have it stick.
+    Annotate {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Rename: `ADDR=NAME` (hex addr). Repeatable.
+        #[arg(long, value_name = "ADDR=NAME")]
+        rename: Vec<String>,
+        /// Force-define a function at ADDR (hex). Repeatable.
+        #[arg(long = "func", value_name = "ADDR", value_parser = parse_hex)]
+        force_func: Vec<u64>,
+        /// Remove a bogus auto-discovered function at ADDR (hex).
+        /// Repeatable.
+        #[arg(long = "not-func", value_name = "ADDR", value_parser = parse_hex)]
+        not_func: Vec<u64>,
+        /// Set calling convention: `ADDR=CONV`. Repeatable.
+        #[arg(long, value_name = "ADDR=CONV")]
+        cc: Vec<String>,
+        /// Attach a plate comment: `ADDR=TEXT`. Repeatable.
+        #[arg(long, value_name = "ADDR=TEXT")]
+        comment: Vec<String>,
+        /// Print the current override set and exit (no edits).
+        #[arg(long)]
+        list: bool,
+        /// Remove all overrides (delete the sidecar).
+        #[arg(long)]
+        clear: bool,
+    },
     /// List every Call site with statically-resolved argument values.
     ///
     /// For each Call instruction the tool walks back through the
@@ -390,6 +423,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Coverage { file } => cmd_coverage(&file),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
+        Commands::Annotate { file, rename, force_func, not_func, cc, comment, list, clear } =>
+            cmd_annotate(&file, &rename, &force_func, &not_func, &cc, &comment, list, clear),
         Commands::Callsites { file, target, min_resolved, iters, callbacks } => cmd_callsites(&file, target, min_resolved, iters, callbacks, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
@@ -671,6 +706,25 @@ fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
             Err(e) => eprintln!("[ERROR] {}", e),
         }
     }
+
+    // Apply the user-override sidecar (`<binary>.gra.json`) LAST, so
+    // manual corrections win over auto-analysis and propagate to
+    // every command that loads the binary -- the interactive
+    // manual-correction layer a mature reversing workflow needs.
+    match gr_program::OverrideSet::load_for_binary(path) {
+        Ok(overrides) if !overrides.is_empty() => {
+            let n = overrides.apply(&mut program);
+            eprintln!(
+                "[overrides] applied {} of {} corrections from {}",
+                n,
+                overrides.len(),
+                gr_program::OverrideSet::sidecar_path(path).display()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[overrides] WARNING: {}", e),
+    }
+
     Ok(program)
 }
 
@@ -940,6 +994,88 @@ fn sanitize_filename(name: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cmd_annotate(
+    file: &Path,
+    rename: &[String],
+    force_func: &[u64],
+    not_func: &[u64],
+    cc: &[String],
+    comment: &[String],
+    list: bool,
+    clear: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gr_program::OverrideSet;
+
+    let sidecar = OverrideSet::sidecar_path(file);
+
+    if clear {
+        if sidecar.exists() {
+            std::fs::remove_file(&sidecar)?;
+            println!("Removed {}", sidecar.display());
+        } else {
+            println!("No override sidecar to remove.");
+        }
+        return Ok(());
+    }
+
+    let mut overrides = OverrideSet::load_for_binary(file)?;
+
+    // Parse "ADDR=VALUE" once; the value may itself contain '=' so
+    // split only on the first occurrence.
+    let parse_kv = |s: &str| -> Result<(u64, String), String> {
+        let (addr_s, val) = s
+            .split_once('=')
+            .ok_or_else(|| format!("expected ADDR=VALUE, got '{}'", s))?;
+        let addr = parse_hex(addr_s.trim())?;
+        Ok((addr, val.to_string()))
+    };
+
+    let mut edits = 0;
+    for r in rename {
+        let (addr, name) = parse_kv(r)?;
+        overrides.names.insert(addr, name);
+        edits += 1;
+    }
+    for &addr in force_func {
+        if !overrides.force_functions.contains(&addr) {
+            overrides.force_functions.push(addr);
+            edits += 1;
+        }
+    }
+    for &addr in not_func {
+        if !overrides.remove_functions.contains(&addr) {
+            overrides.remove_functions.push(addr);
+            edits += 1;
+        }
+    }
+    for c in cc {
+        let (addr, conv) = parse_kv(c)?;
+        overrides.calling_conventions.insert(addr, conv);
+        edits += 1;
+    }
+    for c in comment {
+        let (addr, text) = parse_kv(c)?;
+        overrides.comments.insert(addr, text);
+        edits += 1;
+    }
+
+    if edits > 0 {
+        overrides.save(&sidecar)?;
+        println!(
+            "Recorded {} edit(s); {} total corrections in {}",
+            edits,
+            overrides.len(),
+            sidecar.display()
+        );
+    }
+
+    if list || edits == 0 {
+        print_overrides(&overrides, &sidecar);
+    }
+    Ok(())
+}
+
 fn cmd_callsites(
     path: &Path,
     target: Option<u64>,
@@ -1052,6 +1188,44 @@ fn cmd_callsites(
         println!();
     }
     Ok(())
+}
+
+fn print_overrides(o: &gr_program::OverrideSet, sidecar: &Path) {
+    if o.is_empty() {
+        println!("No overrides recorded ({} absent or empty).", sidecar.display());
+        return;
+    }
+    println!("Override set ({}):", sidecar.display());
+    if !o.force_functions.is_empty() {
+        println!("  force functions:");
+        for a in &o.force_functions {
+            println!("    0x{:08x}", a);
+        }
+    }
+    if !o.remove_functions.is_empty() {
+        println!("  remove functions:");
+        for a in &o.remove_functions {
+            println!("    0x{:08x}", a);
+        }
+    }
+    if !o.names.is_empty() {
+        println!("  renames:");
+        for (a, n) in &o.names {
+            println!("    0x{:08x} = {}", a, n);
+        }
+    }
+    if !o.calling_conventions.is_empty() {
+        println!("  calling conventions:");
+        for (a, c) in &o.calling_conventions {
+            println!("    0x{:08x} = {}", a, c);
+        }
+    }
+    if !o.comments.is_empty() {
+        println!("  comments:");
+        for (a, c) in &o.comments {
+            println!("    0x{:08x} = {}", a, c);
+        }
+    }
 }
 
 fn cmd_taint(path: &Path, address: Option<u64>, params: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {

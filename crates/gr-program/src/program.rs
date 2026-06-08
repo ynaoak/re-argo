@@ -3,6 +3,7 @@ use gr_loader::{BinaryInfo, BinaryLoader};
 use gr_arch::arch::create_architecture;
 use gr_arch::Architecture;
 
+use crate::comments::CommentManager;
 use crate::listing::Listing;
 use crate::reference::ReferenceManager;
 use crate::symbol::{SourceType, Symbol, SymbolTable, SymbolType};
@@ -33,6 +34,9 @@ pub struct Program {
     pub symbol_table: SymbolTable,
     pub references: ReferenceManager,
     pub data_types: DataTypeManager,
+    /// Persistent comments (plate / EOL / etc.). Populated by the
+    /// user-override layer and any analyzer that annotates addresses.
+    pub comments: CommentManager,
 }
 
 impl Program {
@@ -82,6 +86,7 @@ impl Program {
             symbol_table,
             references: ReferenceManager::new(),
             data_types: DataTypeManager::new(),
+            comments: CommentManager::new(),
         })
     }
 

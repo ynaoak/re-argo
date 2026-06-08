@@ -50,6 +50,7 @@ pub(crate) mod helpers {
             symbol_table: SymbolTable::new(),
             references: ReferenceManager::new(),
             data_types: DataTypeManager::new(),
+            comments: gr_program::comments::CommentManager::new(),
         }
     }
 
@@ -108,6 +109,7 @@ pub(crate) mod helpers {
             symbol_table: SymbolTable::new(),
             references: ReferenceManager::new(),
             data_types: DataTypeManager::new(),
+            comments: gr_program::comments::CommentManager::new(),
         }
     }
 }
