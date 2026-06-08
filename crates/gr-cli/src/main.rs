@@ -284,6 +284,25 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// List every Call site with statically-resolved argument values.
+    ///
+    /// For each Call instruction the tool walks back through the
+    /// caller's lifted P-code, tracking the most recent constant
+    /// write to each calling-convention argument register. Output is
+    /// one line per call site: address, target (when direct), and
+    /// the resolved register values. Foundational data for tracking
+    /// parser-registry / callback chains across functions.
+    Callsites {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Only show call sites whose target matches this function
+        /// address (hex). Useful for "who calls register_parser?".
+        #[arg(short, long, value_parser = parse_hex)]
+        target: Option<u64>,
+        /// Only show call sites that resolved at least N arguments.
+        #[arg(short = 'n', long, default_value = "0")]
+        min_resolved: usize,
+    },
     /// Patch a binary file
     Patch {
         /// Path to the binary file
@@ -357,6 +376,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Coverage { file } => cmd_coverage(&file),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
+        Commands::Callsites { file, target, min_resolved } => cmd_callsites(&file, target, min_resolved, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
     }
@@ -904,6 +924,80 @@ fn sanitize_filename(name: &str) -> String {
         out.push_str("anon");
     }
     out
+}
+
+fn cmd_callsites(
+    path: &Path,
+    target: Option<u64>,
+    min_resolved: usize,
+    thumb: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let lifter = match make_lifter(&program.info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("callsites: no lifter for {}", program.info.arch);
+            return Ok(());
+        }
+    };
+
+    let sites = gr_analysis::callsite::resolve_call_sites(lifter.as_ref(), &program)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("{:?}", e).into() })?;
+
+    let filtered: Vec<_> = sites
+        .iter()
+        .filter(|s| {
+            if let Some(t) = target
+                && s.call_target != Some(t)
+            {
+                return false;
+            }
+            s.args.iter().filter(|a| a.value.is_some()).count() >= min_resolved
+        })
+        .collect();
+
+    println!(
+        "{} call sites total, {} after filter",
+        sites.len(),
+        filtered.len()
+    );
+    println!("{}", "-".repeat(72));
+
+    for site in &filtered {
+        let target_str = match site.call_target {
+            Some(t) => {
+                let name = program.function_name_at(t);
+                format!("0x{:08x} ({})", t, name)
+            }
+            None => "indirect".to_string(),
+        };
+        let caller_name = program.function_name_at(site.caller_function);
+        println!(
+            "0x{:08x}  in {}  ->  {}",
+            site.call_site, caller_name, target_str
+        );
+        for arg in &site.args {
+            match arg.value {
+                Some(v) => {
+                    // If the resolved value points at a known
+                    // function or string symbol, surface that.
+                    let annot = program.symbol_table.primary_at(v).map(|s| s.name.clone());
+                    match annot {
+                        Some(name) => println!("    {:>3} = 0x{:x}  // {}", arg.reg_name, v, name),
+                        None => println!("    {:>3} = 0x{:x}", arg.reg_name, v),
+                    }
+                }
+                None => {
+                    if min_resolved == 0 {
+                        println!("    {:>3} = ?", arg.reg_name);
+                    }
+                }
+            }
+        }
+        println!();
+    }
+    Ok(())
 }
 
 fn cmd_taint(path: &Path, address: Option<u64>, params: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
