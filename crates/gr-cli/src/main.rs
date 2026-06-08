@@ -317,6 +317,32 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
+    /// Auto-iterate analyser-correction proposals to a fixpoint.
+    ///
+    /// Each round:
+    ///   1. Analyse the binary (auto + current sidecar overrides).
+    ///   2. Run the heuristic correction engine to surface
+    ///      probable analyser mistakes (calls to undiscovered
+    ///      functions, false-positive tiny functions, ...).
+    ///   3. If `--apply`, persist new corrections to the
+    ///      `<binary>.gra.json` sidecar and re-analyse next round.
+    ///   4. Stop when a round produces zero new proposals
+    ///      (converged) or `--max-rounds` is hit.
+    ///
+    /// Without `--apply` the loop runs ONCE and just prints
+    /// proposals (dry run) -- useful for previewing what the
+    /// auto-driver would do.
+    Iterate {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Persist proposals to the sidecar and iterate. Without
+        /// this flag, just print a single round of proposals.
+        #[arg(long)]
+        apply: bool,
+        /// Maximum rounds before giving up (default 5).
+        #[arg(long, default_value = "5")]
+        max_rounds: usize,
+    },
     /// List every Call site with statically-resolved argument values.
     ///
     /// For each Call instruction the tool walks back through the
@@ -425,6 +451,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
         Commands::Annotate { file, rename, force_func, not_func, cc, comment, list, clear } =>
             cmd_annotate(&file, &rename, &force_func, &not_func, &cc, &comment, list, clear),
+        Commands::Iterate { file, apply, max_rounds } => cmd_iterate(&file, apply, max_rounds),
         Commands::Callsites { file, target, min_resolved, iters, callbacks } => cmd_callsites(&file, target, min_resolved, iters, callbacks, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
@@ -1225,6 +1252,144 @@ fn print_overrides(o: &gr_program::OverrideSet, sidecar: &Path) {
         for (a, c) in &o.comments {
             println!("    0x{:08x} = {}", a, c);
         }
+    }
+}
+
+/// Drive the heuristic correction-proposal engine to a fixpoint.
+///
+/// `apply == false` is the dry-run preview: analyse once, print
+/// proposals, exit. `apply == true` is the active loop:
+/// analyse, propose, persist new proposals to the sidecar,
+/// re-analyse, repeat until a round yields nothing new or
+/// `max_rounds` is hit. Convergence (zero new proposals after the
+/// previous round's mutations took effect) is the natural stop.
+fn cmd_iterate(
+    path: &Path,
+    apply: bool,
+    max_rounds: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gr_analysis::iterate::{propose_corrections_ctx, Correction};
+    use gr_program::OverrideSet;
+
+    let sidecar = OverrideSet::sidecar_path(path);
+
+    // Dry-run path: a single proposal pass, no mutations.
+    if !apply {
+        eprintln!("[iterate] dry-run -- showing one round of proposals, no edits");
+        let program = analyze_binary(path)?;
+        let existing = OverrideSet::load_for_binary(path).unwrap_or_default();
+        let proposals = propose_corrections_ctx(&program, Some(&existing));
+        print_proposals(&proposals);
+        eprintln!(
+            "[iterate] {} proposals (dry-run). Re-run with --apply to persist + iterate.",
+            proposals.len()
+        );
+        return Ok(());
+    }
+
+    // Active loop: track per-round novelty against everything we
+    // have proposed so far (including any pre-existing sidecar
+    // entries) so the fixpoint check is "did this round add
+    // anything we hadn't already recorded?"
+    let mut overrides = OverrideSet::load_for_binary(path)?;
+    let starting_total = overrides.len();
+    let mut total_new: usize = 0;
+
+    for round in 1..=max_rounds {
+        eprintln!("[iterate] === round {}/{} ===", round, max_rounds);
+        // Snapshot the current sidecar contents so the diff at the
+        // end of this round is "what got added by THIS round".
+        let before_total = overrides.len();
+
+        // Persist whatever the previous round added so this round's
+        // analyse-binary picks it up.
+        if round > 1 || starting_total != before_total {
+            overrides.save(&sidecar)?;
+        }
+
+        let program = analyze_binary(path)?;
+        let proposals = propose_corrections_ctx(&program, Some(&overrides));
+
+        if proposals.is_empty() {
+            eprintln!("[iterate] no proposals; converged at round {}", round);
+            break;
+        }
+
+        // Merge only the proposals that aren't already in the
+        // sidecar (avoid infinite-loop loops where the same
+        // suggestion keeps coming back).
+        let mut accepted: Vec<&Correction> = Vec::new();
+        let mut staged = overrides.clone();
+        for c in &proposals {
+            let before = correction_in_set(c, &staged);
+            c.apply_to(&mut staged);
+            let after = correction_in_set(c, &staged);
+            if !before && after {
+                accepted.push(c);
+            }
+        }
+
+        if accepted.is_empty() {
+            eprintln!(
+                "[iterate] round {}: {} proposals, all already in sidecar; converged",
+                round,
+                proposals.len()
+            );
+            break;
+        }
+
+        eprintln!(
+            "[iterate] round {}: applied {} new corrections ({} proposed total)",
+            round,
+            accepted.len(),
+            proposals.len()
+        );
+        for c in &accepted {
+            eprintln!(
+                "  + 0x{:08x}  {:?}  -- {}",
+                c.addr(),
+                c.kind,
+                c.reason
+            );
+        }
+        overrides = staged;
+        total_new += accepted.len();
+    }
+
+    // Final persist + summary.
+    overrides.save(&sidecar)?;
+    eprintln!(
+        "[iterate] done. {} new corrections added this run; {} total in sidecar.",
+        total_new,
+        overrides.len()
+    );
+    Ok(())
+}
+
+fn correction_in_set(c: &gr_analysis::iterate::Correction, set: &gr_program::OverrideSet) -> bool {
+    use gr_analysis::iterate::CorrectionKind;
+    match &c.kind {
+        CorrectionKind::ForceFunction { addr } => set.force_functions.contains(addr),
+        CorrectionKind::NotFunction { addr } => set.remove_functions.contains(addr),
+        CorrectionKind::Rename { addr, name } => set.names.get(addr) == Some(name),
+        CorrectionKind::SetCallingConvention { addr, cc } => {
+            set.calling_conventions.get(addr) == Some(cc)
+        }
+    }
+}
+
+fn print_proposals(proposals: &[gr_analysis::iterate::Correction]) {
+    if proposals.is_empty() {
+        println!("(no proposals)");
+        return;
+    }
+    for c in proposals {
+        println!(
+            "  0x{:08x}  {:?}\n    reason: {}",
+            c.addr(),
+            c.kind,
+            c.reason
+        );
     }
 }
 
