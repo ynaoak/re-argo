@@ -302,6 +302,13 @@ enum Commands {
         /// Only show call sites that resolved at least N arguments.
         #[arg(short = 'n', long, default_value = "0")]
         min_resolved: usize,
+        /// Inter-procedural propagation iterations. 0 = intra-
+        /// function only. 1+ = propagate resolved arguments into
+        /// callees and re-resolve, letting chains like
+        /// `register_parser(my_cb) -> list_add(my_cb) -> ...`
+        /// surface end-to-end. Stops early at fixpoint.
+        #[arg(short = 'i', long, default_value = "3")]
+        iters: usize,
     },
     /// Patch a binary file
     Patch {
@@ -376,7 +383,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Coverage { file } => cmd_coverage(&file),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
-        Commands::Callsites { file, target, min_resolved } => cmd_callsites(&file, target, min_resolved, cli.thumb),
+        Commands::Callsites { file, target, min_resolved, iters } => cmd_callsites(&file, target, min_resolved, iters, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
     }
@@ -930,6 +937,7 @@ fn cmd_callsites(
     path: &Path,
     target: Option<u64>,
     min_resolved: usize,
+    iters: usize,
     thumb: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
@@ -942,8 +950,15 @@ fn cmd_callsites(
         }
     };
 
-    let sites = gr_analysis::callsite::resolve_call_sites(lifter.as_ref(), &program)
-        .map_err(|e| -> Box<dyn std::error::Error> { format!("{:?}", e).into() })?;
+    // `iters == 0` keeps the simple intra-function resolver from
+    // the first PR; >0 iterates the inter-procedural propagator to
+    // fixpoint (or `iters` rounds, whichever comes first).
+    let sites = if iters == 0 {
+        gr_analysis::callsite::resolve_call_sites(lifter.as_ref(), &program)
+    } else {
+        gr_analysis::callsite::resolve_call_sites_iterative(lifter.as_ref(), &program, iters)
+    }
+    .map_err(|e| -> Box<dyn std::error::Error> { format!("{:?}", e).into() })?;
 
     let filtered: Vec<_> = sites
         .iter()
