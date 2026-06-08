@@ -956,8 +956,16 @@ impl X86Lifter {
         let disp = insn.memory_displacement64();
 
         if base_reg == iced_x86::Register::RIP || base_reg == iced_x86::Register::EIP {
-            let effective = insn.ip().wrapping_add(insn.len() as u64).wrapping_add(disp);
-            return Ok(constant(effective, ps));
+            // iced_x86::Instruction::memory_displacement64() returns
+            // the *effective* address for rip-relative operands --
+            // i.e. it has already added `rip + insn.len()` to the
+            // raw displacement bytes from the encoding. The previous
+            // code added them again, so every `lea reg, [rip+disp]`
+            // produced a constant that was `2 * rip + insn.len()` too
+            // high; downstream the callsite resolver then matched
+            // the wrong (or no) function address, breaking
+            // `callsites --callbacks`.
+            return Ok(constant(disp, ps));
         }
 
         let has_base = base_reg != iced_x86::Register::None;
