@@ -17,6 +17,7 @@ use crate::stack::StackFrameAnalyzer;
 use crate::strings::StringSearchAnalyzer;
 use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
 use crate::noreturn_prop::{DuplicateCodeAnalyzer, NoReturnPropagationAnalyzer};
+use crate::addrtable::AddressTableAnalyzer;
 use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
 use crate::pcoderef::PcodeReferenceAnalyzer;
 use crate::signatures::SignatureApplierAnalyzer;
@@ -51,6 +52,7 @@ impl AnalysisManager {
             Box::new(ThunkDetectorAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
+            Box::new(AddressTableAnalyzer),
             Box::new(SwitchTableAnalyzer),
             Box::new(TailCallAnalyzer),
             Box::new(VTableAnalyzer),
