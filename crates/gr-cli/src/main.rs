@@ -309,6 +309,13 @@ enum Commands {
         /// surface end-to-end. Stops early at fixpoint.
         #[arg(short = 'i', long, default_value = "3")]
         iters: usize,
+        /// Callback-mode: only list call sites where at least one
+        /// resolved argument value matches the entry point of a
+        /// known function (i.e., a function pointer is being
+        /// passed in). Surfaces parser-registry / callback-table
+        /// patterns directly. Implies inter-procedural propagation.
+        #[arg(long)]
+        callbacks: bool,
     },
     /// Patch a binary file
     Patch {
@@ -383,7 +390,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Coverage { file } => cmd_coverage(&file),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
-        Commands::Callsites { file, target, min_resolved, iters } => cmd_callsites(&file, target, min_resolved, iters, cli.thumb),
+        Commands::Callsites { file, target, min_resolved, iters, callbacks } => cmd_callsites(&file, target, min_resolved, iters, callbacks, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
     }
@@ -938,6 +945,7 @@ fn cmd_callsites(
     target: Option<u64>,
     min_resolved: usize,
     iters: usize,
+    callbacks_only: bool,
     thumb: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
@@ -950,15 +958,32 @@ fn cmd_callsites(
         }
     };
 
-    // `iters == 0` keeps the simple intra-function resolver from
-    // the first PR; >0 iterates the inter-procedural propagator to
-    // fixpoint (or `iters` rounds, whichever comes first).
-    let sites = if iters == 0 {
+    // Callback mode requires the propagator; bump iters if the
+    // caller passed 0. (Defaults to 3 either way, but be explicit.)
+    let effective_iters = if callbacks_only { iters.max(3) } else { iters };
+
+    let sites = if effective_iters == 0 {
         gr_analysis::callsite::resolve_call_sites(lifter.as_ref(), &program)
     } else {
-        gr_analysis::callsite::resolve_call_sites_iterative(lifter.as_ref(), &program, iters)
+        gr_analysis::callsite::resolve_call_sites_iterative(
+            lifter.as_ref(),
+            &program,
+            effective_iters,
+        )
     }
     .map_err(|e| -> Box<dyn std::error::Error> { format!("{:?}", e).into() })?;
+
+    // Build the set of known function entry points once -- used to
+    // tag resolved-arg values that happen to point at a discovered
+    // function ("this arg is a callback to func X").
+    use std::collections::HashSet;
+    let func_entries: HashSet<u64> = program
+        .listing
+        .functions()
+        .map(|f| f.entry_point)
+        .collect();
+
+    let is_callback_value = |v: u64| -> bool { func_entries.contains(&v) };
 
     let filtered: Vec<_> = sites
         .iter()
@@ -968,7 +993,18 @@ fn cmd_callsites(
             {
                 return false;
             }
-            s.args.iter().filter(|a| a.value.is_some()).count() >= min_resolved
+            if s.args.iter().filter(|a| a.value.is_some()).count() < min_resolved {
+                return false;
+            }
+            if callbacks_only
+                && !s
+                    .args
+                    .iter()
+                    .any(|a| matches!(a.value, Some(v) if is_callback_value(v)))
+            {
+                return false;
+            }
+            true
         })
         .collect();
 
@@ -995,12 +1031,15 @@ fn cmd_callsites(
         for arg in &site.args {
             match arg.value {
                 Some(v) => {
-                    // If the resolved value points at a known
-                    // function or string symbol, surface that.
-                    let annot = program.symbol_table.primary_at(v).map(|s| s.name.clone());
-                    match annot {
-                        Some(name) => println!("    {:>3} = 0x{:x}  // {}", arg.reg_name, v, name),
-                        None => println!("    {:>3} = 0x{:x}", arg.reg_name, v),
+                    // Annotate by lookup priority: function entry
+                    // beats general symbol. Function callbacks get
+                    // a [callback] tag to make the parser-registry
+                    // pattern obvious at a glance.
+                    let name = program.symbol_table.primary_at(v).map(|s| s.name.clone());
+                    let tag = if is_callback_value(v) { " [callback]" } else { "" };
+                    match name {
+                        Some(n) => println!("    {:>3} = 0x{:x}  // {}{}", arg.reg_name, v, n, tag),
+                        None => println!("    {:>3} = 0x{:x}{}", arg.reg_name, v, tag),
                     }
                 }
                 None => {
