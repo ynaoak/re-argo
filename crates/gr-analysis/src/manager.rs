@@ -11,13 +11,14 @@ use crate::ehframe::EhFrameAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::propagation::ConstantPropagationAnalyzer;
+use crate::rtti::RttiAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::strings::StringSearchAnalyzer;
 use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
 use crate::noreturn_prop::{DuplicateCodeAnalyzer, NoReturnPropagationAnalyzer};
 use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
-use crate::rtti::RttiAnalyzer;
+use crate::pcoderef::PcodeReferenceAnalyzer;
 use crate::signatures::SignatureApplierAnalyzer;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
 use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
@@ -49,6 +50,7 @@ impl AnalysisManager {
             Box::new(StackFrameAnalyzer),
             Box::new(ThunkDetectorAnalyzer),
             Box::new(DataReferenceAnalyzer),
+            Box::new(PcodeReferenceAnalyzer),
             Box::new(SwitchTableAnalyzer),
             Box::new(TailCallAnalyzer),
             Box::new(VTableAnalyzer),
