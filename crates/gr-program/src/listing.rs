@@ -47,6 +47,15 @@ impl Listing {
         self.functions.insert(func.entry_point, func);
     }
 
+    /// Remove the function whose entry point is `entry`. Returns the
+    /// removed function if one existed. Used by the user-override
+    /// layer to purge bogus auto-discovered functions (e.g. the
+    /// pattern-matcher's false positives) without re-running the
+    /// whole analysis.
+    pub fn remove_function(&mut self, entry: u64) -> Option<Function> {
+        self.functions.remove(&entry)
+    }
+
     pub fn get_function(&self, entry: u64) -> Option<&Function> {
         self.functions.get(&entry)
     }
