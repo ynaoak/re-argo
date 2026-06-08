@@ -158,6 +158,158 @@ pub fn resolve_call_sites(
     Ok(out)
 }
 
+/// Per-function summary of values its parameter registers have ever
+/// been called with. Indexed by argument position 0..5 in
+/// calling-convention order (RDI, RSI, RDX, RCX, R8, R9 for SysV).
+///
+/// Built from a `Vec<CallSite>` by `build_param_summaries`: for
+/// every call to function F with a resolved `args[i] = Some(v)`, the
+/// value `v` is added to F's `params[i]` set. When the set has
+/// exactly one element, that parameter has a *known* value at every
+/// call site we observed -- the inter-procedural propagator below
+/// uses that to extend the constant-tracking inside F.
+pub type ParamSummaries = FxHashMap<u64, Vec<std::collections::HashSet<u64>>>;
+
+/// Roll up `sites` into "for each function, what constants does each
+/// of its parameter registers ever receive?"  Foundation for
+/// inter-procedural propagation: a function whose param 0 is always
+/// called with `&handler` can be analysed as if `handler` were a
+/// compile-time constant in its body.
+pub fn build_param_summaries(sites: &[CallSite]) -> ParamSummaries {
+    let mut out: ParamSummaries = FxHashMap::default();
+    for site in sites {
+        let Some(target) = site.call_target else {
+            continue;
+        };
+        let entry = out
+            .entry(target)
+            .or_insert_with(|| vec![std::collections::HashSet::new(); X86_64_SYSV_ARG_REGS.len()]);
+        for (i, arg) in site.args.iter().enumerate() {
+            if let Some(v) = arg.value {
+                entry[i].insert(v);
+            }
+        }
+    }
+    out
+}
+
+/// Re-resolve call sites with the given parameter summaries seeded
+/// into each function's initial register map. A parameter with a
+/// *single* observed value is treated as a compile-time constant on
+/// entry; parameters with multiple values (call site polymorphism)
+/// are left unresolved.
+///
+/// This is the single-step inter-procedural propagator. Call it in
+/// a fixpoint loop (via `resolve_call_sites_iterative`) to extend
+/// reach across longer call chains: each round, newly-resolved
+/// arguments at outer call sites feed back into the summary for the
+/// next round, and chains like
+///     register_parser(my_parser) -> list_add(my_parser) -> ...
+/// surface end-to-end.
+pub fn resolve_call_sites_with_summaries(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    summaries: &ParamSummaries,
+) -> Result<Vec<CallSite>, AnalysisError> {
+    if !matches!(program.info.arch, gr_loader::Architecture::X86_64) {
+        return Ok(Vec::new());
+    }
+
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out: Vec<CallSite> = Vec::new();
+    for func in program.listing.functions() {
+        let max_insns = func
+            .body
+            .ranges()
+            .map(|r| r.size as usize)
+            .sum::<usize>()
+            .max(500);
+        let Ok(lifted) = lifter.lift_range(&program.info.memory, func.entry_point, max_insns)
+        else {
+            continue;
+        };
+
+        // Seed const_regs from this function's parameter summary:
+        // any param register whose summary set has exactly one
+        // value is a known constant on entry.
+        let mut const_regs: FxHashMap<u64, u64> = FxHashMap::default();
+        if let Some(summary) = summaries.get(&func.entry_point) {
+            for (i, set) in summary.iter().enumerate() {
+                if set.len() == 1
+                    && let Some(&v) = set.iter().next()
+                {
+                    const_regs.insert(X86_64_SYSV_ARG_REGS[i].0, v);
+                }
+            }
+        }
+
+        for insn in &lifted {
+            for op in &insn.ops {
+                match op.opcode {
+                    OpCode::Call | OpCode::CallInd => {
+                        if seen.insert(insn.address) {
+                            let target = direct_call_target(op);
+                            let caller = program
+                                .listing
+                                .function_containing(insn.address)
+                                .map(|f| f.entry_point)
+                                .unwrap_or(func.entry_point);
+                            let args = X86_64_SYSV_ARG_REGS
+                                .iter()
+                                .map(|&(offset, name)| ResolvedArg {
+                                    reg_offset: offset,
+                                    reg_name: name,
+                                    value: const_regs.get(&offset).copied(),
+                                })
+                                .collect();
+                            out.push(CallSite {
+                                call_site: insn.address,
+                                caller_function: caller,
+                                call_target: target,
+                                args,
+                            });
+                        }
+                        const_regs.clear();
+                    }
+                    _ => apply_write(op, &mut const_regs),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Iterate the propagator to fixpoint (or until `max_iters`). On
+/// each round: rebuild parameter summaries from the previous
+/// round's call sites, then re-resolve. Stops early when no new
+/// per-param constants appear.
+pub fn resolve_call_sites_iterative(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    max_iters: usize,
+) -> Result<Vec<CallSite>, AnalysisError> {
+    let mut sites = resolve_call_sites(lifter, program)?;
+    let mut prev_total_known = count_known_args(&sites);
+    for _ in 0..max_iters {
+        let summaries = build_param_summaries(&sites);
+        let next = resolve_call_sites_with_summaries(lifter, program, &summaries)?;
+        let next_known = count_known_args(&next);
+        sites = next;
+        if next_known == prev_total_known {
+            break;
+        }
+        prev_total_known = next_known;
+    }
+    Ok(sites)
+}
+
+fn count_known_args(sites: &[CallSite]) -> usize {
+    sites
+        .iter()
+        .map(|s| s.args.iter().filter(|a| a.value.is_some()).count())
+        .sum()
+}
+
 /// Update `const_regs` for `op`'s output, if any. A `Copy out = const`
 /// records the value; any other op that writes to a register
 /// invalidates it.
@@ -168,11 +320,30 @@ fn apply_write(op: &gr_core::pcode::PcodeOp, const_regs: &mut FxHashMap<u64, u64
     }
     match op.opcode {
         OpCode::Copy => {
-            if let Some(input) = op.inputs.first()
-                && input.space == SpaceId::CONST
-            {
-                const_regs.insert(out.offset, input.offset);
-                return;
+            if let Some(input) = op.inputs.first() {
+                match input.space {
+                    SpaceId::CONST => {
+                        // mov reg, imm
+                        const_regs.insert(out.offset, input.offset);
+                        return;
+                    }
+                    SpaceId::REGISTER => {
+                        // mov reg, reg -- propagate the source's
+                        // known value when we have one. Critical
+                        // for the `lea rax, [&sym]; mov rdi, rax`
+                        // idiom that gcc uses for callback /
+                        // function-pointer arguments instead of a
+                        // direct `mov rdi, imm`; without this,
+                        // every register-laundered constant gets
+                        // dropped and inter-procedural propagation
+                        // never finds the callback target.
+                        if let Some(&src_val) = const_regs.get(&input.offset) {
+                            const_regs.insert(out.offset, src_val);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
             }
             const_regs.remove(&out.offset);
         }
