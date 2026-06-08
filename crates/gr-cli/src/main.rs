@@ -1356,8 +1356,15 @@ fn cmd_iterate(
         total_new += accepted.len();
     }
 
-    // Final persist + summary.
-    overrides.save(&sidecar)?;
+    // Final persist + summary. Only write the sidecar when this run
+    // actually added corrections -- otherwise a clean binary (zero
+    // proposals) would litter an empty `<binary>.gra.json`. Any
+    // mid-loop additions were already persisted at the start of the
+    // following round, so skipping here when `total_new == 0` loses
+    // nothing.
+    if total_new > 0 {
+        overrides.save(&sidecar)?;
+    }
     eprintln!(
         "[iterate] done. {} new corrections added this run; {} total in sidecar.",
         total_new,
