@@ -317,6 +317,39 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
+    /// List every Call site with statically-resolved argument values.
+    ///
+    /// For each Call instruction the tool walks back through the
+    /// caller's lifted P-code, tracking the most recent constant
+    /// write to each calling-convention argument register. Output is
+    /// one line per call site: address, target (when direct), and
+    /// the resolved register values. Foundational data for tracking
+    /// parser-registry / callback chains across functions.
+    Callsites {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Only show call sites whose target matches this function
+        /// address (hex). Useful for "who calls register_parser?".
+        #[arg(short, long, value_parser = parse_hex)]
+        target: Option<u64>,
+        /// Only show call sites that resolved at least N arguments.
+        #[arg(short = 'n', long, default_value = "0")]
+        min_resolved: usize,
+        /// Inter-procedural propagation iterations. 0 = intra-
+        /// function only. 1+ = propagate resolved arguments into
+        /// callees and re-resolve, letting chains like
+        /// `register_parser(my_cb) -> list_add(my_cb) -> ...`
+        /// surface end-to-end. Stops early at fixpoint.
+        #[arg(short = 'i', long, default_value = "3")]
+        iters: usize,
+        /// Callback-mode: only list call sites where at least one
+        /// resolved argument value matches the entry point of a
+        /// known function (i.e., a function pointer is being
+        /// passed in). Surfaces parser-registry / callback-table
+        /// patterns directly. Implies inter-procedural propagation.
+        #[arg(long)]
+        callbacks: bool,
+    },
     /// Patch a binary file
     Patch {
         /// Path to the binary file
@@ -392,6 +425,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
         Commands::Annotate { file, rename, force_func, not_func, cc, comment, list, clear } =>
             cmd_annotate(&file, &rename, &force_func, &not_func, &cc, &comment, list, clear),
+        Commands::Callsites { file, target, min_resolved, iters, callbacks } => cmd_callsites(&file, target, min_resolved, iters, callbacks, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
     }
@@ -1038,6 +1072,120 @@ fn cmd_annotate(
 
     if list || edits == 0 {
         print_overrides(&overrides, &sidecar);
+    }
+    Ok(())
+}
+
+fn cmd_callsites(
+    path: &Path,
+    target: Option<u64>,
+    min_resolved: usize,
+    iters: usize,
+    callbacks_only: bool,
+    thumb: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let lifter = match make_lifter(&program.info, thumb) {
+        Some(l) => l,
+        None => {
+            eprintln!("callsites: no lifter for {}", program.info.arch);
+            return Ok(());
+        }
+    };
+
+    // Callback mode requires the propagator; bump iters if the
+    // caller passed 0. (Defaults to 3 either way, but be explicit.)
+    let effective_iters = if callbacks_only { iters.max(3) } else { iters };
+
+    let sites = if effective_iters == 0 {
+        gr_analysis::callsite::resolve_call_sites(lifter.as_ref(), &program)
+    } else {
+        gr_analysis::callsite::resolve_call_sites_iterative(
+            lifter.as_ref(),
+            &program,
+            effective_iters,
+        )
+    }
+    .map_err(|e| -> Box<dyn std::error::Error> { format!("{:?}", e).into() })?;
+
+    // Build the set of known function entry points once -- used to
+    // tag resolved-arg values that happen to point at a discovered
+    // function ("this arg is a callback to func X").
+    use std::collections::HashSet;
+    let func_entries: HashSet<u64> = program
+        .listing
+        .functions()
+        .map(|f| f.entry_point)
+        .collect();
+
+    let is_callback_value = |v: u64| -> bool { func_entries.contains(&v) };
+
+    let filtered: Vec<_> = sites
+        .iter()
+        .filter(|s| {
+            if let Some(t) = target
+                && s.call_target != Some(t)
+            {
+                return false;
+            }
+            if s.args.iter().filter(|a| a.value.is_some()).count() < min_resolved {
+                return false;
+            }
+            if callbacks_only
+                && !s
+                    .args
+                    .iter()
+                    .any(|a| matches!(a.value, Some(v) if is_callback_value(v)))
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    println!(
+        "{} call sites total, {} after filter",
+        sites.len(),
+        filtered.len()
+    );
+    println!("{}", "-".repeat(72));
+
+    for site in &filtered {
+        let target_str = match site.call_target {
+            Some(t) => {
+                let name = program.function_name_at(t);
+                format!("0x{:08x} ({})", t, name)
+            }
+            None => "indirect".to_string(),
+        };
+        let caller_name = program.function_name_at(site.caller_function);
+        println!(
+            "0x{:08x}  in {}  ->  {}",
+            site.call_site, caller_name, target_str
+        );
+        for arg in &site.args {
+            match arg.value {
+                Some(v) => {
+                    // Annotate by lookup priority: function entry
+                    // beats general symbol. Function callbacks get
+                    // a [callback] tag to make the parser-registry
+                    // pattern obvious at a glance.
+                    let name = program.symbol_table.primary_at(v).map(|s| s.name.clone());
+                    let tag = if is_callback_value(v) { " [callback]" } else { "" };
+                    match name {
+                        Some(n) => println!("    {:>3} = 0x{:x}  // {}{}", arg.reg_name, v, n, tag),
+                        None => println!("    {:>3} = 0x{:x}{}", arg.reg_name, v, tag),
+                    }
+                }
+                None => {
+                    if min_resolved == 0 {
+                        println!("    {:>3} = ?", arg.reg_name);
+                    }
+                }
+            }
+        }
+        println!();
     }
     Ok(())
 }

@@ -956,8 +956,16 @@ impl X86Lifter {
         let disp = insn.memory_displacement64();
 
         if base_reg == iced_x86::Register::RIP || base_reg == iced_x86::Register::EIP {
-            let effective = insn.ip().wrapping_add(insn.len() as u64).wrapping_add(disp);
-            return Ok(constant(effective, ps));
+            // iced_x86::Instruction::memory_displacement64() returns
+            // the *effective* address for rip-relative operands --
+            // i.e. it has already added `rip + insn.len()` to the
+            // raw displacement bytes from the encoding. The previous
+            // code added them again, so every `lea reg, [rip+disp]`
+            // produced a constant that was `2 * rip + insn.len()` too
+            // high; downstream the callsite resolver then matched
+            // the wrong (or no) function address, breaking
+            // `callsites --callbacks`.
+            return Ok(constant(disp, ps));
         }
 
         let has_base = base_reg != iced_x86::Register::None;
@@ -1176,6 +1184,56 @@ mod tests {
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
         assert_eq!(lifted.ops.len(), 1);
         assert_eq!(lifted.ops[0].opcode, OpCode::Copy);
+    }
+
+    #[test]
+    fn lift_lea_rip_relative_uses_effective_address_once() {
+        // Regression for the rip-relative LEA double-count: iced's
+        // memory_displacement64() already folds in rip+len, so the
+        // lifter must NOT add them again. The classic gcc callback
+        // idiom `lea rdi, [rip + func]` has to resolve to the exact
+        // function address or `callsites --callbacks` can't match it.
+        let lifter = X86Lifter::new_64();
+        // lea rax, [rip+0x100]  =  48 8d 05 00 01 00 00
+        // ip 0x1000, len 7, disp 0x100 -> effective 0x1000+7+0x100 = 0x1107
+        let mem = make_memory(&[0x48, 0x8d, 0x05, 0x00, 0x01, 0x00, 0x00], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.length, 7);
+        assert_eq!(lifted.ops.len(), 1);
+        let op = &lifted.ops[0];
+        assert_eq!(op.opcode, OpCode::Copy);
+        let src = &op.inputs[0];
+        assert_eq!(
+            src.space, CONST_SPACE,
+            "lea rip-relative source should be a constant effective address"
+        );
+        assert_eq!(
+            src.offset, 0x1107,
+            "rip-relative effective address must be ip+len+disp counted exactly once"
+        );
+    }
+
+    #[test]
+    fn lift_mov_rip_relative_load_address_is_effective() {
+        // The same effective-address path feeds rip-relative LOADs,
+        // e.g. `mov rax, [rip + global]`. Confirm the Load's address
+        // operand is the once-counted effective address, not double.
+        let lifter = X86Lifter::new_64();
+        // mov rax, [rip+0x100]  =  48 8b 05 00 01 00 00  (len 7)
+        // effective 0x1000+7+0x100 = 0x1107
+        let mem = make_memory(&[0x48, 0x8b, 0x05, 0x00, 0x01, 0x00, 0x00], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.length, 7);
+        let load = lifted
+            .ops
+            .iter()
+            .find(|o| o.opcode == OpCode::Load)
+            .expect("rip-relative mov should emit a Load");
+        // LOAD inputs: [space-id-const, address]. The address operand
+        // (index 1) carries the effective rip-relative address.
+        let addr = &load.inputs[1];
+        assert_eq!(addr.space, CONST_SPACE);
+        assert_eq!(addr.offset, 0x1107);
     }
 
     #[test]

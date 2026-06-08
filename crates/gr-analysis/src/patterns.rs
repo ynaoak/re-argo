@@ -6,18 +6,32 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
 pub struct PatternFunctionAnalyzer;
 
+/// Only 4+ byte prologue patterns -- short 2-3 byte forms like
+/// `sub rsp, imm8` (`48 83 EC`) or `push r12` (`41 54`) appear far
+/// too often inside instruction operands and unrelated data to be
+/// reliable function-start signals. Stripped binaries produced
+/// hundreds of thousands of false positives from the short patterns
+/// before we tightened to this 4+ byte set.
 const X86_64_PROLOGUE_PATTERNS: &[&[u8]] = &[
     &[0x55, 0x48, 0x89, 0xE5],         // push rbp; mov rbp, rsp
     &[0x55, 0x48, 0x8B, 0xEC],         // push rbp; mov rbp, rsp (alt)
-    &[0x48, 0x83, 0xEC],               // sub rsp, imm8
-    &[0x48, 0x81, 0xEC],               // sub rsp, imm32
-    &[0x40, 0x53],                      // push rbx (REX)
-    &[0x40, 0x55],                      // push rbp (REX)
-    &[0x41, 0x54],                      // push r12
-    &[0x41, 0x55],                      // push r13
-    &[0x41, 0x56],                      // push r14
-    &[0x41, 0x57],                      // push r15
+    &[0x48, 0x81, 0xEC],               // sub rsp, imm32 -- 3 bytes but
+                                       // followed by a 4-byte imm that
+                                       // we don't need to parse here;
+                                       // the boundary check below filters
+                                       // the random-position matches.
 ];
+
+/// A real function start sits immediately after some boundary
+/// marker: the previous function's ret (0xC3 / 0xC2), an int3
+/// padding (0xCC), nop padding (0x90), or zero-fill padding (0x00).
+/// If the byte preceding our candidate address is anything else, we
+/// are matching a prologue pattern mid-instruction inside another
+/// function -- a guaranteed false positive that this single check
+/// eliminates the bulk of.
+fn is_boundary_byte(b: u8) -> bool {
+    matches!(b, 0xC3 | 0xC2 | 0xCC | 0x90 | 0x00)
+}
 
 impl Analyzer for PatternFunctionAnalyzer {
     fn name(&self) -> &str {
@@ -55,7 +69,17 @@ impl Analyzer for PatternFunctionAnalyzer {
             let mut offset = 0u64;
             while offset + 4 <= size {
                 let addr = base + offset;
-                if program.listing.has_function(addr) || program.listing.has_instruction(addr) {
+
+                // Skip addresses that are already known to be inside
+                // a function body. `has_function` only catches the
+                // entry; `function_containing` catches mid-body
+                // matches that the previous predicate missed and was
+                // the main escape valve for false positives in
+                // stripped binaries.
+                if program.listing.has_function(addr)
+                    || program.listing.has_instruction(addr)
+                    || program.listing.function_containing(addr).is_some()
+                {
                     offset += 1;
                     continue;
                 }
@@ -75,6 +99,27 @@ impl Analyzer for PatternFunctionAnalyzer {
                     if buf[0] == 0xCC || buf[0] == 0x00 {
                         offset += 1;
                         continue;
+                    }
+
+                    // Require a function-boundary byte immediately
+                    // before `addr`. Without this gate the prologue
+                    // pattern matches anywhere inside other functions
+                    // (e.g. a `push rbp` inside an ABI-conformant call
+                    // sequence) -- on a stripped libc we were emitting
+                    // ~384k spurious FUN_* symbols.
+                    if offset > 0 {
+                        let prev = base + offset - 1;
+                        let mut pb = [0u8; 1];
+                        let prev_ok = program
+                            .info
+                            .memory
+                            .read_bytes(prev, &mut pb)
+                            .is_ok()
+                            && is_boundary_byte(pb[0]);
+                        if !prev_ok {
+                            offset += 1;
+                            continue;
+                        }
                     }
 
                     let name = format!("FUN_{:08x}", addr);
