@@ -13,10 +13,26 @@
 //! * `decompile_function` -- C pseudocode for a function.
 //! * `find_xrefs`       -- refs to / from an address.
 //!
+//! And the **AI-driven correction loop** tools, which let an agent
+//! iteratively improve the analysis through conversation:
+//!
+//! * `assess_function`     -- quality metrics for one function
+//!   (truncation, unresolved call targets, ...).
+//! * `propose_corrections` -- heuristic engine's list of probable
+//!   analyser mistakes, each with a reason.
+//! * `apply_override`      -- record a correction into the
+//!   `<binary>.gra.json` sidecar (force/remove/rename/cc).
+//! * `reanalyze`           -- re-run analysis so the corrected
+//!   model is visible to the next query.
+//!
+//! The agent loop is: propose_corrections -> (review) ->
+//! apply_override -> reanalyze -> assess_function -> repeat until
+//! satisfied. The same corrections persist to the sidecar so they
+//! survive across sessions and feed every other command.
+//!
 //! Designed for use with LLM-based clients (Claude Code, ...). The
-//! binary is loaded *once* at startup; every tool call hits cached
-//! `Program` state. Analysis is run lazily on the first tool that
-//! needs it.
+//! binary is loaded *once* at startup; correction tools mutate the
+//! in-memory `Program` (via reanalyze) and the on-disk sidecar.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -24,7 +40,6 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use gr_analysis::AnalysisManager;
 use gr_program::Program;
 
 /// JSON-RPC 2.0 request envelope. `id` is optional because
@@ -64,6 +79,10 @@ struct RpcError {
 /// avoids needing Send+Sync bounds on the trait object.
 struct Server {
     program: Program,
+    /// Path to the loaded binary. Needed so the AI-driven
+    /// correction loop can re-analyse after writing override
+    /// corrections to the `<binary>.gra.json` sidecar.
+    path: std::path::PathBuf,
     thumb: bool,
 }
 
@@ -72,15 +91,29 @@ impl Server {
         // Load + analyse up-front. The MCP transport is "long-lived
         // process answering one binary's questions," so paying the
         // analysis cost once at startup is the right shape.
-        let mut program = crate::analyze_binary(path)?;
-        let manager = AnalysisManager::new();
-        let _ = manager.run_all(&mut program);
-        Ok(Server { program, thumb })
+        // analyze_binary already runs the full analyzer manager AND
+        // applies any existing override sidecar.
+        let program = crate::analyze_binary(path)?;
+        Ok(Server {
+            program,
+            path: path.to_path_buf(),
+            thumb,
+        })
+    }
+
+    /// Re-run the full analysis pass (auto + sidecar overrides) from
+    /// scratch. Called after the AI applies a correction so the next
+    /// query sees the corrected model. Returns the new function
+    /// count for a confirmation message.
+    fn reanalyze(&mut self) -> Result<usize, String> {
+        let program = crate::analyze_binary(&self.path).map_err(|e| e.to_string())?;
+        self.program = program;
+        Ok(self.program.listing.functions().count())
     }
 
     /// Handle one JSON-RPC request. Returns `Some(response_json)`
     /// for requests, `None` for notifications (id-less messages).
-    fn handle(&self, req: RpcRequest) -> Option<String> {
+    fn handle(&mut self, req: RpcRequest) -> Option<String> {
         if req.jsonrpc != "2.0" {
             return Some(error_response(req.id, -32600, "invalid jsonrpc version"));
         }
@@ -112,20 +145,26 @@ impl Server {
         })
     }
 
-    fn handle_tool_call(&self, params: &Value) -> Result<Value, String> {
+    fn handle_tool_call(&mut self, params: &Value) -> Result<Value, String> {
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
-            .ok_or("missing 'name'")?;
+            .ok_or("missing 'name'")?
+            .to_string();
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-        let content = match name {
+        let content = match name.as_str() {
             "get_program_info" => tool_program_info(&self.program),
             "list_functions" => tool_list_functions(&self.program, &args),
             "list_symbols" => tool_list_symbols(&self.program, &args),
             "disassemble" => tool_disassemble(&self.program, &args),
             "decompile_function" => tool_decompile(self, &args),
             "find_xrefs" => tool_find_xrefs(&self.program, &args),
+            // --- AI-driven correction loop ---
+            "assess_function" => tool_assess_function(&self.program, &args),
+            "propose_corrections" => tool_propose_corrections(self),
+            "apply_override" => tool_apply_override(self, &args),
+            "reanalyze" => tool_reanalyze(self),
             other => return Err(format!("unknown tool: {}", other)),
         }?;
 
@@ -142,7 +181,7 @@ impl Server {
 /// to stdout, write trace info to stderr.
 pub fn run_stdio(path: &Path, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[mcp] loading {}", path.display());
-    let server = Server::new(path, thumb)?;
+    let mut server = Server::new(path, thumb)?;
     eprintln!("[mcp] ready; {} functions discovered", server.program.listing.functions().count());
 
     let stdin = std::io::stdin();
@@ -256,6 +295,41 @@ fn tool_list() -> Value {
                 },
                 "required": ["address"]
             }
+        },
+        {
+            "name": "assess_function",
+            "description": "Quality assessment of one function: instruction/byte/call counts, whether it appears truncated at the first call, and any call targets that aren't yet defined as functions. Use this to decide whether a function needs correction.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": {"type": "string", "description": "Function entry point (hex)."}
+                },
+                "required": ["address"]
+            }
+        },
+        {
+            "name": "propose_corrections",
+            "description": "Run the heuristic correction engine across the whole program and return concrete proposed corrections (force-function, remove-function, ...) each with a reason. The starting point for the AI correction loop: propose -> review -> apply_override -> reanalyze -> repeat.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "apply_override",
+            "description": "Record a manual correction into the persistent <binary>.gra.json sidecar. kind is one of: force_function, not_function, rename, set_cc. Does NOT re-analyse by itself -- call reanalyze afterwards (or set reanalyze=true) to see the effect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "description": "force_function | not_function | rename | set_cc"},
+                    "address": {"type": "string", "description": "Target address (hex)."},
+                    "value": {"type": "string", "description": "For rename: the new name. For set_cc: the convention. Ignored otherwise."},
+                    "reanalyze": {"type": "boolean", "description": "Re-run analysis immediately after recording (default false)."}
+                },
+                "required": ["kind", "address"]
+            }
+        },
+        {
+            "name": "reanalyze",
+            "description": "Re-run the full analysis pass (auto-analysis + all sidecar overrides). Call after apply_override to make the corrected model visible to subsequent queries.",
+            "inputSchema": { "type": "object", "properties": {} }
         },
     ])
 }
@@ -388,4 +462,117 @@ fn tool_find_xrefs(program: &Program, args: &Value) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+// ============================================================
+// AI-driven correction loop tools
+// ============================================================
+
+fn tool_assess_function(program: &Program, args: &Value) -> Result<String, String> {
+    let addr = parse_addr(args, "address")?;
+    match gr_analysis::iterate::assess_function(program, addr) {
+        Some(a) => {
+            let mut out = String::new();
+            out.push_str(&a.one_line());
+            out.push('\n');
+            if !a.unresolved_call_targets.is_empty() {
+                out.push_str("  unresolved call targets (candidates for force_function):\n");
+                for t in &a.unresolved_call_targets {
+                    out.push_str(&format!("    0x{:08x}\n", t));
+                }
+            }
+            if a.ends_on_call {
+                out.push_str(
+                    "  NOTE: body ends on a Call -- discovery may have truncated this function.\n",
+                );
+            }
+            Ok(out)
+        }
+        None => Err(format!("no function at 0x{:x}", addr)),
+    }
+}
+
+fn tool_propose_corrections(server: &Server) -> Result<String, String> {
+    // Feed the current sidecar in as context so we don't re-propose
+    // corrections that fight ones already recorded.
+    let existing = gr_program::OverrideSet::load_for_binary(&server.path).unwrap_or_default();
+    let proposals =
+        gr_analysis::iterate::propose_corrections_ctx(&server.program, Some(&existing));
+    if proposals.is_empty() {
+        return Ok("No corrections proposed; analysis looks clean by the current heuristics.".into());
+    }
+    let mut out = format!("{} correction(s) proposed:\n", proposals.len());
+    for c in &proposals {
+        out.push_str(&format!(
+            "  0x{:08x}  {:?}\n    reason: {}\n",
+            c.addr(),
+            c.kind,
+            c.reason
+        ));
+    }
+    out.push_str(
+        "\nApply with apply_override (kind = force_function / not_function / rename / set_cc), then reanalyze.\n",
+    );
+    Ok(out)
+}
+
+fn tool_apply_override(server: &mut Server, args: &Value) -> Result<String, String> {
+    use gr_program::OverrideSet;
+
+    let kind = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'kind'")?;
+    let addr = parse_addr(args, "address")?;
+    let value = args.get("value").and_then(|v| v.as_str());
+    let do_reanalyze = args
+        .get("reanalyze")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut set = OverrideSet::load_for_binary(&server.path)?;
+    match kind {
+        "force_function" => {
+            if !set.force_functions.contains(&addr) {
+                set.force_functions.push(addr);
+            }
+        }
+        "not_function" => {
+            if !set.remove_functions.contains(&addr) {
+                set.remove_functions.push(addr);
+            }
+        }
+        "rename" => {
+            let name = value.ok_or("rename requires 'value' (the new name)")?;
+            set.names.insert(addr, name.to_string());
+        }
+        "set_cc" => {
+            let cc = value.ok_or("set_cc requires 'value' (the convention)")?;
+            set.calling_conventions.insert(addr, cc.to_string());
+        }
+        other => return Err(format!("unknown kind '{}'", other)),
+    }
+
+    let sidecar = OverrideSet::sidecar_path(&server.path);
+    set.save(&sidecar)?;
+
+    let mut out = format!(
+        "Recorded {} at 0x{:08x} into {} ({} total corrections).",
+        kind,
+        addr,
+        sidecar.display(),
+        set.len()
+    );
+    if do_reanalyze {
+        let n = server.reanalyze()?;
+        out.push_str(&format!("\nRe-analysed: {} functions now defined.", n));
+    } else {
+        out.push_str("\nCall reanalyze to apply.");
+    }
+    Ok(out)
+}
+
+fn tool_reanalyze(server: &mut Server) -> Result<String, String> {
+    let n = server.reanalyze()?;
+    Ok(format!("Re-analysed; {} functions defined.", n))
 }

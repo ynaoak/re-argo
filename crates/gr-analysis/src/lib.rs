@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod ehframe;
 pub mod filler;
 pub mod indirect;
+pub mod iterate;
 pub mod manager;
 pub mod propagation;
 pub mod references;
