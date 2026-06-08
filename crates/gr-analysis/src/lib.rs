@@ -1,6 +1,7 @@
 pub mod analyzer;
 #[cfg(test)]
 mod testutil;
+pub mod addrtable;
 pub mod boundary;
 pub mod callingconv;
 pub mod callgraph;
