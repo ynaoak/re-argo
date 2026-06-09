@@ -140,7 +140,7 @@ impl Analyzer for NoReturnAnalyzer {
     }
 
     fn description(&self) -> &str {
-        "Identifies functions that never return (exit, abort, etc.)"
+        "Marks functions that never return using the signature DB + heuristics"
     }
 
     fn priority(&self) -> u32 {
@@ -148,19 +148,39 @@ impl Analyzer for NoReturnAnalyzer {
     }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let no_return_names = [
-            "exit", "_exit", "abort", "_abort", "__cxa_throw",
-            "ExitProcess", "TerminateProcess", "__stack_chk_fail",
-            "panic", "__assert_fail", "err", "errx",
-        ];
+        use std::sync::OnceLock;
+        use crate::signatures::SignatureDatabase;
+        static DB: OnceLock<SignatureDatabase> = OnceLock::new();
+        let db = DB.get_or_init(SignatureDatabase::new);
 
-        let mut name_set: std::collections::HashSet<String> = no_return_names.iter()
-            .map(|n| n.to_string())
+        // Build a name-set from the signature DB plus a few Rust/language-runtime names
+        // not covered there.
+        let mut name_set: std::collections::HashSet<String> = db
+            .no_return_names()
+            .flat_map(|n| {
+                [
+                    n.to_owned(),
+                    format!("{n}@plt"),
+                    format!("{n}@got.plt"),
+                ]
+            })
             .collect();
-        for n in &no_return_names {
-            name_set.insert(format!("{}@plt", n));
+
+        // Language-runtime no-return names not in the C/Win32 signature DB
+        for extra in &[
+            "panic",
+            "rust_panic",
+            "core::panicking::panic",
+            "std::process::exit",
+            "__aeabi_unwind_cpp_pr0",
+            "__aeabi_unwind_cpp_pr1",
+            "abort@plt",
+            "_abort",
+        ] {
+            name_set.insert(extra.to_string());
         }
 
+        // Step 1: mark functions whose symbol name is in the no-return set
         let no_return_addrs: std::collections::BTreeSet<u64> = program
             .symbol_table
             .iter()
@@ -168,19 +188,31 @@ impl Analyzer for NoReturnAnalyzer {
             .map(|sym| sym.address)
             .collect();
 
-        let mut detected = 0;
+        let mut marked = 0usize;
+        for &addr in &no_return_addrs {
+            if let Some(func) = program.listing.get_function_mut(addr) {
+                if !func.no_return {
+                    func.no_return = true;
+                    marked += 1;
+                }
+            }
+        }
+
+        // Step 2: count callers that only call no-return targets (heuristic)
         let func_entries: Vec<u64> = program.listing.functions().map(|f| f.entry_point).collect();
+        let mut detected = 0;
         for entry in func_entries {
             if let Some(func) = program.listing.get_function(entry)
-                && func.call_targets.iter().any(|t| no_return_addrs.contains(t)) {
-                    detected += 1;
-                }
+                && func.call_targets.iter().any(|t| no_return_addrs.contains(t))
+            {
+                detected += 1;
+            }
         }
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
             functions_found: detected,
-            references_found: 0,
+            references_found: marked,
             instructions_decoded: 0,
         })
     }
