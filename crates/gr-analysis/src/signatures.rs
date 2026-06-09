@@ -41,7 +41,8 @@ impl SignatureDatabase {
         // Each entry: (name, return_type, params, library, no_return)
         // Sources: IDA TIL (libc.til, mssdk.til), Binary Ninja type libraries,
         //          glibc headers, POSIX.1-2017, Win32 SDK
-        let sigs: &[(&str, &str, &[(&str, &str)], &str, bool)] = &[
+        type SigEntry = (&'static str, &'static str, &'static [(&'static str, &'static str)], &'static str, bool);
+        let sigs: &[SigEntry] = &[
             // ── stdio.h ────────────────────────────────────────────────────────────
             sig!("printf",    "int",    ["format" => "const char*"],                                     "libc"),
             sig!("fprintf",   "int",    ["stream" => "FILE*", "format" => "const char*"],                "libc"),

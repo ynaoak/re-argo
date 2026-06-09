@@ -190,11 +190,11 @@ impl Analyzer for NoReturnAnalyzer {
 
         let mut marked = 0usize;
         for &addr in &no_return_addrs {
-            if let Some(func) = program.listing.get_function_mut(addr) {
-                if !func.no_return {
-                    func.no_return = true;
-                    marked += 1;
-                }
+            if let Some(func) = program.listing.get_function_mut(addr)
+                && !func.no_return
+            {
+                func.no_return = true;
+                marked += 1;
             }
         }
 
