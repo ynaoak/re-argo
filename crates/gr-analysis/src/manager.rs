@@ -4,6 +4,7 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
 use crate::callingconv::CallingConventionAnalyzer;
 use crate::canary::StackCanaryAnalyzer;
+use crate::crypto::CryptoConstantAnalyzer;
 use crate::coverage::CoverageAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
 use crate::demangle::DemangleAnalyzer;
@@ -11,8 +12,10 @@ use crate::discovery::FunctionDiscoveryAnalyzer;
 use crate::ehframe::EhFrameAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
 use crate::fingerprint::CompilerFingerprintAnalyzer;
+use crate::format_varargs::FormatVarargsAnalyzer;
 use crate::got_annotate::GotAnnotator;
 use crate::immstr::ImmediateStringAnnotator;
+use crate::inline_mem::InlineMemAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
@@ -29,6 +32,7 @@ use crate::pcoderef::PcodeReferenceAnalyzer;
 use crate::signatures::SignatureApplierAnalyzer;
 use crate::callsite_annotate::CallSiteAnnotator;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
+use crate::tls::TlsVariableAnalyzer;
 use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
 use crate::vtable::VTableAnalyzer;
 use crate::xref_report::{CrossReferenceReportAnalyzer, UnreferencedFunctionAnalyzer};
@@ -54,11 +58,13 @@ impl AnalysisManager {
             Box::new(FillerBytesAnalyzer),
             Box::new(StringSearchAnalyzer),
             Box::new(NoReturnAnalyzer),
+            Box::new(CryptoConstantAnalyzer),
             Box::new(ScalarReferenceAnalyzer),
             Box::new(ConstantPropagationAnalyzer),
             Box::new(StackFrameAnalyzer),
             Box::new(StackStringAnalyzer),
             Box::new(ImmediateStringAnnotator),
+            Box::new(InlineMemAnalyzer),
             Box::new(ThunkDetectorAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
@@ -70,9 +76,11 @@ impl AnalysisManager {
             Box::new(PatternFunctionAnalyzer),
             Box::new(SignatureApplierAnalyzer),
             Box::new(StackCanaryAnalyzer),
+            Box::new(TlsVariableAnalyzer),
             Box::new(CallSiteAnnotator),
             Box::new(StringXrefAnnotator),
             Box::new(GotAnnotator),
+            Box::new(FormatVarargsAnalyzer),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
             Box::new(DuplicateCodeAnalyzer),

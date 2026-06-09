@@ -23,6 +23,7 @@
 
 use gr_lift::PcodeLift;
 use gr_program::comments::CommentType;
+use gr_program::symbol::{SourceType, Symbol, SymbolType};
 use gr_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -62,6 +63,7 @@ impl Analyzer for CallSiteAnnotator {
         let db = DB.get_or_init(SignatureDatabase::new);
 
         let mut annotated = 0usize;
+        let mut string_promotions: Vec<u64> = Vec::new();
         for site in &sites {
             let Some(target) = site.call_target else {
                 continue;
@@ -79,9 +81,29 @@ impl Analyzer for CallSiteAnnotator {
             {
                 continue;
             }
-            let text = format_call(sig, site, program);
+            let text = format_call(sig, site, program, &mut string_promotions);
             program.comments.set(site.call_site, CommentType::Pre, text);
             annotated += 1;
+        }
+
+        // Light type-propagation: every address we successfully read as
+        // a C string here was *proven* to be string data (a signature
+        // declared its containing argument `char*` and we got a valid
+        // NUL-terminated printable run out of it). Promote those bytes
+        // to a `s_XXXX` Data symbol so xref reports and decompiler
+        // output show them as strings instead of bare integers.
+        string_promotions.sort_unstable();
+        string_promotions.dedup();
+        for addr in string_promotions {
+            if program.symbol_table.primary_at(addr).is_some() {
+                continue;
+            }
+            program.symbol_table.add(Symbol::new(
+                format!("s_{:x}", addr),
+                addr,
+                SymbolType::Data,
+                SourceType::Analysis,
+            ));
         }
 
         Ok(AnalysisResult {
@@ -97,6 +119,7 @@ fn format_call(
     sig: &FunctionSignature,
     site: &crate::callsite::CallSite,
     program: &Program,
+    string_promotions: &mut Vec<u64>,
 ) -> String {
     let mut out = format!("{}(", sig.name);
     let n = sig.parameters.len().min(site.args.len());
@@ -114,6 +137,7 @@ fn format_call(
             Some(v) if is_pointer_type(ptype) => {
                 if let Some(s) = read_c_string(program, v) {
                     out.push_str(&format!("\"{}\"", escape(&s)));
+                    string_promotions.push(v);
                 } else {
                     out.push_str(&format!("0x{:x}", v));
                 }
@@ -134,6 +158,8 @@ fn format_call(
         && let Some(fmt_addr) = site.args[fmt_idx].value
         && let Some(fmt) = read_c_string(program, fmt_addr)
     {
+        // Format string itself is a known string — propagate.
+        string_promotions.push(fmt_addr);
         let specs = parse_format_specs(&fmt);
         let extra_start = fmt_idx + 1;
         let avail = site.args.len().saturating_sub(extra_start);
@@ -145,7 +171,10 @@ fn format_call(
             first = false;
             match arg.value {
                 Some(v) if spec.is_string => match read_c_string(program, v) {
-                    Some(s) => out.push_str(&format!("\"{}\"", escape(&s))),
+                    Some(s) => {
+                        out.push_str(&format!("\"{}\"", escape(&s)));
+                        string_promotions.push(v);
+                    }
                     None => out.push_str(&format!("0x{:x}", v)),
                 },
                 Some(v) if spec.is_pointer => out.push_str(&format!("0x{:x}", v)),
