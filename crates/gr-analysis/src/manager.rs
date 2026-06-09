@@ -3,12 +3,14 @@ use gr_program::Program;
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
 use crate::callingconv::CallingConventionAnalyzer;
+use crate::canary::StackCanaryAnalyzer;
 use crate::coverage::CoverageAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
 use crate::demangle::DemangleAnalyzer;
 use crate::discovery::FunctionDiscoveryAnalyzer;
 use crate::ehframe::EhFrameAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
+use crate::fingerprint::CompilerFingerprintAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
@@ -42,6 +44,7 @@ impl AnalysisManager {
     pub fn new() -> Self {
         let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
             Box::new(EntryPointAnalyzer),
+            Box::new(CompilerFingerprintAnalyzer),
             Box::new(DemangleAnalyzer),
             Box::new(EhFrameAnalyzer),
             Box::new(FunctionDiscoveryAnalyzer),
@@ -62,6 +65,7 @@ impl AnalysisManager {
             Box::new(RttiAnalyzer),
             Box::new(PatternFunctionAnalyzer),
             Box::new(SignatureApplierAnalyzer),
+            Box::new(StackCanaryAnalyzer),
             Box::new(CallSiteAnnotator),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),

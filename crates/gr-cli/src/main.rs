@@ -490,7 +490,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let info = BinaryLoader::load(path)?;
+    // We need a Program (not just BinaryInfo) so the fingerprint
+    // analyzer can populate metadata cheaply — it only reads .comment
+    // and .note.gnu.build-id; no disassembly or lifting.
+    let mut program = gr_program::Program::from_binary(path)?;
+    let info = &program.info;
     println!("File:         {}", path.display());
     println!("Format:       {}", info.format);
     println!("Architecture: {}", info.arch);
@@ -499,6 +503,18 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("Entry Point:  0x{:x}", info.entry_point);
     println!("Sections:     {}", info.sections.len());
     println!("Symbols:      {}", info.symbols.len());
+
+    let fp = gr_analysis::fingerprint::CompilerFingerprintAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&fp, &mut program);
+    let p = &program.metadata.properties;
+    if !p.is_empty() {
+        println!();
+        for key in ["compiler", "language", "libc_version", "build_id"] {
+            if let Some(v) = p.get(key) {
+                println!("{:<13} {}", format!("{}:", key), v);
+            }
+        }
+    }
     Ok(())
 }
 

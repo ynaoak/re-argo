@@ -5,6 +5,7 @@ use gr_arch::Architecture;
 
 use crate::comments::CommentManager;
 use crate::listing::Listing;
+use crate::metadata::ProgramMetadata;
 use crate::reference::ReferenceManager;
 use crate::symbol::{SourceType, Symbol, SymbolTable, SymbolType};
 
@@ -37,6 +38,9 @@ pub struct Program {
     /// Persistent comments (plate / EOL / etc.). Populated by the
     /// user-override layer and any analyzer that annotates addresses.
     pub comments: CommentManager,
+    /// Compiler / language / build metadata, surfaced via `info` and
+    /// `export`. Populated by the compiler-fingerprint analyzer.
+    pub metadata: ProgramMetadata,
 }
 
 impl Program {
@@ -87,6 +91,7 @@ impl Program {
             references: ReferenceManager::new(),
             data_types: DataTypeManager::new(),
             comments: CommentManager::new(),
+            metadata: ProgramMetadata::default(),
         })
     }
 
