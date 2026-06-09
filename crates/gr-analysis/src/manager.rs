@@ -25,12 +25,14 @@ use crate::loops::LoopAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
+use crate::scc::CallGraphSccAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::stackstr::StackStringAnalyzer;
 use crate::string_xref::StringXrefAnnotator;
 use crate::strings::StringSearchAnalyzer;
 use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
+use crate::switches_v2::SwitchTableOffsetAnalyzer;
 use crate::noreturn_prop::{DuplicateCodeAnalyzer, NoReturnPropagationAnalyzer};
 use crate::addrtable::AddressTableAnalyzer;
 use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
@@ -77,6 +79,7 @@ impl AnalysisManager {
             Box::new(PcodeReferenceAnalyzer),
             Box::new(AddressTableAnalyzer),
             Box::new(SwitchTableAnalyzer),
+            Box::new(SwitchTableOffsetAnalyzer),
             Box::new(TailCallAnalyzer),
             Box::new(VTableAnalyzer),
             Box::new(RttiAnalyzer),
@@ -93,6 +96,7 @@ impl AnalysisManager {
             Box::new(ExceptionFlowAnalyzer),
             Box::new(AntiDebugAnalyzer),
             Box::new(ComplexityAnalyzer),
+            Box::new(CallGraphSccAnalyzer),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
             Box::new(DuplicateCodeAnalyzer),

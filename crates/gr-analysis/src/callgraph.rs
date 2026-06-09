@@ -73,6 +73,35 @@ impl CallGraph {
             .collect()
     }
 
+    /// Strongly-connected components — Tarjan, one Vec per SCC,
+    /// each entry a `(address, name)` pair. Trivial single-node
+    /// components without self-loops are filtered out so callers
+    /// get only the cyclic clusters.
+    pub fn recursive_clusters(&self) -> Vec<Vec<(u64, String)>> {
+        let mut out: Vec<Vec<(u64, String)>> = Vec::new();
+        for component in petgraph::algo::tarjan_scc(&self.graph) {
+            let cyclic = if component.len() == 1 {
+                self.graph.contains_edge(component[0], component[0])
+            } else {
+                component.len() > 1
+            };
+            if !cyclic {
+                continue;
+            }
+            let mut members: Vec<(u64, String)> = component
+                .iter()
+                .map(|&n| {
+                    let node = &self.graph[n];
+                    (node.address, node.name.clone())
+                })
+                .collect();
+            members.sort_by_key(|(a, _)| *a);
+            out.push(members);
+        }
+        out.sort_by_key(|m| m[0].0);
+        out
+    }
+
     pub fn to_dot(&self) -> String {
         let mut out = String::from("digraph callgraph {\n    rankdir=LR;\n    node [shape=box];\n");
         for idx in self.graph.node_indices() {

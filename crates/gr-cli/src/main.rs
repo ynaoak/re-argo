@@ -125,6 +125,9 @@ enum Commands {
         /// Output DOT format
         #[arg(long)]
         dot: bool,
+        /// Print strongly-connected components (mutual / direct recursion)
+        #[arg(long)]
+        scc: bool,
     },
     /// Show P-code for instructions at an address
     Pcode {
@@ -475,7 +478,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Metrics { file, sort, top } => cmd_metrics(&file, &sort, top),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
-        Commands::Callgraph { file, dot } => cmd_callgraph(&file, dot),
+        Commands::Callgraph { file, dot, scc } => cmd_callgraph(&file, dot, scc),
         Commands::Pcode {
             file,
             start,
@@ -1135,27 +1138,51 @@ fn cmd_xrefs(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-fn cmd_callgraph(path: &Path, dot: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_callgraph(
+    path: &Path,
+    dot: bool,
+    scc: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
     let cg = CallGraph::build(&program);
 
     if dot {
         print!("{}", cg.to_dot());
-    } else {
+        return Ok(());
+    }
+
+    if scc {
+        let clusters = cg.recursive_clusters();
         println!(
-            "Call graph: {} nodes, {} edges\n",
-            cg.node_count(),
-            cg.edge_count()
+            "Found {} recursive cluster{} in call graph",
+            clusters.len(),
+            if clusters.len() == 1 { "" } else { "s" }
         );
-        for func in program.listing.functions() {
-            let callees = cg.callees_of(func.entry_point);
-            if callees.is_empty() {
-                continue;
+        for (i, members) in clusters.iter().enumerate() {
+            println!("\n  cluster {} ({} func{}):",
+                i,
+                members.len(),
+                if members.len() == 1 { "" } else { "s" });
+            for (addr, name) in members {
+                println!("    0x{:x}  {}", addr, name);
             }
-            println!("  {} (0x{:x}):", func.name, func.entry_point);
-            for callee in &callees {
-                println!("    -> {} (0x{:x})", callee.name, callee.address);
-            }
+        }
+        return Ok(());
+    }
+
+    println!(
+        "Call graph: {} nodes, {} edges\n",
+        cg.node_count(),
+        cg.edge_count()
+    );
+    for func in program.listing.functions() {
+        let callees = cg.callees_of(func.entry_point);
+        if callees.is_empty() {
+            continue;
+        }
+        println!("  {} (0x{:x}):", func.name, func.entry_point);
+        for callee in &callees {
+            println!("    -> {} (0x{:x})", callee.name, callee.address);
         }
     }
     Ok(())
