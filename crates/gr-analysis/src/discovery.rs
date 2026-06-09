@@ -49,7 +49,18 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             if visited.contains(&func_entry) {
                 continue;
             }
-            if program.listing.has_function(func_entry) {
+            // A pre-existing function with an empty body (added by
+            // EhFrameAnalyzer, EntryPointAnalyzer, or by Symbols
+            // pre-seeding) still needs its body discovered — without
+            // it `function_containing` rejects every address inside
+            // and every downstream analyzer (callsite resolver,
+            // boundary checker, coverage…) treats those bytes as
+            // un-owned. Re-run discovery, then merge results in.
+            let needs_body = program
+                .listing
+                .get_function(func_entry)
+                .is_some_and(|f| f.body.is_empty());
+            if program.listing.has_function(func_entry) && !needs_body {
                 continue;
             }
 
@@ -68,12 +79,23 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                         program.references.add(*r);
                     }
 
-                    let mut func = if let Some(sym) = program.symbol_table.primary_at(func_entry) {
-                        Function::new(func_entry, sym.name.clone())
+                    if needs_body {
+                        if let Some(existing) = program.listing.get_function_mut(func_entry) {
+                            existing.body = discovery.body;
+                            existing.call_targets = discovery.call_targets.clone();
+                        }
                     } else {
-                        Function::new(func_entry, format!("FUN_{:08x}", func_entry))
-                    };
-                    func.body = discovery.body;
+                        let mut func =
+                            if let Some(sym) = program.symbol_table.primary_at(func_entry) {
+                                Function::new(func_entry, sym.name.clone())
+                            } else {
+                                Function::new(func_entry, format!("FUN_{:08x}", func_entry))
+                            };
+                        func.body = discovery.body;
+                        func.call_targets = discovery.call_targets.clone();
+                        program.listing.add_function(func);
+                        functions_found += 1;
+                    }
 
                     for call_target in &discovery.call_targets {
                         if !visited.contains(call_target)
@@ -82,10 +104,6 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                             work_queue.push_back(*call_target);
                         }
                     }
-
-                    func.call_targets = discovery.call_targets;
-                    program.listing.add_function(func);
-                    functions_found += 1;
                 }
                 Err(_) => continue,
             }

@@ -84,6 +84,7 @@ mod tests {
             }).collect(),
             symbols: Vec::new(),
             references: Vec::new(),
+            comments: Vec::new(),
             references_count: 0,
             instructions_count: 0,
             has_dwarf: false,

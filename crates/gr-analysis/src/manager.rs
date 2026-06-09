@@ -14,6 +14,7 @@ use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
+use crate::stackstr::StackStringAnalyzer;
 use crate::strings::StringSearchAnalyzer;
 use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
 use crate::noreturn_prop::{DuplicateCodeAnalyzer, NoReturnPropagationAnalyzer};
@@ -21,6 +22,7 @@ use crate::addrtable::AddressTableAnalyzer;
 use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
 use crate::pcoderef::PcodeReferenceAnalyzer;
 use crate::signatures::SignatureApplierAnalyzer;
+use crate::callsite_annotate::CallSiteAnnotator;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
 use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
 use crate::vtable::VTableAnalyzer;
@@ -49,6 +51,7 @@ impl AnalysisManager {
             Box::new(ScalarReferenceAnalyzer),
             Box::new(ConstantPropagationAnalyzer),
             Box::new(StackFrameAnalyzer),
+            Box::new(StackStringAnalyzer),
             Box::new(ThunkDetectorAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
@@ -59,6 +62,7 @@ impl AnalysisManager {
             Box::new(RttiAnalyzer),
             Box::new(PatternFunctionAnalyzer),
             Box::new(SignatureApplierAnalyzer),
+            Box::new(CallSiteAnnotator),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
             Box::new(DuplicateCodeAnalyzer),

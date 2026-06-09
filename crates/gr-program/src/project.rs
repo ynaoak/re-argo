@@ -14,6 +14,8 @@ pub struct ProjectSummary {
     pub functions: Vec<FunctionSummary>,
     pub symbols: Vec<SymbolSummary>,
     pub references: Vec<ReferenceSummary>,
+    #[serde(default)]
+    pub comments: Vec<CommentSummary>,
     pub references_count: usize,
     pub instructions_count: usize,
     pub has_dwarf: bool,
@@ -22,6 +24,13 @@ pub struct ProjectSummary {
     pub version: String,
     pub dynamic_libs: Vec<String>,
     pub import_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentSummary {
+    pub address: u64,
+    pub kind: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +92,17 @@ impl ProjectSummary {
             })
             .collect();
 
+        let comments = program
+            .comments
+            .iter()
+            .take(20000)
+            .map(|c| CommentSummary {
+                address: c.address,
+                kind: format!("{:?}", c.comment_type),
+                text: c.text,
+            })
+            .collect();
+
         Self {
             name: program.name.clone(),
             format: format!("{}", program.info.format),
@@ -92,6 +112,7 @@ impl ProjectSummary {
             functions,
             symbols,
             references,
+            comments,
             references_count: program.references.len(),
             instructions_count: program.listing.instruction_count(),
             has_dwarf: program.has_dwarf(),
@@ -167,6 +188,11 @@ mod tests {
                 from: 0x1000,
                 to: 0x2000,
                 ref_type: "CALL".into(),
+            }],
+            comments: vec![CommentSummary {
+                address: 0x1003,
+                kind: "Pre".into(),
+                text: "printf(...)".into(),
             }],
             references_count: 42,
             instructions_count: 100,

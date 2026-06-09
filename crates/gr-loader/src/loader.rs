@@ -296,11 +296,32 @@ impl BinaryLoader {
             });
         }
 
+        // Modern glibc + linkers split the PLT in two when CET / IBT is
+        // enabled:
+        //   `.plt`     — legacy stubs, kept for fallback; index 0 is the
+        //                resolver header, so import i lives at +`(i+1)*16`.
+        //   `.plt.sec` — IBT-aware entries called directly by compiler
+        //                output; no header, so import i lives at +`i*16`.
+        //   `.plt.got` — bind-now variant used when the linker can resolve
+        //                lazily-bound stubs at load time; same shape as
+        //                `.plt.sec` but indexed independently.
+        //
+        // The relocation order in `.rela.plt` is the canonical mapping
+        // both sections obey, so we can emit `name@plt` symbols at every
+        // matching base. Without this, callers that target `.plt.sec`
+        // (CET binaries → essentially everything on modern distros) see
+        // no symbol at the call target and downstream signature- /
+        // call-site analyzers all silently miss.
         let mut imports = Vec::new();
-        let plt_section = elf.section_headers.iter().find(|sh| {
-            elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("") == ".plt"
-        });
-        let plt_base = plt_section.map(|sh| sh.sh_addr).unwrap_or(0);
+        let section_addr = |want: &str| -> Option<u64> {
+            elf.section_headers
+                .iter()
+                .find(|sh| elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("") == want)
+                .map(|sh| sh.sh_addr)
+        };
+        let plt_base = section_addr(".plt").unwrap_or(0);
+        let plt_sec_base = section_addr(".plt.sec");
+        let plt_got_base = section_addr(".plt.got");
         let plt_entry_size: u64 = 16;
 
         for (i, reloc) in elf.pltrelocs.iter().enumerate() {
@@ -321,6 +342,22 @@ impl BinaryLoader {
                         size: plt_entry_size,
                         kind: SymbolKind::Function,
                     });
+                    if let Some(base) = plt_sec_base {
+                        symbols.push(LoadSymbol {
+                            name: format!("{}@plt", name),
+                            address: base + i as u64 * plt_entry_size,
+                            size: plt_entry_size,
+                            kind: SymbolKind::Function,
+                        });
+                    }
+                    if let Some(base) = plt_got_base {
+                        symbols.push(LoadSymbol {
+                            name: format!("{}@plt", name),
+                            address: base + i as u64 * plt_entry_size,
+                            size: plt_entry_size,
+                            kind: SymbolKind::Function,
+                        });
+                    }
                     symbols.push(LoadSymbol {
                         name: format!("{}@GOT", name),
                         address: got_addr,
