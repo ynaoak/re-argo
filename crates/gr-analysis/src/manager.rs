@@ -3,19 +3,23 @@ use gr_program::Program;
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
 use crate::callingconv::CallingConventionAnalyzer;
+use crate::anti_debug::AntiDebugAnalyzer;
 use crate::canary::StackCanaryAnalyzer;
+use crate::crt::CrtAnalyzer;
 use crate::crypto::CryptoConstantAnalyzer;
 use crate::coverage::CoverageAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
 use crate::demangle::DemangleAnalyzer;
 use crate::discovery::FunctionDiscoveryAnalyzer;
 use crate::ehframe::EhFrameAnalyzer;
+use crate::exception::ExceptionFlowAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
 use crate::fingerprint::CompilerFingerprintAnalyzer;
 use crate::format_varargs::FormatVarargsAnalyzer;
 use crate::got_annotate::GotAnnotator;
 use crate::immstr::ImmediateStringAnnotator;
 use crate::inline_mem::InlineMemAnalyzer;
+use crate::loops::LoopAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
@@ -75,12 +79,16 @@ impl AnalysisManager {
             Box::new(RttiAnalyzer),
             Box::new(PatternFunctionAnalyzer),
             Box::new(SignatureApplierAnalyzer),
+            Box::new(CrtAnalyzer),
             Box::new(StackCanaryAnalyzer),
             Box::new(TlsVariableAnalyzer),
             Box::new(CallSiteAnnotator),
             Box::new(StringXrefAnnotator),
             Box::new(GotAnnotator),
             Box::new(FormatVarargsAnalyzer),
+            Box::new(LoopAnalyzer),
+            Box::new(ExceptionFlowAnalyzer),
+            Box::new(AntiDebugAnalyzer),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
             Box::new(DuplicateCodeAnalyzer),
