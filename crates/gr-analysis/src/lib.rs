@@ -21,6 +21,7 @@ pub mod strings;
 pub mod switches;
 pub mod noreturn_prop;
 pub mod patterns;
+pub mod pcoderef;
 pub mod rtti;
 pub mod signatures;
 pub mod thunk;
