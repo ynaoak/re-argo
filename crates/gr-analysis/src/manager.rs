@@ -5,7 +5,9 @@ use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
 use crate::callingconv::CallingConventionAnalyzer;
 use crate::anti_debug::AntiDebugAnalyzer;
 use crate::canary::StackCanaryAnalyzer;
+use crate::complexity::ComplexityAnalyzer;
 use crate::crt::CrtAnalyzer;
+use crate::crt_patterns::CrtPatternAnalyzer;
 use crate::crypto::CryptoConstantAnalyzer;
 use crate::coverage::CoverageAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
@@ -70,6 +72,7 @@ impl AnalysisManager {
             Box::new(ImmediateStringAnnotator),
             Box::new(InlineMemAnalyzer),
             Box::new(ThunkDetectorAnalyzer),
+            Box::new(CrtPatternAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
             Box::new(AddressTableAnalyzer),
@@ -89,6 +92,7 @@ impl AnalysisManager {
             Box::new(LoopAnalyzer),
             Box::new(ExceptionFlowAnalyzer),
             Box::new(AntiDebugAnalyzer),
+            Box::new(ComplexityAnalyzer),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
             Box::new(DuplicateCodeAnalyzer),

@@ -91,6 +91,25 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// Print per-function complexity metrics
+    Metrics {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Sort by this column (mccabe, blocks, insns, fan_in, fan_out, stack)
+        #[arg(long, default_value = "mccabe")]
+        sort: String,
+        /// Show only the top N functions after sorting
+        #[arg(long, default_value_t = 25)]
+        top: usize,
+    },
+    /// Emit a DOT graph of a function's control flow
+    Cfg {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Function entry address (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+    },
     /// Show cross-references to/from an address
     Xrefs {
         /// Path to the binary file
@@ -453,6 +472,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Registers { file } => cmd_registers(&file),
         Commands::Analyze { file } => cmd_analyze(&file),
         Commands::Functions { file } => cmd_functions(&file),
+        Commands::Metrics { file, sort, top } => cmd_metrics(&file, &sort, top),
+        Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
         Commands::Callgraph { file, dot } => cmd_callgraph(&file, dot),
         Commands::Pcode {
@@ -892,6 +913,178 @@ fn cmd_functions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!("\nTotal: {} functions", program.listing.function_count());
+    Ok(())
+}
+
+fn cmd_metrics(
+    path: &Path,
+    sort: &str,
+    top: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    // Collect (entry, name, metrics) for every function whose
+    // ComplexityAnalyzer summary was written into metadata.
+    let mut rows: Vec<(u64, String, gr_analysis::complexity::FunctionMetrics)> = Vec::new();
+    for f in program.listing.functions() {
+        let key = format!("func_{:x}_metrics", f.entry_point);
+        let Some(raw) = program.metadata.get_property(&key) else {
+            continue;
+        };
+        let Some(m) = gr_analysis::complexity::parse_metrics(raw) else {
+            continue;
+        };
+        rows.push((f.entry_point, f.name.clone(), m));
+    }
+
+    let key_of = |m: &gr_analysis::complexity::FunctionMetrics| -> i64 {
+        match sort {
+            "mccabe" => m.cyclomatic as i64,
+            "blocks" => m.basic_blocks as i64,
+            "insns" => m.instructions as i64,
+            "fan_in" => m.fan_in as i64,
+            "fan_out" => m.fan_out as i64,
+            "stack" => m.stack_size as i64,
+            _ => m.cyclomatic as i64,
+        }
+    };
+    rows.sort_by_key(|(_, _, m)| -key_of(m));
+    if rows.len() > top {
+        rows.truncate(top);
+    }
+
+    println!(
+        "\n{:<18} {:<32} {:>6} {:>6} {:>6} {:>6} {:>7} {:>8}",
+        "Address", "Name", "insns", "blocks", "mccabe", "fanIn", "fanOut", "stack"
+    );
+    println!("{}", "-".repeat(95));
+    for (addr, name, m) in &rows {
+        let display_name = if name.len() > 32 {
+            format!("{}…", &name[..31])
+        } else {
+            name.clone()
+        };
+        println!(
+            "0x{:016x} {:<32} {:>6} {:>6} {:>6} {:>6} {:>7} {:>8}",
+            addr,
+            display_name,
+            m.instructions,
+            m.basic_blocks,
+            m.cyclomatic,
+            m.fan_in,
+            m.fan_out,
+            m.stack_size
+        );
+    }
+    println!("\nShowing top {} sorted by {}", rows.len(), sort);
+    Ok(())
+}
+
+fn cmd_cfg(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    let Some(func) = program.listing.get_function(address) else {
+        eprintln!("cfg: no function at 0x{:x}", address);
+        return Ok(());
+    };
+
+    // Compute basic blocks from instruction-level flow info. A new
+    // block starts at: function entry, any branch target, and the
+    // instruction immediately after any branch.
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut block_starts: BTreeSet<u64> = BTreeSet::new();
+    block_starts.insert(func.entry_point);
+    let ranges: Vec<(u64, u64)> = func
+        .body
+        .ranges()
+        .map(|r| (r.start.offset, r.start.offset + r.size))
+        .collect();
+    let mut insns: Vec<&gr_arch::DecodedInstruction> = Vec::new();
+    for (s, e) in &ranges {
+        for ins in program.listing.instructions_in_range(*s, *e) {
+            insns.push(ins);
+        }
+    }
+    insns.sort_by_key(|i| i.address);
+
+    use gr_arch::FlowType;
+    let mut after_branch = false;
+    for ins in &insns {
+        if after_branch {
+            block_starts.insert(ins.address);
+        }
+        match ins.flow_type {
+            FlowType::ConditionalJump | FlowType::UnconditionalJump => {
+                if let Some(t) = ins.branch_target {
+                    block_starts.insert(t);
+                }
+                after_branch = true;
+            }
+            FlowType::Return => after_branch = true,
+            _ => after_branch = false,
+        }
+    }
+
+    // Build edges by walking instructions in block order.
+    let starts: Vec<u64> = block_starts.iter().copied().collect();
+    let mut edges: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut block_for_addr: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut cursor = 0usize;
+    for ins in &insns {
+        while cursor + 1 < starts.len() && starts[cursor + 1] <= ins.address {
+            cursor += 1;
+        }
+        block_for_addr.insert(ins.address, starts[cursor]);
+    }
+    for ins in &insns {
+        let from_block = *block_for_addr.get(&ins.address).unwrap_or(&0);
+        match ins.flow_type {
+            FlowType::ConditionalJump => {
+                if let Some(t) = ins.branch_target {
+                    edges.insert((from_block, t));
+                }
+                let fall = ins.address + ins.length as u64;
+                if block_for_addr.contains_key(&fall) {
+                    edges.insert((from_block, fall));
+                }
+            }
+            FlowType::UnconditionalJump => {
+                if let Some(t) = ins.branch_target {
+                    edges.insert((from_block, t));
+                }
+            }
+            FlowType::Return => {}
+            _ => {
+                let next = ins.address + ins.length as u64;
+                if block_for_addr
+                    .get(&next)
+                    .is_some_and(|b| *b != from_block)
+                {
+                    edges.insert((from_block, next));
+                }
+            }
+        }
+    }
+
+    println!("digraph \"{}\" {{", func.name);
+    println!("    node [shape=box, fontname=\"Courier\"];");
+    for &b in &starts {
+        let header = if b == func.entry_point {
+            format!("{} (entry)", func.name)
+        } else {
+            format!("0x{:x}", b)
+        };
+        println!("    \"0x{:x}\" [label=\"{}\"];", b, header);
+    }
+    for (from, to) in &edges {
+        println!("    \"0x{:x}\" -> \"0x{:x}\";", from, to);
+    }
+    println!("}}");
+    println!(
+        "// {} basic blocks, {} edges, McCabe={}",
+        starts.len(),
+        edges.len(),
+        edges.len() as i64 - starts.len() as i64 + 2
+    );
     Ok(())
 }
 

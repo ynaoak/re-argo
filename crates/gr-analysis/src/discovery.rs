@@ -39,6 +39,40 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             }
         }
 
+        // `.init_array` / `.fini_array` / `.preinit_array` (and the
+        // legacy `.ctors` / `.dtors`) hold pointer arrays the loader
+        // calls before / after `main`. Discovery doesn't follow
+        // these by default — they're populated by the linker and
+        // referenced only from `.dynamic`, never from code — so
+        // stripped binaries end up with `frame_dummy` and
+        // `__do_global_dtors_aux` invisible to every downstream
+        // analyzer that walks the function list. Seeding them here
+        // costs almost nothing and unlocks the CRT-pattern recogniser.
+        let pointer_width = if program.info.bits == 64 { 8 } else { 4 };
+        for sec_name in [".init_array", ".fini_array", ".preinit_array", ".ctors", ".dtors"] {
+            let Some(section) = program.info.sections.iter().find(|s| s.name == sec_name) else {
+                continue;
+            };
+            if section.size == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; section.size.min(4096) as usize];
+            if program.info.memory.read_bytes(section.address, &mut buf).is_err() {
+                continue;
+            }
+            for chunk in buf.chunks_exact(pointer_width) {
+                let ptr = if pointer_width == 8 {
+                    u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]))
+                } else {
+                    u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])) as u64
+                };
+                if ptr == 0 || ptr == u64::MAX {
+                    continue;
+                }
+                work_queue.push_back(ptr);
+            }
+        }
+
         const MAX_FUNCTIONS: usize = 50_000;
         const MAX_INSTRUCTIONS: usize = 5_000_000;
 
