@@ -177,7 +177,14 @@ impl Analyzer for RttiAnalyzer {
         // (a). Without this, the smoke ELF (Animal/Dog/Cat
         // chain) emits two extra "vtable for Animal"s pointing
         // at Dog's and Animal's own typeinfo structures.
-        let mut vtables: Vec<(u64, String)> = Vec::new();
+        // Records (header_addr, linker_base_addr, class_name).
+        // `header_addr` is the typeinfo-pointer slot; `linker_base`
+        // is what the linker calls "vtable for X" (header + ptr_size).
+        // Emitting symbols at BOTH lets users probe with either
+        // convention -- common RTTI walkers in Ghidra/IDA report the
+        // header address, the C++ linker reports +ptr_size, and we
+        // want xref to succeed at both.
+        let mut vtables: Vec<(u64, u64, String)> = Vec::new();
         for &(start, end) in &data_sections {
             let mut addr = (start + ptr_size - 1) & !(ptr_size - 1);
             while addr + ptr_size * 2 <= end {
@@ -190,7 +197,7 @@ impl Analyzer for RttiAnalyzer {
                     if let Ok(first_vfunc) = program.info.memory.read_u64(vt_addr)
                         && in_any_range(first_vfunc, &code_ranges)
                     {
-                        vtables.push((vt_addr, class_name.clone()));
+                        vtables.push((addr, vt_addr, class_name.clone()));
                     }
                 }
                 addr += ptr_size;
@@ -213,8 +220,8 @@ impl Analyzer for RttiAnalyzer {
             classes_found += 1;
         }
 
-        for (vt_addr, class_name) in &vtables {
-            let sym_name = format!("vtable for {}", class_name);
+        for (header_addr, vt_addr, class_name) in &vtables {
+            let primary = format!("vtable for {}", class_name);
             // `set_primary` front-inserts so this class-aware name
             // wins over VTableAnalyzer's earlier `vtable_<hex>`
             // placeholder under `primary_at` lookup. (User
@@ -222,7 +229,19 @@ impl Analyzer for RttiAnalyzer {
             // step, which runs after every analyzer.)
             program
                 .symbol_table
-                .set_primary(*vt_addr, sym_name, SymbolType::Data);
+                .set_primary(*vt_addr, primary, SymbolType::Data);
+            // Header alias at the typeinfo-pointer slot. Probing
+            // there is what RTTI walkers in Ghidra/IDA naturally
+            // produce; without this xref/decompile users with that
+            // habit just see a bare hex address and assume the
+            // analyzer didn't fire.
+            let alias = format!("vtable for {} (header)", class_name);
+            program.symbol_table.add(Symbol::new(
+                alias,
+                *header_addr,
+                SymbolType::Data,
+                SourceType::Analysis,
+            ));
         }
 
         Ok(AnalysisResult {
@@ -395,6 +414,14 @@ mod tests {
             .primary_at(0x2050)
             .expect("vtable symbol present");
         assert_eq!(vt_sym.name, "vtable for myCls");
+        // Header alias at the typeinfo-pointer slot (0x2048) so a
+        // user probing the header convention doesn't see a bare hex.
+        let header_syms = prog.symbol_table.get_at(0x2048);
+        assert!(
+            header_syms.iter().any(|s| s.name == "vtable for myCls (header)"),
+            "header alias missing at 0x2048: {:?}",
+            header_syms
+        );
     }
 
     #[test]

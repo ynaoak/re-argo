@@ -40,13 +40,30 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
-    /// List symbols in the binary
+    /// List symbols in the binary.
+    ///
+    /// By default surfaces only loader-side symbols (.symtab /
+    /// .dynsym / exports / imports) -- fast, no analysis required.
+    /// Pass `--all` to additionally run the full analysis pass and
+    /// include every symbol the analyzers added (RTTI vtable /
+    /// typeinfo names, demangled forms, sidecar overrides, ...).
+    /// Without `--all`, a stripped binary will look empty even
+    /// after `analyze`, because what `analyze` recovered lives in
+    /// the in-memory program model, not the loader's symbol list.
     Symbols {
         /// Path to the binary file
         file: PathBuf,
         /// Filter by symbol kind (func, data, import, export)
         #[arg(short, long)]
         kind: Option<String>,
+        /// Include analysis-added symbols (runs full analyze).
+        #[arg(short, long)]
+        all: bool,
+        /// Only show symbols whose name contains this substring
+        /// (case-insensitive). Useful for `--all --name vtable`
+        /// after running RTTI recovery.
+        #[arg(short, long, value_name = "SUBSTR")]
+        name: Option<String>,
     },
     /// Disassemble instructions
     Disasm {
@@ -427,7 +444,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Info { file } => cmd_info(&file),
         Commands::Sections { file } => cmd_sections(&file),
-        Commands::Symbols { file, kind } => cmd_symbols(&file, kind.as_deref()),
+        Commands::Symbols { file, kind, all, name } => cmd_symbols(&file, kind.as_deref(), all, name.as_deref()),
         Commands::Disasm {
             file,
             start,
@@ -522,8 +539,12 @@ fn cmd_sections(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_symbols(path: &Path, kind_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let info = BinaryLoader::load(path)?;
+fn cmd_symbols(
+    path: &Path,
+    kind_filter: Option<&str>,
+    include_analysis: bool,
+    name_filter: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{:<8} {:>16} {:>8} Name",
         "Kind", "Address", "Size"
@@ -538,18 +559,78 @@ fn cmd_symbols(path: &Path, kind_filter: Option<&str>) -> Result<(), Box<dyn std
         _ => None,
     });
 
-    for sym in &info.symbols {
+    let name_lc = name_filter.map(|s| s.to_lowercase());
+    let name_pass = |name: &str| -> bool {
+        match &name_lc {
+            Some(n) => name.to_lowercase().contains(n),
+            None => true,
+        }
+    };
+
+    if !include_analysis {
+        let info = BinaryLoader::load(path)?;
+        for sym in &info.symbols {
+            if let Some(ref filter) = kind_match
+                && let Some(expected) = filter
+                && sym.kind != *expected
+            {
+                continue;
+            }
+            if !name_pass(&sym.name) {
+                continue;
+            }
+            println!(
+                "{:<8} {:>16} {:>8} {}",
+                format!("{}", sym.kind),
+                format!("0x{:x}", sym.address),
+                sym.size,
+                sym.name
+            );
+        }
+        return Ok(());
+    }
+
+    // `--all`: run the full analysis pipeline and emit every
+    // symbol the program model has, deduped by (addr, name).
+    // This is what surfaces RTTI vtable / typeinfo names that
+    // the analyzers added but the loader-only path can't see.
+    let program = analyze_binary(path)?;
+    use gr_program::symbol::SymbolType as PSymType;
+    let to_kind = |ty: PSymType| -> SymbolKind {
+        match ty {
+            PSymType::Function => SymbolKind::Function,
+            PSymType::ExternalFunction => SymbolKind::Import,
+            PSymType::ExternalData => SymbolKind::Import,
+            PSymType::Data | PSymType::Label => SymbolKind::Data,
+        }
+    };
+    let mut seen: std::collections::HashSet<(u64, String)> =
+        std::collections::HashSet::new();
+    let mut rows: Vec<(u64, SymbolKind, String)> = Vec::new();
+    for sym in program.symbol_table.iter() {
+        let kind = to_kind(sym.symbol_type);
         if let Some(ref filter) = kind_match
             && let Some(expected) = filter
-                && sym.kind != *expected {
-                    continue;
-                }
+            && kind != *expected
+        {
+            continue;
+        }
+        if !name_pass(&sym.name) {
+            continue;
+        }
+        if !seen.insert((sym.address, sym.name.clone())) {
+            continue;
+        }
+        rows.push((sym.address, kind, sym.name.clone()));
+    }
+    rows.sort_by_key(|(a, _, _)| *a);
+    for (addr, kind, name) in rows {
         println!(
             "{:<8} {:>16} {:>8} {}",
-            format!("{}", sym.kind),
-            format!("0x{:x}", sym.address),
-            sym.size,
-            sym.name
+            format!("{}", kind),
+            format!("0x{:x}", addr),
+            0,
+            name
         );
     }
     Ok(())
