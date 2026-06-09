@@ -11,12 +11,15 @@ use crate::discovery::FunctionDiscoveryAnalyzer;
 use crate::ehframe::EhFrameAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
 use crate::fingerprint::CompilerFingerprintAnalyzer;
+use crate::got_annotate::GotAnnotator;
+use crate::immstr::ImmediateStringAnnotator;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::stackstr::StackStringAnalyzer;
+use crate::string_xref::StringXrefAnnotator;
 use crate::strings::StringSearchAnalyzer;
 use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
 use crate::noreturn_prop::{DuplicateCodeAnalyzer, NoReturnPropagationAnalyzer};
@@ -55,6 +58,7 @@ impl AnalysisManager {
             Box::new(ConstantPropagationAnalyzer),
             Box::new(StackFrameAnalyzer),
             Box::new(StackStringAnalyzer),
+            Box::new(ImmediateStringAnnotator),
             Box::new(ThunkDetectorAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
@@ -67,6 +71,8 @@ impl AnalysisManager {
             Box::new(SignatureApplierAnalyzer),
             Box::new(StackCanaryAnalyzer),
             Box::new(CallSiteAnnotator),
+            Box::new(StringXrefAnnotator),
+            Box::new(GotAnnotator),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
             Box::new(DuplicateCodeAnalyzer),
