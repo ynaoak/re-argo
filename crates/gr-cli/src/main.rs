@@ -1,4 +1,5 @@
 mod mcp;
+mod symbol_import;
 
 use std::path::{Path, PathBuf};
 
@@ -310,6 +311,19 @@ enum Commands {
         /// Attach a plate comment: `ADDR=TEXT`. Repeatable.
         #[arg(long, value_name = "ADDR=TEXT")]
         comment: Vec<String>,
+        /// Bulk-import (offset, name) pairs from FILE and merge into
+        /// the rename map. Accepts JSON (object map or array of
+        /// records) and "ADDR NAME" text. Mangled C++ / Rust names
+        /// are demangled unless `--keep-mangled` is passed. The
+        /// primary use case is loading a community-maintained
+        /// symbol database (e.g. LeviLamina's BDS function list) so
+        /// every command shows readable names instead of FUN_xxx.
+        #[arg(long, value_name = "FILE")]
+        import: Option<PathBuf>,
+        /// With --import, store the mangled name verbatim instead of
+        /// running it through the demangler.
+        #[arg(long, requires = "import")]
+        keep_mangled: bool,
         /// Print the current override set and exit (no edits).
         #[arg(long)]
         list: bool,
@@ -449,8 +463,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Coverage { file } => cmd_coverage(&file),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
-        Commands::Annotate { file, rename, force_func, not_func, cc, comment, list, clear } =>
-            cmd_annotate(&file, &rename, &force_func, &not_func, &cc, &comment, list, clear),
+        Commands::Annotate { file, rename, force_func, not_func, cc, comment, import, keep_mangled, list, clear } =>
+            cmd_annotate(&file, &rename, &force_func, &not_func, &cc, &comment, import.as_deref(), keep_mangled, list, clear),
         Commands::Iterate { file, apply, max_rounds } => cmd_iterate(&file, apply, max_rounds),
         Commands::Callsites { file, target, min_resolved, iters, callbacks } => cmd_callsites(&file, target, min_resolved, iters, callbacks, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
@@ -1029,6 +1043,8 @@ fn cmd_annotate(
     not_func: &[u64],
     cc: &[String],
     comment: &[String],
+    import: Option<&Path>,
+    keep_mangled: bool,
     list: bool,
     clear: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1085,6 +1101,21 @@ fn cmd_annotate(
         let (addr, text) = parse_kv(c)?;
         overrides.comments.insert(addr, text);
         edits += 1;
+    }
+
+    if let Some(import_path) = import {
+        let data = std::fs::read_to_string(import_path)
+            .map_err(|e| format!("read {}: {}", import_path.display(), e))?;
+        let entries = symbol_import::parse(&data, import_path)?;
+        let (added, demangled) =
+            symbol_import::merge_into(&mut overrides, entries, !keep_mangled);
+        edits += added;
+        println!(
+            "imported {} name(s) from {} ({} demangled)",
+            added,
+            import_path.display(),
+            demangled
+        );
     }
 
     if edits > 0 {
