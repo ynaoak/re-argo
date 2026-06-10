@@ -31,6 +31,14 @@ pub struct RustEmitter<'a> {
     output: String,
     symbol_names: &'a BTreeMap<u64, String>,
     string_literals: &'a BTreeMap<u64, String>,
+    /// Per-instruction-address annotation map; mirrors the same
+    /// surface CEmitter exposes so callers don't need to track
+    /// emitter type to attach analyzer comments. See
+    /// `CEmitter::with_annotations` for the contract.
+    annotations: Option<&'a BTreeMap<u64, Vec<String>>>,
+    /// Per-address emit-once dedup, so multi-op instructions don't
+    /// replay the same comment.
+    emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
 }
 
 impl Default for RustEmitter<'static> {
@@ -46,6 +54,8 @@ impl RustEmitter<'static> {
             output: String::new(),
             symbol_names: empty_u64_map(),
             string_literals: empty_u64_map(),
+            annotations: None,
+            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 }
@@ -61,7 +71,19 @@ impl<'a> RustEmitter<'a> {
             output: String::new(),
             symbol_names,
             string_literals,
+            annotations: None,
+            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Attach per-address annotations. Mirrors
+    /// `CEmitter::with_annotations`.
+    pub fn with_annotations(
+        mut self,
+        annotations: &'a BTreeMap<u64, Vec<String>>,
+    ) -> Self {
+        self.annotations = Some(annotations);
+        self
     }
 
     pub fn emit_function(
@@ -253,10 +275,32 @@ impl<'a> RustEmitter<'a> {
             if op.dead || op.block != block_id {
                 continue;
             }
+            self.emit_annotations_for(op.address);
             if let Some(line) = self.emit_op(func, op) {
                 self.line(&line);
             }
         }
+    }
+
+    /// Emit any analyzer-supplied annotations for `addr` as `// …`
+    /// lines. Dedup against `self.emitted` so several ops lifted
+    /// from one instruction don't replay the same comment.
+    fn emit_annotations_for(&mut self, addr: u64) {
+        let Some(ann) = self.annotations else {
+            return;
+        };
+        if self.emitted.borrow().contains(&addr) {
+            return;
+        }
+        let Some(lines) = ann.get(&addr) else {
+            self.emitted.borrow_mut().insert(addr);
+            return;
+        };
+        for ln in lines {
+            let cleaned = ln.replace(['\n', '\r'], " ");
+            linef!(self, "// {}", cleaned);
+        }
+        self.emitted.borrow_mut().insert(addr);
     }
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
@@ -267,6 +311,7 @@ impl<'a> RustEmitter<'a> {
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
                 continue;
             }
+            self.emit_annotations_for(op.address);
             if let Some(line) = self.emit_op(func, op) {
                 self.line(&line);
             }

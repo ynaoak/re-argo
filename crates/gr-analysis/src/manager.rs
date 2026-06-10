@@ -25,6 +25,9 @@ use crate::hot::HotFunctionAnalyzer;
 use crate::immstr::ImmediateStringAnnotator;
 use crate::inline_mem::InlineMemAnalyzer;
 use crate::loops::LoopAnalyzer;
+use crate::macho_objc::MachoObjCAnalyzer;
+use crate::pe_enrich::PeEnrichmentAnalyzer;
+use crate::pe_seh::PeSehAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::indirect_resolve::IndirectCallResolver;
 use crate::propagation::ConstantPropagationAnalyzer;
@@ -67,6 +70,9 @@ impl AnalysisManager {
         let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
             Box::new(EntryPointAnalyzer),
             Box::new(CompilerFingerprintAnalyzer),
+            Box::new(PeSehAnalyzer),
+            Box::new(PeEnrichmentAnalyzer),
+            Box::new(MachoObjCAnalyzer),
             Box::new(DemangleAnalyzer),
             Box::new(EhFrameAnalyzer),
             Box::new(FunctionDiscoveryAnalyzer),
