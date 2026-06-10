@@ -530,10 +530,22 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let fp = gr_analysis::fingerprint::CompilerFingerprintAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&fp, &mut program);
+    let rfp = gr_analysis::runtime_fp::RuntimeFingerprintAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&rfp, &mut program);
+    let pe = gr_analysis::pe_enrich::PeEnrichmentAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&pe, &mut program);
     let p = &program.metadata.properties;
     if !p.is_empty() {
         println!();
-        for key in ["compiler", "language", "libc_version", "build_id"] {
+        for key in [
+            "compiler",
+            "language",
+            "runtime",
+            "libc_version",
+            "build_id",
+            "pe_product",
+            "pe_version",
+        ] {
             if let Some(v) = p.get(key) {
                 println!("{:<13} {}", format!("{}:", key), v);
             }
