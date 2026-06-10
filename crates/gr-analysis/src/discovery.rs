@@ -11,6 +11,36 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
 pub struct FunctionDiscoveryAnalyzer;
 
+/// Re-run function discovery after late analyzers (CrtAnalyzer,
+/// CrtPatternAnalyzer) have added new function entries with empty
+/// bodies. The body-filling re-entry inside the primary Discovery
+/// pass handles existing zero-body functions; we just need that
+/// pass to run *after* the late renamers have populated them.
+pub struct LateDiscoveryAnalyzer;
+
+impl Analyzer for LateDiscoveryAnalyzer {
+    fn name(&self) -> &str {
+        "Late Discovery"
+    }
+    fn description(&self) -> &str {
+        "Re-runs function discovery to fill bodies for late-added functions (main, CRT helpers)"
+    }
+    fn priority(&self) -> u32 {
+        // After CrtPatternAnalyzer (470) + CrtAnalyzer (710), before
+        // CallSiteAnnotator (750) so the resolved arg values it
+        // produces benefit from the now-discovered call_targets.
+        730
+    }
+    fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        FunctionDiscoveryAnalyzer.analyze(program).map(|r| AnalysisResult {
+            analyzer_name: self.name().into(),
+            functions_found: r.functions_found,
+            references_found: r.references_found,
+            instructions_decoded: r.instructions_decoded,
+        })
+    }
+}
+
 impl Analyzer for FunctionDiscoveryAnalyzer {
     fn name(&self) -> &str {
         "Function Discovery"

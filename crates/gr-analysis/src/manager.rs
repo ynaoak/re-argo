@@ -4,6 +4,7 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
 use crate::callingconv::CallingConventionAnalyzer;
 use crate::anti_debug::AntiDebugAnalyzer;
+use crate::arity::ArgumentArityAnalyzer;
 use crate::canary::StackCanaryAnalyzer;
 use crate::complexity::ComplexityAnalyzer;
 use crate::crt::CrtAnalyzer;
@@ -11,8 +12,9 @@ use crate::crt_patterns::CrtPatternAnalyzer;
 use crate::crypto::CryptoConstantAnalyzer;
 use crate::coverage::CoverageAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
+use crate::deadcode::DeadCodeAnalyzer;
 use crate::demangle::DemangleAnalyzer;
-use crate::discovery::FunctionDiscoveryAnalyzer;
+use crate::discovery::{FunctionDiscoveryAnalyzer, LateDiscoveryAnalyzer};
 use crate::ehframe::EhFrameAnalyzer;
 use crate::exception::ExceptionFlowAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
@@ -43,6 +45,7 @@ use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
 use crate::tls::TlsVariableAnalyzer;
 use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
 use crate::vtable::VTableAnalyzer;
+use crate::wrapper::WrapperFunctionAnalyzer;
 use crate::xref_report::{CrossReferenceReportAnalyzer, UnreferencedFunctionAnalyzer};
 
 pub struct AnalysisManager {
@@ -86,6 +89,7 @@ impl AnalysisManager {
             Box::new(PatternFunctionAnalyzer),
             Box::new(SignatureApplierAnalyzer),
             Box::new(CrtAnalyzer),
+            Box::new(LateDiscoveryAnalyzer),
             Box::new(StackCanaryAnalyzer),
             Box::new(TlsVariableAnalyzer),
             Box::new(CallSiteAnnotator),
@@ -95,7 +99,10 @@ impl AnalysisManager {
             Box::new(LoopAnalyzer),
             Box::new(ExceptionFlowAnalyzer),
             Box::new(AntiDebugAnalyzer),
+            Box::new(ArgumentArityAnalyzer),
+            Box::new(WrapperFunctionAnalyzer),
             Box::new(ComplexityAnalyzer),
+            Box::new(DeadCodeAnalyzer),
             Box::new(CallGraphSccAnalyzer),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
