@@ -155,19 +155,159 @@ impl Analyzer for MachoObjCAnalyzer {
             }
             classes_found += 1;
 
-            if method_list == 0 {
-                continue;
+            if method_list != 0 {
+                methods_found += parse_method_list(program, method_list, &class_name, '-');
             }
-            methods_found += parse_method_list(program, method_list, &class_name, '-');
+
+            // class_ro_t at 0x30 holds the ivar list; we recover
+            // the instance variables as Data symbols on the class
+            // metadata's offset table. Class methods (the meta-
+            // class IMPs) live behind the `isa` chain — read the
+            // meta-class via class_addr's `isa` field at 0x00 and
+            // walk its method list as `+[ClassName ...]`.
+            if let Some(ivar_list) = read_u64(program, class_ro + 0x30)
+                && ivar_list != 0
+            {
+                methods_found += parse_ivar_list(program, ivar_list, &class_name);
+            }
+            if let Some(meta_class) = read_u64(program, class_addr)
+                && meta_class != 0
+                && meta_class != class_addr
+                && let Some(meta_ro) = read_u64(program, meta_class + 0x20)
+            {
+                let meta_ro = meta_ro & !1;
+                if let Some(meta_methods) = read_u64(program, meta_ro + 0x20)
+                    && meta_methods != 0
+                {
+                    methods_found += parse_method_list(program, meta_methods, &class_name, '+');
+                }
+            }
+        }
+
+        // (2) Protocols — `__objc_protolist` is a parallel
+        // pointer list. Each entry is a `protocol_t*`. Layout
+        // mirrors class_ro_t roughly: name pointer at +0x08,
+        // instance method list at +0x18.
+        let mut protocols_found = 0usize;
+        if let Some((proto_base, proto_size)) = find_section(program, "__objc_protolist") {
+            protocols_found = parse_protocol_list(program, proto_base, proto_size);
         }
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
-            functions_found: classes_found + methods_found,
+            functions_found: classes_found + methods_found + protocols_found,
             references_found: 0,
             instructions_decoded: 0,
         })
     }
+}
+
+/// Walk a Mach-O `ivar_list_t`. Layout:
+/// ```c
+/// struct ivar_list_t {
+///     uint32_t entsize_and_flags;  // 0x00
+///     uint32_t count;              // 0x04
+///     ivar_t   ivars[count];       // 0x08
+/// };
+/// struct ivar_t {                  // 0x20 bytes
+///     uint64_t * offset;           // 0x00 -> *int32
+///     const char * name;           // 0x08
+///     const char * type;           // 0x10
+///     uint32_t alignment;          // 0x18
+///     uint32_t size;               // 0x1c
+/// };
+/// ```
+fn parse_ivar_list(program: &mut Program, list_addr: u64, class_name: &str) -> usize {
+    let Some(header) = read_u64(program, list_addr) else {
+        return 0;
+    };
+    let entsize = (header & 0xffff_ffff) as u32;
+    let count = (header >> 32) as u32;
+    if entsize != 0x20 || count > 4096 {
+        return 0;
+    }
+    let mut added = 0usize;
+    for i in 0..count as u64 {
+        let entry = list_addr + 8 + i * entsize as u64;
+        let Some(name_ptr) = read_u64(program, entry + 0x08) else {
+            continue;
+        };
+        let Some(ivar_name) = read_c_str(program, name_ptr, 96) else {
+            continue;
+        };
+        let Some(offset_ptr) = read_u64(program, entry) else {
+            continue;
+        };
+        if offset_ptr == 0 {
+            continue;
+        }
+        let sym_name = format!("objc_ivar_{}_{}", sanitize(class_name), sanitize(&ivar_name));
+        if program.symbol_table.primary_at(offset_ptr).is_none() {
+            program.symbol_table.add(Symbol::new(
+                sym_name,
+                offset_ptr,
+                SymbolType::Data,
+                SourceType::Analysis,
+            ));
+            added += 1;
+        }
+    }
+    added
+}
+
+/// Walk `__objc_protolist`. Each pointer goes to a `protocol_t`:
+/// ```c
+/// struct protocol_t {
+///     void       * isa;              // 0x00
+///     const char * name;             // 0x08
+///     protocol_list_t * protocols;   // 0x10
+///     method_list_t * instance;      // 0x18
+///     method_list_t * class;         // 0x20
+///     method_list_t * opt_instance;  // 0x28
+///     method_list_t * opt_class;     // 0x30
+///     ...
+/// };
+/// ```
+fn parse_protocol_list(program: &mut Program, list_base: u64, list_size: u64) -> usize {
+    let cap = list_size.min(1 << 16) as usize;
+    let mut buf = vec![0u8; cap];
+    if program.info.memory.read_bytes(list_base, &mut buf).is_err() {
+        return 0;
+    }
+    let mut added = 0usize;
+    for chunk in buf.chunks_exact(8) {
+        let proto_addr = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+        if proto_addr == 0 {
+            continue;
+        }
+        let Some(name_ptr) = read_u64(program, proto_addr + 0x08) else {
+            continue;
+        };
+        let Some(name) = read_c_str(program, name_ptr, 128) else {
+            continue;
+        };
+        if program.symbol_table.primary_at(proto_addr).is_none() {
+            program.symbol_table.add(Symbol::new(
+                format!("objc_proto_{}", sanitize(&name)),
+                proto_addr,
+                SymbolType::Data,
+                SourceType::Analysis,
+            ));
+        }
+        // Required instance + class methods get protocol-qualified
+        // function symbols so the listing names the contract.
+        for (slot, leader, kind) in [(0x18u64, '-', "req"), (0x20, '+', "req"), (0x28, '-', "opt"), (0x30, '+', "opt")] {
+            let Some(ml) = read_u64(program, proto_addr + slot) else {
+                continue;
+            };
+            if ml != 0 {
+                let label = format!("{}<{}>", name, kind);
+                added += parse_method_list(program, ml, &label, leader);
+            }
+        }
+        added += 1;
+    }
+    added
 }
 
 fn parse_method_list(

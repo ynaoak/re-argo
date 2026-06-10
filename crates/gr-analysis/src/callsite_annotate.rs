@@ -63,7 +63,29 @@ impl Analyzer for CallSiteAnnotator {
         // constants through callback chains like
         //   register_parser(my_parser) -> list_add(my_parser) -> …
         // 4 rounds is enough for everything we've measured.
-        let sites = resolve_call_sites_iterative(&*lifter, program, 4)?;
+        let mut sites = resolve_call_sites_iterative(&*lifter, program, 4)?;
+
+        // Layer multi-block CFG-aware constant propagation on top:
+        // anywhere the iterative resolver came back with `?` for an
+        // arg register, ask the CFG tracker whether it can pin a
+        // value by joining predecessor states. This is the "format
+        // string set in one block, used in the next" pattern that
+        // the linear resolver misses.
+        let cfg_constants = crate::cfg_const::build_call_constants(&*lifter, program);
+        for site in sites.iter_mut() {
+            let Some(snap) = cfg_constants.get(&site.call_site) else {
+                continue;
+            };
+            for arg in site.args.iter_mut() {
+                if arg.value.is_some() {
+                    continue;
+                }
+                if let Some(v) = snap.get(&arg.reg_offset) {
+                    arg.value = Some(*v);
+                }
+            }
+        }
+        let sites = sites;
 
         use std::sync::OnceLock;
         static DB: OnceLock<SignatureDatabase> = OnceLock::new();

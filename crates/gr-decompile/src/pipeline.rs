@@ -321,6 +321,9 @@ fn build_decompile_result(
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
+    if let Some(ann) = annotations {
+        rust_emitter = rust_emitter.with_annotations(ann);
+    }
     let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
     Ok(DecompileResult {
