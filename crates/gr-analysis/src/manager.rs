@@ -21,10 +21,12 @@ use crate::filler::FillerBytesAnalyzer;
 use crate::fingerprint::CompilerFingerprintAnalyzer;
 use crate::format_varargs::FormatVarargsAnalyzer;
 use crate::got_annotate::GotAnnotator;
+use crate::hot::HotFunctionAnalyzer;
 use crate::immstr::ImmediateStringAnnotator;
 use crate::inline_mem::InlineMemAnalyzer;
 use crate::loops::LoopAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
+use crate::indirect_resolve::IndirectCallResolver;
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
 use crate::scc::CallGraphSccAnalyzer;
@@ -107,6 +109,7 @@ impl AnalysisManager {
             Box::new(ComplexityAnalyzer),
             Box::new(DeadCodeAnalyzer),
             Box::new(CallGraphSccAnalyzer),
+            Box::new(HotFunctionAnalyzer),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
             Box::new(PanicLikeAnalyzer),
@@ -117,6 +120,7 @@ impl AnalysisManager {
             Box::new(CrossReferenceReportAnalyzer),
             Box::new(UnreferencedFunctionAnalyzer),
             Box::new(IndirectCallAnalyzer),
+            Box::new(IndirectCallResolver),
             Box::new(StringReferenceAnalyzer),
             Box::new(CoverageAnalyzer),
             Box::new(TypeRecoveryAnalyzer),

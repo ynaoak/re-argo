@@ -324,6 +324,56 @@ fn patterns() -> Vec<Pattern> {
         // No distinctive prologue — match the canonical empty body
         // when preceded by __libc_csu_init only at link time, which
         // we can't see here. Skip.
+
+        // _dl_relocate_static_pie (glibc dynamic-linker stub
+        // emitted by every PIE executable):
+        //   f3 0f 1e fa               endbr64
+        //   c3                        ret
+        // Trivial body — just an endbr64 + ret. Emit on length-5
+        // exactly so a more interesting function happening to
+        // start with endbr64+ret doesn't false-positive.
+        Pattern {
+            name: "_dl_relocate_static_pie",
+            prefix: &[0xf3, 0x0f, 0x1e, 0xfa, 0xc3],
+            mask: &[1, 1, 1, 1, 1],
+        },
+
+        // glibc's `__do_global_ctors_aux` (legacy: pre-glibc-2.34,
+        // still emitted by some sysv toolchains targeting ELF):
+        //   55                        push rbp
+        //   48 89 e5                  mov rbp, rsp
+        //   53                        push rbx
+        //   48 83 ec 08               sub rsp, 8
+        //   48 8d 1d <disp32>         lea rbx, [rip+__CTOR_END__]
+        Pattern {
+            name: "__do_global_ctors_aux",
+            prefix: &[
+                0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x08,
+                0x48, 0x8d, 0x1d, 0, 0, 0, 0,
+            ],
+            mask: &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+        },
+
+        // gcc's `call_weak_fn` (libgcc / crt helper):
+        //   48 8b 05 <disp32>         mov rax, [rip+_Jv_RegisterClasses]
+        //   48 85 c0                  test rax, rax
+        //   74 02                     je <skip>
+        //   ff e0                     jmp rax
+        Pattern {
+            name: "call_weak_fn",
+            prefix: &[
+                0x48, 0x8b, 0x05, 0, 0, 0, 0,
+                0x48, 0x85, 0xc0,
+                0x74, 0x02,
+                0xff, 0xe0,
+            ],
+            mask: &[
+                1, 1, 1, 0, 0, 0, 0,
+                1, 1, 1,
+                1, 1,
+                1, 1,
+            ],
+        },
     ]
 }
 
