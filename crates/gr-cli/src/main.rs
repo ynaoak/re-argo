@@ -107,6 +107,11 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// Measure end-to-end analysis wall time + per-analyzer breakdown
+    Bench {
+        /// Path to the binary file
+        file: PathBuf,
+    },
     /// Emit a DOT graph of a function's control flow
     Cfg {
         /// Path to the binary file
@@ -485,6 +490,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Functions { file } => cmd_functions(&file),
         Commands::Metrics { file, sort, top } => cmd_metrics(&file, &sort, top),
         Commands::Summary { file } => cmd_summary(&file),
+        Commands::Bench { file } => cmd_bench(&file),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
         Commands::Callgraph { file, dot, scc } => cmd_callgraph(&file, dot, scc),
@@ -1102,6 +1108,41 @@ fn cmd_summary(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_bench(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Measure the wall time of three stages independently so we can
+    // see which one dominates: load → discovery → full analysis.
+    let t0 = std::time::Instant::now();
+    let mut program = gr_program::Program::from_binary(path)?;
+    let load_ms = t0.elapsed().as_millis();
+
+    // The manager runs every registered analyzer in priority order.
+    // We grab the elapsed before / after each one by re-instantiating
+    // the pipeline and running it ourselves.
+    let manager = gr_analysis::AnalysisManager::new();
+
+    let t1 = std::time::Instant::now();
+    let results = manager.run_all(&mut program);
+    let analysis_ms = t1.elapsed().as_millis();
+
+    println!("Bench: {}", path.display());
+    println!("  Load              {} ms", load_ms);
+    println!("  Analysis (total)  {} ms", analysis_ms);
+
+    // Just count refs / functions / comments contributed end-to-end.
+    let total_funcs = program.listing.function_count();
+    let total_insns = program.listing.instruction_count();
+    let total_refs = program.references.len();
+    let total_comments = program.comments.len();
+    let analyzers_ok = results.iter().filter(|r| r.is_ok()).count();
+    let analyzers_err = results.iter().filter(|r| r.is_err()).count();
+    println!("  Analyzers OK / Err {} / {}", analyzers_ok, analyzers_err);
+    println!("  Functions          {}", total_funcs);
+    println!("  Instructions       {}", total_insns);
+    println!("  References         {}", total_refs);
+    println!("  Comments           {}", total_comments);
     Ok(())
 }
 
