@@ -52,6 +52,7 @@ pub(crate) mod helpers {
             data_types: DataTypeManager::new(),
             comments: gr_program::comments::CommentManager::new(),
             metadata: gr_program::metadata::ProgramMetadata::default(),
+            call_renderings: std::collections::BTreeMap::new(),
         }
     }
 
@@ -112,6 +113,7 @@ pub(crate) mod helpers {
             data_types: DataTypeManager::new(),
             comments: gr_program::comments::CommentManager::new(),
             metadata: gr_program::metadata::ProgramMetadata::default(),
+            call_renderings: std::collections::BTreeMap::new(),
         }
     }
 }

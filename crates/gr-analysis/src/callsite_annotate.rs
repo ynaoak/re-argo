@@ -110,8 +110,12 @@ impl Analyzer for CallSiteAnnotator {
             {
                 continue;
             }
-            let text = format_call(sig, site, program, &mut string_promotions);
+            let (text, rendering) = format_call(sig, site, program, &mut string_promotions);
             program.comments.set(site.call_site, CommentType::Pre, text);
+            // Store the C-syntax form for the decompiler emitters to
+            // pick up — they otherwise emit `printf@plt()` with no
+            // arguments.
+            program.call_renderings.insert(site.call_site, rendering);
             annotated += 1;
         }
 
@@ -144,13 +148,18 @@ impl Analyzer for CallSiteAnnotator {
     }
 }
 
+/// Returns `(human_annotation, c_call_rendering)`. The annotation
+/// has the IDA-style `param=value` labels for the EOL/Pre comment
+/// stream; the rendering has the bare value list the C decompiler
+/// emits in place of the `<callee>@plt()` stub.
 fn format_call(
     sig: &FunctionSignature,
     site: &crate::callsite::CallSite,
     program: &Program,
     string_promotions: &mut Vec<u64>,
-) -> String {
+) -> (String, String) {
     let mut out = format!("{}(", sig.name);
+    let mut render = format!("{}(", sig.name);
     let n = sig.parameters.len().min(site.args.len());
     let mut first = true;
     for i in 0..n {
@@ -158,6 +167,7 @@ fn format_call(
         let val = site.args[i].value;
         if !first {
             out.push_str(", ");
+            render.push_str(", ");
         }
         first = false;
         out.push_str(pname);
@@ -165,14 +175,25 @@ fn format_call(
         match val {
             Some(v) if is_pointer_type(ptype) => {
                 if let Some(s) = read_c_string(program, v) {
-                    out.push_str(&format!("\"{}\"", escape(&s)));
+                    let lit = format!("\"{}\"", escape(&s));
+                    out.push_str(&lit);
+                    render.push_str(&lit);
                     string_promotions.push(v);
                 } else {
-                    out.push_str(&format!("0x{:x}", v));
+                    let hex = format!("0x{:x}", v);
+                    out.push_str(&hex);
+                    render.push_str(&hex);
                 }
             }
-            Some(v) => out.push_str(&format!("0x{:x}", v)),
-            None => out.push('?'),
+            Some(v) => {
+                let hex = format!("0x{:x}", v);
+                out.push_str(&hex);
+                render.push_str(&hex);
+            }
+            None => {
+                out.push('?');
+                render.push_str(&fallback_arg_name(i));
+            }
         }
     }
 
@@ -196,42 +217,64 @@ fn format_call(
             let arg = &site.args[extra_start + k];
             if !first {
                 out.push_str(", ");
+                render.push_str(", ");
             }
             first = false;
-            match arg.value {
+            let formatted = match arg.value {
                 Some(v) if spec.is_string => match read_c_string(program, v) {
                     Some(s) => {
-                        out.push_str(&format!("\"{}\"", escape(&s)));
                         string_promotions.push(v);
+                        format!("\"{}\"", escape(&s))
                     }
-                    None => out.push_str(&format!("0x{:x}", v)),
+                    None => format!("0x{:x}", v),
                 },
-                Some(v) if spec.is_pointer => out.push_str(&format!("0x{:x}", v)),
+                Some(v) if spec.is_pointer => format!("0x{:x}", v),
                 Some(v) if spec.is_char => {
                     let c = (v as u8) as char;
                     if c.is_ascii_graphic() || c == ' ' {
-                        out.push_str(&format!("'{}'", c));
+                        format!("'{}'", c)
                     } else {
-                        out.push_str(&format!("0x{:x}", v));
+                        format!("0x{:x}", v)
                     }
                 }
-                Some(v) if spec.is_signed => out.push_str(&format!("{}", v as i64)),
-                Some(v) => out.push_str(&format!("{}", v)),
-                None => out.push('?'),
+                Some(v) if spec.is_signed => format!("{}", v as i64),
+                Some(v) => format!("{}", v),
+                None => "?".into(),
+            };
+            out.push_str(&formatted);
+            if formatted == "?" {
+                render.push_str(&fallback_vararg_name(k));
+            } else {
+                render.push_str(&formatted);
             }
         }
         if specs.len() > avail {
             out.push_str(", …");
+            render.push_str(", /* … */");
         }
     } else if sig.parameters.len() > n {
         out.push_str(", …");
+        render.push_str(", /* … */");
     }
 
     out.push(')');
+    render.push(')');
     if sig.no_return {
         out.push_str("  // noreturn");
     }
-    out
+    (out, render)
+}
+
+fn fallback_arg_name(idx: usize) -> String {
+    static REG_NAMES: &[&str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    REG_NAMES
+        .get(idx)
+        .map(|n| (*n).to_string())
+        .unwrap_or_else(|| format!("arg{}", idx))
+}
+
+fn fallback_vararg_name(idx: usize) -> String {
+    format!("vararg{}", idx)
 }
 
 /// Return the index of the format-string parameter when `name` is a

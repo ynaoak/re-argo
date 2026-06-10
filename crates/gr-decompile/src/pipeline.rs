@@ -44,7 +44,7 @@ pub fn decompile(
 
     let terminated = trim_to_return(lifted);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None)
+    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None)
 }
 
 pub fn decompile_function(
@@ -61,6 +61,7 @@ pub fn decompile_function(
         &symbols,
         &string_literals,
         Some(&annotations),
+        Some(&program.call_renderings),
     )
 }
 
@@ -118,6 +119,7 @@ pub fn decompile_function_with_maps(
     symbols: &std::collections::BTreeMap<u64, String>,
     string_literals: &std::collections::BTreeMap<u64, String>,
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
+    call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
 ) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
     let func_name = func
@@ -154,7 +156,15 @@ pub fn decompile_function_with_maps(
         trim_to_return(lifted)
     };
 
-    build_decompile_result(terminated, &func_name, func_entry, symbols, string_literals, annotations)
+    build_decompile_result(
+        terminated,
+        &func_name,
+        func_entry,
+        symbols,
+        string_literals,
+        annotations,
+        call_renderings,
+    )
 }
 
 /// Decompile every function the program knows about, in parallel.
@@ -196,6 +206,7 @@ pub fn decompile_all(
                     &symbols,
                     &string_literals,
                     Some(&annotations),
+                    Some(&program.call_renderings),
                 ),
             )
         })
@@ -260,6 +271,7 @@ fn build_decompile_result(
     symbols: &std::collections::BTreeMap<u64, String>,
     string_literals: &std::collections::BTreeMap<u64, String>,
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
+    call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -318,11 +330,17 @@ fn build_decompile_result(
     if let Some(ann) = annotations {
         c_emitter = c_emitter.with_annotations(ann);
     }
+    if let Some(rend) = call_renderings {
+        c_emitter = c_emitter.with_call_renderings(rend);
+    }
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
     if let Some(ann) = annotations {
         rust_emitter = rust_emitter.with_annotations(ann);
+    }
+    if let Some(rend) = call_renderings {
+        rust_emitter = rust_emitter.with_call_renderings(rend);
     }
     let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
