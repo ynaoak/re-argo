@@ -31,11 +31,13 @@ use crate::scc::CallGraphSccAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::stackstr::StackStringAnalyzer;
+use crate::string_rename::StringHintRenameAnalyzer;
 use crate::string_xref::StringXrefAnnotator;
 use crate::strings::StringSearchAnalyzer;
 use crate::switches::{SwitchTableAnalyzer, TailCallAnalyzer};
 use crate::switches_v2::SwitchTableOffsetAnalyzer;
 use crate::noreturn_prop::{DuplicateCodeAnalyzer, NoReturnPropagationAnalyzer};
+use crate::panic_like::PanicLikeAnalyzer;
 use crate::addrtable::AddressTableAnalyzer;
 use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
 use crate::pcoderef::PcodeReferenceAnalyzer;
@@ -90,6 +92,7 @@ impl AnalysisManager {
             Box::new(SignatureApplierAnalyzer),
             Box::new(CrtAnalyzer),
             Box::new(LateDiscoveryAnalyzer),
+            Box::new(StringHintRenameAnalyzer),
             Box::new(StackCanaryAnalyzer),
             Box::new(TlsVariableAnalyzer),
             Box::new(CallSiteAnnotator),
@@ -106,6 +109,7 @@ impl AnalysisManager {
             Box::new(CallGraphSccAnalyzer),
             Box::new(StructLayoutAnalyzer),
             Box::new(NoReturnPropagationAnalyzer),
+            Box::new(PanicLikeAnalyzer),
             Box::new(DuplicateCodeAnalyzer),
             Box::new(FunctionBoundaryAnalyzer),
             Box::new(VariadicFunctionAnalyzer),

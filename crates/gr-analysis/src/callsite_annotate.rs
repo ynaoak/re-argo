@@ -27,7 +27,7 @@ use gr_program::symbol::{SourceType, Symbol, SymbolType};
 use gr_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
-use crate::callsite::resolve_call_sites;
+use crate::callsite::resolve_call_sites_iterative;
 use crate::signatures::{FunctionSignature, SignatureDatabase};
 
 pub struct CallSiteAnnotator;
@@ -56,7 +56,14 @@ impl Analyzer for CallSiteAnnotator {
         }
 
         let lifter: Box<dyn PcodeLift + Sync> = Box::new(gr_lift::x86::X86Lifter::new_64());
-        let sites = resolve_call_sites(&*lifter, program)?;
+        // Iterative inter-procedural resolver: a function whose
+        // parameter has a *single* observed value across all
+        // observed call sites is treated as a compile-time constant
+        // inside that function. Round-by-round propagation pushes
+        // constants through callback chains like
+        //   register_parser(my_parser) -> list_add(my_parser) -> …
+        // 4 rounds is enough for everything we've measured.
+        let sites = resolve_call_sites_iterative(&*lifter, program, 4)?;
 
         use std::sync::OnceLock;
         static DB: OnceLock<SignatureDatabase> = OnceLock::new();
@@ -316,7 +323,11 @@ fn read_c_string(program: &Program, addr: u64) -> Option<String> {
     // lives near a section boundary. Try a few decreasing windows and
     // accept the largest one we can actually read.
     let mut buf = [0u8; 64];
-    let read_len = [64, 32, 16, 8, 4]
+    // Finer-grained fallback: skipping straight from 16 to 8 (the
+    // old behaviour) caused 13-byte strings like "out of memory" to
+    // truncate to "out of m" when the parent section was 29 bytes
+    // long and reading 16 straddled the boundary.
+    let read_len = [64, 48, 32, 24, 16, 14, 12, 10, 8, 6, 4]
         .into_iter()
         .find(|&n| program.info.memory.read_bytes(addr, &mut buf[..n]).is_ok())?;
     let slice = &buf[..read_len];

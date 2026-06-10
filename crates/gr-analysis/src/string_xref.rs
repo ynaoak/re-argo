@@ -91,7 +91,7 @@ impl Analyzer for StringXrefAnnotator {
 
 fn read_c_string(program: &Program, addr: u64) -> Option<String> {
     let mut buf = [0u8; 64];
-    let read_len = [64, 32, 16, 8, 4]
+    let read_len = [64, 48, 32, 24, 16, 14, 12, 10, 8, 6, 4]
         .into_iter()
         .find(|&n| program.info.memory.read_bytes(addr, &mut buf[..n]).is_ok())?;
     let slice = &buf[..read_len];
