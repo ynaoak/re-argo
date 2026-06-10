@@ -13,6 +13,7 @@ use crate::crypto::CryptoConstantAnalyzer;
 use crate::coverage::CoverageAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
 use crate::deadcode::DeadCodeAnalyzer;
+use crate::dwarf_enrich::DwarfEnrichmentAnalyzer;
 use crate::demangle::DemangleAnalyzer;
 use crate::discovery::{FunctionDiscoveryAnalyzer, LateDiscoveryAnalyzer};
 use crate::ehframe::EhFrameAnalyzer;
@@ -104,6 +105,7 @@ impl AnalysisManager {
             Box::new(SignatureApplierAnalyzer),
             Box::new(CrtAnalyzer),
             Box::new(LateDiscoveryAnalyzer),
+            Box::new(DwarfEnrichmentAnalyzer),
             Box::new(StringHintRenameAnalyzer),
             Box::new(StackCanaryAnalyzer),
             Box::new(TlsVariableAnalyzer),

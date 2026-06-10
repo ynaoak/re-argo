@@ -18,6 +18,7 @@ pub mod crt_patterns;
 pub mod crypto;
 pub mod dataref;
 pub mod deadcode;
+pub mod dwarf_enrich;
 pub mod demangle;
 pub mod discovery;
 pub mod ehframe;

@@ -102,6 +102,11 @@ enum Commands {
         #[arg(long, default_value_t = 25)]
         top: usize,
     },
+    /// Print a one-screen summary of the top analysis findings
+    Summary {
+        /// Path to the binary file
+        file: PathBuf,
+    },
     /// Emit a DOT graph of a function's control flow
     Cfg {
         /// Path to the binary file
@@ -291,6 +296,9 @@ enum Commands {
     Coverage {
         /// Path to the binary file
         file: PathBuf,
+        /// Also report annotation density (comments per discovered instruction)
+        #[arg(long)]
+        annotated: bool,
     },
     /// Search for byte patterns in the binary
     Search {
@@ -476,6 +484,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Analyze { file } => cmd_analyze(&file),
         Commands::Functions { file } => cmd_functions(&file),
         Commands::Metrics { file, sort, top } => cmd_metrics(&file, &sort, top),
+        Commands::Summary { file } => cmd_summary(&file),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
         Commands::Callgraph { file, dot, scc } => cmd_callgraph(&file, dot, scc),
@@ -501,7 +510,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Diff { file_a, file_b } => cmd_diff(&file_a, &file_b),
         Commands::SemanticDiff { file_a, file_b, kinds } => cmd_semantic_diff(&file_a, &file_b, &kinds, cli.thumb),
         Commands::Imports { file, exports } => cmd_imports(&file, exports),
-        Commands::Coverage { file } => cmd_coverage(&file),
+        Commands::Coverage { file, annotated } => cmd_coverage(&file, annotated),
         Commands::Script { file, script } => cmd_script(&file, &script, cli.thumb),
         Commands::Mcp { file } => mcp::run_stdio(&file, cli.thumb),
         Commands::Annotate { file, rename, force_func, not_func, cc, comment, import, keep_mangled, list, clear } =>
@@ -992,6 +1001,107 @@ fn cmd_metrics(
         );
     }
     println!("\nShowing top {} sorted by {}", rows.len(), sort);
+    Ok(())
+}
+
+fn cmd_summary(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    let info = &program.info;
+
+    println!("=== {} ===", path.display());
+    println!("  Format         {} / {} ({} bit)", info.format, info.arch, info.bits);
+    println!("  Entry          0x{:x}", info.entry_point);
+
+    // Runtime / language summary from metadata.
+    let p = &program.metadata.properties;
+    let interesting_keys = [
+        "language", "runtime", "compiler", "libc_version",
+        "pe_product", "pe_version", "build_id",
+    ];
+    let mut had_meta = false;
+    for k in interesting_keys {
+        if let Some(v) = p.get(k) {
+            if !had_meta {
+                println!();
+                println!("Identity:");
+                had_meta = true;
+            }
+            println!("  {:<14} {}", k, v);
+        }
+    }
+
+    // Function counts: total / named / with metrics.
+    let total = program.listing.function_count();
+    let named = program
+        .listing
+        .functions()
+        .filter(|f| !f.name.starts_with("FUN_"))
+        .count();
+    let no_return = program.listing.functions().filter(|f| f.no_return).count();
+    let thunks = program.listing.functions().filter(|f| f.is_thunk).count();
+    println!();
+    println!("Functions:");
+    println!("  total          {}", total);
+    println!("  named          {} ({:.0}%)",
+        named,
+        if total > 0 { 100.0 * named as f64 / total as f64 } else { 0.0 });
+    println!("  no-return      {}", no_return);
+    println!("  thunks         {}", thunks);
+
+    // Comment / annotation totals.
+    let mut by_kind: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for c in program.comments.iter() {
+        *by_kind.entry(format!("{:?}", c.comment_type)).or_default() += 1;
+    }
+    if !by_kind.is_empty() {
+        println!();
+        println!("Annotations:");
+        for (k, v) in &by_kind {
+            println!("  {:<14} {}", k.to_ascii_lowercase(), v);
+        }
+    }
+
+    // Hot functions — top 5 by fan-in inferred from metrics.
+    let mut top: Vec<(u64, String, usize)> = Vec::new();
+    for f in program.listing.functions() {
+        let key = format!("func_{:x}_metrics", f.entry_point);
+        if let Some(raw) = p.get(&key)
+            && let Some(m) = gr_analysis::complexity::parse_metrics(raw)
+        {
+            top.push((f.entry_point, f.name.clone(), m.fan_in));
+        }
+    }
+    top.sort_by_key(|(_, _, fan)| std::cmp::Reverse(*fan));
+    let to_show: Vec<_> = top
+        .into_iter()
+        .filter(|(_, _, fi)| *fi >= 3)
+        .take(8)
+        .collect();
+    if !to_show.is_empty() {
+        println!();
+        println!("Hottest:");
+        for (addr, name, fan) in &to_show {
+            println!("  0x{:<12x} called by {} functions  {}", addr, fan, name);
+        }
+    }
+
+    // SCC clusters from metadata.
+    let mut scc_keys: Vec<&String> = p.keys().filter(|k| k.starts_with("scc_")).collect();
+    scc_keys.sort();
+    if !scc_keys.is_empty() {
+        println!();
+        println!("Recursive clusters: {}", scc_keys.len());
+        for k in scc_keys.iter().take(4) {
+            if let Some(v) = p.get(*k) {
+                println!("  {}", v);
+            }
+        }
+        if scc_keys.len() > 4 {
+            println!("  …{} more", scc_keys.len() - 4);
+        }
+    }
+
     Ok(())
 }
 
@@ -2493,7 +2603,7 @@ fn cmd_imports(path: &Path, show_exports: bool) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn cmd_coverage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_coverage(path: &Path, annotated: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
     let total_code: u64 = program.info.sections.iter()
@@ -2510,6 +2620,33 @@ fn cmd_coverage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Coverage:         {:.1}%", coverage);
     println!("  Functions:        {}", program.listing.function_count());
     println!("  Instructions:     {}", program.listing.instruction_count());
+
+    if annotated {
+        // Annotation density: how many decoded instruction addresses
+        // host at least one CommentManager entry, by kind.
+        let insn_addrs: std::collections::BTreeSet<u64> = program
+            .listing
+            .instructions()
+            .map(|i| i.address)
+            .collect();
+        let mut annotated_insn = std::collections::BTreeSet::new();
+        let mut total_comments = 0usize;
+        for c in program.comments.iter() {
+            total_comments += 1;
+            if insn_addrs.contains(&c.address) {
+                annotated_insn.insert(c.address);
+            }
+        }
+        let pct = if !insn_addrs.is_empty() {
+            100.0 * annotated_insn.len() as f64 / insn_addrs.len() as f64
+        } else {
+            0.0
+        };
+        println!();
+        println!("  Comments:         {}", total_comments);
+        println!("  Annotated insns:  {} ({:.1}%)", annotated_insn.len(), pct);
+        println!("  Call renderings:  {}", program.call_renderings.len());
+    }
 
     println!("\nPer-section breakdown:");
     println!("  {:<25} {:>10} {:>10} {:>8}", "Section", "Size", "Flags", "Type");
