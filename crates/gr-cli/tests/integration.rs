@@ -165,6 +165,7 @@ fn project_summary_roundtrip() {
         }],
         symbols: Vec::new(),
         references: Vec::new(),
+        comments: Vec::new(),
         references_count: 10,
         instructions_count: 50,
         has_dwarf: false,

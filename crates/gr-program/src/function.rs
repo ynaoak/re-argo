@@ -49,6 +49,14 @@ pub struct Function {
     pub thunk_target: Option<u64>,
     pub call_targets: BTreeSet<u64>,
     pub stack_frame: StackFrame,
+    /// Return type string from signature DB / DWARF / user override
+    pub return_type: Option<String>,
+    /// Parameter list: (name, type) pairs from signature DB / DWARF / user override
+    pub parameters: Vec<(String, String)>,
+    /// True when the function is known to never return (exit, abort, throw, …)
+    pub no_return: bool,
+    /// Library or module the function belongs to (e.g. "libc", "win32")
+    pub library: Option<String>,
 }
 
 impl Function {
@@ -62,6 +70,10 @@ impl Function {
             thunk_target: None,
             call_targets: BTreeSet::new(),
             stack_frame: StackFrame::default(),
+            return_type: None,
+            parameters: Vec::new(),
+            no_return: false,
+            library: None,
         }
     }
 }

@@ -51,6 +51,7 @@ pub(crate) mod helpers {
             references: ReferenceManager::new(),
             data_types: DataTypeManager::new(),
             comments: gr_program::comments::CommentManager::new(),
+            metadata: gr_program::metadata::ProgramMetadata::default(),
         }
     }
 
@@ -110,6 +111,7 @@ pub(crate) mod helpers {
             references: ReferenceManager::new(),
             data_types: DataTypeManager::new(),
             comments: gr_program::comments::CommentManager::new(),
+            metadata: gr_program::metadata::ProgramMetadata::default(),
         }
     }
 }

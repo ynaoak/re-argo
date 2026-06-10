@@ -11,6 +11,36 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
 pub struct FunctionDiscoveryAnalyzer;
 
+/// Re-run function discovery after late analyzers (CrtAnalyzer,
+/// CrtPatternAnalyzer) have added new function entries with empty
+/// bodies. The body-filling re-entry inside the primary Discovery
+/// pass handles existing zero-body functions; we just need that
+/// pass to run *after* the late renamers have populated them.
+pub struct LateDiscoveryAnalyzer;
+
+impl Analyzer for LateDiscoveryAnalyzer {
+    fn name(&self) -> &str {
+        "Late Discovery"
+    }
+    fn description(&self) -> &str {
+        "Re-runs function discovery to fill bodies for late-added functions (main, CRT helpers)"
+    }
+    fn priority(&self) -> u32 {
+        // After CrtPatternAnalyzer (470) + CrtAnalyzer (710), before
+        // CallSiteAnnotator (750) so the resolved arg values it
+        // produces benefit from the now-discovered call_targets.
+        730
+    }
+    fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        FunctionDiscoveryAnalyzer.analyze(program).map(|r| AnalysisResult {
+            analyzer_name: self.name().into(),
+            functions_found: r.functions_found,
+            references_found: r.references_found,
+            instructions_decoded: r.instructions_decoded,
+        })
+    }
+}
+
 impl Analyzer for FunctionDiscoveryAnalyzer {
     fn name(&self) -> &str {
         "Function Discovery"
@@ -39,6 +69,40 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             }
         }
 
+        // `.init_array` / `.fini_array` / `.preinit_array` (and the
+        // legacy `.ctors` / `.dtors`) hold pointer arrays the loader
+        // calls before / after `main`. Discovery doesn't follow
+        // these by default — they're populated by the linker and
+        // referenced only from `.dynamic`, never from code — so
+        // stripped binaries end up with `frame_dummy` and
+        // `__do_global_dtors_aux` invisible to every downstream
+        // analyzer that walks the function list. Seeding them here
+        // costs almost nothing and unlocks the CRT-pattern recogniser.
+        let pointer_width = if program.info.bits == 64 { 8 } else { 4 };
+        for sec_name in [".init_array", ".fini_array", ".preinit_array", ".ctors", ".dtors"] {
+            let Some(section) = program.info.sections.iter().find(|s| s.name == sec_name) else {
+                continue;
+            };
+            if section.size == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; section.size.min(4096) as usize];
+            if program.info.memory.read_bytes(section.address, &mut buf).is_err() {
+                continue;
+            }
+            for chunk in buf.chunks_exact(pointer_width) {
+                let ptr = if pointer_width == 8 {
+                    u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]))
+                } else {
+                    u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])) as u64
+                };
+                if ptr == 0 || ptr == u64::MAX {
+                    continue;
+                }
+                work_queue.push_back(ptr);
+            }
+        }
+
         const MAX_FUNCTIONS: usize = 50_000;
         const MAX_INSTRUCTIONS: usize = 5_000_000;
 
@@ -49,7 +113,18 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             if visited.contains(&func_entry) {
                 continue;
             }
-            if program.listing.has_function(func_entry) {
+            // A pre-existing function with an empty body (added by
+            // EhFrameAnalyzer, EntryPointAnalyzer, or by Symbols
+            // pre-seeding) still needs its body discovered — without
+            // it `function_containing` rejects every address inside
+            // and every downstream analyzer (callsite resolver,
+            // boundary checker, coverage…) treats those bytes as
+            // un-owned. Re-run discovery, then merge results in.
+            let needs_body = program
+                .listing
+                .get_function(func_entry)
+                .is_some_and(|f| f.body.is_empty());
+            if program.listing.has_function(func_entry) && !needs_body {
                 continue;
             }
 
@@ -68,12 +143,23 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                         program.references.add(*r);
                     }
 
-                    let mut func = if let Some(sym) = program.symbol_table.primary_at(func_entry) {
-                        Function::new(func_entry, sym.name.clone())
+                    if needs_body {
+                        if let Some(existing) = program.listing.get_function_mut(func_entry) {
+                            existing.body = discovery.body;
+                            existing.call_targets = discovery.call_targets.clone();
+                        }
                     } else {
-                        Function::new(func_entry, format!("FUN_{:08x}", func_entry))
-                    };
-                    func.body = discovery.body;
+                        let mut func =
+                            if let Some(sym) = program.symbol_table.primary_at(func_entry) {
+                                Function::new(func_entry, sym.name.clone())
+                            } else {
+                                Function::new(func_entry, format!("FUN_{:08x}", func_entry))
+                            };
+                        func.body = discovery.body;
+                        func.call_targets = discovery.call_targets.clone();
+                        program.listing.add_function(func);
+                        functions_found += 1;
+                    }
 
                     for call_target in &discovery.call_targets {
                         if !visited.contains(call_target)
@@ -82,10 +168,6 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                             work_queue.push_back(*call_target);
                         }
                     }
-
-                    func.call_targets = discovery.call_targets;
-                    program.listing.add_function(func);
-                    functions_found += 1;
                 }
                 Err(_) => continue,
             }
