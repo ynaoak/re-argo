@@ -41,6 +41,15 @@ pub struct Program {
     /// Compiler / language / build metadata, surfaced via `info` and
     /// `export`. Populated by the compiler-fingerprint analyzer.
     pub metadata: ProgramMetadata,
+    /// Per-call-site rendering: address of the Call instruction →
+    /// the C-style expression the decompiler should emit *in place*
+    /// of the synthetic `<callee>@plt()` stub. Populated by
+    /// `CallSiteAnnotator` once it has resolved arg values + a
+    /// matching `SignatureDatabase` signature; the decompiler
+    /// emitters check this map before falling back to their
+    /// untyped form. Format: full expression *without* a trailing
+    /// semicolon — `printf("hi %d", 42)`.
+    pub call_renderings: std::collections::BTreeMap<u64, String>,
 }
 
 impl Program {
@@ -92,6 +101,7 @@ impl Program {
             data_types: DataTypeManager::new(),
             comments: CommentManager::new(),
             metadata: ProgramMetadata::default(),
+            call_renderings: std::collections::BTreeMap::new(),
         })
     }
 

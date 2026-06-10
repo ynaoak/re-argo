@@ -69,6 +69,18 @@ impl Analyzer for PeSehAnalyzer {
             recovered += parse_pdata(program, base, size);
         }
 
+        // TLS callbacks land in `.tls` (the
+        // IMAGE_TLS_DIRECTORY.AddressOfCallBacks field points into
+        // here, but our loader doesn't expose the data directory
+        // directly; we scan the section start for the canonical
+        // null-terminated pointer array layout). These callbacks
+        // run *before* main and are a classic anti-debug slot —
+        // surfacing them as Functions makes them visible to every
+        // downstream pass.
+        if let Some((tls_base, tls_size)) = find_section(program, ".tls") {
+            recovered += parse_tls_callbacks(program, tls_base, tls_size);
+        }
+
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
             functions_found: recovered,
@@ -76,6 +88,58 @@ impl Analyzer for PeSehAnalyzer {
             instructions_decoded: 0,
         })
     }
+}
+
+/// Walk a null-terminated array of qword callback pointers
+/// starting at `base`. Each entry is registered as a Function +
+/// `tls_callback_<n>` Symbol; we use a Plate comment so the
+/// listing makes it obvious these run before `main` is reached.
+fn parse_tls_callbacks(program: &mut Program, base: u64, size: u64) -> usize {
+    let cap = size.min(4096) as usize;
+    let mut buf = vec![0u8; cap];
+    if program.info.memory.read_bytes(base, &mut buf).is_err() {
+        return 0;
+    }
+    let ptr_size = 8usize;
+    let valid_code = code_ranges(program);
+    let mut added = 0usize;
+    let mut idx = 0usize;
+    for chunk in buf.chunks_exact(ptr_size) {
+        let ptr = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+        if ptr == 0 {
+            break;
+        }
+        if !crate::utils::is_valid_address(ptr, &valid_code) {
+            idx += 1;
+            continue;
+        }
+        if !program.listing.has_function(ptr) {
+            program.listing.add_function(gr_program::function::Function::new(
+                ptr,
+                format!("tls_callback_{}", idx),
+            ));
+            added += 1;
+        }
+        program.symbol_table.add(gr_program::symbol::Symbol::new(
+            format!("tls_callback_{}", idx),
+            ptr,
+            gr_program::symbol::SymbolType::Function,
+            gr_program::symbol::SourceType::Analysis,
+        ));
+        if program
+            .comments
+            .get(ptr, gr_program::comments::CommentType::Plate)
+            .is_none()
+        {
+            program.comments.set(
+                ptr,
+                gr_program::comments::CommentType::Plate,
+                "TLS callback — runs before main (anti-debug-adjacent)",
+            );
+        }
+        idx += 1;
+    }
+    added
 }
 
 fn find_section(program: &Program, name: &str) -> Option<(u64, u64)> {

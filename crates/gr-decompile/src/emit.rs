@@ -47,6 +47,13 @@ pub struct CEmitter<'a> {
     /// `wrapper → foo` / `loop back-edge` right next to the
     /// statement they describe.
     annotations: Option<&'a BTreeMap<u64, Vec<String>>>,
+    /// Per-call-site rendering: when set, the Call op at a given
+    /// instruction address is emitted using the rendering string
+    /// (a C-syntax `printf("hi", 42)` expression) instead of the
+    /// untyped `<callee>@plt()` stub. Populated by
+    /// `CallSiteAnnotator` once the iterative resolver has pinned
+    /// arg values + a `SignatureDatabase` signature.
+    call_renderings: Option<&'a BTreeMap<u64, String>>,
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
@@ -66,6 +73,7 @@ impl CEmitter<'static> {
             symbol_names: empty_u64_map(),
             string_literals: empty_u64_map(),
             annotations: None,
+            call_renderings: None,
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -95,6 +103,7 @@ impl<'a> CEmitter<'a> {
             symbol_names,
             string_literals,
             annotations: None,
+            call_renderings: None,
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -108,6 +117,18 @@ impl<'a> CEmitter<'a> {
         annotations: &'a BTreeMap<u64, Vec<String>>,
     ) -> Self {
         self.annotations = Some(annotations);
+        self
+    }
+
+    /// Attach per-call-site C-syntax renderings (typically from
+    /// `program.call_renderings`). When the Call op at an address
+    /// in the map is emitted, the rendering string is used in
+    /// place of the synthetic `<callee>@plt()` stub.
+    pub fn with_call_renderings(
+        mut self,
+        renderings: &'a BTreeMap<u64, String>,
+    ) -> Self {
+        self.call_renderings = Some(renderings);
         self
     }
 
@@ -538,6 +559,16 @@ impl<'a> CEmitter<'a> {
                 Some(format!("*({}*){} = {};", size_to_type(size), addr, val))
             }
             OpCode::Call => {
+                // CallSiteAnnotator may have stashed a fully
+                // resolved C-syntax rendering for this call site
+                // (e.g. `printf("hello %d\n", 42)`). When present,
+                // use it; otherwise fall back to the bare
+                // `<callee>@plt()` stub from the symbol table.
+                if let Some(renderings) = self.call_renderings
+                    && let Some(rendering) = renderings.get(&op.address)
+                {
+                    return Some(format!("{};", rendering));
+                }
                 let target_expr = self.input_expr(func, op, 0);
                 let call_name = if let Some(target_vn) = op.inputs.first() {
                     let addr = func.varnodes[*target_vn as usize].data.offset;

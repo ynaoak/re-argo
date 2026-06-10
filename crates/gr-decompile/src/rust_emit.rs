@@ -36,6 +36,9 @@ pub struct RustEmitter<'a> {
     /// emitter type to attach analyzer comments. See
     /// `CEmitter::with_annotations` for the contract.
     annotations: Option<&'a BTreeMap<u64, Vec<String>>>,
+    /// Per-call-site C-syntax rendering map. Mirror of the C
+    /// emitter's `call_renderings`; see `emit.rs` for the rationale.
+    call_renderings: Option<&'a BTreeMap<u64, String>>,
     /// Per-address emit-once dedup, so multi-op instructions don't
     /// replay the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
@@ -55,6 +58,7 @@ impl RustEmitter<'static> {
             symbol_names: empty_u64_map(),
             string_literals: empty_u64_map(),
             annotations: None,
+            call_renderings: None,
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -72,6 +76,7 @@ impl<'a> RustEmitter<'a> {
             symbol_names,
             string_literals,
             annotations: None,
+            call_renderings: None,
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -83,6 +88,16 @@ impl<'a> RustEmitter<'a> {
         annotations: &'a BTreeMap<u64, Vec<String>>,
     ) -> Self {
         self.annotations = Some(annotations);
+        self
+    }
+
+    /// Attach per-call-site C-syntax renderings. Mirror of
+    /// `CEmitter::with_call_renderings`.
+    pub fn with_call_renderings(
+        mut self,
+        renderings: &'a BTreeMap<u64, String>,
+    ) -> Self {
+        self.call_renderings = Some(renderings);
         self
     }
 
@@ -523,6 +538,15 @@ impl<'a> RustEmitter<'a> {
                 ))
             }
             OpCode::Call => {
+                // Same `program.call_renderings` short-circuit as
+                // the C emitter — see emit.rs for the rationale.
+                // We strip the `@plt` suffix the symbol table uses
+                // since Rust identifiers can't contain `@`.
+                if let Some(renderings) = self.call_renderings
+                    && let Some(rendering) = renderings.get(&op.address)
+                {
+                    return Some(format!("{};", rendering));
+                }
                 let target_expr = self.input_expr(func, op, 0);
                 let call_name = if let Some(target_vn) = op.inputs.first() {
                     let addr = func.varnodes[*target_vn as usize].data.offset;
