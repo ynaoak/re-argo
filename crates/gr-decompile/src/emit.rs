@@ -41,6 +41,15 @@ pub struct CEmitter<'a> {
     output: String,
     symbol_names: &'a BTreeMap<u64, String>,
     string_literals: &'a BTreeMap<u64, String>,
+    /// Per-instruction-address annotations (from the analyzer
+    /// CommentManager). Surfaces them as inline `// …` lines in the
+    /// decompiled output so the user sees `printf(format=…)` /
+    /// `wrapper → foo` / `loop back-edge` right next to the
+    /// statement they describe.
+    annotations: Option<&'a BTreeMap<u64, Vec<String>>>,
+    /// Track which addresses we've already emitted annotations for,
+    /// so multi-op instructions don't repeat the same comment.
+    emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
 }
 
 impl Default for CEmitter<'static> {
@@ -56,6 +65,8 @@ impl CEmitter<'static> {
             output: String::new(),
             symbol_names: empty_u64_map(),
             string_literals: empty_u64_map(),
+            annotations: None,
+            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
 }
@@ -83,7 +94,21 @@ impl<'a> CEmitter<'a> {
             output: String::new(),
             symbol_names,
             string_literals,
+            annotations: None,
+            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Attach per-address annotations (typically from
+    /// `program.comments`). Annotations are emitted as `// …` lines
+    /// immediately before the first SsaOp that lifts an instruction
+    /// at that address, deduped so multi-op instructions don't repeat.
+    pub fn with_annotations(
+        mut self,
+        annotations: &'a BTreeMap<u64, Vec<String>>,
+    ) -> Self {
+        self.annotations = Some(annotations);
+        self
     }
 
     pub fn emit_function(
@@ -269,6 +294,7 @@ impl<'a> CEmitter<'a> {
             if op.dead || op.block != block_id {
                 continue;
             }
+            self.emit_annotations_for(op.address);
             if let Some(line) = self.emit_op(func, op) {
                 self.line(&line);
             }
@@ -283,10 +309,34 @@ impl<'a> CEmitter<'a> {
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
                 continue;
             }
+            self.emit_annotations_for(op.address);
             if let Some(line) = self.emit_op(func, op) {
                 self.line(&line);
             }
         }
+    }
+
+    /// Emit any analyzer-supplied annotations for `addr` as `// …`
+    /// lines. Dedup so several ops lifted from the same instruction
+    /// don't replay the same comment.
+    fn emit_annotations_for(&mut self, addr: u64) {
+        let Some(ann) = self.annotations else {
+            return;
+        };
+        if self.emitted.borrow().contains(&addr) {
+            return;
+        }
+        let Some(lines) = ann.get(&addr) else {
+            self.emitted.borrow_mut().insert(addr);
+            return;
+        };
+        for ln in lines {
+            // Strip stray newlines so we don't break the
+            // line-prefix indentation.
+            let cleaned = ln.replace(['\n', '\r'], " ");
+            linef!(self, "// {}", cleaned);
+        }
+        self.emitted.borrow_mut().insert(addr);
     }
 
     fn emit_op(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {

@@ -44,7 +44,7 @@ pub fn decompile(
 
     let terminated = trim_to_return(lifted);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(terminated, func_name, entry, &empty, &empty)
+    build_decompile_result(terminated, func_name, entry, &empty, &empty, None)
 }
 
 pub fn decompile_function(
@@ -53,7 +53,27 @@ pub fn decompile_function(
     func_entry: u64,
 ) -> Result<DecompileResult, String> {
     let (symbols, string_literals) = build_program_maps(program);
-    decompile_function_with_maps(lifter, program, func_entry, &symbols, &string_literals)
+    let annotations = build_annotations(program);
+    decompile_function_with_maps(
+        lifter,
+        program,
+        func_entry,
+        &symbols,
+        &string_literals,
+        Some(&annotations),
+    )
+}
+
+/// Roll up every `program.comments` entry into the per-address vector
+/// the C / Rust emitters want. One BTreeMap per program; passed by
+/// reference into every decompile call so the cost is paid once.
+pub fn build_annotations(program: &Program) -> std::collections::BTreeMap<u64, Vec<String>> {
+    let mut out: std::collections::BTreeMap<u64, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for c in program.comments.iter() {
+        out.entry(c.address).or_default().push(c.text);
+    }
+    out
 }
 
 /// Iterate `program.symbol_table` once and return the two
@@ -97,6 +117,7 @@ pub fn decompile_function_with_maps(
     func_entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
     string_literals: &std::collections::BTreeMap<u64, String>,
+    annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
 ) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
     let func_name = func
@@ -133,7 +154,7 @@ pub fn decompile_function_with_maps(
         trim_to_return(lifted)
     };
 
-    build_decompile_result(terminated, &func_name, func_entry, symbols, string_literals)
+    build_decompile_result(terminated, &func_name, func_entry, symbols, string_literals, annotations)
 }
 
 /// Decompile every function the program knows about, in parallel.
@@ -161,6 +182,7 @@ pub fn decompile_all(
     // work. `decompile_function_with_maps` is the same code path
     // minus the rebuild.
     let (symbols, string_literals) = build_program_maps(program);
+    let annotations = build_annotations(program);
 
     entries
         .par_iter()
@@ -173,6 +195,7 @@ pub fn decompile_all(
                     entry,
                     &symbols,
                     &string_literals,
+                    Some(&annotations),
                 ),
             )
         })
@@ -236,6 +259,7 @@ fn build_decompile_result(
     entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
     string_literals: &std::collections::BTreeMap<u64, String>,
+    annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -291,6 +315,9 @@ fn build_decompile_result(
     // maps * two emitters). The borrow-based `with_maps` API is
     // zero-clone.
     let mut c_emitter = CEmitter::with_maps(symbols, string_literals);
+    if let Some(ann) = annotations {
+        c_emitter = c_emitter.with_annotations(ann);
+    }
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
