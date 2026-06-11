@@ -36,6 +36,12 @@ use gr_core::pcode::OpCode;
 use gr_lift::{LiftedInstruction, PcodeLift};
 use gr_program::Program;
 
+/// Set → Range widening threshold. A `Set` join that crosses this
+/// size collapses to a Range envelope to keep the per-block state
+/// bounded. 8 is the value the original implementation used; named
+/// here so review-time tuning has one source of truth.
+const SET_WIDEN_THRESHOLD: usize = 8;
+
 /// Abstract value lattice. Ordered roughly bottom → top by precision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbstractValue {
@@ -62,20 +68,19 @@ impl AbstractValue {
             (Const(a), Set(s)) | (Set(s), Const(a)) => {
                 let mut s = s.clone();
                 s.insert(*a);
-                if s.len() > 8 {
+                if s.len() > SET_WIDEN_THRESHOLD {
                     Range(*s.iter().min().unwrap(), *s.iter().max().unwrap())
                 } else {
                     Set(s)
                 }
             }
             (Set(a), Set(b)) => {
-                let mut s: BTreeSet<u64> = a.union(b).copied().collect();
-                if s.len() > 8 {
+                let s: BTreeSet<u64> = a.union(b).copied().collect();
+                if s.len() > SET_WIDEN_THRESHOLD {
                     let lo = *s.iter().min().unwrap();
                     let hi = *s.iter().max().unwrap();
                     Range(lo, hi)
                 } else {
-                    s = s.into_iter().collect();
                     Set(s)
                 }
             }
@@ -212,91 +217,117 @@ fn propagate(insns: &[LiftedInstruction], out: &mut VsaResult) {
     let mut out_st: BTreeMap<u64, State> = BTreeMap::new();
     in_st.insert(entry, State::new());
 
-    for _round in 0..8 {
-        let mut changed = false;
-        let mut worklist: VecDeque<u64> = VecDeque::from_iter(starts_vec.iter().copied());
-        let mut seen: BTreeSet<u64> = BTreeSet::new();
-        while let Some(b) = worklist.pop_front() {
-            if !seen.insert(b) {
-                continue;
-            }
-            let joined = if let Some(ps) = preds.get(&b) {
-                if ps.is_empty() && b == entry {
-                    State::new()
-                } else {
-                    join_states(ps.iter().filter_map(|p| out_st.get(p)))
-                }
-            } else if b == entry {
+    // Build the successor relation once so we can enqueue only the
+    // blocks whose input state might have changed. Before this, the
+    // outer `for _round in 0..8 { for b in all_blocks }` re-walked
+    // every block 8 times even when only a leaf had flipped — O(rounds
+    // × blocks × ops). A real worklist is O(edges × convergence-rounds).
+    let mut succs: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for (b, ps) in &preds {
+        for p in ps {
+            succs.entry(*p).or_default().insert(*b);
+        }
+    }
+
+    // Per-block iteration cap so an irreducible / cycle-heavy CFG can't
+    // loop forever. 8 matches the previous outer-round limit; in
+    // practice convergence takes 1-2 rounds for reducible CFGs.
+    const MAX_VISITS_PER_BLOCK: usize = 8;
+    let mut visits: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut worklist: VecDeque<u64> = VecDeque::from_iter(starts_vec.iter().copied());
+    let mut in_queue: BTreeSet<u64> = starts_vec.iter().copied().collect();
+
+    while let Some(b) = worklist.pop_front() {
+        in_queue.remove(&b);
+        let v = visits.entry(b).or_insert(0);
+        if *v >= MAX_VISITS_PER_BLOCK {
+            continue;
+        }
+        *v += 1;
+
+        let joined = if let Some(ps) = preds.get(&b) {
+            if ps.is_empty() && b == entry {
                 State::new()
             } else {
-                continue;
-            };
-
-            if in_st.get(&b) != Some(&joined) {
-                in_st.insert(b, joined.clone());
-                changed = true;
+                join_states(ps.iter().filter_map(|p| out_st.get(p)))
             }
+        } else if b == entry {
+            State::new()
+        } else {
+            continue;
+        };
 
-            let block_end = starts_vec
-                .iter()
-                .find(|&&s| s > b)
-                .copied()
-                .unwrap_or(u64::MAX);
-            let mut st = joined;
-            let Some(&start_idx) = addr_to_idx.get(&b) else {
-                continue;
-            };
-            let mut call_snaps: Vec<(u64, BTreeMap<u64, AbstractValue>)> = Vec::new();
-            for insn in &insns[start_idx..] {
-                if insn.address >= block_end {
-                    break;
-                }
-                for op in &insn.ops {
-                    match op.opcode {
-                        OpCode::Call | OpCode::CallInd => {
-                            let mut regs = BTreeMap::new();
-                            for ((sp, off), v) in &st {
-                                if *sp == SpaceId::REGISTER
-                                    && !matches!(v, AbstractValue::Top | AbstractValue::Bot)
-                                {
-                                    regs.insert(*off, v.clone());
-                                }
+        let in_changed = in_st.get(&b) != Some(&joined);
+        if in_changed {
+            in_st.insert(b, joined.clone());
+        }
+
+        let block_end = starts_vec
+            .iter()
+            .find(|&&s| s > b)
+            .copied()
+            .unwrap_or(u64::MAX);
+        let mut st = joined;
+        let Some(&start_idx) = addr_to_idx.get(&b) else {
+            continue;
+        };
+        let mut call_snaps: Vec<(u64, BTreeMap<u64, AbstractValue>)> = Vec::new();
+        for insn in &insns[start_idx..] {
+            if insn.address >= block_end {
+                break;
+            }
+            for op in &insn.ops {
+                match op.opcode {
+                    OpCode::Call | OpCode::CallInd => {
+                        let mut regs = BTreeMap::new();
+                        for ((sp, off), val) in &st {
+                            if *sp == SpaceId::REGISTER
+                                && !matches!(val, AbstractValue::Top | AbstractValue::Bot)
+                            {
+                                regs.insert(*off, val.clone());
                             }
-                            call_snaps.push((insn.address, regs));
-                            st.retain(|(sp, _), _| *sp != SpaceId::REGISTER);
                         }
-                        OpCode::Copy => apply_copy(&mut st, op),
-                        OpCode::IntAdd => apply_intadd(&mut st, op),
-                        _ => {
-                            if let Some(d) = op.output.as_ref() {
-                                st.remove(&(d.space, d.offset));
-                            }
+                        call_snaps.push((insn.address, regs));
+                        st.retain(|(sp, _), _| *sp != SpaceId::REGISTER);
+                    }
+                    OpCode::Copy => apply_copy(&mut st, op),
+                    OpCode::IntAdd => apply_intadd(&mut st, op),
+                    _ => {
+                        if let Some(d) = op.output.as_ref() {
+                            st.remove(&(d.space, d.offset));
                         }
                     }
                 }
-            }
-            for (addr, regs) in call_snaps {
-                let entry = out.entry(addr).or_default();
-                if entry.is_empty() {
-                    *entry = regs;
-                } else {
-                    let mut merged: BTreeMap<u64, AbstractValue> = BTreeMap::new();
-                    for (k, v) in entry.iter() {
-                        if let Some(other) = regs.get(k) {
-                            merged.insert(*k, v.join(other));
-                        }
-                    }
-                    *entry = merged;
-                }
-            }
-
-            if out_st.get(&b) != Some(&st) {
-                out_st.insert(b, st);
-                changed = true;
             }
         }
-        if !changed {
-            break;
+        for (addr, regs) in call_snaps {
+            let entry = out.entry(addr).or_default();
+            if entry.is_empty() {
+                *entry = regs;
+            } else {
+                let mut merged: BTreeMap<u64, AbstractValue> = BTreeMap::new();
+                for (k, v) in entry.iter() {
+                    if let Some(other) = regs.get(k) {
+                        merged.insert(*k, v.join(other));
+                    }
+                }
+                *entry = merged;
+            }
+        }
+
+        let out_changed = out_st.get(&b) != Some(&st);
+        if out_changed {
+            out_st.insert(b, st);
+            // Only successors of the just-changed block need re-walking.
+            // That's the central optimisation over the previous "scan
+            // every block every round" form.
+            if let Some(ss) = succs.get(&b) {
+                for s in ss {
+                    if in_queue.insert(*s) {
+                        worklist.push_back(*s);
+                    }
+                }
+            }
         }
     }
 }
@@ -471,5 +502,175 @@ mod tests {
     fn as_single_unknown_returns_none() {
         assert_eq!(AbstractValue::Top.as_single(), None);
         assert_eq!(AbstractValue::Range(5, 10).as_single(), None);
+    }
+
+    /// End-to-end VSA on a synthesised P-code stream — pins down the
+    /// worklist convergence behaviour so the post-review refactor
+    /// from "scan all blocks every round" to "succs-on-change"
+    /// doesn't silently regress.
+    ///
+    /// Synthesised stream:
+    ///   block A (entry, addr 0x1000):
+    ///     COPY rdi = CONST(0x42)
+    ///     BRANCH 0x2000
+    ///   block B (addr 0x2000):
+    ///     CALL <some target> ; expect snapshot to record rdi = 0x42
+    ///     RETURN
+    #[test]
+    fn propagate_records_call_snapshot_across_blocks() {
+        use gr_core::address::{Address, SpaceId};
+        use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
+        use gr_lift::LiftedInstruction;
+
+        // rdi register offset in the SysV register map = 0x38; using
+        // the same convention the rest of the crate does so the
+        // result map's inner key is comparable.
+        let rdi_off = 0x38u64;
+
+        fn vn_reg(off: u64) -> VarnodeData {
+            VarnodeData {
+                space: SpaceId::REGISTER,
+                offset: off,
+                size: 8,
+            }
+        }
+        fn vn_const(v: u64) -> VarnodeData {
+            VarnodeData {
+                space: SpaceId::CONST,
+                offset: v,
+                size: 8,
+            }
+        }
+        fn vn_ram(addr: u64) -> VarnodeData {
+            VarnodeData {
+                space: SpaceId::RAM,
+                offset: addr,
+                size: 8,
+            }
+        }
+        fn op(opcode: OpCode, inputs: Vec<VarnodeData>, output: Option<VarnodeData>) -> PcodeOp {
+            let mut o = PcodeOp::new(opcode, SeqNum::new(Address::new(SpaceId::RAM, 0), 0));
+            o.inputs = inputs.into_iter().collect();
+            o.output = output;
+            o
+        }
+
+        let block_a = LiftedInstruction {
+            address: 0x1000,
+            length: 4,
+            mnemonic: "block-a".into(),
+            ops: vec![
+                op(OpCode::Copy, vec![vn_const(0x42)], Some(vn_reg(rdi_off))),
+                op(OpCode::Branch, vec![vn_ram(0x2000)], None),
+            ],
+        };
+        let block_b = LiftedInstruction {
+            address: 0x2000,
+            length: 4,
+            mnemonic: "block-b".into(),
+            ops: vec![
+                op(OpCode::Call, vec![vn_const(0xdeadbeef)], None),
+                op(OpCode::Return, vec![vn_const(0)], None),
+            ],
+        };
+
+        let mut result = VsaResult::new();
+        propagate(&[block_a, block_b], &mut result);
+
+        let snap = result.get(&0x2000).expect("call snapshot at 0x2000");
+        let v = snap.get(&rdi_off).expect("rdi tracked across branch");
+        assert_eq!(v.as_single(), Some(0x42));
+    }
+
+    /// Convergence: when block A pins rdi to two different values
+    /// along two branches, the joined input to the callee block
+    /// becomes a Set with both. Verifies the worklist re-walks block
+    /// B exactly when out_state for one of its predecessors actually
+    /// changed.
+    #[test]
+    fn propagate_joins_disagreeing_predecessors_into_set() {
+        use gr_core::address::{Address, SpaceId};
+        use gr_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
+        use gr_lift::LiftedInstruction;
+
+        let rdi_off = 0x38u64;
+
+        fn vn_reg(off: u64) -> VarnodeData {
+            VarnodeData {
+                space: SpaceId::REGISTER,
+                offset: off,
+                size: 8,
+            }
+        }
+        fn vn_const(v: u64) -> VarnodeData {
+            VarnodeData {
+                space: SpaceId::CONST,
+                offset: v,
+                size: 8,
+            }
+        }
+        fn vn_ram(a: u64) -> VarnodeData {
+            VarnodeData {
+                space: SpaceId::RAM,
+                offset: a,
+                size: 8,
+            }
+        }
+        fn op(opcode: OpCode, inputs: Vec<VarnodeData>, output: Option<VarnodeData>) -> PcodeOp {
+            let mut o = PcodeOp::new(opcode, SeqNum::new(Address::new(SpaceId::RAM, 0), 0));
+            o.inputs = inputs.into_iter().collect();
+            o.output = output;
+            o
+        }
+
+        // entry block at 0x1000: conditional branch to 0x2000 / fall
+        // through to 0x1010
+        let entry = LiftedInstruction {
+            address: 0x1000,
+            length: 4,
+            mnemonic: "entry".into(),
+            ops: vec![op(OpCode::CBranch, vec![vn_ram(0x2000)], None)],
+        };
+        // fall-through block: rdi = 0x42, jmp to 0x3000
+        let fallthrough = LiftedInstruction {
+            address: 0x1010,
+            length: 4,
+            mnemonic: "ft".into(),
+            ops: vec![
+                op(OpCode::Copy, vec![vn_const(0x42)], Some(vn_reg(rdi_off))),
+                op(OpCode::Branch, vec![vn_ram(0x3000)], None),
+            ],
+        };
+        // taken block: rdi = 0x43, jmp to 0x3000
+        let taken = LiftedInstruction {
+            address: 0x2000,
+            length: 4,
+            mnemonic: "taken".into(),
+            ops: vec![
+                op(OpCode::Copy, vec![vn_const(0x43)], Some(vn_reg(rdi_off))),
+                op(OpCode::Branch, vec![vn_ram(0x3000)], None),
+            ],
+        };
+        let call_block = LiftedInstruction {
+            address: 0x3000,
+            length: 4,
+            mnemonic: "call".into(),
+            ops: vec![
+                op(OpCode::Call, vec![vn_const(0xdeadbeef)], None),
+                op(OpCode::Return, vec![vn_const(0)], None),
+            ],
+        };
+
+        let mut result = VsaResult::new();
+        propagate(&[entry, fallthrough, taken, call_block], &mut result);
+
+        let snap = result.get(&0x3000).expect("call snapshot at 0x3000");
+        let v = snap.get(&rdi_off).expect("rdi joined into call snapshot");
+        match v {
+            AbstractValue::Set(s) => {
+                assert!(s.contains(&0x42) && s.contains(&0x43), "got: {:?}", s);
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
     }
 }

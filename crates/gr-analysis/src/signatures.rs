@@ -419,8 +419,10 @@ impl SignatureDatabase {
 
     pub fn add_pattern(&mut self, pattern: Vec<u8>, sig: FunctionSignature) {
         // Store the byte pattern as a hex string so the BTreeMap key
-        // stays serde-friendly. Patterns are matched at lookup time
-        // by decoding back to bytes — see `lookup_by_pattern`.
+        // stays serde-friendly. No `lookup_by_pattern` reader exists
+        // yet; the pattern table is currently write-only and surfaced
+        // only via `signature_count` + JSON export. When a reader
+        // lands it will decode the hex back to bytes for matching.
         let hex: String = pattern.iter().map(|b| format!("{:02x}", b)).collect();
         self.by_pattern.insert(hex, sig);
     }

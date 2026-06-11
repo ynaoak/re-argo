@@ -55,10 +55,18 @@ impl Analyzer for LinearSweepAnalyzer {
         "Speculative function discovery via prologue scan + lift-and-validate"
     }
     fn priority(&self) -> u32 {
-        // After CrtPattern (470) so we don't fight its renames;
-        // before signature-driven passes so the new functions get
-        // every downstream analyzer's full treatment.
-        480
+        // After CrtAnalyzer (710) + LateDiscovery (730) so `main` and
+        // every CrtPattern-recovered body is in the listing before
+        // we walk uncovered territory. Running earlier (the previous
+        // 480 slot) caused stripped binaries to register `main`'s
+        // prologue or interior bytes as `FUN_*` because CrtAnalyzer
+        // hadn't seeded the function yet, leaving its body absent
+        // from `covered`.
+        //
+        // 740 sits between LateDiscovery (730) and CallSiteAnnotator
+        // (750) so signature-driven renamers see the new entries
+        // in the same round as everything else.
+        740
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         if !matches!(program.info.arch, gr_loader::Architecture::X86_64) {
@@ -92,13 +100,19 @@ impl Analyzer for LinearSweepAnalyzer {
             .collect();
 
         let lifter: Box<dyn PcodeLift> = Box::new(gr_lift::x86::X86Lifter::new_64());
-        let mut new_functions: Vec<u64> = Vec::new();
+        let mut new_functions: Vec<(u64, u64)> = Vec::new();
         let mut visited: BTreeSet<u64> = BTreeSet::new();
 
         for (sec_start, sec_end) in &exec_sections {
             let mut addr = (*sec_start + 15) & !15;
             while addr + 8 < *sec_end {
-                if !is_uncovered(addr, &covered) && !visited.insert(addr) {
+                // Skip when EITHER the address is already inside a
+                // known function body OR we've already tried it this
+                // run. The previous form used `&&` AND short-circuited
+                // past `visited.insert` for the dominant case, so
+                // `visited` never populated and we re-walked every
+                // address.
+                if is_inside_function_body(addr, &covered) || !visited.insert(addr) {
                     addr += 16;
                     continue;
                 }
@@ -112,22 +126,29 @@ impl Analyzer for LinearSweepAnalyzer {
                     addr += 16;
                     continue;
                 }
-                if is_inside_function_body(addr, &covered) {
-                    addr += 16;
-                    continue;
-                }
                 // Speculatively lift up to 256 insns. Accept the
                 // candidate iff the lift reaches a Return / IndirectJump
-                // and doesn't overlap existing functions.
-                if validate_candidate(&*lifter, program, addr, &covered) {
-                    new_functions.push(addr);
+                // and doesn't overlap existing functions. On accept,
+                // record the lifted range so subsequent 16-byte-aligned
+                // candidates inside the newly-found body get skipped
+                // by the next iteration's `is_inside_function_body`
+                // check (and not re-validated).
+                if let Some(end) = validate_candidate_with_extent(&*lifter, program, addr, &covered)
+                {
+                    new_functions.push((addr, end));
+                    covered.push((addr, end));
+                    // Re-sort so the binary-search-style scan stays
+                    // consistent. Cost is linear-in-N; the candidate
+                    // count is bounded by section size / 16 so this
+                    // doesn't dominate.
+                    covered.sort_by_key(|(s, _)| *s);
                 }
                 addr += 16;
             }
         }
 
         let mut added = 0usize;
-        for entry in &new_functions {
+        for (entry, _end) in &new_functions {
             if program.listing.has_function(*entry) {
                 continue;
             }
@@ -152,10 +173,6 @@ impl Analyzer for LinearSweepAnalyzer {
             instructions_decoded: 0,
         })
     }
-}
-
-fn is_uncovered(addr: u64, covered: &[(u64, u64)]) -> bool {
-    !covered.iter().any(|(s, e)| addr >= *s && addr < *e)
 }
 
 fn is_inside_function_body(addr: u64, covered: &[(u64, u64)]) -> bool {
@@ -208,49 +225,55 @@ fn looks_like_prologue(bytes: &[u8]) -> bool {
 ///  * none of the lifted addresses fall inside an existing
 ///    function's body — overlap means we re-discovered a known
 ///    function or stumbled into the middle of one
-fn validate_candidate(
+///
+/// On accept, returns `Some(end_address)` where `end_address` is
+/// exclusive (last_insn.address + last_insn.length). Callers feed
+/// this back into `covered` so adjacent candidates inside the
+/// just-discovered body get skipped without re-lifting.
+fn validate_candidate_with_extent(
     lifter: &dyn PcodeLift,
     program: &Program,
     entry: u64,
     covered: &[(u64, u64)],
-) -> bool {
-    let Ok(lifted) = lifter.lift_range(&program.info.memory, entry, 256) else {
-        return false;
-    };
+) -> Option<u64> {
+    let lifted = lifter.lift_range(&program.info.memory, entry, 256).ok()?;
     if lifted.len() < 3 {
-        return false;
+        return None;
     }
-    let mut terminated = false;
-    for insn in &lifted {
+    let mut terminator_idx: Option<usize> = None;
+    for (i, insn) in lifted.iter().enumerate() {
         if is_inside_function_body(insn.address, covered) {
-            return false;
+            return None;
         }
         // Look at the underlying `DecodedInstruction.flow_type` via
         // the listing if the address is decoded, else inspect the
         // P-code op to detect a Return. The lifter's
         // `LiftedInstruction` carries the raw bytes + ops but not
         // the high-level flow_type, so we check op opcode directly.
-        for op in &insn.ops {
-            if matches!(
+        let pcode_terminates = insn.ops.iter().any(|op| {
+            matches!(
                 op.opcode,
-                gr_core::pcode::OpCode::Return
-                    | gr_core::pcode::OpCode::BranchInd
-            ) {
-                terminated = true;
-                break;
-            }
-        }
-        if terminated {
-            break;
-        }
-        if let Some(insn_meta) = program.listing.instructions_in_range(insn.address, insn.address + 1).next()
-            && matches!(insn_meta.flow_type, FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall)
-        {
-            terminated = true;
+                gr_core::pcode::OpCode::Return | gr_core::pcode::OpCode::BranchInd
+            )
+        });
+        let flow_terminates = program
+            .listing
+            .instructions_in_range(insn.address, insn.address + 1)
+            .next()
+            .is_some_and(|m| {
+                matches!(
+                    m.flow_type,
+                    FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall
+                )
+            });
+        if pcode_terminates || flow_terminates {
+            terminator_idx = Some(i);
             break;
         }
     }
-    terminated
+    let idx = terminator_idx?;
+    let last = &lifted[idx];
+    Some(last.address + last.length as u64)
 }
 
 #[cfg(test)]
@@ -297,5 +320,67 @@ mod tests {
         assert!(is_inside_function_body(0x2049, &covered));
         assert!(!is_inside_function_body(0x1500, &covered));
         assert!(!is_inside_function_body(0x2050, &covered));
+    }
+
+    /// Synthesise a tiny ELF-shaped Program with a single
+    /// push/mov/ret routine and confirm the validator accepts it
+    /// AND reports an end address pointing past the `ret`. This is
+    /// the regression test for the post-review fix that swapped
+    /// `validate_candidate -> bool` for `validate_candidate_with_extent
+    /// -> Option<u64>`.
+    #[test]
+    fn validate_returns_end_address_for_simple_function() {
+        use crate::testutil::helpers::make_x86_64_program;
+
+        // push rbp; mov rbp, rsp; xor eax, eax; pop rbp; ret
+        let code: [u8; 8] = [0x55, 0x48, 0x89, 0xe5, 0x31, 0xc0, 0x5d, 0xc3];
+        let entry = 0x1000u64;
+        let program = make_x86_64_program(&code, entry);
+        let lifter = gr_lift::x86::X86Lifter::new_64();
+
+        let end = validate_candidate_with_extent(&lifter, &program, entry, &[])
+            .expect("simple ret-terminated routine should validate");
+        // ret is the last byte: addr 0x1007, length 1 → end = 0x1008.
+        assert_eq!(end, entry + code.len() as u64);
+    }
+
+    /// Bodies that overlap an already-covered range must be rejected
+    /// even if they would otherwise terminate. This pins down the
+    /// "don't re-discover the same function" guarantee.
+    #[test]
+    fn validate_rejects_when_overlap_with_covered() {
+        use crate::testutil::helpers::make_x86_64_program;
+
+        let code: [u8; 8] = [0x55, 0x48, 0x89, 0xe5, 0x31, 0xc0, 0x5d, 0xc3];
+        let entry = 0x1000u64;
+        let program = make_x86_64_program(&code, entry);
+        let lifter = gr_lift::x86::X86Lifter::new_64();
+
+        // Cover 0x1004..0x1008 so the lift collides on its third
+        // instruction (`xor eax, eax` at 0x1004).
+        let covered = vec![(0x1004u64, 0x1008u64)];
+        assert!(
+            validate_candidate_with_extent(&lifter, &program, entry, &covered).is_none(),
+            "overlap with covered range must reject"
+        );
+    }
+
+    /// Sequences with no terminator must be rejected — otherwise the
+    /// sweep would happily mark the middle of `.text` as a function
+    /// every 16 bytes.
+    #[test]
+    fn validate_rejects_when_no_terminator() {
+        use crate::testutil::helpers::make_x86_64_program;
+
+        // Four `mov eax, eax` style fillers, no ret.
+        let code: [u8; 16] = [
+            0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0,
+            0x89, 0xc0,
+        ];
+        let entry = 0x2000u64;
+        let program = make_x86_64_program(&code, entry);
+        let lifter = gr_lift::x86::X86Lifter::new_64();
+
+        assert!(validate_candidate_with_extent(&lifter, &program, entry, &[]).is_none());
     }
 }

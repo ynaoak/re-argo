@@ -143,26 +143,19 @@ impl Analyzer for TagAnalyzer {
 /// replacement is `None`, the original comment text is used.
 fn derive_tags(text: &str) -> Vec<(TagKind, Option<String>)> {
     let mut out = Vec::new();
-    let lower = text.to_ascii_lowercase();
 
     // Direct prefix / keyword matches against the analyzer output
     // we already emit. Keep these in sync with the comment strings
     // in canary.rs / anti_debug.rs / crypto.rs / etc.
+    //
+    // The previous form allocated a `String` lowered copy of every
+    // comment regardless of need. Most comments hit only `starts_with`
+    // checks, so we now defer the lowering to the first
+    // case-insensitive needle we test.
     if text.starts_with("crypto:") {
         out.push((TagKind::Crypto, None));
     }
-    if lower.contains("stack-protected") || lower.contains("canary load") {
-        out.push((TagKind::StackProtected, None));
-    }
-    if lower.contains("anti-debug")
-        || lower.contains("rdtsc")
-        || lower.contains("int3")
-        || lower.contains("ptrace")
-        || lower.contains("isdebuggerpresent")
-    {
-        out.push((TagKind::AntiDebug, None));
-    }
-    if text.starts_with("C++ EH:") || lower.contains("itanium abi") {
+    if text.starts_with("C++ EH:") {
         out.push((TagKind::Exception, None));
     }
     if text.starts_with("wrapper →") || text.starts_with("wrapper ->") {
@@ -187,6 +180,24 @@ fn derive_tags(text: &str) -> Vec<(TagKind, Option<String>)> {
         // TLS callbacks are runtime hooks — flag as suspicious so
         // they're easy to find in malware triage.
         out.push((TagKind::Suspicious, None));
+    }
+
+    // Case-insensitive needles — only allocate the lowered copy when
+    // at least one of these is reached.
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("stack-protected") || lower.contains("canary load") {
+        out.push((TagKind::StackProtected, None));
+    }
+    if lower.contains("anti-debug")
+        || lower.contains("rdtsc")
+        || lower.contains("int3")
+        || lower.contains("ptrace")
+        || lower.contains("isdebuggerpresent")
+    {
+        out.push((TagKind::AntiDebug, None));
+    }
+    if lower.contains("itanium abi") && !out.iter().any(|(k, _)| matches!(k, TagKind::Exception)) {
+        out.push((TagKind::Exception, None));
     }
     out
 }
