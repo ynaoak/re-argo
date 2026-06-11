@@ -2,18 +2,21 @@
 
 A Rust reimplementation of [NSA Ghidra](https://github.com/NationalSecurityAgency/ghidra)'s core binary analysis pipeline. CLI-first, library-first — no GUI.
 
+> **For AI agents and operators**: see [CLAUDE.md](CLAUDE.md) for the complete CLI-operations reference (every command, every flag, output conventions, multi-command recipes, common gotchas). This README is the human-readable overview.
+
 ## Features
 
-- **20,000+ lines** of Rust across 10 crates
-- **252 tests**, clippy clean
-- **6 architectures**: x86/x64, ARM/AArch64, RISC-V, MIPS, PowerPC, SPARC
-- **30 analyzers**: function discovery, string search, stack analysis, VTable detection, calling convention inference, and more
-- **Full P-code IR**: all 74 opcodes with emulation support
-- **Decompiler**: SSA construction, 10 optimization rules, type inference, C/Rust pseudocode output
-- **Debug info**: DWARF (functions, types, parameters, line numbers), PDB headers/types
+- **~20,000+ lines** of Rust across 10 crates
+- **600+ tests**, clippy clean across `--all-targets -- -D warnings`
+- **6 architectures**: x86 / x64, ARM / AArch64, RISC-V, MIPS, PowerPC, SPARC
+- **68 analyzers** in the AnalysisManager pipeline: function discovery (recursive descent + linear sweep), 312-entry signature DB (libc / POSIX / Win32 / libstdc++), CRT pattern recognition, VSA + multi-block constant tracker, RTTI / VTable recovery, calling-convention inference, anti-debug / crypto / loop / exception / wrapper / no-return propagation, BN-style tag categorisation, hot-function detection, dead-code, callgraph SCC, complexity metrics
+- **Full P-code IR**: 74 opcodes with emulation support
+- **Decompiler**: SSA construction, 6 optimisation passes, type inference, C / Rust pseudocode output with **inline analyzer comments + signature-aware call rendering** (`printf("hi %d", 42)` instead of `printf@plt()`)
+- **Debug info**: DWARF (functions, types, parameters, line numbers, source-file plates), PDB headers / types
 - **SLEIGH runtime**: packed format reader, decision trees, context database, zlib decompression
-- **Binary formats**: ELF, PE, Mach-O, COFF, raw binary
-- **Debugger foundation**: GDB RSP protocol, breakpoints, watchpoints, syscall emulation, state snapshots
+- **Binary formats**: ELF, PE (with `.pdata` / TLS callbacks / IAT / `.rsrc` VS_VERSIONINFO), Mach-O (with ObjC classes / methods / ivars / protocols), COFF, raw binary
+- **Debugger foundation**: GDB RSP protocol (client + server), breakpoints, watchpoints, syscall emulation, state snapshots
+- **MCP integration**: speak Model Context Protocol over stdio to embed ghidra-rust into AI hosts (Claude Code, etc.)
 
 ## Quick Start
 
@@ -21,85 +24,94 @@ A Rust reimplementation of [NSA Ghidra](https://github.com/NationalSecurityAgenc
 # Build
 cargo build --release
 
-# Analyze a binary
-cargo run -- analyze /path/to/binary
+# Triage a binary
+target/release/ghidra-rust info <binary>
+target/release/ghidra-rust summary <binary>
+
+# Browse discovered functions
+target/release/ghidra-rust functions <binary>
+target/release/ghidra-rust metrics <binary> --top 25
+
+# Cross-search by name / symbol / comment / tag
+target/release/ghidra-rust find <binary> "printf"
 
 # Disassemble
-cargo run -- disasm /path/to/binary -n 50
+target/release/ghidra-rust disasm <binary> -n 50
 
-# Decompile entry point
-cargo run -- decompile /path/to/binary
+# Decompile
+target/release/ghidra-rust decompile <binary> --address 0x401000
 
-# Show P-code
-cargo run -- pcode /path/to/binary -n 20
+# Reverse callgraph — who calls into this address?
+target/release/ghidra-rust backtrace <binary> 0x401000
 
-# Emulate with breakpoints
-cargo run -- emulate /path/to/binary --break 0x401000 -n 1000
+# Categorised findings (crypto / suspicious / library / …)
+target/release/ghidra-rust tags <binary> --list-types
 
-# Export analysis to JSON
-cargo run -- export /path/to/binary
+# Memory map
+target/release/ghidra-rust memmap <binary>
 
-# Export to Ghidra-compatible XML
-cargo run -- export-xml /path/to/binary
+# Export everything to JSON
+target/release/ghidra-rust export <binary> -o out.json
 ```
 
-## CLI Commands
+For the full command surface, every flag, output formats, and multi-command recipes, see [CLAUDE.md](CLAUDE.md).
 
-| Command | Description |
-|---------|-------------|
-| `info` | Display binary file information |
-| `sections` | List sections |
-| `symbols` | List symbols (filterable by kind) |
-| `disasm` | Disassemble instructions |
-| `registers` | List architecture registers |
-| `hexdump` | Hex dump at address |
-| `analyze` | Run full analysis pipeline |
-| `functions` | List discovered functions |
-| `xrefs` | Show cross-references |
-| `callgraph` | Display call graph (with DOT export) |
-| `pcode` | Show P-code IR |
-| `decompile` | Decompile to C pseudocode |
-| `export` | Export analysis to JSON |
-| `export-xml` | Export to Ghidra XML |
-| `emulate` | Emulate with P-code |
+## CLI Commands (overview)
+
+40+ subcommands organised into eight groups:
+
+| Group | Commands |
+|---|---|
+| Triage | `info`, `summary`, `sections`, `memmap`, `symbols`, `imports`, `strings` |
+| Analysis | `analyze`, `functions`, `metrics`, `bench`, `coverage`, `workflow` |
+| Findings | `tags`, `find`, `signatures` |
+| Code views | `disasm`, `pcode`, `decompile`, `decompile-all`, `cfg` |
+| Cross-refs | `xrefs`, `callgraph`, `backtrace`, `callsites` |
+| Data / search | `hexdump`, `search` |
+| Diff | `diff`, `semantic-diff` |
+| Export | `export`, `export-xml` |
+| Emulation | `emulate`, `gdbserver`, `debug` |
+| Manual correction | `annotate`, `iterate` |
+| Integration | `script`, `mcp`, `patch`, `taint`, `registers` |
 
 ## Architecture
 
 ```
-gr-cli ─────────────────────────────────────────────┐
-  ├── gr-decompile (SSA, optimization, C/Rust output)│
-  │     ├── gr-lift (x86 → P-code)                   │
-  │     └── gr-sleigh (SLEIGH runtime)                │
-  ├── gr-analysis (30 analyzers)                      │
-  │     └── gr-program (Program model)                │
-  ├── gr-arch (6 architectures, .cspec/.pspec)        │
-  ├── gr-loader (ELF/PE/Mach-O/COFF, DWARF, PDB)     │
-  ├── gr-emulator (P-code emulation, debugger)        │
-  └── gr-core (addresses, P-code IR, data types)      │
-──────────────────────────────────────────────────────┘
+gr-cli ────────────────────────────────────────────────┐
+  ├── gr-decompile (SSA, optimisation, C/Rust output)  │
+  │     ├── gr-lift (x86 / ARM / RISC-V / ... → P-code) │
+  │     └── gr-sleigh (SLEIGH runtime)                  │
+  ├── gr-analysis (68 analyzers)                        │
+  │     └── gr-program (Program model + Tags)           │
+  ├── gr-arch (6 architectures, .cspec / .pspec)        │
+  ├── gr-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)  │
+  ├── gr-emulator (P-code emulation, debugger, GDB RSP) │
+  └── gr-core (addresses, P-code IR, data types)        │
+─────────────────────────────────────────────────────────┘
 ```
 
 ## Crates
 
-| Crate | Lines | Description |
-|-------|-------|-------------|
-| `gr-core` | ~1,800 | Address model, P-code IR (74 ops), data types |
-| `gr-loader` | ~2,500 | Binary loaders, DWARF, PDB, FLIRT, relocations |
-| `gr-arch` | ~2,200 | 6 architectures, .cspec/.pspec/.ldefs parsers |
-| `gr-program` | ~1,500 | Program model, symbols, references, undo/redo |
-| `gr-analysis` | ~2,000 | 30 analysis passes |
-| `gr-lift` | ~1,100 | x86 → P-code lifter |
-| `gr-emulator` | ~2,000 | P-code emulator, debugger, GDB RSP |
-| `gr-decompile` | ~2,500 | SSA, optimization, structuring, C/Rust output |
-| `gr-sleigh` | ~1,800 | SLEIGH specification runtime |
-| `gr-cli` | ~700 | Command-line interface |
+| Crate | Purpose |
+|-------|---------|
+| `gr-core` | Address model, P-code IR (74 ops), data types |
+| `gr-loader` | ELF / PE / Mach-O / COFF, DWARF, PDB, FLIRT, relocations |
+| `gr-arch` | 6 architectures, .cspec / .pspec / .ldefs parsers, assembler |
+| `gr-program` | Program model, symbols, references, comments, **tags**, **call_renderings**, undo / redo, diff, SARIF, metadata |
+| `gr-analysis` | 68 analyzers (function discovery, signatures, VSA, CRT patterns, tags, …) |
+| `gr-lift` | Multi-arch → P-code lifter |
+| `gr-emulator` | P-code emulator, debugger, GDB RSP |
+| `gr-decompile` | SSA, optimisation, structuring, C / Rust output with annotations |
+| `gr-sleigh` | SLEIGH specification runtime |
+| `gr-cli` | 40+ CLI subcommands |
 
 ## Building
 
 ```bash
-cargo build
-cargo test
-cargo clippy
+cargo build              # debug
+cargo build --release    # release
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Ghidra Reference
