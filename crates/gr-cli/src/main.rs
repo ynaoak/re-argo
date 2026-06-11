@@ -123,6 +123,16 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// Cross-search functions, symbols, strings, and comments (BN-style Command Palette)
+    Find {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Substring to grep for (case-insensitive)
+        query: String,
+        /// Limit the result count
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Emit a DOT graph of a function's control flow
     Cfg {
         /// Path to the binary file
@@ -503,6 +513,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Summary { file } => cmd_summary(&file),
         Commands::Tags { file, filter, list_types } => cmd_tags(&file, filter.as_deref(), list_types),
         Commands::Bench { file } => cmd_bench(&file),
+        Commands::Find { file, query, limit } => cmd_find(&file, &query, limit),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
         Commands::Callgraph { file, dot, scc } => cmd_callgraph(&file, dot, scc),
@@ -1184,6 +1195,114 @@ fn cmd_tags(
     }
     println!();
     println!("Showing {} tag{}", shown, if shown == 1 { "" } else { "s" });
+    Ok(())
+}
+
+fn cmd_find(
+    path: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    let q = query.to_ascii_lowercase();
+
+    println!("\nSearch results for `{}` in {}", query, path.display());
+    println!("{}", "-".repeat(72));
+
+    let mut hits = 0usize;
+
+    // Functions
+    let mut func_hits = 0usize;
+    for f in program.listing.functions() {
+        if hits >= limit {
+            break;
+        }
+        if f.name.to_ascii_lowercase().contains(&q) {
+            if func_hits == 0 {
+                println!("\n[functions]");
+            }
+            println!("  0x{:<16x} {}", f.entry_point, f.name);
+            func_hits += 1;
+            hits += 1;
+        }
+    }
+
+    // Symbols
+    let mut sym_hits = 0usize;
+    for s in program.symbol_table.iter() {
+        if hits >= limit {
+            break;
+        }
+        if s.name.to_ascii_lowercase().contains(&q) {
+            if sym_hits == 0 {
+                println!("\n[symbols]");
+            }
+            println!(
+                "  0x{:<16x} {:<10} {}",
+                s.address,
+                format!("{:?}", s.symbol_type),
+                s.name
+            );
+            sym_hits += 1;
+            hits += 1;
+        }
+    }
+
+    // Comments
+    let mut com_hits = 0usize;
+    for c in program.comments.iter() {
+        if hits >= limit {
+            break;
+        }
+        if c.text.to_ascii_lowercase().contains(&q) {
+            if com_hits == 0 {
+                println!("\n[comments]");
+            }
+            println!(
+                "  0x{:<16x} {:<6} {}",
+                c.address,
+                format!("{:?}", c.comment_type),
+                c.text
+            );
+            com_hits += 1;
+            hits += 1;
+        }
+    }
+
+    // Tags
+    let mut tag_hits = 0usize;
+    for (addr, t) in program.tags.iter_addresses() {
+        if hits >= limit {
+            break;
+        }
+        if t.kind.as_str().contains(&q) || t.text.to_ascii_lowercase().contains(&q) {
+            if tag_hits == 0 {
+                println!("\n[tags]");
+            }
+            println!("  0x{:<16x} {:<10} {}", addr, t.kind.as_str(), t.text);
+            tag_hits += 1;
+            hits += 1;
+        }
+    }
+    for (addr, t) in program.tags.iter_functions() {
+        if hits >= limit {
+            break;
+        }
+        if t.kind.as_str().contains(&q) || t.text.to_ascii_lowercase().contains(&q) {
+            if tag_hits == 0 {
+                println!("\n[tags]");
+            }
+            println!("  0x{:<16x} {:<10} {}  [function-scope]", addr, t.kind.as_str(), t.text);
+            tag_hits += 1;
+            hits += 1;
+        }
+    }
+
+    println!();
+    println!(
+        "{} hits (functions: {}, symbols: {}, comments: {}, tags: {})",
+        hits, func_hits, sym_hits, com_hits, tag_hits
+    );
     Ok(())
 }
 
