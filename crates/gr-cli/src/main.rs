@@ -123,6 +123,21 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// List analyzer pipeline (BN-style Workflow) and warn on dependency issues
+    Workflow {
+        /// Limit to analyzers that have declared provides/consumes
+        #[arg(long)]
+        declared_only: bool,
+    },
+    /// Export / inspect the built-in signature database (type-archive workflow)
+    Signatures {
+        /// When set, write the built-in database to this file as JSON
+        #[arg(long)]
+        export: Option<PathBuf>,
+        /// Filter the listing by library name (libc / Win32 / POSIX / …)
+        #[arg(long)]
+        library: Option<String>,
+    },
     /// Cross-search functions, symbols, strings, and comments (BN-style Command Palette)
     Find {
         /// Path to the binary file
@@ -514,6 +529,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Tags { file, filter, list_types } => cmd_tags(&file, filter.as_deref(), list_types),
         Commands::Bench { file } => cmd_bench(&file),
         Commands::Find { file, query, limit } => cmd_find(&file, &query, limit),
+        Commands::Signatures { export, library } => cmd_signatures(export.as_deref(), library.as_deref()),
+        Commands::Workflow { declared_only } => cmd_workflow(declared_only),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
         Commands::Callgraph { file, dot, scc } => cmd_callgraph(&file, dot, scc),
@@ -1195,6 +1212,90 @@ fn cmd_tags(
     }
     println!();
     println!("Showing {} tag{}", shown, if shown == 1 { "" } else { "s" });
+    Ok(())
+}
+
+fn cmd_workflow(declared_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mgr = gr_analysis::AnalysisManager::new();
+
+    println!("Analyzer pipeline (priority order):");
+    println!("{}", "-".repeat(72));
+    println!("  prio  name                              provides → consumes");
+
+    for (name, prio, provides, consumes) in mgr.workflow_listing() {
+        if declared_only && provides.is_empty() && consumes.is_empty() {
+            continue;
+        }
+        let p = provides.join(",");
+        let c = consumes.join(",");
+        println!(
+            "  {:>4}  {:<32}  {} → {}",
+            prio,
+            name,
+            if p.is_empty() { "-" } else { p.as_str() },
+            if c.is_empty() { "-" } else { c.as_str() },
+        );
+    }
+
+    let warnings = mgr.validate_workflow();
+    if warnings.is_empty() {
+        println!();
+        println!("Workflow validation: OK (no dependency issues detected)");
+    } else {
+        println!();
+        println!("Workflow validation: {} warning(s)", warnings.len());
+        for (consumer, dep, problem) in &warnings {
+            println!("  ⚠  {} consumes `{}` — {}", consumer, dep, problem);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_signatures(
+    export: Option<&Path>,
+    library: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = gr_analysis::signatures::SignatureDatabase::new();
+    if let Some(p) = export {
+        db.save_to_file(p)?;
+        println!(
+            "Exported {} signatures to {}",
+            db.signature_count(),
+            p.display()
+        );
+        return Ok(());
+    }
+
+    println!("Built-in signature database: {} entries", db.signature_count());
+    println!("{}", "-".repeat(72));
+    println!("  library  name                      return       params");
+
+    let mut shown = 0usize;
+    for sig in db.iter_signatures() {
+        if let Some(lib) = library
+            && !sig.library.eq_ignore_ascii_case(lib)
+        {
+            continue;
+        }
+        let params = sig
+            .parameters
+            .iter()
+            .map(|(n, t)| format!("{}: {}", n, t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name_col = if sig.no_return {
+            format!("{} [noreturn]", sig.name)
+        } else {
+            sig.name.clone()
+        };
+        println!(
+            "  {:<8} {:<25} {:<12} ({})",
+            sig.library, name_col, sig.return_type, params
+        );
+        shown += 1;
+    }
+    println!();
+    println!("Showing {} signatures", shown);
     Ok(())
 }
 

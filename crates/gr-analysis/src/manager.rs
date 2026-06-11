@@ -159,6 +159,53 @@ impl AnalysisManager {
         results
     }
 
+    /// Walk the priority-sorted analyzer list and report any
+    /// consumer that runs before its producer — a BN-style
+    /// "workflow validation" pass. Returns `(consumer, dep,
+    /// problem)` tuples where `problem` is either
+    /// `"runs_before_producer"` or `"missing_producer"`. Used by
+    /// the `workflow` CLI subcommand to catch pipeline ordering
+    /// regressions before they manifest as silent analyzer no-ops.
+    pub fn validate_workflow(&self) -> Vec<(String, String, &'static str)> {
+        let mut warnings = Vec::new();
+        let mut seen_providers: std::collections::BTreeMap<&'static str, u32> =
+            std::collections::BTreeMap::new();
+        for a in &self.analyzers {
+            for cap in a.consumes() {
+                match seen_providers.get(cap) {
+                    Some(producer_prio) if *producer_prio <= a.priority() => {}
+                    Some(_) => warnings.push((
+                        a.name().to_string(),
+                        (*cap).to_string(),
+                        "runs_before_producer",
+                    )),
+                    None => warnings.push((
+                        a.name().to_string(),
+                        (*cap).to_string(),
+                        "missing_producer",
+                    )),
+                }
+            }
+            for cap in a.provides() {
+                seen_providers.entry(cap).or_insert(a.priority());
+            }
+        }
+        warnings
+    }
+
+    /// Iterate (name, priority, provides, consumes) for every
+    /// analyzer in priority order — drives the `workflow` CLI
+    /// listing.
+    pub fn workflow_listing(
+        &self,
+    ) -> impl Iterator<
+        Item = (&str, u32, &'static [&'static str], &'static [&'static str]),
+    > {
+        self.analyzers
+            .iter()
+            .map(|a| (a.name(), a.priority(), a.provides(), a.consumes()))
+    }
+
     pub fn run_all_or_fail(
         &self,
         program: &mut Program,

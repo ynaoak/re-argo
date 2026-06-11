@@ -265,6 +265,8 @@ dependencies = [
  "rayon",
  "rustc-demangle",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror",
 ]

@@ -53,6 +53,9 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
     fn priority(&self) -> u32 {
         100
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["functions"]
+    }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let mut work_queue: VecDeque<u64> = VecDeque::new();

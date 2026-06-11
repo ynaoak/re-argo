@@ -44,6 +44,12 @@ impl Analyzer for CallSiteAnnotator {
         // before the CrossReferenceReport analyzer (which prints comments).
         750
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["call_renderings", "callsite_comments"]
+    }
+    fn consumes(&self) -> &'static [&'static str] {
+        &["functions", "signatures"]
+    }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         if !matches!(program.info.arch, gr_loader::Architecture::X86_64) {
