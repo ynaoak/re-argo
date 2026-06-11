@@ -155,6 +155,10 @@ enum Commands {
         /// Maximum hops to walk back from the target
         #[arg(long, default_value_t = 6)]
         depth: usize,
+        /// Maximum number of distinct paths to enumerate (hub
+        /// functions easily exceed the default)
+        #[arg(long, default_value_t = 256)]
+        max_paths: usize,
     },
     /// ASCII layout of every loaded section + permission bits
     Memmap {
@@ -522,7 +526,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             around,
             depth,
         } => cmd_callgraph(&file, dot, scc, around, depth),
-        Commands::Backtrace { file, address, depth } => cmd_backtrace(&file, address, depth),
+        Commands::Backtrace { file, address, depth, max_paths } => cmd_backtrace(&file, address, depth, max_paths),
         Commands::Memmap { file } => cmd_memmap(&file),
         Commands::Pcode {
             file,
@@ -1426,11 +1430,12 @@ fn cmd_backtrace(
     path: &Path,
     address: u64,
     depth: usize,
+    max_paths: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
     let cg = CallGraph::build(&program);
 
-    let paths = cg.paths_to(address, depth);
+    let paths = cg.paths_to(address, depth, max_paths);
     if paths.is_empty() {
         let known = cg.callers_of(address).len();
         println!(
@@ -1476,11 +1481,19 @@ fn cmd_memmap(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Sort by load address so the map reads as a linear memory
+    // layout. The loader's natural order is section-header order;
+    // for ELF that's usually address-sorted already, but PE / Mach-O
+    // can reorder things (resources after code, etc.) and we want
+    // the same picture across formats.
+    let mut sections = info.sections.clone();
+    sections.sort_by_key(|s| s.address);
+
     println!("Memory map of {}", path.display());
     println!("{}", "-".repeat(72));
     println!("  {:<22} {:<18} {:>10}  perm  size-bar", "name", "range", "size");
 
-    for s in &info.sections {
+    for s in &sections {
         if s.size == 0 {
             continue;
         }
@@ -1521,7 +1534,7 @@ fn cmd_memmap(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!(
         "Total: {} sections, {} bytes",
-        info.sections.iter().filter(|s| s.size > 0).count(),
+        sections.iter().filter(|s| s.size > 0).count(),
         total
     );
     Ok(())
