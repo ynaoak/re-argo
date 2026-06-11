@@ -20,11 +20,14 @@
 //!     uint32_t flags;              // 0x00
 //!     uint32_t instance_start;     // 0x04
 //!     uint32_t instance_size;      // 0x08
-//!     uint32_t reserved;           // 0x0c
-//!     void    * ivar_layout;       // 0x10
-//!     const char * name;           // 0x18    <- C string
+//!     uint32_t reserved;           // 0x0c (64-bit only)
+//!     uint8_t       * ivar_layout; // 0x10
+//!     const char    * name;        // 0x18    <- C string
 //!     method_list_t * baseMethods; // 0x20
-//!     ...
+//!     protocol_list_t * baseProtocols; // 0x28
+//!     ivar_list_t   * ivars;       // 0x30
+//!     uint8_t       * weak_ivar_layout; // 0x38
+//!     property_list_t * baseProperties; // 0x40
 //! };
 //!
 //! struct method_list_t {
@@ -121,7 +124,12 @@ impl Analyzer for MachoObjCAnalyzer {
         let mut methods_found = 0usize;
         let mut classes_found = 0usize;
         for chunk in buf.chunks_exact(ptr) {
-            let class_addr = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+            // `chunks_exact(8)` guarantees an 8-byte slice, so the
+            // try_into can't fail. The previous `unwrap_or([0; 8])`
+            // pessimistically masked any conversion failure into a
+            // null pointer that then got skipped, which was harmless
+            // but obscured intent.
+            let class_addr = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)"));
             if class_addr == 0 {
                 continue;
             }
@@ -140,6 +148,9 @@ impl Analyzer for MachoObjCAnalyzer {
             let Some(class_name) = read_c_str(program, name_ptr, 128) else {
                 continue;
             };
+            if !looks_like_identifier(&class_name) {
+                continue;
+            }
             let Some(method_list) = read_u64(program, class_ro + 0x20) else {
                 continue;
             };
@@ -235,6 +246,9 @@ fn parse_ivar_list(program: &mut Program, list_addr: u64, class_name: &str) -> u
         let Some(ivar_name) = read_c_str(program, name_ptr, 96) else {
             continue;
         };
+        if !looks_like_identifier(&ivar_name) {
+            continue;
+        }
         let Some(offset_ptr) = read_u64(program, entry) else {
             continue;
         };
@@ -276,7 +290,7 @@ fn parse_protocol_list(program: &mut Program, list_base: u64, list_size: u64) ->
     }
     let mut added = 0usize;
     for chunk in buf.chunks_exact(8) {
-        let proto_addr = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+        let proto_addr = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)"));
         if proto_addr == 0 {
             continue;
         }
@@ -286,6 +300,9 @@ fn parse_protocol_list(program: &mut Program, list_base: u64, list_size: u64) ->
         let Some(name) = read_c_str(program, name_ptr, 128) else {
             continue;
         };
+        if !looks_like_identifier(&name) {
+            continue;
+        }
         if program.symbol_table.primary_at(proto_addr).is_none() {
             program.symbol_table.add(Symbol::new(
                 format!("objc_proto_{}", sanitize(&name)),
@@ -338,7 +355,13 @@ fn parse_method_list(
             )
         } else {
             // Small method: each field is a *signed 32-bit RVA*
-            // relative to its own location.
+            // relative to its own location. Layout:
+            //   +0  i32: SEL ref     → entry + s  → &SEL → C-string
+            //   +4  i32: types ref   → entry + 4 + t → @ encoded types
+            //   +8  i32: IMP ref     → entry + 8 + im → function
+            // We currently don't use the types string but read + discard
+            // it; surfacing it as an EOL comment or per-method tag is
+            // a follow-up improvement.
             let (s, t, im) = (
                 read_i32(program, entry),
                 read_i32(program, entry + 4),
@@ -442,8 +465,31 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Validate a candidate class / protocol / ivar name: must be at least
+/// 2 characters, must contain at least one ASCII alphabetic, and must
+/// not contain any control characters. Rejects null / partially-read
+/// strings + accidentally-parsed binary blobs that would otherwise
+/// produce noise-y symbols.
+fn looks_like_identifier(s: &str) -> bool {
+    if s.len() < 2 {
+        return false;
+    }
+    let mut has_alpha = false;
+    for c in s.chars() {
+        if c.is_control() {
+            return false;
+        }
+        if c.is_ascii_alphabetic() {
+            has_alpha = true;
+        }
+    }
+    has_alpha
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{looks_like_identifier, sanitize};
+
     #[test]
     fn module_compiles() {
         let _ = super::MachoObjCAnalyzer;
@@ -451,7 +497,39 @@ mod tests {
 
     #[test]
     fn sanitize_basic() {
-        assert_eq!(super::sanitize("My Class:Name"), "My_Class_Name");
-        assert_eq!(super::sanitize("Foo123"), "Foo123");
+        assert_eq!(sanitize("My Class:Name"), "My_Class_Name");
+        assert_eq!(sanitize("Foo123"), "Foo123");
+    }
+
+    #[test]
+    fn identifier_accepts_normal_names() {
+        assert!(looks_like_identifier("NSString"));
+        assert!(looks_like_identifier("MyView_v2"));
+        assert!(looks_like_identifier("__internal"));
+    }
+
+    #[test]
+    fn identifier_rejects_too_short() {
+        // Mach-O class names are always ≥ 2 characters (`__` etc.);
+        // single-char hits are almost certainly garbage from a stray
+        // pointer.
+        assert!(!looks_like_identifier(""));
+        assert!(!looks_like_identifier("A"));
+    }
+
+    #[test]
+    fn identifier_rejects_control_chars() {
+        // Random bytes 0x01..0x1f would otherwise sneak through and
+        // produce noise symbols.
+        assert!(!looks_like_identifier("Hello\x01World"));
+        assert!(!looks_like_identifier("\x7f"));
+    }
+
+    #[test]
+    fn identifier_rejects_all_digits_or_punctuation() {
+        // No alphabetic anywhere — almost certainly a bad pointer
+        // landed on a length-prefixed binary blob.
+        assert!(!looks_like_identifier("12345"));
+        assert!(!looks_like_identifier(":::"));
     }
 }
