@@ -40,6 +40,7 @@ pub mod manager;
 pub mod propagation;
 pub mod references;
 pub mod stack;
+pub mod linear_sweep;
 pub mod stackstr;
 pub mod tagger;
 pub mod string_rename;

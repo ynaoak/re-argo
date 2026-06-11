@@ -38,6 +38,7 @@ use crate::runtime_fp::RuntimeFingerprintAnalyzer;
 use crate::scc::CallGraphSccAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
+use crate::linear_sweep::LinearSweepAnalyzer;
 use crate::stackstr::StackStringAnalyzer;
 use crate::tagger::TagAnalyzer;
 use crate::string_rename::StringHintRenameAnalyzer;
@@ -94,6 +95,7 @@ impl AnalysisManager {
             Box::new(InlineMemAnalyzer),
             Box::new(ThunkDetectorAnalyzer),
             Box::new(CrtPatternAnalyzer),
+            Box::new(LinearSweepAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
             Box::new(AddressTableAnalyzer),
