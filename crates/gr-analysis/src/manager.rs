@@ -38,7 +38,9 @@ use crate::runtime_fp::RuntimeFingerprintAnalyzer;
 use crate::scc::CallGraphSccAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
+use crate::linear_sweep::LinearSweepAnalyzer;
 use crate::stackstr::StackStringAnalyzer;
+use crate::tagger::TagAnalyzer;
 use crate::string_rename::StringHintRenameAnalyzer;
 use crate::string_xref::StringXrefAnnotator;
 use crate::strings::StringSearchAnalyzer;
@@ -93,6 +95,7 @@ impl AnalysisManager {
             Box::new(InlineMemAnalyzer),
             Box::new(ThunkDetectorAnalyzer),
             Box::new(CrtPatternAnalyzer),
+            Box::new(LinearSweepAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
             Box::new(AddressTableAnalyzer),
@@ -137,6 +140,7 @@ impl AnalysisManager {
             Box::new(CoverageAnalyzer),
             Box::new(TypeRecoveryAnalyzer),
             Box::new(DataTypeAnalyzer),
+            Box::new(TagAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }
@@ -153,6 +157,53 @@ impl AnalysisManager {
             results.push(analyzer.analyze(program));
         }
         results
+    }
+
+    /// Walk the priority-sorted analyzer list and report any
+    /// consumer that runs before its producer — a BN-style
+    /// "workflow validation" pass. Returns `(consumer, dep,
+    /// problem)` tuples where `problem` is either
+    /// `"runs_before_producer"` or `"missing_producer"`. Used by
+    /// the `workflow` CLI subcommand to catch pipeline ordering
+    /// regressions before they manifest as silent analyzer no-ops.
+    pub fn validate_workflow(&self) -> Vec<(String, String, &'static str)> {
+        let mut warnings = Vec::new();
+        let mut seen_providers: std::collections::BTreeMap<&'static str, u32> =
+            std::collections::BTreeMap::new();
+        for a in &self.analyzers {
+            for cap in a.consumes() {
+                match seen_providers.get(cap) {
+                    Some(producer_prio) if *producer_prio <= a.priority() => {}
+                    Some(_) => warnings.push((
+                        a.name().to_string(),
+                        (*cap).to_string(),
+                        "runs_before_producer",
+                    )),
+                    None => warnings.push((
+                        a.name().to_string(),
+                        (*cap).to_string(),
+                        "missing_producer",
+                    )),
+                }
+            }
+            for cap in a.provides() {
+                seen_providers.entry(cap).or_insert(a.priority());
+            }
+        }
+        warnings
+    }
+
+    /// Iterate (name, priority, provides, consumes) for every
+    /// analyzer in priority order — drives the `workflow` CLI
+    /// listing.
+    pub fn workflow_listing(
+        &self,
+    ) -> impl Iterator<
+        Item = (&str, u32, &'static [&'static str], &'static [&'static str]),
+    > {
+        self.analyzers
+            .iter()
+            .map(|a| (a.name(), a.priority(), a.provides(), a.consumes()))
     }
 
     pub fn run_all_or_fail(

@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use gr_program::symbol::{SourceType, Symbol, SymbolType};
 use gr_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionSignature {
     pub name: String,
     pub return_type: String,
@@ -15,9 +18,9 @@ pub struct FunctionSignature {
     pub no_return: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SignatureDatabase {
-    by_pattern: BTreeMap<Vec<u8>, FunctionSignature>,
+    by_pattern: BTreeMap<String, FunctionSignature>,
     by_name: BTreeMap<String, FunctionSignature>,
 }
 
@@ -415,11 +418,57 @@ impl SignatureDatabase {
     }
 
     pub fn add_pattern(&mut self, pattern: Vec<u8>, sig: FunctionSignature) {
-        self.by_pattern.insert(pattern, sig);
+        // Store the byte pattern as a hex string so the BTreeMap key
+        // stays serde-friendly. No `lookup_by_pattern` reader exists
+        // yet; the pattern table is currently write-only and surfaced
+        // only via `signature_count` + JSON export. When a reader
+        // lands it will decode the hex back to bytes for matching.
+        let hex: String = pattern.iter().map(|b| format!("{:02x}", b)).collect();
+        self.by_pattern.insert(hex, sig);
     }
 
     pub fn signature_count(&self) -> usize {
         self.by_name.len() + self.by_pattern.len()
+    }
+
+    /// Merge another database into this one. Conflicts (same name)
+    /// keep the *attached* version, matching BN's `attach_type_archive`
+    /// override-not-replace behaviour: a project-level type archive
+    /// can refine the built-in libc signatures without losing
+    /// anything else. Pattern-based entries always merge additively
+    /// since their keys are byte sequences.
+    pub fn merge(&mut self, other: SignatureDatabase) {
+        for (k, v) in other.by_name {
+            self.by_name.insert(k, v);
+        }
+        for (k, v) in other.by_pattern {
+            self.by_pattern.insert(k, v);
+        }
+    }
+
+    /// Load a SignatureDatabase from a JSON file. Used by `--attach`
+    /// to layer a user / project signature archive on top of the
+    /// built-in libc / Win32 / POSIX set.
+    pub fn load_from_file(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let db: SignatureDatabase = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+        Ok(db)
+    }
+
+    /// Save the current database to a JSON file. Used by
+    /// `signatures --export` so users can extract the built-in
+    /// signature set, customise it, and re-attach.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(path, json).map_err(|e| format!("write {}: {}", path.display(), e))
+    }
+
+    /// Iterate every name-keyed signature in the database. Used by
+    /// `signatures` CLI to print + filter the catalogue.
+    pub fn iter_signatures(&self) -> impl Iterator<Item = &FunctionSignature> {
+        self.by_name.values()
     }
 
     pub fn no_return_names(&self) -> impl Iterator<Item = &str> {
@@ -438,6 +487,12 @@ impl Analyzer for SignatureApplierAnalyzer {
     }
     fn priority(&self) -> u32 {
         700
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["signatures"]
+    }
+    fn consumes(&self) -> &'static [&'static str] {
+        &["functions"]
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         use std::sync::OnceLock;
