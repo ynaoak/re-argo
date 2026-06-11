@@ -50,6 +50,12 @@ pub struct Program {
     /// untyped form. Format: full expression *without* a trailing
     /// semicolon — `printf("hi %d", 42)`.
     pub call_renderings: std::collections::BTreeMap<u64, String>,
+    /// Categorised analyzer findings (Binary-Ninja-style tags).
+    /// Distinct from `comments` — comments annotate byte ranges in
+    /// the listing; tags drive filterable reports (`tags --filter
+    /// crypto`, `summary`, JSON export). Populated by `TagAnalyzer`
+    /// which re-categorises the existing analyzer output stream.
+    pub tags: crate::tags::TagManager,
 }
 
 impl Program {
@@ -102,6 +108,7 @@ impl Program {
             comments: CommentManager::new(),
             metadata: ProgramMetadata::default(),
             call_renderings: std::collections::BTreeMap::new(),
+            tags: crate::tags::TagManager::new(),
         })
     }
 

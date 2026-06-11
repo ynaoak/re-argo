@@ -12,6 +12,7 @@ pub mod project;
 pub mod reference;
 pub mod sarif;
 pub mod symbol;
+pub mod tags;
 
 pub use function::Function;
 pub use listing::Listing;
@@ -21,3 +22,4 @@ pub use project::ProjectSummary;
 pub use overrides::OverrideSet;
 pub use diff::ProgramDiff;
 pub use symbol::{Symbol, SymbolTable, SymbolType};
+pub use tags::{Tag, TagKind, TagManager};

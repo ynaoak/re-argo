@@ -53,6 +53,7 @@ pub(crate) mod helpers {
             comments: gr_program::comments::CommentManager::new(),
             metadata: gr_program::metadata::ProgramMetadata::default(),
             call_renderings: std::collections::BTreeMap::new(),
+            tags: gr_program::tags::TagManager::new(),
         }
     }
 
@@ -114,6 +115,7 @@ pub(crate) mod helpers {
             comments: gr_program::comments::CommentManager::new(),
             metadata: gr_program::metadata::ProgramMetadata::default(),
             call_renderings: std::collections::BTreeMap::new(),
+            tags: gr_program::tags::TagManager::new(),
         }
     }
 }

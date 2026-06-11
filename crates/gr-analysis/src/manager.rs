@@ -39,6 +39,7 @@ use crate::scc::CallGraphSccAnalyzer;
 use crate::references::{NoReturnAnalyzer, ScalarReferenceAnalyzer};
 use crate::stack::StackFrameAnalyzer;
 use crate::stackstr::StackStringAnalyzer;
+use crate::tagger::TagAnalyzer;
 use crate::string_rename::StringHintRenameAnalyzer;
 use crate::string_xref::StringXrefAnnotator;
 use crate::strings::StringSearchAnalyzer;
@@ -137,6 +138,7 @@ impl AnalysisManager {
             Box::new(CoverageAnalyzer),
             Box::new(TypeRecoveryAnalyzer),
             Box::new(DataTypeAnalyzer),
+            Box::new(TagAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }

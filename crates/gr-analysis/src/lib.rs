@@ -41,6 +41,7 @@ pub mod propagation;
 pub mod references;
 pub mod stack;
 pub mod stackstr;
+pub mod tagger;
 pub mod string_rename;
 pub mod string_xref;
 pub mod strings;

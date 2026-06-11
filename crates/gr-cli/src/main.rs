@@ -107,6 +107,17 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// List categorised analyzer findings (Binary-Ninja-style tags)
+    Tags {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Show only tags of this kind (`crypto`, `suspicious`, `library`, …)
+        #[arg(long)]
+        filter: Option<String>,
+        /// Print the per-kind count summary instead of individual tags
+        #[arg(long)]
+        list_types: bool,
+    },
     /// Measure end-to-end analysis wall time + per-analyzer breakdown
     Bench {
         /// Path to the binary file
@@ -490,6 +501,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Functions { file } => cmd_functions(&file),
         Commands::Metrics { file, sort, top } => cmd_metrics(&file, &sort, top),
         Commands::Summary { file } => cmd_summary(&file),
+        Commands::Tags { file, filter, list_types } => cmd_tags(&file, filter.as_deref(), list_types),
         Commands::Bench { file } => cmd_bench(&file),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
@@ -1108,6 +1120,70 @@ fn cmd_summary(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_tags(
+    path: &Path,
+    filter: Option<&str>,
+    list_types: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    if list_types {
+        // Per-kind counts across both address + function scopes.
+        let counts = program.tags.counts_by_kind();
+        println!("\nTag categories in {}:", path.display());
+        println!("{}", "-".repeat(48));
+        println!("  {:<20} {:>8}", "kind", "count");
+        for (k, n) in &counts {
+            println!("  {:<20} {:>8}", k, n);
+        }
+        println!();
+        println!("  Total tags: {}", program.tags.len());
+        return Ok(());
+    }
+
+    let filter_kind = filter.map(gr_program::TagKind::parse);
+
+    println!("\nTags in {}", path.display());
+    println!("{}", "-".repeat(72));
+    println!("  scope      kind       address            auto   text");
+    let mut shown = 0usize;
+    for (addr, t) in program.tags.iter_addresses() {
+        if let Some(k) = &filter_kind
+            && &t.kind != k
+        {
+            continue;
+        }
+        println!(
+            "  {:<10} {:<10} 0x{:<16x} {:<6} {}",
+            "address",
+            t.kind.as_str(),
+            addr,
+            t.auto,
+            t.text
+        );
+        shown += 1;
+    }
+    for (addr, t) in program.tags.iter_functions() {
+        if let Some(k) = &filter_kind
+            && &t.kind != k
+        {
+            continue;
+        }
+        println!(
+            "  {:<10} {:<10} 0x{:<16x} {:<6} {}",
+            "function",
+            t.kind.as_str(),
+            addr,
+            t.auto,
+            t.text
+        );
+        shown += 1;
+    }
+    println!();
+    println!("Showing {} tag{}", shown, if shown == 1 { "" } else { "s" });
     Ok(())
 }
 
