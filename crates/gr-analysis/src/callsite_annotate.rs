@@ -72,16 +72,32 @@ impl Analyzer for CallSiteAnnotator {
         // string set in one block, used in the next" pattern that
         // the linear resolver misses.
         let cfg_constants = crate::cfg_const::build_call_constants(&*lifter, program);
+        // VSA runs on the same lifted P-code stream but tracks
+        // abstract value sets / ranges instead of point constants.
+        // When the iterative + cfg_const passes both gave `?`, ask
+        // VSA whether the value's still pinned (single set / degenerate
+        // range), which catches arguments built from a conditional
+        // join with two equal-valued predecessors that the point
+        // tracker can't represent.
+        let vsa_constants = crate::vsa::run_vsa(&*lifter, program);
         for site in sites.iter_mut() {
-            let Some(snap) = cfg_constants.get(&site.call_site) else {
-                continue;
-            };
+            let snap = cfg_constants.get(&site.call_site);
+            let vsa_snap = vsa_constants.get(&site.call_site);
             for arg in site.args.iter_mut() {
                 if arg.value.is_some() {
                     continue;
                 }
-                if let Some(v) = snap.get(&arg.reg_offset) {
+                if let Some(snap) = snap
+                    && let Some(v) = snap.get(&arg.reg_offset)
+                {
                     arg.value = Some(*v);
+                    continue;
+                }
+                if let Some(vs) = vsa_snap
+                    && let Some(av) = vs.get(&arg.reg_offset)
+                    && let Some(v) = av.as_single()
+                {
+                    arg.value = Some(v);
                 }
             }
         }
