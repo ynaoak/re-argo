@@ -138,6 +138,28 @@ enum Commands {
         /// Print strongly-connected components (mutual / direct recursion)
         #[arg(long)]
         scc: bool,
+        /// Restrict the callgraph to the BFS neighbourhood around this address
+        #[arg(long, value_parser = parse_hex)]
+        around: Option<u64>,
+        /// Neighbourhood radius (hops). Only relevant with --around
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+    },
+    /// Print every reverse-callgraph path that reaches the target address
+    Backtrace {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Target address (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Maximum hops to walk back from the target
+        #[arg(long, default_value_t = 6)]
+        depth: usize,
+    },
+    /// ASCII layout of every loaded section + permission bits
+    Memmap {
+        /// Path to the binary file
+        file: PathBuf,
     },
     /// Show P-code for instructions at an address
     Pcode {
@@ -493,7 +515,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Bench { file } => cmd_bench(&file),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
         Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
-        Commands::Callgraph { file, dot, scc } => cmd_callgraph(&file, dot, scc),
+        Commands::Callgraph {
+            file,
+            dot,
+            scc,
+            around,
+            depth,
+        } => cmd_callgraph(&file, dot, scc, around, depth),
+        Commands::Backtrace { file, address, depth } => cmd_backtrace(&file, address, depth),
+        Commands::Memmap { file } => cmd_memmap(&file),
         Commands::Pcode {
             file,
             start,
@@ -1305,12 +1335,24 @@ fn cmd_callgraph(
     path: &Path,
     dot: bool,
     scc: bool,
+    around: Option<u64>,
+    depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
     let cg = CallGraph::build(&program);
 
+    // When --around is set, restrict every downstream display
+    // (DOT, plain text, even SCC) to the BFS-neighbourhood. Lets a
+    // 50k-function callgraph shrink to the user-relevant
+    // neighbourhood without the rest of the command surface
+    // changing.
+    let slice: Option<Vec<(u64, String)>> = around.map(|c| cg.neighborhood(c, depth));
+
     if dot {
-        print!("{}", cg.to_dot());
+        match &slice {
+            Some(keep) => print!("{}", cg.to_dot_filtered(keep)),
+            None => print!("{}", cg.to_dot()),
+        }
         return Ok(());
     }
 
@@ -1333,6 +1375,35 @@ fn cmd_callgraph(
         return Ok(());
     }
 
+    if let Some(keep) = &slice {
+        let keep_set: std::collections::BTreeSet<u64> =
+            keep.iter().map(|(a, _)| *a).collect();
+        println!(
+            "Call graph slice ({} nodes within depth {} of 0x{:x}):\n",
+            keep.len(),
+            depth,
+            around.unwrap_or(0)
+        );
+        for func in program.listing.functions() {
+            if !keep_set.contains(&func.entry_point) {
+                continue;
+            }
+            let callees: Vec<_> = cg
+                .callees_of(func.entry_point)
+                .into_iter()
+                .filter(|c| keep_set.contains(&c.address))
+                .collect();
+            if callees.is_empty() {
+                continue;
+            }
+            println!("  {} (0x{:x}):", func.name, func.entry_point);
+            for callee in &callees {
+                println!("    -> {} (0x{:x})", callee.name, callee.address);
+            }
+        }
+        return Ok(());
+    }
+
     println!(
         "Call graph: {} nodes, {} edges\n",
         cg.node_count(),
@@ -1348,6 +1419,111 @@ fn cmd_callgraph(
             println!("    -> {} (0x{:x})", callee.name, callee.address);
         }
     }
+    Ok(())
+}
+
+fn cmd_backtrace(
+    path: &Path,
+    address: u64,
+    depth: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+    let cg = CallGraph::build(&program);
+
+    let paths = cg.paths_to(address, depth);
+    if paths.is_empty() {
+        let known = cg.callers_of(address).len();
+        println!(
+            "No backtrace paths to 0x{:x} (function not in callgraph; direct callers known: {})",
+            address, known
+        );
+        return Ok(());
+    }
+
+    let target_name = program.function_name_at(address);
+    println!(
+        "Backtrace paths to {} (0x{:x}), max depth {}:",
+        target_name, address, depth
+    );
+    println!("{}", "-".repeat(72));
+
+    // Sort by path length so the shortest paths print first — they're
+    // the most useful for "how does an entry point reach this?"
+    let mut paths = paths;
+    paths.sort_by_key(|p| p.len());
+
+    for (i, path) in paths.iter().enumerate() {
+        println!();
+        // Print root → … → target so it reads top-down.
+        let rendered: Vec<String> = path
+            .iter()
+            .rev()
+            .map(|(a, n)| format!("{} (0x{:x})", n, a))
+            .collect();
+        println!("  [{}] {}", i + 1, rendered.join(" → "));
+    }
+    println!();
+    println!("Showing {} path(s)", paths.len());
+    Ok(())
+}
+
+fn cmd_memmap(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+
+    let total: u64 = info.sections.iter().map(|s| s.size).sum();
+    if total == 0 {
+        println!("No sections in {}", path.display());
+        return Ok(());
+    }
+
+    println!("Memory map of {}", path.display());
+    println!("{}", "-".repeat(72));
+    println!("  {:<22} {:<18} {:>10}  perm  size-bar", "name", "range", "size");
+
+    for s in &info.sections {
+        if s.size == 0 {
+            continue;
+        }
+        let perm = format!(
+            "{}{}{}",
+            if s.flags.contains(SectionFlags::READ) {
+                "r"
+            } else {
+                "-"
+            },
+            if s.flags.contains(SectionFlags::WRITE) {
+                "w"
+            } else {
+                "-"
+            },
+            if s.flags.contains(SectionFlags::EXECUTE) {
+                "x"
+            } else {
+                "-"
+            },
+        );
+        // Logarithmic bar so a 30-byte .comment and a 1-MiB .text
+        // stay visually distinguishable without the bar going off
+        // the right edge.
+        let bar_len = if s.size <= 1 {
+            1
+        } else {
+            ((s.size as f64).log2() as usize).clamp(1, 30)
+        };
+        let bar: String = "█".repeat(bar_len);
+        let range = format!("0x{:x}..0x{:x}", s.address, s.address + s.size);
+        println!(
+            "  {:<22} {:<18} {:>10}  {}   {}",
+            s.name, range, s.size, perm, bar
+        );
+    }
+
+    println!();
+    println!(
+        "Total: {} sections, {} bytes",
+        info.sections.iter().filter(|s| s.size > 0).count(),
+        total
+    );
     Ok(())
 }
 
