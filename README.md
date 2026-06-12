@@ -71,7 +71,7 @@ For the full command surface, every flag, output formats, and multi-command reci
 | Diff | `diff`, `semantic-diff` |
 | Export | `export`, `export-xml` |
 | Emulation | `emulate`, `gdbserver`, `debug` |
-| Capability | `entropy`, `rop`, `capa`, `packer`, `embedded`, `vuln` |
+| Capability | `entropy`, `rop` (ROP/JOP/COP), `capa`, `packer`, `embedded`, `vuln`, `ioc` |
 | Manual correction | `annotate`, `iterate` |
 | Integration | `script`, `mcp`, `patch`, `taint`, `registers` |
 

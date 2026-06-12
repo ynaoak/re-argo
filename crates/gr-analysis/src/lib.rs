@@ -35,6 +35,7 @@ pub mod immstr;
 pub mod indirect;
 pub mod indirect_resolve;
 pub mod inline_mem;
+pub mod ioc;
 pub mod iterate;
 pub mod loops;
 pub mod macho_objc;

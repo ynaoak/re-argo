@@ -32,6 +32,7 @@ use crate::pe_enrich::PeEnrichmentAnalyzer;
 use crate::pe_seh::PeSehAnalyzer;
 use crate::indirect::{IndirectCallAnalyzer, StringReferenceAnalyzer};
 use crate::indirect_resolve::IndirectCallResolver;
+use crate::ioc::IocExtractor;
 use crate::propagation::ConstantPropagationAnalyzer;
 use crate::rtti::RttiAnalyzer;
 use crate::runtime_fp::RuntimeFingerprintAnalyzer;
@@ -147,6 +148,7 @@ impl AnalysisManager {
             Box::new(TypeRecoveryAnalyzer),
             Box::new(DataTypeAnalyzer),
             Box::new(VulnAnalyzer),
+            Box::new(IocExtractor),
             Box::new(TagAnalyzer),
             Box::new(CapaAnalyzer),
         ];
