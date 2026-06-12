@@ -295,6 +295,7 @@ name = "gr-analysis"
 version = "0.1.0"
 dependencies = [
  "cpp_demangle",
+ "goblin",
  "gr-arch",
  "gr-core",
  "gr-lift",
