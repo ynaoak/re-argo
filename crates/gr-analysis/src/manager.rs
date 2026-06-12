@@ -21,6 +21,7 @@ use crate::ehframe::EhFrameAnalyzer;
 use crate::exception::ExceptionFlowAnalyzer;
 use crate::filler::FillerBytesAnalyzer;
 use crate::fingerprint::CompilerFingerprintAnalyzer;
+use crate::floss_lite::FlossLiteAnalyzer;
 use crate::format_varargs::FormatVarargsAnalyzer;
 use crate::got_annotate::GotAnnotator;
 use crate::hot::HotFunctionAnalyzer;
@@ -93,6 +94,7 @@ impl AnalysisManager {
             Box::new(FunctionDiscoveryAnalyzer),
             Box::new(FillerBytesAnalyzer),
             Box::new(StringSearchAnalyzer),
+            Box::new(FlossLiteAnalyzer),
             Box::new(NoReturnAnalyzer),
             Box::new(CryptoConstantAnalyzer),
             Box::new(EntropyAnalyzer),

@@ -61,6 +61,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Flag dangerous-API call sites (Cwe_checker-style)" | `vuln <bin>` |
 | "Scan with a YARA ruleset (lite subset)" | `yara <bin> rules.yar` |
 | "Compare two binaries by content similarity (TLSH)" | `tlsh-diff <a> <b>` |
+| "Decode obfuscated strings (XOR / ROL)" | `floss <bin>` |
 
 ---
 
@@ -548,6 +549,21 @@ Compare two binaries by TLSH (Trend Micro Locality-Sensitive Hash). Lower distan
 Useful for malware-family clustering and "is this a recompile of that?" sanity checks. Complements `imphash` (which clusters by IAT identity) with content-based similarity that survives small recompiles. Both hashes are also surfaced in `metadata.imphash` and `metadata.tlsh` for JSON export.
 
 PE binaries additionally get **Authenticode signature info** surfaced via `metadata.signed` / `metadata.cert_count` / `metadata.cert_subjects` (the latter is a newline-joined `CN=…, O=…, C=…` list extracted heuristically from the PKCS#7 blob). The `triage` and `info` commands print these alongside the hashes.
+
+#### `floss <FILE> [--min-length N] [--with-add] [--limit N] [--include-printable-source]`
+
+FLOSS-lite obfuscated-string decoder. Brute-force XOR (and optionally ROL / ADD) decode of every read-only data section, surfacing strings that don't appear in a plain `strings` pass because they're stored encoded. Real malware often XOR-encodes its C2 URLs / config blobs against a single-byte key; this command catches that pattern.
+
+| Flag | Purpose |
+|---|---|
+| `--min-length N` | Minimum decoded-string length (default 8). Higher values cut noise. |
+| `--with-add` | Also try ADD-decode (default off — ADD is rarer and noisier) |
+| `--limit N` | Print only the first N hits (default 200, 0 = unlimited) |
+| `--include-printable-source` | Drop the conservative "encoded bytes must be non-printable" filter — noisier but catches the edge case where the encoded form also happens to be printable |
+
+Tradeoffs: the default filter chain (3 distinct consecutive letters, ≥ 60% alnum, ≥ 4 distinct chars overall, non-periodic, encoded source mostly non-printable) keeps the false-positive rate manageable but still produces noise on large binaries — expect hundreds of "candidate" lines on a /bin/* target. Real obfuscated strings stand out (URLs / paths / API names). Raise `--min-length` or invoke with `--with-add` only when chasing specific encodings.
+
+The pipeline-wide analyzer surfaces `metadata.decoded_string_count` and adds a single summary `obfuscated-string` Custom tag at the entry point — per-string tags would flood the tags report, so detailed inspection goes through this CLI command.
 
 #### `yara <FILE> <RULES.yar> [--sample N]`
 
