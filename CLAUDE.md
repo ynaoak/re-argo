@@ -59,6 +59,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Find embedded files (PE / ZIP / PNG / …) in the binary" | `embedded <bin>` |
 | "Flag dangerous-API call sites (Cwe_checker-style)" | `vuln <bin>` |
 | "Scan with a YARA ruleset (lite subset)" | `yara <bin> rules.yar` |
+| "Compare two binaries by content similarity (TLSH)" | `tlsh-diff <a> <b>` |
 
 ---
 
@@ -195,11 +196,11 @@ Each comment: `{address, kind, text}` (`kind` ∈ `Eol | Pre | Post | Plate | Re
 
 Display format, architecture, bits, entry point, section count, symbol count, plus compiler / runtime fingerprints when detected, plus high-signal triage values (`imphash`, `packer`, `entropy_overall`) when the cheap analyzers can detect them.
 
-Example output keys: `Format`, `Architecture`, `Bits`, `Entry Point`, `language`, `runtime`, `libc_version`, `pe_product`, `pe_version`, `build_id`, `compiler`, `imphash`, `packer`, `entropy_overall`.
+Example output keys: `Format`, `Architecture`, `Bits`, `Entry Point`, `language`, `runtime`, `libc_version`, `pe_product`, `pe_version`, `build_id`, `compiler`, `imphash`, `tlsh`, `signed`, `cert_subjects`, `packer`, `entropy_overall`.
 
 #### `triage <FILE>`
 
-One-screen malware-triage report. Runs the full analysis pipeline and prints a digestible summary combining format / arch / entry, identity (compiler / language / runtime), hashes (`imphash`), packer + overall entropy, capa rule matches (top 10), CWE findings grouped by id, IoCs grouped by kind, and tag counts. Designed for "what is this and should I worry about it?" in one pass — typically the first command to run on an unknown sample.
+One-screen malware-triage report. Runs the full analysis pipeline and prints a digestible summary combining format / arch / entry, identity (compiler / language / runtime), hashes (`imphash`, `tlsh`), code-signing info (Authenticode subjects for PE), packer + overall entropy, capa rule matches (top 10), CWE findings grouped by id, IoCs grouped by kind, and tag counts. Designed for "what is this and should I worry about it?" in one pass — typically the first command to run on an unknown sample.
 
 #### `summary <FILE>`
 
@@ -514,6 +515,18 @@ Indicator-of-compromise extractor. Classifies every discovered string into one o
 | Flag | Purpose |
 |---|---|
 | `--kind KIND` | Show only this kind (e.g. `--kind url`, `--kind registry-key`) |
+
+#### `tlsh-diff <FILE_A> <FILE_B>`
+
+Compare two binaries by TLSH (Trend Micro Locality-Sensitive Hash). Lower distance means more similar:
+
+* `< 30` → likely same family
+* `< 50` → related
+* `> 100` → unrelated
+
+Useful for malware-family clustering and "is this a recompile of that?" sanity checks. Complements `imphash` (which clusters by IAT identity) with content-based similarity that survives small recompiles. Both hashes are also surfaced in `metadata.imphash` and `metadata.tlsh` for JSON export.
+
+PE binaries additionally get **Authenticode signature info** surfaced via `metadata.signed` / `metadata.cert_count` / `metadata.cert_subjects` (the latter is a newline-joined `CN=…, O=…, C=…` list extracted heuristically from the PKCS#7 blob). The `triage` and `info` commands print these alongside the hashes.
 
 #### `yara <FILE> <RULES.yar> [--sample N]`
 

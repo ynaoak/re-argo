@@ -5,6 +5,7 @@ use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
 use crate::callingconv::CallingConventionAnalyzer;
 use crate::anti_debug::AntiDebugAnalyzer;
 use crate::arity::ArgumentArityAnalyzer;
+use crate::authenticode::AuthenticodeAnalyzer;
 use crate::canary::StackCanaryAnalyzer;
 use crate::complexity::ComplexityAnalyzer;
 use crate::crt::CrtAnalyzer;
@@ -59,6 +60,7 @@ use crate::capa::CapaAnalyzer;
 use crate::entropy::EntropyAnalyzer;
 use crate::packer::PackerAnalyzer;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
+use crate::tlsh::TlshAnalyzer;
 use crate::vuln::VulnAnalyzer;
 use crate::tls::TlsVariableAnalyzer;
 use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
@@ -95,6 +97,8 @@ impl AnalysisManager {
             Box::new(CryptoConstantAnalyzer),
             Box::new(EntropyAnalyzer),
             Box::new(ImphashAnalyzer),
+            Box::new(TlshAnalyzer),
+            Box::new(AuthenticodeAnalyzer),
             Box::new(PackerAnalyzer),
             Box::new(ScalarReferenceAnalyzer),
             Box::new(ConstantPropagationAnalyzer),

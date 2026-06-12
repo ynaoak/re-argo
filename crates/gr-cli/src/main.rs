@@ -619,6 +619,16 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         sample: usize,
     },
+    /// Compare two binaries by TLSH fuzzy hash.
+    ///
+    /// Lower distance = more similar. Per the TLSH reference: < 30
+    /// likely same family, < 50 related, > 100 unrelated.
+    TlshDiff {
+        /// First binary
+        file_a: PathBuf,
+        /// Second binary
+        file_b: PathBuf,
+    },
     /// One-screen malware-triage report.
     ///
     /// Runs the full analysis pipeline and prints a digestible
@@ -735,6 +745,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Vuln { file } => cmd_vuln(&file),
         Commands::Ioc { file, kind } => cmd_ioc(&file, kind.as_deref()),
         Commands::Triage { file } => cmd_triage(&file),
+        Commands::TlshDiff { file_a, file_b } => cmd_tlsh_diff(&file_a, &file_b),
         Commands::Yara { file, rules, sample } => cmd_yara(&file, &rules, sample),
     }
 }
@@ -765,6 +776,10 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // `info` shows them without a full pipeline run.
     let imp = gr_analysis::imphash::ImphashAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&imp, &mut program);
+    let tl = gr_analysis::tlsh::TlshAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&tl, &mut program);
+    let auth = gr_analysis::authenticode::AuthenticodeAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&auth, &mut program);
     let ent = gr_analysis::entropy::EntropyAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&ent, &mut program);
     let pkr = gr_analysis::packer::PackerAnalyzer;
@@ -782,6 +797,9 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "pe_product",
             "pe_version",
             "imphash",
+            "tlsh",
+            "signed",
+            "cert_subjects",
             "packer",
             "entropy_overall",
         ] {
@@ -3911,6 +3929,32 @@ fn cmd_ioc(path: &Path, kind_filter: Option<&str>) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+fn cmd_tlsh_diff(a: &Path, b: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let info_a = gr_loader::BinaryLoader::load(a)?;
+    let info_b = gr_loader::BinaryLoader::load(b)?;
+    let ha = gr_analysis::tlsh::compute_for_binary(&info_a)
+        .ok_or("could not compute TLSH for first binary (too small?)")?;
+    let hb = gr_analysis::tlsh::compute_for_binary(&info_b)
+        .ok_or("could not compute TLSH for second binary (too small?)")?;
+    let dist = gr_analysis::tlsh::compare(&ha, &hb)
+        .ok_or("could not compute TLSH distance")?;
+    let verdict = if dist < 30 {
+        "likely same family"
+    } else if dist < 50 {
+        "related"
+    } else if dist > 100 {
+        "unrelated"
+    } else {
+        "weakly similar"
+    };
+    println!("\nTLSH comparison:");
+    println!("  {:<24} {}", a.display(), ha);
+    println!("  {:<24} {}", b.display(), hb);
+    println!();
+    println!("  distance: {} ({})", dist, verdict);
+    Ok(())
+}
+
 fn cmd_yara(
     bin_path: &Path,
     rules_path: &Path,
@@ -3992,10 +4036,33 @@ fn cmd_triage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Hashes
-    if let Some(h) = p.get("imphash") {
+    let imphash = p.get("imphash");
+    let tlsh = p.get("tlsh");
+    if imphash.is_some() || tlsh.is_some() {
         println!();
         println!("Hashes:");
-        println!("  imphash       {}", h);
+        if let Some(h) = imphash {
+            println!("  imphash       {}", h);
+        }
+        if let Some(h) = tlsh {
+            println!("  tlsh          {}", h);
+        }
+    }
+
+    // Code signing
+    if let Some(signed) = p.get("signed") {
+        println!();
+        println!("Code signing:");
+        println!("  signed        {}", signed);
+        if let Some(count) = p.get("cert_count") {
+            println!("  certificates  {}", count);
+        }
+        if let Some(subjects) = p.get("cert_subjects") {
+            println!("  subjects:");
+            for line in subjects.lines() {
+                println!("    {}", line);
+            }
+        }
     }
 
     // Packer + entropy
