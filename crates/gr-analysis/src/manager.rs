@@ -24,6 +24,7 @@ use crate::format_varargs::FormatVarargsAnalyzer;
 use crate::got_annotate::GotAnnotator;
 use crate::hot::HotFunctionAnalyzer;
 use crate::immstr::ImmediateStringAnnotator;
+use crate::imphash::ImphashAnalyzer;
 use crate::inline_mem::InlineMemAnalyzer;
 use crate::loops::LoopAnalyzer;
 use crate::macho_objc::MachoObjCAnalyzer;
@@ -93,6 +94,7 @@ impl AnalysisManager {
             Box::new(NoReturnAnalyzer),
             Box::new(CryptoConstantAnalyzer),
             Box::new(EntropyAnalyzer),
+            Box::new(ImphashAnalyzer),
             Box::new(PackerAnalyzer),
             Box::new(ScalarReferenceAnalyzer),
             Box::new(ConstantPropagationAnalyzer),

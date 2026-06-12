@@ -32,6 +32,7 @@ pub mod format_varargs;
 pub mod got_annotate;
 pub mod hot;
 pub mod immstr;
+pub mod imphash;
 pub mod indirect;
 pub mod indirect_resolve;
 pub mod inline_mem;
