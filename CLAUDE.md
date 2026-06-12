@@ -58,6 +58,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Is this packed? Which packer?" | `packer <bin>` |
 | "Find embedded files (PE / ZIP / PNG / …) in the binary" | `embedded <bin>` |
 | "Flag dangerous-API call sites (Cwe_checker-style)" | `vuln <bin>` |
+| "Scan with a YARA ruleset (lite subset)" | `yara <bin> rules.yar` |
 
 ---
 
@@ -513,6 +514,24 @@ Indicator-of-compromise extractor. Classifies every discovered string into one o
 | Flag | Purpose |
 |---|---|
 | `--kind KIND` | Show only this kind (e.g. `--kind url`, `--kind registry-key`) |
+
+#### `yara <FILE> <RULES.yar> [--sample N]`
+
+Scan the binary with a YARA-lite ruleset. Supports a strict subset of the YARA rule language:
+
+* Text strings: `$x = "literal"` (case-sensitive) and `nocase` modifier.
+* Hex strings: `$x = { 4D 5A ?? ?? 50 45 }` with `??` full-byte, `4?` high-nibble, `?A` low-nibble wildcards.
+* Conditions: `$x`, `not E`, `E and E`, `E or E`, parens, `any of them`, `all of them`, `N of them`.
+* Comments: `// line` and `/* block */`.
+* `meta:` blocks are parsed but ignored.
+
+Unsupported syntax (`wide`, `fullword`, regex strings, `for any i in (...)`, imports/sections helpers, `filesize`) errors out at parse time with a clear message — callers can fall back to the full YARA binary.
+
+| Flag | Purpose |
+|---|---|
+| `--sample N` | Show only the first N string-match offsets per rule (default 5) |
+
+Output is one block per matched rule with per-string hit counts and the first N offsets. Useful for malware-family classification using community rulesets that fit the supported subset.
 
 ---
 

@@ -601,6 +601,24 @@ enum Commands {
         #[arg(long)]
         kind: Option<String>,
     },
+    /// Scan a binary with a YARA-lite ruleset.
+    ///
+    /// Supports a strict subset of YARA: text + hex strings (with
+    /// `??` / `?A` / `A?` wildcards), `nocase` modifier, boolean
+    /// conditions (`and` / `or` / `not`, parentheses), and
+    /// quantifiers (`any of them`, `all of them`, `N of them`).
+    /// Reports one line per matched rule plus the offsets of each
+    /// contributing string. Unsupported syntax (`wide`, regex,
+    /// loops) errors out instead of silently skipping.
+    Yara {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Path to the `.yar` rule file
+        rules: PathBuf,
+        /// Show the first N string-match offsets per rule (default 5)
+        #[arg(long, default_value_t = 5)]
+        sample: usize,
+    },
     /// One-screen malware-triage report.
     ///
     /// Runs the full analysis pipeline and prints a digestible
@@ -717,6 +735,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Vuln { file } => cmd_vuln(&file),
         Commands::Ioc { file, kind } => cmd_ioc(&file, kind.as_deref()),
         Commands::Triage { file } => cmd_triage(&file),
+        Commands::Yara { file, rules, sample } => cmd_yara(&file, &rules, sample),
     }
 }
 
@@ -3889,6 +3908,57 @@ fn cmd_ioc(path: &Path, kind_filter: Option<&str>) -> Result<(), Box<dyn std::er
         shown += 1;
     }
     println!("\nShowing {} of {} IoC(s)", shown, lines.len());
+    Ok(())
+}
+
+fn cmd_yara(
+    bin_path: &Path,
+    rules_path: &Path,
+    sample: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rules_src = std::fs::read_to_string(rules_path)?;
+    let rules = gr_analysis::yara_lite::parse_rules(&rules_src)
+        .map_err(|e| format!("YARA parse error in {}: {}", rules_path.display(), e))?;
+    let info = gr_loader::BinaryLoader::load(bin_path)?;
+    let matches = gr_analysis::yara_lite::scan(&info, &rules);
+
+    println!(
+        "\nYARA matches in {} ({} rule(s) loaded, {} matched):",
+        bin_path.display(),
+        rules.len(),
+        matches.len()
+    );
+    println!("{}", "-".repeat(72));
+    if matches.is_empty() {
+        println!("  (no rules matched)");
+        return Ok(());
+    }
+    for m in &matches {
+        println!("  rule: {}", m.rule);
+        for (name, hits) in &m.string_hits {
+            if hits.is_empty() {
+                continue;
+            }
+            let shown: Vec<String> = hits
+                .iter()
+                .take(sample)
+                .map(|h| format!("0x{:x}", h))
+                .collect();
+            let extra = if hits.len() > sample {
+                format!(" (+{} more)", hits.len() - sample)
+            } else {
+                String::new()
+            };
+            println!(
+                "    ${} ({} hit{}): {}{}",
+                name,
+                hits.len(),
+                if hits.len() == 1 { "" } else { "s" },
+                shown.join(", "),
+                extra
+            );
+        }
+    }
     Ok(())
 }
 
