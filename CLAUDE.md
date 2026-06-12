@@ -11,6 +11,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | Goal | Command |
 |---|---|
 | "What is this binary?" (format, arch, runtime, libc, language) | `info <bin>` |
+| "One-screen malware-triage report" | `triage <bin>` |
 | "Show me everything at a glance" | `summary <bin>` |
 | "Run the full analysis pipeline (does everything)" | `analyze <bin>` |
 | "List every function the analyzer found" | `functions <bin>` |
@@ -191,13 +192,17 @@ Each comment: `{address, kind, text}` (`kind` ∈ `Eol | Pre | Post | Plate | Re
 
 #### `info <FILE>`
 
-Display format, architecture, bits, entry point, section count, symbol count, plus compiler / runtime fingerprints when detected.
+Display format, architecture, bits, entry point, section count, symbol count, plus compiler / runtime fingerprints when detected, plus high-signal triage values (`imphash`, `packer`, `entropy_overall`) when the cheap analyzers can detect them.
 
-Example output keys: `Format`, `Architecture`, `Bits`, `Entry Point`, `language`, `runtime`, `libc_version`, `pe_product`, `pe_version`, `build_id`, `compiler`.
+Example output keys: `Format`, `Architecture`, `Bits`, `Entry Point`, `language`, `runtime`, `libc_version`, `pe_product`, `pe_version`, `build_id`, `compiler`, `imphash`, `packer`, `entropy_overall`.
+
+#### `triage <FILE>`
+
+One-screen malware-triage report. Runs the full analysis pipeline and prints a digestible summary combining format / arch / entry, identity (compiler / language / runtime), hashes (`imphash`), packer + overall entropy, capa rule matches (top 10), CWE findings grouped by id, IoCs grouped by kind, and tag counts. Designed for "what is this and should I worry about it?" in one pass — typically the first command to run on an unknown sample.
 
 #### `summary <FILE>`
 
-One-screen digest: format / entry / runtime identity / function counts (total, named %, no-return, thunks) / annotation densities / hottest functions by fan-in / recursive-cluster count.
+One-screen digest: format / entry / runtime identity / function counts (total, named %, no-return, thunks) / annotation densities / hottest functions by fan-in / recursive-cluster count / **Triage block** (packer, entropy_overall, imphash, capa rule count, CWE finding count, IoC count) / **Tags by kind** breakdown. The triage / tags blocks consolidate the work the cheap analyzers produced, so users see the at-a-glance findings without invoking each individual `packer` / `capa` / `vuln` / `ioc` command separately.
 
 #### `sections <FILE>`
 

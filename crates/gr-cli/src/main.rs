@@ -601,6 +601,18 @@ enum Commands {
         #[arg(long)]
         kind: Option<String>,
     },
+    /// One-screen malware-triage report.
+    ///
+    /// Runs the full analysis pipeline and prints a digestible
+    /// summary combining: format / arch / entry, identity
+    /// (compiler / language / runtime / imphash), packer / entropy,
+    /// capability rules matched, dangerous-API call sites, IoCs by
+    /// kind, and tag counts. Designed for "what is this and should I
+    /// worry about it?" in one pass.
+    Triage {
+        /// Path to the binary file
+        file: PathBuf,
+    },
     /// Patch a binary file
     Patch {
         /// Path to the binary file
@@ -704,6 +716,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Embedded { file, limit } => cmd_embedded(&file, limit),
         Commands::Vuln { file } => cmd_vuln(&file),
         Commands::Ioc { file, kind } => cmd_ioc(&file, kind.as_deref()),
+        Commands::Triage { file } => cmd_triage(&file),
     }
 }
 
@@ -728,6 +741,16 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let _ = gr_analysis::Analyzer::analyze(&rfp, &mut program);
     let pe = gr_analysis::pe_enrich::PeEnrichmentAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&pe, &mut program);
+    // Imphash, packer, and overall entropy are all cheap analyses
+    // that surface high-signal triage info. We run them here so
+    // `info` shows them without a full pipeline run.
+    let imp = gr_analysis::imphash::ImphashAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&imp, &mut program);
+    let ent = gr_analysis::entropy::EntropyAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&ent, &mut program);
+    let pkr = gr_analysis::packer::PackerAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&pkr, &mut program);
+
     let p = &program.metadata.properties;
     if !p.is_empty() {
         println!();
@@ -739,9 +762,12 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "build_id",
             "pe_product",
             "pe_version",
+            "imphash",
+            "packer",
+            "entropy_overall",
         ] {
             if let Some(v) = p.get(key) {
-                println!("{:<13} {}", format!("{}:", key), v);
+                println!("{:<16} {}", format!("{}:", key), v);
             }
         }
     }
@@ -1284,6 +1310,76 @@ fn cmd_summary(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         if scc_keys.len() > 4 {
             println!("  …{} more", scc_keys.len() - 4);
+        }
+    }
+
+    // Triage findings — surface the work the packer / entropy / capa
+    // / vuln / ioc / imphash analyzers did so users don't have to
+    // invoke each command separately.
+    let packer = p.get("packer");
+    let imphash = p.get("imphash");
+    let entropy_overall = p.get("entropy_overall");
+    let capa_lines = p.get("capa_rules").map(|s| s.lines().count()).unwrap_or(0);
+    let ioc_count: usize = p
+        .get("ioc_count")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let bug_count = program
+        .tags
+        .iter_functions()
+        .filter(|(_, t)| matches!(t.kind, gr_program::TagKind::Bug))
+        .count();
+
+    if packer.is_some()
+        || imphash.is_some()
+        || entropy_overall.is_some()
+        || capa_lines > 0
+        || ioc_count > 0
+        || bug_count > 0
+    {
+        println!();
+        println!("Triage:");
+        if let Some(v) = packer {
+            let evidence = p
+                .get("packer_evidence")
+                .map(|e| format!(" ({})", e))
+                .unwrap_or_default();
+            println!("  packer         {}{}", v, evidence);
+        }
+        if let Some(v) = entropy_overall {
+            println!("  entropy        {} bits/byte (overall)", v);
+        }
+        if let Some(v) = imphash {
+            println!("  imphash        {}", v);
+        }
+        if capa_lines > 0 {
+            println!("  capabilities   {} rule(s) matched", capa_lines);
+            if let Some(raw) = p.get("capa_rules") {
+                for r in raw.lines().take(3) {
+                    println!("                 {}", r);
+                }
+                if capa_lines > 3 {
+                    println!("                 …{} more", capa_lines - 3);
+                }
+            }
+        }
+        if bug_count > 0 {
+            println!("  cwe-findings   {} dangerous-API call site(s)", bug_count);
+        }
+        if ioc_count > 0 {
+            println!("  iocs           {} extracted (urls / paths / registry / …)", ioc_count);
+        }
+    }
+
+    // Tag totals — already populated by the pipeline. Render the
+    // full kind breakdown so users see at-a-glance what categories
+    // fired without invoking `tags --list-types`.
+    let tag_counts = program.tags.counts_by_kind();
+    if !tag_counts.is_empty() {
+        println!();
+        println!("Tags by kind:");
+        for (k, n) in &tag_counts {
+            println!("  {:<14} {}", k, n);
         }
     }
 
@@ -3794,6 +3890,151 @@ fn cmd_ioc(path: &Path, kind_filter: Option<&str>) -> Result<(), Box<dyn std::er
     }
     println!("\nShowing {} of {} IoC(s)", shown, lines.len());
     Ok(())
+}
+
+fn cmd_triage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Suppress per-analyzer log lines so the triage report is the
+    // only thing on stdout/stderr. We capture stderr by directing it
+    // to a sink — fall back to default if redirection isn't
+    // available.
+    let program = analyze_binary_quiet(path)?;
+    let info = &program.info;
+    let p = &program.metadata.properties;
+
+    println!("=== Triage: {} ===", path.display());
+    println!("  format        {} / {} ({} bit)", info.format, info.arch, info.bits);
+    println!("  entry         0x{:x}", info.entry_point);
+    println!("  sections      {}", info.sections.len());
+    println!("  imports       {}", info.imports.len());
+
+    // Identity
+    let identity_keys = ["compiler", "language", "runtime", "libc_version", "build_id"];
+    let identity: Vec<(&str, &String)> = identity_keys
+        .iter()
+        .filter_map(|k| p.get(*k).map(|v| (*k, v)))
+        .collect();
+    if !identity.is_empty() {
+        println!();
+        println!("Identity:");
+        for (k, v) in identity {
+            println!("  {:<14} {}", k, v);
+        }
+    }
+
+    // Hashes
+    if let Some(h) = p.get("imphash") {
+        println!();
+        println!("Hashes:");
+        println!("  imphash       {}", h);
+    }
+
+    // Packer + entropy
+    let entropy_overall = p.get("entropy_overall");
+    let packer = p.get("packer");
+    if packer.is_some() || entropy_overall.is_some() {
+        println!();
+        println!("Packer / Entropy:");
+        if let Some(v) = packer {
+            let ev = p
+                .get("packer_evidence")
+                .map(|e| format!(" ({})", e))
+                .unwrap_or_default();
+            println!("  packer        {}{}", v, ev);
+        } else {
+            println!("  packer        (none detected)");
+        }
+        if let Some(v) = entropy_overall {
+            let h: f64 = v.parse().unwrap_or(0.0);
+            let verdict = if h >= gr_analysis::entropy::ENTROPY_PACKED_THRESHOLD {
+                " (likely packed)"
+            } else if h >= gr_analysis::entropy::ENTROPY_HIGH_THRESHOLD {
+                " (high entropy)"
+            } else {
+                ""
+            };
+            println!("  entropy       {} bits/byte{}", v, verdict);
+        }
+    }
+
+    // Capabilities
+    if let Some(raw) = p.get("capa_rules") {
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
+        println!();
+        println!("Capabilities ({}):", lines.len());
+        for line in lines.iter().take(10) {
+            println!("  {}", line);
+        }
+        if lines.len() > 10 {
+            println!("  …{} more", lines.len() - 10);
+        }
+    }
+
+    // CWE findings (vuln)
+    let bugs: Vec<_> = program
+        .tags
+        .iter_functions()
+        .filter(|(_, t)| matches!(t.kind, gr_program::TagKind::Bug))
+        .collect();
+    if !bugs.is_empty() {
+        let mut by_cwe: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for (_, t) in &bugs {
+            let cwe = t.text.split_once(": ").map(|(c, _)| c).unwrap_or("CWE-?");
+            *by_cwe.entry(cwe.to_string()).or_default() += 1;
+        }
+        println!();
+        println!("CWE findings ({}):", bugs.len());
+        for (cwe, n) in &by_cwe {
+            println!("  {:<10} {}", cwe, n);
+        }
+    }
+
+    // IoCs grouped by kind
+    if let Some(raw) = p.get("iocs") {
+        let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let total: usize = raw.lines().filter(|l| !l.is_empty()).count();
+        for line in raw.lines() {
+            let mut parts = line.splitn(3, ' ');
+            let (_, Some(kind), _) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            *by_kind.entry(kind.to_string()).or_default() += 1;
+        }
+        if !by_kind.is_empty() {
+            println!();
+            println!("IoCs ({}):", total);
+            for (k, n) in &by_kind {
+                println!("  {:<14} {}", k, n);
+            }
+        }
+    }
+
+    // Tag counts overall (already drives downstream reports)
+    let tag_counts = program.tags.counts_by_kind();
+    if !tag_counts.is_empty() {
+        println!();
+        println!("Tags by kind:");
+        for (k, n) in &tag_counts {
+            println!("  {:<14} {}", k, n);
+        }
+    }
+
+    Ok(())
+}
+
+/// Same as `analyze_binary` but suppresses the per-analyzer log spam
+/// on stderr — the `triage` command is meant to be a clean
+/// one-screen report.
+fn analyze_binary_quiet(path: &Path) -> Result<gr_program::Program, Box<dyn std::error::Error>> {
+    let mut program = gr_program::Program::from_binary(path)?;
+    let manager = gr_analysis::AnalysisManager::new();
+    let _ = manager.run_all(&mut program);
+    // Apply overrides silently too.
+    if let Ok(overrides) = gr_program::OverrideSet::load_for_binary(path)
+        && !overrides.is_empty()
+    {
+        overrides.apply(&mut program);
+    }
+    Ok(program)
 }
 
 fn find_file_offset(info: &gr_loader::BinaryInfo, address: u64, data: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {

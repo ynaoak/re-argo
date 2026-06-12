@@ -62,7 +62,7 @@ For the full command surface, every flag, output formats, and multi-command reci
 
 | Group | Commands |
 |---|---|
-| Triage | `info`, `summary`, `sections`, `memmap`, `symbols`, `imports`, `strings` |
+| Triage | `info`, `triage`, `summary`, `sections`, `memmap`, `symbols`, `imports`, `strings` |
 | Analysis | `analyze`, `functions`, `metrics`, `bench`, `coverage`, `workflow` |
 | Findings | `tags`, `find`, `signatures` |
 | Code views | `disasm`, `pcode`, `decompile`, `decompile-all`, `cfg` |
