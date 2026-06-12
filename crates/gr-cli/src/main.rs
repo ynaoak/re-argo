@@ -504,6 +504,55 @@ enum Commands {
         #[arg(long)]
         callbacks: bool,
     },
+    /// Per-section Shannon entropy report.
+    ///
+    /// Surfaces packed / encrypted regions (UPX, Themida, VMProtect,
+    /// ASPack, …). Sections above 7.0 bits/byte are flagged as
+    /// high-entropy; above 7.5 as likely packed.
+    Entropy {
+        /// Path to the binary file
+        file: PathBuf,
+    },
+    /// Find ROP gadgets in executable sections (x86 / x64 only).
+    ///
+    /// Walks every executable section, locates each `ret`, and
+    /// disassembles backwards to enumerate the valid instruction
+    /// sequences ending at the `ret`. Output matches the
+    /// ROPgadget / ropper format.
+    Rop {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Bytes to walk back from each `ret` (controls how long a
+        /// gadget can be)
+        #[arg(long, default_value_t = 20)]
+        depth: usize,
+        /// Maximum number of instructions in each gadget (excluding
+        /// the trailing `ret`)
+        #[arg(long, default_value_t = 6)]
+        max_insns: usize,
+        /// Filter to gadgets made of useful mnemonics (pop / mov /
+        /// xor / add / sub / push / xchg / lea / …)
+        #[arg(long)]
+        useful_only: bool,
+        /// Substring filter applied to the gadget text (e.g. "pop rdi")
+        #[arg(long)]
+        contains: Option<String>,
+        /// Maximum gadgets to print (0 = unlimited)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Capa-style capability rule report.
+    ///
+    /// Matches built-in rules against discovered imports, strings,
+    /// and tags. Surfaces high-level verbs like "encrypts data using
+    /// AES" or "captures keyboard input" — what does this binary do?
+    Capa {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Filter rules whose namespace contains this substring
+        #[arg(long)]
+        namespace: Option<String>,
+    },
     /// Patch a binary file
     Patch {
         /// Path to the binary file
@@ -599,6 +648,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Callsites { file, target, min_resolved, iters, callbacks } => cmd_callsites(&file, target, min_resolved, iters, callbacks, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
+        Commands::Entropy { file } => cmd_entropy(&file),
+        Commands::Rop { file, depth, max_insns, useful_only, contains, limit } =>
+            cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit),
+        Commands::Capa { file, namespace } => cmd_capa(&file, namespace.as_deref()),
     }
 }
 
@@ -3452,6 +3505,118 @@ fn cmd_script(path: &Path, script_path: &Path, thumb: bool) -> Result<(), Box<dy
         let l = l.trim();
         !l.is_empty() && !l.starts_with('#')
     }).count());
+    Ok(())
+}
+
+fn cmd_entropy(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    println!("\nShannon entropy (bits/byte) for {}:", path.display());
+    println!("{}", "-".repeat(72));
+    println!("  {:<24} {:>10} {:>8} verdict", "section", "size", "entropy");
+
+    let mut shown = 0usize;
+    for section in &program.info.sections {
+        if section.size == 0 || section.address == 0 {
+            continue;
+        }
+        let key = format!("entropy_{}", section.name);
+        let Some(raw) = program.metadata.get_property(&key) else {
+            continue;
+        };
+        let h: f64 = raw.parse().unwrap_or(0.0);
+        let verdict = if h >= gr_analysis::entropy::ENTROPY_PACKED_THRESHOLD {
+            "likely packed"
+        } else if h >= gr_analysis::entropy::ENTROPY_HIGH_THRESHOLD {
+            "high entropy"
+        } else if h <= 1.0 {
+            "near-zero"
+        } else {
+            ""
+        };
+        println!(
+            "  {:<24} {:>10} {:>8.3} {}",
+            section.name, section.size, h, verdict
+        );
+        shown += 1;
+    }
+    if let Some(overall) = program.metadata.get_property("entropy_overall") {
+        println!("\n  overall entropy: {}", overall);
+    }
+    println!("\nShowing {} section{}", shown, if shown == 1 { "" } else { "s" });
+    Ok(())
+}
+
+fn cmd_rop(
+    path: &Path,
+    depth: usize,
+    max_insns: usize,
+    useful_only: bool,
+    contains: Option<&str>,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = gr_loader::BinaryLoader::load(path)?;
+
+    let opts = gr_analysis::rop::RopOptions {
+        depth_bytes: depth,
+        max_insns,
+        useful_only,
+    };
+    let mut gadgets = gr_analysis::rop::find_gadgets(&info, opts);
+
+    if let Some(needle) = contains {
+        let needle_l = needle.to_ascii_lowercase();
+        gadgets.retain(|g| g.text.to_ascii_lowercase().contains(&needle_l));
+    }
+
+    let total = gadgets.len();
+    println!("\nROP gadgets in {}: {} found", path.display(), total);
+    println!("{}", "-".repeat(72));
+
+    let to_show = if limit == 0 {
+        gadgets.len()
+    } else {
+        gadgets.len().min(limit)
+    };
+    for g in gadgets.iter().take(to_show) {
+        println!("0x{:016x} : {}", g.address, g.text);
+    }
+    if to_show < total {
+        println!("\n... {} more (raise --limit to see them)", total - to_show);
+    }
+    Ok(())
+}
+
+fn cmd_capa(path: &Path, namespace: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let rules = program
+        .metadata
+        .get_property("capa_rules")
+        .unwrap_or("")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
+
+    println!("\nCapa capabilities in {}:", path.display());
+    println!("{}", "-".repeat(72));
+    if rules.is_empty() {
+        println!("  (no rules matched)");
+        return Ok(());
+    }
+
+    let mut shown = 0usize;
+    for r in &rules {
+        if let Some(ns) = namespace
+            && !r.contains(ns)
+        {
+            continue;
+        }
+        println!("  {}", r);
+        shown += 1;
+    }
+
+    println!("\nShowing {} of {} rules matched", shown, rules.len());
     Ok(())
 }
 
