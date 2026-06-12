@@ -74,6 +74,7 @@ pub mod utils;
 pub mod vtable;
 pub mod wrapper;
 pub mod xref_report;
+pub mod yara_lite;
 
 pub use analyzer::Analyzer;
 pub use callgraph::CallGraph;
