@@ -513,21 +513,22 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
-    /// Find ROP gadgets in executable sections (x86 / x64 only).
+    /// Find ROP / JOP / COP gadgets in executable sections (x86 / x64 only).
     ///
-    /// Walks every executable section, locates each `ret`, and
-    /// disassembles backwards to enumerate the valid instruction
-    /// sequences ending at the `ret`. Output matches the
-    /// ROPgadget / ropper format.
+    /// Walks every executable section, locates each terminator
+    /// (`ret` for ROP, indirect `jmp` for JOP, indirect `call` for
+    /// COP), and disassembles backwards to enumerate the valid
+    /// instruction sequences ending at the terminator. Output
+    /// matches the ROPgadget / ropper format.
     Rop {
         /// Path to the binary file
         file: PathBuf,
-        /// Bytes to walk back from each `ret` (controls how long a
-        /// gadget can be)
+        /// Bytes to walk back from each terminator (controls how long
+        /// a gadget can be)
         #[arg(long, default_value_t = 20)]
         depth: usize,
         /// Maximum number of instructions in each gadget (excluding
-        /// the trailing `ret`)
+        /// the trailing terminator)
         #[arg(long, default_value_t = 6)]
         max_insns: usize,
         /// Filter to gadgets made of useful mnemonics (pop / mov /
@@ -540,6 +541,11 @@ enum Commands {
         /// Maximum gadgets to print (0 = unlimited)
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Gadget kinds to search for. Comma-separated list of
+        /// `rop`, `jop`, `cop`. Default `rop` matches classic
+        /// ROPgadget behaviour; pass `all` for ROP + JOP + COP.
+        #[arg(long, default_value = "rop")]
+        kinds: String,
     },
     /// Capa-style capability rule report.
     ///
@@ -578,6 +584,22 @@ enum Commands {
     Vuln {
         /// Path to the binary file
         file: PathBuf,
+    },
+    /// Extract indicators-of-compromise (URLs, IPs, registry keys, …)
+    /// from discovered strings.
+    ///
+    /// Each finding is also surfaced as a Custom `ioc` tag at the
+    /// string address, so `tags --filter ioc` produces the same
+    /// listing.
+    Ioc {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Filter results to one kind (`url`, `ipv4`, `ipv6`,
+        /// `registry-key`, `named-pipe`, `mutex`, `win-path`,
+        /// `posix-path`, `email`, `eth-addr`, `btc-addr`,
+        /// `user-agent`, `domain`)
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Patch a binary file
     Patch {
@@ -675,12 +697,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
         Commands::Entropy { file } => cmd_entropy(&file),
-        Commands::Rop { file, depth, max_insns, useful_only, contains, limit } =>
-            cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit),
+        Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
+            cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
         Commands::Capa { file, namespace } => cmd_capa(&file, namespace.as_deref()),
         Commands::Packer { file } => cmd_packer(&file),
         Commands::Embedded { file, limit } => cmd_embedded(&file, limit),
         Commands::Vuln { file } => cmd_vuln(&file),
+        Commands::Ioc { file, kind } => cmd_ioc(&file, kind.as_deref()),
     }
 }
 
@@ -3583,13 +3606,27 @@ fn cmd_rop(
     useful_only: bool,
     contains: Option<&str>,
     limit: usize,
+    kinds_spec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = gr_loader::BinaryLoader::load(path)?;
+
+    let kinds: &'static [gr_analysis::rop::GadgetKind] = match kinds_spec.to_ascii_lowercase().as_str() {
+        "all" | "rop,jop,cop" | "rop,cop,jop" | "jop,rop,cop" | "jop,cop,rop"
+        | "cop,rop,jop" | "cop,jop,rop" => gr_analysis::rop::ALL_KINDS,
+        "rop" => &[gr_analysis::rop::GadgetKind::Rop],
+        "jop" => &[gr_analysis::rop::GadgetKind::Jop],
+        "cop" => &[gr_analysis::rop::GadgetKind::Cop],
+        "rop,jop" | "jop,rop" => &[gr_analysis::rop::GadgetKind::Rop, gr_analysis::rop::GadgetKind::Jop],
+        "rop,cop" | "cop,rop" => &[gr_analysis::rop::GadgetKind::Rop, gr_analysis::rop::GadgetKind::Cop],
+        "jop,cop" | "cop,jop" => &[gr_analysis::rop::GadgetKind::Jop, gr_analysis::rop::GadgetKind::Cop],
+        other => return Err(format!("unknown gadget kind spec: {}", other).into()),
+    };
 
     let opts = gr_analysis::rop::RopOptions {
         depth_bytes: depth,
         max_insns,
         useful_only,
+        kinds,
     };
     let mut gadgets = gr_analysis::rop::find_gadgets(&info, opts);
 
@@ -3599,7 +3636,7 @@ fn cmd_rop(
     }
 
     let total = gadgets.len();
-    println!("\nROP gadgets in {}: {} found", path.display(), total);
+    println!("\nGadgets in {} ({}): {} found", path.display(), kinds_spec, total);
     println!("{}", "-".repeat(72));
 
     let to_show = if limit == 0 {
@@ -3608,7 +3645,7 @@ fn cmd_rop(
         gadgets.len().min(limit)
     };
     for g in gadgets.iter().take(to_show) {
-        println!("0x{:016x} : {}", g.address, g.text);
+        println!("0x{:016x} [{}] {}", g.address, g.kind.label(), g.text);
     }
     if to_show < total {
         println!("\n... {} more (raise --limit to see them)", total - to_show);
@@ -3722,6 +3759,40 @@ fn cmd_vuln(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("  0x{:016x} {:<10} {}", addr, cwe, rest);
     }
+    Ok(())
+}
+
+fn cmd_ioc(path: &Path, kind_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let raw = program.metadata.get_property("iocs").unwrap_or("");
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
+
+    println!("\nIoCs in {}: {} finding(s)", path.display(), lines.len());
+    println!("{}", "-".repeat(72));
+    if lines.is_empty() {
+        println!("  (no IoCs matched)");
+        return Ok(());
+    }
+    println!("  {:<18} {:<14} value", "address", "kind");
+
+    let mut shown = 0usize;
+    for line in &lines {
+        // Format from analyzer: "0x{addr} {kind} {value}"
+        let mut parts = line.splitn(3, ' ');
+        let (Some(addr), Some(kind), Some(value)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if let Some(want) = kind_filter
+            && kind != want
+        {
+            continue;
+        }
+        println!("  {:<18} {:<14} {}", addr, kind, value);
+        shown += 1;
+    }
+    println!("\nShowing {} of {} IoC(s)", shown, lines.len());
     Ok(())
 }
 

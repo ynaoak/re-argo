@@ -51,7 +51,8 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Run multi-command script" | `script <bin> queries.grs` |
 | "Speak MCP to a host like Claude Code" | `mcp <bin>` |
 | "Per-section entropy (detect packing)" | `entropy <bin>` |
-| "Find ROP gadgets (x86 / x64)" | `rop <bin> --useful-only --contains "pop rdi"` |
+| "Find ROP / JOP / COP gadgets (x86 / x64)" | `rop <bin> --kinds all --useful-only --contains "pop rdi"` |
+| "Extract IoCs (URLs / IPs / registry keys / mutexes)" | `ioc <bin>` |
 | "What does this binary do? (Capa-style)" | `capa <bin>` |
 | "Is this packed? Which packer?" | `packer <bin>` |
 | "Find embedded files (PE / ZIP / PNG / …) in the binary" | `embedded <bin>` |
@@ -459,19 +460,20 @@ Mark `N` parameter registers as tainted at function `ADDR` and propagate through
 
 Per-section Shannon entropy report (bits/byte, 0.0–8.0). Sections above 7.0 are flagged `high entropy`; above 7.5 `likely packed`. Use as the first triage step on samples of suspected packers (UPX, Themida, VMProtect, ASPack, …). Also surfaces `metadata.entropy_<section>` for the JSON `export`.
 
-#### `rop <FILE> [--depth N] [--max-insns N] [--useful-only] [--contains TEXT] [--limit N]`
+#### `rop <FILE> [--depth N] [--max-insns N] [--useful-only] [--contains TEXT] [--limit N] [--kinds rop|jop|cop|all]`
 
-Find ROP gadgets in executable sections (x86 / x64 only). Walks every `ret`, disassembles backwards, and prints the resulting instruction sequences in ROPgadget / ropper format.
+Find ROP / JOP / COP gadgets in executable sections (x86 / x64 only). Walks every terminator (`ret` for ROP, `jmp reg`/`jmp [mem]` for JOP, `call reg`/`call [mem]` for COP), disassembles backwards, and prints the resulting instruction sequences in ROPgadget / ropper format.
 
 | Flag | Purpose |
 |---|---|
-| `--depth N` | Bytes to walk back from each `ret` (default 20) |
+| `--depth N` | Bytes to walk back from each terminator (default 20) |
 | `--max-insns N` | Maximum instructions in each gadget (default 6) |
 | `--useful-only` | Filter to mnemonics actually useful for ROP (pop / mov / xor / add / …) |
 | `--contains TEXT` | Substring filter applied to the gadget text |
 | `--limit N` | Maximum gadgets to print (default 200, 0 = unlimited) |
+| `--kinds` | Gadget kinds: `rop` (default), `jop`, `cop`, or comma-list, or `all` |
 
-Use `--contains "pop rdi"` to find arg-1 set-up gadgets directly. ARM / MIPS / RISC-V binaries return an empty list.
+Use `--contains "pop rdi"` to find arg-1 set-up gadgets directly. Output rows are prefixed with `[rop]` / `[jop]` / `[cop]` to identify the terminator. ARM / MIPS / RISC-V binaries return an empty list.
 
 #### `capa <FILE> [--namespace SUBSTR]`
 
@@ -498,6 +500,14 @@ Cwe_checker-style vulnerability pattern report. Tags functions that call known-d
 * **CWE-676** — `strtok`, `tmpnam`, `mktemp`, `alloca`
 
 Read the JSON `export`'s `tags{}` map (kind = `bug`) for the machine-parseable form.
+
+#### `ioc <FILE> [--kind KIND]`
+
+Indicator-of-compromise extractor. Classifies every discovered string into one of: `url`, `ipv4`, `ipv6`, `email`, `registry-key`, `named-pipe`, `mutex`, `win-path`, `posix-path`, `eth-addr`, `btc-addr`, `user-agent`, `domain`. Each match is also surfaced as a Custom `ioc` tag at the string address — `tags --filter ioc` produces the same listing for downstream consumers. The full list is also written to `metadata.iocs` for JSON export.
+
+| Flag | Purpose |
+|---|---|
+| `--kind KIND` | Show only this kind (e.g. `--kind url`, `--kind registry-key`) |
 
 ---
 
