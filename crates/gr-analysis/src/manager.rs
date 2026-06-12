@@ -53,7 +53,11 @@ use crate::patterns::{PatternFunctionAnalyzer, StructLayoutAnalyzer};
 use crate::pcoderef::PcodeReferenceAnalyzer;
 use crate::signatures::SignatureApplierAnalyzer;
 use crate::callsite_annotate::CallSiteAnnotator;
+use crate::capa::CapaAnalyzer;
+use crate::entropy::EntropyAnalyzer;
+use crate::packer::PackerAnalyzer;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
+use crate::vuln::VulnAnalyzer;
 use crate::tls::TlsVariableAnalyzer;
 use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
 use crate::vtable::VTableAnalyzer;
@@ -87,6 +91,8 @@ impl AnalysisManager {
             Box::new(StringSearchAnalyzer),
             Box::new(NoReturnAnalyzer),
             Box::new(CryptoConstantAnalyzer),
+            Box::new(EntropyAnalyzer),
+            Box::new(PackerAnalyzer),
             Box::new(ScalarReferenceAnalyzer),
             Box::new(ConstantPropagationAnalyzer),
             Box::new(StackFrameAnalyzer),
@@ -140,7 +146,9 @@ impl AnalysisManager {
             Box::new(CoverageAnalyzer),
             Box::new(TypeRecoveryAnalyzer),
             Box::new(DataTypeAnalyzer),
+            Box::new(VulnAnalyzer),
             Box::new(TagAnalyzer),
+            Box::new(CapaAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
         Self { analyzers }

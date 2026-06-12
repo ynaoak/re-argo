@@ -261,6 +261,7 @@ dependencies = [
  "gr-lift",
  "gr-loader",
  "gr-program",
+ "iced-x86",
  "petgraph",
  "rayon",
  "rustc-demangle",

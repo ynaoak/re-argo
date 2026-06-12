@@ -50,6 +50,12 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Auto-correct fixpoint loop" | `iterate <bin> --apply --max-rounds 5` |
 | "Run multi-command script" | `script <bin> queries.grs` |
 | "Speak MCP to a host like Claude Code" | `mcp <bin>` |
+| "Per-section entropy (detect packing)" | `entropy <bin>` |
+| "Find ROP gadgets (x86 / x64)" | `rop <bin> --useful-only --contains "pop rdi"` |
+| "What does this binary do? (Capa-style)" | `capa <bin>` |
+| "Is this packed? Which packer?" | `packer <bin>` |
+| "Find embedded files (PE / ZIP / PNG / …) in the binary" | `embedded <bin>` |
+| "Flag dangerous-API call sites (Cwe_checker-style)" | `vuln <bin>` |
 
 ---
 
@@ -446,6 +452,52 @@ Patch a binary file. Either supply raw `--bytes` (hex, space-separated) or `--as
 #### `taint <FILE> [-a ADDR] [-p N]`
 
 Mark `N` parameter registers as tainted at function `ADDR` and propagate through SSA to dangerous sinks (libc functions known to mishandle untrusted input). Useful for vulnerability triage.
+
+### Capability detection (cross-tool inspiration)
+
+#### `entropy <FILE>`
+
+Per-section Shannon entropy report (bits/byte, 0.0–8.0). Sections above 7.0 are flagged `high entropy`; above 7.5 `likely packed`. Use as the first triage step on samples of suspected packers (UPX, Themida, VMProtect, ASPack, …). Also surfaces `metadata.entropy_<section>` for the JSON `export`.
+
+#### `rop <FILE> [--depth N] [--max-insns N] [--useful-only] [--contains TEXT] [--limit N]`
+
+Find ROP gadgets in executable sections (x86 / x64 only). Walks every `ret`, disassembles backwards, and prints the resulting instruction sequences in ROPgadget / ropper format.
+
+| Flag | Purpose |
+|---|---|
+| `--depth N` | Bytes to walk back from each `ret` (default 20) |
+| `--max-insns N` | Maximum instructions in each gadget (default 6) |
+| `--useful-only` | Filter to mnemonics actually useful for ROP (pop / mov / xor / add / …) |
+| `--contains TEXT` | Substring filter applied to the gadget text |
+| `--limit N` | Maximum gadgets to print (default 200, 0 = unlimited) |
+
+Use `--contains "pop rdi"` to find arg-1 set-up gadgets directly. ARM / MIPS / RISC-V binaries return an empty list.
+
+#### `capa <FILE> [--namespace SUBSTR]`
+
+Capa-style capability report. Built-in rules match against discovered imports, strings, and tags; each match is one rule namespace + name, e.g. `host-interaction/file-system/read-file`. Filter by namespace substring (`--namespace persistence`).
+
+#### `packer <FILE>`
+
+DIE / PEiD-style packer detection. Matches the entry-point byte signature and section-name layout against a curated table (UPX, ASPack, FSG, MEW, PECompact, Petite, Themida, VMProtect, ASProtect, Enigma, NSPack, Mpress, Yoda's Crypter). Surfaces the matched packer in `metadata.packer` and the evidence channel (`entry-point` or `section-name`) in `metadata.packer_evidence`. Also surfaces a `Suspicious` tag on the entry point so the regular `tags` report picks it up.
+
+#### `embedded <FILE> [--limit N]`
+
+Binwalk-style embedded-file scan. Walks every initialized byte looking for the magic-byte prefixes of common formats — ELF / PE / Mach-O droppers, ZIP / GZIP / 7z / RAR / XZ / Zstandard / BZIP2 archives, PNG / JPEG / GIF / PDF / SQLite resources, Java class files, POSIX tar. Output: `address kind magic` rows. Useful for triaging malware droppers, firmware blobs with embedded resources, and installers with appended archives.
+
+#### `vuln <FILE>`
+
+Cwe_checker-style vulnerability pattern report. Tags functions that call known-dangerous APIs with the matching CWE id:
+
+* **CWE-78** — `system`, `popen`, `exec*`, `WinExec`, `ShellExecute*`
+* **CWE-120** — unchecked `strcpy` / `strcat` / `wcscpy` / `wcscat` / `lstrcpy*` / `StrCpy*`
+* **CWE-134** — `sprintf` / `vsprintf` (buffer + format)
+* **CWE-242** — `gets`
+* **CWE-330** — predictable RNG (`rand` / `random`)
+* **CWE-426** — `LoadLibrary*` (DLL hijack risk)
+* **CWE-676** — `strtok`, `tmpnam`, `mktemp`, `alloca`
+
+Read the JSON `export`'s `tags{}` map (kind = `bug`) for the machine-parseable form.
 
 ---
 

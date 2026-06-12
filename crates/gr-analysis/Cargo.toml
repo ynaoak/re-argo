@@ -20,3 +20,4 @@ rustc-hash = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+iced-x86 = { workspace = true }
