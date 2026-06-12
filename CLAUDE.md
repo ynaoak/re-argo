@@ -53,6 +53,9 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Per-section entropy (detect packing)" | `entropy <bin>` |
 | "Find ROP gadgets (x86 / x64)" | `rop <bin> --useful-only --contains "pop rdi"` |
 | "What does this binary do? (Capa-style)" | `capa <bin>` |
+| "Is this packed? Which packer?" | `packer <bin>` |
+| "Find embedded files (PE / ZIP / PNG / …) in the binary" | `embedded <bin>` |
+| "Flag dangerous-API call sites (Cwe_checker-style)" | `vuln <bin>` |
 
 ---
 
@@ -473,6 +476,28 @@ Use `--contains "pop rdi"` to find arg-1 set-up gadgets directly. ARM / MIPS / R
 #### `capa <FILE> [--namespace SUBSTR]`
 
 Capa-style capability report. Built-in rules match against discovered imports, strings, and tags; each match is one rule namespace + name, e.g. `host-interaction/file-system/read-file`. Filter by namespace substring (`--namespace persistence`).
+
+#### `packer <FILE>`
+
+DIE / PEiD-style packer detection. Matches the entry-point byte signature and section-name layout against a curated table (UPX, ASPack, FSG, MEW, PECompact, Petite, Themida, VMProtect, ASProtect, Enigma, NSPack, Mpress, Yoda's Crypter). Surfaces the matched packer in `metadata.packer` and the evidence channel (`entry-point` or `section-name`) in `metadata.packer_evidence`. Also surfaces a `Suspicious` tag on the entry point so the regular `tags` report picks it up.
+
+#### `embedded <FILE> [--limit N]`
+
+Binwalk-style embedded-file scan. Walks every initialized byte looking for the magic-byte prefixes of common formats — ELF / PE / Mach-O droppers, ZIP / GZIP / 7z / RAR / XZ / Zstandard / BZIP2 archives, PNG / JPEG / GIF / PDF / SQLite resources, Java class files, POSIX tar. Output: `address kind magic` rows. Useful for triaging malware droppers, firmware blobs with embedded resources, and installers with appended archives.
+
+#### `vuln <FILE>`
+
+Cwe_checker-style vulnerability pattern report. Tags functions that call known-dangerous APIs with the matching CWE id:
+
+* **CWE-78** — `system`, `popen`, `exec*`, `WinExec`, `ShellExecute*`
+* **CWE-120** — unchecked `strcpy` / `strcat` / `wcscpy` / `wcscat` / `lstrcpy*` / `StrCpy*`
+* **CWE-134** — `sprintf` / `vsprintf` (buffer + format)
+* **CWE-242** — `gets`
+* **CWE-330** — predictable RNG (`rand` / `random`)
+* **CWE-426** — `LoadLibrary*` (DLL hijack risk)
+* **CWE-676** — `strtok`, `tmpnam`, `mktemp`, `alloca`
+
+Read the JSON `export`'s `tags{}` map (kind = `bug`) for the machine-parseable form.
 
 ---
 

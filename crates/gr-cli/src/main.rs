@@ -553,6 +553,32 @@ enum Commands {
         #[arg(long)]
         namespace: Option<String>,
     },
+    /// DIE / PEiD-style packer signature detection (UPX, ASPack, Themida, …)
+    Packer {
+        /// Path to the binary file
+        file: PathBuf,
+    },
+    /// Scan loaded memory for embedded files (Binwalk-style).
+    ///
+    /// Looks for ELF / PE / Mach-O droppers, ZIP / GZIP / 7z
+    /// archives, PNG / JPEG / PDF resources inside `.rsrc` / data
+    /// sections.
+    Embedded {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Maximum number of findings to print (0 = unlimited)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Cwe_checker-style vulnerability pattern report.
+    ///
+    /// Tags functions that call known-dangerous APIs (`gets`,
+    /// unchecked `strcpy`, `system`, predictable RNG, …) with the
+    /// matching CWE id.
+    Vuln {
+        /// Path to the binary file
+        file: PathBuf,
+    },
     /// Patch a binary file
     Patch {
         /// Path to the binary file
@@ -652,6 +678,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit),
         Commands::Capa { file, namespace } => cmd_capa(&file, namespace.as_deref()),
+        Commands::Packer { file } => cmd_packer(&file),
+        Commands::Embedded { file, limit } => cmd_embedded(&file, limit),
+        Commands::Vuln { file } => cmd_vuln(&file),
     }
 }
 
@@ -3617,6 +3646,82 @@ fn cmd_capa(path: &Path, namespace: Option<&str>) -> Result<(), Box<dyn std::err
     }
 
     println!("\nShowing {} of {} rules matched", shown, rules.len());
+    Ok(())
+}
+
+fn cmd_packer(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    println!("\nPacker detection for {}:", path.display());
+    println!("{}", "-".repeat(72));
+
+    match program.metadata.get_property("packer") {
+        Some(label) => {
+            let evidence = program
+                .metadata
+                .get_property("packer_evidence")
+                .unwrap_or("unknown");
+            println!("  packer:    {}", label);
+            println!("  evidence:  {}", evidence);
+            if let Some(overall) = program.metadata.get_property("entropy_overall") {
+                println!("  entropy:   {} (overall)", overall);
+            }
+        }
+        None => {
+            println!("  (no known packer signature matched)");
+            if let Some(overall) = program.metadata.get_property("entropy_overall") {
+                println!("  overall entropy: {}", overall);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_embedded(path: &Path, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let info = gr_loader::BinaryLoader::load(path)?;
+    let findings = gr_analysis::embedded::scan(&info, 1);
+
+    println!("\nEmbedded files in {}: {} found", path.display(), findings.len());
+    println!("{}", "-".repeat(72));
+    println!("  {:<18} {:<32} magic", "address", "kind");
+
+    let to_show = if limit == 0 { findings.len() } else { findings.len().min(limit) };
+    for f in findings.iter().take(to_show) {
+        println!(
+            "  0x{:016x} {:<32} {}",
+            f.address, f.kind, f.magic_hex
+        );
+    }
+    if to_show < findings.len() {
+        println!("\n... {} more (raise --limit to see them)", findings.len() - to_show);
+    }
+    Ok(())
+}
+
+fn cmd_vuln(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let program = analyze_binary(path)?;
+
+    let bug_tags: Vec<_> = program
+        .tags
+        .iter_functions()
+        .filter(|(_, t)| matches!(t.kind, gr_program::TagKind::Bug))
+        .collect();
+
+    println!("\nVulnerability patterns in {}: {} finding(s)", path.display(), bug_tags.len());
+    println!("{}", "-".repeat(72));
+    if bug_tags.is_empty() {
+        println!("  (no dangerous-API calls flagged)");
+        return Ok(());
+    }
+    println!("  {:<18} {:<10} detail", "function", "cwe");
+    for (addr, tag) in &bug_tags {
+        // Tag text format: "CWE-XXX: label (name)"
+        let (cwe, rest) = match tag.text.split_once(": ") {
+            Some((c, r)) => (c, r),
+            None => ("", tag.text.as_str()),
+        };
+        println!("  0x{:016x} {:<10} {}", addr, cwe, rest);
+    }
     Ok(())
 }
 
