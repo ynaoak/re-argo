@@ -1,3 +1,4 @@
+mod carve;
 mod mcp;
 mod symbol_import;
 
@@ -648,6 +649,46 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Carve a single function (or VA range) into a small standalone file.
+    ///
+    /// Sidesteps the size limit that makes GUI Ghidra truncate / choke
+    /// on very large images (e.g. the ~222 MB Minecraft Bedrock server)
+    /// by extracting only the bytes of interest while keeping their
+    /// original virtual address, so RIP-relative operands and call
+    /// targets still resolve correctly.
+    ///
+    /// Range selection (pick one): `--address` carves a discovered
+    /// function's full extent (runs analysis); `--address --size`,
+    /// `--start --end`, or `--start --size` carve an explicit range
+    /// without analysis (fast on huge binaries).
+    ///
+    /// `--format elf` (default) emits a minimal ELF placed at the
+    /// original VA that Ghidra and ghidra-rust auto-load with no manual
+    /// setup; `--format raw` emits the bytes verbatim and prints the
+    /// Ghidra "Raw Binary" import parameters.
+    Carve {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Function entry address to carve (hex). Runs analysis to find
+        /// the function extent unless `--size` is also given.
+        #[arg(long, value_parser = parse_hex)]
+        address: Option<u64>,
+        /// Start of an explicit VA range to carve (hex)
+        #[arg(long, value_parser = parse_hex)]
+        start: Option<u64>,
+        /// End of the VA range, exclusive (hex). Use with `--start`.
+        #[arg(long, value_parser = parse_hex)]
+        end: Option<u64>,
+        /// Number of bytes to carve. Use with `--address` or `--start`.
+        #[arg(long)]
+        size: Option<u64>,
+        /// Container format: `elf` (default, auto-loads) or `raw`.
+        #[arg(long, default_value = "elf")]
+        format: String,
+        /// Output file path (default: `<file>.carved.<addr>.elf` / `.bin`)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -726,6 +767,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Callsites { file, target, min_resolved, iters, callbacks } => cmd_callsites(&file, target, min_resolved, iters, callbacks, cli.thumb),
         Commands::Search { file, hex, text, max_results } => cmd_search(&file, hex.as_deref(), text.as_deref(), max_results),
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
+        Commands::Carve { file, address, start, end, size, format, output } =>
+            cmd_carve(&file, address, start, end, size, &format, output.as_deref(), cli.thumb),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3566,6 +3609,135 @@ fn cmd_patch(
     let out_path = output.unwrap_or(path);
     std::fs::write(out_path, &data)?;
     println!("Written to: {}", out_path.display());
+    Ok(())
+}
+
+/// Read `[start, end)` from the loaded memory model, zero-filling any
+/// uninitialised holes so ranges that touch `.bss`-like gaps still succeed.
+fn read_va_span(info: &gr_loader::BinaryInfo, start: u64, end: u64) -> Vec<u8> {
+    let len = end.saturating_sub(start);
+    let mut out = vec![0u8; len as usize];
+    for (i, slot) in out.iter_mut().enumerate() {
+        if let Some(b) = info.memory.read_byte(start + i as u64) {
+            *slot = b;
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_carve(
+    path: &Path,
+    address: Option<u64>,
+    start: Option<u64>,
+    end: Option<u64>,
+    size: Option<u64>,
+    format: &str,
+    output: Option<&Path>,
+    thumb: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let format = format.to_ascii_lowercase();
+    if format != "elf" && format != "raw" {
+        return Err(format!("unknown --format '{}': expected 'elf' or 'raw'", format).into());
+    }
+
+    let info = BinaryLoader::load(path)?;
+
+    // Resolve the [carve_start, carve_end) virtual-address range and the
+    // entry address to record in the carved file.
+    let (carve_start, carve_end, entry): (u64, u64, u64) = match (address, start, end, size) {
+        // Function entry, extent discovered by analysis.
+        (Some(addr), None, None, None) => {
+            eprintln!("[carve] running analysis to find the extent of the function at 0x{:x} ...", addr);
+            let program = analyze_binary(path)?;
+            let func = program
+                .listing
+                .get_function(addr)
+                .or_else(|| program.listing.function_containing(addr))
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    format!(
+                        "no function found at or containing 0x{:x}; pass --size N to carve a fixed length without analysis",
+                        addr
+                    )
+                    .into()
+                })?;
+            if func.body.is_empty() {
+                return Err(format!(
+                    "function at 0x{:x} has no discovered body; pass --size N to carve a fixed length",
+                    func.entry_point
+                )
+                .into());
+            }
+            let lo = func.body.ranges().map(|r| r.start.offset).min().unwrap();
+            let hi = func.body.ranges().map(|r| r.end_offset()).max().unwrap();
+            (lo, hi, func.entry_point)
+        }
+        // Function entry + explicit length (no analysis).
+        (Some(addr), None, None, Some(n)) => (addr, addr + n, addr),
+        // Explicit range by end.
+        (None, Some(s), Some(e), None) => {
+            if e <= s {
+                return Err("--end must be greater than --start".into());
+            }
+            (s, e, s)
+        }
+        // Explicit range by length.
+        (None, Some(s), None, Some(n)) => (s, s + n, s),
+        _ => {
+            return Err(
+                "specify exactly one of: --address ADDR | --address ADDR --size N | --start S --end E | --start S --size N"
+                    .into(),
+            );
+        }
+    };
+
+    let data = read_va_span(&info, carve_start, carve_end);
+    if data.is_empty() {
+        return Err("carve range is empty".into());
+    }
+    let nonzero = data.iter().filter(|&&b| b != 0).count();
+    if nonzero == 0 {
+        eprintln!(
+            "[carve] WARNING: every byte in 0x{:x}..0x{:x} is zero/uninitialised — wrong address or unmapped range?",
+            carve_start, carve_end
+        );
+    }
+
+    let default_ext = if format == "elf" { "elf" } else { "bin" };
+    let default_name = format!(
+        "{}.carved.{:x}.{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("out"),
+        carve_start,
+        default_ext
+    );
+    let out_path: PathBuf = output
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| path.with_file_name(default_name));
+
+    let bytes_written: Vec<u8> = if format == "elf" {
+        carve::build_min_elf(info.arch, info.bits, info.endian, carve_start, entry, &data)
+    } else {
+        data.clone()
+    };
+    std::fs::write(&out_path, &bytes_written)?;
+
+    let lang = carve::ghidra_language_id(info.arch, info.endian, thumb);
+    println!("Carved 0x{:x}..0x{:x} ({} bytes) from {}", carve_start, carve_end, data.len(), path.display());
+    println!("  Entry:    0x{:x}", entry);
+    println!("  Format:   {}", format);
+    println!("  Written:  {} ({} bytes)", out_path.display(), bytes_written.len());
+    if format == "elf" {
+        println!();
+        println!("Auto-loads at the original VA — no manual setup:");
+        println!("  ghidra-rust decompile {} --address 0x{:x}", out_path.display(), entry);
+        println!("  (or drag into GUI Ghidra; arch + base are detected from the ELF header)");
+    } else {
+        println!();
+        println!("Import into GUI Ghidra as \"Raw Binary\":");
+        println!("  Language:      {}", lang);
+        println!("  Base address:  0x{:x}", carve_start);
+        println!("  Then disassemble at 0x{:x}", entry);
+    }
     Ok(())
 }
 

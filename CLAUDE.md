@@ -47,6 +47,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Show P-code IR (low-level)" | `pcode <bin> --start 0x401000 -n 16` |
 | "Search byte / text patterns" | `search <bin> --hex "55 48 89 e5"` |
 | "Patch a binary" | `patch <bin> 0x401000 --bytes "90 90 90" -o patched` |
+| "Carve 1 function out of a huge binary (for GUI Ghidra)" | `carve <bin> --address 0x401000 -o func.elf` |
 | "Persist manual corrections to a sidecar" | `annotate <bin> --rename 0x401000=my_main --func 0x401080` |
 | "Auto-correct fixpoint loop" | `iterate <bin> --apply --max-rounds 5` |
 | "Run multi-command script" | `script <bin> queries.grs` |
@@ -435,6 +436,26 @@ Edit the persistent override sidecar `<binary>.gra.json` that re-applies on ever
 #### `iterate <FILE> [--apply] [--max-rounds N]`
 
 Auto-correction fixpoint. Each round runs analysis, surfaces probable analyser mistakes (calls to undiscovered functions, false-positive tiny functions, …), persists them to the sidecar if `--apply`, and re-runs. Without `--apply` it's a dry-run that just prints proposals. Default max-rounds 5.
+
+#### `carve <FILE> [--address ADDR] [--start ADDR] [--end ADDR] [--size N] [--format elf|raw] [-o OUT]`
+
+Extract a single function (or an arbitrary VA range) into a small standalone file so a size-limited tool — notably GUI Ghidra, whose importer truncates / chokes on very large images (e.g. the ~222 MB Minecraft Bedrock server) — can analyse just the bytes of interest. The carved bytes keep their **original virtual address**, so RIP-relative operands and call targets still resolve to the correct addresses.
+
+Range selection (pick exactly one):
+
+| Flags | Behaviour |
+|---|---|
+| `--address ADDR` | Run analysis, carve the discovered function's full extent (entry → last body byte) |
+| `--address ADDR --size N` | Function entry + explicit byte length (skips analysis — fast on huge binaries) |
+| `--start ADDR --end ADDR` | Arbitrary half-open VA range (skips analysis) |
+| `--start ADDR --size N` | Arbitrary range by length (skips analysis) |
+
+Output container (`--format`):
+
+* `elf` (default) — a minimal single-`.text` ELF placed at the original VA. Ghidra and ghidra-rust both auto-detect arch + base, so the carved function round-trips with **zero manual setup**: `ghidra-rust carve big --start 0x… --size N -o f.elf` then `ghidra-rust decompile f.elf --address 0x…`. Emitted for any source arch (even a PE source), since Ghidra loads ELF for every architecture.
+* `raw` — the bytes verbatim; the command prints the Ghidra "Raw Binary" import parameters (SLEIGH language id + base address) to type into the import dialog.
+
+Default output path is `<file>.carved.<addr>.elf` (or `.bin` for `raw`). Use the fast `--start/--size` form on multi-hundred-MB binaries — it never runs the analysis pipeline, only the loader. The `--address`-only form must analyse the whole binary to find the function's extent.
 
 ### Scripting / integration
 
