@@ -620,6 +620,30 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         sample: usize,
     },
+    /// FLOSS-lite obfuscated string decoder.
+    ///
+    /// Brute-force XOR / ROL (optionally ADD) decode of every
+    /// read-only data section. Surfaces strings that don't appear
+    /// in a plain `strings` pass because they're stored encoded.
+    Floss {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Minimum decoded-string length (default 8)
+        #[arg(long, default_value_t = 8)]
+        min_length: usize,
+        /// Also try ADD-decode (default off — ADD is rarer and noisier)
+        #[arg(long)]
+        with_add: bool,
+        /// Print only the first N hits (0 = unlimited)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Disable the conservative "encoded bytes must be non-printable"
+        /// filter. Off by default — turn on to chase obfuscated
+        /// strings whose encoded form happens to be printable too.
+        /// Substantially noisier.
+        #[arg(long)]
+        include_printable_source: bool,
+    },
     /// Compare two binaries by TLSH fuzzy hash.
     ///
     /// Lower distance = more similar. Per the TLSH reference: < 30
@@ -789,6 +813,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Ioc { file, kind } => cmd_ioc(&file, kind.as_deref()),
         Commands::Triage { file } => cmd_triage(&file),
         Commands::TlshDiff { file_a, file_b } => cmd_tlsh_diff(&file_a, &file_b),
+        Commands::Floss { file, min_length, with_add, limit, include_printable_source } =>
+            cmd_floss(&file, min_length, with_add, limit, include_printable_source),
         Commands::Yara { file, rules, sample } => cmd_yara(&file, &rules, sample),
     }
 }
@@ -4098,6 +4124,65 @@ fn cmd_ioc(path: &Path, kind_filter: Option<&str>) -> Result<(), Box<dyn std::er
         shown += 1;
     }
     println!("\nShowing {} of {} IoC(s)", shown, lines.len());
+    Ok(())
+}
+
+fn cmd_floss(
+    path: &Path,
+    min_length: usize,
+    with_add: bool,
+    limit: usize,
+    include_printable_source: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = gr_loader::BinaryLoader::load(path)?;
+    let opts = gr_analysis::floss_lite::FlossOptions {
+        min_length,
+        try_xor: true,
+        try_add: with_add,
+        try_rol: true,
+        max_per_section: 4096,
+        require_nonprintable_source: !include_printable_source,
+        dedup_per_address: true,
+    };
+    let mut all: Vec<gr_analysis::floss_lite::DecodedString> = Vec::new();
+    for section in &info.sections {
+        if section.size == 0
+            || section.size > 16 * 1024 * 1024
+            || section.flags.contains(gr_loader::SectionFlags::EXECUTE)
+        {
+            continue;
+        }
+        let mut buf = vec![0u8; section.size as usize];
+        if info.memory.read_bytes(section.address, &mut buf).is_err() {
+            continue;
+        }
+        let found = gr_analysis::floss_lite::decode_section(&buf, section.address, &opts);
+        all.extend(found);
+    }
+
+    println!(
+        "\nFLOSS-lite decoded strings in {} ({} found):",
+        path.display(),
+        all.len()
+    );
+    println!("{}", "-".repeat(72));
+    if all.is_empty() {
+        println!("  (no obfuscated strings recovered)");
+        return Ok(());
+    }
+    println!("  {:<18} {:<14} value", "address", "method");
+    let to_show = if limit == 0 { all.len() } else { all.len().min(limit) };
+    for d in all.iter().take(to_show) {
+        println!(
+            "  0x{:016x} {:<14} {:?}",
+            d.address,
+            d.method.label(),
+            d.plaintext
+        );
+    }
+    if to_show < all.len() {
+        println!("\n... {} more (raise --limit to see them)", all.len() - to_show);
+    }
     Ok(())
 }
 

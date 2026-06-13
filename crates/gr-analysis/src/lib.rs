@@ -29,6 +29,7 @@ pub mod entropy;
 pub mod exception;
 pub mod filler;
 pub mod fingerprint;
+pub mod floss_lite;
 pub mod format_varargs;
 pub mod got_annotate;
 pub mod hot;
