@@ -3,7 +3,7 @@ name = "gr-arch"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Architecture abstraction and disassembly for ghidra-rust"
+description = "Architecture abstraction and disassembly for RE-Argo"
 
 [features]
 default = ["x86", "arm"]

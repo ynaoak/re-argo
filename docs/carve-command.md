@@ -33,10 +33,10 @@ uninitialised holes (so ranges that touch `.bss`-like gaps don't fail).
 * `raw` (default): the bytes verbatim. The command prints the Ghidra "Raw
   Binary" import parameters — SLEIGH language id + base address — to type in.
 * `elf`: a minimal single-PT_LOAD / single-`.text` ELF placed at the original
-  VA. Ghidra and ghidra-rust both auto-detect arch + base, so the carved
+  VA. Ghidra and re-argo both auto-detect arch + base, so the carved
   function round-trips with zero manual setup:
-  `ghidra-rust carve big --start 0x... --size N -o f.elf --format elf` →
-  `ghidra-rust decompile f.elf --address 0x...`.
+  `re-argo carve big --start 0x... --size N -o f.elf --format elf` →
+  `re-argo decompile f.elf --address 0x...`.
 
 The ELF container is emitted for any source arch (even a PE source) because
 Ghidra loads ELF for every architecture; ELF is the universal carve wrapper.
@@ -53,7 +53,7 @@ Ghidra loads ELF for every architecture; ELF is the universal carve wrapper.
 ehdr | phdr[1: PT_LOAD R+X @ base] | <text data> | .shstrtab | shdr[3: NULL/.text/.shstrtab]
 ```
 
-`.text` is `SHT_PROGBITS`, `sh_addr = base` so ghidra-rust's loader (which
+`.text` is `SHT_PROGBITS`, `sh_addr = base` so re-argo's loader (which
 builds memory blocks from PROGBITS sections with `sh_addr != 0`) maps it; the
 `PT_LOAD` header feeds the address map. `e_entry = entry`, `e_type = ET_EXEC`.
 

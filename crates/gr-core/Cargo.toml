@@ -3,7 +3,7 @@ name = "gr-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core types for ghidra-rust: address model, P-code IR, data types"
+description = "Core types for RE-Argo: address model, P-code IR, data types"
 
 [dependencies]
 thiserror = { workspace = true }

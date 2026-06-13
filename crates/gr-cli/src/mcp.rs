@@ -122,7 +122,7 @@ impl Server {
             "initialize" => Ok(json!({
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
-                    "name": "ghidra-rust",
+                    "name": "re-argo",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": { "tools": {} },

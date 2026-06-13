@@ -3,7 +3,7 @@ name = "gr-emulator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "P-code emulator for ghidra-rust"
+description = "P-code emulator for RE-Argo"
 
 [dependencies]
 gr-core = { workspace = true }

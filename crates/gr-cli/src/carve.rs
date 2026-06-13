@@ -9,7 +9,7 @@
 //!   * `raw` — the bytes verbatim; the caller is told the SLEIGH language id
 //!     and base address to type into Ghidra's "Raw Binary" import dialog.
 //!   * `elf` — a minimal single-section ELF placed at the original virtual
-//!     address. Ghidra (and ghidra-rust itself) auto-detect arch + base, so the
+//!     address. Ghidra (and RE-Argo itself) auto-detect arch + base, so the
 //!     carved function round-trips with zero manual setup.
 
 use gr_core::address::Endian;

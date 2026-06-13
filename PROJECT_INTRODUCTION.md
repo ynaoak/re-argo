@@ -1,6 +1,6 @@
-# 🛡️ ghidra-rust: Ghidra Core Analysis Pipeline in Rust
+# 🛡️ RE-Argo: CLI-Native RE + Malware-Triage Toolkit
 
-`ghidra-rust` は、世界最高峰のオープンソース・リバースエンジニアリングツールである **NSA Ghidra** のコア解析エンジンを、**Rust 言語で再実装**する野心的なプロジェクトです。
+`re-argo` は、CLI ネイティブのリバースエンジニアリング＋マルウェアトリアージ・ツールキットです。出発点は **NSA Ghidra** のコア解析エンジンを Rust で再実装することでしたが、その上に独自のマルウェア家族判定（imphash / TLSH / RichHash）、能力検出（Capa）、IoC 抽出、YARA-lite、FLOSS-lite、パッカー識別、CWE 脆弱性パターン検出、ROP/JOP/COP ガジェット探索、Authenticode 署名解析などの層を積み重ね、独立した**マルウェア解析ワークベンチ**へと成長しました。GUI を持たず、CLI とライブラリと AI エージェント（MCP）から直接操作することを設計の中心に置いています。
 
 ## 🎯 プロジェクトのミッション
 
