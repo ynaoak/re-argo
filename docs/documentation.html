@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RE-Argo — Documentation</title>
+<meta name="description" content="RE-Argo の CLI コマンドリファレンス。全コマンド・フラグ・出力規約・複数コマンドのレシピ・よくある落とし穴。">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <a class="brand" href="index.html">
+    <span class="logo">RA</span> RE-Argo
+  </a>
+  <span class="spacer"></span>
+  <a class="navlink" href="index.html">Home</a>
+  <a class="navlink active hide-sm" href="documentation.html">Documentation</a>
+  <a class="btn" href="https://github.com/ynaoak/re-argo">GitHub</a>
+</nav>
+
+<div class="wrap">
+  <div class="doc-shell">
+
+    <aside class="doc-side">
+      <h4>はじめに</h4>
+      <a href="#calling">CLI の呼び出し方</a>
+      <a href="#build">ビルド / テスト</a>
+      <a href="#quickref">ゴール別クイックリファレンス</a>
+
+      <h4>コマンド: 探索 / トリアージ</h4>
+      <a href="#info">info</a>
+      <a href="#triage">triage</a>
+      <a href="#summary">summary</a>
+      <a href="#sections">sections / memmap</a>
+      <a href="#symbols">symbols / imports / strings</a>
+
+      <h4>コマンド: 解析</h4>
+      <a href="#analyze">analyze</a>
+      <a href="#functions">functions / metrics</a>
+      <a href="#coverage">coverage / bench / workflow</a>
+
+      <h4>コマンド: 所見</h4>
+      <a href="#tags">tags</a>
+      <a href="#find">find</a>
+      <a href="#signatures">signatures</a>
+
+      <h4>コマンド: コード閲覧</h4>
+      <a href="#disasm">disasm / pcode</a>
+      <a href="#decompile">decompile</a>
+      <a href="#cfg">cfg</a>
+
+      <h4>コマンド: 参照</h4>
+      <a href="#xrefs">xrefs / callgraph</a>
+      <a href="#backtrace">backtrace / callsites</a>
+
+      <h4>コマンド: トリアージ層</h4>
+      <a href="#entropy">entropy</a>
+      <a href="#capa">capa / packer</a>
+      <a href="#ioc">ioc / vuln</a>
+      <a href="#yara">yara / floss</a>
+      <a href="#rop">rop / embedded</a>
+      <a href="#tlsh">tlsh-diff</a>
+
+      <h4>コマンド: その他</h4>
+      <a href="#data">hexdump / search</a>
+      <a href="#diff">diff / semantic-diff</a>
+      <a href="#export">export</a>
+      <a href="#emulate">emulate / gdbserver</a>
+      <a href="#annotate">annotate / iterate / carve</a>
+      <a href="#mcp">script / mcp / taint</a>
+
+      <h4>リファレンス</h4>
+      <a href="#conventions">出力規約</a>
+      <a href="#gotchas">よくある落とし穴</a>
+    </aside>
+
+    <main class="doc-main">
+      <h1>Documentation</h1>
+      <p class="sub">
+        RE-Argo の CLI オペレーション・リファレンス。すべてのコマンド・フラグ・出力規約を、
+        LLM・人間どちらでも試行錯誤なしに使えるよう記述しています。これはリポジトリの
+        <a href="https://github.com/ynaoak/re-argo/blob/main/CLAUDE.md"><code>CLAUDE.md</code></a> を正として生成された HTML 版です。
+      </p>
+
+      <h2 id="calling">CLI の呼び出し方</h2>
+<pre><code><span class="code-comment"># 開発ビルド</span>
+cargo run --release -- &lt;command&gt; &lt;args&gt;
+
+<span class="code-comment"># リリースビルド後</span>
+target/release/re-argo &lt;command&gt; &lt;args&gt;</code></pre>
+      <p>
+        16 進アドレスは <code>0x401000</code> / <code>401000</code> / <code>0X401000</code> のいずれでも可。
+        グローバルフラグ <code>--thumb</code> は 32-bit ARM を Thumb モードでデコードする場合のみ使用します
+        （x86_64 / aarch64 では不要）。
+      </p>
+
+      <h2 id="build">ビルド / テスト / Lint</h2>
+<pre><code>cargo build              <span class="code-comment"># debug build</span>
+cargo build --release    <span class="code-comment"># release build</span>
+cargo test --workspace   <span class="code-comment"># 約 600 テスト</span>
+cargo clippy --workspace --all-targets -- -D warnings</code></pre>
+
+      <h2 id="quickref">ゴール別クイックリファレンス</h2>
+      <table>
+        <thead><tr><th>やりたいこと</th><th>コマンド</th></tr></thead>
+        <tbody>
+          <tr><td>このバイナリは何か（形式 / アーキ / ランタイム / libc / 言語）</td><td><code>info &lt;bin&gt;</code></td></tr>
+          <tr><td>1 画面のマルウェアトリアージレポート</td><td><code>triage &lt;bin&gt;</code></td></tr>
+          <tr><td>全体を一目で</td><td><code>summary &lt;bin&gt;</code></td></tr>
+          <tr><td>フル解析パイプラインを実行</td><td><code>analyze &lt;bin&gt;</code></td></tr>
+          <tr><td>発見した全関数を列挙</td><td><code>functions &lt;bin&gt;</code></td></tr>
+          <tr><td>名前で横断検索（関数 / シンボル / コメント / タグ）</td><td><code>find &lt;bin&gt; &lt;query&gt;</code></td></tr>
+          <tr><td>分類済み所見（crypto / suspicious / library …）</td><td><code>tags &lt;bin&gt;</code></td></tr>
+          <tr><td>アドレスで逆アセンブル</td><td><code>disasm &lt;bin&gt; --start 0x401000 -n 32</code></td></tr>
+          <tr><td>関数の疑似コード</td><td><code>decompile &lt;bin&gt; --address 0x401000</code></td></tr>
+          <tr><td>このアドレスを呼ぶのは誰か（逆コールグラフ）</td><td><code>backtrace &lt;bin&gt; 0x401000</code></td></tr>
+          <tr><td>IoC 抽出（URL / IP / レジストリキー / mutex）</td><td><code>ioc &lt;bin&gt;</code></td></tr>
+          <tr><td>このバイナリは何をするか（Capa スタイル）</td><td><code>capa &lt;bin&gt;</code></td></tr>
+          <tr><td>パックされているか / どのパッカーか</td><td><code>packer &lt;bin&gt;</code></td></tr>
+          <tr><td>難読化文字列のデコード（XOR / ROL）</td><td><code>floss &lt;bin&gt;</code></td></tr>
+          <tr><td>JSON で機械可読出力</td><td><code>export &lt;bin&gt; -o out.json</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ===================== 探索 / トリアージ ===================== -->
+      <h2 id="info">探索 / トリアージ</h2>
+
+      <h3>info <span class="badge">discovery</span></h3>
+      <p>形式・アーキテクチャ・ビット幅・エントリポイント・セクション数・シンボル数に加え、検出できればコンパイラ / ランタイムのフィンガープリント、高シグナルなトリアージ値（<code>imphash</code> / <code>packer</code> / <code>entropy_overall</code>）を表示。出力キー例: <code>Format</code>, <code>Architecture</code>, <code>language</code>, <code>runtime</code>, <code>libc_version</code>, <code>imphash</code>, <code>tlsh</code>, <code>richhash</code>, <code>signed</code>, <code>packer</code>。</p>
+
+      <h3 id="triage">triage <span class="badge">最初の一手</span></h3>
+      <p>1 画面のマルウェアトリアージレポート。フルパイプラインを実行し、形式 / アーキ / エントリ、識別子（コンパイラ / 言語 / ランタイム）、ハッシュ（imphash / tlsh）、コード署名情報、パッカー + 全体エントロピー、capa ルールマッチ（上位 10）、CWE 所見、IoC、タグ数をまとめて表示。「これは何で、心配すべきか？」を一発で。</p>
+
+      <h3 id="summary">summary</h3>
+      <p>1 画面のダイジェスト: 形式 / エントリ / ランタイム識別 / 関数数（総数・命名率・no-return・thunk）/ 注釈密度 / fan-in 上位関数 / 再帰クラスタ数 / <strong>トリアージブロック</strong>（packer, entropy, imphash, capa, CWE, IoC 数）/ <strong>kind 別タグ</strong>内訳。</p>
+
+      <h3 id="sections">sections / memmap</h3>
+      <p><code>sections</code> は <code>Name / Address / Size / Flags</code> の表。<code>memmap</code> は同じデータをアドレス順に並べ、log₂ スケールのサイズバー付きで表示。</p>
+
+      <h3 id="symbols">symbols / imports / strings</h3>
+      <p><code>symbols &lt;FILE&gt; [-k func|data|import|export] [--all] [-n SUBSTR]</code> — 既定はローダ側シンボル（高速）。ストリップ済みバイナリでは <code>--all</code> でフル解析を走らせ、RTTI / VTable / アナライザー復元名を含めます。</p>
+      <p><code>imports &lt;FILE&gt; [--exports]</code> — imports（既定）/ exports を列挙。<code>strings &lt;FILE&gt; [-m N] [--all]</code> — 印字可能文字列（既定最小長 4）。</p>
+
+      <!-- ===================== 解析 ===================== -->
+      <h2 id="analyze">解析パイプライン</h2>
+
+      <h3>analyze</h3>
+      <p>フルの <strong>68 アナライザー</strong>パイプラインを実行。多くのコマンドが内部で暗黙に実行するため、<code>analyze</code> は主に (1) 各アナライザーの寄与を stderr で確認、(2) パイプラインのみを走らせる、用途で使います。</p>
+
+      <h3 id="functions">functions / metrics</h3>
+      <p><code>functions</code> — 発見した全関数（アドレス / 名前 / ブロック数）。<code>metrics &lt;FILE&gt; [--sort COL] [--top N]</code> — 関数別の McCabe / blocks / insns / fan-in / fan-out / stack。ソット列: <code>mccabe</code>(既定) / <code>blocks</code> / <code>insns</code> / <code>fan_in</code> / <code>fan_out</code> / <code>stack</code>。</p>
+
+      <h3 id="coverage">coverage / bench / workflow</h3>
+      <p><code>coverage [--annotated]</code> — 解析がデコードした実行可能バイトの割合。<code>bench</code> — 解析のウォールクロック + ステージ別内訳。<code>workflow [--declared-only]</code> — 全アナライザーを優先度順に <code>provides → consumes</code> 付きで列挙し、最後にパイプラインを検証。</p>
+
+      <!-- ===================== 所見 ===================== -->
+      <h2 id="tags">所見 + 分類</h2>
+
+      <h3>tags <span class="badge">BN スタイル</span></h3>
+      <p><code>tags &lt;FILE&gt; [--filter KIND] [--list-types]</code> — 分類済みのアナライザー所見。<code>--list-types</code> で kind 別カウント要約。<code>--filter</code> の kind スラッグ（カノニカル）: <code>crypto</code>, <code>suspicious</code>, <code>library</code>, <code>anti_debug</code>, <code>noreturn</code>, <code>wrapper</code>, <code>important</code>, <code>loop</code>, <code>recursive</code>, <code>stack_protected</code>, <code>exception</code>, <code>bug</code>, <code>crash</code>。出力: <code>scope kind address auto text</code>。</p>
+
+      <h3 id="find">find</h3>
+      <p><code>find &lt;FILE&gt; &lt;QUERY&gt; [--limit N]</code> — 関数 / シンボル / コメント / タグを大文字小文字無視の部分一致で横断検索。1 ショットで名前を見つける最速手段。</p>
+
+      <h3 id="signatures">signatures</h3>
+      <p><code>signatures [--library LIB] [--export PATH]</code> — 組み込みシグネチャ DB（約 312 エントリ、libc / Win32 / POSIX / libstdc++）の閲覧 / エクスポート。</p>
+
+      <!-- ===================== コード閲覧 ===================== -->
+      <h2 id="disasm">コード閲覧</h2>
+
+      <h3>disasm / pcode</h3>
+      <p><code>disasm &lt;FILE&gt; [-s ADDR] [-n N]</code> — ADDR から N 命令を逆アセンブル（既定はエントリ）。<code>pcode &lt;FILE&gt; [-s ADDR] [-n N]</code> — リフト済み P-code IR を表示。</p>
+
+      <h3 id="decompile">decompile / decompile-all</h3>
+      <p><code>decompile &lt;FILE&gt; [-a ADDR] [--ssa] [--rust]</code> — 関数を疑似コードへ。<code>--ssa</code> で最適化済み SSA IR、<code>--rust</code> で Rust 風出力。インライン <code>// &lt;comment&gt;</code> 注釈とコールレンダリング置換（<code>printf("hi", 42)</code>）を含みます。<code>decompile-all [-o DIR] [--skip-errors]</code> で全関数を並列に。</p>
+
+      <h3 id="cfg">cfg</h3>
+      <p><code>cfg &lt;FILE&gt; &lt;ADDRESS&gt;</code> — 単一関数の基本ブロック CFG を Graphviz DOT で出力。<code>dot -Tpng</code> へパイプ可。</p>
+
+      <!-- ===================== 参照 ===================== -->
+      <h2 id="xrefs">参照 / 呼び出し関係</h2>
+
+      <h3>xrefs / callgraph</h3>
+      <p><code>xrefs &lt;FILE&gt; &lt;ADDRESS&gt;</code> — そのアドレスへの / からの相互参照（TYPE: CALL / JUMP / READ / WRITE …）。<code>callgraph [--dot] [--scc] [--around ADDR] [--depth N]</code> — コールグラフ。<code>--scc</code> で強連結成分（相互 / 直接再帰）。</p>
+
+      <h3 id="backtrace">backtrace / callsites</h3>
+      <p><code>backtrace &lt;FILE&gt; &lt;ADDRESS&gt; [--depth N] [--max-paths N]</code> — ADDRESS へ至る逆コールグラフの全経路（最短優先・循環検出）。既定 depth 6。<code>callsites [-t ADDR] [-n N] [--callbacks]</code> — 静的に解決した引数値つきの全コールサイト。</p>
+
+      <!-- ===================== トリアージ層 ===================== -->
+      <h2 id="entropy">能力検出 / トリアージ層</h2>
+
+      <h3>entropy</h3>
+      <p>セクション別 Shannon エントロピー（bits/byte, 0.0–8.0）。7.0 超は <code>high entropy</code>、7.5 超は <code>likely packed</code> とフラグ。パッカー疑いサンプルの第一手。</p>
+
+      <h3 id="capa">capa / packer</h3>
+      <p><code>capa [--namespace SUBSTR]</code> — Capa スタイルの能力レポート。組み込みルールが imports / strings / tags にマッチし、<code>host-interaction/file-system/read-file</code> のような namespace + 名前を返します。<code>packer</code> — DIE / PEiD スタイルのパッカー検出（UPX / ASPack / Themida / VMProtect …）。</p>
+
+      <h3 id="ioc">ioc / vuln</h3>
+      <p><code>ioc [--kind KIND]</code> — IoC 抽出。全文字列を <code>url</code> / <code>ipv4</code> / <code>ipv6</code> / <code>email</code> / <code>registry-key</code> / <code>named-pipe</code> / <code>mutex</code> / <code>win-path</code> / <code>posix-path</code> / <code>eth-addr</code> / <code>btc-addr</code> / <code>user-agent</code> / <code>domain</code> に分類。<code>vuln</code> — Cwe_checker スタイルの脆弱パターン（CWE-78 / -120 / -134 / -242 / -330 / -426 / -676）。</p>
+
+      <h3 id="yara">yara / floss</h3>
+      <p><code>yara &lt;FILE&gt; &lt;RULES.yar&gt; [--sample N]</code> — YARA-lite スキャン（テキスト / ワイルドカード hex / ブール条件 / <code>N of them</code>）。非対応構文はパース時に明示エラー。<code>floss [--min-length N] [--with-add] [--limit N]</code> — XOR / ROL / ADD 難読化文字列のブルートフォースデコード。</p>
+
+      <h3 id="rop">rop / embedded</h3>
+      <p><code>rop [--kinds rop|jop|cop|all] [--useful-only] [--contains TEXT] [--limit N]</code> — x86 / x64 の ROP / JOP / COP ガジェット探索（ROPgadget / ropper 形式）。<code>embedded [--limit N]</code> — Binwalk スタイルの埋め込みファイル走査（ELF / PE / ZIP / PNG / PDF / SQLite …）。</p>
+
+      <h3 id="tlsh">tlsh-diff</h3>
+      <p><code>tlsh-diff &lt;A&gt; &lt;B&gt;</code> — TLSH（内容ファジーハッシュ）で 2 バイナリを比較。距離 &lt; 30 で同一ファミリの可能性、&lt; 50 で関連、&gt; 100 で無関係。</p>
+
+      <!-- ===================== その他 ===================== -->
+      <h2 id="data">データ / 検索</h2>
+      <h3>hexdump / search</h3>
+      <p><code>hexdump &lt;FILE&gt; &lt;ADDRESS&gt; [LENGTH]</code> — アドレスから 16 バイト幅で hex ダンプ（既定 256 バイト）。<code>search [--hex PAT] [--text PAT] [-n N]</code> — バイト / テキスト検索。<code>--hex "48 8b ?? 24"</code> は <code>??</code> ワイルドカード、<code>--text</code> は正規表現。</p>
+
+      <h2 id="diff">Diff</h2>
+      <h3>diff / semantic-diff</h3>
+      <p><code>diff &lt;A&gt; &lt;B&gt;</code> — バイト / シンボルテーブルレベルの比較。<code>semantic-diff &lt;A&gt; &lt;B&gt; [-k KINDS]</code> — SSA / 逆コンパイル関数レベルで <code>identical</code> / <code>renamed</code> / <code>tweaked</code> / <code>modified</code> / <code>added</code> / <code>removed</code> を報告。</p>
+
+      <h2 id="export">エクスポート</h2>
+      <h3>export / export-xml</h3>
+      <p><code>export &lt;FILE&gt; [-o PATH]</code> — 解析の JSON ダンプ。<code>export-xml &lt;FILE&gt; [-o PATH]</code> — Ghidra 互換 XML。JSON のトップレベルキーは <code>name</code> / <code>format</code> / <code>arch</code> / <code>functions[]</code> / <code>symbols[]</code> / <code>references[]</code> / <code>tags{}</code> ほか。</p>
+
+      <h2 id="emulate">エミュレーション / デバッグ</h2>
+      <h3>emulate / gdbserver / debug</h3>
+      <p><code>emulate [-s ADDR] [-n STEPS] [-b ADDR …]</code> — P-code エミュレータを ADDR から最大 STEPS ステップ実行（決定的）。<code>gdbserver [-l HOST:PORT]</code> — GDB RSP サーバ（既定 <code>127.0.0.1:1234</code>、gdb-multiarch / lldb 互換）。<code>debug</code> — 対話 REPL。</p>
+
+      <h2 id="annotate">手動補正レイヤー</h2>
+      <h3>annotate / iterate / carve</h3>
+      <p><code>annotate [--rename ADDR=NAME] [--func ADDR] [--comment ADDR=TEXT] [--import FILE] [--list] [--clear]</code> — 永続オーバーライド・サイドカー <code>&lt;binary&gt;.gra.json</code> を編集し、以後の解析へ再適用。<code>iterate [--apply] [--max-rounds N]</code> — 自動補正の不動点ループ。<code>carve [--address ADDR | --start --end | --start --size] [--format elf|raw] [-o OUT]</code> — 単一関数 / VA 範囲を小さな単体ファイルへ切り出し（元の VA を維持）。GUI Ghidra が読めない巨大バイナリの一部だけを解析する用途。</p>
+      <div class="callout">
+        詳細な <code>carve</code> の設計メモは
+        <a href="https://github.com/ynaoak/re-argo/blob/main/docs/carve-command.md"><code>docs/carve-command.md</code></a> を参照。
+      </div>
+
+      <h2 id="mcp">スクリプト / 統合</h2>
+      <h3>script / mcp / taint / patch</h3>
+      <p><code>script &lt;FILE&gt; &lt;SCRIPT.grs&gt;</code> — <code>.grs</code> スクリプトから複数コマンドを実行。<code>mcp &lt;FILE&gt;</code> — Model Context Protocol を stdio で話し、AI ホスト（Claude Code 等）へ埋め込み。公開ツール: <code>list_functions</code>, <code>decompile_function</code>, <code>disassemble</code>, <code>find_xrefs</code>, <code>list_symbols</code>, <code>get_program_info</code>。<code>taint [-a ADDR] [-p N]</code> — N 個の引数レジスタをテイントし SSA 経由で危険なシンクへ伝播。<code>patch &lt;ADDR&gt; [--bytes | --asm] [-o OUT]</code> — バイナリのパッチ。</p>
+
+      <!-- ===================== リファレンス ===================== -->
+      <h2 id="conventions">出力フォーマット規約</h2>
+      <ul>
+        <li><strong>アドレス列</strong>: 小文字 16 進 + <code>0x</code> プレフィックス（<code>0x401234</code>）。狭い列ではゼロ拡張しない。</li>
+        <li><strong>関数参照</strong>: <code>name (0xADDR)</code> 形式（例 <code>printf@plt (0x401050)</code>）。シンボルなしは <code>FUN_&lt;addr&gt;</code>、PLT サンクは <code>@plt</code> サフィックス。</li>
+        <li><strong>タグの scope</strong>: <code>address</code>（命令 / データバイト）または <code>function</code>（エントリ）。組み込み kind スラッグ: <code>important</code>, <code>suspicious</code>, <code>library</code>, <code>crypto</code>, <code>bug</code>, <code>crash</code>, <code>noreturn</code>, <code>wrapper</code>, <code>recursive</code>, <code>loop</code>, <code>stack_protected</code>, <code>anti_debug</code>, <code>exception</code>。</li>
+        <li><strong>JSON (export)</strong>: 各関数は <code>{address, name, block_count, call_count, stack_size}</code>、各シンボルは <code>{address, name, kind}</code>（kind ∈ Function / ExternalFunction / Data / Label）。</li>
+      </ul>
+
+      <h2 id="gotchas">よくある落とし穴</h2>
+      <ol>
+        <li><code>&lt;ADDRESS&gt;</code> 引数は 16 進必須（<code>0x401000</code> または <code>401000</code>、<code>4198400</code> ではない）。</li>
+        <li><code>symbols</code> は既定でローダ側のみ。ストリップ済みバイナリでは <code>--all</code> を付ける。</li>
+        <li><code>cargo run</code> は毎回リビルド。<code>cargo build --release</code> 後に <code>target/release/re-argo</code> を直接呼ぶと速い（<code>.gra.json</code> サイドカー以外に永続キャッシュはなし）。</li>
+        <li><code>--thumb</code> は 32-bit ARM のみ。x86_64 / aarch64 では付けない。</li>
+        <li><code>find &lt;bin&gt; &lt;query&gt;</code> は大文字小文字無視の部分一致。名前探しの最初の一手。</li>
+        <li><code>backtrace</code> の既定 depth は 6。大きなバイナリのハブ関数では <code>--depth 12 --max-paths 1024</code> が必要なことが多い。</li>
+        <li><code>tags --filter</code> はカノニカルな kind スラッグ（<code>anti_debug</code>、<code>Anti-Debug</code> ではない）。</li>
+      </ol>
+
+    </main>
+  </div>
+</div>
+
+<footer>
+  <p>
+    RE-Argo — CLI-native reverse-engineering &amp; malware-triage toolkit ·
+    <a href="https://github.com/ynaoak/re-argo">GitHub</a> ·
+    <a href="index.html">Home</a> ·
+    Apache-2.0
+  </p>
+</footer>
+
+</body>
+</html>
