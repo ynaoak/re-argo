@@ -291,143 +291,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gr-analysis"
-version = "0.1.0"
-dependencies = [
- "cpp_demangle",
- "goblin",
- "gr-arch",
- "gr-core",
- "gr-lift",
- "gr-loader",
- "gr-program",
- "iced-x86",
- "md-5",
- "petgraph",
- "rayon",
- "rustc-demangle",
- "rustc-hash",
- "serde",
- "serde_json",
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "gr-arch"
-version = "0.1.0"
-dependencies = [
- "capstone",
- "gr-core",
- "gr-loader",
- "iced-x86",
- "quick-xml",
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "gr-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "gr-analysis",
- "gr-arch",
- "gr-core",
- "gr-decompile",
- "gr-emulator",
- "gr-lift",
- "gr-loader",
- "gr-program",
- "gr-sleigh",
- "rustc-hash",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "gr-core"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "gr-decompile"
-version = "0.1.0"
-dependencies = [
- "gr-core",
- "gr-lift",
- "gr-loader",
- "gr-program",
- "rayon",
- "rustc-hash",
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "gr-emulator"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "gr-core",
- "serde",
- "serde_json",
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "gr-lift"
-version = "0.1.0"
-dependencies = [
- "capstone",
- "gr-core",
- "gr-loader",
- "iced-x86",
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "gr-loader"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "gimli",
- "goblin",
- "gr-core",
- "memmap2",
- "object",
- "thiserror",
-]
-
-[[package]]
-name = "gr-program"
-version = "0.1.0"
-dependencies = [
- "gr-arch",
- "gr-core",
- "gr-lift",
- "gr-loader",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "gr-sleigh"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "gr-core",
- "thiserror",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -599,6 +462,143 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "reargo-analysis"
+version = "0.1.0"
+dependencies = [
+ "cpp_demangle",
+ "goblin",
+ "iced-x86",
+ "md-5",
+ "petgraph",
+ "rayon",
+ "reargo-arch",
+ "reargo-core",
+ "reargo-lift",
+ "reargo-loader",
+ "reargo-program",
+ "rustc-demangle",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-arch"
+version = "0.1.0"
+dependencies = [
+ "capstone",
+ "iced-x86",
+ "quick-xml",
+ "reargo-core",
+ "reargo-loader",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "reargo-analysis",
+ "reargo-arch",
+ "reargo-core",
+ "reargo-decompile",
+ "reargo-emulator",
+ "reargo-lift",
+ "reargo-loader",
+ "reargo-program",
+ "reargo-sleigh",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "reargo-core"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-decompile"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "reargo-core",
+ "reargo-lift",
+ "reargo-loader",
+ "reargo-program",
+ "rustc-hash",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-emulator"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "reargo-core",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-lift"
+version = "0.1.0"
+dependencies = [
+ "capstone",
+ "iced-x86",
+ "reargo-core",
+ "reargo-loader",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-loader"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "gimli",
+ "goblin",
+ "memmap2",
+ "object",
+ "reargo-core",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-program"
+version = "0.1.0"
+dependencies = [
+ "reargo-arch",
+ "reargo-core",
+ "reargo-lift",
+ "reargo-loader",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-sleigh"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "reargo-core",
+ "thiserror",
 ]
 
 [[package]]

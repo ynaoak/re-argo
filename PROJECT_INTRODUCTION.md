@@ -62,20 +62,20 @@
 
 ## 🏗️ ソフトウェア・アーキテクチャ
 
-プロジェクトは 10 個の独立したクレートで構成されており、疎結合で再利用性の高い設計となっています。内部クレートは `gr-*` の名前を保持し、公開バイナリは `re-argo` です。
+プロジェクトは 10 個の独立したクレートで構成されており、疎結合で再利用性の高い設計となっています。クレートはすべて `reargo-*` の接頭辞で統一され、公開バイナリは `re-argo` です。
 
 | クレート名 | 役割 |
 | :--- | :--- |
-| `gr-core` | アドレスモデル、P-code IR（74 オペコード）定義、基本データ型 |
-| `gr-loader` | バイナリのロード（ELF / PE / Mach-O / COFF / raw）、DWARF/PDB 解析、リロケーション、ハッシュ |
-| `gr-arch` | 6 アーキテクチャの仕様定義（.cspec / .pspec / .ldefs）、アセンブラ |
-| `gr-program` | プログラムモデル（シンボル、参照、コメント、**タグ**、コールレンダリング、undo/redo、diff、SARIF） |
-| `gr-analysis` | 68 アナライザー（関数探索、シグネチャ、VSA、CRT パターン、タグ、capa / yara / floss / packer / vuln / ioc / authenticode / TLSH / imphash / richhash / rop …） |
-| `gr-lift` | 機械語から P-code への変換 (マルチアーキ Lifter) |
-| `gr-emulator` | P-code エミュレータ、デバッガ基盤、GDB RSP |
-| `gr-decompile` | SSA 構築、6 つの最適化パス、構造化、C / Rust 疑似コード生成（注釈付き） |
-| `gr-sleigh` | SLEIGH 仕様ランタイム |
-| `gr-cli` | 統合コマンドラインインターフェース（`re-argo` バイナリ、50+ サブコマンド） |
+| `reargo-core` | アドレスモデル、P-code IR（74 オペコード）定義、基本データ型 |
+| `reargo-loader` | バイナリのロード（ELF / PE / Mach-O / COFF / raw）、DWARF/PDB 解析、リロケーション、ハッシュ |
+| `reargo-arch` | 6 アーキテクチャの仕様定義（.cspec / .pspec / .ldefs）、アセンブラ |
+| `reargo-program` | プログラムモデル（シンボル、参照、コメント、**タグ**、コールレンダリング、undo/redo、diff、SARIF） |
+| `reargo-analysis` | 68 アナライザー（関数探索、シグネチャ、VSA、CRT パターン、タグ、capa / yara / floss / packer / vuln / ioc / authenticode / TLSH / imphash / richhash / rop …） |
+| `reargo-lift` | 機械語から P-code への変換 (マルチアーキ Lifter) |
+| `reargo-emulator` | P-code エミュレータ、デバッガ基盤、GDB RSP |
+| `reargo-decompile` | SSA 構築、6 つの最適化パス、構造化、C / Rust 疑似コード生成（注釈付き） |
+| `reargo-sleigh` | SLEIGH 仕様ランタイム |
+| `reargo-cli` | 統合コマンドラインインターフェース（`re-argo` バイナリ、50+ サブコマンド） |
 
 ---
 

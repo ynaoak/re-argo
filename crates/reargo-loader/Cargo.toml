@@ -1,0 +1,15 @@
+[package]
+name = "reargo-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Binary format loaders for RE-Argo (ELF, PE, Mach-O)"
+
+[dependencies]
+reargo-core = { workspace = true }
+goblin = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+gimli = { workspace = true }
+object = { workspace = true }

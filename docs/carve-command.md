@@ -43,9 +43,9 @@ Ghidra loads ELF for every architecture; ELF is the universal carve wrapper.
 
 ## Implementation
 
-* `crates/gr-cli/src/carve.rs` — `ghidra_language_id()` (arch→SLEIGH id) and
+* `crates/reargo-cli/src/carve.rs` — `ghidra_language_id()` (arch→SLEIGH id) and
   `build_min_elf()` (32/64-bit, LE/BE ELF synthesiser).
-* `crates/gr-cli/src/main.rs` — `Carve` subcommand variant + `cmd_carve()`.
+* `crates/reargo-cli/src/main.rs` — `Carve` subcommand variant + `cmd_carve()`.
 
 ### Minimal ELF layout
 

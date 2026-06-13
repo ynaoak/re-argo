@@ -1,0 +1,16 @@
+[package]
+name = "reargo-decompile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Decompiler core: SSA, optimization, control flow structuring, C output"
+
+[dependencies]
+reargo-core = { workspace = true }
+reargo-loader = { workspace = true }
+reargo-lift = { workspace = true }
+reargo-program = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+rustc-hash = { workspace = true }
+rayon = { workspace = true }

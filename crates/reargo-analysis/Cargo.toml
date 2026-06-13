@@ -1,0 +1,25 @@
+[package]
+name = "reargo-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Analysis engine for RE-Argo: function discovery, references, call graph"
+
+[dependencies]
+reargo-core = { workspace = true }
+reargo-loader = { workspace = true }
+reargo-arch = { workspace = true }
+reargo-program = { workspace = true }
+reargo-lift = { workspace = true }
+thiserror = { workspace = true }
+petgraph = { workspace = true }
+cpp_demangle = { workspace = true }
+rustc-demangle = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+iced-x86 = { workspace = true }
+md-5 = { workspace = true }
+goblin = { workspace = true }

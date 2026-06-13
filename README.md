@@ -115,35 +115,34 @@ For the full command surface, every flag, output formats, and multi-command reci
 ## Architecture
 
 ```
-re-argo (gr-cli) ──────────────────────────────────────┐
-  ├── gr-decompile (SSA, optimisation, C/Rust output)  │
-  │     ├── gr-lift (x86 / ARM / RISC-V / ... → P-code) │
-  │     └── gr-sleigh (SLEIGH runtime)                  │
-  ├── gr-analysis (68 analyzers + triage layer)         │
-  │     └── gr-program (Program model + Tags)           │
-  ├── gr-arch (6 architectures, .cspec / .pspec)        │
-  ├── gr-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)  │
-  ├── gr-emulator (P-code emulation, debugger, GDB RSP) │
-  └── gr-core (addresses, P-code IR, data types)        │
-─────────────────────────────────────────────────────────┘
+re-argo (reargo-cli)
+  ├── reargo-decompile (SSA, optimisation, C/Rust output)
+  │     ├── reargo-lift (x86 / ARM / RISC-V / ... → P-code)
+  │     └── reargo-sleigh (SLEIGH runtime)
+  ├── reargo-analysis (68 analyzers + triage layer)
+  │     └── reargo-program (Program model + Tags)
+  ├── reargo-arch (6 architectures, .cspec / .pspec)
+  ├── reargo-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)
+  ├── reargo-emulator (P-code emulation, debugger, GDB RSP)
+  └── reargo-core (addresses, P-code IR, data types)
 ```
 
 ## Crates
 
-The internal Rust crates keep their `gr-*` names (they don't appear in `cargo install` or the CLI surface, and renaming would churn the dependency graph for no user benefit). The published binary is `re-argo`.
+All Rust crates share the `reargo-*` prefix; the published CLI binary is `re-argo`. The crates aren't exposed via `cargo install` or the CLI surface — only the `re-argo` binary is.
 
 | Crate | Purpose |
 |-------|---------|
-| `gr-core` | Address model, P-code IR (74 ops), data types |
-| `gr-loader` | ELF / PE / Mach-O / COFF, DWARF, PDB, FLIRT, relocations, MD5 / FNV / CRC32 hashing |
-| `gr-arch` | 6 architectures, .cspec / .pspec / .ldefs parsers, assembler |
-| `gr-program` | Program model, symbols, references, comments, **tags**, **call_renderings**, undo / redo, diff, SARIF, metadata |
-| `gr-analysis` | 68 analyzers — function discovery, signatures, VSA, CRT patterns, tags, capa / yara / floss / packer / vuln / ioc / authenticode / TLSH / imphash / richhash / rop, … |
-| `gr-lift` | Multi-arch → P-code lifter |
-| `gr-emulator` | P-code emulator, debugger, GDB RSP |
-| `gr-decompile` | SSA, optimisation, structuring, C / Rust output with annotations |
-| `gr-sleigh` | SLEIGH specification runtime |
-| `gr-cli` | The `re-argo` CLI binary (50+ subcommands) |
+| `reargo-core` | Address model, P-code IR (74 ops), data types |
+| `reargo-loader` | ELF / PE / Mach-O / COFF, DWARF, PDB, FLIRT, relocations, MD5 / FNV / CRC32 hashing |
+| `reargo-arch` | 6 architectures, .cspec / .pspec / .ldefs parsers, assembler |
+| `reargo-program` | Program model, symbols, references, comments, **tags**, **call_renderings**, undo / redo, diff, SARIF, metadata |
+| `reargo-analysis` | 68 analyzers — function discovery, signatures, VSA, CRT patterns, tags, capa / yara / floss / packer / vuln / ioc / authenticode / TLSH / imphash / richhash / rop, … |
+| `reargo-lift` | Multi-arch → P-code lifter |
+| `reargo-emulator` | P-code emulator, debugger, GDB RSP |
+| `reargo-decompile` | SSA, optimisation, structuring, C / Rust output with annotations |
+| `reargo-sleigh` | SLEIGH specification runtime |
+| `reargo-cli` | The `re-argo` CLI binary (50+ subcommands) |
 
 ## Building
 

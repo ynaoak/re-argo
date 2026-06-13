@@ -1,0 +1,11 @@
+[package]
+name = "reargo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types for RE-Argo: address model, P-code IR, data types"
+
+[dependencies]
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+bitflags = { workspace = true }
