@@ -8,13 +8,15 @@ Originally started as a Rust reimplementation of [NSA Ghidra](https://github.com
 
 > **For AI agents and operators**: see [CLAUDE.md](CLAUDE.md) for the complete CLI-operations reference (every command, every flag, output conventions, multi-command recipes, common gotchas). This README is the human-readable overview.
 
+> **Website**: a static landing page + HTML documentation live under [`docs/`](docs/index.html) (GitHub Pages-ready — point Pages at the `docs/` folder of `main`).
+
 ## Features
 
 ### Analysis core (Ghidra-style)
 
 - **6 architectures**: x86 / x64, ARM / AArch64, RISC-V, MIPS, PowerPC, SPARC
 - **Full P-code IR**: 74 opcodes with emulation support
-- **70+ analyzers** in priority order: function discovery (recursive descent + linear sweep), 312-entry signature DB (libc / POSIX / Win32 / libstdc++), CRT pattern recognition, VSA + multi-block constant tracker, RTTI / VTable recovery, calling-convention inference, anti-debug / crypto / loop / exception / wrapper / no-return propagation, BN-style tag categorisation, hot-function detection, dead-code, callgraph SCC, complexity metrics
+- **68 analyzers** in priority order: function discovery (recursive descent + linear sweep), 312-entry signature DB (libc / POSIX / Win32 / libstdc++), CRT pattern recognition, VSA + multi-block constant tracker, RTTI / VTable recovery, calling-convention inference, anti-debug / crypto / loop / exception / wrapper / no-return propagation, BN-style tag categorisation, hot-function detection, dead-code, callgraph SCC, complexity metrics
 - **Decompiler**: SSA construction, 6 optimisation passes, type inference, C / Rust pseudocode output with **inline analyzer comments + signature-aware call rendering** (`printf("hi %d", 42)` instead of `printf@plt()`)
 - **Debug info**: DWARF (functions, types, parameters, line numbers, source-file plates), PDB headers / types
 - **SLEIGH runtime**: packed format reader, decision trees, context database, zlib decompression
@@ -117,7 +119,7 @@ re-argo (gr-cli) ─────────────────────
   ├── gr-decompile (SSA, optimisation, C/Rust output)  │
   │     ├── gr-lift (x86 / ARM / RISC-V / ... → P-code) │
   │     └── gr-sleigh (SLEIGH runtime)                  │
-  ├── gr-analysis (70+ analyzers + triage layer)        │
+  ├── gr-analysis (68 analyzers + triage layer)         │
   │     └── gr-program (Program model + Tags)           │
   ├── gr-arch (6 architectures, .cspec / .pspec)        │
   ├── gr-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)  │
@@ -136,7 +138,7 @@ The internal Rust crates keep their `gr-*` names (they don't appear in `cargo in
 | `gr-loader` | ELF / PE / Mach-O / COFF, DWARF, PDB, FLIRT, relocations, MD5 / FNV / CRC32 hashing |
 | `gr-arch` | 6 architectures, .cspec / .pspec / .ldefs parsers, assembler |
 | `gr-program` | Program model, symbols, references, comments, **tags**, **call_renderings**, undo / redo, diff, SARIF, metadata |
-| `gr-analysis` | 70+ analyzers — function discovery, signatures, VSA, CRT patterns, tags, capa / yara / floss / packer / vuln / ioc / authenticode / TLSH / imphash / richhash / rop, … |
+| `gr-analysis` | 68 analyzers — function discovery, signatures, VSA, CRT patterns, tags, capa / yara / floss / packer / vuln / ioc / authenticode / TLSH / imphash / richhash / rop, … |
 | `gr-lift` | Multi-arch → P-code lifter |
 | `gr-emulator` | P-code emulator, debugger, GDB RSP |
 | `gr-decompile` | SSA, optimisation, structuring, C / Rust output with annotations |

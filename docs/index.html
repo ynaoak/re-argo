@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RE-Argo — CLI-native reverse-engineering &amp; malware-triage toolkit</title>
+<meta name="description" content="RE-Argo は Rust 製の CLI ネイティブなリバースエンジニアリング＋マルウェアトリアージ・ツールキット。Ghidra 相当のマルチアーキテクチャ解析パイプライン上に、バイナリクラスタリング・能力検出・IoC 抽出層を備えます。">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <a class="brand" href="index.html">
+    <span class="logo">RA</span> RE-Argo
+  </a>
+  <span class="spacer"></span>
+  <a class="navlink active hide-sm" href="index.html">Home</a>
+  <a class="navlink" href="documentation.html">Documentation</a>
+  <a class="btn" href="https://github.com/ynaoak/re-argo">GitHub</a>
+</nav>
+
+<header class="hero">
+  <span class="eyebrow">Rust · CLI-first · AI-agent-first</span>
+  <h1>不明なバイナリへ漕ぎ出す<br><span class="grad">RE-Argo</span></h1>
+  <p class="lead">
+    CLI ネイティブのリバースエンジニアリング＋マルウェアトリアージ・ツールキット。
+    Ghidra 相当のマルチアーキテクチャ解析パイプラインの上に、
+    バイナリクラスタリング・能力検出・IoC 抽出の層を積み重ねた、Rust 製の解析ワークベンチです。
+  </p>
+  <div class="cta">
+    <a class="btn primary" href="documentation.html">ドキュメントを読む →</a>
+    <a class="btn" href="https://github.com/ynaoak/re-argo">GitHub で見る</a>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="stats">
+    <div class="stat"><div class="num">6</div><div class="label">アーキテクチャ</div></div>
+    <div class="stat"><div class="num">68</div><div class="label">アナライザー</div></div>
+    <div class="stat"><div class="num">50+</div><div class="label">CLI コマンド</div></div>
+    <div class="stat"><div class="num">600+</div><div class="label">テスト</div></div>
+  </div>
+</div>
+
+<div class="wrap">
+  <section class="block" id="what">
+    <h2>RE-Argo とは</h2>
+    <p class="sub">
+      出発点は <a href="https://github.com/NationalSecurityAgency/ghidra">NSA Ghidra</a> の解析パイプラインを
+      Rust で再実装することでした。そこから、マルウェア家族判定・能力検出・IoC 抽出の層を積み重ね、
+      独立した <strong>RE + トリアージ・ワークベンチ</strong> へと成長しています。GUI は持たず、
+      CLI とライブラリ、そして AI エージェント（MCP）から直接操作する設計です。
+    </p>
+    <div class="callout">
+      🚢 <strong>Argo</strong> は未知の海へ漕ぎ出した神話の船。RE-Argo は、未知のバイナリへ持ち込む計器です。<strong>RE</strong> = Reverse Engineering。
+    </div>
+  </section>
+
+  <section class="block" id="core">
+    <h2>解析コア（Ghidra スタイル）</h2>
+    <p class="sub">マルチアーキテクチャのリフティングと逆コンパイルを支える基盤。</p>
+    <div class="grid cols-3">
+      <div class="card">
+        <div class="icon">🧩</div>
+        <h3>6 アーキテクチャ</h3>
+        <p>x86 / x64・ARM / AArch64・RISC-V・MIPS・PowerPC・SPARC。命令は 74 オペコードの P-code IR にリフトされ、フルエミュレーション対応。</p>
+      </div>
+      <div class="card">
+        <div class="icon">⚙️</div>
+        <h3>68 アナライザー</h3>
+        <p>関数探索（再帰下降＋リニアスイープ）、312 エントリのシグネチャ DB、VSA、RTTI / VTable 復元、呼び出し規約推定、anti-debug / crypto / loop 検出などを優先度順に実行。</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔬</div>
+        <h3>逆コンパイラ</h3>
+        <p>SSA 構築・6 つの最適化パス・型推論。C / Rust 疑似コードを出力し、インライン注釈とシグネチャ対応のコールレンダリング付き。</p>
+      </div>
+      <div class="card">
+        <div class="icon">📐</div>
+        <h3>デバッグ情報</h3>
+        <p>DWARF（関数 / 型 / 引数 / 行番号 / ソースプレート）、PDB ヘッダー / 型。SLEIGH ランタイムも内蔵。</p>
+      </div>
+      <div class="card">
+        <div class="icon">📦</div>
+        <h3>バイナリ形式</h3>
+        <p>ELF・PE（.pdata / TLS コールバック / IAT / Rich Header）・Mach-O（ObjC クラス / メソッド / ivar）・COFF・raw。</p>
+      </div>
+      <div class="card">
+        <div class="icon">🐞</div>
+        <h3>デバッガ基盤</h3>
+        <p>GDB RSP プロトコル（クライアント＋サーバ）、ブレークポイント、ウォッチポイント、syscall エミュレーション、スナップショット。MCP 統合も。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="triage">
+    <h2>マルウェアトリアージ層</h2>
+    <p class="sub">RE-Argo を際立たせる、解析コアの上に載る独自レイヤー。</p>
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="icon tag-accent">🩺</div>
+        <h3>ワンスクリーン・トリアージ</h3>
+        <p><code>triage</code> がフルパイプラインを実行し、形式 / アーキ / 識別子 / ハッシュ / パッカー / capa / CWE / IoC / タグ数を 1 枚のレポートに集約します。</p>
+      </div>
+      <div class="card">
+        <div class="icon tag-accent">🧬</div>
+        <h3>家族クラスタリング</h3>
+        <p>imphash、TLSH（内容ファジー）、RichHash（MSVC ツールチェイン）を <code>info</code> / <code>triage</code> で提示。<code>tlsh-diff</code> で類似度比較。</p>
+      </div>
+      <div class="card">
+        <div class="icon tag-accent">🎯</div>
+        <h3>能力検出 &amp; YARA-lite</h3>
+        <p>Capa スタイルの 20 ルールエンジンと、YARA のストリクトサブセット（テキスト＋ワイルドカード hex、ブール条件、<code>N of them</code>）。</p>
+      </div>
+      <div class="card">
+        <div class="icon tag-accent">🔓</div>
+        <h3>FLOSS-lite &amp; パッカー識別</h3>
+        <p>XOR / ROL / ADD の難読化文字列デコーダと、DIE / PEiD スタイルの UPX / ASPack / Themida / VMProtect ほかの識別。</p>
+      </div>
+      <div class="card">
+        <div class="icon tag-accent">🌐</div>
+        <h3>IoC 抽出</h3>
+        <p>URL / IPv4 / IPv6 / email / レジストリキー / named-pipe / mutex / パス / ETH / BTC / user-agent / ドメインの 13 種分類。</p>
+      </div>
+      <div class="card">
+        <div class="icon tag-warn">⚠️</div>
+        <h3>CWE 脆弱性パターン</h3>
+        <p>危険な API 呼び出しに CWE id（78 / 120 / 134 / 242 / 330 / 426 / 676）を付与。ROP / JOP / COP ガジェット探索、埋め込みファイル検出も。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="quickstart">
+    <h2>クイックスタート</h2>
+    <p class="sub">ビルドして、未知のサンプルにまず <code>triage</code> を当てる。</p>
+<pre><code><span class="code-comment"># ビルド（バイナリは target/release/re-argo に生成）</span>
+<span class="code-cmd">cargo</span> build --release
+
+<span class="code-comment"># ワンスクリーンのマルウェアトリアージ — 最初に打つ一手</span>
+target/release/re-argo <span class="code-arg">triage</span> &lt;binary&gt;
+
+<span class="code-comment"># 名前 / シンボル / コメント / タグを横断検索</span>
+target/release/re-argo <span class="code-arg">find</span> &lt;binary&gt; "printf"
+
+<span class="code-comment"># アドレス指定で逆コンパイル</span>
+target/release/re-argo <span class="code-arg">decompile</span> &lt;binary&gt; --address 0x401000
+
+<span class="code-comment"># IoC（URL / IP / レジストリキー / …）抽出</span>
+target/release/re-argo <span class="code-arg">ioc</span> &lt;binary&gt;
+
+<span class="code-comment"># Capa スタイルの能力レポート</span>
+target/release/re-argo <span class="code-arg">capa</span> &lt;binary&gt;</code></pre>
+    <p style="margin-top:1rem;">
+      全コマンド・全フラグ・出力形式・複数コマンドのレシピは
+      <a href="documentation.html">ドキュメントページ</a>を参照してください。
+    </p>
+  </section>
+
+  <section class="block arch" id="architecture">
+    <h2>アーキテクチャ</h2>
+    <p class="sub">疎結合な 10 個の Rust クレートで構成。内部クレートは <code>gr-*</code> 名、公開バイナリは <code>re-argo</code>。</p>
+<pre><code>re-argo (gr-cli) ──────────────────────────────────────┐
+  ├── gr-decompile (SSA, 最適化, C/Rust 出力)          │
+  │     ├── gr-lift (x86 / ARM / RISC-V / ... → P-code) │
+  │     └── gr-sleigh (SLEIGH ランタイム)               │
+  ├── gr-analysis (68 アナライザー + トリアージ層)      │
+  │     └── gr-program (プログラムモデル + タグ)        │
+  ├── gr-arch (6 アーキテクチャ, .cspec / .pspec)       │
+  ├── gr-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)  │
+  ├── gr-emulator (P-code エミュレーション, GDB RSP)    │
+  └── gr-core (アドレス, P-code IR, データ型)           │
+─────────────────────────────────────────────────────────┘</code></pre>
+  </section>
+</div>
+
+<footer>
+  <p>
+    RE-Argo — CLI-native reverse-engineering &amp; malware-triage toolkit ·
+    <a href="https://github.com/ynaoak/re-argo">GitHub</a> ·
+    <a href="documentation.html">Documentation</a> ·
+    Apache-2.0
+  </p>
+</footer>
+
+</body>
+</html>
