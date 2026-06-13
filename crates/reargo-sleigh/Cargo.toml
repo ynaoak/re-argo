@@ -1,0 +1,11 @@
+[package]
+name = "reargo-sleigh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SLEIGH specification runtime for RE-Argo"
+
+[dependencies]
+reargo-core = { workspace = true }
+thiserror = { workspace = true }
+flate2 = { workspace = true }

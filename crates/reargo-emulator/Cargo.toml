@@ -1,0 +1,14 @@
+[package]
+name = "reargo-emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P-code emulator for RE-Argo"
+
+[dependencies]
+reargo-core = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+bitflags = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

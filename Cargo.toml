@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/gr-core",
-    "crates/gr-loader",
-    "crates/gr-arch",
-    "crates/gr-program",
-    "crates/gr-analysis",
-    "crates/gr-lift",
-    "crates/gr-emulator",
-    "crates/gr-decompile",
-    "crates/gr-sleigh",
-    "crates/gr-cli",
+    "crates/reargo-core",
+    "crates/reargo-loader",
+    "crates/reargo-arch",
+    "crates/reargo-program",
+    "crates/reargo-analysis",
+    "crates/reargo-lift",
+    "crates/reargo-emulator",
+    "crates/reargo-decompile",
+    "crates/reargo-sleigh",
+    "crates/reargo-cli",
 ]
 
 [workspace.package]
@@ -20,15 +20,15 @@ license = "Apache-2.0"
 repository = "https://github.com/ynaoak/re-argo"
 
 [workspace.dependencies]
-gr-core = { path = "crates/gr-core" }
-gr-loader = { path = "crates/gr-loader" }
-gr-arch = { path = "crates/gr-arch" }
-gr-program = { path = "crates/gr-program" }
-gr-analysis = { path = "crates/gr-analysis" }
-gr-lift = { path = "crates/gr-lift" }
-gr-emulator = { path = "crates/gr-emulator" }
-gr-decompile = { path = "crates/gr-decompile" }
-gr-sleigh = { path = "crates/gr-sleigh" }
+reargo-core = { path = "crates/reargo-core" }
+reargo-loader = { path = "crates/reargo-loader" }
+reargo-arch = { path = "crates/reargo-arch" }
+reargo-program = { path = "crates/reargo-program" }
+reargo-analysis = { path = "crates/reargo-analysis" }
+reargo-lift = { path = "crates/reargo-lift" }
+reargo-emulator = { path = "crates/reargo-emulator" }
+reargo-decompile = { path = "crates/reargo-decompile" }
+reargo-sleigh = { path = "crates/reargo-sleigh" }
 goblin = "0.9"
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }

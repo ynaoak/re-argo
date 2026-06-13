@@ -158,18 +158,17 @@ target/release/re-argo <span class="code-arg">capa</span> &lt;binary&gt;</code><
 
   <section class="block arch" id="architecture">
     <h2>アーキテクチャ</h2>
-    <p class="sub">疎結合な 10 個の Rust クレートで構成。内部クレートは <code>gr-*</code> 名、公開バイナリは <code>re-argo</code>。</p>
-<pre><code>re-argo (gr-cli) ──────────────────────────────────────┐
-  ├── gr-decompile (SSA, 最適化, C/Rust 出力)          │
-  │     ├── gr-lift (x86 / ARM / RISC-V / ... → P-code) │
-  │     └── gr-sleigh (SLEIGH ランタイム)               │
-  ├── gr-analysis (68 アナライザー + トリアージ層)      │
-  │     └── gr-program (プログラムモデル + タグ)        │
-  ├── gr-arch (6 アーキテクチャ, .cspec / .pspec)       │
-  ├── gr-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)  │
-  ├── gr-emulator (P-code エミュレーション, GDB RSP)    │
-  └── gr-core (アドレス, P-code IR, データ型)           │
-─────────────────────────────────────────────────────────┘</code></pre>
+    <p class="sub">疎結合な 10 個の Rust クレートで構成。クレートは <code>reargo-*</code> 接頭辞、公開バイナリは <code>re-argo</code>。</p>
+<pre><code>re-argo (reargo-cli)
+  ├── reargo-decompile (SSA, 最適化, C/Rust 出力)
+  │     ├── reargo-lift (x86 / ARM / RISC-V / ... → P-code)
+  │     └── reargo-sleigh (SLEIGH ランタイム)
+  ├── reargo-analysis (68 アナライザー + トリアージ層)
+  │     └── reargo-program (プログラムモデル + タグ)
+  ├── reargo-arch (6 アーキテクチャ, .cspec / .pspec)
+  ├── reargo-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)
+  ├── reargo-emulator (P-code エミュレーション, GDB RSP)
+  └── reargo-core (アドレス, P-code IR, データ型)</code></pre>
   </section>
 </div>
 

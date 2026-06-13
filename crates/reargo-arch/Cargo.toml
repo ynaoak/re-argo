@@ -1,0 +1,20 @@
+[package]
+name = "reargo-arch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Architecture abstraction and disassembly for RE-Argo"
+
+[features]
+default = ["x86", "arm"]
+x86 = ["dep:iced-x86"]
+arm = ["dep:capstone"]
+
+[dependencies]
+reargo-core = { workspace = true }
+reargo-loader = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+iced-x86 = { workspace = true, optional = true }
+capstone = { workspace = true, optional = true }
+quick-xml = { workspace = true }

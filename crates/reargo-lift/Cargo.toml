@@ -1,0 +1,14 @@
+[package]
+name = "reargo-lift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P-code lifting: translate machine instructions to P-code IR"
+
+[dependencies]
+reargo-core = { workspace = true }
+reargo-loader = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+iced-x86 = { workspace = true }
+capstone = { workspace = true }
