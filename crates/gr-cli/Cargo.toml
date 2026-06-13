@@ -3,10 +3,10 @@ name = "gr-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI binary analysis tool powered by ghidra-rust"
+description = "CLI binary analysis + malware-triage tool — RE-Argo"
 
 [[bin]]
-name = "ghidra-rust"
+name = "re-argo"
 path = "src/main.rs"
 
 [dependencies]

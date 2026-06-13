@@ -3,7 +3,7 @@ name = "gr-analysis"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Analysis engine for ghidra-rust: function discovery, references, call graph"
+description = "Analysis engine for RE-Argo: function discovery, references, call graph"
 
 [dependencies]
 gr-core = { workspace = true }

@@ -83,7 +83,7 @@ pub fn generate_sarif(program: &Program) -> SarifReport {
         runs: vec![SarifRun {
             tool: SarifTool {
                 driver: SarifDriver {
-                    name: "ghidra-rust".into(),
+                    name: "re-argo".into(),
                     version: env!("CARGO_PKG_VERSION").into(),
                 },
             },

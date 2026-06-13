@@ -1,64 +1,99 @@
-# ghidra-rust
+# RE-Argo
 
-A Rust reimplementation of [NSA Ghidra](https://github.com/NationalSecurityAgency/ghidra)'s core binary analysis pipeline. CLI-first, library-first — no GUI.
+**CLI-native reverse-engineering + malware-triage toolkit, written in Rust.**
+
+Originally started as a Rust reimplementation of [NSA Ghidra](https://github.com/NationalSecurityAgency/ghidra)'s analysis pipeline; has since grown into a focused **RE + triage** workbench with a binary-clustering / capability-detection / IoC-extraction layer on top of multi-arch lifting and decompilation. No GUI — CLI first, library first, AI-agent first.
+
+> The name **Argo** echoes the mythological ship that sailed into uncharted waters: RE-Argo is the instrument you take into an unknown binary. **RE** = Reverse Engineering.
 
 > **For AI agents and operators**: see [CLAUDE.md](CLAUDE.md) for the complete CLI-operations reference (every command, every flag, output conventions, multi-command recipes, common gotchas). This README is the human-readable overview.
 
 ## Features
 
-- **~20,000+ lines** of Rust across 10 crates
-- **600+ tests**, clippy clean across `--all-targets -- -D warnings`
+### Analysis core (Ghidra-style)
+
 - **6 architectures**: x86 / x64, ARM / AArch64, RISC-V, MIPS, PowerPC, SPARC
-- **68 analyzers** in the AnalysisManager pipeline: function discovery (recursive descent + linear sweep), 312-entry signature DB (libc / POSIX / Win32 / libstdc++), CRT pattern recognition, VSA + multi-block constant tracker, RTTI / VTable recovery, calling-convention inference, anti-debug / crypto / loop / exception / wrapper / no-return propagation, BN-style tag categorisation, hot-function detection, dead-code, callgraph SCC, complexity metrics
 - **Full P-code IR**: 74 opcodes with emulation support
+- **70+ analyzers** in priority order: function discovery (recursive descent + linear sweep), 312-entry signature DB (libc / POSIX / Win32 / libstdc++), CRT pattern recognition, VSA + multi-block constant tracker, RTTI / VTable recovery, calling-convention inference, anti-debug / crypto / loop / exception / wrapper / no-return propagation, BN-style tag categorisation, hot-function detection, dead-code, callgraph SCC, complexity metrics
 - **Decompiler**: SSA construction, 6 optimisation passes, type inference, C / Rust pseudocode output with **inline analyzer comments + signature-aware call rendering** (`printf("hi %d", 42)` instead of `printf@plt()`)
 - **Debug info**: DWARF (functions, types, parameters, line numbers, source-file plates), PDB headers / types
 - **SLEIGH runtime**: packed format reader, decision trees, context database, zlib decompression
-- **Binary formats**: ELF, PE (with `.pdata` / TLS callbacks / IAT / `.rsrc` VS_VERSIONINFO), Mach-O (with ObjC classes / methods / ivars / protocols), COFF, raw binary
+- **Binary formats**: ELF, PE (with `.pdata` / TLS callbacks / IAT / `.rsrc` VS_VERSIONINFO / Rich Header), Mach-O (with ObjC classes / methods / ivars / protocols), COFF, raw binary
 - **Debugger foundation**: GDB RSP protocol (client + server), breakpoints, watchpoints, syscall emulation, state snapshots
-- **MCP integration**: speak Model Context Protocol over stdio to embed ghidra-rust into AI hosts (Claude Code, etc.)
+- **MCP integration**: Model Context Protocol over stdio for AI hosts (Claude Code, etc.)
+
+### Malware-triage layer (RE-Argo's distinctive surface)
+
+- **One-screen triage**: `triage` runs the full pipeline and prints format / arch / identity / hashes / packer / capa / CWE / IoCs / tag counts in a single digestible report
+- **Family clustering**: imphash, TLSH (content-fuzzy), RichHash (MSVC toolchain), all surfaced in `info` / `triage`
+- **Capability detection**: 20-rule Capa-style engine matching against imports / strings / tags
+- **YARA-lite**: parse and match a strict subset of YARA rules (text + hex with wildcards, boolean conditions, `N of them` quantifiers)
+- **FLOSS-lite**: brute-force XOR / ROL / ADD obfuscated-string decoder
+- **IoC extraction**: 13-kind classifier (URL / IPv4 / IPv6 / email / registry-key / named-pipe / mutex / posix-path / win-path / ETH / BTC / user-agent / domain)
+- **Packer ID**: DIE / PEiD-style signatures for UPX / ASPack / Themida / VMProtect / MEW / FSG / PECompact / NSPack / Mpress / Yoda / …
+- **CWE-aware vuln patterns**: tags functions calling dangerous APIs (CWE-78 / -120 / -134 / -242 / -330 / -426 / -676)
+- **Section anomalies**: RWX / writable-code / packer-shaped layout detection
+- **Authenticode**: PE code-signing presence + heuristic CN= / O= subject extraction
+- **Entropy**: per-section Shannon entropy + packer threshold flagging
+- **ROP / JOP / COP gadgets**: x86 / x64 gadget finder with ROPgadget-style output
+- **Embedded files**: Binwalk-lite scan for ELF / PE / Mach-O / ZIP / GZIP / 7z / PNG / JPEG / PDF / SQLite resources
 
 ## Quick Start
 
 ```bash
-# Build
+# Build (binary lands at target/release/re-argo)
 cargo build --release
 
-# Triage a binary
-target/release/ghidra-rust info <binary>
-target/release/ghidra-rust summary <binary>
+# One-screen malware-triage
+target/release/re-argo triage <binary>
+
+# Triage a binary the long way
+target/release/re-argo info <binary>
+target/release/re-argo summary <binary>
 
 # Browse discovered functions
-target/release/ghidra-rust functions <binary>
-target/release/ghidra-rust metrics <binary> --top 25
+target/release/re-argo functions <binary>
+target/release/re-argo metrics <binary> --top 25
 
 # Cross-search by name / symbol / comment / tag
-target/release/ghidra-rust find <binary> "printf"
+target/release/re-argo find <binary> "printf"
 
 # Disassemble
-target/release/ghidra-rust disasm <binary> -n 50
+target/release/re-argo disasm <binary> -n 50
 
 # Decompile
-target/release/ghidra-rust decompile <binary> --address 0x401000
+target/release/re-argo decompile <binary> --address 0x401000
 
 # Reverse callgraph — who calls into this address?
-target/release/ghidra-rust backtrace <binary> 0x401000
+target/release/re-argo backtrace <binary> 0x401000
 
 # Categorised findings (crypto / suspicious / library / …)
-target/release/ghidra-rust tags <binary> --list-types
+target/release/re-argo tags <binary> --list-types
+
+# Capa-style capabilities
+target/release/re-argo capa <binary>
+
+# Extract IoCs (URLs / IPs / registry keys / …)
+target/release/re-argo ioc <binary>
+
+# Scan with a YARA-lite ruleset
+target/release/re-argo yara <binary> rules.yar
+
+# Compare two binaries by TLSH content-fuzzy hash
+target/release/re-argo tlsh-diff <a> <b>
 
 # Memory map
-target/release/ghidra-rust memmap <binary>
+target/release/re-argo memmap <binary>
 
 # Export everything to JSON
-target/release/ghidra-rust export <binary> -o out.json
+target/release/re-argo export <binary> -o out.json
 ```
 
 For the full command surface, every flag, output formats, and multi-command recipes, see [CLAUDE.md](CLAUDE.md).
 
 ## CLI Commands (overview)
 
-40+ subcommands organised into eight groups:
+50+ subcommands across the following groups:
 
 | Group | Commands |
 |---|---|
@@ -72,17 +107,17 @@ For the full command surface, every flag, output formats, and multi-command reci
 | Export | `export`, `export-xml` |
 | Emulation | `emulate`, `gdbserver`, `debug` |
 | Capability | `entropy`, `rop` (ROP/JOP/COP), `capa`, `packer`, `embedded`, `vuln`, `ioc`, `yara`, `tlsh-diff`, `floss` |
-| Manual correction | `annotate`, `iterate` |
+| Manual correction | `annotate`, `iterate`, `carve` |
 | Integration | `script`, `mcp`, `patch`, `taint`, `registers` |
 
 ## Architecture
 
 ```
-gr-cli ────────────────────────────────────────────────┐
+re-argo (gr-cli) ──────────────────────────────────────┐
   ├── gr-decompile (SSA, optimisation, C/Rust output)  │
   │     ├── gr-lift (x86 / ARM / RISC-V / ... → P-code) │
   │     └── gr-sleigh (SLEIGH runtime)                  │
-  ├── gr-analysis (68 analyzers)                        │
+  ├── gr-analysis (70+ analyzers + triage layer)        │
   │     └── gr-program (Program model + Tags)           │
   ├── gr-arch (6 architectures, .cspec / .pspec)        │
   ├── gr-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)  │
@@ -93,31 +128,33 @@ gr-cli ────────────────────────�
 
 ## Crates
 
+The internal Rust crates keep their `gr-*` names (they don't appear in `cargo install` or the CLI surface, and renaming would churn the dependency graph for no user benefit). The published binary is `re-argo`.
+
 | Crate | Purpose |
 |-------|---------|
 | `gr-core` | Address model, P-code IR (74 ops), data types |
-| `gr-loader` | ELF / PE / Mach-O / COFF, DWARF, PDB, FLIRT, relocations |
+| `gr-loader` | ELF / PE / Mach-O / COFF, DWARF, PDB, FLIRT, relocations, MD5 / FNV / CRC32 hashing |
 | `gr-arch` | 6 architectures, .cspec / .pspec / .ldefs parsers, assembler |
 | `gr-program` | Program model, symbols, references, comments, **tags**, **call_renderings**, undo / redo, diff, SARIF, metadata |
-| `gr-analysis` | 68 analyzers (function discovery, signatures, VSA, CRT patterns, tags, …) |
+| `gr-analysis` | 70+ analyzers — function discovery, signatures, VSA, CRT patterns, tags, capa / yara / floss / packer / vuln / ioc / authenticode / TLSH / imphash / richhash / rop, … |
 | `gr-lift` | Multi-arch → P-code lifter |
 | `gr-emulator` | P-code emulator, debugger, GDB RSP |
 | `gr-decompile` | SSA, optimisation, structuring, C / Rust output with annotations |
 | `gr-sleigh` | SLEIGH specification runtime |
-| `gr-cli` | 40+ CLI subcommands |
+| `gr-cli` | The `re-argo` CLI binary (50+ subcommands) |
 
 ## Building
 
 ```bash
 cargo build              # debug
-cargo build --release    # release
+cargo build --release    # release; binary at target/release/re-argo
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-## Ghidra Reference
+## Ghidra reference
 
-The `ghidra/` git submodule contains the original NSA Ghidra source for reference.
+The `ghidra/` git submodule contains the original NSA Ghidra source for cross-reference during analyzer development.
 
 ## License
 

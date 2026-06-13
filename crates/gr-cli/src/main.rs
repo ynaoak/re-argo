@@ -20,7 +20,7 @@ use gr_loader::{BinaryLoader, Memory, SectionFlags, SymbolKind};
 use gr_program::{Program, ProgramDiff, ProjectSummary};
 
 #[derive(Parser)]
-#[command(name = "ghidra-rust", version, about = "Binary analysis tool powered by ghidra-rust")]
+#[command(name = "re-argo", version, about = "RE-Argo — CLI-native RE + malware-triage toolkit")]
 struct Cli {
     /// Decode ARM code in Thumb (T16/T32) mode instead of A32
     #[arg(long, global = true)]
@@ -697,7 +697,7 @@ enum Commands {
     /// without analysis (fast on huge binaries).
     ///
     /// `--format elf` (default) emits a minimal ELF placed at the
-    /// original VA that Ghidra and ghidra-rust auto-load with no manual
+    /// original VA that Ghidra and RE-Argo auto-load with no manual
     /// setup; `--format raw` emits the bytes verbatim and prints the
     /// Ghidra "Raw Binary" import parameters.
     Carve {
@@ -3784,7 +3784,7 @@ fn cmd_carve(
     if format == "elf" {
         println!();
         println!("Auto-loads at the original VA — no manual setup:");
-        println!("  ghidra-rust decompile {} --address 0x{:x}", out_path.display(), entry);
+        println!("  re-argo decompile {} --address 0x{:x}", out_path.display(), entry);
         println!("  (or drag into GUI Ghidra; arch + base are detected from the ELF header)");
     } else {
         println!();

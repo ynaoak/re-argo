@@ -3,7 +3,7 @@ name = "gr-sleigh"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SLEIGH specification runtime for ghidra-rust"
+description = "SLEIGH specification runtime for RE-Argo"
 
 [dependencies]
 gr-core = { workspace = true }

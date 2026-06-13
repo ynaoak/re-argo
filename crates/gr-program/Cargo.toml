@@ -3,7 +3,7 @@ name = "gr-program"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Program model for ghidra-rust: functions, symbols, references, listing"
+description = "Program model for RE-Argo: functions, symbols, references, listing"
 
 [dependencies]
 gr-core = { workspace = true }

@@ -1,6 +1,6 @@
-# ghidra-rust
+# RE-Argo
 
-Rust reimplementation of Ghidra's core binary analysis pipeline. CLI-first, library-first — no GUI.
+CLI-native reverse-engineering + malware-triage toolkit in Rust. Built atop a Ghidra-equivalent multi-arch analysis pipeline, with a binary-clustering / capability-detection / IoC-extraction layer on top. CLI-first, library-first — no GUI. Binary name: `re-argo`.
 
 This document is the **AI agent operations reference**. It documents every CLI command with enough specificity that an LLM can choose the right command, supply correct flags, parse the output, and chain commands without trial-and-error.
 
@@ -57,7 +57,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 
 ```bash
 cargo run --release -- <command> <args>     # development build
-target/release/ghidra-rust <command> <args> # after a release build
+target/release/re-argo <command> <args> # after a release build
 ```
 
 All commands accept `--thumb` (global flag, before the subcommand or after) to decode ARM code in Thumb mode. Most users on x86_64 / aarch64 binaries can ignore it.
@@ -82,59 +82,59 @@ cargo clippy --workspace --all-targets -- -D warnings
 ### Triage a stripped binary
 
 ```bash
-ghidra-rust info <bin>              # format / arch / runtime
-ghidra-rust summary <bin>           # 1-screen overview
-ghidra-rust functions <bin>         # see what's named
-ghidra-rust tags <bin> --list-types # categorised findings
-ghidra-rust find <bin> "main"       # find the entry-likely func
-ghidra-rust decompile <bin> --address <main_addr>
+re-argo info <bin>              # format / arch / runtime
+re-argo summary <bin>           # 1-screen overview
+re-argo functions <bin>         # see what's named
+re-argo tags <bin> --list-types # categorised findings
+re-argo find <bin> "main"       # find the entry-likely func
+re-argo decompile <bin> --address <main_addr>
 ```
 
 ### Investigate suspected crypto
 
 ```bash
-ghidra-rust tags <bin> --filter crypto
+re-argo tags <bin> --filter crypto
 # → "address  crypto  0x402020  crypto: AES S-box (forward)"
-ghidra-rust xrefs <bin> 0x402020    # who uses the S-box?
-ghidra-rust backtrace <bin> <user_addr>   # who reaches that user?
+re-argo xrefs <bin> 0x402020    # who uses the S-box?
+re-argo backtrace <bin> <user_addr>   # who reaches that user?
 ```
 
 ### Hunt a suspected vulnerable function
 
 ```bash
-ghidra-rust find <bin> "strcpy"     # locate the unsafe call
-ghidra-rust backtrace <bin> <strcpy_plt_addr>   # reverse reach
-ghidra-rust taint <bin> --address <reachable_func>
-ghidra-rust decompile <bin> --address <reachable_func>
+re-argo find <bin> "strcpy"     # locate the unsafe call
+re-argo backtrace <bin> <strcpy_plt_addr>   # reverse reach
+re-argo taint <bin> --address <reachable_func>
+re-argo decompile <bin> --address <reachable_func>
 ```
 
 ### Find anti-debug
 
 ```bash
-ghidra-rust tags <bin> --filter anti_debug
-ghidra-rust workflow                 # show the anti-debug analyzer is enabled
+re-argo tags <bin> --filter anti_debug
+re-argo workflow                 # show the anti-debug analyzer is enabled
 ```
 
 ### Compare two builds
 
 ```bash
-ghidra-rust diff old.bin new.bin           # symbol / byte level
-ghidra-rust semantic-diff old.bin new.bin  # SSA / function level
+re-argo diff old.bin new.bin           # symbol / byte level
+re-argo semantic-diff old.bin new.bin  # SSA / function level
 ```
 
 ### Bulk extract decompiled C for offline review
 
 ```bash
-ghidra-rust decompile-all <bin> -o /tmp/decomp --skip-errors
+re-argo decompile-all <bin> -o /tmp/decomp --skip-errors
 ls /tmp/decomp/*.c
 ```
 
 ### Restore stripped function names from a community symbol list
 
 ```bash
-ghidra-rust annotate <bin> --import community_symbols.json
-ghidra-rust functions <bin>                 # names now flow through every subsequent command
-ghidra-rust iterate <bin> --apply           # let the heuristic correction loop finish the job
+re-argo annotate <bin> --import community_symbols.json
+re-argo functions <bin>                 # names now flow through every subsequent command
+re-argo iterate <bin> --apply           # let the heuristic correction loop finish the job
 ```
 
 ---
@@ -431,7 +431,7 @@ Run a sequence of analysis commands from a `.grs` script file.
 
 #### `mcp <FILE>`
 
-Speak Model Context Protocol over stdio. Loads the binary, runs analysis, then reads newline-delimited JSON-RPC 2.0 requests on stdin and answers on stdout. Tools exposed: `list_functions`, `decompile_function`, `disassemble`, `find_xrefs`, `list_symbols`, `get_program_info`. Designed for embedding ghidra-rust into AI hosts (Claude Code, etc.).
+Speak Model Context Protocol over stdio. Loads the binary, runs analysis, then reads newline-delimited JSON-RPC 2.0 requests on stdin and answers on stdout. Tools exposed: `list_functions`, `decompile_function`, `disassemble`, `find_xrefs`, `list_symbols`, `get_program_info`. Designed for embedding re-argo into AI hosts (Claude Code, etc.).
 
 ### Other
 
@@ -480,7 +480,7 @@ Mark `N` parameter registers as tainted at function `ADDR` and propagate through
 
 1. **Hex addresses are required for `<ADDRESS>` arguments.** `0x401000` or `401000`, not `4198400`.
 2. **`symbols` defaults to loader-side only.** On stripped binaries, pass `--all` to see analyzer-recovered names.
-3. **`cargo run` rebuilds on every invocation.** Build once (`cargo build --release`) then call `target/release/ghidra-rust` directly to avoid the rebuild cost. The CLI is idempotent and re-runs the analysis pipeline per invocation.
+3. **`cargo run` rebuilds on every invocation.** Build once (`cargo build --release`) then call `target/release/re-argo` directly to avoid the rebuild cost. The CLI is idempotent and re-runs the analysis pipeline per invocation.
 4. **`--thumb` is only relevant for 32-bit ARM binaries.** x86_64 / aarch64 binaries should not pass it.
 5. **`analyze` runs the same pipeline `decompile`, `xrefs`, `tags` etc. already run internally.** Use it when you want the per-analyzer summary line on stderr, not to "warm up" a cache (there is no persistent cache between invocations — except for the `<binary>.gra.json` override sidecar).
 6. **`find <bin> <query>` is case-insensitive substring** — use it before more specific queries; it's the fastest way to locate a name across functions / symbols / comments / tags in one shot.
