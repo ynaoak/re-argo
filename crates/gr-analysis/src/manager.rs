@@ -60,6 +60,8 @@ use crate::callsite_annotate::CallSiteAnnotator;
 use crate::capa::CapaAnalyzer;
 use crate::entropy::EntropyAnalyzer;
 use crate::packer::PackerAnalyzer;
+use crate::rich_header::RichHeaderAnalyzer;
+use crate::section_anomaly::SectionAnomalyAnalyzer;
 use crate::thunk::{EntryPointAnalyzer, ThunkDetectorAnalyzer};
 use crate::tlsh::TlshAnalyzer;
 use crate::vuln::VulnAnalyzer;
@@ -98,6 +100,8 @@ impl AnalysisManager {
             Box::new(NoReturnAnalyzer),
             Box::new(CryptoConstantAnalyzer),
             Box::new(EntropyAnalyzer),
+            Box::new(SectionAnomalyAnalyzer),
+            Box::new(RichHeaderAnalyzer),
             Box::new(ImphashAnalyzer),
             Box::new(TlshAnalyzer),
             Box::new(AuthenticodeAnalyzer),

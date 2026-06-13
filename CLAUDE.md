@@ -198,7 +198,7 @@ Each comment: `{address, kind, text}` (`kind` ∈ `Eol | Pre | Post | Plate | Re
 
 Display format, architecture, bits, entry point, section count, symbol count, plus compiler / runtime fingerprints when detected, plus high-signal triage values (`imphash`, `packer`, `entropy_overall`) when the cheap analyzers can detect them.
 
-Example output keys: `Format`, `Architecture`, `Bits`, `Entry Point`, `language`, `runtime`, `libc_version`, `pe_product`, `pe_version`, `build_id`, `compiler`, `imphash`, `tlsh`, `signed`, `cert_subjects`, `packer`, `entropy_overall`.
+Example output keys: `Format`, `Architecture`, `Bits`, `Entry Point`, `language`, `runtime`, `libc_version`, `pe_product`, `pe_version`, `build_id`, `compiler`, `imphash`, `tlsh`, `richhash`, `signed`, `cert_subjects`, `packer`, `entropy_overall`, `section_anomaly_count`.
 
 #### `triage <FILE>`
 

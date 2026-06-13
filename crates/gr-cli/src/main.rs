@@ -847,12 +847,16 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let _ = gr_analysis::Analyzer::analyze(&imp, &mut program);
     let tl = gr_analysis::tlsh::TlshAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&tl, &mut program);
+    let rh = gr_analysis::rich_header::RichHeaderAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&rh, &mut program);
     let auth = gr_analysis::authenticode::AuthenticodeAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&auth, &mut program);
     let ent = gr_analysis::entropy::EntropyAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&ent, &mut program);
     let pkr = gr_analysis::packer::PackerAnalyzer;
     let _ = gr_analysis::Analyzer::analyze(&pkr, &mut program);
+    let sa = gr_analysis::section_anomaly::SectionAnomalyAnalyzer;
+    let _ = gr_analysis::Analyzer::analyze(&sa, &mut program);
 
     let p = &program.metadata.properties;
     if !p.is_empty() {
@@ -867,6 +871,7 @@ fn cmd_info(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "pe_version",
             "imphash",
             "tlsh",
+            "richhash",
             "signed",
             "cert_subjects",
             "packer",
@@ -1457,6 +1462,12 @@ fn cmd_summary(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(v) = imphash {
             println!("  imphash        {}", v);
+        }
+        if let Some(v) = p.get("richhash") {
+            println!("  richhash       {}", v);
+        }
+        if let Some(v) = p.get("section_anomaly_count") {
+            println!("  anomalies      {} section(s) flagged", v);
         }
         if capa_lines > 0 {
             println!("  capabilities   {} rule(s) matched", capa_lines);
@@ -4295,7 +4306,8 @@ fn cmd_triage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Hashes
     let imphash = p.get("imphash");
     let tlsh = p.get("tlsh");
-    if imphash.is_some() || tlsh.is_some() {
+    let richhash = p.get("richhash");
+    if imphash.is_some() || tlsh.is_some() || richhash.is_some() {
         println!();
         println!("Hashes:");
         if let Some(h) = imphash {
@@ -4303,6 +4315,23 @@ fn cmd_triage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(h) = tlsh {
             println!("  tlsh          {}", h);
+        }
+        if let Some(h) = richhash {
+            println!("  richhash      {}", h);
+            if let Some(n) = p.get("rich_records") {
+                println!("                ({} Rich Header records)", n);
+            }
+        }
+    }
+
+    // Section anomalies
+    if let Some(count) = p.get("section_anomaly_count") {
+        println!();
+        println!("Section anomalies ({}):", count);
+        if let Some(raw) = p.get("section_anomalies") {
+            for line in raw.lines().take(10) {
+                println!("  {}", line);
+            }
         }
     }
 

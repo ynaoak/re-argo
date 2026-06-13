@@ -342,25 +342,66 @@ fn looks_like_btc_address(s: &str) -> bool {
 
 fn looks_like_domain(s: &str) -> bool {
     // Last-resort: 5-253 chars, ≥1 dot, ASCII alphanumerics and dots
-    // / hyphens. The TLD must be 2-24 alphabetic chars. We exclude
-    // version strings (e.g. "1.2.3") by requiring the TLD to be all
-    // alphabetic and ≥2 chars.
+    // / hyphens. Tightened beyond the naïve check so we don't flag
+    // version strings (`1.2.3`), shared libraries (`lib.so`), file
+    // extensions (`.history`), or struct member access (`obj.field`).
     if s.len() < 5 || s.len() > 253 {
         return false;
     }
     if s.contains(' ') || s.contains('/') || s.contains(':') {
         return false;
     }
+    // Must not start with a separator — `.history`, `-foo.com`,
+    // `_x.org` aren't valid domains.
+    let first = s.as_bytes()[0];
+    if first == b'.' || first == b'-' || first == b'_' {
+        return false;
+    }
     let Some(dot) = s.rfind('.') else { return false };
+    let sld = &s[..dot]; // everything before the last dot
     let tld = &s[dot + 1..];
+    // SLD must be ≥ 2 chars and contain ≥ 1 alphabetic — kills
+    // version strings (`1.2.3`) and pure-numeric SLDs (`12.org`).
+    if sld.len() < 2 {
+        return false;
+    }
+    if !sld.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
     if tld.len() < 2 || tld.len() > 24 {
         return false;
     }
-    if !tld.bytes().all(|b| b.is_ascii_alphabetic()) {
+    // TLD must be all-lowercase alphabetic. Real domains use
+    // lowercase in strings; mixed-case is almost always a code
+    // identifier (`obj.SomeMethod`, `Type.Field`). This single check
+    // filters out a huge swath of false positives.
+    if !tld.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    // TLD allowlist — small enough to fit inline, big enough to
+    // cover the common cases. Two-letter ccTLDs are accepted by
+    // the 2-char short-circuit.
+    if tld.len() > 2 && !is_known_tld(tld) {
         return false;
     }
     s.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+}
+
+/// Allowlist of common TLDs (gTLDs + the malware-popular new TLDs).
+/// 2-character ccTLDs are accepted without consulting this list.
+fn is_known_tld(tld: &str) -> bool {
+    matches!(
+        tld,
+        "com" | "org" | "net" | "info" | "biz" | "name" | "pro"
+        | "edu" | "gov" | "mil" | "int" | "arpa"
+        | "io" | "ai" | "app" | "dev" | "xyz" | "online" | "site"
+        | "top" | "click" | "link" | "live" | "shop" | "club"
+        | "tech" | "cloud" | "store" | "blog" | "host" | "space"
+        | "agency" | "today" | "world" | "global" | "digital"
+        | "icu" | "fun" | "rest" | "wtf" | "tools" | "support"
+        | "monster" | "country" | "buzz" | "uno" | "cyou"
+    )
 }
 
 #[cfg(test)]
@@ -456,6 +497,37 @@ mod tests {
     fn domain_only() {
         assert_eq!(classify("malware.example.com"), Some(IocKind::Domain));
         assert_ne!(classify("1.2.3"), Some(IocKind::Domain)); // TLD all-digit
+    }
+
+    #[test]
+    fn domain_false_positives_filtered() {
+        // Leading dot — looks like a file extension, not a domain.
+        assert_ne!(classify(".history"), Some(IocKind::Domain));
+        assert_ne!(classify(".bashrc"), Some(IocKind::Domain));
+        // Mixed-case TLD: code identifier, not a domain.
+        assert_ne!(classify("obj.SomeMethod"), Some(IocKind::Domain));
+        assert_ne!(classify("Type.Field"), Some(IocKind::Domain));
+        // Unknown TLD > 2 chars: not a real TLD.
+        assert_ne!(classify("foo.invalidtld"), Some(IocKind::Domain));
+        // Leading hyphen / underscore.
+        assert_ne!(classify("-foo.com"), Some(IocKind::Domain));
+        assert_ne!(classify("_x.org"), Some(IocKind::Domain));
+        // Pure-numeric SLD.
+        assert_ne!(classify("12.org"), Some(IocKind::Domain));
+        // Note: `lib.so` is technically ambiguous (Somalia ccTLD vs
+        // shared library suffix). We accept the false positive on
+        // 2-char ccTLDs to preserve recall on real C2 domains;
+        // callers can post-filter `.so` / `.dll` / `.exe` if needed.
+    }
+
+    #[test]
+    fn domain_real_cases_still_classified() {
+        assert_eq!(classify("attacker.com"), Some(IocKind::Domain));
+        assert_eq!(classify("evil.example.io"), Some(IocKind::Domain));
+        assert_eq!(classify("sub.domain.net"), Some(IocKind::Domain));
+        // 2-letter ccTLD short-circuit.
+        assert_eq!(classify("malware.ru"), Some(IocKind::Domain));
+        assert_eq!(classify("c2.cn"), Some(IocKind::Domain));
     }
 
     #[test]
