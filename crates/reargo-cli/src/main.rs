@@ -3705,15 +3705,38 @@ fn cmd_xref_scan(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
     let hits = reargo_analysis::xref_scan::scan_xrefs(&info, target, limit);
-    println!("References to 0x{:x} ({} found):", target, hits.len());
-    if hits.is_empty() {
-        println!("  (none — not an x86 image, target unmapped, or no direct reference)");
+
+    // PIE binaries store vtable / function-pointer slots as RELATIVE
+    // relocations whose target lives in the reloc addend, not the on-disk
+    // bytes — invisible to both a code-operand scan and a raw byte search.
+    // Surface them so indirect/virtual references are found too.
+    let ptr_refs: Vec<u64> = std::fs::read(path)
+        .ok()
+        .map(|data| {
+            reargo_loader::elf_pointer_relocations(&data)
+                .into_iter()
+                .filter(|(_, tgt)| *tgt == target)
+                .map(|(slot, _)| slot)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let total = hits.len() + ptr_refs.len();
+    println!("References to 0x{:x} ({} found):", target, total);
+    if total == 0 {
+        println!("  (none — not an x86 image, target unmapped, or no reference)");
     }
     for h in &hits {
         println!("  0x{:016x} [{}] {}", h.addr, h.kind.label(), h.text);
     }
+    for slot in &ptr_refs {
+        println!(
+            "  0x{:016x} [PTRREL] pointer slot (vtable / fn-ptr table) -> 0x{:x}",
+            slot, target
+        );
+    }
     if limit != 0 && hits.len() >= limit {
-        println!("  ... (stopped at --limit {}; pass --limit 0 for all)", limit);
+        println!("  ... (code hits stopped at --limit {}; pass --limit 0 for all)", limit);
     }
     Ok(())
 }
