@@ -324,7 +324,7 @@ inline comment column that makes stripped C++ readable without manually cross-re
 
 Show lifted P-code IR — the low-level intermediate the analysis stack runs on. Output is one line per P-code op grouped by source instruction.
 
-#### `decompile <FILE> [-a ADDR] [--ssa] [--rust]`
+#### `decompile <FILE> [-a ADDR] [--ssa] [--rust] [-A]`
 
 Decompile a function to pseudocode.
 
@@ -333,8 +333,16 @@ Decompile a function to pseudocode.
 | `-a ADDR` | Function address (hex). Defaults to entry point |
 | `--ssa` | Dump the optimised SSA IR instead of C |
 | `--rust` | Emit Rust-style pseudocode instead of C |
+| `-A`/`--annotate` | Append a `// 0xADDR=...` comment to each line classifying its address literals |
 
 Output includes inline `// <comment>` lines from the analysis annotations and call-rendering substitutions (`printf("hi", 42)` instead of `printf@plt()`).
+
+With `-A`, every line that still carries a raw `0x...` literal (an unresolved
+call target, vtable pointer, or data reference the renderer couldn't name) gets
+a trailing comment classifying it with the same scheme as `disasm -A`:
+`import@plt` / `vtable[class]` / `fn` / `string` / `data:<section>`. Literals
+below `0x1000` (stack/struct offsets, small constants) are skipped. This makes
+the residual addresses in carved-function output readable without cross-referencing.
 
 #### `decompile-all <FILE> [-o DIR] [--rust] [--skip-errors]`
 

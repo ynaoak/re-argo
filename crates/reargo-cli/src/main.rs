@@ -230,6 +230,9 @@ enum Commands {
         /// Output Rust-style pseudocode instead of C
         #[arg(long)]
         rust: bool,
+        /// Annotate addresses in the output (import@plt / vtable[class] / fn / string / data)
+        #[arg(short = 'A', long)]
+        annotate: bool,
     },
     /// Decompile every discovered function in parallel
     DecompileAll {
@@ -883,7 +886,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             start,
             count,
         } => cmd_pcode(&file, start, count, cli.thumb),
-        Commands::Decompile { file, address, ssa, rust } => cmd_decompile(&file, address, ssa, rust, cli.thumb),
+        Commands::Decompile { file, address, ssa, rust, annotate } => cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate),
         Commands::DecompileAll { file, output_dir, rust, skip_errors } => cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb),
         Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
@@ -1273,6 +1276,68 @@ fn addresses_in_insn(insn: &reargo_arch::arch::DecodedInstruction) -> Vec<u64> {
             {
                 out.push(v);
             }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Post-process decompiled C/Rust text, appending a `// 0xADDR=class` comment to
+/// each line that references a classifiable address (call targets, vtable/data
+/// pointers). Reuses `short_classify_addr`. Addresses below 0x1000 are skipped
+/// (stack/struct offsets, small constants) to avoid noise.
+fn annotate_code(
+    code: &str,
+    info: &reargo_loader::BinaryInfo,
+    relocs: &std::collections::BTreeMap<u64, u64>,
+) -> String {
+    let mut out = String::with_capacity(code.len() + code.len() / 8);
+    for line in code.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let mut notes: Vec<String> = Vec::new();
+        for v in hex_literals_in_line(trimmed) {
+            // Skip stack/struct offsets and small constants.
+            if v >= 0x1000
+                && let Some(c) = short_classify_addr(info, relocs, v)
+            {
+                notes.push(format!("0x{:x}={}", v, c));
+            }
+        }
+        if notes.is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(trimmed);
+            out.push_str("  // ");
+            out.push_str(&notes.join(", "));
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Parse the distinct `0x<hex>` literals in a line of decompiled text, in order
+/// of first appearance (duplicates removed). Pure/testable.
+fn hex_literals_in_line(line: &str) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'0' && i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+            let s = i + 2;
+            let mut j = s;
+            while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            if j > s
+                && let Ok(v) = u64::from_str_radix(&line[s..j], 16)
+                && !out.contains(&v)
+            {
+                out.push(v);
+            }
+            i = j.max(i + 1);
         } else {
             i += 1;
         }
@@ -2401,7 +2466,7 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Resu
     Ok(())
 }
 
-fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
     let lifter = match make_lifter(&program.info, thumb) {
@@ -2417,6 +2482,19 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
     let result = reargo_decompile::decompile_function(lifter.as_ref(), &program, entry)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+    // For --annotate: a binary-info + reloc map for classifying addresses that
+    // appear literally in the decompiled C/Rust (call targets, vtable/data ptrs).
+    let annot = if annotate {
+        let info = BinaryLoader::load(path)?;
+        let relocs: std::collections::BTreeMap<u64, u64> = std::fs::read(path)
+            .ok()
+            .map(|d| reargo_loader::elf_pointer_relocations(&d).into_iter().collect())
+            .unwrap_or_default();
+        Some((info, relocs))
+    } else {
+        None
+    };
+
     if show_ssa {
         print!("{}", result.ssa_dump);
     } else {
@@ -2425,10 +2503,10 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
                 println!("{}\n", def);
             }
         }
-        if show_rust {
-            print!("{}", result.rust_code);
-        } else {
-            print!("{}", result.c_code);
+        let code = if show_rust { &result.rust_code } else { &result.c_code };
+        match &annot {
+            Some((info, relocs)) => print!("{}", annotate_code(code, info, relocs)),
+            None => print!("{}", code),
         }
     }
 
@@ -5203,4 +5281,30 @@ fn find_file_offset(info: &reargo_loader::BinaryInfo, address: u64, data: &[u8])
         }
     }
     Err(format!("address 0x{:x} not in any section", address).into())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::hex_literals_in_line;
+
+    #[test]
+    fn hex_literals_basic() {
+        assert_eq!(hex_literals_in_line("call 0xceab6a0();"), vec![0xceab6a0]);
+        // dedup + order preserved
+        assert_eq!(
+            hex_literals_in_line("x = 0x10; y = 0xcf6d3f0; z = 0x10;"),
+            vec![0x10, 0xcf6d3f0]
+        );
+    }
+
+    #[test]
+    fn hex_literals_edges() {
+        assert_eq!(hex_literals_in_line("no addresses here"), Vec::<u64>::new());
+        // bare 0x with no digits is ignored, doesn't hang
+        assert_eq!(hex_literals_in_line("0x bad 0xg"), Vec::<u64>::new());
+        // uppercase X and mixed-case digits
+        assert_eq!(hex_literals_in_line("*(uint64_t*)0XABcd"), vec![0xabcd]);
+        // adjacent literals
+        assert_eq!(hex_literals_in_line("0x1,0x2"), vec![1, 2]);
+    }
 }
