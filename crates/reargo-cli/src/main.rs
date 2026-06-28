@@ -750,9 +750,14 @@ enum Commands {
     Vtable {
         /// Path to the binary file
         file: PathBuf,
-        /// An address inside the vtable (a method slot or the base) (hex)
+        /// An address inside the vtable (a method slot or the base) (hex).
+        /// Optional when `--name` is given.
         #[arg(value_parser = parse_hex)]
-        address: u64,
+        address: Option<u64>,
+        /// Find vtables by (demangled) class-name substring instead of an
+        /// address — automates the name -> type_info -> vtable reverse lookup.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -835,7 +840,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Carve { file, address, start, end, size, format, output } =>
             cmd_carve(&file, address, start, end, size, &format, output.as_deref(), cli.thumb),
         Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
-        Commands::Vtable { file, address } => cmd_vtable(&file, address),
+        Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3756,7 +3761,11 @@ fn cmd_xref_scan(
     Ok(())
 }
 
-fn cmd_vtable(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_vtable(
+    path: &Path,
+    address: Option<u64>,
+    name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeMap;
     let info = BinaryLoader::load(path)?;
     let data = std::fs::read(path)?;
@@ -3773,13 +3782,81 @@ fn cmd_vtable(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error
         .filter(|s| s.flags.contains(reargo_loader::SectionFlags::EXECUTE) && s.size > 0)
         .map(|s| (s.address, s.address + s.size))
         .collect();
+    let read_cstr = |addr: u64| -> String {
+        let mut bytes = Vec::new();
+        for i in 0..256u64 {
+            match info.memory.read_byte(addr + i) {
+                Some(0) | None => break,
+                Some(b) => bytes.push(b),
+            }
+        }
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+
+    match (address, name) {
+        (Some(addr), _) => print_vtable_at(&info, &relocs, &exec, addr, Some(addr), &read_cstr),
+        (None, Some(substr)) => {
+            // Reverse lookup: scan every reloc whose target is a plausible
+            // mangled type_info name string; match the demangled name against
+            // `substr`, then resolve type_info -> vtable for each hit.
+            let mut reverse: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+            for (slot, target) in &relocs {
+                reverse.entry(*target).or_default().push(*slot);
+            }
+            let is_code = |a: u64| exec.iter().any(|(s, e)| a >= *s && a < *e);
+            let mut shown = 0;
+            for (slot, target) in &relocs {
+                if is_code(*target) {
+                    continue; // name strings live in rodata, not code
+                }
+                let raw = read_cstr(*target);
+                if raw.len() < 3 || !raw.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'N') {
+                    continue;
+                }
+                let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw))
+                    .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+                    .unwrap_or_default();
+                if !pretty.to_lowercase().contains(&substr.to_lowercase()) {
+                    continue;
+                }
+                // `slot` = type_info+8 (name pointer). type_info = slot-8.
+                let type_info = slot.wrapping_sub(8);
+                // vtable base-8 is a slot pointing at `type_info`, whose base
+                // (slot+8) begins a run of code pointers.
+                if let Some(refs) = reverse.get(&type_info) {
+                    for &r in refs {
+                        let cand_base = r.wrapping_add(8);
+                        if relocs.get(&cand_base).copied().is_some_and(is_code) {
+                            println!("== {} ==", pretty);
+                            let _ = print_vtable_at(&info, &relocs, &exec, cand_base, None, &read_cstr);
+                            println!();
+                            shown += 1;
+                        }
+                    }
+                }
+            }
+            if shown == 0 {
+                println!("no class matching '{}' found", substr);
+            }
+            Ok(())
+        }
+        (None, None) => Err("provide an address or --name <substr>".into()),
+    }
+}
+
+fn print_vtable_at(
+    info: &reargo_loader::BinaryInfo,
+    relocs: &std::collections::BTreeMap<u64, u64>,
+    exec: &[(u64, u64)],
+    base_hint: u64,
+    queried: Option<u64>,
+    read_cstr: &dyn Fn(u64) -> String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let is_code = |a: u64| exec.iter().any(|(s, e)| a >= *s && a < *e);
     let slot_to_code = |slot: u64| relocs.get(&slot).copied().filter(|t| is_code(*t));
 
-    // Walk back to the vtable base: the lowest consecutive 8-byte slot that
-    // still holds a code pointer. The slot just below the base (base-8) holds
-    // the RTTI type_info pointer (a data pointer), which stops the walk.
-    let mut base = address;
+    // Walk back to the vtable base (lowest consecutive code-pointer slot).
+    let mut base = base_hint;
     while slot_to_code(base.wrapping_sub(8)).is_some() {
         base -= 8;
     }
@@ -3788,19 +3865,10 @@ fn cmd_vtable(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error
     if let Ok(off_top) = info.memory.read_u64(base.wrapping_sub(16)) {
         println!("offset-to-top: {}", off_top as i64);
     }
-
-    // RTTI: base-8 -> type_info; type_info+8 -> mangled name string.
     if let Some(&rtti) = relocs.get(&base.wrapping_sub(8)) {
         println!("RTTI type_info: 0x{:x}", rtti);
         if let Some(&name_addr) = relocs.get(&rtti.wrapping_add(8)) {
-            let mut bytes = Vec::new();
-            for i in 0..256u64 {
-                match info.memory.read_byte(name_addr + i) {
-                    Some(0) | None => break,
-                    Some(b) => bytes.push(b),
-                }
-            }
-            let mangled = String::from_utf8_lossy(&bytes).to_string();
+            let mangled = read_cstr(name_addr);
             let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", mangled))
                 .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
                 .unwrap_or_else(|| mangled.clone());
@@ -3810,12 +3878,11 @@ fn cmd_vtable(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error
         println!("RTTI type_info: (none — base-8 is not a relocation)");
     }
 
-    // List virtual method slots from the base.
     println!("methods:");
     let mut idx = 0u64;
     let mut slot = base;
     while let Some(target) = slot_to_code(slot) {
-        let marker = if slot == address { "  <- queried" } else { "" };
+        let marker = if queried == Some(slot) { "  <- queried" } else { "" };
         println!("  [{:>3}] 0x{:016x} -> 0x{:x}{}", idx, slot, target, marker);
         idx += 1;
         slot += 8;
