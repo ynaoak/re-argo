@@ -78,6 +78,36 @@ fn iced_reg_to_varnode(r: iced_x86::Register) -> Option<VarnodeData> {
     map.get(&r).copied()
 }
 
+/// XMM register file base in REGISTER space. Mirrors Ghidra's x86-64 SLEIGH
+/// layout (xmm registers begin at 0x1200, stride 0x10). Scalar SSE ops view
+/// the low 4 (ss) / 8 (sd) bytes at the same offset; the SSA layer keys on
+/// (offset,size) so the aliasing is exact for dataflow purposes.
+const XMM_BASE: u64 = 0x1200;
+
+/// Map an iced XMM register to its REGISTER-space base offset. Returns `None`
+/// for non-XMM (incl. YMM/ZMM, which we don't model yet).
+fn iced_xmm_offset(r: iced_x86::Register) -> Option<u64> {
+    let rn = r as u32;
+    let x0 = iced_x86::Register::XMM0 as u32;
+    let x31 = iced_x86::Register::XMM31 as u32;
+    if rn >= x0 && rn <= x31 {
+        Some(XMM_BASE + (rn - x0) as u64 * 0x10)
+    } else {
+        None
+    }
+}
+
+/// True if any operand is an XMM register. Used to route SSE/float
+/// instructions away from the integer match (and to disambiguate the
+/// `movsd`/`movss` mnemonic, which iced shares with the string instruction —
+/// the string form has no XMM operand).
+fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
+    (0..insn.op_count()).any(|i| {
+        insn.op_kind(i) == iced_x86::OpKind::Register
+            && iced_xmm_offset(insn.op_register(i)).is_some()
+    })
+}
+
 pub struct X86Lifter {
     is_64: bool,
 }
@@ -109,6 +139,14 @@ impl X86Lifter {
         let mut ops: Vec<PcodeOp> = Vec::new();
         let mut seq_base: u32 = 0;
         let ps = self.ptr_size();
+
+        // SSE / scalar-float instructions are lifted to FLOAT_* p-code so the
+        // SSA/dataflow passes can track noise/biome math (the BDS world-gen is
+        // almost entirely scalar SSE). Routed by XMM-operand presence, which
+        // also disambiguates `movsd`/`movss` from the string instruction.
+        if insn_touches_xmm(insn) {
+            return self.lift_sse(insn, address);
+        }
 
         match insn.mnemonic() {
             Nop | Endbr64 | Endbr32 => {}
@@ -729,6 +767,265 @@ impl X86Lifter {
         Ok(ops)
     }
 
+    /// Lift an SSE / scalar-float instruction to FLOAT_* p-code. Only reached
+    /// when the instruction touches an XMM register. Unmodeled SSE mnemonics
+    /// (shuffles, min/max, andn, …) fall through to an opaque CallOther so the
+    /// caller never sees a decode error.
+    fn lift_sse(
+        &self,
+        insn: &iced_x86::Instruction,
+        address: u64,
+    ) -> Result<Vec<PcodeOp>, LiftError> {
+        use iced_x86::Mnemonic::*;
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut sb: u32 = 0;
+
+        // Scalar element width for this mnemonic group (sd=8, ss=4, packed=16).
+        let m = insn.mnemonic();
+        let sz: u32 = match m {
+            Addsd | Subsd | Mulsd | Divsd | Sqrtsd | Movsd | Comisd | Ucomisd | Cvtsd2ss
+            | Minsd | Maxsd => 8,
+            Addss | Subss | Mulss | Divss | Sqrtss | Movss | Comiss | Ucomiss | Cvtss2sd
+            | Minss | Maxss => 4,
+            // Packed ops act on the full 128-bit register. We model packed
+            // arithmetic as a single FLOAT op over the whole varnode — not
+            // bit-exact SIMD, but it keeps the vectorized noise math readable
+            // and the dataflow connected (the BDS gradient loop is auto-
+            // vectorized over the x/y/z lanes).
+            Movaps | Movups | Movapd | Movupd | Movdqa | Movdqu | Addps | Subps | Mulps
+            | Divps | Shufps | Shufpd | Unpcklps | Unpckhps | Unpcklpd | Unpckhpd
+            | Movhlps | Movlhps | Pshufd => 16,
+            Movq => 8,
+            Movd => 4,
+            _ => 8,
+        };
+
+        // Binary float arithmetic: dst (xmm) = dst OP src. Covers scalar
+        // (sd/ss) and packed (ps) forms; packed runs at sz=16 (whole-register
+        // approximation — see the sz note above).
+        let float_bin = match m {
+            Addsd | Addss | Addps => Some(OpCode::FloatAdd),
+            Subsd | Subss | Subps => Some(OpCode::FloatSub),
+            Mulsd | Mulss | Mulps => Some(OpCode::FloatMult),
+            Divsd | Divss | Divps => Some(OpCode::FloatDiv),
+            _ => None,
+        };
+        if let Some(opcode) = float_bin {
+            let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+            let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+            ops.push(PcodeOp {
+                opcode,
+                seq: seq(sb),
+                output: Some(dst),
+                inputs: SmallVec::from_slice(&[dst, src]),
+            });
+            return Ok(ops);
+        }
+
+        match m {
+            // sqrt: dst (xmm) = sqrt(src)
+            Sqrtsd | Sqrtss => {
+                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatSqrt,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
+            // Scalar / packed moves and gp<->xmm moves (movd/movq).
+            Movsd | Movss | Movaps | Movups | Movapd | Movupd | Movdqa | Movdqu | Movd
+            | Movq => {
+                if insn.op_kind(0) == iced_x86::OpKind::Memory {
+                    // store xmm/gp -> memory
+                    let val = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                    self.write_back_if_memory(insn, 0, val, &mut ops, &mut sb, address)?;
+                } else {
+                    let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                    let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Copy,
+                        seq: seq(sb),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[src]),
+                    });
+                }
+            }
+
+            // int -> float : dst (xmm) = (float)int_src
+            Cvtsi2sd | Cvtsi2ss => {
+                let src = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatInt2Float,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
+            // float -> int (truncating cvtt*, and rounding cvt* approximated as trunc)
+            Cvttsd2si | Cvttss2si | Cvtsd2si | Cvtss2si => {
+                let in_sz = if matches!(m, Cvttsd2si | Cvtsd2si) { 8 } else { 4 };
+                let src = self.sse_operand(insn, 1, in_sz, &mut ops, &mut sb, address)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatTrunc,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
+            // float -> float resize (double<->single)
+            Cvtsd2ss | Cvtss2sd => {
+                let in_sz = if m == Cvtsd2ss { 8 } else { 4 };
+                let out_sz = if m == Cvtsd2ss { 4 } else { 8 };
+                let src = self.sse_operand(insn, 1, in_sz, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, out_sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatFloat2Float,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
+            // ordered/unordered compare: set ZF = (a==b), CF = (a<b), PF = 0.
+            // Enables je/jne/jb/jae/ja/jbe after a float compare.
+            Comisd | Comiss | Ucomisd | Ucomiss => {
+                let a = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                let b = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatEqual,
+                    seq: seq(sb),
+                    output: Some(reg(ZF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[a, b]),
+                });
+                sb += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatLess,
+                    seq: seq(sb),
+                    output: Some(reg(CF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[a, b]),
+                });
+            }
+
+            // xorps/pxor self-zero idiom -> 0; otherwise low-lane xor.
+            Xorps | Xorpd | Pxor => {
+                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
+                if insn.op_kind(1) == iced_x86::OpKind::Register
+                    && insn.op_register(0) == insn.op_register(1)
+                {
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Copy,
+                        seq: seq(sb),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[constant(0, 8)]),
+                    });
+                } else {
+                    let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntXor,
+                        seq: seq(sb),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[dst, src]),
+                    });
+                }
+            }
+
+            // Shuffles / unpacks rearrange lanes between two registers. We
+            // can't express the permute in scalar p-code, so we model the
+            // result as a Copy of the source — lossy, but it keeps the
+            // dataflow edge alive instead of emitting an opaque trap.
+            Shufps | Shufpd | Unpcklps | Unpckhps | Unpcklpd | Unpckhpd | Movhlps
+            | Movlhps | Pshufd => {
+                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::Copy,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
+            // and/or used for sign/abs masks — approximate on the low lane.
+            Andps | Andpd | Orps | Orpd => {
+                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                let opcode = if matches!(m, Andps | Andpd) {
+                    OpCode::IntAnd
+                } else {
+                    OpCode::IntOr
+                };
+                ops.push(PcodeOp {
+                    opcode,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[dst, src]),
+                });
+            }
+
+            // Unmodeled SSE (shuffles, min/max, andn, …): opaque, no decode error.
+            _ => {
+                ops.push(PcodeOp {
+                    opcode: OpCode::CallOther,
+                    seq: seq(sb),
+                    output: None,
+                    inputs: SmallVec::from_slice(&[constant(0, 4)]),
+                });
+            }
+        }
+
+        Ok(ops)
+    }
+
+    /// Resolve an SSE operand at the given element size. XMM registers map to
+    /// the XMM register file (low lane); memory becomes a sized Load; GP
+    /// registers (the integer side of cvt*) use the natural integer mapping.
+    fn sse_operand(
+        &self,
+        insn: &iced_x86::Instruction,
+        idx: u32,
+        size: u32,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> Result<VarnodeData, LiftError> {
+        use iced_x86::OpKind;
+        match insn.op_kind(idx) {
+            OpKind::Register => {
+                let r = insn.op_register(idx);
+                if let Some(off) = iced_xmm_offset(r) {
+                    Ok(VarnodeData::new(REG_SPACE, off, size))
+                } else {
+                    iced_reg_to_varnode(r).ok_or_else(|| LiftError::Unsupported {
+                        address: insn.ip(),
+                        mnemonic: format!("unsupported sse register {:?}", r),
+                    })
+                }
+            }
+            OpKind::Memory => {
+                let addr_vn = self.compute_memory_address(insn, ops, seq_base, address)?;
+                let result = unique(*seq_base as u64 * 0x10 + 0x700, size);
+                let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
+                *seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::Load,
+                    seq,
+                    output: Some(result),
+                    inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), addr_vn]),
+                });
+                Ok(result)
+            }
+            _ => self.lift_operand(insn, idx, ops, seq_base, address),
+        }
+    }
+
     /// Set ZF/SF from a result varnode. Used by Add/Sub/Inc/Dec and by
     /// the logical ops, which (per Intel manual) clear CF/OF separately.
     fn emit_zf_sf_from(
@@ -1174,6 +1471,84 @@ mod tests {
         assert_eq!(lifted.ops[0].opcode, OpCode::Load);
         assert_eq!(lifted.ops[1].opcode, OpCode::Copy);
         assert_eq!(lifted.ops[2].opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn lift_mulsd_xmm() {
+        // mulsd xmm0, xmm1 = f2 0f 59 c1
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xf2, 0x0f, 0x59, 0xc1], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::FloatMult);
+        // dst = xmm0 (offset 0x1200, size 8 low lane)
+        let out = lifted.ops[0].output.unwrap();
+        assert_eq!(out.offset, 0x1200);
+        assert_eq!(out.size, 8);
+        // inputs: [xmm0, xmm1]
+        assert_eq!(lifted.ops[0].inputs[0].offset, 0x1200);
+        assert_eq!(lifted.ops[0].inputs[1].offset, 0x1210);
+    }
+
+    #[test]
+    fn lift_addsd_mem() {
+        // addsd xmm2, [rip+0x10] = f2 0f 58 15 10 00 00 00
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xf2, 0x0f, 0x58, 0x15, 0x10, 0x00, 0x00, 0x00], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // a Load (mem operand) then FLOAT_ADD
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Load));
+        let add = lifted.ops.iter().find(|o| o.opcode == OpCode::FloatAdd).unwrap();
+        assert_eq!(add.output.unwrap().offset, 0x1220); // xmm2
+    }
+
+    #[test]
+    fn lift_cvtsi2sd() {
+        // cvtsi2sd xmm0, eax = f2 0f 2a c0
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xf2, 0x0f, 0x2a, 0xc0], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let cvt = lifted.ops.iter().find(|o| o.opcode == OpCode::FloatInt2Float).unwrap();
+        assert_eq!(cvt.output.unwrap().offset, 0x1200);
+        assert_eq!(cvt.output.unwrap().size, 8);
+    }
+
+    #[test]
+    fn lift_xorps_self_zeroes() {
+        // xorps xmm0, xmm0 = 0f 57 c0
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x0f, 0x57, 0xc0], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::Copy);
+        assert_eq!(lifted.ops[0].inputs[0].space, CONST_SPACE);
+        assert_eq!(lifted.ops[0].inputs[0].offset, 0);
+    }
+
+    #[test]
+    fn lift_ucomisd_sets_flags() {
+        // ucomisd xmm0, xmm1 = 66 0f 2e c1
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x66, 0x0f, 0x2e, 0xc1], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatEqual
+            && o.output.unwrap().offset == ZF_OFFSET));
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatLess
+            && o.output.unwrap().offset == CF_OFFSET));
+    }
+
+    #[test]
+    fn string_movsd_not_treated_as_sse() {
+        // movsd (string, a5) has no xmm operand -> must NOT hit SSE path
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xa5], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // falls to integer default (CallOther), never the SSE float path
+        assert!(!lifted.ops.iter().any(|o| matches!(
+            o.opcode,
+            OpCode::FloatAdd | OpCode::FloatMult | OpCode::FloatSub | OpCode::FloatDiv
+        )));
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::CallOther));
     }
 
     #[test]

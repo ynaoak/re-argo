@@ -503,6 +503,105 @@ impl<'a> CEmitter<'a> {
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
                 Some(format!("{} = ({}){} % ({}){};", dst, ty, a, ty, b))
             }
+            OpCode::FloatAdd => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} + {};", dst, a, b))
+            }
+            OpCode::FloatSub => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} - {};", dst, a, b))
+            }
+            OpCode::FloatMult => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} * {};", dst, a, b))
+            }
+            OpCode::FloatDiv => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} / {};", dst, a, b))
+            }
+            OpCode::FloatNeg => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = -{};", dst, a))
+            }
+            OpCode::FloatAbs => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = fabs({});", dst, a))
+            }
+            OpCode::FloatSqrt => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = sqrt({});", dst, a))
+            }
+            OpCode::FloatEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} == {};", dst, a, b))
+            }
+            OpCode::FloatNotEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} != {};", dst, a, b))
+            }
+            OpCode::FloatLess => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} < {};", dst, a, b))
+            }
+            OpCode::FloatLessEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} <= {};", dst, a, b))
+            }
+            OpCode::FloatInt2Float => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = if out_size == 4 { "float" } else { "double" };
+                Some(format!("{} = ({}){};", dst, ty, a))
+            }
+            OpCode::FloatFloat2Float => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = if out_size == 4 { "float" } else { "double" };
+                Some(format!("{} = ({}){};", dst, ty, a))
+            }
+            OpCode::FloatTrunc => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = size_to_signed_type(out_size);
+                Some(format!("{} = ({}){};", dst, ty, a))
+            }
+            OpCode::FloatFloor => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = floor({});", dst, a))
+            }
+            OpCode::FloatCeil => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = ceil({});", dst, a))
+            }
+            OpCode::FloatRound => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = round({});", dst, a))
+            }
             OpCode::BoolAnd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
@@ -734,6 +833,11 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x88, 8) => "r9".into(),
         (0x90, 8) => "r10".into(),
         (0x98, 8) => "r11".into(),
+        // XMM register file (base 0x1200, stride 0x10). Scalar sd/ss views
+        // share the offset, so name by offset regardless of size.
+        (off, _) if (0x1200..0x1300).contains(&off) && off % 0x10 == 0 => {
+            format!("xmm{}", (off - 0x1200) / 0x10)
+        }
         _ => format!("var_{:x}", offset),
     }
 }

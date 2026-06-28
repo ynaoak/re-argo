@@ -102,6 +102,16 @@ fn x64_registers() -> Vec<RegisterInfo> {
         aliases: vec!["eflags".to_string()],
     });
 
+    // XMM register file (base 0x1200, stride 0x10) — used by the SSE/scalar
+    // float lifting. Full 16-byte view; scalar sd/ss ops alias the low lane.
+    for i in 0..16u64 {
+        regs.push(RegisterInfo {
+            name: format!("XMM{}", i),
+            varnode: VarnodeData::new(REGISTER_SPACE, 0x1200 + i * 0x10, 16),
+            aliases: Vec::new(),
+        });
+    }
+
     regs
 }
 
