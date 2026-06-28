@@ -47,18 +47,44 @@ pub fn find_function_start(info: &BinaryInfo, addr: u64, max_back: u64) -> Optio
     // body preceded by a boundary). Scan from addr downward, keep the smallest.
     let mut best: Option<u64> = None;
     let mut p = addr;
+    // Track the smallest valid candidate, and (preferentially) the smallest
+    // valid candidate that *begins with a recognisable prologue* — a real
+    // entry almost always starts with `push rbp/rbx/r12-r15`, `endbr64`, or
+    // `sub rsp`, which rejects mid-function false positives (e.g. a candidate
+    // starting `mov rbp,[rbx+0x28]` preceded by a coincidental 0x90/0xc3 byte).
+    let mut best_prologue: Option<u64> = None;
     loop {
         let off = (p - lo) as usize;
         let prev_is_boundary = off == 0 || matches!(buf[off - 1], 0xC3 | 0xCB | 0xCC | 0x90);
         if prev_is_boundary && linear_reaches(&buf[off..], p, addr, bits) {
             best = Some(p);
+            if starts_with_prologue(&buf[off..]) {
+                best_prologue = Some(p);
+            }
         }
         if p == lo {
             break;
         }
         p -= 1;
     }
-    best
+    best_prologue.or(best)
+}
+
+/// Does `code` begin with a typical x86-64 function prologue? Used to prefer a
+/// real entry over a mid-function false boundary.
+fn starts_with_prologue(code: &[u8]) -> bool {
+    match code {
+        // endbr64
+        [0xf3, 0x0f, 0x1e, 0xfa, ..] => true,
+        // push rbp / rbx / rbp etc. (0x53,0x55,0x56,0x57 = rbx,rbp,rsi,rdi)
+        [0x53 | 0x55 | 0x56 | 0x57, ..] => true,
+        // push r12-r15  (41 54..57)
+        [0x41, 0x54..=0x57, ..] => true,
+        // sub rsp, imm8 / imm32  (48 83 ec .. / 48 81 ec ..)
+        [0x48, 0x83, 0xec, ..] | [0x48, 0x81, 0xec, ..] => true,
+        // mov rbp, rsp prologue tail not counted; require a push/sub/endbr.
+        _ => false,
+    }
 }
 
 /// Does a linear disassembly starting at `start` (bytes = `code`) reach
@@ -136,6 +162,29 @@ mod tests {
         let prog = make_x86_64_program(&code, 0x1000);
         let start = find_function_start(&prog.info, 0x1007, 0x100).unwrap();
         assert_eq!(start, 0x1001, "internal jmp must not block finding the entry");
+    }
+
+    #[test]
+    fn prefers_prologue_over_midfunction_false_boundary() {
+        // 0x1000: ret                                  (prev fn end)
+        // 0x1001: push rbp; sub rsp,8                  (REAL entry, prologue)
+        // 0x1006: nop  (0x90 — a coincidental boundary byte)
+        // 0x1007: mov rbp,[rbx+0x28]  (mid-fn, looks like a candidate but no
+        //          prologue) ; this is where a naive scan might stop
+        // 0x100e: xor eax,eax  (query)
+        // 0x1010: ret
+        let code = vec![
+            0xc3, // 0x1000 ret
+            0x55, 0x48, 0x83, 0xec, 0x08, // 0x1001 push rbp; sub rsp,8
+            0x90, // 0x1006 nop
+            0x48, 0x8b, 0x6b, 0x28, // 0x1007 mov rbp,[rbx+0x28]
+            0x31, 0xc0, // 0x100d? xor eax,eax
+            0xc3,
+        ];
+        let prog = make_x86_64_program(&code, 0x1000);
+        // query at 0x100d (the xor)
+        let start = find_function_start(&prog.info, 0x100d, 0x100).unwrap();
+        assert_eq!(start, 0x1001, "should pick the prologue entry, not the mid-fn 0x1007");
     }
 
     #[test]
