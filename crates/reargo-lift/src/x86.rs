@@ -325,6 +325,56 @@ impl X86Lifter {
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
+            Xadd => {
+                // xadd dst, src: old = dst; dst = dst + src; src = old.
+                // (LOCK is a no-op for single-threaded dataflow.) Unhandled, it
+                // dropped to CallOther → `__builtin_trap()` (the atomic refcount
+                // bump `lock xadd [mem], ax` in the climate selector). dst is
+                // read here, so lifting it as a value (LOAD for memory) is
+                // correct — unlike the write-only `mov` case.
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                let old = unique(0x720, dst.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::Copy,
+                    seq: seq(seq_base),
+                    output: Some(old),
+                    inputs: SmallVec::from_slice(&[dst]),
+                });
+                seq_base += 1;
+                // Carry/overflow from the pre-op operands (like ADD).
+                self.emit_add_carry_flags(dst, src, &mut ops, &mut seq_base, address);
+                let sum = unique(0x730, dst.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAdd,
+                    seq: seq(seq_base),
+                    output: Some(sum),
+                    inputs: SmallVec::from_slice(&[dst, src]),
+                });
+                seq_base += 1;
+                self.emit_zf_sf_from(sum, &mut ops, &mut seq_base, address);
+                // dst = sum (register Copy, or Store back if memory).
+                if insn.op_kind(0) == iced_x86::OpKind::Memory {
+                    self.write_back_if_memory(insn, 0, sum, &mut ops, &mut seq_base, address)?;
+                } else {
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Copy,
+                        seq: seq(seq_base),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[sum]),
+                    });
+                    seq_base += 1;
+                }
+                // src = old.
+                ops.push(PcodeOp {
+                    opcode: OpCode::Copy,
+                    seq: seq(seq_base),
+                    output: Some(src),
+                    inputs: SmallVec::from_slice(&[old]),
+                });
+                seq_base += 1;
+            }
+
             Imul => {
                 if insn.op_count() >= 2 {
                     let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
@@ -1737,6 +1787,25 @@ mod tests {
         let sx = lifted.ops.iter().find(|o| o.opcode == OpCode::IntSExt).expect("IntSExt");
         assert_eq!(sx.output.unwrap().size, 8, "dest RAX is 8 bytes");
         assert_eq!(sx.inputs[0].size, 4, "src EAX is 4 bytes");
+    }
+
+    #[test]
+    fn lift_xadd_reg_swaps_and_adds_no_trap() {
+        // xadd ecx, eax = 0f c1 c1  (dst=ecx, src=eax)
+        // old = ecx; ecx = ecx + eax; eax = old. Must not be a CallOther.
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x0f, 0xc1, 0xc1], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(!lifted.ops.iter().any(|o| o.opcode == OpCode::CallOther),
+            "xadd must be lifted, not CallOther: {:?}", lifted.ops);
+        assert_eq!(lifted.ops.iter().filter(|o| o.opcode == OpCode::IntAdd).count(), 1);
+        // The sum and the saved-old both flow through Copies; at least the
+        // src-writeback (eax = old) and old-save Copies are present.
+        assert!(lifted.ops.iter().filter(|o| o.opcode == OpCode::Copy).count() >= 2,
+            "xadd needs old-save + src writeback: {:?}", lifted.ops);
+        // ZF is set from the sum.
+        assert!(lifted.ops.iter().any(|o|
+            o.opcode == OpCode::IntEqual && o.output.is_some_and(|v| v.offset == ZF_OFFSET)));
     }
 
     #[test]
