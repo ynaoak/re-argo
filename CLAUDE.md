@@ -312,9 +312,13 @@ Inspect / export the built-in signature database (~312 entries spanning libc / W
 
 ### Code views
 
-#### `disasm <FILE> [-s ADDR] [-n N]`
+#### `disasm <FILE> [-s ADDR] [-n N] [-A]`
 
 Disassemble N instructions starting at ADDR (defaults to entry point). Format: `0xADDR  bytes  mnemonic operands`.
+With `-A`/`--annotate`, append a `; addr=...` comment classifying each referenced address (the branch
+target and `[...h]` rip-relative memory operands) as an import (`floorf@plt`), a vtable + demangled
+class (`vtable[NodeGraphBiomeSource<Pos2d>]`), code (`fn`), a string, or data — an IDA/Ghidra-style
+inline comment column that makes stripped C++ readable without manually cross-referencing addresses.
 
 #### `pcode <FILE> [-s ADDR] [-n N]`
 
