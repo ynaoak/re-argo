@@ -26,6 +26,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Dump CFG of a function as Graphviz DOT" | `cfg <bin> 0x401000` |
 | "Cross-references to/from an address" | `xrefs <bin> 0x401000` |
 | "Fast xref to an address on a HUGE binary (no full analysis)" | `xref-scan <bin> 0x401000` |
+| "Recover a C++ class name + vmethods from a vtable slot (PIE)" | `vtable <bin> 0x401000` |
 | "All call sites with resolved arguments" | `callsites <bin>` |
 | "Strings in the binary" | `strings <bin> --min-length 6` |
 | "Search for bytes or text" | `search <bin> --hex "48 8b ?? 24"` / `--text "password"` |
@@ -347,6 +348,16 @@ Also **relocation-aware**: reports `[PTRREL]` vtable / function-pointer slots wh
 from a PIE `R_X86_64_RELATIVE` reloc addend (invisible to a byte search, since the on-disk slot is
 zero) — so virtually-dispatched functions with no direct call site are still found. `--limit`
 bounds the code-hit count (default 200; 0 = unlimited). Loader-only, ~1.5 s on a 222 MB image.
+
+#### `vtable <FILE> <ADDRESS>`
+
+Recover the C++ vtable around `ADDRESS` (Itanium ABI, PIE). Given any address inside a vtable — e.g.
+a `[PTRREL]` slot reported by `xref-scan` — it walks back to the vtable base via RELATIVE
+relocations, reads the RTTI `type_info`, demangles the class name, and lists the virtual method
+targets (with the queried slot marked). Works on a stripped PIE binary because the slots come from
+`.rela.dyn` addends, not the (zero) on-disk bytes. Reverse-lookup recipe to go from a class *name* to
+its vtable: `search --text <Name>` → mangled `type_info` name string → `xref-scan` that (gives
+`type_info+8`) → `xref-scan` the `type_info` (gives `vtable_base-8`) → `vtable <base>`.
 
 #### `xrefs <FILE> <ADDRESS>`
 
