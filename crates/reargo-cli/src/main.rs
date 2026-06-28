@@ -3878,6 +3878,12 @@ fn cmd_members(
         return Ok(());
     }
     let all = reargo_analysis::members::member_accesses(&info, address, insns);
+    // Auto-detect which register holds `this` so the object's own fields stand
+    // out from accesses through unrelated base registers (a common confound).
+    let this_reg = reargo_analysis::members::this_register(&info, address);
+    if let Some(t) = &this_reg {
+        println!("(this = {})", t);
+    }
     let want = base.map(|b| b.to_lowercase());
     let rows: Vec<_> = all
         .into_iter()
@@ -3886,9 +3892,10 @@ fn cmd_members(
     println!("Member accesses from 0x{:x} ({} distinct):", address, rows.len());
     println!("  {:<6} {:<10} {:>5} {:>6} {:>4}  sample", "base", "offset", "total", "writes", "lea");
     for m in &rows {
+        let mark = if Some(&m.base) == this_reg.as_ref() { "  <- this" } else { "" };
         println!(
-            "  {:<6} +0x{:<7x} {:>5} {:>6} {:>4}  {}",
-            m.base, m.offset, m.count, m.writes, m.lea, m.sample
+            "  {:<6} +0x{:<7x} {:>5} {:>6} {:>4}  {}{}",
+            m.base, m.offset, m.count, m.writes, m.lea, m.sample, mark
         );
     }
     Ok(())

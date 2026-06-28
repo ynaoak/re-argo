@@ -95,6 +95,39 @@ pub fn member_accesses(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<M
     out
 }
 
+/// Detect the register a function keeps `this` in. SysV passes `this` in rdi;
+/// non-leaf methods usually save it into a callee-saved register early
+/// (`mov rbx,rdi`). Returns the lower-cased register name (e.g. "rbx") so
+/// callers can filter `members` to the object's own fields and avoid conflating
+/// accesses through unrelated base registers.
+pub fn this_register(info: &BinaryInfo, addr: u64) -> Option<String> {
+    let mut buf = [0u8; 128];
+    for (i, b) in buf.iter_mut().enumerate() {
+        if let Some(v) = info.memory.read_byte(addr + i as u64) {
+            *b = v;
+        }
+    }
+    let mut dec = Decoder::with_ip(info.bits, &buf, addr, DecoderOptions::NONE);
+    let mut ii = IcedInsn::default();
+    let mut n = 0;
+    while dec.can_decode() && n < 12 {
+        dec.decode_out(&mut ii);
+        if ii.is_invalid() {
+            break;
+        }
+        n += 1;
+        // `mov <callee-saved>, rdi` — the saved `this`.
+        if ii.mnemonic() == iced_x86::Mnemonic::Mov && ii.op1_register() == Register::RDI {
+            return Some(format!("{:?}", ii.op0_register()).to_lowercase());
+        }
+        // First call clobbers rdi; if `this` wasn't saved yet, it stays rdi.
+        if ii.flow_control() == iced_x86::FlowControl::Call {
+            break;
+        }
+    }
+    Some("rdi".to_string())
+}
+
 /// Heuristic: does the function at `addr` look like a C++ constructor — i.e.
 /// does it write a vtable pointer (a rip-relative `lea`) to `[this + 0]` in its
 /// first few instructions? This distinguishes a real sub-object *constructor*
@@ -309,6 +342,18 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].0, 0x40); // offset
         assert_eq!(subs[0].1, 0x1009); // ctor target
+    }
+
+    #[test]
+    fn detects_this_register() {
+        // push rbx; mov rbx, rdi; ret  -> this saved in rbx
+        let code = vec![0x53, 0x48, 0x89, 0xfb, 0xc3];
+        let prog = make_x86_64_program(&code, 0x1000);
+        assert_eq!(this_register(&prog.info, 0x1000).as_deref(), Some("rbx"));
+        // no save before a call -> stays rdi
+        let code2 = vec![0xe8, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        let prog2 = make_x86_64_program(&code2, 0x2000);
+        assert_eq!(this_register(&prog2.info, 0x2000).as_deref(), Some("rdi"));
     }
 
     #[test]
