@@ -56,19 +56,38 @@ pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
     }
 
     let mut visited = BTreeSet::new();
-    structure_from(cfg, cfg.entry_block, &mut visited)
+    let mut path = BTreeSet::new();
+    structure_from(cfg, cfg.entry_block, &mut visited, &mut path)
 }
 
 fn structure_from(
     cfg: &ControlFlowGraph,
     block_id: BlockId,
     visited: &mut BTreeSet<BlockId>,
+    // The current DFS recursion stack (ancestors of `block_id` on the active
+    // path). Distinct from `visited`: a successor in `path` is a *back-edge*
+    // (loop), whereas one merely in `visited` is a forward cross/merge edge
+    // (an if-goto). Without this distinction every already-seen branch target
+    // was modeled as a `while`, turning forward merges into degenerate
+    // single-pass `while (cond) { goto L; }` loops.
+    path: &mut BTreeSet<BlockId>,
 ) -> StructuredBlock {
     if visited.contains(&block_id) {
         return StructuredBlock::Goto(block_id);
     }
     visited.insert(block_id);
+    path.insert(block_id);
+    let result = structure_block_body(cfg, block_id, visited, path);
+    path.remove(&block_id);
+    result
+}
 
+fn structure_block_body(
+    cfg: &ControlFlowGraph,
+    block_id: BlockId,
+    visited: &mut BTreeSet<BlockId>,
+    path: &mut BTreeSet<BlockId>,
+) -> StructuredBlock {
     let block = &cfg.blocks[block_id];
 
     match block.successors.len() {
@@ -82,7 +101,7 @@ fn structure_from(
                     StructuredBlock::Goto(next),
                 ])
             } else {
-                let next_struct = structure_from(cfg, next, visited);
+                let next_struct = structure_from(cfg, next, visited, path);
                 StructuredBlock::Sequence(vec![
                     StructuredBlock::Basic(block_id),
                     next_struct,
@@ -99,7 +118,7 @@ fn structure_from(
 
             if true_returns && false_returns {
                 let (then_body, else_body, join) =
-                    structure_diamond(cfg, true_target, false_target, visited);
+                    structure_diamond(cfg, true_target, false_target, visited, path);
                 let if_node = StructuredBlock::IfThenElse {
                     condition_block: block_id,
                     then_body: Box::new(then_body),
@@ -107,37 +126,58 @@ fn structure_from(
                 };
                 join_into_sequence(if_node, join)
             } else if visited.contains(&true_target) && !visited.contains(&false_target) {
-                // Loop back-edge with the loop-body fall-through dead, exit
-                // through false_target. Express as `while (cond) { ... }`
-                // so emit produces the conditional exit; the previous code
-                // emitted `while (true) { goto true_target; }`, an infinite
-                // loop that lost the false_target exit entirely.
-                let body = structure_from(cfg, false_target, visited);
-                StructuredBlock::Sequence(vec![
-                    StructuredBlock::WhileLoop {
-                        condition_block: block_id,
-                        body: Box::new(StructuredBlock::Goto(true_target)),
-                    },
-                    body,
-                ])
+                let body = structure_from(cfg, false_target, visited, path);
+                if path.contains(&true_target) {
+                    // true_target is an ancestor on the active path → a real
+                    // back-edge. Express as `while (cond) { goto header; }` so
+                    // emit keeps the conditional exit through false_target.
+                    StructuredBlock::Sequence(vec![
+                        StructuredBlock::WhileLoop {
+                            condition_block: block_id,
+                            body: Box::new(StructuredBlock::Goto(true_target)),
+                        },
+                        body,
+                    ])
+                } else {
+                    // true_target is merely already-visited (a forward merge),
+                    // not a loop. `while (cond) { goto L; }` would be a
+                    // degenerate single-pass loop; emit the equivalent, clearer
+                    // `if (cond) goto L;` then fall through to false_target.
+                    StructuredBlock::Sequence(vec![
+                        StructuredBlock::IfThen {
+                            condition_block: block_id,
+                            then_body: Box::new(StructuredBlock::Goto(true_target)),
+                        },
+                        body,
+                    ])
+                }
             } else if !visited.contains(&true_target) && visited.contains(&false_target) {
-                // Mirror case: condition's *false* branch is the back-edge,
-                // exit through true_target on the next iteration. A
-                // `while (!cond)` would invert the printed expression, but
-                // we don't yet rewrite branch conditions; use DoWhileLoop
-                // so the conditional exit is preserved (the previous code
-                // built a `while (true) { goto false_target; }`).
-                let body = structure_from(cfg, true_target, visited);
-                StructuredBlock::Sequence(vec![
-                    StructuredBlock::DoWhileLoop {
-                        body: Box::new(StructuredBlock::Goto(false_target)),
+                if path.contains(&false_target) {
+                    // Mirror back-edge: the *false* branch loops back. Use
+                    // DoWhileLoop to preserve the conditional exit without
+                    // inverting the printed condition.
+                    let body = structure_from(cfg, true_target, visited, path);
+                    StructuredBlock::Sequence(vec![
+                        StructuredBlock::DoWhileLoop {
+                            body: Box::new(StructuredBlock::Goto(false_target)),
+                            condition_block: block_id,
+                        },
+                        body,
+                    ])
+                } else {
+                    // Forward merge on the false side: `if (cond) { <body> }
+                    // else goto L;`. The then-arm is the real fall-through
+                    // body; the else is the merge jump.
+                    let then_body = structure_from(cfg, true_target, visited, path);
+                    StructuredBlock::IfThenElse {
                         condition_block: block_id,
-                    },
-                    body,
-                ])
+                        then_body: Box::new(then_body),
+                        else_body: Box::new(StructuredBlock::Goto(false_target)),
+                    }
+                }
             } else {
                 let (then_body, else_body, join) =
-                    structure_diamond(cfg, true_target, false_target, visited);
+                    structure_diamond(cfg, true_target, false_target, visited, path);
                 let if_node = StructuredBlock::IfThenElse {
                     condition_block: block_id,
                     then_body: Box::new(then_body),
@@ -221,6 +261,7 @@ fn structure_diamond(
     true_target: BlockId,
     false_target: BlockId,
     parent_visited: &mut BTreeSet<BlockId>,
+    path: &mut BTreeSet<BlockId>,
 ) -> (StructuredBlock, StructuredBlock, Vec<StructuredBlock>) {
     let then_reach = collect_reachable(cfg, true_target, parent_visited);
     let else_reach = collect_reachable(cfg, false_target, parent_visited);
@@ -239,8 +280,8 @@ fn structure_diamond(
     }
     let mut then_visited = arm_blocked.clone();
     let mut else_visited = arm_blocked.clone();
-    let then_body = structure_from(cfg, true_target, &mut then_visited);
-    let else_body = structure_from(cfg, false_target, &mut else_visited);
+    let then_body = structure_from(cfg, true_target, &mut then_visited, path);
+    let else_body = structure_from(cfg, false_target, &mut else_visited, path);
 
     parent_visited.extend(&then_visited);
     parent_visited.extend(&else_visited);
@@ -249,7 +290,7 @@ fn structure_diamond(
         let then_body = strip_trailing_goto(then_body, j);
         let else_body = strip_trailing_goto(else_body, j);
         parent_visited.remove(&j);
-        let s = structure_from(cfg, j, parent_visited);
+        let s = structure_from(cfg, j, parent_visited, path);
         (then_body, else_body, vec![s])
     } else {
         (then_body, else_body, Vec::new())
@@ -379,6 +420,31 @@ mod tests {
             "loop with conditional back-edge must produce a While or DoWhile, not an unconditional Loop ({:?})", s);
         assert_eq!(infinite, 0,
             "unconditional Loop would lose the loop's exit-condition: {:?}", s);
+    }
+
+    #[test]
+    fn forward_merge_emits_if_goto_not_degenerate_while() {
+        // A: cbranch D else B ; B: cbranch D else C ; C: ret ; D: ret
+        // When structuring B, its true-target D is already *visited* (it is the
+        // join of A's diamond) but NOT on the active path — a forward merge,
+        // not a loop. The old code modeled every visited branch target as a
+        // `while (cond) { goto D; }` (a degenerate single-pass loop). With
+        // path-tracking it must instead be `if (cond) goto D;` — an IfThen — so
+        // no WhileLoop/DoWhileLoop appears anywhere in the structured form.
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1003)]),
+            lifted(0x1001, vec![cbranch(0x1001, 0x1003)]),
+            lifted(0x1002, vec![ret(0x1002)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        let whiles = count(&s, &|n| matches!(n, StructuredBlock::WhileLoop { .. }));
+        let dos = count(&s, &|n| matches!(n, StructuredBlock::DoWhileLoop { .. }));
+        let ifthens = count(&s, &|n| matches!(n, StructuredBlock::IfThen { .. }));
+        assert_eq!(whiles, 0, "forward merge must not become a while: {:?}", s);
+        assert_eq!(dos, 0, "forward merge must not become a do-while: {:?}", s);
+        assert!(ifthens >= 1, "forward-merge branch should be an IfThen goto: {:?}", s);
     }
 
     #[test]
