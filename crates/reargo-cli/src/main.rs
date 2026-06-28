@@ -76,6 +76,10 @@ enum Commands {
         /// Number of instructions to disassemble
         #[arg(short = 'n', long, default_value = "32")]
         count: usize,
+        /// Annotate referenced addresses inline (function / vtable class /
+        /// import / string) — like an IDA/Ghidra comment column.
+        #[arg(short = 'A', long)]
+        annotate: bool,
     },
     /// List registers for the binary's architecture
     Registers {
@@ -851,7 +855,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             start,
             count,
-        } => cmd_disasm(&file, start, count, cli.thumb),
+            annotate,
+        } => cmd_disasm(&file, start, count, cli.thumb, annotate),
         Commands::Registers { file } => cmd_registers(&file),
         Commands::Analyze { file } => cmd_analyze(&file),
         Commands::Functions { file } => cmd_functions(&file),
@@ -1191,7 +1196,7 @@ fn cmd_hexdump(
     Ok(())
 }
 
-fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool, annotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
     let arch = create_architecture_with_options(info.arch, thumb)?;
     let address = start.unwrap_or(info.entry_point);
@@ -1203,15 +1208,124 @@ fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Res
         address
     );
 
+    // For --annotate: a reloc map (vtable detection) + import map, built once.
+    let relocs: std::collections::BTreeMap<u64, u64> = if annotate {
+        std::fs::read(path)
+            .ok()
+            .map(|d| reargo_loader::elf_pointer_relocations(&d).into_iter().collect())
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+
     let instructions = arch.decode_linear(&info.memory, address, count)?;
     for insn in &instructions {
-        println!("{}", insn);
+        if annotate {
+            let mut notes: Vec<String> = Vec::new();
+            for a in addresses_in_insn(insn) {
+                if let Some(c) = short_classify_addr(&info, &relocs, a) {
+                    notes.push(format!("0x{:x}={}", a, c));
+                }
+            }
+            if notes.is_empty() {
+                println!("{}", insn);
+            } else {
+                println!("{}  ; {}", insn, notes.join(", "));
+            }
+        } else {
+            println!("{}", insn);
+        }
     }
 
     if instructions.is_empty() {
         println!("  (no instructions decoded at 0x{:x})", address);
     }
     Ok(())
+}
+
+/// Addresses an instruction references: its branch target plus any absolute
+/// `<hex>h` operands (rip-relative effective addresses / immediates as the
+/// formatter renders them).
+fn addresses_in_insn(insn: &reargo_arch::arch::DecodedInstruction) -> Vec<u64> {
+    let mut out = Vec::new();
+    if let Some(t) = insn.branch_target {
+        out.push(t);
+    }
+    // Parse `<hex>h]` tokens — hex addresses that close a memory operand
+    // `[...h]` (rip-relative effective addresses). Bare immediates like
+    // `sub rsp, 0A88h` (no closing `]`) are excluded; direct branch targets
+    // come from `branch_target` above.
+    let ops = &insn.operands;
+    let bytes = ops.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let s = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i + 1 < bytes.len()
+                && (bytes[i] == b'h' || bytes[i] == b'H')
+                && bytes[i + 1] == b']'
+                && i - s >= 4
+                && let Ok(v) = u64::from_str_radix(&ops[s..i], 16)
+                && !out.contains(&v)
+            {
+                out.push(v);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Short one-word classification of an address for inline disasm annotation.
+fn short_classify_addr(
+    info: &reargo_loader::BinaryInfo,
+    relocs: &std::collections::BTreeMap<u64, u64>,
+    addr: u64,
+) -> Option<String> {
+    // Import (PLT)?
+    for imp in &info.imports {
+        if imp.plt_address == addr {
+            return Some(format!("{}@plt", imp.name));
+        }
+    }
+    // vtable? base-8 -> type_info -> name.
+    let read_cstr = |a: u64| -> String {
+        let mut b = Vec::new();
+        for i in 0..160u64 {
+            match info.memory.read_byte(a + i) { Some(0) | None => break, Some(c) => b.push(c) }
+        }
+        String::from_utf8_lossy(&b).to_string()
+    };
+    if let Some(&rtti) = relocs.get(&addr.wrapping_sub(8))
+        && let Some(&name) = relocs.get(&rtti.wrapping_add(8))
+    {
+        let raw = read_cstr(name);
+        let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw))
+            .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+            .unwrap_or(raw);
+        return Some(format!("vtable[{}]", pretty));
+    }
+    // Section-based: code → fn, else a string or data.
+    let sec = info.sections.iter().find(|s| addr >= s.address && addr < s.address + s.size)?;
+    if sec.flags.contains(reargo_loader::SectionFlags::EXECUTE) {
+        return Some("fn".into());
+    }
+    // String?
+    let mut sb = Vec::new();
+    for i in 0..40u64 {
+        match info.memory.read_byte(addr + i) {
+            Some(b) if (0x20..0x7f).contains(&b) => sb.push(b),
+            _ => break,
+        }
+    }
+    if sb.len() >= 4 {
+        return Some(format!("\"{}\"", String::from_utf8_lossy(&sb)));
+    }
+    Some(format!("data:{}", sec.name))
 }
 
 fn cmd_registers(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
