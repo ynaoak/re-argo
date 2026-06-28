@@ -680,6 +680,13 @@ impl<'a> CEmitter<'a> {
                 };
                 Some(format!("{}();", call_name))
             }
+            OpCode::CallInd => {
+                // Indirect / virtual call: render the resolved target (a
+                // function pointer or `*(vtable+offset)` deref) so C++ virtual
+                // dispatch is visible instead of `call 0x0`.
+                let target = self.input_expr(func, op, 0);
+                Some(format!("(*{})();", target))
+            }
             OpCode::Return => {
                 let val = self.input_expr(func, op, 0);
                 Some(format!("return {};", val))

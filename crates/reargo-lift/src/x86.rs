@@ -483,13 +483,34 @@ impl X86Lifter {
                     ]),
                 });
                 seq_base += 1;
-                let target = insn.near_branch_target();
-                ops.push(PcodeOp {
-                    opcode: OpCode::Call,
-                    seq: seq(seq_base),
-                    output: None,
-                    inputs: SmallVec::from_slice(&[ram(target, ps)]),
-                });
+                // Direct `call rel` → Call to the resolved target. Indirect
+                // `call reg` / `call [mem]` (e.g. C++ virtual dispatch) →
+                // CallInd to the actual target operand, so the callee — a
+                // register or a `[vtable+offset]` deref — survives instead of
+                // collapsing to `call 0x0`.
+                use iced_x86::OpKind;
+                let is_direct = matches!(
+                    insn.op_kind(0),
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                );
+                if is_direct {
+                    let target = insn.near_branch_target();
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Call,
+                        seq: seq(seq_base),
+                        output: None,
+                        inputs: SmallVec::from_slice(&[ram(target, ps)]),
+                    });
+                } else {
+                    let target =
+                        self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                    ops.push(PcodeOp {
+                        opcode: OpCode::CallInd,
+                        seq: seq(seq_base),
+                        output: None,
+                        inputs: SmallVec::from_slice(&[target]),
+                    });
+                }
             }
 
             Ret => {
@@ -1471,6 +1492,37 @@ mod tests {
         assert_eq!(lifted.ops[0].opcode, OpCode::Load);
         assert_eq!(lifted.ops[1].opcode, OpCode::Copy);
         assert_eq!(lifted.ops[2].opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn lift_indirect_call_reg() {
+        // call rax = ff d0  -> CallInd with the register target (not Call 0x0)
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xff, 0xd0], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let call = lifted.ops.iter().find(|o| o.opcode == OpCode::CallInd).unwrap();
+        assert_eq!(call.inputs[0].offset, 0x00); // rax
+        assert!(!lifted.ops.iter().any(|o| o.opcode == OpCode::Call));
+    }
+
+    #[test]
+    fn lift_indirect_call_mem_vtable() {
+        // call [rax+0x10] = ff 50 10  -> CallInd through a Load of the slot
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xff, 0x50, 0x10], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Load));
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+
+    #[test]
+    fn lift_direct_call_still_call() {
+        // e8 rel32 stays a direct Call to the resolved target
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xe8, 0x00, 0x01, 0x00, 0x00], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Call));
+        assert!(!lifted.ops.iter().any(|o| o.opcode == OpCode::CallInd));
     }
 
     #[test]
