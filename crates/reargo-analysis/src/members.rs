@@ -198,6 +198,11 @@ fn subobject_ctors_raw(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(
     let mut pending: Option<u64> = None;
     // Last call target, for the factory pattern `call; mov [base+off], rax`.
     let mut last_call: Option<u64> = None;
+    // Registers currently aliasing the entry `this` (rdi on entry, + copies).
+    // A `call` while rdi still holds `this` is a base-class ctor (offset 0,
+    // no lea), which the lea-rdi pattern alone misses.
+    let mut this_aliases: std::collections::HashSet<Register> =
+        std::collections::HashSet::from([Register::RDI]);
     let mut out = Vec::new();
     let mut n = 0;
     while dec.can_decode() && n < max_insns {
@@ -225,6 +230,21 @@ fn subobject_ctors_raw(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(
                     && ii.memory_base() != Register::RIP =>
             {
                 pending = Some(ii.memory_displacement64());
+                this_aliases.remove(&Register::RDI); // rdi now = this+off
+            }
+            // Register-to-register move: propagate / clear the `this` alias.
+            iced_x86::Mnemonic::Mov
+                if ii.op0_register() != Register::None
+                    && ii.op1_register() != Register::None =>
+            {
+                if this_aliases.contains(&ii.op1_register()) {
+                    this_aliases.insert(ii.op0_register());
+                } else {
+                    this_aliases.remove(&ii.op0_register());
+                }
+                if ii.op0_register() == Register::RDI {
+                    pending = None;
+                }
             }
             iced_x86::Mnemonic::Call => {
                 last_call = if ii.near_branch_target() != 0 {
@@ -232,15 +252,25 @@ fn subobject_ctors_raw(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(
                 } else {
                     None
                 };
+                // Base-class ctor: rdi still holds `this` (offset 0).
+                if this_aliases.contains(&Register::RDI)
+                    && let Some(t) = last_call
+                {
+                    out.push((0, t));
+                }
                 if let Some(off) = pending.take()
                     && let Some(t) = last_call
                 {
                     out.push((off, t));
                 }
+                // Caller-saved regs clobbered across the call.
+                this_aliases.remove(&Register::RDI);
+                this_aliases.remove(&Register::RAX);
             }
             _ => {
                 if ii.op0_register() == Register::RDI {
                     pending = None;
+                    this_aliases.remove(&Register::RDI);
                 }
                 // rax clobbered by a non-call write ends the factory window.
                 if ii.op0_register() == Register::RAX && m != iced_x86::Mnemonic::Mov {
@@ -279,6 +309,24 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].0, 0x40); // offset
         assert_eq!(subs[0].1, 0x1009); // ctor target
+    }
+
+    #[test]
+    fn detects_base_class_ctor_at_offset0() {
+        // mov rbx, rdi      (save this)   = 48 89 fb
+        // mov rdi, rbx      (this -> rdi) = 48 89 df
+        // call rel32=0 (-> base ctor)     = e8 00 00 00 00  (target 0x100d)
+        // ret
+        let code = vec![
+            0x48, 0x89, 0xfb, // mov rbx,rdi
+            0x48, 0x89, 0xdf, // mov rdi,rbx
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (target = 0x1006+5 = 0x100b)
+            0xc3,
+        ];
+        let prog = make_x86_64_program(&code, 0x1000);
+        let subs = subobject_ctors(&prog.info, 0x1000, 16);
+        // base ctor recorded at offset 0
+        assert!(subs.iter().any(|(o, t)| *o == 0 && *t == 0x100b), "got {:?}", subs);
     }
 
     #[test]
