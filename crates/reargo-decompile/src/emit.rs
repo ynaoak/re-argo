@@ -683,9 +683,17 @@ impl<'a> CEmitter<'a> {
             OpCode::CallInd => {
                 // Indirect / virtual call: render the resolved target (a
                 // function pointer or `*(vtable+offset)` deref) so C++ virtual
-                // dispatch is visible instead of `call 0x0`.
+                // dispatch is visible instead of `call 0x0`. When the target is
+                // a `[obj_vtable + offset]` load, annotate the vtable index —
+                // the single most useful hint for C++ virtual-method RE.
                 let target = self.input_expr(func, op, 0);
-                Some(format!("(*{})();", target))
+                let ann = op
+                    .inputs
+                    .first()
+                    .and_then(|&t| self.vcall_vtable_offset(func, t))
+                    .map(|off| format!("  // vfn[{}] (vtable+0x{:x})", off / 8, off))
+                    .unwrap_or_default();
+                Some(format!("(*{})();{}", target, ann))
             }
             OpCode::Return => {
                 let val = self.input_expr(func, op, 0);
@@ -699,6 +707,37 @@ impl<'a> CEmitter<'a> {
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
             }
         }
+    }
+
+    /// If `target` (a CALLIND callee) is a Load of `[base + const]` — the
+    /// classic C++ virtual dispatch `*(this_vtable + vfn_offset)` — return the
+    /// constant byte offset into the vtable. Traces two SSA defs: the Load,
+    /// then the IntAdd that formed its address.
+    fn vcall_vtable_offset(&self, func: &SsaFunction, target: crate::ssa::VarId) -> Option<u64> {
+        let tvn = func.varnodes.get(target as usize)?;
+        let load = func.ops.get(tvn.def_op?)?;
+        if load.opcode != OpCode::Load || load.inputs.len() < 2 {
+            return None;
+        }
+        let avn = func.varnodes.get(load.inputs[1] as usize)?;
+        let add = func.ops.get(avn.def_op?)?;
+        if add.opcode != OpCode::IntAdd {
+            return None;
+        }
+        for &inp in add.inputs.iter() {
+            if let Some(v) = func.varnodes.get(inp as usize)
+                && v.data.space == SpaceId::CONST
+            {
+                let off = v.data.offset;
+                // A real vtable slot offset is small and pointer-aligned;
+                // anything else (e.g. `config_ptr + base`) is not a vfn index.
+                if off > 0 && off < 0x4000 && off % 8 == 0 {
+                    return Some(off);
+                }
+                return None;
+            }
+        }
+        None
     }
 
     fn input_expr(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, idx: usize) -> String {
