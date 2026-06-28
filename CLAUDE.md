@@ -27,6 +27,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Cross-references to/from an address" | `xrefs <bin> 0x401000` |
 | "Fast xref to an address on a HUGE binary (no full analysis)" | `xref-scan <bin> 0x401000` |
 | "Recover a C++ class name + vmethods from a vtable slot (PIE)" | `vtable <bin> 0x401000` |
+| "Find a function's entry from an interior address (no full analysis)" | `func-start <bin> 0x401000` |
 | "All call sites with resolved arguments" | `callsites <bin>` |
 | "Strings in the binary" | `strings <bin> --min-length 6` |
 | "Search for bytes or text" | `search <bin> --hex "48 8b ?? 24"` / `--text "password"` |
@@ -337,6 +338,18 @@ Decompile every discovered function in parallel. With `-o`, writes `<dir>/<name>
 Emit a DOT graph of a single function's basic-block control flow. Pipe to `dot -Tpng > out.png` or graphviz.com.
 
 ### References / call relationships
+
+#### `func-start <FILE> <ADDRESS> [--max-back N]`
+
+Find the entry of the function containing `ADDRESS` **without full analysis** — for huge stripped
+binaries where an arbitrary `carve --start` window bisects the function (it treats its own first byte
+as an entry). Backward-scans for a function boundary (`ret` / `int3` / `nop` padding) then verifies a
+clean linear decode from the candidate to `ADDRESS`, rejecting candidates whose path crosses a
+`ret`/unconditional-jump boundary. Prints the entry and a ready-to-run `carve --address` line.
+`--max-back` bounds the backward scan (default 8192). Heuristic — can mis-fire if a `0xC3`/`0xCC`/
+`0x90` byte sits mid-instruction; verify the prologue with `disasm` when in doubt. Pairs with
+`xref-scan` (find a reference site) → `func-start` (find its enclosing function) → `carve` +
+`decompile`.
 
 #### `xref-scan <FILE> <TARGET> [--limit N]`
 
