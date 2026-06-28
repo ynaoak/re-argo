@@ -81,11 +81,12 @@ fn linear_reaches(code: &[u8], start: u64, target: u64, bits: u32) -> bool {
         }
         ip = ii.next_ip();
         steps += 1;
-        if matches!(
-            ii.flow_control(),
-            FlowControl::Return | FlowControl::UnconditionalBranch
-        ) && ip <= target
-        {
+        // Only a `ret` is a definitive function boundary. Unconditional jumps
+        // are common *inside* a function (jump tables, loop back-edges, switch
+        // fallthrough), so rejecting on them makes large functions unfindable —
+        // accept them and rely on the `ret`-preceded entry + smallest-start
+        // selection to pick the true boundary.
+        if ii.flow_control() == FlowControl::Return && ip <= target {
             return false; // function boundary at/before target
         }
     }
@@ -112,6 +113,29 @@ mod tests {
         let prog = make_x86_64_program(&code, 0x1000);
         let start = find_function_start(&prog.info, 0x1005, 0x100).unwrap();
         assert_eq!(start, 0x1001, "entry is right after the preceding ret");
+    }
+
+    #[test]
+    fn finds_entry_across_internal_unconditional_jump() {
+        // A function with an internal `jmp` (loop back-edge / switch) must
+        // still be findable — the jmp is NOT a function boundary, only `ret` is.
+        // 0x1000: ret                         (prev fn end)
+        // 0x1001: xor eax,eax                 (entry)
+        // 0x1003: jmp +2 (to 0x1007)          (internal unconditional jump)
+        // 0x1005: int3; int3
+        // 0x1007: nop                         (query here)
+        // 0x1008: ret
+        let code = vec![
+            0xc3, // 0x1000 ret
+            0x31, 0xc0, // 0x1001 xor eax,eax
+            0xeb, 0x02, // 0x1003 jmp 0x1007
+            0xcc, 0xcc, // 0x1005 int3 pad
+            0x90, // 0x1007 nop  (query)
+            0xc3, // 0x1008 ret
+        ];
+        let prog = make_x86_64_program(&code, 0x1000);
+        let start = find_function_start(&prog.info, 0x1007, 0x100).unwrap();
+        assert_eq!(start, 0x1001, "internal jmp must not block finding the entry");
     }
 
     #[test]
