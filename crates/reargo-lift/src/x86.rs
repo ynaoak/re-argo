@@ -955,6 +955,72 @@ impl X86Lifter {
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
+            // CMOVcc dst, src: dst = cond ? src : dst. We have no select op and
+            // can't micro-branch inside one instruction, so use a branchless
+            // select: mask = -zext(cond) (0 → 0, 1 → all-ones), then
+            // dst = dst ^ ((dst ^ src) & mask). dst is read (preserved when the
+            // condition is false), so lifting it as a value is correct. Parity
+            // codes (no PF) leave dst unchanged.
+            Cmova | Cmovae | Cmovb | Cmovbe | Cmove | Cmovne | Cmovg | Cmovge
+            | Cmovl | Cmovle | Cmovo | Cmovno | Cmovs | Cmovns => {
+                if let Some(cond) =
+                    self.cc_condition(insn.condition_code(), &mut ops, &mut seq_base, address)
+                {
+                    let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                    let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                    // cond (1 byte) → width of dst.
+                    let cond_w = if dst.size == 1 {
+                        cond
+                    } else {
+                        let z = unique(0x4b0, dst.size);
+                        ops.push(PcodeOp {
+                            opcode: OpCode::IntZExt,
+                            seq: seq(seq_base),
+                            output: Some(z),
+                            inputs: SmallVec::from_slice(&[cond]),
+                        });
+                        seq_base += 1;
+                        z
+                    };
+                    // mask = -cond_w  (0 or all-ones)
+                    let mask = unique(0x4b4, dst.size);
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Int2Comp,
+                        seq: seq(seq_base),
+                        output: Some(mask),
+                        inputs: SmallVec::from_slice(&[cond_w]),
+                    });
+                    seq_base += 1;
+                    // diff = dst ^ src
+                    let diff = unique(0x4b8, dst.size);
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntXor,
+                        seq: seq(seq_base),
+                        output: Some(diff),
+                        inputs: SmallVec::from_slice(&[dst, src]),
+                    });
+                    seq_base += 1;
+                    // masked = diff & mask
+                    let masked = unique(0x4bc, dst.size);
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntAnd,
+                        seq: seq(seq_base),
+                        output: Some(masked),
+                        inputs: SmallVec::from_slice(&[diff, mask]),
+                    });
+                    seq_base += 1;
+                    // dst = dst ^ masked
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntXor,
+                        seq: seq(seq_base),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[dst, masked]),
+                    });
+                    seq_base += 1;
+                    self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
+                }
+            }
+
             // Parity-flag jumps are not modelled (no PF tracking yet);
             // emit a CallOther so the emulator surfaces the gap instead
             // of silently branching on whatever was in ZF.
@@ -1919,6 +1985,23 @@ mod tests {
         let sx = lifted.ops.iter().find(|o| o.opcode == OpCode::IntSExt).expect("IntSExt");
         assert_eq!(sx.output.unwrap().size, 8, "dest RAX is 8 bytes");
         assert_eq!(sx.inputs[0].size, 4, "src EAX is 4 bytes");
+    }
+
+    #[test]
+    fn lift_cmovcc_branchless_select_no_trap() {
+        // cmove rax, rcx = 48 0f 44 c1 -> rax = ZF ? rcx : rax
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0x48, 0x0f, 0x44, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther),
+            "cmovcc must be lifted, not CallOther: {:?}", l.ops);
+        // Branchless select shape: a 2COMP mask, an AND, and two XORs.
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Int2Comp), "mask = -cond");
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntAnd));
+        assert_eq!(l.ops.iter().filter(|o| o.opcode == OpCode::IntXor).count(), 2);
+        // Final op writes RAX (offset 0).
+        let last = l.ops.last().unwrap();
+        assert_eq!(last.opcode, OpCode::IntXor);
+        assert_eq!(last.output.unwrap().offset, 0x0, "result -> RAX");
     }
 
     #[test]
