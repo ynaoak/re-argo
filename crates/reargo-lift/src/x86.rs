@@ -463,26 +463,17 @@ impl X86Lifter {
             }
 
             Call => {
-                let sp = self.sp();
-                let ret_addr = address + insn.len() as u64;
-                ops.push(PcodeOp {
-                    opcode: OpCode::IntSub,
-                    seq: seq(seq_base),
-                    output: Some(sp),
-                    inputs: SmallVec::from_slice(&[sp, constant(ps as u64, ps)]),
-                });
-                seq_base += 1;
-                ops.push(PcodeOp {
-                    opcode: OpCode::Store,
-                    seq: seq(seq_base),
-                    output: None,
-                    inputs: SmallVec::from_slice(&[
-                        constant(RAM_SPACE.0 as u64, 4),
-                        sp,
-                        constant(ret_addr, ps),
-                    ]),
-                });
-                seq_base += 1;
+                // A `call` pushes the return address (sp -= 8) and the callee's
+                // `ret` pops it — net zero on sp from the *caller's* dataflow,
+                // which is all we model (callees are opaque). Emitting the
+                // push as `sp -= 8; *sp = ret_addr` and never restoring it (the
+                // callee's ret is a different function) desynced sp by 8 per
+                // call, corrupting every subsequent stack-local offset, and
+                // littered the decompile with `rsp = rsp - 8; *rsp = 0x...`
+                // return-address noise. So model the opaque call as net-zero on
+                // sp: no push. (The function's own Ret still pops the caller's
+                // return address from the entry sp.)
+                //
                 // Direct `call rel` → Call to the resolved target. Indirect
                 // `call reg` / `call [mem]` (e.g. C++ virtual dispatch) →
                 // CallInd to the actual target operand, so the callee — a
@@ -1717,10 +1708,12 @@ mod tests {
         // call rel32 = e8 10 00 00 00
         let mem = make_memory(&[0xe8, 0x10, 0x00, 0x00, 0x00], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(lifted.ops.len(), 3);
-        assert_eq!(lifted.ops[0].opcode, OpCode::IntSub);
-        assert_eq!(lifted.ops[1].opcode, OpCode::Store);
-        assert_eq!(lifted.ops[2].opcode, OpCode::Call);
+        // Opaque call is net-zero on sp (no return-address push): just the Call.
+        assert_eq!(lifted.ops.len(), 1);
+        assert_eq!(lifted.ops[0].opcode, OpCode::Call);
+        assert_eq!(lifted.ops[0].inputs[0].offset, 0x1015); // resolved target
+        // sp must NOT be touched by the call (no IntSub/Store).
+        assert!(!lifted.ops.iter().any(|o| o.opcode == OpCode::IntSub || o.opcode == OpCode::Store));
     }
 
     #[test]
