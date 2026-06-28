@@ -116,8 +116,10 @@ pub fn subobject_ctors(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(
     }
     let mut dec = Decoder::with_ip(info.bits, &buf, start, DecoderOptions::NONE);
     let mut ii = IcedInsn::default();
-    // Pending `lea rdi, [base+off]` not yet consumed by a call.
+    // Pending `lea rdi, [base+off]` not yet consumed by a call (in-place ctor).
     let mut pending: Option<u64> = None;
+    // Last call target, for the factory pattern `call; mov [base+off], rax`.
+    let mut last_call: Option<u64> = None;
     let mut out = Vec::new();
     let mut n = 0;
     while dec.can_decode() && n < max_insns {
@@ -126,7 +128,20 @@ pub fn subobject_ctors(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(
             break;
         }
         n += 1;
-        match ii.mnemonic() {
+        let m = ii.mnemonic();
+        // Factory pattern: a pointer member assigned the result of a call —
+        // `call make_X(); mov [base+off], rax`. Catches members like
+        // `obj+0x1B0 = makeSubObject()` that aren't constructed in place.
+        if m == iced_x86::Mnemonic::Mov
+            && ii.op0_kind() == OpKind::Memory
+            && ii.op1_register() == Register::RAX
+            && ii.memory_base() != Register::RIP
+            && ii.memory_base() != Register::RSP
+            && let Some(ctor) = last_call
+        {
+            out.push((ii.memory_displacement64(), ctor));
+        }
+        match m {
             iced_x86::Mnemonic::Lea
                 if ii.op0_register() == Register::RDI
                     && ii.memory_base() != Register::RIP =>
@@ -134,16 +149,24 @@ pub fn subobject_ctors(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(
                 pending = Some(ii.memory_displacement64());
             }
             iced_x86::Mnemonic::Call => {
+                last_call = if ii.near_branch_target() != 0 {
+                    Some(ii.near_branch_target())
+                } else {
+                    None
+                };
                 if let Some(off) = pending.take()
-                    && ii.near_branch_target() != 0
+                    && let Some(t) = last_call
                 {
-                    out.push((off, ii.near_branch_target()));
+                    out.push((off, t));
                 }
             }
             _ => {
-                // Any write to rdi other than the tracked lea invalidates it.
                 if ii.op0_register() == Register::RDI {
                     pending = None;
+                }
+                // rax clobbered by a non-call write ends the factory window.
+                if ii.op0_register() == Register::RAX && m != iced_x86::Mnemonic::Mov {
+                    last_call = None;
                 }
             }
         }
@@ -151,6 +174,8 @@ pub fn subobject_ctors(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(
             break;
         }
     }
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
