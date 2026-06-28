@@ -357,7 +357,10 @@ relocations, reads the RTTI `type_info`, demangles the class name, and lists the
 targets (with the queried slot marked). Works on a stripped PIE binary because the slots come from
 `.rela.dyn` addends, not the (zero) on-disk bytes. Reverse-lookup recipe to go from a class *name* to
 its vtable: `search --text <Name>` → mangled `type_info` name string → `xref-scan` that (gives
-`type_info+8`) → `xref-scan` the `type_info` (gives `vtable_base-8`) → `vtable <base>`.
+`type_info+8`) → `xref-scan` the `type_info` (gives `vtable_base-8`) → `vtable <base>`. Or skip the
+chase entirely: **`vtable <bin> --name <substr>`** scans the RTTI name strings, matches the
+demangled class name against the substring, and prints every matching class's vtable + vmethods in
+one shot (the address arg is optional when `--name` is given).
 
 #### `xrefs <FILE> <ADDRESS>`
 
