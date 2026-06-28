@@ -789,6 +789,16 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
+    /// Classify what an address is (no full analysis): code/data section, the
+    /// enclosing function entry, an import (PLT) name, a vtable + its class, a
+    /// type_info name, or a string. Unifies the navigation lookups.
+    Whatis {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Address to classify (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+    },
     /// Map an object's member layout from a constructor/method (no full analysis).
     ///
     /// Lists every `[reg + offset]` member access a function makes, grouped by
@@ -900,6 +910,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
         Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
         Commands::Classes { file, filter, limit } => cmd_classes(&file, filter.as_deref(), limit),
+        Commands::Whatis { file, address } => cmd_whatis(&file, address),
         Commands::Members { file, address, insns, base, sub, ctor } => cmd_members(&file, address, insns, base.as_deref(), sub, ctor),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
@@ -3879,6 +3890,84 @@ fn cmd_members(
             "  {:<6} +0x{:<7x} {:>5} {:>6} {:>4}  {}",
             m.base, m.offset, m.count, m.writes, m.lea, m.sample
         );
+    }
+    Ok(())
+}
+
+fn cmd_whatis(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    let info = BinaryLoader::load(path)?;
+    let data = std::fs::read(path)?;
+    println!("0x{:x}:", address);
+
+    // Section + perms.
+    if let Some(s) = info.sections.iter().find(|s| address >= s.address && address < s.address + s.size) {
+        let mut perms = String::new();
+        perms.push(if s.flags.contains(reargo_loader::SectionFlags::READ) { 'r' } else { '-' });
+        perms.push(if s.flags.contains(reargo_loader::SectionFlags::WRITE) { 'w' } else { '-' });
+        perms.push(if s.flags.contains(reargo_loader::SectionFlags::EXECUTE) { 'x' } else { '-' });
+        println!("  section: {} [{}]  (+0x{:x})", s.name, perms, address - s.address);
+        // Code → enclosing function entry.
+        if s.flags.contains(reargo_loader::SectionFlags::EXECUTE)
+            && let Some(e) = reargo_analysis::funcstart::find_function_start(&info, address, 8192)
+        {
+            println!("  in function: entry 0x{:x} (+0x{:x} in)", e, address - e);
+        }
+    } else {
+        println!("  section: (none — unmapped)");
+    }
+
+    // Import (PLT)?
+    for imp in &info.imports {
+        if imp.plt_address == address {
+            println!("  import: {} (PLT stub @0x{:x}, GOT 0x{:x})", imp.name, imp.plt_address, imp.got_address);
+        }
+    }
+
+    // String? (skip executable sections — instruction bytes look like text)
+    let in_exec = info.sections.iter().any(|s| {
+        s.flags.contains(reargo_loader::SectionFlags::EXECUTE)
+            && address >= s.address
+            && address < s.address + s.size
+    });
+    let mut sbytes = Vec::new();
+    if !in_exec {
+        for i in 0..64u64 {
+            match info.memory.read_byte(address + i) {
+                Some(b) if (0x20..0x7f).contains(&b) => sbytes.push(b),
+                _ => break,
+            }
+        }
+    }
+    if sbytes.len() >= 4 {
+        let s = String::from_utf8_lossy(&sbytes);
+        println!("  string: \"{}\"{}", s, if sbytes.len() == 64 { "..." } else { "" });
+        // A mangled type_info name string?
+        if (sbytes[0].is_ascii_digit() || sbytes[0] == b'N')
+            && let Some(d) = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", s))
+        {
+            println!("  type_info name for: {}", d.trim_start_matches("typeinfo name for "));
+        }
+    }
+
+    // vtable? base-8 is a RELATIVE reloc to a type_info whose +8 names the class.
+    let relocs: BTreeMap<u64, u64> =
+        reargo_loader::elf_pointer_relocations(&data).into_iter().collect();
+    let read_cstr = |a: u64| -> String {
+        let mut b = Vec::new();
+        for i in 0..200u64 {
+            match info.memory.read_byte(a + i) { Some(0) | None => break, Some(c) => b.push(c) }
+        }
+        String::from_utf8_lossy(&b).to_string()
+    };
+    if let Some(&rtti) = relocs.get(&address.wrapping_sub(8))
+        && let Some(&name) = relocs.get(&rtti.wrapping_add(8))
+    {
+        let raw = read_cstr(name);
+        let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw))
+            .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+            .unwrap_or(raw);
+        println!("  vtable for class: {}  (run `vtable {} 0x{:x}`)", pretty, path.display(), address);
     }
     Ok(())
 }
