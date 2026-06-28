@@ -811,6 +811,10 @@ enum Commands {
         /// Instead, show the sub-object construction map (offset -> ctor)
         #[arg(long)]
         sub: bool,
+        /// With --sub, keep only verified constructors (targets that set a
+        /// vtable pointer) — filters out plain method calls on sub-objects.
+        #[arg(long)]
+        ctor: bool,
     },
 }
 
@@ -896,7 +900,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
         Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
         Commands::Classes { file, filter, limit } => cmd_classes(&file, filter.as_deref(), limit),
-        Commands::Members { file, address, insns, base, sub } => cmd_members(&file, address, insns, base.as_deref(), sub),
+        Commands::Members { file, address, insns, base, sub, ctor } => cmd_members(&file, address, insns, base.as_deref(), sub, ctor),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3839,13 +3843,26 @@ fn cmd_members(
     insns: usize,
     base: Option<&str>,
     sub: bool,
+    ctor: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
     if sub {
         let subs = reargo_analysis::members::subobject_ctors(&info, address, insns);
-        println!("Sub-object constructors from 0x{:x} ({} found):", address, subs.len());
-        for (off, ctor) in &subs {
-            println!("  +0x{:<7x} -> ctor 0x{:x}", off, ctor);
+        println!("Sub-object construction map from 0x{:x} ({} found):", address, subs.len());
+        for (off, target) in &subs {
+            // With --ctor, verify whether the in-place target sets a vtable
+            // pointer (a real ctor) vs. is just a method called on the
+            // sub-object — disambiguating the lea-rdi pattern.
+            let tag = if ctor {
+                if reargo_analysis::members::sets_vptr_early(&info, *target) {
+                    "  [ctor: sets vptr]"
+                } else {
+                    "  [non-ctor: no vptr store — method or factory]"
+                }
+            } else {
+                ""
+            };
+            println!("  +0x{:<7x} -> 0x{:x}{}", off, target, tag);
         }
         return Ok(());
     }
