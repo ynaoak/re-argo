@@ -936,6 +936,25 @@ impl X86Lifter {
                 });
             }
 
+            // SETcc r/m8: dst byte = condition (0/1). Was unhandled → CallOther.
+            // Reuses the shared cc_condition flag formulas. Parity codes (no PF)
+            // fall back to writing 0.
+            Seta | Setae | Setb | Setbe | Sete | Setne | Setg | Setge | Setl | Setle
+            | Seto | Setno | Sets | Setns => {
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let cond = self
+                    .cc_condition(insn.condition_code(), &mut ops, &mut seq_base, address)
+                    .unwrap_or_else(|| constant(0, 1));
+                ops.push(PcodeOp {
+                    opcode: OpCode::Copy,
+                    seq: seq(seq_base),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[cond]),
+                });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
+            }
+
             // Parity-flag jumps are not modelled (no PF tracking yet);
             // emit a CallOther so the emulator surfaces the gap instead
             // of silently branching on whatever was in ZF.
@@ -1352,6 +1371,67 @@ impl X86Lifter {
         });
         *seq_base += 1;
         out
+    }
+
+    /// Evaluate an instruction's x86 condition code into a 1-byte boolean
+    /// varnode, reusing the same flag formulas as the Jcc arms. Returns None
+    /// for parity conditions (PF is not modelled) and `None`/unknown codes —
+    /// callers fall back (e.g. SETcc writes 0). Shared by SETcc/CMOVcc.
+    fn cc_condition(
+        &self,
+        cc: iced_x86::ConditionCode,
+        ops: &mut Vec<PcodeOp>,
+        seq_base: &mut u32,
+        address: u64,
+    ) -> Option<VarnodeData> {
+        use iced_x86::ConditionCode as C;
+        let bool_or = |a: VarnodeData, b: VarnodeData, off: u64, ops: &mut Vec<PcodeOp>, seq_base: &mut u32| {
+            let out = unique(off, 1);
+            ops.push(PcodeOp {
+                opcode: OpCode::BoolOr,
+                seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
+                output: Some(out),
+                inputs: SmallVec::from_slice(&[a, b]),
+            });
+            *seq_base += 1;
+            out
+        };
+        let (zf, cf, sf, of) = (
+            reg(ZF_OFFSET, 1),
+            reg(CF_OFFSET, 1),
+            reg(SF_OFFSET, 1),
+            reg(OF_OFFSET, 1),
+        );
+        Some(match cc {
+            C::e => zf,
+            C::ne => self.emit_not(zf, 0x490, ops, seq_base, address),
+            C::b => cf,
+            C::ae => self.emit_not(cf, 0x492, ops, seq_base, address),
+            C::s => sf,
+            C::ns => self.emit_not(sf, 0x494, ops, seq_base, address),
+            C::o => of,
+            C::no => self.emit_not(of, 0x496, ops, seq_base, address),
+            C::be => bool_or(cf, zf, 0x498, ops, seq_base),
+            C::a => {
+                let t = bool_or(cf, zf, 0x49a, ops, seq_base);
+                self.emit_not(t, 0x49c, ops, seq_base, address)
+            }
+            C::l => self.emit_sf_xor_of(ops, seq_base, address),
+            C::ge => {
+                let x = self.emit_sf_xor_of(ops, seq_base, address);
+                self.emit_not(x, 0x4a0, ops, seq_base, address)
+            }
+            C::le => {
+                let x = self.emit_sf_xor_of(ops, seq_base, address);
+                bool_or(zf, x, 0x4a2, ops, seq_base)
+            }
+            C::g => {
+                let x = self.emit_sf_xor_of(ops, seq_base, address);
+                let t = bool_or(zf, x, 0x4a4, ops, seq_base);
+                self.emit_not(t, 0x4a6, ops, seq_base, address)
+            }
+            _ => return None, // p / np (PF unmodelled) and None
+        })
     }
 
     /// BoolNegate helper: write `!src` into a unique at the given offset.
@@ -1839,6 +1919,23 @@ mod tests {
         let sx = lifted.ops.iter().find(|o| o.opcode == OpCode::IntSExt).expect("IntSExt");
         assert_eq!(sx.output.unwrap().size, 8, "dest RAX is 8 bytes");
         assert_eq!(sx.inputs[0].size, 4, "src EAX is 4 bytes");
+    }
+
+    #[test]
+    fn lift_setcc_writes_condition_byte() {
+        let lifter = X86Lifter::new_64();
+        // sete al = 0f 94 c0  -> AL = ZF
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x94, 0xc0], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        let cp = l.ops.iter().find(|o| o.opcode == OpCode::Copy).expect("Copy");
+        assert_eq!(cp.inputs[0].offset, ZF_OFFSET, "sete copies ZF");
+        assert_eq!(cp.output.unwrap().offset, 0x0, "into AL");
+        // setne al = 0f 95 c0  -> AL = !ZF (a BoolNegate appears)
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x95, 0xc0], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolNegate));
+        // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
     }
 
     #[test]
