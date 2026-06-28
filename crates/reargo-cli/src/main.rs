@@ -789,6 +789,26 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
+    /// Map an object's member layout from a constructor/method (no full analysis).
+    ///
+    /// Lists every `[reg + offset]` member access a function makes, grouped by
+    /// base register and offset (with write / lea / total counts). The `this`
+    /// pointer is a stable base register, so this reconstructs the object's
+    /// field layout — for resolving "what's at obj+0xNNN" that a decompiler's
+    /// struct recovery misses on large constructors.
+    Members {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Function entry address (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Max instructions to scan (default 400)
+        #[arg(long, default_value_t = 400)]
+        insns: usize,
+        /// Only show accesses through this base register (e.g. rbx)
+        #[arg(long)]
+        base: Option<String>,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -873,6 +893,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
         Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
         Commands::Classes { file, filter, limit } => cmd_classes(&file, filter.as_deref(), limit),
+        Commands::Members { file, address, insns, base } => cmd_members(&file, address, insns, base.as_deref()),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3805,6 +3826,30 @@ fn cmd_xref_scan(
     }
     if limit != 0 && hits.len() >= limit {
         println!("  ... (code hits stopped at --limit {}; pass --limit 0 for all)", limit);
+    }
+    Ok(())
+}
+
+fn cmd_members(
+    path: &Path,
+    address: u64,
+    insns: usize,
+    base: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    let all = reargo_analysis::members::member_accesses(&info, address, insns);
+    let want = base.map(|b| b.to_lowercase());
+    let rows: Vec<_> = all
+        .into_iter()
+        .filter(|m| want.as_ref().is_none_or(|b| &m.base == b))
+        .collect();
+    println!("Member accesses from 0x{:x} ({} distinct):", address, rows.len());
+    println!("  {:<6} {:<10} {:>5} {:>6} {:>4}  sample", "base", "offset", "total", "writes", "lea");
+    for m in &rows {
+        println!(
+            "  {:<6} +0x{:<7x} {:>5} {:>6} {:>4}  {}",
+            m.base, m.offset, m.count, m.writes, m.lea, m.sample
+        );
     }
     Ok(())
 }
