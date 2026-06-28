@@ -29,6 +29,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Recover a C++ class name + vmethods from a vtable slot (PIE)" | `vtable <bin> 0x401000` |
 | "Find a function's entry from an interior address (no full analysis)" | `func-start <bin> 0x401000` |
 | "List every C++ class in a stripped PIE binary (RTTI browser)" | `classes <bin> [--filter Foo]` |
+| "Classify what an address is (code/data/import/vtable/string)" | `whatis <bin> 0x401000` |
 | "Map an object's field layout from a constructor/method" | `members <bin> 0x401000 [--base rbx]` |
 | "All call sites with resolved arguments" | `callsites <bin>` |
 | "Strings in the binary" | `strings <bin> --min-length 6` |
@@ -354,6 +355,15 @@ construction map** (`offset -> ctor`): it detects both the in-place `lea rdi,[th
 and the factory `call make_X(); mov [base+off], rax` patterns, reconstructing the composition tree
 so you can find which sub-constructor owns a deep field and recurse. (Caveat: the `lea rdi; call`
 pattern can't distinguish a constructor from any other method called on the sub-object — verify.)
+
+#### `whatis <FILE> <ADDRESS>`
+
+Classify what an address is — **no full analysis** — by combining the navigation lookups into one
+answer: the containing section + `rwx` perms (and `+offset` into it); for code, the enclosing
+function entry (via `func-start`); an import (PLT) name; for a vtable (a `[base-8 -> type_info]`
+RELATIVE-reloc chain) the demangled class; a printable string; and a demangled `type_info` name
+string. The fast first question to ask about any unknown address before reaching for `vtable` /
+`func-start` / `imports` individually.
 
 #### `classes <FILE> [--filter SUBSTR] [--limit N]`
 
