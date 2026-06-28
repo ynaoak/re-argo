@@ -740,6 +740,20 @@ enum Commands {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    /// Recover the C++ vtable around an address (PIE, Itanium ABI).
+    ///
+    /// Given any address that is a vtable method slot (e.g. one found by
+    /// `xref-scan ... [PTRREL]`), walk to the vtable base, read the Itanium
+    /// RTTI type name (demangled), and list the virtual method targets.
+    /// Resolves the slots through RELATIVE relocations, so it works on a
+    /// stripped PIE binary where the pointers aren't in the on-disk bytes.
+    Vtable {
+        /// Path to the binary file
+        file: PathBuf,
+        /// An address inside the vtable (a method slot or the base) (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -821,6 +835,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Carve { file, address, start, end, size, format, output } =>
             cmd_carve(&file, address, start, end, size, &format, output.as_deref(), cli.thumb),
         Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
+        Commands::Vtable { file, address } => cmd_vtable(&file, address),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3737,6 +3752,80 @@ fn cmd_xref_scan(
     }
     if limit != 0 && hits.len() >= limit {
         println!("  ... (code hits stopped at --limit {}; pass --limit 0 for all)", limit);
+    }
+    Ok(())
+}
+
+fn cmd_vtable(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    let info = BinaryLoader::load(path)?;
+    let data = std::fs::read(path)?;
+    // slot_offset -> target, for every RELATIVE reloc (PIE pointer slots).
+    let relocs: BTreeMap<u64, u64> =
+        reargo_loader::elf_pointer_relocations(&data).into_iter().collect();
+    if relocs.is_empty() {
+        return Err("no RELATIVE relocations (not a PIE ELF?) — vtable recovery needs them".into());
+    }
+
+    let exec: Vec<(u64, u64)> = info
+        .sections
+        .iter()
+        .filter(|s| s.flags.contains(reargo_loader::SectionFlags::EXECUTE) && s.size > 0)
+        .map(|s| (s.address, s.address + s.size))
+        .collect();
+    let is_code = |a: u64| exec.iter().any(|(s, e)| a >= *s && a < *e);
+    let slot_to_code = |slot: u64| relocs.get(&slot).copied().filter(|t| is_code(*t));
+
+    // Walk back to the vtable base: the lowest consecutive 8-byte slot that
+    // still holds a code pointer. The slot just below the base (base-8) holds
+    // the RTTI type_info pointer (a data pointer), which stops the walk.
+    let mut base = address;
+    while slot_to_code(base.wrapping_sub(8)).is_some() {
+        base -= 8;
+    }
+
+    println!("vtable base:   0x{:x}", base);
+    if let Ok(off_top) = info.memory.read_u64(base.wrapping_sub(16)) {
+        println!("offset-to-top: {}", off_top as i64);
+    }
+
+    // RTTI: base-8 -> type_info; type_info+8 -> mangled name string.
+    if let Some(&rtti) = relocs.get(&base.wrapping_sub(8)) {
+        println!("RTTI type_info: 0x{:x}", rtti);
+        if let Some(&name_addr) = relocs.get(&rtti.wrapping_add(8)) {
+            let mut bytes = Vec::new();
+            for i in 0..256u64 {
+                match info.memory.read_byte(name_addr + i) {
+                    Some(0) | None => break,
+                    Some(b) => bytes.push(b),
+                }
+            }
+            let mangled = String::from_utf8_lossy(&bytes).to_string();
+            let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", mangled))
+                .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+                .unwrap_or_else(|| mangled.clone());
+            println!("class:         {}  (mangled type {})", pretty, mangled);
+        }
+    } else {
+        println!("RTTI type_info: (none — base-8 is not a relocation)");
+    }
+
+    // List virtual method slots from the base.
+    println!("methods:");
+    let mut idx = 0u64;
+    let mut slot = base;
+    while let Some(target) = slot_to_code(slot) {
+        let marker = if slot == address { "  <- queried" } else { "" };
+        println!("  [{:>3}] 0x{:016x} -> 0x{:x}{}", idx, slot, target, marker);
+        idx += 1;
+        slot += 8;
+        if idx >= 128 {
+            println!("  ... (stopped at 128)");
+            break;
+        }
+    }
+    if idx == 0 {
+        println!("  (no code-pointer slots at the base — is the address inside a vtable?)");
     }
     Ok(())
 }
