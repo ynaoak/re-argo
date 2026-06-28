@@ -28,6 +28,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Fast xref to an address on a HUGE binary (no full analysis)" | `xref-scan <bin> 0x401000` |
 | "Recover a C++ class name + vmethods from a vtable slot (PIE)" | `vtable <bin> 0x401000` |
 | "Find a function's entry from an interior address (no full analysis)" | `func-start <bin> 0x401000` |
+| "List every C++ class in a stripped PIE binary (RTTI browser)" | `classes <bin> [--filter Foo]` |
 | "All call sites with resolved arguments" | `callsites <bin>` |
 | "Strings in the binary" | `strings <bin> --min-length 6` |
 | "Search for bytes or text" | `search <bin> --hex "48 8b ?? 24"` / `--text "password"` |
@@ -338,6 +339,15 @@ Decompile every discovered function in parallel. With `-o`, writes `<dir>/<name>
 Emit a DOT graph of a single function's basic-block control flow. Pipe to `dot -Tpng > out.png` or graphviz.com.
 
 ### References / call relationships
+
+#### `classes <FILE> [--filter SUBSTR] [--limit N]`
+
+List every C++ class in a stripped **PIE** binary — a Ghidra-style RTTI class browser. Scans the
+RELATIVE relocations for Itanium `type_info` name strings, demangles them, and resolves each
+class's vtable address. `--filter` keeps only classes whose demangled name contains the substring;
+`--limit` caps the count (0 = all). Loader-only; inventories tens of thousands of classes in
+~1 s. Use it to locate any class instantly, then `vtable <base>` for its methods, or
+`vtable --name <substr>` for a single class's full vtable.
 
 #### `func-start <FILE> <ADDRESS> [--max-back N]`
 
