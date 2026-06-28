@@ -29,6 +29,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Recover a C++ class name + vmethods from a vtable slot (PIE)" | `vtable <bin> 0x401000` |
 | "Find a function's entry from an interior address (no full analysis)" | `func-start <bin> 0x401000` |
 | "List every C++ class in a stripped PIE binary (RTTI browser)" | `classes <bin> [--filter Foo]` |
+| "Map an object's field layout from a constructor/method" | `members <bin> 0x401000 [--base rbx]` |
 | "All call sites with resolved arguments" | `callsites <bin>` |
 | "Strings in the binary" | `strings <bin> --min-length 6` |
 | "Search for bytes or text" | `search <bin> --hex "48 8b ?? 24"` / `--text "password"` |
@@ -339,6 +340,16 @@ Decompile every discovered function in parallel. With `-o`, writes `<dir>/<name>
 Emit a DOT graph of a single function's basic-block control flow. Pipe to `dot -Tpng > out.png` or graphviz.com.
 
 ### References / call relationships
+
+#### `members <FILE> <ADDRESS> [--insns N] [--base REG]`
+
+Map an object's field layout from a constructor or method — **no full analysis**. Lists every
+`[reg + offset]` member access in the function, grouped by base register and offset, with total /
+write / lea counts and a sample instruction. A C++ `this` pointer is a stable base register, so this
+reconstructs the object's member layout (which offset holds which sub-object), filling the gap the
+decompiler's struct recovery leaves on large constructors. `--base rbx` filters to one register;
+scan stops at the first `ret` or `--insns` (default 400). Pairs with `vtable`/`classes` to resolve
+"what type is at obj+0xNNN" while tracing an object graph.
 
 #### `classes <FILE> [--filter SUBSTR] [--limit N]`
 
