@@ -152,15 +152,53 @@ impl X86Lifter {
             Nop | Endbr64 | Endbr32 => {}
 
             Mov => {
-                let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::Copy,
-                    seq: seq(seq_base),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[src]),
-                });
-                seq_base += 1;
-                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
+                use iced_x86::OpKind;
+                if insn.op_kind(0) == OpKind::Memory {
+                    // Write-only memory destination: compute the address ONCE
+                    // and STORE the source. Previously the destination was
+                    // lifted as a *value* (`lift_two_operands` → `lift_operand`
+                    // on the dest), which emitted a dead `LOAD [dst]` (its
+                    // result is immediately overwritten by the Copy) AND a first
+                    // address computation; `write_back_if_memory` then computed
+                    // the address a SECOND time for the Store. CSE merged the
+                    // two identical address temps, and the merged unique offset
+                    // collided with an unrelated earlier use of the same offset
+                    // — so e.g. `mov [rbx+8], 1` decompiled as a store to a
+                    // stale `rsp+0x30` temp. One address, one Store, no LOAD.
+                    let src_raw = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                    let dst_size = match insn.memory_size().size() as u32 {
+                        0 => self.ptr_size(),
+                        s => s,
+                    };
+                    let src = if src_raw.size != dst_size && src_raw.space == CONST_SPACE {
+                        constant(src_raw.offset, dst_size)
+                    } else {
+                        src_raw
+                    };
+                    let addr_vn =
+                        self.compute_memory_address(insn, &mut ops, &mut seq_base, address)?;
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Store,
+                        seq: seq(seq_base),
+                        output: None,
+                        inputs: SmallVec::from_slice(&[
+                            constant(RAM_SPACE.0 as u64, 4),
+                            addr_vn,
+                            src,
+                        ]),
+                    });
+                    seq_base += 1;
+                } else {
+                    let (dst, src) =
+                        self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Copy,
+                        seq: seq(seq_base),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[src]),
+                    });
+                    seq_base += 1;
+                }
             }
 
             Push => {
@@ -1602,6 +1640,38 @@ mod tests {
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
         assert_eq!(lifted.ops.len(), 1);
         assert_eq!(lifted.ops[0].opcode, OpCode::Copy);
+    }
+
+    #[test]
+    fn lift_mov_mem_dest_is_address_plus_store_no_dead_load() {
+        // mov byte ptr [rbx+8], 1 = c6 43 08 01
+        // A write-only memory destination must lift to exactly one address
+        // computation + one Store — NO LOAD of the destination (it would be
+        // dead) and NO duplicate address computation. The old path lifted the
+        // dest as a value (dead LOAD + 1st address) then wrote back (2nd
+        // address); CSE merged the two address temps and the merged unique
+        // offset collided with an unrelated earlier use, making the store look
+        // like it targeted a stale address in decompile output.
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0xc6, 0x43, 0x08, 0x01], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(
+            !lifted.ops.iter().any(|o| o.opcode == OpCode::Load),
+            "write-only mov destination must not emit a LOAD: {:?}",
+            lifted.ops
+        );
+        let adds = lifted.ops.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
+        let stores = lifted.ops.iter().filter(|o| o.opcode == OpCode::Store).count();
+        assert_eq!(adds, 1, "exactly one address computation: {:?}", lifted.ops);
+        assert_eq!(stores, 1, "exactly one store: {:?}", lifted.ops);
+        // The Store's address input is the IntAdd output (rbx+8), and the
+        // stored value is the 1-byte constant 1.
+        let add = lifted.ops.iter().find(|o| o.opcode == OpCode::IntAdd).unwrap();
+        let store = lifted.ops.iter().find(|o| o.opcode == OpCode::Store).unwrap();
+        assert_eq!(store.inputs[1].offset, add.output.unwrap().offset);
+        assert_eq!(store.inputs[2].space, CONST_SPACE);
+        assert_eq!(store.inputs[2].offset, 1);
+        assert_eq!(store.inputs[2].size, 1, "byte store width");
     }
 
     #[test]
