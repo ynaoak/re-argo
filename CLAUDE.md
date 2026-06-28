@@ -454,7 +454,7 @@ Range selection (pick exactly one):
 
 Output container (`--format`):
 
-* `elf` (default) — a minimal single-`.text` ELF placed at the original VA. Ghidra and re-argo both auto-detect arch + base, so the carved function round-trips with **zero manual setup**: `re-argo carve big --start 0x… --size N -o f.elf` then `re-argo decompile f.elf --address 0x…`. Emitted for any source arch (even a PE source), since Ghidra loads ELF for every architecture.
+* `elf` (default) — a minimal ELF placed at the original VA. Ghidra and re-argo both auto-detect arch + base, so the carved function round-trips with **zero manual setup**: `re-argo carve big --start 0x… --size N -o f.elf` then `re-argo decompile f.elf --address 0x…`. Emitted for any source arch (even a PE source), since Ghidra loads ELF for every architecture. For x86-64, the carve also **bundles the function's referenced read-only constant pool / jump tables** as extra `.rodataN` segments at their original VAs (coalesced, capped 256 KB), so float-constant resolution and other rodata-dependent analysis work on the carve without analysing the whole image — e.g. the BDS noise functions decompile with `f32 const 0.015625 (= 1/64)` annotations.
 * `raw` — the bytes verbatim; the command prints the Ghidra "Raw Binary" import parameters (SLEIGH language id + base address) to type into the import dialog.
 
 Default output path is `<file>.carved.<addr>.elf` (or `.bin` for `raw`). Use the fast `--start/--size` form on multi-hundred-MB binaries — it never runs the analysis pipeline, only the loader. The `--address`-only form must analyse the whole binary to find the function's extent.
