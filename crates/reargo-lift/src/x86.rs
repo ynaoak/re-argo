@@ -375,6 +375,58 @@ impl X86Lifter {
                 seq_base += 1;
             }
 
+            Div | Idiv => {
+                // (I)DIV r/m: quotient → A-reg, remainder → D-reg. The true
+                // dividend is the D:A pair (128/64/32-bit); compiler code sets
+                // D = sign/zero extension of A (via cqo/cdq or xor edx,edx), so
+                // we model the dividend as the accumulator alone — quotient and
+                // remainder both derive from the *old* accumulator. Unhandled,
+                // this dropped to CallOther → trap. One explicit operand: the
+                // divisor.
+                use iced_x86::Register as R;
+                let signed = insn.mnemonic() == Idiv;
+                let src = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let (acc_r, hi_r) = match src.size {
+                    8 => (R::RAX, R::RDX),
+                    4 => (R::EAX, R::EDX),
+                    2 => (R::AX, R::DX),
+                    _ => (R::AL, R::AH), // byte form: dividend AX, quot AL, rem AH
+                };
+                let acc = iced_reg_to_varnode(acc_r).unwrap_or_else(|| constant(0, ps));
+                let hi = iced_reg_to_varnode(hi_r).unwrap_or_else(|| constant(0, ps));
+                let old = unique(0x740, acc.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::Copy,
+                    seq: seq(seq_base),
+                    output: Some(old),
+                    inputs: SmallVec::from_slice(&[acc]),
+                });
+                seq_base += 1;
+                let (div_op, rem_op) = if signed {
+                    (OpCode::IntSDiv, OpCode::IntSRem)
+                } else {
+                    (OpCode::IntDiv, OpCode::IntRem)
+                };
+                ops.push(PcodeOp {
+                    opcode: div_op,
+                    seq: seq(seq_base),
+                    output: Some(acc),
+                    inputs: SmallVec::from_slice(&[old, src]),
+                });
+                seq_base += 1;
+                // Remainder to the D register (skip for the byte form, whose AH
+                // high-byte varnode may be unavailable in the register map).
+                if src.size >= 2 {
+                    ops.push(PcodeOp {
+                        opcode: rem_op,
+                        seq: seq(seq_base),
+                        output: Some(hi),
+                        inputs: SmallVec::from_slice(&[old, src]),
+                    });
+                    seq_base += 1;
+                }
+            }
+
             Imul => {
                 if insn.op_count() >= 2 {
                     let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
@@ -1787,6 +1839,25 @@ mod tests {
         let sx = lifted.ops.iter().find(|o| o.opcode == OpCode::IntSExt).expect("IntSExt");
         assert_eq!(sx.output.unwrap().size, 8, "dest RAX is 8 bytes");
         assert_eq!(sx.inputs[0].size, 4, "src EAX is 4 bytes");
+    }
+
+    #[test]
+    fn lift_div_idiv_quotient_eax_remainder_edx() {
+        let lifter = X86Lifter::new_64();
+        // div ecx = f7 f1  -> EAX = EAX / ECX (unsigned), EDX = EAX % ECX
+        let lifted = lifter.lift_instruction(&make_memory(&[0xf7, 0xf1], 0x1000), 0x1000).unwrap();
+        assert!(!lifted.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        let q = lifted.ops.iter().find(|o| o.opcode == OpCode::IntDiv).expect("IntDiv");
+        let r = lifted.ops.iter().find(|o| o.opcode == OpCode::IntRem).expect("IntRem");
+        assert_eq!(q.output.unwrap().offset, 0x0, "quotient -> EAX");
+        assert_eq!(r.output.unwrap().offset, 0x10, "remainder -> EDX");
+        // quotient and remainder both derive from the SAME saved-old dividend.
+        assert_eq!(q.inputs[0].offset, r.inputs[0].offset);
+
+        // idiv ecx = f7 f9  -> signed variants.
+        let lifted = lifter.lift_instruction(&make_memory(&[0xf7, 0xf9], 0x1000), 0x1000).unwrap();
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::IntSDiv));
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::IntSRem));
     }
 
     #[test]
