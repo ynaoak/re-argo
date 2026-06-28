@@ -723,6 +723,23 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Fast cross-reference scan to an address WITHOUT full analysis.
+    ///
+    /// Linear-disassembles the executable sections and reports every
+    /// instruction whose resolved operand points at TARGET: rip-relative
+    /// memory refs, direct call/jmp targets, and absolute immediates.
+    /// Scales to multi-hundred-MB binaries where `xrefs` (which needs the
+    /// full analysis pipeline) is impractical.
+    XrefScan {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Target address to find references to (hex)
+        #[arg(value_parser = parse_hex)]
+        target: u64,
+        /// Maximum hits to report (0 = unlimited)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -803,6 +820,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
         Commands::Carve { file, address, start, end, size, format, output } =>
             cmd_carve(&file, address, start, end, size, &format, output.as_deref(), cli.thumb),
+        Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3678,6 +3696,26 @@ fn read_va_span(info: &reargo_loader::BinaryInfo, start: u64, end: u64) -> Vec<u
         }
     }
     out
+}
+
+fn cmd_xref_scan(
+    path: &Path,
+    target: u64,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    let hits = reargo_analysis::xref_scan::scan_xrefs(&info, target, limit);
+    println!("References to 0x{:x} ({} found):", target, hits.len());
+    if hits.is_empty() {
+        println!("  (none — not an x86 image, target unmapped, or no direct reference)");
+    }
+    for h in &hits {
+        println!("  0x{:016x} [{}] {}", h.addr, h.kind.label(), h.text);
+    }
+    if limit != 0 && hits.len() >= limit {
+        println!("  ... (stopped at --limit {}; pass --limit 0 for all)", limit);
+    }
+    Ok(())
 }
 
 /// Collect the read-only constant-pool / jump-table regions a carved x86-64
