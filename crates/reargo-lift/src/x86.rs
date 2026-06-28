@@ -304,11 +304,21 @@ impl X86Lifter {
                     }
                     And | Or | Xor => {
                         // Logical ops set ZF/SF from the result and clear
-                        // CF/OF unconditionally (x86 manual). Shifts have
-                        // CF/OF semantics that depend on the count and are
-                        // intentionally not modelled here yet.
+                        // CF/OF unconditionally (x86 manual).
                         self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
                         self.emit_clear_cf_of(&mut ops, &mut seq_base, address);
+                    }
+                    Shl | Shr | Sar => {
+                        // Shifts set ZF/SF/PF from the result; only CF/OF are
+                        // count-dependent (CF = last bit shifted out, OF for
+                        // 1-bit shifts) and remain unmodelled. Previously ZF/SF
+                        // were skipped entirely, so `shr rcx, 0x20; je L` read a
+                        // stale ZF from an earlier op (e.g. the prologue
+                        // `sub rsp, N`) and decompiled as `if (rsp == 0)`.
+                        // (Strictly, a masked count of 0 leaves flags unchanged;
+                        // that rare case is not modelled — setting ZF/SF from the
+                        // result is correct for every non-zero shift.)
+                        self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
                     }
                     _ => {}
                 }
@@ -497,6 +507,48 @@ impl X86Lifter {
                     seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
+            // Accumulator sign-extension (no explicit operands). CBW/CWDE/CDQE
+            // widen AL→AX→EAX→RAX in place; previously these dropped to an
+            // opaque CallOther → `__builtin_trap()` mid-function, severing the
+            // dataflow (e.g. the `cdqe` in the BE noise sampler's index calc).
+            Cbw | Cwde | Cdqe => {
+                use iced_x86::Register as R;
+                let (dst_r, src_r) = match insn.mnemonic() {
+                    Cbw => (R::AX, R::AL),
+                    Cwde => (R::EAX, R::AX),
+                    _ => (R::RAX, R::EAX), // Cdqe
+                };
+                let dst = iced_reg_to_varnode(dst_r).unwrap_or_else(|| constant(0, ps));
+                let src = iced_reg_to_varnode(src_r).unwrap_or_else(|| constant(0, ps));
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntSExt,
+                    seq: seq(seq_base),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
+            // Sign-extend the accumulator into the D register: CWD/CDQ/CQO fill
+            // (D)X/EDX/RDX with the sign bit of (A)X/EAX/RAX, the standard
+            // idiom before `idiv`. Modeled as an arithmetic right shift of the
+            // accumulator by (width-1), which broadcasts the sign bit.
+            Cwd | Cdq | Cqo => {
+                use iced_x86::Register as R;
+                let (acc_r, hi_r, width) = match insn.mnemonic() {
+                    Cwd => (R::AX, R::DX, 16u64),
+                    Cdq => (R::EAX, R::EDX, 32u64),
+                    _ => (R::RAX, R::RDX, 64u64), // Cqo
+                };
+                let acc = iced_reg_to_varnode(acc_r).unwrap_or_else(|| constant(0, ps));
+                let hi = iced_reg_to_varnode(hi_r).unwrap_or_else(|| constant(0, ps));
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntSRight,
+                    seq: seq(seq_base),
+                    output: Some(hi),
+                    inputs: SmallVec::from_slice(&[acc, constant(width - 1, 4)]),
                 });
             }
 
@@ -1672,6 +1724,43 @@ mod tests {
         assert_eq!(store.inputs[2].space, CONST_SPACE);
         assert_eq!(store.inputs[2].offset, 1);
         assert_eq!(store.inputs[2].size, 1, "byte store width");
+    }
+
+    #[test]
+    fn lift_cdqe_is_sign_extend_not_trap() {
+        // cdqe = 48 98  -> RAX = sext(EAX); must not be an opaque CallOther.
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x48, 0x98], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(!lifted.ops.iter().any(|o| o.opcode == OpCode::CallOther),
+            "cdqe must be lifted, not dropped to CallOther: {:?}", lifted.ops);
+        let sx = lifted.ops.iter().find(|o| o.opcode == OpCode::IntSExt).expect("IntSExt");
+        assert_eq!(sx.output.unwrap().size, 8, "dest RAX is 8 bytes");
+        assert_eq!(sx.inputs[0].size, 4, "src EAX is 4 bytes");
+    }
+
+    #[test]
+    fn lift_cqo_fills_rdx_with_sign() {
+        // cqo = 48 99  -> RDX = RAX >>s 63 (broadcast sign bit).
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x48, 0x99], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let sr = lifted.ops.iter().find(|o| o.opcode == OpCode::IntSRight).expect("IntSRight");
+        assert_eq!(sr.inputs[1].space, CONST_SPACE);
+        assert_eq!(sr.inputs[1].offset, 63);
+    }
+
+    #[test]
+    fn lift_shr_sets_zf_from_result() {
+        // shr rcx, 0x20 = 48 c1 e9 20 -> the shift result must drive ZF so a
+        // following `je` tests the shifted value, not a stale earlier flag.
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x48, 0xc1, 0xe9, 0x20], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let zf = lifted.ops.iter().find(|o| {
+            o.opcode == OpCode::IntEqual && o.output.is_some_and(|v| v.offset == ZF_OFFSET)
+        });
+        assert!(zf.is_some(), "shr must set ZF from its result: {:?}", lifted.ops);
     }
 
     #[test]
