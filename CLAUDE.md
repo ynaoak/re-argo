@@ -349,7 +349,11 @@ write / lea counts and a sample instruction. A C++ `this` pointer is a stable ba
 reconstructs the object's member layout (which offset holds which sub-object), filling the gap the
 decompiler's struct recovery leaves on large constructors. `--base rbx` filters to one register;
 scan stops at the first `ret` or `--insns` (default 400). Pairs with `vtable`/`classes` to resolve
-"what type is at obj+0xNNN" while tracing an object graph.
+"what type is at obj+0xNNN" while tracing an object graph. `--sub` instead reports the **sub-object
+construction map** (`offset -> ctor`): it detects both the in-place `lea rdi,[this+off]; call ctor`
+and the factory `call make_X(); mov [base+off], rax` patterns, reconstructing the composition tree
+so you can find which sub-constructor owns a deep field and recurse. (Caveat: the `lea rdi; call`
+pattern can't distinguish a constructor from any other method called on the sub-object — verify.)
 
 #### `classes <FILE> [--filter SUBSTR] [--limit N]`
 
