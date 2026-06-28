@@ -40,34 +40,41 @@ pub fn find_function_start(info: &BinaryInfo, addr: u64, max_back: u64) -> Optio
         }
     }
 
-    // A position `p` is the function entry iff (a) the byte before it ends a
-    // function (ret/retf/int3/nop padding) — or it's the section start — and
-    // (b) a linear decode p->addr is clean with no function boundary in
-    // between. The true entry is the SMALLEST such `p` (earliest contiguous
-    // body preceded by a boundary). Scan from addr downward, keep the smallest.
-    let mut best: Option<u64> = None;
+    // PRIMARY: the closest position `p` <= addr that is (a) preceded by a
+    // function boundary (ret/retf/int3/nop or section start) and (b) begins
+    // with a recognisable prologue. This is robust to *early-return* functions
+    // (multiple `ret`s) — which defeat a clean-linear-decode test — and to
+    // intervening functions (the closest such `p` is the enclosing entry).
     let mut p = addr;
-    // Track the smallest valid candidate, and (preferentially) the smallest
-    // valid candidate that *begins with a recognisable prologue* — a real
-    // entry almost always starts with `push rbp/rbx/r12-r15`, `endbr64`, or
-    // `sub rsp`, which rejects mid-function false positives (e.g. a candidate
-    // starting `mov rbp,[rbx+0x28]` preceded by a coincidental 0x90/0xc3 byte).
-    let mut best_prologue: Option<u64> = None;
     loop {
         let off = (p - lo) as usize;
         let prev_is_boundary = off == 0 || matches!(buf[off - 1], 0xC3 | 0xCB | 0xCC | 0x90);
-        if prev_is_boundary && linear_reaches(&buf[off..], p, addr, bits) {
-            best = Some(p);
-            if starts_with_prologue(&buf[off..]) {
-                best_prologue = Some(p);
-            }
+        if prev_is_boundary && starts_with_prologue(&buf[off..]) {
+            return Some(p);
         }
         if p == lo {
             break;
         }
         p -= 1;
     }
-    best_prologue.or(best)
+
+    // FALLBACK (functions whose entry isn't a textbook prologue): the smallest
+    // candidate preceded by a boundary whose linear decode reaches `addr`
+    // cleanly with no intervening function boundary.
+    let mut best: Option<u64> = None;
+    let mut p = addr;
+    loop {
+        let off = (p - lo) as usize;
+        let prev_is_boundary = off == 0 || matches!(buf[off - 1], 0xC3 | 0xCB | 0xCC | 0x90);
+        if prev_is_boundary && linear_reaches(&buf[off..], p, addr, bits) {
+            best = Some(p);
+        }
+        if p == lo {
+            break;
+        }
+        p -= 1;
+    }
+    best
 }
 
 /// Does `code` begin with a typical x86-64 function prologue? Used to prefer a
