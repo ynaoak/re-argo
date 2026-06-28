@@ -773,6 +773,22 @@ enum Commands {
         #[arg(long, default_value_t = 8192)]
         max_back: u64,
     },
+    /// List every C++ class in a PIE binary (RTTI class inventory).
+    ///
+    /// Scans the RELATIVE relocations for Itanium `type_info` name strings,
+    /// demangles them, and resolves each class's vtable address — a
+    /// Ghidra-style class browser that works on a stripped PIE binary. Filter
+    /// with `--filter <substr>`.
+    Classes {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Only classes whose demangled name contains this substring
+        #[arg(long)]
+        filter: Option<String>,
+        /// Max classes to print (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -856,6 +872,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
         Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
         Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
+        Commands::Classes { file, filter, limit } => cmd_classes(&file, filter.as_deref(), limit),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3788,6 +3805,84 @@ fn cmd_xref_scan(
     }
     if limit != 0 && hits.len() >= limit {
         println!("  ... (code hits stopped at --limit {}; pass --limit 0 for all)", limit);
+    }
+    Ok(())
+}
+
+fn cmd_classes(
+    path: &Path,
+    filter: Option<&str>,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let info = BinaryLoader::load(path)?;
+    let data = std::fs::read(path)?;
+    let relocs: BTreeMap<u64, u64> =
+        reargo_loader::elf_pointer_relocations(&data).into_iter().collect();
+    if relocs.is_empty() {
+        return Err("no RELATIVE relocations (not a PIE ELF?) — RTTI inventory needs them".into());
+    }
+    let exec: Vec<(u64, u64)> = info
+        .sections
+        .iter()
+        .filter(|s| s.flags.contains(reargo_loader::SectionFlags::EXECUTE) && s.size > 0)
+        .map(|s| (s.address, s.address + s.size))
+        .collect();
+    let is_code = |a: u64| exec.iter().any(|(s, e)| a >= *s && a < *e);
+    let read_cstr = |addr: u64| -> String {
+        let mut bytes = Vec::new();
+        for i in 0..256u64 {
+            match info.memory.read_byte(addr + i) {
+                Some(0) | None => break,
+                Some(b) => bytes.push(b),
+            }
+        }
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    let mut reverse: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (slot, target) in &relocs {
+        reverse.entry(*target).or_default().push(*slot);
+    }
+
+    // (class name, vtable base). A type_info name string is the target of a
+    // reloc at `type_info+8`; the vtable's `base-8` slot points at type_info.
+    let mut classes: BTreeSet<(String, u64)> = BTreeSet::new();
+    let filt = filter.map(|f| f.to_lowercase());
+    for (slot, target) in &relocs {
+        if is_code(*target) {
+            continue;
+        }
+        let raw = read_cstr(*target);
+        if raw.len() < 3 || !raw.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'N') {
+            continue;
+        }
+        let pretty = match reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw)) {
+            Some(s) => s.trim_start_matches("typeinfo name for ").to_string(),
+            None => continue,
+        };
+        if let Some(f) = &filt
+            && !pretty.to_lowercase().contains(f)
+        {
+            continue;
+        }
+        let type_info = slot.wrapping_sub(8);
+        if let Some(refs) = reverse.get(&type_info) {
+            for &r in refs {
+                let base = r.wrapping_add(8);
+                if relocs.get(&base).copied().is_some_and(is_code) {
+                    classes.insert((pretty.clone(), base));
+                }
+            }
+        }
+    }
+
+    println!("C++ classes ({} found):", classes.len());
+    for (i, (name, base)) in classes.iter().enumerate() {
+        if limit != 0 && i >= limit {
+            println!("  ... ({} more; raise --limit)", classes.len() - i);
+            break;
+        }
+        println!("  0x{:016x}  {}", base, name);
     }
     Ok(())
 }
