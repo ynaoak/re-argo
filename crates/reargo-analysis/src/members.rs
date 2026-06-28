@@ -95,10 +95,88 @@ pub fn member_accesses(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<M
     out
 }
 
+/// Sub-object constructor map: detect `lea rdi, [base + offset]` (the SysV
+/// `this` argument) shortly followed by a `call <target>` — the canonical C++
+/// "construct a member/base sub-object at `offset`" pattern. Returns
+/// `(offset, ctor_target)` pairs, which reconstruct the composition tree and
+/// let you find which sub-constructor owns a deep field (e.g. `obj+0x1B0`).
+pub fn subobject_ctors(info: &BinaryInfo, start: u64, max_insns: usize) -> Vec<(u64, u64)> {
+    if !matches!(
+        info.arch,
+        reargo_loader::Architecture::X86_64 | reargo_loader::Architecture::X86
+    ) {
+        return Vec::new();
+    }
+    let cap = max_insns.saturating_mul(15).max(64);
+    let mut buf = vec![0u8; cap];
+    for (i, b) in buf.iter_mut().enumerate() {
+        if let Some(v) = info.memory.read_byte(start + i as u64) {
+            *b = v;
+        }
+    }
+    let mut dec = Decoder::with_ip(info.bits, &buf, start, DecoderOptions::NONE);
+    let mut ii = IcedInsn::default();
+    // Pending `lea rdi, [base+off]` not yet consumed by a call.
+    let mut pending: Option<u64> = None;
+    let mut out = Vec::new();
+    let mut n = 0;
+    while dec.can_decode() && n < max_insns {
+        dec.decode_out(&mut ii);
+        if ii.is_invalid() {
+            break;
+        }
+        n += 1;
+        match ii.mnemonic() {
+            iced_x86::Mnemonic::Lea
+                if ii.op0_register() == Register::RDI
+                    && ii.memory_base() != Register::RIP =>
+            {
+                pending = Some(ii.memory_displacement64());
+            }
+            iced_x86::Mnemonic::Call => {
+                if let Some(off) = pending.take()
+                    && ii.near_branch_target() != 0
+                {
+                    out.push((off, ii.near_branch_target()));
+                }
+            }
+            _ => {
+                // Any write to rdi other than the tracked lea invalidates it.
+                if ii.op0_register() == Register::RDI {
+                    pending = None;
+                }
+            }
+        }
+        if ii.flow_control() == iced_x86::FlowControl::Return {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::helpers::make_x86_64_program;
+
+    #[test]
+    fn finds_subobject_ctors() {
+        // lea rdi, [rbx+0x40]   = 48 8d 7b 40
+        // call +0 (0x100c)      = e8 00 00 00 00
+        // ret
+        // lea rdi,[rbx+0x40] (4 bytes @0x1000) ; call rel32=0 (5 bytes @0x1004,
+        // target = 0x1004+5 = 0x1009) ; ret
+        let code = vec![
+            0x48, 0x8d, 0x7b, 0x40, // lea rdi,[rbx+0x40]
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call 0x1009
+            0xc3,
+        ];
+        let prog = make_x86_64_program(&code, 0x1000);
+        let subs = subobject_ctors(&prog.info, 0x1000, 16);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].0, 0x40); // offset
+        assert_eq!(subs[0].1, 0x1009); // ctor target
+    }
 
     #[test]
     fn finds_member_writes_and_lea() {
