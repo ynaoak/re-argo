@@ -759,6 +759,20 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Find the entry of the function containing an interior address — without
+    /// full analysis. Backward-scans for a function boundary (ret/int3/nop
+    /// padding) then verifies a clean linear decode to the address. Fixes the
+    /// "carve window bisects the function" problem on huge stripped binaries.
+    FuncStart {
+        /// Path to the binary file
+        file: PathBuf,
+        /// An address inside the function (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Max bytes to scan backward (default 8192)
+        #[arg(long, default_value_t = 8192)]
+        max_back: u64,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -841,6 +855,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             cmd_carve(&file, address, start, end, size, &format, output.as_deref(), cli.thumb),
         Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
         Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
+        Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -3716,6 +3731,22 @@ fn read_va_span(info: &reargo_loader::BinaryInfo, start: u64, end: u64) -> Vec<u
         }
     }
     out
+}
+
+fn cmd_funcstart(path: &Path, address: u64, max_back: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    match reargo_analysis::funcstart::find_function_start(&info, address, max_back) {
+        Some(entry) => {
+            println!("function entry: 0x{:x}  (size to 0x{:x} = {} bytes)", entry, address, address - entry);
+            println!("carve it:  re-argo carve {} --address 0x{:x}", path.display(), entry);
+            println!("  (or:     re-argo carve {} --start 0x{:x} --size <N>)", path.display(), entry);
+        }
+        None => println!(
+            "no function boundary found within {} bytes before 0x{:x} (try a larger --max-back, or 0x{:x} is the entry)",
+            max_back, address, address
+        ),
+    }
+    Ok(())
 }
 
 fn cmd_xref_scan(
