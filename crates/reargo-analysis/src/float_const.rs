@@ -122,6 +122,35 @@ impl Analyzer for FloatConstantAnalyzer {
     }
 }
 
+/// Decode `code` (placed at virtual address `base`, `bits` = 32/64) and return
+/// every rip-relative memory **data** target it references, as
+/// `(target_va, access_width_bytes)`. Used by `carve` to pull a function's
+/// constant pool / jump tables into the carved file so float-constant
+/// annotation and rodata-dependent decompilation work on the carve.
+pub fn rip_relative_data_targets(code: &[u8], base: u64, bits: u32) -> Vec<(u64, u32)> {
+    let mut out = Vec::new();
+    if code.is_empty() {
+        return out;
+    }
+    let mut dec = Decoder::with_ip(bits, code, base, DecoderOptions::NONE);
+    let mut ii = IcedInsn::default();
+    while dec.can_decode() {
+        dec.decode_out(&mut ii);
+        if ii.is_invalid() {
+            continue;
+        }
+        let has_mem = (0..ii.op_count()).any(|i| ii.op_kind(i) == OpKind::Memory);
+        if has_mem && ii.memory_base() == Register::RIP {
+            let mut sz = ii.memory_size().size() as u32;
+            if sz == 0 {
+                sz = 8;
+            }
+            out.push((ii.memory_displacement64(), sz));
+        }
+    }
+    out
+}
+
 /// If `bytes` at `addr` decode to a float SSE op with a rip-relative memory
 /// operand, return `(effective_target_address, element_width_bytes)`.
 fn decode_float_const_load(addr: u64, bytes: &[u8]) -> Option<(u64, u32)> {

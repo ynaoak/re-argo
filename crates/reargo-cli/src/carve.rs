@@ -91,32 +91,65 @@ impl Writer {
 /// section is `SHT_PROGBITS` at `sh_addr = base` (so analysers that build memory
 /// from PROGBITS sections map it) and a `PT_LOAD` segment covers the same bytes
 /// (so loaders that build their address map from program headers map it too).
-pub fn build_min_elf(
+/// One loadable region of a carved file.
+pub struct CarveSegment {
+    /// Virtual address the bytes load at (their original VA).
+    pub vaddr: u64,
+    /// Executable (`.text`, R+X) vs read-only data (`.rodata`, R).
+    pub exec: bool,
+    pub data: Vec<u8>,
+}
+
+/// Build a minimal ELF with one PT_LOAD per segment, each placed at its
+/// original VA. The first segment is `.text` (or named by its exec flag);
+/// the rest become `.rodataN`. This lets a carve carry the function's
+/// constant pool / jump tables so rodata-dependent decompilation (e.g.
+/// float-constant resolution) works on the carved file.
+pub fn build_min_elf_segments(
     arch: Architecture,
     bits: u32,
     endian: Endian,
-    base: u64,
     entry: u64,
-    data: &[u8],
+    segments: &[CarveSegment],
 ) -> Vec<u8> {
+    assert!(!segments.is_empty(), "at least one segment required");
     let le = matches!(endian, Endian::Little);
     let is64 = bits == 64;
     let machine = elf_machine(arch);
 
-    // Section-name string table: "\0.text\0.shstrtab\0".
-    let shstrtab: &[u8] = b"\0.text\0.shstrtab\0";
-    let name_text: u32 = 1; // offset of ".text"
-    let name_shstr: u32 = 7; // offset of ".shstrtab"
+    // Build the section-name string table and per-section name offsets.
+    // Layout: "\0" + each section name + "\0" + ".shstrtab\0".
+    let mut shstrtab: Vec<u8> = vec![0];
+    let mut name_offs: Vec<u32> = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        name_offs.push(shstrtab.len() as u32);
+        let nm = if i == 0 {
+            if seg.exec { ".text".to_string() } else { ".rodata".to_string() }
+        } else {
+            format!(".rodata{}", i)
+        };
+        shstrtab.extend_from_slice(nm.as_bytes());
+        shstrtab.push(0);
+    }
+    let name_shstr = shstrtab.len() as u32;
+    shstrtab.extend_from_slice(b".shstrtab\0");
 
     let (ehsize, phentsize, shentsize) = if is64 { (64u64, 56u64, 64u64) } else { (52u64, 32u64, 40u64) };
     let phoff = ehsize;
-    let phnum = 1u64;
-    let data_off = phoff + phentsize * phnum;
-    let shstr_off = data_off + data.len() as u64;
-    // Align the section-header table to 8 bytes for tidiness.
+    let phnum = segments.len() as u64;
+
+    // Assign 8-byte-aligned file offsets to each segment's data.
+    let mut seg_off: Vec<u64> = Vec::with_capacity(segments.len());
+    let mut cursor = phoff + phentsize * phnum;
+    for seg in segments {
+        cursor = (cursor + 7) & !7;
+        seg_off.push(cursor);
+        cursor += seg.data.len() as u64;
+    }
+    let shstr_off = cursor;
     let shoff = (shstr_off + shstrtab.len() as u64 + 7) & !7;
-    let shnum = 3u64; // NULL, .text, .shstrtab
-    let shstrndx = 2u16;
+    let shnum = segments.len() as u64 + 2; // NULL + per-segment + .shstrtab
+    let shstrndx = (segments.len() + 1) as u16;
 
     let mut w = Writer::new(le);
 
@@ -146,33 +179,41 @@ pub fn build_min_elf(
     w.u16(shnum as u16);
     w.u16(shstrndx);
 
-    // --- Program header: one PT_LOAD, R+X ---
-    let filesz = data.len() as u64;
-    if is64 {
-        w.u32(1); // p_type = PT_LOAD
-        w.u32(5); // p_flags = PF_R | PF_X
-        w.u64(data_off); // p_offset
-        w.u64(base); // p_vaddr
-        w.u64(base); // p_paddr
-        w.u64(filesz); // p_filesz
-        w.u64(filesz); // p_memsz
-        w.u64(0x1000); // p_align
-    } else {
-        w.u32(1); // p_type
-        w.u32(data_off as u32); // p_offset
-        w.u32(base as u32); // p_vaddr
-        w.u32(base as u32); // p_paddr
-        w.u32(filesz as u32); // p_filesz
-        w.u32(filesz as u32); // p_memsz
-        w.u32(5); // p_flags
-        w.u32(0x1000); // p_align
+    // --- Program headers: one PT_LOAD per segment ---
+    for (i, seg) in segments.iter().enumerate() {
+        let filesz = seg.data.len() as u64;
+        let flags = if seg.exec { 5u32 } else { 4u32 }; // R+X or R
+        if is64 {
+            w.u32(1); // PT_LOAD
+            w.u32(flags);
+            w.u64(seg_off[i]);
+            w.u64(seg.vaddr);
+            w.u64(seg.vaddr);
+            w.u64(filesz);
+            w.u64(filesz);
+            w.u64(0x1000);
+        } else {
+            w.u32(1);
+            w.u32(seg_off[i] as u32);
+            w.u32(seg.vaddr as u32);
+            w.u32(seg.vaddr as u32);
+            w.u32(filesz as u32);
+            w.u32(filesz as u32);
+            w.u32(flags);
+            w.u32(0x1000);
+        }
     }
 
-    debug_assert_eq!(w.buf.len() as u64, data_off);
-    // --- carved bytes ---
-    w.bytes(data);
+    // --- Segment data blocks (8-byte aligned) ---
+    for (i, seg) in segments.iter().enumerate() {
+        while (w.buf.len() as u64) < seg_off[i] {
+            w.buf.push(0);
+        }
+        w.bytes(&seg.data);
+    }
     // --- .shstrtab ---
-    w.bytes(shstrtab);
+    debug_assert_eq!(w.buf.len() as u64, shstr_off);
+    w.bytes(&shstrtab);
     // pad to shoff
     while (w.buf.len() as u64) < shoff {
         w.buf.push(0);
@@ -182,9 +223,24 @@ pub fn build_min_elf(
     // [0] NULL
     let null_shdr = if is64 { 64 } else { 40 };
     w.bytes(&vec![0u8; null_shdr]);
-    // [1] .text (PROGBITS, ALLOC|EXECINSTR)
-    write_shdr(&mut w, is64, name_text, 1, 0x6, base, data_off, filesz, 16, 0);
-    // [2] .shstrtab (STRTAB)
+    // [1..] per-segment PROGBITS
+    for (i, seg) in segments.iter().enumerate() {
+        // .text = ALLOC|EXECINSTR (0x6); .rodata = ALLOC (0x2)
+        let flags = if seg.exec { 0x6u64 } else { 0x2u64 };
+        write_shdr(
+            &mut w,
+            is64,
+            name_offs[i],
+            1,
+            flags,
+            seg.vaddr,
+            seg_off[i],
+            seg.data.len() as u64,
+            16,
+            0,
+        );
+    }
+    // [last] .shstrtab (STRTAB)
     write_shdr(&mut w, is64, name_shstr, 3, 0, 0, shstr_off, shstrtab.len() as u64, 1, 0);
 
     w.buf
@@ -230,12 +286,16 @@ fn write_shdr(
 mod tests {
     use super::*;
 
+    fn one_text(base: u64, data: &[u8]) -> Vec<CarveSegment> {
+        vec![CarveSegment { vaddr: base, exec: true, data: data.to_vec() }]
+    }
+
     #[test]
     fn elf64_roundtrips_through_loader() {
         // A tiny x86_64 stub placed at a non-trivial base.
         let base = 0x140001000u64;
         let code = vec![0x55, 0x48, 0x89, 0xe5, 0x90, 0x5d, 0xc3]; // push rbp; mov rbp,rsp; nop; pop rbp; ret
-        let elf = build_min_elf(Architecture::X86_64, 64, Endian::Little, base, base, &code);
+        let elf = build_min_elf_segments(Architecture::X86_64, 64, Endian::Little, base, &one_text(base, &code));
 
         let info = reargo_loader::BinaryLoader::load_bytes(&elf).expect("carved ELF must load");
         assert_eq!(info.arch, Architecture::X86_64);
@@ -250,11 +310,34 @@ mod tests {
     fn elf32_be_header_is_wellformed() {
         let base = 0x10000u64;
         let code = vec![0u8; 8];
-        let elf = build_min_elf(Architecture::PowerPc, 32, Endian::Big, base, base, &code);
+        let elf = build_min_elf_segments(Architecture::PowerPc, 32, Endian::Big, base, &one_text(base, &code));
         assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(elf[4], 1); // ELFCLASS32
         assert_eq!(elf[5], 2); // ELFDATA2MSB
         let info = reargo_loader::BinaryLoader::load_bytes(&elf).expect("carved ELF32 must load");
         assert_eq!(info.arch, Architecture::PowerPc);
+    }
+
+    #[test]
+    fn multi_segment_maps_code_and_rodata() {
+        // .text at a high base, plus a disjoint .rodata constant pool.
+        let code_base = 0x491ba30u64;
+        let data_base = 0xee4730u64;
+        let code = vec![0x90, 0x90, 0xc3]; // nop; nop; ret
+        let rodata = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+        let segs = vec![
+            CarveSegment { vaddr: code_base, exec: true, data: code.clone() },
+            CarveSegment { vaddr: data_base, exec: false, data: rodata.clone() },
+        ];
+        let elf = build_min_elf_segments(Architecture::X86_64, 64, Endian::Little, code_base, &segs);
+
+        let info = reargo_loader::BinaryLoader::load_bytes(&elf).expect("multi-seg ELF must load");
+        assert_eq!(info.entry_point, code_base);
+        let mut cbuf = vec![0u8; code.len()];
+        info.memory.read_bytes(code_base, &mut cbuf).expect("code mapped");
+        assert_eq!(cbuf, code);
+        let mut dbuf = vec![0u8; rodata.len()];
+        info.memory.read_bytes(data_base, &mut dbuf).expect("rodata mapped at its VA");
+        assert_eq!(dbuf, rodata);
     }
 }

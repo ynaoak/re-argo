@@ -3680,6 +3680,86 @@ fn read_va_span(info: &reargo_loader::BinaryInfo, start: u64, end: u64) -> Vec<u
     out
 }
 
+/// Collect the read-only constant-pool / jump-table regions a carved x86-64
+/// function references via rip-relative addressing, as standalone read-only
+/// carve segments. This makes a single-function carve self-contained for
+/// rodata-dependent decompilation (notably float-constant resolution).
+fn collect_const_segments(
+    info: &reargo_loader::BinaryInfo,
+    code: &[u8],
+    code_start: u64,
+    code_end: u64,
+    bits: u32,
+) -> Vec<carve::CarveSegment> {
+    use reargo_loader::SectionFlags;
+    // Initialized, non-executable sections are valid constant sources.
+    let ro_ranges: Vec<(u64, u64)> = info
+        .sections
+        .iter()
+        .filter(|s| s.address != 0 && s.size > 0 && !s.flags.contains(SectionFlags::EXECUTE))
+        .map(|s| (s.address, s.address + s.size))
+        .collect();
+
+    let mut windows: Vec<(u64, u64)> = Vec::new();
+    for (addr, sz) in reargo_analysis::float_const::rip_relative_data_targets(code, code_start, bits)
+    {
+        if addr >= code_start && addr < code_end {
+            continue; // already present in the code segment
+        }
+        if !ro_ranges.iter().any(|(s, e)| addr >= *s && addr < *e) {
+            continue; // not a read-only data reference (skip GOT/bss/exec)
+        }
+        let w = (sz.max(8)) as u64;
+        windows.push((addr & !7, (addr + w + 7) & !7));
+    }
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    windows.sort();
+    // Coalesce windows within 64 bytes of each other.
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (lo, hi) in windows {
+        if let Some(last) = merged.last_mut()
+            && lo <= last.1 + 64
+        {
+            if hi > last.1 {
+                last.1 = hi;
+            }
+            continue;
+        }
+        merged.push((lo, hi));
+    }
+
+    const MAX_TOTAL: u64 = 256 * 1024;
+    const MAX_SEGS: usize = 64;
+    let mut segs = Vec::new();
+    let mut total = 0u64;
+    for (lo, hi) in merged {
+        if segs.len() >= MAX_SEGS {
+            break;
+        }
+        // Clamp to the containing section so a window never spans a gap.
+        let (slo, shi) = match ro_ranges.iter().find(|(s, e)| lo >= *s && lo < *e) {
+            Some((s, e)) => ((*s).max(lo), (*e).min(hi)),
+            None => (lo, hi),
+        };
+        if shi <= slo {
+            continue;
+        }
+        let span = shi - slo;
+        if total + span > MAX_TOTAL {
+            break;
+        }
+        total += span;
+        segs.push(carve::CarveSegment {
+            vaddr: slo,
+            exec: false,
+            data: read_va_span(info, slo, shi),
+        });
+    }
+    segs
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_carve(
     path: &Path,
@@ -3770,7 +3850,26 @@ fn cmd_carve(
         .unwrap_or_else(|| path.with_file_name(default_name));
 
     let bytes_written: Vec<u8> = if format == "elf" {
-        carve::build_min_elf(info.arch, info.bits, info.endian, carve_start, entry, &data)
+        let mut segments = vec![carve::CarveSegment {
+            vaddr: carve_start,
+            exec: true,
+            data: data.clone(),
+        }];
+        // Bundle the function's referenced constant pool / jump tables so the
+        // carve is self-contained for rodata-dependent decompilation.
+        if info.bits == 64 {
+            let consts = collect_const_segments(&info, &data, carve_start, carve_end, info.bits);
+            if !consts.is_empty() {
+                let bytes: u64 = consts.iter().map(|s| s.data.len() as u64).sum();
+                eprintln!(
+                    "[carve] bundled {} read-only constant-pool segment(s) ({} bytes) referenced by the function",
+                    consts.len(),
+                    bytes
+                );
+                segments.extend(consts);
+            }
+        }
+        carve::build_min_elf_segments(info.arch, info.bits, info.endian, entry, &segments)
     } else {
         data.clone()
     };
