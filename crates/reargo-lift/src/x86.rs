@@ -1586,7 +1586,55 @@ impl X86Lifter {
                 });
             }
 
-            // Unmodeled SSE (shuffles, min/max, andn, …): opaque, no decode error.
+            // Scalar compare → mask: CMPSS/CMPSD (iced spells the pseudo-ops
+            // cmpltss/… but the mnemonic is Cmpss/Cmpsd + an imm8 predicate)
+            // set the destination lane to all-ones if the float predicate
+            // holds, else 0. Faithful in the low lane for the ordered
+            // predicates (eq/lt/le/neq/nlt/nle); unord/ord (3/7) fall through.
+            Cmpss | Cmpsd => {
+                let lane = if m == Cmpsd { 8 } else { 4 };
+                let pred = insn.immediate8() & 0x7;
+                let cmp_def = match pred {
+                    0 => Some((OpCode::FloatEqual, false)),
+                    1 => Some((OpCode::FloatLess, false)),
+                    2 => Some((OpCode::FloatLessEqual, false)),
+                    4 => Some((OpCode::FloatNotEqual, false)),
+                    5 => Some((OpCode::FloatLess, true)),
+                    6 => Some((OpCode::FloatLessEqual, true)),
+                    _ => None, // 3 unord / 7 ord — NaN semantics, not modelled
+                };
+                if let Some((cmp_op, negate)) = cmp_def {
+                    let dst = self.sse_operand(insn, 0, lane, &mut ops, &mut sb, address)?;
+                    let src = self.sse_operand(insn, 1, lane, &mut ops, &mut sb, address)?;
+                    let cmp = unique(0x790, 1);
+                    ops.push(PcodeOp { opcode: cmp_op, seq: seq(sb), output: Some(cmp),
+                        inputs: SmallVec::from_slice(&[dst, src]) });
+                    sb += 1;
+                    let bit = if negate {
+                        let nb = unique(0x792, 1);
+                        ops.push(PcodeOp { opcode: OpCode::BoolNegate, seq: seq(sb), output: Some(nb),
+                            inputs: SmallVec::from_slice(&[cmp]) });
+                        sb += 1;
+                        nb
+                    } else {
+                        cmp
+                    };
+                    let z = unique(0x794, lane);
+                    ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(sb), output: Some(z),
+                        inputs: SmallVec::from_slice(&[bit]) });
+                    sb += 1;
+                    ops.push(PcodeOp { opcode: OpCode::Int2Comp, seq: seq(sb), output: Some(dst),
+                        inputs: SmallVec::from_slice(&[z]) });
+                } else {
+                    ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: None,
+                        inputs: SmallVec::from_slice(&[constant(0, 4)]) });
+                }
+            }
+
+            // Unmodeled SSE (lane-precise byte SIMD like pcmpeqb/pmovmskb, min/
+            // max, …): opaque, no decode error. These appear in inlined string/
+            // memory utilities, not worldgen math; a scalar model would be
+            // unfaithful, so surface the gap honestly instead.
             _ => {
                 ops.push(PcodeOp {
                     opcode: OpCode::CallOther,
@@ -2381,6 +2429,18 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_cmpltss_produces_mask() {
+        // cmpltss xmm0, xmm1 = f3 0f c2 c1 01  (cmpss + predicate 1 = LT)
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0xf3, 0x0f, 0xc2, 0xc1, 0x01], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther),
+            "cmpltss must lift: {:?}", l.ops);
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatLess), "LT predicate");
+        // result is a 0/all-ones mask (zext of the bool then two's complement).
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Int2Comp));
     }
 
     #[test]
