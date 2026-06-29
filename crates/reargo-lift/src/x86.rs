@@ -210,6 +210,29 @@ impl X86Lifter {
                 }
             }
 
+            // XCHG dst, src: swap. tmp = dst; dst = src; src = tmp. (LOCK is a
+            // no-op for single-threaded dataflow.) dst/src are both read+written.
+            Xchg => {
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                let tmp = unique(0x560, dst.size);
+                ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(tmp),
+                    inputs: SmallVec::from_slice(&[dst]) });
+                seq_base += 1;
+                // dst = src (Store back if dst is memory).
+                if insn.op_kind(0) == iced_x86::OpKind::Memory {
+                    self.write_back_if_memory(insn, 0, src, &mut ops, &mut seq_base, address)?;
+                } else {
+                    ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(dst),
+                        inputs: SmallVec::from_slice(&[src]) });
+                    seq_base += 1;
+                }
+                // src = tmp (src is a register for the reg/mem forms).
+                ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(src),
+                    inputs: SmallVec::from_slice(&[tmp]) });
+                seq_base += 1;
+            }
+
             Push => {
                 let src = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let sp = self.sp();
@@ -1598,8 +1621,9 @@ impl X86Lifter {
             // result as a Copy of the source — lossy, but it keeps the
             // dataflow edge alive instead of emitting an opaque trap.
             Shufps | Shufpd | Unpcklps | Unpckhps | Unpcklpd | Unpckhpd | Movhlps
-            | Movlhps | Pshufd | Punpckldq | Punpckhdq | Punpcklqdq | Punpckhqdq
-            | Punpcklbw | Punpcklwd | Movlps | Movlpd | Movhps | Movhpd => {
+            | Movlhps | Pshufd | Pshuflw | Pshufhw | Pshufb | Punpckldq | Punpckhdq
+            | Punpcklqdq | Punpckhqdq | Punpcklbw | Punpcklwd | Movlps | Movlpd
+            | Movhps | Movhpd => {
                 let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
                 let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 ops.push(PcodeOp {
@@ -2549,6 +2573,25 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_xchg_swaps_via_three_copies() {
+        // xchg eax, ecx = 87 c1 -> tmp=eax; eax=ecx; ecx=tmp
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0x87, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert_eq!(l.ops.iter().filter(|o| o.opcode == OpCode::Copy).count(), 3,
+            "xchg = three copies: {:?}", l.ops);
+    }
+
+    #[test]
+    fn lift_pshuflw_is_copy_not_trap() {
+        // pshuflw xmm0, xmm1, 0x1b = f2 0f 70 c1 1b
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0xf2, 0x0f, 0x70, 0xc1, 0x1b], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Copy));
     }
 
     #[test]
