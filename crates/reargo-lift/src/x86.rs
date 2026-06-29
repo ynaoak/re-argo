@@ -375,6 +375,124 @@ impl X86Lifter {
                 seq_base += 1;
             }
 
+            // Rotates: no p-code rotate op, so synthesize from shifts + or.
+            // ror x,n = (x >> n) | (x << (w-n)); rol x,n = (x << n) | (x >> (w-n)).
+            // Flags (CF/OF only) are count-dependent and left unmodelled.
+            Rol | Ror => {
+                let is_ror = insn.mnemonic() == Ror;
+                let (dst, cnt) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
+                let wbits = (dst.size as u64) * 8;
+                // Mask the count to (width-1) = count mod width. Using the x86
+                // 5/6-bit shift mask (0x1F/0x3F) would leave a byte/word count
+                // >= width (e.g. `ror byte, 0x11`), and `x >> 17` / `x << -9`
+                // on an 8-bit value both yield 0 → wrong. (width-1) is the
+                // correct rotate modulus for these power-of-two widths.
+                let mask = wbits - 1;
+                let n = unique(0x4c0, dst.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAnd,
+                    seq: seq(seq_base),
+                    output: Some(n),
+                    inputs: SmallVec::from_slice(&[cnt, constant(mask, dst.size)]),
+                });
+                seq_base += 1;
+                let comp = unique(0x4c2, dst.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntSub,
+                    seq: seq(seq_base),
+                    output: Some(comp),
+                    inputs: SmallVec::from_slice(&[constant(wbits, dst.size), n]),
+                });
+                seq_base += 1;
+                let (prim_op, prim_amt, sec_op, sec_amt) = if is_ror {
+                    (OpCode::IntRight, n, OpCode::IntLeft, comp)
+                } else {
+                    (OpCode::IntLeft, n, OpCode::IntRight, comp)
+                };
+                let a = unique(0x4c4, dst.size);
+                ops.push(PcodeOp {
+                    opcode: prim_op,
+                    seq: seq(seq_base),
+                    output: Some(a),
+                    inputs: SmallVec::from_slice(&[dst, prim_amt]),
+                });
+                seq_base += 1;
+                let b = unique(0x4c6, dst.size);
+                ops.push(PcodeOp {
+                    opcode: sec_op,
+                    seq: seq(seq_base),
+                    output: Some(b),
+                    inputs: SmallVec::from_slice(&[dst, sec_amt]),
+                });
+                seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntOr,
+                    seq: seq(seq_base),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[a, b]),
+                });
+                seq_base += 1;
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
+            }
+
+            // ADC/SBB: add/sub with carry. value + ZF/SF + a correct CF (carry
+            // out from either sub-step) so multi-word chains stay consistent.
+            Adc | Sbb => {
+                let is_sbb = insn.mnemonic() == Sbb;
+                let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
+                let cf_in = unique(0x4d0, dst.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntZExt,
+                    seq: seq(seq_base),
+                    output: Some(cf_in),
+                    inputs: SmallVec::from_slice(&[reg(CF_OFFSET, 1)]),
+                });
+                seq_base += 1;
+                // First carry/borrow: from dst (op) src.
+                let c1 = unique(0x4d2, 1);
+                ops.push(PcodeOp {
+                    opcode: if is_sbb { OpCode::IntLess } else { OpCode::IntCarry },
+                    seq: seq(seq_base),
+                    output: Some(c1),
+                    inputs: SmallVec::from_slice(&[dst, src]),
+                });
+                seq_base += 1;
+                let step = unique(0x4d4, dst.size);
+                ops.push(PcodeOp {
+                    opcode: if is_sbb { OpCode::IntSub } else { OpCode::IntAdd },
+                    seq: seq(seq_base),
+                    output: Some(step),
+                    inputs: SmallVec::from_slice(&[dst, src]),
+                });
+                seq_base += 1;
+                // Second carry/borrow: from step (op) cf_in.
+                let c2 = unique(0x4d6, 1);
+                ops.push(PcodeOp {
+                    opcode: if is_sbb { OpCode::IntLess } else { OpCode::IntCarry },
+                    seq: seq(seq_base),
+                    output: Some(c2),
+                    inputs: SmallVec::from_slice(&[step, cf_in]),
+                });
+                seq_base += 1;
+                ops.push(PcodeOp {
+                    opcode: if is_sbb { OpCode::IntSub } else { OpCode::IntAdd },
+                    seq: seq(seq_base),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[step, cf_in]),
+                });
+                seq_base += 1;
+                // CF = c1 | c2.
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolOr,
+                    seq: seq(seq_base),
+                    output: Some(reg(CF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[c1, c2]),
+                });
+                seq_base += 1;
+                self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
+                self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
+            }
+
             Div | Idiv => {
                 // (I)DIV r/m: quotient → A-reg, remainder → D-reg. The true
                 // dividend is the D:A pair (128/64/32-bit); compiler code sets
@@ -1985,6 +2103,41 @@ mod tests {
         let sx = lifted.ops.iter().find(|o| o.opcode == OpCode::IntSExt).expect("IntSExt");
         assert_eq!(sx.output.unwrap().size, 8, "dest RAX is 8 bytes");
         assert_eq!(sx.inputs[0].size, 4, "src EAX is 4 bytes");
+    }
+
+    #[test]
+    fn lift_ror_is_shift_or_no_trap() {
+        let lifter = X86Lifter::new_64();
+        // ror eax, 1 = d1 c8
+        let l = lifter.lift_instruction(&make_memory(&[0xd1, 0xc8], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntRight));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntLeft));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntOr));
+    }
+
+    #[test]
+    fn lift_ror_byte_count_masked_to_width_minus_1() {
+        let lifter = X86Lifter::new_64();
+        // ror al, 9 = c0 c8 09 — a byte rotate count masks to 9 & 0x7 = 1, not
+        // the 5-bit shift mask 0x1f (which would shift the 8-bit value to 0).
+        let l = lifter.lift_instruction(&make_memory(&[0xc0, 0xc8, 0x09], 0x1000), 0x1000).unwrap();
+        let and = l.ops.iter().find(|o| o.opcode == OpCode::IntAnd).expect("count mask");
+        assert_eq!(and.inputs[1].offset, 0x7, "byte rotate count masks to width-1");
+    }
+
+    #[test]
+    fn lift_adc_adds_carry_and_sets_cf() {
+        let lifter = X86Lifter::new_64();
+        // adc eax, ecx = 11 c8
+        let l = lifter.lift_instruction(&make_memory(&[0x11, 0xc8], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        // carry chained in (zext of CF) and CF written back.
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntCarry));
+        assert!(l.ops.iter().any(|o|
+            o.opcode == OpCode::BoolOr && o.output.is_some_and(|v| v.offset == CF_OFFSET)),
+            "adc writes CF: {:?}", l.ops);
     }
 
     #[test]
