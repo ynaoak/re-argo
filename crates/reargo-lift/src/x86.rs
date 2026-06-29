@@ -493,6 +493,93 @@ impl X86Lifter {
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
+            // CMPXCHG dst, src: if acc == dst { ZF=1; dst = src } else { ZF=0;
+            // acc = dst }. The CAS at the heart of refcounts/atomics. Unhandled,
+            // it dropped to CallOther → trap (the `lock cmpxchg` in shared_ptr
+            // release across the worldgen node graph). LOCK is a no-op for
+            // single-threaded dataflow. Modeled branchlessly:
+            //   eq    = (acc == dst)         (also ZF)
+            //   emask = -zext(eq)            (all-ones iff equal)
+            //   dst   = old ^ ((old^src) & emask)        // equal ? src : old
+            //   acc   = acc ^ ((acc^old) & ~emask)       // equal ? acc : old
+            Cmpxchg => {
+                use iced_x86::Register as R;
+                let old = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                let acc_r = match old.size {
+                    8 => R::RAX,
+                    4 => R::EAX,
+                    2 => R::AX,
+                    _ => R::AL,
+                };
+                let acc = iced_reg_to_varnode(acc_r).unwrap_or_else(|| constant(0, old.size));
+                // eq → ZF.
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntEqual,
+                    seq: seq(seq_base),
+                    output: Some(reg(ZF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[acc, old]),
+                });
+                seq_base += 1;
+                let eqz = unique(0x4e0, old.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntZExt,
+                    seq: seq(seq_base),
+                    output: Some(eqz),
+                    inputs: SmallVec::from_slice(&[reg(ZF_OFFSET, 1)]),
+                });
+                seq_base += 1;
+                let emask = unique(0x4e2, old.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::Int2Comp,
+                    seq: seq(seq_base),
+                    output: Some(emask),
+                    inputs: SmallVec::from_slice(&[eqz]),
+                });
+                seq_base += 1;
+                let nmask = unique(0x4e4, old.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntNegate,
+                    seq: seq(seq_base),
+                    output: Some(nmask),
+                    inputs: SmallVec::from_slice(&[emask]),
+                });
+                seq_base += 1;
+                // dst = old ^ ((old ^ src) & emask)
+                let d1 = unique(0x4e6, old.size);
+                ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(seq_base), output: Some(d1),
+                    inputs: SmallVec::from_slice(&[old, src]) });
+                seq_base += 1;
+                let d2 = unique(0x4e8, old.size);
+                ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(seq_base), output: Some(d2),
+                    inputs: SmallVec::from_slice(&[d1, emask]) });
+                seq_base += 1;
+                let newdst = unique(0x4ea, old.size);
+                ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(seq_base), output: Some(newdst),
+                    inputs: SmallVec::from_slice(&[old, d2]) });
+                seq_base += 1;
+                // acc = acc ^ ((acc ^ old) & nmask)
+                let a1 = unique(0x4ec, old.size);
+                ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(seq_base), output: Some(a1),
+                    inputs: SmallVec::from_slice(&[acc, old]) });
+                seq_base += 1;
+                let a2 = unique(0x4ee, old.size);
+                ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(seq_base), output: Some(a2),
+                    inputs: SmallVec::from_slice(&[a1, nmask]) });
+                seq_base += 1;
+                ops.push(PcodeOp { opcode: OpCode::IntXor, seq: seq(seq_base), output: Some(acc),
+                    inputs: SmallVec::from_slice(&[acc, a2]) });
+                seq_base += 1;
+                // Commit dst (Store for memory; for a register, newdst -> dst).
+                if insn.op_kind(0) == iced_x86::OpKind::Memory {
+                    self.write_back_if_memory(insn, 0, newdst, &mut ops, &mut seq_base, address)?;
+                } else {
+                    ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(old),
+                        inputs: SmallVec::from_slice(&[newdst]) });
+                    seq_base += 1;
+                }
+            }
+
             Div | Idiv => {
                 // (I)DIV r/m: quotient → A-reg, remainder → D-reg. The true
                 // dividend is the D:A pair (128/64/32-bit); compiler code sets
@@ -2172,6 +2259,22 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_cmpxchg_cas_sets_zf_no_trap() {
+        // cmpxchg rbx, rcx = 48 0f b1 cb  (dst=rbx, src=rcx, acc=rax)
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0x48, 0x0f, 0xb1, 0xcb], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther),
+            "cmpxchg must be lifted: {:?}", l.ops);
+        // ZF = (acc == dst).
+        assert!(l.ops.iter().any(|o|
+            o.opcode == OpCode::IntEqual && o.output.is_some_and(|v| v.offset == ZF_OFFSET)),
+            "cmpxchg sets ZF: {:?}", l.ops);
+        // Branchless select masks: a 2COMP and its complement (NEGATE).
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Int2Comp));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntNegate));
     }
 
     #[test]
