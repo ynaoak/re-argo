@@ -661,7 +661,21 @@ impl<'a> RustEmitter<'a> {
             }
             OpCode::Branch => None,
             OpCode::CBranch => None,
-            OpCode::CallOther => Some("core::intrinsics::abort();".into()),
+            OpCode::CallOther => {
+                // int3 (CallOther const 3) is a real trap; an unmodeled machine
+                // instruction (const 0) is not a crash — don't render it as abort.
+                let is_int3 = op
+                    .inputs
+                    .first()
+                    .and_then(|&inp| func.varnodes.get(inp as usize))
+                    .map(|v| v.data.space == SpaceId::CONST && v.data.offset == 3)
+                    .unwrap_or(false);
+                if is_int3 {
+                    Some("core::intrinsics::abort();".into())
+                } else {
+                    Some("unmodeled_insn(); // machine op not yet lifted (dataflow intact)".into())
+                }
+            }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))

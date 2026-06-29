@@ -701,7 +701,25 @@ impl<'a> CEmitter<'a> {
             }
             OpCode::Branch => None,
             OpCode::CBranch => None,
-            OpCode::CallOther => Some("__builtin_trap();".into()),
+            OpCode::CallOther => {
+                // The lifter encodes int3 as CallOther(const 3) and any
+                // not-yet-lifted machine instruction as CallOther(const 0).
+                // Distinguish them: int3 is a genuine breakpoint/trap, whereas
+                // an unmodeled instruction is NOT a crash — rendering both as
+                // `__builtin_trap()` falsely implied the function aborts there
+                // (it doesn't; the surrounding dataflow is intact).
+                let is_int3 = op
+                    .inputs
+                    .first()
+                    .and_then(|&inp| func.varnodes.get(inp as usize))
+                    .map(|v| v.data.space == SpaceId::CONST && v.data.offset == 3)
+                    .unwrap_or(false);
+                if is_int3 {
+                    Some("__builtin_trap();".into())
+                } else {
+                    Some("__unmodeled_insn();  // machine op not yet lifted (dataflow intact)".into())
+                }
+            }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
