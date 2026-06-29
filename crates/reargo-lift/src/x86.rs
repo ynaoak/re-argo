@@ -640,6 +640,62 @@ impl X86Lifter {
                 }
             }
 
+            // BT r/m, bit: CF = (operand >> (bit mod width)) & 1. Test-only
+            // (BTS/BTR/BTC would also modify the bit — not yet emitted here).
+            // Was unhandled → CallOther.
+            Bt => {
+                let val = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let bit = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                let wmask = if val.size >= 8 { 0x3F } else { (val.size as u64) * 8 - 1 };
+                // bit & (width-1)
+                let mb = unique(0x4f0, val.size);
+                let bit_w = if bit.size == val.size {
+                    bit
+                } else {
+                    // normalize the count varnode to the operand width
+                    let z = unique(0x4f2, val.size);
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntZExt,
+                        seq: seq(seq_base),
+                        output: Some(z),
+                        inputs: SmallVec::from_slice(&[bit]),
+                    });
+                    seq_base += 1;
+                    z
+                };
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAnd,
+                    seq: seq(seq_base),
+                    output: Some(mb),
+                    inputs: SmallVec::from_slice(&[bit_w, constant(wmask, val.size)]),
+                });
+                seq_base += 1;
+                let sh = unique(0x4f4, val.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntRight,
+                    seq: seq(seq_base),
+                    output: Some(sh),
+                    inputs: SmallVec::from_slice(&[val, mb]),
+                });
+                seq_base += 1;
+                let lo = unique(0x4f6, val.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAnd,
+                    seq: seq(seq_base),
+                    output: Some(lo),
+                    inputs: SmallVec::from_slice(&[sh, constant(1, val.size)]),
+                });
+                seq_base += 1;
+                // CF = (lo != 0)  → the tested bit, as a 1-byte boolean.
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntNotEqual,
+                    seq: seq(seq_base),
+                    output: Some(reg(CF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[lo, constant(0, val.size)]),
+                });
+                seq_base += 1;
+            }
+
             Imul => {
                 if insn.op_count() >= 2 {
                     let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
@@ -1296,8 +1352,8 @@ impl X86Lifter {
             // and the dataflow connected (the BDS gradient loop is auto-
             // vectorized over the x/y/z lanes).
             Movaps | Movups | Movapd | Movupd | Movdqa | Movdqu | Addps | Subps | Mulps
-            | Divps | Shufps | Shufpd | Unpcklps | Unpckhps | Unpcklpd | Unpckhpd
-            | Movhlps | Movlhps | Pshufd => 16,
+            | Divps | Addpd | Subpd | Mulpd | Divpd | Shufps | Shufpd | Unpcklps | Unpckhps
+            | Unpcklpd | Unpckhpd | Movhlps | Movlhps | Pshufd | Cvtpd2ps | Cvtps2pd => 16,
             Movq => 8,
             Movd => 4,
             _ => 8,
@@ -1307,10 +1363,10 @@ impl X86Lifter {
         // (sd/ss) and packed (ps) forms; packed runs at sz=16 (whole-register
         // approximation — see the sz note above).
         let float_bin = match m {
-            Addsd | Addss | Addps => Some(OpCode::FloatAdd),
-            Subsd | Subss | Subps => Some(OpCode::FloatSub),
-            Mulsd | Mulss | Mulps => Some(OpCode::FloatMult),
-            Divsd | Divss | Divps => Some(OpCode::FloatDiv),
+            Addsd | Addss | Addps | Addpd => Some(OpCode::FloatAdd),
+            Subsd | Subss | Subps | Subpd => Some(OpCode::FloatSub),
+            Mulsd | Mulss | Mulps | Mulpd => Some(OpCode::FloatMult),
+            Divsd | Divss | Divps | Divpd => Some(OpCode::FloatDiv),
             _ => None,
         };
         if let Some(opcode) = float_bin {
@@ -1406,12 +1462,23 @@ impl X86Lifter {
                 });
             }
 
-            // float -> float resize (double<->single)
+            // float -> float resize (double<->single), scalar and packed.
             Cvtsd2ss | Cvtss2sd => {
                 let in_sz = if m == Cvtsd2ss { 8 } else { 4 };
                 let out_sz = if m == Cvtsd2ss { 4 } else { 8 };
                 let src = self.sse_operand(insn, 1, in_sz, &mut ops, &mut sb, address)?;
                 let dst = self.sse_operand(insn, 0, out_sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatFloat2Float,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+            // packed double<->single (whole-register approximation).
+            Cvtpd2ps | Cvtps2pd => {
+                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::FloatFloat2Float,
                     seq: seq(sb),
@@ -2291,6 +2358,30 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_bt_sets_cf_from_tested_bit() {
+        // bt eax, ecx = 0f a3 c8 -> CF = (eax >> (ecx & 31)) & 1
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0xa3, 0xc8], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntRight), "shifts operand by bit index");
+        assert!(l.ops.iter().any(|o|
+            o.opcode == OpCode::IntNotEqual && o.output.is_some_and(|v| v.offset == CF_OFFSET)),
+            "bt writes CF: {:?}", l.ops);
+    }
+
+    #[test]
+    fn lift_packed_double_arith() {
+        let lifter = X86Lifter::new_64();
+        // addpd xmm0, xmm1 = 66 0f 58 c1
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0x58, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatAdd));
+        // cvtpd2ps xmm0, xmm1 = 66 0f 5a c1
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0x5a, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatFloat2Float));
     }
 
     #[test]
