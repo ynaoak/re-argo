@@ -324,6 +324,31 @@ inline comment column that makes stripped C++ readable without manually cross-re
 
 Show lifted P-code IR — the low-level intermediate the analysis stack runs on. Output is one line per P-code op grouped by source instruction.
 
+##### x86-64 lifting coverage
+
+The x86 lifter (`reargo-lift/src/x86.rs`) covers the integer + SSE/scalar-float
+instruction mix found in optimised C++ binaries: ALU (add/sub/and/or/xor/not/neg/
+inc/dec, **adc/sbb**, **rol/ror**, shifts that set ZF/SF), **one-operand mul/imul**
+(full-width D:A product — the MT19937/LCG multiply) and div/idiv, sign-extension
+(movsx/movsxd, cbw/cwde/cdqe, cwd/cdq/cqo), **bt**, **setcc/cmovcc** (via a shared
+`cc_condition`), **xchg**, atomics (**xadd**, **cmpxchg** — modelled, `lock` is a
+dataflow no-op), control flow (jcc incl. **jp/jnp** once `comisd`/`ucomisd` set PF =
+`isnan(a)||isnan(b)`), direct/indirect calls (CALLIND with vfn-index annotation),
+and SSE: scalar + packed float add/sub/mul/div/sqrt/cmp-to-mask, conversions
+(cvt\*2si incl. memory source, cvtdq2ps/cvttps2dq, cvtpd2ps), bitwise
+(andps/orps/xorps/andnps + pand/por/pxor/pandn), packed-int (paddd/psubd/**pmuludq**/
+psrad), shuffles/unpacks (modelled as lossy Copy).
+
+Instructions best left opaque-but-named — lane-precise byte SIMD (`pmovmskb`,
+`pcmpeqb`) and bit-scan (`bsr`/`bsf`) — are emitted as **named intrinsics** via
+`reargo_core::pcode::intrinsic`: a `CallOther` carrying a tag const + operands + an
+output, rendered `out = name(args)` (with `bsr`/`bsf` also setting ZF), so dataflow
+stays intact without a verbose unrolled expansion. A genuinely unmodelled op renders
+`__unmodeled_insn()` and `int3` renders `__builtin_trap()` — distinct, never
+conflated. Validated: across 291 BE world-gen functions (biome node-graph, features,
+structure placement, RNG, and the 3-dimension chunk generators) every instruction is
+either fully lifted or a named intrinsic — zero opaque `CallOther`.
+
 #### `decompile <FILE> [-a ADDR] [--ssa] [--rust] [-A]`
 
 Decompile a function to pseudocode.
