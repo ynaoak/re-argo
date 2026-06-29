@@ -520,6 +520,37 @@ impl fmt::Display for PcodeOp {
     }
 }
 
+/// Named-intrinsic tags for `CallOther`. Some machine instructions are best
+/// represented as an opaque-but-named operation with intact dataflow (a
+/// destination that is a known function of its inputs) rather than expanded
+/// into dozens of scalar ops (which hurts readability) or dropped to a
+/// misleading trap. This is exactly how Ghidra/IDA surface lane-precise SIMD
+/// and bit-scan ops. The lifter emits `CallOther` with `inputs[0] = const
+/// <tag>` and the real operands following; the decompiler renders
+/// `out = <name>(operands…)`.
+///
+/// Tags 0 (generic unmodeled) and 3 (int3 breakpoint) are reserved and not
+/// named here. Named tags start at 0x100 to stay clear of those.
+pub mod intrinsic {
+    pub const BASE: u64 = 0x100;
+    pub const BSR: u64 = 0x100;
+    pub const BSF: u64 = 0x101;
+    pub const PMOVMSKB: u64 = 0x102;
+    pub const PCMPEQB: u64 = 0x103;
+
+    /// Map an intrinsic tag to its rendered name, or None if `tag` is not a
+    /// named intrinsic (e.g. 0 generic / 3 int3).
+    pub fn name(tag: u64) -> Option<&'static str> {
+        Some(match tag {
+            BSR => "bsr",
+            BSF => "bsf",
+            PMOVMSKB => "pmovmskb",
+            PCMPEQB => "pcmpeqb",
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

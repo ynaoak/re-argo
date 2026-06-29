@@ -662,16 +662,26 @@ impl<'a> RustEmitter<'a> {
             OpCode::Branch => None,
             OpCode::CBranch => None,
             OpCode::CallOther => {
-                // int3 (CallOther const 3) is a real trap; an unmodeled machine
-                // instruction (const 0) is not a crash — don't render it as abort.
-                let is_int3 = op
+                // Tag in the first const input: 3 = int3 (real trap), 0x100+ =
+                // named intrinsic (opaque-but-named with intact dataflow, e.g.
+                // bsr/pmovmskb), 0 = not-yet-lifted instruction.
+                let tag = op
                     .inputs
                     .first()
                     .and_then(|&inp| func.varnodes.get(inp as usize))
-                    .map(|v| v.data.space == SpaceId::CONST && v.data.offset == 3)
-                    .unwrap_or(false);
-                if is_int3 {
+                    .filter(|v| v.data.space == SpaceId::CONST)
+                    .map(|v| v.data.offset);
+                if tag == Some(3) {
                     Some("core::intrinsics::abort();".into())
+                } else if let Some(name) = tag.and_then(reargo_core::pcode::intrinsic::name) {
+                    let args: Vec<String> = (1..op.inputs.len())
+                        .map(|i| self.input_expr(func, op, i))
+                        .collect();
+                    let call = format!("{}({})", name, args.join(", "));
+                    match out_name {
+                        Some(dst) => Some(format!("{} = {};", dst, call)),
+                        None => Some(format!("{};", call)),
+                    }
                 } else {
                     Some("unmodeled_insn(); // machine op not yet lifted (dataflow intact)".into())
                 }

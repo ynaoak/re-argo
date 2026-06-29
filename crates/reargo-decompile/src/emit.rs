@@ -702,20 +702,29 @@ impl<'a> CEmitter<'a> {
             OpCode::Branch => None,
             OpCode::CBranch => None,
             OpCode::CallOther => {
-                // The lifter encodes int3 as CallOther(const 3) and any
-                // not-yet-lifted machine instruction as CallOther(const 0).
-                // Distinguish them: int3 is a genuine breakpoint/trap, whereas
-                // an unmodeled instruction is NOT a crash — rendering both as
-                // `__builtin_trap()` falsely implied the function aborts there
-                // (it doesn't; the surrounding dataflow is intact).
-                let is_int3 = op
+                // The lifter tags CallOther via its first const input: 3 = int3
+                // (a real breakpoint/trap), 0x100+ = a named intrinsic (a known
+                // op kept opaque but with intact dataflow, e.g. bsr/pmovmskb),
+                // 0 = a not-yet-lifted instruction. Render each honestly rather
+                // than as `__builtin_trap()` (which falsely implied a crash).
+                let tag = op
                     .inputs
                     .first()
                     .and_then(|&inp| func.varnodes.get(inp as usize))
-                    .map(|v| v.data.space == SpaceId::CONST && v.data.offset == 3)
-                    .unwrap_or(false);
-                if is_int3 {
+                    .filter(|v| v.data.space == SpaceId::CONST)
+                    .map(|v| v.data.offset);
+                if tag == Some(3) {
                     Some("__builtin_trap();".into())
+                } else if let Some(name) = tag.and_then(reargo_core::pcode::intrinsic::name) {
+                    // `out = name(operands…)` — the operands are inputs[1..].
+                    let args: Vec<String> = (1..op.inputs.len())
+                        .map(|i| self.input_expr(func, op, i))
+                        .collect();
+                    let call = format!("{}({})", name, args.join(", "));
+                    match out_name {
+                        Some(dst) => Some(format!("{} = {};", dst, call)),
+                        None => Some(format!("{};", call)),
+                    }
                 } else {
                     Some("__unmodeled_insn();  // machine op not yet lifted (dataflow intact)".into())
                 }

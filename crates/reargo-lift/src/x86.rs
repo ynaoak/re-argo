@@ -720,6 +720,34 @@ impl X86Lifter {
                 seq_base += 1;
             }
 
+            // BSR/BSF: dst = index of the highest/lowest set bit; ZF = (src==0).
+            // The exact index needs an unrolled bit search; represent it as a
+            // named intrinsic with intact dataflow (dst = bsr(src)) — Ghidra/IDA
+            // style — plus the faithfully-modelled ZF so a following branch works.
+            Bsr | Bsf => {
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntEqual,
+                    seq: seq(seq_base),
+                    output: Some(reg(ZF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[src, constant(0, src.size)]),
+                });
+                seq_base += 1;
+                let tag = if insn.mnemonic() == Bsr {
+                    reargo_core::pcode::intrinsic::BSR
+                } else {
+                    reargo_core::pcode::intrinsic::BSF
+                };
+                ops.push(PcodeOp {
+                    opcode: OpCode::CallOther,
+                    seq: seq(seq_base),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[constant(tag, 8), src]),
+                });
+                seq_base += 1;
+            }
+
             Mul | Imul => {
                 let signed = insn.mnemonic() == Imul;
                 if signed && insn.op_count() >= 2 {
@@ -1775,10 +1803,32 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[dst, cnt]) });
             }
 
-            // Unmodeled SSE (lane-precise byte SIMD like pcmpeqb/pmovmskb, min/
-            // max, …): opaque, no decode error. These appear in inlined string/
-            // memory utilities, not worldgen math; a scalar model would be
-            // unfaithful, so surface the gap honestly instead.
+            // Lane-precise byte SIMD (the SSE memchr/strlen idiom). A scalar
+            // model would need ~16-lane unrolling and hurt readability, so
+            // represent them as named intrinsics with intact dataflow
+            // (out = pmovmskb(src) / pcmpeqb(dst, src)) — Ghidra/IDA style.
+            Pmovmskb => {
+                let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+                let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::CallOther,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[constant(reargo_core::pcode::intrinsic::PMOVMSKB, 8), src]),
+                });
+            }
+            Pcmpeqb => {
+                let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::CallOther,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[constant(reargo_core::pcode::intrinsic::PCMPEQB, 8), dst, src]),
+                });
+            }
+
+            // Unmodeled SSE (min/max, other lane ops): opaque, no decode error.
             _ => {
                 ops.push(PcodeOp {
                     opcode: OpCode::CallOther,
@@ -2573,6 +2623,21 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_bsr_named_intrinsic_with_zf() {
+        // bsr rcx, rcx = 48 0f bd c9 -> ZF=(rcx==0); rcx = bsr(rcx) intrinsic
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0x48, 0x0f, 0xbd, 0xc9], 0x1000), 0x1000).unwrap();
+        // ZF faithfully modelled.
+        assert!(l.ops.iter().any(|o|
+            o.opcode == OpCode::IntEqual && o.output.is_some_and(|v| v.offset == ZF_OFFSET)));
+        // The index is a named intrinsic CallOther: output = dst, input[0] = tag.
+        let co = l.ops.iter().find(|o| o.opcode == OpCode::CallOther).expect("CallOther");
+        assert!(co.output.is_some(), "intrinsic has a destination (dataflow intact)");
+        assert_eq!(co.inputs[0].offset, reargo_core::pcode::intrinsic::BSR);
+        assert_eq!(reargo_core::pcode::intrinsic::name(co.inputs[0].offset), Some("bsr"));
     }
 
     #[test]
