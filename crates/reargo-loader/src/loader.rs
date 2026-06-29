@@ -121,6 +121,30 @@ pub struct BinaryInfo {
 
 pub struct BinaryLoader;
 
+/// Parse an ELF image and return `(slot_offset, target_address)` for every
+/// RELATIVE relocation (`R_X86_64_RELATIVE` / `R_AARCH64_RELATIVE`). In a PIE
+/// binary these are the absolute pointers the dynamic loader writes at load
+/// time — vtable slots, function-pointer / jump tables, RTTI — whose target
+/// does **not** appear in the on-disk bytes (the slot reads as zero; the
+/// value lives in the relocation addend). This lets tools find indirect /
+/// vtable references that a raw byte search or code-operand scan cannot see.
+pub fn elf_pointer_relocations(data: &[u8]) -> Vec<(u64, u64)> {
+    const R_X86_64_RELATIVE: u32 = 8;
+    const R_AARCH64_RELATIVE: u32 = 1027;
+    let Ok(elf) = goblin::elf::Elf::parse(data) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for reloc in elf.dynrelas.iter().chain(elf.pltrelocs.iter()) {
+        if (reloc.r_type == R_X86_64_RELATIVE || reloc.r_type == R_AARCH64_RELATIVE)
+            && let Some(addend) = reloc.r_addend
+        {
+            out.push((reloc.r_offset, addend as u64));
+        }
+    }
+    out
+}
+
 impl BinaryLoader {
     pub fn load(path: &Path) -> Result<BinaryInfo, LoaderError> {
         let data = std::fs::read(path)?;
@@ -704,5 +728,18 @@ impl std::fmt::Display for SymbolKind {
             Self::Section => write!(f, "SECTION"),
             Self::Unknown => write!(f, "UNKNOWN"),
         }
+    }
+}
+
+#[cfg(test)]
+mod reloc_tests {
+    use super::elf_pointer_relocations;
+
+    #[test]
+    fn non_elf_returns_empty_without_panicking() {
+        assert!(elf_pointer_relocations(b"not an elf").is_empty());
+        assert!(elf_pointer_relocations(&[]).is_empty());
+        // A valid ELF magic but truncated body must also not panic.
+        assert!(elf_pointer_relocations(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).is_empty());
     }
 }

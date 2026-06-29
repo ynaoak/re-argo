@@ -503,6 +503,105 @@ impl<'a> CEmitter<'a> {
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
                 Some(format!("{} = ({}){} % ({}){};", dst, ty, a, ty, b))
             }
+            OpCode::FloatAdd => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} + {};", dst, a, b))
+            }
+            OpCode::FloatSub => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} - {};", dst, a, b))
+            }
+            OpCode::FloatMult => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} * {};", dst, a, b))
+            }
+            OpCode::FloatDiv => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} / {};", dst, a, b))
+            }
+            OpCode::FloatNeg => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = -{};", dst, a))
+            }
+            OpCode::FloatAbs => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = fabs({});", dst, a))
+            }
+            OpCode::FloatSqrt => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = sqrt({});", dst, a))
+            }
+            OpCode::FloatEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} == {};", dst, a, b))
+            }
+            OpCode::FloatNotEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} != {};", dst, a, b))
+            }
+            OpCode::FloatLess => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} < {};", dst, a, b))
+            }
+            OpCode::FloatLessEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} <= {};", dst, a, b))
+            }
+            OpCode::FloatInt2Float => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = if out_size == 4 { "float" } else { "double" };
+                Some(format!("{} = ({}){};", dst, ty, a))
+            }
+            OpCode::FloatFloat2Float => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = if out_size == 4 { "float" } else { "double" };
+                Some(format!("{} = ({}){};", dst, ty, a))
+            }
+            OpCode::FloatTrunc => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = size_to_signed_type(out_size);
+                Some(format!("{} = ({}){};", dst, ty, a))
+            }
+            OpCode::FloatFloor => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = floor({});", dst, a))
+            }
+            OpCode::FloatCeil => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = ceil({});", dst, a))
+            }
+            OpCode::FloatRound => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = round({});", dst, a))
+            }
             OpCode::BoolAnd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
@@ -581,18 +680,91 @@ impl<'a> CEmitter<'a> {
                 };
                 Some(format!("{}();", call_name))
             }
+            OpCode::CallInd => {
+                // Indirect / virtual call: render the resolved target (a
+                // function pointer or `*(vtable+offset)` deref) so C++ virtual
+                // dispatch is visible instead of `call 0x0`. When the target is
+                // a `[obj_vtable + offset]` load, annotate the vtable index —
+                // the single most useful hint for C++ virtual-method RE.
+                let target = self.input_expr(func, op, 0);
+                let ann = op
+                    .inputs
+                    .first()
+                    .and_then(|&t| self.vcall_vtable_offset(func, t))
+                    .map(|off| format!("  // vfn[{}] (vtable+0x{:x})", off / 8, off))
+                    .unwrap_or_default();
+                Some(format!("(*{})();{}", target, ann))
+            }
             OpCode::Return => {
                 let val = self.input_expr(func, op, 0);
                 Some(format!("return {};", val))
             }
             OpCode::Branch => None,
             OpCode::CBranch => None,
-            OpCode::CallOther => Some("__builtin_trap();".into()),
+            OpCode::CallOther => {
+                // The lifter tags CallOther via its first const input: 3 = int3
+                // (a real breakpoint/trap), 0x100+ = a named intrinsic (a known
+                // op kept opaque but with intact dataflow, e.g. bsr/pmovmskb),
+                // 0 = a not-yet-lifted instruction. Render each honestly rather
+                // than as `__builtin_trap()` (which falsely implied a crash).
+                let tag = op
+                    .inputs
+                    .first()
+                    .and_then(|&inp| func.varnodes.get(inp as usize))
+                    .filter(|v| v.data.space == SpaceId::CONST)
+                    .map(|v| v.data.offset);
+                if tag == Some(3) {
+                    Some("__builtin_trap();".into())
+                } else if let Some(name) = tag.and_then(reargo_core::pcode::intrinsic::name) {
+                    // `out = name(operands…)` — the operands are inputs[1..].
+                    let args: Vec<String> = (1..op.inputs.len())
+                        .map(|i| self.input_expr(func, op, i))
+                        .collect();
+                    let call = format!("{}({})", name, args.join(", "));
+                    match out_name {
+                        Some(dst) => Some(format!("{} = {};", dst, call)),
+                        None => Some(format!("{};", call)),
+                    }
+                } else {
+                    Some("__unmodeled_insn();  // machine op not yet lifted (dataflow intact)".into())
+                }
+            }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
             }
         }
+    }
+
+    /// If `target` (a CALLIND callee) is a Load of `[base + const]` — the
+    /// classic C++ virtual dispatch `*(this_vtable + vfn_offset)` — return the
+    /// constant byte offset into the vtable. Traces two SSA defs: the Load,
+    /// then the IntAdd that formed its address.
+    fn vcall_vtable_offset(&self, func: &SsaFunction, target: crate::ssa::VarId) -> Option<u64> {
+        let tvn = func.varnodes.get(target as usize)?;
+        let load = func.ops.get(tvn.def_op?)?;
+        if load.opcode != OpCode::Load || load.inputs.len() < 2 {
+            return None;
+        }
+        let avn = func.varnodes.get(load.inputs[1] as usize)?;
+        let add = func.ops.get(avn.def_op?)?;
+        if add.opcode != OpCode::IntAdd {
+            return None;
+        }
+        for &inp in add.inputs.iter() {
+            if let Some(v) = func.varnodes.get(inp as usize)
+                && v.data.space == SpaceId::CONST
+            {
+                let off = v.data.offset;
+                // A real vtable slot offset is small and pointer-aligned;
+                // anything else (e.g. `config_ptr + base`) is not a vfn index.
+                if off > 0 && off < 0x4000 && off % 8 == 0 {
+                    return Some(off);
+                }
+                return None;
+            }
+        }
+        None
     }
 
     fn input_expr(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, idx: usize) -> String {
@@ -734,6 +906,11 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x88, 8) => "r9".into(),
         (0x90, 8) => "r10".into(),
         (0x98, 8) => "r11".into(),
+        // XMM register file (base 0x1200, stride 0x10). Scalar sd/ss views
+        // share the offset, so name by offset regardless of size.
+        (off, _) if (0x1200..0x1300).contains(&off) && off % 0x10 == 0 => {
+            format!("xmm{}", (off - 0x1200) / 0x10)
+        }
         _ => format!("var_{:x}", offset),
     }
 }

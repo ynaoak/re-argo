@@ -25,6 +25,12 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Per-function McCabe / fan-in / fan-out metrics" | `metrics <bin> --sort mccabe --top 25` |
 | "Dump CFG of a function as Graphviz DOT" | `cfg <bin> 0x401000` |
 | "Cross-references to/from an address" | `xrefs <bin> 0x401000` |
+| "Fast xref to an address on a HUGE binary (no full analysis)" | `xref-scan <bin> 0x401000` |
+| "Recover a C++ class name + vmethods from a vtable slot (PIE)" | `vtable <bin> 0x401000` |
+| "Find a function's entry from an interior address (no full analysis)" | `func-start <bin> 0x401000` |
+| "List every C++ class in a stripped PIE binary (RTTI browser)" | `classes <bin> [--filter Foo]` |
+| "Classify what an address is (code/data/import/vtable/string)" | `whatis <bin> 0x401000` |
+| "Map an object's field layout from a constructor/method" | `members <bin> 0x401000 [--base rbx]` |
 | "All call sites with resolved arguments" | `callsites <bin>` |
 | "Strings in the binary" | `strings <bin> --min-length 6` |
 | "Search for bytes or text" | `search <bin> --hex "48 8b ?? 24"` / `--text "password"` |
@@ -306,15 +312,44 @@ Inspect / export the built-in signature database (~312 entries spanning libc / W
 
 ### Code views
 
-#### `disasm <FILE> [-s ADDR] [-n N]`
+#### `disasm <FILE> [-s ADDR] [-n N] [-A]`
 
 Disassemble N instructions starting at ADDR (defaults to entry point). Format: `0xADDR  bytes  mnemonic operands`.
+With `-A`/`--annotate`, append a `; addr=...` comment classifying each referenced address (the branch
+target and `[...h]` rip-relative memory operands) as an import (`floorf@plt`), a vtable + demangled
+class (`vtable[NodeGraphBiomeSource<Pos2d>]`), code (`fn`), a string, or data — an IDA/Ghidra-style
+inline comment column that makes stripped C++ readable without manually cross-referencing addresses.
 
 #### `pcode <FILE> [-s ADDR] [-n N]`
 
 Show lifted P-code IR — the low-level intermediate the analysis stack runs on. Output is one line per P-code op grouped by source instruction.
 
-#### `decompile <FILE> [-a ADDR] [--ssa] [--rust]`
+##### x86-64 lifting coverage
+
+The x86 lifter (`reargo-lift/src/x86.rs`) covers the integer + SSE/scalar-float
+instruction mix found in optimised C++ binaries: ALU (add/sub/and/or/xor/not/neg/
+inc/dec, **adc/sbb**, **rol/ror**, shifts that set ZF/SF), **one-operand mul/imul**
+(full-width D:A product — the MT19937/LCG multiply) and div/idiv, sign-extension
+(movsx/movsxd, cbw/cwde/cdqe, cwd/cdq/cqo), **bt**, **setcc/cmovcc** (via a shared
+`cc_condition`), **xchg**, atomics (**xadd**, **cmpxchg** — modelled, `lock` is a
+dataflow no-op), control flow (jcc incl. **jp/jnp** once `comisd`/`ucomisd` set PF =
+`isnan(a)||isnan(b)`), direct/indirect calls (CALLIND with vfn-index annotation),
+and SSE: scalar + packed float add/sub/mul/div/sqrt/cmp-to-mask, conversions
+(cvt\*2si incl. memory source, cvtdq2ps/cvttps2dq, cvtpd2ps), bitwise
+(andps/orps/xorps/andnps + pand/por/pxor/pandn), packed-int (paddd/psubd/**pmuludq**/
+psrad), shuffles/unpacks (modelled as lossy Copy).
+
+Instructions best left opaque-but-named — lane-precise byte SIMD (`pmovmskb`,
+`pcmpeqb`) and bit-scan (`bsr`/`bsf`) — are emitted as **named intrinsics** via
+`reargo_core::pcode::intrinsic`: a `CallOther` carrying a tag const + operands + an
+output, rendered `out = name(args)` (with `bsr`/`bsf` also setting ZF), so dataflow
+stays intact without a verbose unrolled expansion. A genuinely unmodelled op renders
+`__unmodeled_insn()` and `int3` renders `__builtin_trap()` — distinct, never
+conflated. Validated: across 291 BE world-gen functions (biome node-graph, features,
+structure placement, RNG, and the 3-dimension chunk generators) every instruction is
+either fully lifted or a named intrinsic — zero opaque `CallOther`.
+
+#### `decompile <FILE> [-a ADDR] [--ssa] [--rust] [-A]`
 
 Decompile a function to pseudocode.
 
@@ -323,8 +358,16 @@ Decompile a function to pseudocode.
 | `-a ADDR` | Function address (hex). Defaults to entry point |
 | `--ssa` | Dump the optimised SSA IR instead of C |
 | `--rust` | Emit Rust-style pseudocode instead of C |
+| `-A`/`--annotate` | Append a `// 0xADDR=...` comment to each line classifying its address literals |
 
 Output includes inline `// <comment>` lines from the analysis annotations and call-rendering substitutions (`printf("hi", 42)` instead of `printf@plt()`).
+
+With `-A`, every line that still carries a raw `0x...` literal (an unresolved
+call target, vtable pointer, or data reference the renderer couldn't name) gets
+a trailing comment classifying it with the same scheme as `disasm -A`:
+`import@plt` / `vtable[class]` / `fn` / `string` / `data:<section>`. Literals
+below `0x1000` (stack/struct offsets, small constants) are skipped. This makes
+the residual addresses in carved-function output readable without cross-referencing.
 
 #### `decompile-all <FILE> [-o DIR] [--rust] [--skip-errors]`
 
@@ -335,6 +378,74 @@ Decompile every discovered function in parallel. With `-o`, writes `<dir>/<name>
 Emit a DOT graph of a single function's basic-block control flow. Pipe to `dot -Tpng > out.png` or graphviz.com.
 
 ### References / call relationships
+
+#### `members <FILE> <ADDRESS> [--insns N] [--base REG]`
+
+Map an object's field layout from a constructor or method — **no full analysis**. Lists every
+`[reg + offset]` member access in the function, grouped by base register and offset, with total /
+write / lea counts and a sample instruction. A C++ `this` pointer is a stable base register, so this
+reconstructs the object's member layout (which offset holds which sub-object), filling the gap the
+decompiler's struct recovery leaves on large constructors. `--base rbx` filters to one register;
+scan stops at the first `ret` or `--insns` (default 400). Pairs with `vtable`/`classes` to resolve
+"what type is at obj+0xNNN" while tracing an object graph. `--sub` instead reports the **sub-object
+construction map** (`offset -> ctor`): it detects both the in-place `lea rdi,[this+off]; call ctor`
+and the factory `call make_X(); mov [base+off], rax` patterns, reconstructing the composition tree
+so you can find which sub-constructor owns a deep field and recurse. (Caveat: the `lea rdi; call`
+pattern can't distinguish a constructor from any other method called on the sub-object — verify.)
+
+#### `whatis <FILE> <ADDRESS>`
+
+Classify what an address is — **no full analysis** — by combining the navigation lookups into one
+answer: the containing section + `rwx` perms (and `+offset` into it); for code, the enclosing
+function entry (via `func-start`); an import (PLT) name; for a vtable (a `[base-8 -> type_info]`
+RELATIVE-reloc chain) the demangled class; a printable string; and a demangled `type_info` name
+string. The fast first question to ask about any unknown address before reaching for `vtable` /
+`func-start` / `imports` individually.
+
+#### `classes <FILE> [--filter SUBSTR] [--limit N]`
+
+List every C++ class in a stripped **PIE** binary — a Ghidra-style RTTI class browser. Scans the
+RELATIVE relocations for Itanium `type_info` name strings, demangles them, and resolves each
+class's vtable address. `--filter` keeps only classes whose demangled name contains the substring;
+`--limit` caps the count (0 = all). Loader-only; inventories tens of thousands of classes in
+~1 s. Use it to locate any class instantly, then `vtable <base>` for its methods, or
+`vtable --name <substr>` for a single class's full vtable.
+
+#### `func-start <FILE> <ADDRESS> [--max-back N]`
+
+Find the entry of the function containing `ADDRESS` **without full analysis** — for huge stripped
+binaries where an arbitrary `carve --start` window bisects the function (it treats its own first byte
+as an entry). Backward-scans for a function boundary (`ret` / `int3` / `nop` padding) then verifies a
+clean linear decode from the candidate to `ADDRESS`, rejecting candidates whose path crosses a
+`ret`/unconditional-jump boundary. Prints the entry and a ready-to-run `carve --address` line.
+`--max-back` bounds the backward scan (default 8192). Heuristic — can mis-fire if a `0xC3`/`0xCC`/
+`0x90` byte sits mid-instruction; verify the prologue with `disasm` when in doubt. Pairs with
+`xref-scan` (find a reference site) → `func-start` (find its enclosing function) → `carve` +
+`decompile`.
+
+#### `xref-scan <FILE> <TARGET> [--limit N]`
+
+Fast cross-reference scan to `TARGET` **without the full analysis pipeline** — for multi-hundred-MB
+binaries (e.g. the 222 MB BDS server) where `xrefs` is impractical. Linear-disassembles the
+executable sections and reports each instruction whose resolved operand points at `TARGET`:
+`[BRANCH]` (direct call/jmp), `[RIPMEM]` (rip-relative memory ref), `[IMM]` (absolute immediate).
+Also **relocation-aware**: reports `[PTRREL]` vtable / function-pointer slots whose target comes
+from a PIE `R_X86_64_RELATIVE` reloc addend (invisible to a byte search, since the on-disk slot is
+zero) — so virtually-dispatched functions with no direct call site are still found. `--limit`
+bounds the code-hit count (default 200; 0 = unlimited). Loader-only, ~1.5 s on a 222 MB image.
+
+#### `vtable <FILE> <ADDRESS>`
+
+Recover the C++ vtable around `ADDRESS` (Itanium ABI, PIE). Given any address inside a vtable — e.g.
+a `[PTRREL]` slot reported by `xref-scan` — it walks back to the vtable base via RELATIVE
+relocations, reads the RTTI `type_info`, demangles the class name, and lists the virtual method
+targets (with the queried slot marked). Works on a stripped PIE binary because the slots come from
+`.rela.dyn` addends, not the (zero) on-disk bytes. Reverse-lookup recipe to go from a class *name* to
+its vtable: `search --text <Name>` → mangled `type_info` name string → `xref-scan` that (gives
+`type_info+8`) → `xref-scan` the `type_info` (gives `vtable_base-8`) → `vtable <base>`. Or skip the
+chase entirely: **`vtable <bin> --name <substr>`** scans the RTTI name strings, matches the
+demangled class name against the substring, and prints every matching class's vtable + vmethods in
+one shot (the address arg is optional when `--name` is given).
 
 #### `xrefs <FILE> <ADDRESS>`
 
@@ -454,7 +565,7 @@ Range selection (pick exactly one):
 
 Output container (`--format`):
 
-* `elf` (default) — a minimal single-`.text` ELF placed at the original VA. Ghidra and re-argo both auto-detect arch + base, so the carved function round-trips with **zero manual setup**: `re-argo carve big --start 0x… --size N -o f.elf` then `re-argo decompile f.elf --address 0x…`. Emitted for any source arch (even a PE source), since Ghidra loads ELF for every architecture.
+* `elf` (default) — a minimal ELF placed at the original VA. Ghidra and re-argo both auto-detect arch + base, so the carved function round-trips with **zero manual setup**: `re-argo carve big --start 0x… --size N -o f.elf` then `re-argo decompile f.elf --address 0x…`. Emitted for any source arch (even a PE source), since Ghidra loads ELF for every architecture. For x86-64, the carve also **bundles the function's referenced read-only constant pool / jump tables** as extra `.rodataN` segments at their original VAs (coalesced, capped 256 KB), so float-constant resolution and other rodata-dependent analysis work on the carve without analysing the whole image — e.g. the BDS noise functions decompile with `f32 const 0.015625 (= 1/64)` annotations.
 * `raw` — the bytes verbatim; the command prints the Ghidra "Raw Binary" import parameters (SLEIGH language id + base address) to type into the import dialog.
 
 Default output path is `<file>.carved.<addr>.elf` (or `.bin` for `raw`). Use the fast `--start/--size` form on multi-hundred-MB binaries — it never runs the analysis pipeline, only the loader. The `--address`-only form must analyse the whole binary to find the function's extent.
@@ -624,3 +735,4 @@ Output is one block per matched rule with per-string hit counts and the first N 
 8. **`decompile`'s output includes inline analyzer comments.** Lines starting with `// printf(format=…)` or `// stack-protected` are the annotations; the actual code line is the next one.
 9. **`tags --filter` uses the canonical kind slug** (`anti_debug`, not `Anti-Debug`).
 10. **`signatures --export <PATH>`** writes the built-in DB to JSON. Edit and re-attach via `annotate --import` to layer a project-specific type archive. Direct in-process `attach` is on the roadmap but not yet wired into the CLI.
+11. **x86 SSE / scalar-float is lifted to FLOAT_* p-code.** `addsd/mulss/divps/cvtsi2sd/comisd/movaps/…` decompile to real `xmm0 = xmm0 * xmm1` / `(float)` / compare expressions, and `pcode` shows `FLOAT_MULT`/`FLOAT_ADD`. XMM registers print as `xmm0..xmm15`. Caveats: packed (`…ps`) ops are modeled as a single whole-register FLOAT op (not per-lane SIMD) and shuffles (`shufps`/`unpcklps`/…) as a Copy of the source — good enough to keep dataflow connected and read the math, but not bit-exact for lane permutes. Unmodeled SSE (min/max, andn, integer-SIMD) still falls to `CallOther`. This makes float-dominated code (e.g. game world-gen noise) decompilable where it previously produced opaque traps.

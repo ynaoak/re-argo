@@ -76,6 +76,10 @@ enum Commands {
         /// Number of instructions to disassemble
         #[arg(short = 'n', long, default_value = "32")]
         count: usize,
+        /// Annotate referenced addresses inline (function / vtable class /
+        /// import / string) — like an IDA/Ghidra comment column.
+        #[arg(short = 'A', long)]
+        annotate: bool,
     },
     /// List registers for the binary's architecture
     Registers {
@@ -226,6 +230,9 @@ enum Commands {
         /// Output Rust-style pseudocode instead of C
         #[arg(long)]
         rust: bool,
+        /// Annotate addresses in the output (import@plt / vtable[class] / fn / string / data)
+        #[arg(short = 'A', long)]
+        annotate: bool,
     },
     /// Decompile every discovered function in parallel
     DecompileAll {
@@ -723,6 +730,109 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Fast cross-reference scan to an address WITHOUT full analysis.
+    ///
+    /// Linear-disassembles the executable sections and reports every
+    /// instruction whose resolved operand points at TARGET: rip-relative
+    /// memory refs, direct call/jmp targets, and absolute immediates.
+    /// Scales to multi-hundred-MB binaries where `xrefs` (which needs the
+    /// full analysis pipeline) is impractical.
+    XrefScan {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Target address to find references to (hex)
+        #[arg(value_parser = parse_hex)]
+        target: u64,
+        /// Maximum hits to report (0 = unlimited)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Recover the C++ vtable around an address (PIE, Itanium ABI).
+    ///
+    /// Given any address that is a vtable method slot (e.g. one found by
+    /// `xref-scan ... [PTRREL]`), walk to the vtable base, read the Itanium
+    /// RTTI type name (demangled), and list the virtual method targets.
+    /// Resolves the slots through RELATIVE relocations, so it works on a
+    /// stripped PIE binary where the pointers aren't in the on-disk bytes.
+    Vtable {
+        /// Path to the binary file
+        file: PathBuf,
+        /// An address inside the vtable (a method slot or the base) (hex).
+        /// Optional when `--name` is given.
+        #[arg(value_parser = parse_hex)]
+        address: Option<u64>,
+        /// Find vtables by (demangled) class-name substring instead of an
+        /// address — automates the name -> type_info -> vtable reverse lookup.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Find the entry of the function containing an interior address — without
+    /// full analysis. Backward-scans for a function boundary (ret/int3/nop
+    /// padding) then verifies a clean linear decode to the address. Fixes the
+    /// "carve window bisects the function" problem on huge stripped binaries.
+    FuncStart {
+        /// Path to the binary file
+        file: PathBuf,
+        /// An address inside the function (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Max bytes to scan backward (default 8192)
+        #[arg(long, default_value_t = 8192)]
+        max_back: u64,
+    },
+    /// List every C++ class in a PIE binary (RTTI class inventory).
+    ///
+    /// Scans the RELATIVE relocations for Itanium `type_info` name strings,
+    /// demangles them, and resolves each class's vtable address — a
+    /// Ghidra-style class browser that works on a stripped PIE binary. Filter
+    /// with `--filter <substr>`.
+    Classes {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Only classes whose demangled name contains this substring
+        #[arg(long)]
+        filter: Option<String>,
+        /// Max classes to print (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
+    /// Classify what an address is (no full analysis): code/data section, the
+    /// enclosing function entry, an import (PLT) name, a vtable + its class, a
+    /// type_info name, or a string. Unifies the navigation lookups.
+    Whatis {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Address to classify (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+    },
+    /// Map an object's member layout from a constructor/method (no full analysis).
+    ///
+    /// Lists every `[reg + offset]` member access a function makes, grouped by
+    /// base register and offset (with write / lea / total counts). The `this`
+    /// pointer is a stable base register, so this reconstructs the object's
+    /// field layout — for resolving "what's at obj+0xNNN" that a decompiler's
+    /// struct recovery misses on large constructors.
+    Members {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Function entry address (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Max instructions to scan (default 400)
+        #[arg(long, default_value_t = 400)]
+        insns: usize,
+        /// Only show accesses through this base register (e.g. rbx)
+        #[arg(long)]
+        base: Option<String>,
+        /// Instead, show the sub-object construction map (offset -> ctor)
+        #[arg(long)]
+        sub: bool,
+        /// With --sub, keep only verified constructors (targets that set a
+        /// vtable pointer) — filters out plain method calls on sub-objects.
+        #[arg(long)]
+        ctor: bool,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -748,7 +858,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             file,
             start,
             count,
-        } => cmd_disasm(&file, start, count, cli.thumb),
+            annotate,
+        } => cmd_disasm(&file, start, count, cli.thumb, annotate),
         Commands::Registers { file } => cmd_registers(&file),
         Commands::Analyze { file } => cmd_analyze(&file),
         Commands::Functions { file } => cmd_functions(&file),
@@ -775,7 +886,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             start,
             count,
         } => cmd_pcode(&file, start, count, cli.thumb),
-        Commands::Decompile { file, address, ssa, rust } => cmd_decompile(&file, address, ssa, rust, cli.thumb),
+        Commands::Decompile { file, address, ssa, rust, annotate } => cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate),
         Commands::DecompileAll { file, output_dir, rust, skip_errors } => cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb),
         Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
@@ -803,6 +914,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Patch { file, address, bytes, asm, output } => cmd_patch(&file, address, bytes.as_deref(), asm.as_deref(), output.as_deref()),
         Commands::Carve { file, address, start, end, size, format, output } =>
             cmd_carve(&file, address, start, end, size, &format, output.as_deref(), cli.thumb),
+        Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
+        Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
+        Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
+        Commands::Classes { file, filter, limit } => cmd_classes(&file, filter.as_deref(), limit),
+        Commands::Whatis { file, address } => cmd_whatis(&file, address),
+        Commands::Members { file, address, insns, base, sub, ctor } => cmd_members(&file, address, insns, base.as_deref(), sub, ctor),
         Commands::Entropy { file } => cmd_entropy(&file),
         Commands::Rop { file, depth, max_insns, useful_only, contains, limit, kinds } =>
             cmd_rop(&file, depth, max_insns, useful_only, contains.as_deref(), limit, &kinds),
@@ -1082,7 +1199,7 @@ fn cmd_hexdump(
     Ok(())
 }
 
-fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool, annotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let info = BinaryLoader::load(path)?;
     let arch = create_architecture_with_options(info.arch, thumb)?;
     let address = start.unwrap_or(info.entry_point);
@@ -1094,15 +1211,186 @@ fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Res
         address
     );
 
+    // For --annotate: a reloc map (vtable detection) + import map, built once.
+    let relocs: std::collections::BTreeMap<u64, u64> = if annotate {
+        std::fs::read(path)
+            .ok()
+            .map(|d| reargo_loader::elf_pointer_relocations(&d).into_iter().collect())
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+
     let instructions = arch.decode_linear(&info.memory, address, count)?;
     for insn in &instructions {
-        println!("{}", insn);
+        if annotate {
+            let mut notes: Vec<String> = Vec::new();
+            for a in addresses_in_insn(insn) {
+                if let Some(c) = short_classify_addr(&info, &relocs, a) {
+                    notes.push(format!("0x{:x}={}", a, c));
+                }
+            }
+            if notes.is_empty() {
+                println!("{}", insn);
+            } else {
+                println!("{}  ; {}", insn, notes.join(", "));
+            }
+        } else {
+            println!("{}", insn);
+        }
     }
 
     if instructions.is_empty() {
         println!("  (no instructions decoded at 0x{:x})", address);
     }
     Ok(())
+}
+
+/// Addresses an instruction references: its branch target plus any absolute
+/// `<hex>h` operands (rip-relative effective addresses / immediates as the
+/// formatter renders them).
+fn addresses_in_insn(insn: &reargo_arch::arch::DecodedInstruction) -> Vec<u64> {
+    let mut out = Vec::new();
+    if let Some(t) = insn.branch_target {
+        out.push(t);
+    }
+    // Parse `<hex>h]` tokens — hex addresses that close a memory operand
+    // `[...h]` (rip-relative effective addresses). Bare immediates like
+    // `sub rsp, 0A88h` (no closing `]`) are excluded; direct branch targets
+    // come from `branch_target` above.
+    let ops = &insn.operands;
+    let bytes = ops.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let s = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i + 1 < bytes.len()
+                && (bytes[i] == b'h' || bytes[i] == b'H')
+                && bytes[i + 1] == b']'
+                && i - s >= 4
+                && let Ok(v) = u64::from_str_radix(&ops[s..i], 16)
+                && !out.contains(&v)
+            {
+                out.push(v);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Post-process decompiled C/Rust text, appending a `// 0xADDR=class` comment to
+/// each line that references a classifiable address (call targets, vtable/data
+/// pointers). Reuses `short_classify_addr`. Addresses below 0x1000 are skipped
+/// (stack/struct offsets, small constants) to avoid noise.
+fn annotate_code(
+    code: &str,
+    info: &reargo_loader::BinaryInfo,
+    relocs: &std::collections::BTreeMap<u64, u64>,
+) -> String {
+    let mut out = String::with_capacity(code.len() + code.len() / 8);
+    for line in code.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let mut notes: Vec<String> = Vec::new();
+        for v in hex_literals_in_line(trimmed) {
+            // Skip stack/struct offsets and small constants.
+            if v >= 0x1000
+                && let Some(c) = short_classify_addr(info, relocs, v)
+            {
+                notes.push(format!("0x{:x}={}", v, c));
+            }
+        }
+        if notes.is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(trimmed);
+            out.push_str("  // ");
+            out.push_str(&notes.join(", "));
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Parse the distinct `0x<hex>` literals in a line of decompiled text, in order
+/// of first appearance (duplicates removed). Pure/testable.
+fn hex_literals_in_line(line: &str) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'0' && i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+            let s = i + 2;
+            let mut j = s;
+            while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            if j > s
+                && let Ok(v) = u64::from_str_radix(&line[s..j], 16)
+                && !out.contains(&v)
+            {
+                out.push(v);
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Short one-word classification of an address for inline disasm annotation.
+fn short_classify_addr(
+    info: &reargo_loader::BinaryInfo,
+    relocs: &std::collections::BTreeMap<u64, u64>,
+    addr: u64,
+) -> Option<String> {
+    // Import (PLT)?
+    for imp in &info.imports {
+        if imp.plt_address == addr {
+            return Some(format!("{}@plt", imp.name));
+        }
+    }
+    // vtable? base-8 -> type_info -> name.
+    let read_cstr = |a: u64| -> String {
+        let mut b = Vec::new();
+        for i in 0..160u64 {
+            match info.memory.read_byte(a + i) { Some(0) | None => break, Some(c) => b.push(c) }
+        }
+        String::from_utf8_lossy(&b).to_string()
+    };
+    if let Some(&rtti) = relocs.get(&addr.wrapping_sub(8))
+        && let Some(&name) = relocs.get(&rtti.wrapping_add(8))
+    {
+        let raw = read_cstr(name);
+        let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw))
+            .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+            .unwrap_or(raw);
+        return Some(format!("vtable[{}]", pretty));
+    }
+    // Section-based: code → fn, else a string or data.
+    let sec = info.sections.iter().find(|s| addr >= s.address && addr < s.address + s.size)?;
+    if sec.flags.contains(reargo_loader::SectionFlags::EXECUTE) {
+        return Some("fn".into());
+    }
+    // String?
+    let mut sb = Vec::new();
+    for i in 0..40u64 {
+        match info.memory.read_byte(addr + i) {
+            Some(b) if (0x20..0x7f).contains(&b) => sb.push(b),
+            _ => break,
+        }
+    }
+    if sb.len() >= 4 {
+        return Some(format!("\"{}\"", String::from_utf8_lossy(&sb)));
+    }
+    Some(format!("data:{}", sec.name))
 }
 
 fn cmd_registers(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -2178,7 +2466,7 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Resu
     Ok(())
 }
 
-fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
     let lifter = match make_lifter(&program.info, thumb) {
@@ -2194,6 +2482,19 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
     let result = reargo_decompile::decompile_function(lifter.as_ref(), &program, entry)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+    // For --annotate: a binary-info + reloc map for classifying addresses that
+    // appear literally in the decompiled C/Rust (call targets, vtable/data ptrs).
+    let annot = if annotate {
+        let info = BinaryLoader::load(path)?;
+        let relocs: std::collections::BTreeMap<u64, u64> = std::fs::read(path)
+            .ok()
+            .map(|d| reargo_loader::elf_pointer_relocations(&d).into_iter().collect())
+            .unwrap_or_default();
+        Some((info, relocs))
+    } else {
+        None
+    };
+
     if show_ssa {
         print!("{}", result.ssa_dump);
     } else {
@@ -2202,10 +2503,10 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
                 println!("{}\n", def);
             }
         }
-        if show_rust {
-            print!("{}", result.rust_code);
-        } else {
-            print!("{}", result.c_code);
+        let code = if show_rust { &result.rust_code } else { &result.c_code };
+        match &annot {
+            Some((info, relocs)) => print!("{}", annotate_code(code, info, relocs)),
+            None => print!("{}", code),
         }
     }
 
@@ -3680,6 +3981,490 @@ fn read_va_span(info: &reargo_loader::BinaryInfo, start: u64, end: u64) -> Vec<u
     out
 }
 
+fn cmd_funcstart(path: &Path, address: u64, max_back: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    match reargo_analysis::funcstart::find_function_start(&info, address, max_back) {
+        Some(entry) => {
+            println!("function entry: 0x{:x}  (size to 0x{:x} = {} bytes)", entry, address, address - entry);
+            println!("carve it:  re-argo carve {} --address 0x{:x}", path.display(), entry);
+            println!("  (or:     re-argo carve {} --start 0x{:x} --size <N>)", path.display(), entry);
+        }
+        None => println!(
+            "no function boundary found within {} bytes before 0x{:x} (try a larger --max-back, or 0x{:x} is the entry)",
+            max_back, address, address
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_xref_scan(
+    path: &Path,
+    target: u64,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    let hits = reargo_analysis::xref_scan::scan_xrefs(&info, target, limit);
+
+    // PIE binaries store vtable / function-pointer slots as RELATIVE
+    // relocations whose target lives in the reloc addend, not the on-disk
+    // bytes — invisible to both a code-operand scan and a raw byte search.
+    // Surface them so indirect/virtual references are found too.
+    let ptr_refs: Vec<u64> = std::fs::read(path)
+        .ok()
+        .map(|data| {
+            reargo_loader::elf_pointer_relocations(&data)
+                .into_iter()
+                .filter(|(_, tgt)| *tgt == target)
+                .map(|(slot, _)| slot)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let total = hits.len() + ptr_refs.len();
+    println!("References to 0x{:x} ({} found):", target, total);
+    if total == 0 {
+        println!("  (none — not an x86 image, target unmapped, or no reference)");
+    }
+    for h in &hits {
+        println!("  0x{:016x} [{}] {}", h.addr, h.kind.label(), h.text);
+    }
+    for slot in &ptr_refs {
+        println!(
+            "  0x{:016x} [PTRREL] pointer slot (vtable / fn-ptr table) -> 0x{:x}",
+            slot, target
+        );
+    }
+    if limit != 0 && hits.len() >= limit {
+        println!("  ... (code hits stopped at --limit {}; pass --limit 0 for all)", limit);
+    }
+    Ok(())
+}
+
+fn cmd_members(
+    path: &Path,
+    address: u64,
+    insns: usize,
+    base: Option<&str>,
+    sub: bool,
+    ctor: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    if sub {
+        let subs = reargo_analysis::members::subobject_ctors(&info, address, insns);
+        println!("Sub-object construction map from 0x{:x} ({} found):", address, subs.len());
+        for (off, target) in &subs {
+            // With --ctor, verify whether the in-place target sets a vtable
+            // pointer (a real ctor) vs. is just a method called on the
+            // sub-object — disambiguating the lea-rdi pattern.
+            let tag = if ctor {
+                if reargo_analysis::members::sets_vptr_early(&info, *target) {
+                    "  [ctor: sets vptr]"
+                } else {
+                    "  [non-ctor: no vptr store — method or factory]"
+                }
+            } else {
+                ""
+            };
+            println!("  +0x{:<7x} -> 0x{:x}{}", off, target, tag);
+        }
+        return Ok(());
+    }
+    let all = reargo_analysis::members::member_accesses(&info, address, insns);
+    // Auto-detect which register holds `this` so the object's own fields stand
+    // out from accesses through unrelated base registers (a common confound).
+    let this_reg = reargo_analysis::members::this_register(&info, address);
+    if let Some(t) = &this_reg {
+        println!("(this = {})", t);
+    }
+    let want = base.map(|b| b.to_lowercase());
+    let rows: Vec<_> = all
+        .into_iter()
+        .filter(|m| want.as_ref().is_none_or(|b| &m.base == b))
+        .collect();
+    println!("Member accesses from 0x{:x} ({} distinct):", address, rows.len());
+    println!("  {:<6} {:<10} {:>5} {:>6} {:>4}  sample", "base", "offset", "total", "writes", "lea");
+    for m in &rows {
+        let mark = if Some(&m.base) == this_reg.as_ref() { "  <- this" } else { "" };
+        println!(
+            "  {:<6} +0x{:<7x} {:>5} {:>6} {:>4}  {}{}",
+            m.base, m.offset, m.count, m.writes, m.lea, m.sample, mark
+        );
+    }
+    Ok(())
+}
+
+fn cmd_whatis(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    let info = BinaryLoader::load(path)?;
+    let data = std::fs::read(path)?;
+    println!("0x{:x}:", address);
+
+    // Section + perms.
+    if let Some(s) = info.sections.iter().find(|s| address >= s.address && address < s.address + s.size) {
+        let mut perms = String::new();
+        perms.push(if s.flags.contains(reargo_loader::SectionFlags::READ) { 'r' } else { '-' });
+        perms.push(if s.flags.contains(reargo_loader::SectionFlags::WRITE) { 'w' } else { '-' });
+        perms.push(if s.flags.contains(reargo_loader::SectionFlags::EXECUTE) { 'x' } else { '-' });
+        println!("  section: {} [{}]  (+0x{:x})", s.name, perms, address - s.address);
+        // Code → enclosing function entry.
+        if s.flags.contains(reargo_loader::SectionFlags::EXECUTE)
+            && let Some(e) = reargo_analysis::funcstart::find_function_start(&info, address, 8192)
+        {
+            println!("  in function: entry 0x{:x} (+0x{:x} in)", e, address - e);
+        }
+    } else {
+        println!("  section: (none — unmapped)");
+    }
+
+    // Import (PLT)?
+    for imp in &info.imports {
+        if imp.plt_address == address {
+            println!("  import: {} (PLT stub @0x{:x}, GOT 0x{:x})", imp.name, imp.plt_address, imp.got_address);
+        }
+    }
+
+    // String? (skip executable sections — instruction bytes look like text)
+    let in_exec = info.sections.iter().any(|s| {
+        s.flags.contains(reargo_loader::SectionFlags::EXECUTE)
+            && address >= s.address
+            && address < s.address + s.size
+    });
+    let mut sbytes = Vec::new();
+    if !in_exec {
+        for i in 0..64u64 {
+            match info.memory.read_byte(address + i) {
+                Some(b) if (0x20..0x7f).contains(&b) => sbytes.push(b),
+                _ => break,
+            }
+        }
+    }
+    if sbytes.len() >= 4 {
+        let s = String::from_utf8_lossy(&sbytes);
+        println!("  string: \"{}\"{}", s, if sbytes.len() == 64 { "..." } else { "" });
+        // A mangled type_info name string?
+        if (sbytes[0].is_ascii_digit() || sbytes[0] == b'N')
+            && let Some(d) = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", s))
+        {
+            println!("  type_info name for: {}", d.trim_start_matches("typeinfo name for "));
+        }
+    }
+
+    // vtable? base-8 is a RELATIVE reloc to a type_info whose +8 names the class.
+    let relocs: BTreeMap<u64, u64> =
+        reargo_loader::elf_pointer_relocations(&data).into_iter().collect();
+    let read_cstr = |a: u64| -> String {
+        let mut b = Vec::new();
+        for i in 0..200u64 {
+            match info.memory.read_byte(a + i) { Some(0) | None => break, Some(c) => b.push(c) }
+        }
+        String::from_utf8_lossy(&b).to_string()
+    };
+    if let Some(&rtti) = relocs.get(&address.wrapping_sub(8))
+        && let Some(&name) = relocs.get(&rtti.wrapping_add(8))
+    {
+        let raw = read_cstr(name);
+        let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw))
+            .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+            .unwrap_or(raw);
+        println!("  vtable for class: {}  (run `vtable {} 0x{:x}`)", pretty, path.display(), address);
+    }
+    Ok(())
+}
+
+fn cmd_classes(
+    path: &Path,
+    filter: Option<&str>,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let info = BinaryLoader::load(path)?;
+    let data = std::fs::read(path)?;
+    let relocs: BTreeMap<u64, u64> =
+        reargo_loader::elf_pointer_relocations(&data).into_iter().collect();
+    if relocs.is_empty() {
+        return Err("no RELATIVE relocations (not a PIE ELF?) — RTTI inventory needs them".into());
+    }
+    let exec: Vec<(u64, u64)> = info
+        .sections
+        .iter()
+        .filter(|s| s.flags.contains(reargo_loader::SectionFlags::EXECUTE) && s.size > 0)
+        .map(|s| (s.address, s.address + s.size))
+        .collect();
+    let is_code = |a: u64| exec.iter().any(|(s, e)| a >= *s && a < *e);
+    let read_cstr = |addr: u64| -> String {
+        let mut bytes = Vec::new();
+        for i in 0..256u64 {
+            match info.memory.read_byte(addr + i) {
+                Some(0) | None => break,
+                Some(b) => bytes.push(b),
+            }
+        }
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    let mut reverse: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (slot, target) in &relocs {
+        reverse.entry(*target).or_default().push(*slot);
+    }
+
+    // (class name, vtable base). A type_info name string is the target of a
+    // reloc at `type_info+8`; the vtable's `base-8` slot points at type_info.
+    let mut classes: BTreeSet<(String, u64)> = BTreeSet::new();
+    let filt = filter.map(|f| f.to_lowercase());
+    for (slot, target) in &relocs {
+        if is_code(*target) {
+            continue;
+        }
+        let raw = read_cstr(*target);
+        if raw.len() < 3 || !raw.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'N') {
+            continue;
+        }
+        let pretty = match reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw)) {
+            Some(s) => s.trim_start_matches("typeinfo name for ").to_string(),
+            None => continue,
+        };
+        if let Some(f) = &filt
+            && !pretty.to_lowercase().contains(f)
+        {
+            continue;
+        }
+        let type_info = slot.wrapping_sub(8);
+        if let Some(refs) = reverse.get(&type_info) {
+            for &r in refs {
+                let base = r.wrapping_add(8);
+                if relocs.get(&base).copied().is_some_and(is_code) {
+                    classes.insert((pretty.clone(), base));
+                }
+            }
+        }
+    }
+
+    println!("C++ classes ({} found):", classes.len());
+    for (i, (name, base)) in classes.iter().enumerate() {
+        if limit != 0 && i >= limit {
+            println!("  ... ({} more; raise --limit)", classes.len() - i);
+            break;
+        }
+        println!("  0x{:016x}  {}", base, name);
+    }
+    Ok(())
+}
+
+fn cmd_vtable(
+    path: &Path,
+    address: Option<u64>,
+    name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    let info = BinaryLoader::load(path)?;
+    let data = std::fs::read(path)?;
+    // slot_offset -> target, for every RELATIVE reloc (PIE pointer slots).
+    let relocs: BTreeMap<u64, u64> =
+        reargo_loader::elf_pointer_relocations(&data).into_iter().collect();
+    if relocs.is_empty() {
+        return Err("no RELATIVE relocations (not a PIE ELF?) — vtable recovery needs them".into());
+    }
+
+    let exec: Vec<(u64, u64)> = info
+        .sections
+        .iter()
+        .filter(|s| s.flags.contains(reargo_loader::SectionFlags::EXECUTE) && s.size > 0)
+        .map(|s| (s.address, s.address + s.size))
+        .collect();
+    let read_cstr = |addr: u64| -> String {
+        let mut bytes = Vec::new();
+        for i in 0..256u64 {
+            match info.memory.read_byte(addr + i) {
+                Some(0) | None => break,
+                Some(b) => bytes.push(b),
+            }
+        }
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+
+    match (address, name) {
+        (Some(addr), _) => print_vtable_at(&info, &relocs, &exec, addr, Some(addr), &read_cstr),
+        (None, Some(substr)) => {
+            // Reverse lookup: scan every reloc whose target is a plausible
+            // mangled type_info name string; match the demangled name against
+            // `substr`, then resolve type_info -> vtable for each hit.
+            let mut reverse: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+            for (slot, target) in &relocs {
+                reverse.entry(*target).or_default().push(*slot);
+            }
+            let is_code = |a: u64| exec.iter().any(|(s, e)| a >= *s && a < *e);
+            let mut shown = 0;
+            for (slot, target) in &relocs {
+                if is_code(*target) {
+                    continue; // name strings live in rodata, not code
+                }
+                let raw = read_cstr(*target);
+                if raw.len() < 3 || !raw.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'N') {
+                    continue;
+                }
+                let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw))
+                    .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+                    .unwrap_or_default();
+                if !pretty.to_lowercase().contains(&substr.to_lowercase()) {
+                    continue;
+                }
+                // `slot` = type_info+8 (name pointer). type_info = slot-8.
+                let type_info = slot.wrapping_sub(8);
+                // vtable base-8 is a slot pointing at `type_info`, whose base
+                // (slot+8) begins a run of code pointers.
+                if let Some(refs) = reverse.get(&type_info) {
+                    for &r in refs {
+                        let cand_base = r.wrapping_add(8);
+                        if relocs.get(&cand_base).copied().is_some_and(is_code) {
+                            println!("== {} ==", pretty);
+                            let _ = print_vtable_at(&info, &relocs, &exec, cand_base, None, &read_cstr);
+                            println!();
+                            shown += 1;
+                        }
+                    }
+                }
+            }
+            if shown == 0 {
+                println!("no class matching '{}' found", substr);
+            }
+            Ok(())
+        }
+        (None, None) => Err("provide an address or --name <substr>".into()),
+    }
+}
+
+fn print_vtable_at(
+    info: &reargo_loader::BinaryInfo,
+    relocs: &std::collections::BTreeMap<u64, u64>,
+    exec: &[(u64, u64)],
+    base_hint: u64,
+    queried: Option<u64>,
+    read_cstr: &dyn Fn(u64) -> String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let is_code = |a: u64| exec.iter().any(|(s, e)| a >= *s && a < *e);
+    let slot_to_code = |slot: u64| relocs.get(&slot).copied().filter(|t| is_code(*t));
+
+    // Walk back to the vtable base (lowest consecutive code-pointer slot).
+    let mut base = base_hint;
+    while slot_to_code(base.wrapping_sub(8)).is_some() {
+        base -= 8;
+    }
+
+    println!("vtable base:   0x{:x}", base);
+    if let Ok(off_top) = info.memory.read_u64(base.wrapping_sub(16)) {
+        println!("offset-to-top: {}", off_top as i64);
+    }
+    if let Some(&rtti) = relocs.get(&base.wrapping_sub(8)) {
+        println!("RTTI type_info: 0x{:x}", rtti);
+        if let Some(&name_addr) = relocs.get(&rtti.wrapping_add(8)) {
+            let mangled = read_cstr(name_addr);
+            let pretty = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", mangled))
+                .map(|s| s.trim_start_matches("typeinfo name for ").to_string())
+                .unwrap_or_else(|| mangled.clone());
+            println!("class:         {}  (mangled type {})", pretty, mangled);
+        }
+    } else {
+        println!("RTTI type_info: (none — base-8 is not a relocation)");
+    }
+
+    println!("methods:");
+    let mut idx = 0u64;
+    let mut slot = base;
+    while let Some(target) = slot_to_code(slot) {
+        let marker = if queried == Some(slot) { "  <- queried" } else { "" };
+        println!("  [{:>3}] 0x{:016x} -> 0x{:x}{}", idx, slot, target, marker);
+        idx += 1;
+        slot += 8;
+        if idx >= 128 {
+            println!("  ... (stopped at 128)");
+            break;
+        }
+    }
+    if idx == 0 {
+        println!("  (no code-pointer slots at the base — is the address inside a vtable?)");
+    }
+    Ok(())
+}
+
+/// Collect the read-only constant-pool / jump-table regions a carved x86-64
+/// function references via rip-relative addressing, as standalone read-only
+/// carve segments. This makes a single-function carve self-contained for
+/// rodata-dependent decompilation (notably float-constant resolution).
+fn collect_const_segments(
+    info: &reargo_loader::BinaryInfo,
+    code: &[u8],
+    code_start: u64,
+    code_end: u64,
+    bits: u32,
+) -> Vec<carve::CarveSegment> {
+    use reargo_loader::SectionFlags;
+    // Initialized, non-executable sections are valid constant sources.
+    let ro_ranges: Vec<(u64, u64)> = info
+        .sections
+        .iter()
+        .filter(|s| s.address != 0 && s.size > 0 && !s.flags.contains(SectionFlags::EXECUTE))
+        .map(|s| (s.address, s.address + s.size))
+        .collect();
+
+    let mut windows: Vec<(u64, u64)> = Vec::new();
+    for (addr, sz) in reargo_analysis::float_const::rip_relative_data_targets(code, code_start, bits)
+    {
+        if addr >= code_start && addr < code_end {
+            continue; // already present in the code segment
+        }
+        if !ro_ranges.iter().any(|(s, e)| addr >= *s && addr < *e) {
+            continue; // not a read-only data reference (skip GOT/bss/exec)
+        }
+        let w = (sz.max(8)) as u64;
+        windows.push((addr & !7, (addr + w + 7) & !7));
+    }
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    windows.sort();
+    // Coalesce windows within 64 bytes of each other.
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (lo, hi) in windows {
+        if let Some(last) = merged.last_mut()
+            && lo <= last.1 + 64
+        {
+            if hi > last.1 {
+                last.1 = hi;
+            }
+            continue;
+        }
+        merged.push((lo, hi));
+    }
+
+    const MAX_TOTAL: u64 = 256 * 1024;
+    const MAX_SEGS: usize = 64;
+    let mut segs = Vec::new();
+    let mut total = 0u64;
+    for (lo, hi) in merged {
+        if segs.len() >= MAX_SEGS {
+            break;
+        }
+        // Clamp to the containing section so a window never spans a gap.
+        let (slo, shi) = match ro_ranges.iter().find(|(s, e)| lo >= *s && lo < *e) {
+            Some((s, e)) => ((*s).max(lo), (*e).min(hi)),
+            None => (lo, hi),
+        };
+        if shi <= slo {
+            continue;
+        }
+        let span = shi - slo;
+        if total + span > MAX_TOTAL {
+            break;
+        }
+        total += span;
+        segs.push(carve::CarveSegment {
+            vaddr: slo,
+            exec: false,
+            data: read_va_span(info, slo, shi),
+        });
+    }
+    segs
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_carve(
     path: &Path,
@@ -3770,7 +4555,26 @@ fn cmd_carve(
         .unwrap_or_else(|| path.with_file_name(default_name));
 
     let bytes_written: Vec<u8> = if format == "elf" {
-        carve::build_min_elf(info.arch, info.bits, info.endian, carve_start, entry, &data)
+        let mut segments = vec![carve::CarveSegment {
+            vaddr: carve_start,
+            exec: true,
+            data: data.clone(),
+        }];
+        // Bundle the function's referenced constant pool / jump tables so the
+        // carve is self-contained for rodata-dependent decompilation.
+        if info.bits == 64 {
+            let consts = collect_const_segments(&info, &data, carve_start, carve_end, info.bits);
+            if !consts.is_empty() {
+                let bytes: u64 = consts.iter().map(|s| s.data.len() as u64).sum();
+                eprintln!(
+                    "[carve] bundled {} read-only constant-pool segment(s) ({} bytes) referenced by the function",
+                    consts.len(),
+                    bytes
+                );
+                segments.extend(consts);
+            }
+        }
+        carve::build_min_elf_segments(info.arch, info.bits, info.endian, entry, &segments)
     } else {
         data.clone()
     };
@@ -4477,4 +5281,30 @@ fn find_file_offset(info: &reargo_loader::BinaryInfo, address: u64, data: &[u8])
         }
     }
     Err(format!("address 0x{:x} not in any section", address).into())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::hex_literals_in_line;
+
+    #[test]
+    fn hex_literals_basic() {
+        assert_eq!(hex_literals_in_line("call 0xceab6a0();"), vec![0xceab6a0]);
+        // dedup + order preserved
+        assert_eq!(
+            hex_literals_in_line("x = 0x10; y = 0xcf6d3f0; z = 0x10;"),
+            vec![0x10, 0xcf6d3f0]
+        );
+    }
+
+    #[test]
+    fn hex_literals_edges() {
+        assert_eq!(hex_literals_in_line("no addresses here"), Vec::<u64>::new());
+        // bare 0x with no digits is ignored, doesn't hang
+        assert_eq!(hex_literals_in_line("0x bad 0xg"), Vec::<u64>::new());
+        // uppercase X and mixed-case digits
+        assert_eq!(hex_literals_in_line("*(uint64_t*)0XABcd"), vec![0xabcd]);
+        // adjacent literals
+        assert_eq!(hex_literals_in_line("0x1,0x2"), vec![1, 2]);
+    }
 }

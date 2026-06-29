@@ -474,6 +474,98 @@ impl<'a> RustEmitter<'a> {
                 let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
                 Some(format!("{} = (({} as {}) % ({} as {})) as u64;", dst, a, ty, b, ty))
             }
+            OpCode::FloatAdd => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} + {};", dst, a, b))
+            }
+            OpCode::FloatSub => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} - {};", dst, a, b))
+            }
+            OpCode::FloatMult => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} * {};", dst, a, b))
+            }
+            OpCode::FloatDiv => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} / {};", dst, a, b))
+            }
+            OpCode::FloatNeg => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = -{};", dst, a))
+            }
+            OpCode::FloatAbs => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = {}.abs();", dst, a))
+            }
+            OpCode::FloatSqrt => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = {}.sqrt();", dst, a))
+            }
+            OpCode::FloatEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} == {};", dst, a, b))
+            }
+            OpCode::FloatNotEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} != {};", dst, a, b))
+            }
+            OpCode::FloatLess => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} < {};", dst, a, b))
+            }
+            OpCode::FloatLessEqual => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = {} <= {};", dst, a, b))
+            }
+            OpCode::FloatInt2Float | OpCode::FloatFloat2Float => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = if out_size == 4 { "f32" } else { "f64" };
+                Some(format!("{} = {} as {};", dst, a, ty))
+            }
+            OpCode::FloatTrunc => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                let ty = size_to_rust_signed_type(out_size);
+                Some(format!("{} = {} as {};", dst, a, ty))
+            }
+            OpCode::FloatFloor => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = {}.floor();", dst, a))
+            }
+            OpCode::FloatCeil => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = {}.ceil();", dst, a))
+            }
+            OpCode::FloatRound => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = {}.round();", dst, a))
+            }
             OpCode::BoolAnd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
@@ -559,13 +651,41 @@ impl<'a> RustEmitter<'a> {
                 };
                 Some(format!("{}();", call_name))
             }
+            OpCode::CallInd => {
+                let target = self.input_expr(func, op, 0);
+                Some(format!("(*{})();", target))
+            }
             OpCode::Return => {
                 let val = self.input_expr(func, op, 0);
                 Some(format!("return {};", val))
             }
             OpCode::Branch => None,
             OpCode::CBranch => None,
-            OpCode::CallOther => Some("core::intrinsics::abort();".into()),
+            OpCode::CallOther => {
+                // Tag in the first const input: 3 = int3 (real trap), 0x100+ =
+                // named intrinsic (opaque-but-named with intact dataflow, e.g.
+                // bsr/pmovmskb), 0 = not-yet-lifted instruction.
+                let tag = op
+                    .inputs
+                    .first()
+                    .and_then(|&inp| func.varnodes.get(inp as usize))
+                    .filter(|v| v.data.space == SpaceId::CONST)
+                    .map(|v| v.data.offset);
+                if tag == Some(3) {
+                    Some("core::intrinsics::abort();".into())
+                } else if let Some(name) = tag.and_then(reargo_core::pcode::intrinsic::name) {
+                    let args: Vec<String> = (1..op.inputs.len())
+                        .map(|i| self.input_expr(func, op, i))
+                        .collect();
+                    let call = format!("{}({})", name, args.join(", "));
+                    match out_name {
+                        Some(dst) => Some(format!("{} = {};", dst, call)),
+                        None => Some(format!("{};", call)),
+                    }
+                } else {
+                    Some("unmodeled_insn(); // machine op not yet lifted (dataflow intact)".into())
+                }
+            }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
@@ -715,6 +835,9 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x88, 8) => "r9".into(),
         (0x90, 8) => "r10".into(),
         (0x98, 8) => "r11".into(),
+        (off, _) if (0x1200..0x1300).contains(&off) && off % 0x10 == 0 => {
+            format!("xmm{}", (off - 0x1200) / 0x10)
+        }
         _ => format!("var_{:x}", offset),
     }
 }

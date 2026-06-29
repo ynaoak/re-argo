@@ -76,6 +76,13 @@ impl RegisterOverlapMap {
             map.add(format!("R{}W", i), offset, 2);
             map.add(format!("R{}B", i), offset, 1);
         }
+        // XMM register file (base 0x1200, stride 0x10): 16/8/4-byte views.
+        for i in 0..16u64 {
+            let offset = 0x1200 + i * 0x10;
+            map.add(format!("XMM{}", i), offset, 16);
+            map.add(format!("XMM{}_Qa", i), offset, 8);
+            map.add(format!("XMM{}_Da", i), offset, 4);
+        }
         map
     }
 
