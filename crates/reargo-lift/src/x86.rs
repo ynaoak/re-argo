@@ -102,6 +102,14 @@ fn iced_xmm_offset(r: iced_x86::Register) -> Option<u64> {
 /// `movsd`/`movss` mnemonic, which iced shares with the string instruction —
 /// the string form has no XMM operand).
 fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
+    use iced_x86::Mnemonic::*;
+    // Float → int conversions can have *no* XMM register operand — e.g.
+    // `cvttss2si ecx, [rsp+0xA0]` is GP-reg ← float-in-memory. They still must
+    // route to the SSE handler (which loads the float source); the operand
+    // scan below would miss them and they'd fall through to CallOther.
+    if matches!(insn.mnemonic(), Cvttss2si | Cvttsd2si | Cvtss2si | Cvtsd2si) {
+        return true;
+    }
     (0..insn.op_count()).any(|i| {
         insn.op_kind(i) == iced_x86::OpKind::Register
             && iced_xmm_offset(insn.op_register(i)).is_some()
@@ -1361,6 +1369,30 @@ impl X86Lifter {
                 });
             }
 
+            // packed int32 -> float32 / float32 -> int32 (cvtdq2ps, cvttps2dq,
+            // cvtps2dq). Modeled as a single whole-register FLOAT op, like the
+            // other packed (…ps) ops — not per-lane. Was unhandled → CallOther.
+            Cvtdq2ps => {
+                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatInt2Float,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+            Cvttps2dq | Cvtps2dq => {
+                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                ops.push(PcodeOp {
+                    opcode: OpCode::FloatTrunc,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[src]),
+                });
+            }
+
             // float -> int (truncating cvtt*, and rounding cvt* approximated as trunc)
             Cvttsd2si | Cvttss2si | Cvtsd2si | Cvtss2si => {
                 let in_sz = if matches!(m, Cvttsd2si | Cvtsd2si) { 8 } else { 4 };
@@ -2259,6 +2291,28 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_cvtdq2ps_packed_int_to_float() {
+        // cvtdq2ps xmm0, xmm1 = 0f 5b c1
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x5b, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatInt2Float));
+    }
+
+    #[test]
+    fn lift_cvttss2si_memory_source_routes_to_sse() {
+        // cvttss2si ecx, [rax] = f3 0f 2c 08 — GP-reg dest, float-in-memory src,
+        // no XMM register operand. Must still route to SSE: LOAD + FloatTrunc,
+        // not CallOther (regression for insn_touches_xmm missing this shape).
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0xf3, 0x0f, 0x2c, 0x08], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther),
+            "cvttss2si reg,[mem] must lift: {:?}", l.ops);
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Load));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatTrunc));
     }
 
     #[test]
