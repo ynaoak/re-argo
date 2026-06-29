@@ -15,6 +15,7 @@ const ZF_OFFSET: u64 = 0x206;
 const SF_OFFSET: u64 = 0x207;
 const CF_OFFSET: u64 = 0x201;
 const OF_OFFSET: u64 = 0x20B;
+const PF_OFFSET: u64 = 0x202;
 
 fn reg(offset: u64, size: u32) -> VarnodeData {
     VarnodeData::new(REG_SPACE, offset, size)
@@ -696,8 +697,10 @@ impl X86Lifter {
                 seq_base += 1;
             }
 
-            Imul => {
-                if insn.op_count() >= 2 {
+            Mul | Imul => {
+                let signed = insn.mnemonic() == Imul;
+                if signed && insn.op_count() >= 2 {
+                    // 2/3-operand imul: dst = dst * src (truncated low result).
                     let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                     ops.push(PcodeOp {
                         opcode: OpCode::IntMult,
@@ -705,6 +708,45 @@ impl X86Lifter {
                         output: Some(dst),
                         inputs: SmallVec::from_slice(&[dst, src]),
                     });
+                } else {
+                    // One-operand MUL/IMUL: {D:A} = A * src, full-width product —
+                    // the multiply at the core of MT19937/LCG RNG. Widen both to
+                    // 2× the operand size, multiply, split low→A / high→D.
+                    use iced_x86::Register as R;
+                    let src = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                    let s = src.size;
+                    let (acc_r, hi_r) = match s {
+                        8 => (R::RAX, R::RDX),
+                        4 => (R::EAX, R::EDX),
+                        2 => (R::AX, R::DX),
+                        _ => (R::AL, R::AH),
+                    };
+                    let acc = iced_reg_to_varnode(acc_r).unwrap_or_else(|| constant(0, s));
+                    let w = s * 2;
+                    let ext = if signed { OpCode::IntSExt } else { OpCode::IntZExt };
+                    let za = unique(0x520, w);
+                    ops.push(PcodeOp { opcode: ext, seq: seq(seq_base), output: Some(za),
+                        inputs: SmallVec::from_slice(&[acc]) });
+                    seq_base += 1;
+                    let zs = unique(0x528, w);
+                    ops.push(PcodeOp { opcode: ext, seq: seq(seq_base), output: Some(zs),
+                        inputs: SmallVec::from_slice(&[src]) });
+                    seq_base += 1;
+                    let prod = unique(0x530, w);
+                    ops.push(PcodeOp { opcode: OpCode::IntMult, seq: seq(seq_base), output: Some(prod),
+                        inputs: SmallVec::from_slice(&[za, zs]) });
+                    seq_base += 1;
+                    // A = low s bytes.
+                    ops.push(PcodeOp { opcode: OpCode::Subpiece, seq: seq(seq_base), output: Some(acc),
+                        inputs: SmallVec::from_slice(&[prod, constant(0, 4)]) });
+                    seq_base += 1;
+                    // D = high s bytes (skip the byte form, whose AH varnode may
+                    // be unavailable in the register map).
+                    if let Some(hi) = iced_reg_to_varnode(hi_r).filter(|_| s >= 2) {
+                        ops.push(PcodeOp { opcode: OpCode::Subpiece, seq: seq(seq_base), output: Some(hi),
+                            inputs: SmallVec::from_slice(&[prod, constant(s as u64, 4)]) });
+                        seq_base += 1;
+                    }
                 }
             }
 
@@ -1290,15 +1332,22 @@ impl X86Lifter {
                 }
             }
 
-            // Parity-flag jumps are not modelled (no PF tracking yet);
-            // emit a CallOther so the emulator surfaces the gap instead
-            // of silently branching on whatever was in ZF.
+            // Parity-flag jumps. PF is set by float compares (comisd/ucomisd)
+            // as the unordered/NaN flag; jp = jump if PF, jnp = jump if !PF.
+            // (Integer-parity PF is not tracked, but jp/jnp almost always guard
+            // a float NaN check, which the comisd handler now models.)
             Jp | Jnp => {
+                let target = insn.near_branch_target();
+                let cond = if insn.mnemonic() == Jnp {
+                    self.emit_not(reg(PF_OFFSET, 1), 0x544, &mut ops, &mut seq_base, address)
+                } else {
+                    reg(PF_OFFSET, 1)
+                };
                 ops.push(PcodeOp {
-                    opcode: OpCode::CallOther,
+                    opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
-                    inputs: SmallVec::from_slice(&[constant(0, 4)]),
+                    inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
                 });
             }
 
@@ -1505,6 +1554,20 @@ impl X86Lifter {
                     output: Some(reg(CF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[a, b]),
                 });
+                sb += 1;
+                // PF = unordered = isnan(a) || isnan(b). Lets `jp`/`jnp` after a
+                // float compare (the NaN guard) branch on a real condition
+                // instead of an opaque CallOther.
+                let na = unique(0x540, 1);
+                ops.push(PcodeOp { opcode: OpCode::FloatNan, seq: seq(sb), output: Some(na),
+                    inputs: SmallVec::from_slice(&[a]) });
+                sb += 1;
+                let nb = unique(0x542, 1);
+                ops.push(PcodeOp { opcode: OpCode::FloatNan, seq: seq(sb), output: Some(nb),
+                    inputs: SmallVec::from_slice(&[b]) });
+                sb += 1;
+                ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(PF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[na, nb]) });
             }
 
             // xorps/pxor self-zero idiom -> 0; otherwise low-lane xor.
@@ -2486,6 +2549,40 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_one_operand_mul_full_width() {
+        // mul rcx = 48 f7 e1 -> {RDX:RAX} = RAX * RCX (unsigned, 128-bit)
+        let lifter = X86Lifter::new_64();
+        let l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert_eq!(l.ops.iter().filter(|o| o.opcode == OpCode::IntZExt).count(), 2, "unsigned widening");
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        assert_eq!(mul.output.unwrap().size, 16, "128-bit product");
+        // low -> RAX (off 0), high -> RDX (off 0x10), via SUBPIECE.
+        let pieces: Vec<_> = l.ops.iter().filter(|o| o.opcode == OpCode::Subpiece).collect();
+        assert_eq!(pieces.len(), 2);
+        assert!(pieces.iter().any(|o| o.output.unwrap().offset == 0x0));
+        assert!(pieces.iter().any(|o| o.output.unwrap().offset == 0x10));
+        // imul rcx = 48 f7 e9 -> signed widening.
+        let l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe9], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntSExt));
+    }
+
+    #[test]
+    fn lift_ucomisd_sets_pf_and_jnp_branches() {
+        let lifter = X86Lifter::new_64();
+        // ucomisd xmm0, xmm1 = 66 0f 2e c1 -> PF = isnan(a)||isnan(b)
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0x2e, 0xc1], 0x1000), 0x1000).unwrap();
+        assert_eq!(l.ops.iter().filter(|o| o.opcode == OpCode::FloatNan).count(), 2, "isnan of both operands");
+        assert!(l.ops.iter().any(|o|
+            o.opcode == OpCode::BoolOr && o.output.is_some_and(|v| v.offset == PF_OFFSET)),
+            "PF = unordered: {:?}", l.ops);
+        // jnp +5 = 7b 05 -> CBranch on !PF, not a CallOther.
+        let l = lifter.lift_instruction(&make_memory(&[0x7b, 0x05], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::CBranch));
     }
 
     #[test]
