@@ -1535,7 +1535,8 @@ impl X86Lifter {
             // result as a Copy of the source — lossy, but it keeps the
             // dataflow edge alive instead of emitting an opaque trap.
             Shufps | Shufpd | Unpcklps | Unpckhps | Unpcklpd | Unpckhpd | Movhlps
-            | Movlhps | Pshufd => {
+            | Movlhps | Pshufd | Punpckldq | Punpckhdq | Punpcklqdq | Punpckhqdq
+            | Punpcklbw | Punpcklwd | Movlps | Movlpd | Movhps | Movhpd => {
                 let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
                 let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 ops.push(PcodeOp {
@@ -1546,11 +1547,13 @@ impl X86Lifter {
                 });
             }
 
-            // and/or used for sign/abs masks — approximate on the low lane.
-            Andps | Andpd | Orps | Orpd => {
+            // Bitwise and/or — exact (bitwise ops don't cross lanes), modeled on
+            // the low lane like the masks the BDS uses for sign/abs. Pand/Por
+            // are the integer-SIMD spellings of the same operation.
+            Andps | Andpd | Orps | Orpd | Pand | Por => {
                 let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
                 let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
-                let opcode = if matches!(m, Andps | Andpd) {
+                let opcode = if matches!(m, Andps | Andpd | Pand) {
                     OpCode::IntAnd
                 } else {
                     OpCode::IntOr
@@ -1560,6 +1563,26 @@ impl X86Lifter {
                     seq: seq(sb),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[dst, src]),
+                });
+            }
+
+            // and-not: dst = (~dst) & src  (ANDNPS/ANDNPD/PANDN). Exact bitwise.
+            Andnps | Andnpd | Pandn => {
+                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                let ndst = unique(0x780, 8);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntNegate,
+                    seq: seq(sb),
+                    output: Some(ndst),
+                    inputs: SmallVec::from_slice(&[dst]),
+                });
+                sb += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAnd,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[ndst, src]),
                 });
             }
 
@@ -2358,6 +2381,22 @@ mod tests {
         // setbe al = 0f 96 c0  -> AL = CF | ZF (a BoolOr appears)
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x96, 0xc0], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::BoolOr));
+    }
+
+    #[test]
+    fn lift_packed_bitwise_pand_por_pandn() {
+        let lifter = X86Lifter::new_64();
+        // pand xmm0, xmm1 = 66 0f db c1 -> IntAnd
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0xdb, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntAnd));
+        // por xmm0, xmm1 = 66 0f eb c1 -> IntOr
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0xeb, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntOr));
+        // pandn xmm0, xmm1 = 66 0f df c1 -> ~dst & src (IntNegate then IntAnd)
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0xdf, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntNegate));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntAnd));
     }
 
     #[test]
