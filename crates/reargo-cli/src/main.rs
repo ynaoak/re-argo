@@ -1230,6 +1230,12 @@ fn cmd_disasm(path: &Path, start: Option<u64>, count: usize, thumb: bool, annota
                     notes.push(format!("0x{:x}={}", a, c));
                 }
             }
+            // Division-by-constant magics: `imul reg,reg,0x4EC4EC4F` → `÷13`.
+            if let Some(d) =
+                reargo_analysis::magic_div::magic_imul_divisor(insn.address, &insn.bytes)
+            {
+                notes.push(format!("÷{} (division magic)", d));
+            }
             if notes.is_empty() {
                 println!("{}", insn);
             } else {

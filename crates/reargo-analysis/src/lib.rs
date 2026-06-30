@@ -22,6 +22,7 @@ pub mod dataref;
 pub mod deadcode;
 pub mod float_const;
 pub mod funcstart;
+pub mod magic_div;
 pub mod members;
 pub mod xref_scan;
 pub mod dwarf_enrich;
