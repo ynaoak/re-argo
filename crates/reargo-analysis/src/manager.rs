@@ -15,6 +15,7 @@ use crate::coverage::CoverageAnalyzer;
 use crate::dataref::DataReferenceAnalyzer;
 use crate::deadcode::DeadCodeAnalyzer;
 use crate::float_const::FloatConstantAnalyzer;
+use crate::magic_div::MagicDivisionAnalyzer;
 use crate::dwarf_enrich::DwarfEnrichmentAnalyzer;
 use crate::demangle::DemangleAnalyzer;
 use crate::discovery::{FunctionDiscoveryAnalyzer, LateDiscoveryAnalyzer};
@@ -118,6 +119,7 @@ impl AnalysisManager {
             Box::new(LinearSweepAnalyzer),
             Box::new(DataReferenceAnalyzer),
             Box::new(FloatConstantAnalyzer),
+            Box::new(MagicDivisionAnalyzer),
             Box::new(PcodeReferenceAnalyzer),
             Box::new(AddressTableAnalyzer),
             Box::new(SwitchTableAnalyzer),
