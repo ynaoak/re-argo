@@ -168,6 +168,12 @@ enum Commands {
         /// Target address (hex)
         #[arg(value_parser = parse_hex)]
         address: u64,
+        /// Fast mode: linear-sweep executable sections and match call/jump
+        /// targets + resolved lea/mov operand immediates, plus 8-byte LE
+        /// pointer data refs. No full analysis -- works on huge binaries
+        /// (e.g. the 222 MB BDS) in seconds instead of timing out.
+        #[arg(long)]
+        fast: bool,
     },
     /// Show call graph
     Callgraph {
@@ -871,7 +877,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Signatures { export, library } => cmd_signatures(export.as_deref(), library.as_deref()),
         Commands::Workflow { declared_only } => cmd_workflow(declared_only),
         Commands::Cfg { file, address } => cmd_cfg(&file, address),
-        Commands::Xrefs { file, address } => cmd_xrefs(&file, address),
+        Commands::Xrefs { file, address, fast } => {
+            if fast {
+                cmd_xrefs_fast(&file, address, cli.thumb)
+            } else {
+                cmd_xrefs(&file, address)
+            }
+        }
         Commands::Callgraph {
             file,
             dot,
@@ -2241,6 +2253,120 @@ fn cmd_xrefs(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error>
         }
     }
     Ok(())
+}
+
+/// Fast cross-reference scan that skips the full analysis pipeline entirely.
+///
+/// Linear-sweeps every executable section decoding one instruction at a time
+/// (with 1-byte error recovery over data islands) and reports any instruction
+/// whose branch target or a resolved operand immediate equals `address`, plus
+/// any 8-byte little-endian pointer to `address` in data (vtable slots, GOT).
+/// On the 222 MB BDS this finishes in seconds where the analysis-based
+/// `cmd_xrefs` times out.
+fn cmd_xrefs_fast(
+    path: &Path,
+    address: u64,
+    thumb: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    let arch = create_architecture_with_options(info.arch, thumb)?;
+    println!(
+        "Fast xref scan for 0x{:x} (linear sweep, no full analysis):\n",
+        address
+    );
+
+    // Code refs: sweep executable sections with 1-byte error recovery.
+    let mut code_hits = 0usize;
+    for section in &info.sections {
+        if !section.flags.contains(SectionFlags::EXECUTE) {
+            continue;
+        }
+        let end = section.address + section.size;
+        let mut addr = section.address;
+        while addr < end {
+            match arch.decode_instruction(&info.memory, addr) {
+                Ok(insn) => {
+                    let hit = insn.branch_target == Some(address)
+                        || operands_reference(&insn.operands, address);
+                    if hit {
+                        println!(
+                            "  CODE 0x{:x} [{}]  {:<7} {}",
+                            insn.address, section.name, insn.mnemonic, insn.operands
+                        );
+                        code_hits += 1;
+                    }
+                    addr += (insn.length.max(1)) as u64;
+                }
+                Err(_) => addr += 1,
+            }
+        }
+    }
+
+    // Data refs: target as an 8-byte little-endian pointer in any section.
+    let target_le = address.to_le_bytes();
+    let mut data_hits = 0usize;
+    for section in &info.sections {
+        let mut buf = vec![0u8; section.size as usize];
+        if info.memory.read_bytes(section.address, &mut buf).is_err() {
+            continue;
+        }
+        let mut i = 0usize;
+        while i + 8 <= buf.len() {
+            if buf[i..i + 8] == target_le {
+                println!(
+                    "  DATA 0x{:x} [{}]  (8-byte pointer)",
+                    section.address + i as u64,
+                    section.name
+                );
+                data_hits += 1;
+                i += 8;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    println!("\n{} code ref(s), {} data ref(s)", code_hits, data_hits);
+    Ok(())
+}
+
+/// Match a hex immediate token in a rendered operand string against `target`.
+/// Handles both masm-style (`0D479460h`) and C-style (`0x...`) renderings.
+fn operands_reference(operands: &str, target: u64) -> bool {
+    let b = operands.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'0' && i + 1 < b.len() && (b[i + 1] | 0x20) == b'x' {
+            // C-style 0x....
+            let s = i + 2;
+            let mut j = s;
+            while j < b.len() && b[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            if j > s && u64::from_str_radix(&operands[s..j], 16) == Ok(target) {
+                return true;
+            }
+            i = j.max(i + 1);
+        } else if b[i].is_ascii_hexdigit() {
+            // masm-style ....h (digits then a trailing 'h')
+            let s = i;
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            if j > s
+                && j < b.len()
+                && (b[j] | 0x20) == b'h'
+                && u64::from_str_radix(&operands[s..j], 16) == Ok(target)
+            {
+                return true;
+            }
+            i = (j + 1).max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 fn cmd_callgraph(
