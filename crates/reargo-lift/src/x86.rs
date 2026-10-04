@@ -750,8 +750,26 @@ impl X86Lifter {
 
             Mul | Imul => {
                 let signed = insn.mnemonic() == Imul;
-                if signed && insn.op_count() >= 2 {
-                    // 2/3-operand imul: dst = dst * src (truncated low result).
+                if signed && insn.op_count() == 3 {
+                    // 3-operand imul: dst = src * imm (dst is NOT an input).
+                    // `imul ecx, ecx, 0x6C078965` (the MT19937 init step) used
+                    // to lift as `ecx = ecx * ecx`, dropping the immediate.
+                    let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                    let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                    let imm_raw = self.lift_operand(insn, 2, &mut ops, &mut seq_base, address)?;
+                    let imm = if imm_raw.space == CONST_SPACE && imm_raw.size != dst.size {
+                        constant(imm_raw.offset, dst.size)
+                    } else {
+                        imm_raw
+                    };
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntMult,
+                        seq: seq(seq_base),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[src, imm]),
+                    });
+                } else if signed && insn.op_count() == 2 {
+                    // 2-operand imul: dst = dst * src (truncated low result).
                     let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                     ops.push(PcodeOp {
                         opcode: OpCode::IntMult,
@@ -2676,6 +2694,42 @@ mod tests {
         // imul rcx = 48 f7 e9 -> signed widening.
         let l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe9], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntSExt));
+    }
+
+    #[test]
+    fn lift_three_operand_imul_uses_immediate() {
+        let lifter = X86Lifter::new_64();
+        // imul ecx, ecx, 0x6C078965 = 69 c9 65 89 07 6c  (MT19937 init step)
+        let l = lifter
+            .lift_instruction(&make_memory(&[0x69, 0xc9, 0x65, 0x89, 0x07, 0x6c], 0x1000), 0x1000)
+            .unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        assert!(
+            mul.inputs.iter().any(|v| v.space == CONST_SPACE && v.offset == 0x6C07_8965),
+            "immediate must be a multiplicand: {:?}",
+            mul
+        );
+        assert_eq!(mul.output.unwrap().size, 4);
+        // imul eax, ecx, 0xD6F = 69 c1 6f 0d 00 00 -> eax = ecx * 3439 (eax not read)
+        let l = lifter
+            .lift_instruction(&make_memory(&[0x69, 0xc1, 0x6f, 0x0d, 0x00, 0x00], 0x1000), 0x1000)
+            .unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        let out = mul.output.unwrap();
+        assert!(mul.inputs.iter().all(|v| v.space == CONST_SPACE || v.offset != out.offset),
+            "dst (eax) must not be an input: {:?}", mul);
+        assert!(mul.inputs.iter().any(|v| v.space == CONST_SPACE && v.offset == 0xD6F));
+        // imul r15, rax, 0x2AAAAAAB (imm32 sign-extended to 64) = 4c 69 f8 ab aa aa 2a
+        let l = lifter
+            .lift_instruction(&make_memory(&[0x4c, 0x69, 0xf8, 0xab, 0xaa, 0xaa, 0x2a], 0x1000), 0x1000)
+            .unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        assert_eq!(mul.output.unwrap().size, 8);
+        assert!(mul.inputs.iter().all(|v| v.size == 8), "operand sizes match: {:?}", mul);
+        // 2-operand form is unchanged: imul eax, ecx = 0f af c1 -> eax = eax * ecx
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0xaf, 0xc1], 0x1000), 0x1000).unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        assert_eq!(mul.inputs[0].offset, mul.output.unwrap().offset);
     }
 
     #[test]
