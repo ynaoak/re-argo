@@ -73,18 +73,18 @@ fn magic_u32(d: u32) -> u32 {
     loop {
         p += 1;
         if r1 >= nc - r1 {
-            q1 = q1.wrapping_mul(2) + 1;
-            r1 = r1.wrapping_mul(2) - nc;
+            q1 = q1.wrapping_mul(2).wrapping_add(1);
+            r1 = r1.wrapping_mul(2).wrapping_sub(nc);
         } else {
             q1 = q1.wrapping_mul(2);
             r1 = r1.wrapping_mul(2);
         }
-        if r2 + 1 >= d - r2 {
-            q2 = q2.wrapping_mul(2) + 1;
-            r2 = r2.wrapping_mul(2) + 1 - d;
+        if r2.wrapping_add(1) >= d.wrapping_sub(r2) {
+            q2 = q2.wrapping_mul(2).wrapping_add(1);
+            r2 = r2.wrapping_mul(2).wrapping_add(1).wrapping_sub(d);
         } else {
-            q2 = q2.wrapping_mul(2) + 1;
-            r2 = r2.wrapping_mul(2) + 1;
+            q2 = q2.wrapping_mul(2).wrapping_add(1);
+            r2 = r2.wrapping_mul(2).wrapping_add(1);
         }
         let delta = d - 1 - r2;
         if !(p < 64 && (q1 < delta || (q1 == delta && r1 == 0))) {
