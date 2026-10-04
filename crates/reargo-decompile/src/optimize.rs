@@ -555,7 +555,10 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     // the entire key for the typical case and skips the heap alloc
     // that a plain `Vec<ValueKey>` paid for every candidate op.
     type InKeys = SmallVec<[ValueKey; 3]>;
-    let mut seen: rustc_hash::FxHashMap<(usize, &'static str, InKeys), ValueKey> =
+    // The key includes the output size: ZEXT(x:4)->8 and ZEXT(x:4)->16 have
+    // identical opcode+inputs but are different values; merging them
+    // redirected a 16-byte XMM use to the 8-byte view.
+    let mut seen: rustc_hash::FxHashMap<(usize, &'static str, u32, InKeys), ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx, Default::default());
     let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx / 2, Default::default());
@@ -581,7 +584,8 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         if is_commutative(opcode) {
             in_keys.sort();
         }
-        let key = (func.ops[i].block, opcode.name(), in_keys);
+        let out_size = func.varnodes[out_id as usize].data.size;
+        let key = (func.ops[i].block, opcode.name(), out_size, in_keys);
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
         if let Some(&existing) = seen.get(&key) {
@@ -1093,6 +1097,25 @@ mod tests {
         assert_eq!(eliminated, 1, "duplicate add should be eliminated");
         let live_adds = ssa.ops.iter().filter(|op| !op.dead && op.opcode == OpCode::IntAdd).count();
         assert_eq!(live_adds, 1);
+    }
+
+    #[test]
+    fn cse_keeps_extensions_of_different_width() {
+        // xmm0_q = zext(xmm0_d); xmm0 = zext(xmm0_d): same input, different
+        // output size -> NOT the same value.
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let d = VarnodeData::new(SpaceId(2), 0x1200, 4);
+        let q = VarnodeData::new(SpaceId(2), 0x1200, 8);
+        let x = VarnodeData::new(SpaceId(2), 0x1200, 16);
+        let insns = vec![make_lifted(0x1000, vec![
+            PcodeOp { opcode: OpCode::IntZExt, seq: seq(0x1000, 0), output: Some(q),
+                inputs: SmallVec::from_slice(&[d]) },
+            PcodeOp { opcode: OpCode::IntZExt, seq: seq(0x1000, 1), output: Some(x),
+                inputs: SmallVec::from_slice(&[d]) },
+        ])];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        assert_eq!(common_subexpression_elimination(&mut ssa), 0);
     }
 
     #[test]

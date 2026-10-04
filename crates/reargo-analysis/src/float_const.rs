@@ -30,6 +30,55 @@ fn float_width(m: Mnemonic) -> Option<u32> {
     }
 }
 
+/// Packed-float SSE/AVX mnemonics that read a whole 128-bit constant from
+/// memory: returns the element width (4 = `ps`, 8 = `pd`). Vectorised
+/// world-gen code (e.g. BDS density slides) keeps per-lane scale tables in
+/// `.rodata` and loads them with `mulps xmm, [rip+…]`; without this they
+/// decompiled as an opaque `*(void*)0x128f2d0`.
+fn packed_float_width(m: Mnemonic) -> Option<u32> {
+    use Mnemonic::*;
+    match m {
+        Movaps | Movups | Addps | Subps | Mulps | Divps | Minps | Maxps | Sqrtps | Cmpps
+        | Andps | Andnps | Orps | Xorps | Unpcklps | Unpckhps | Shufps | Vmovaps | Vmovups
+        | Vaddps | Vsubps | Vmulps | Vdivps | Vminps | Vmaxps | Vandps | Vorps | Vxorps => {
+            Some(4)
+        }
+        Movapd | Movupd | Addpd | Subpd | Mulpd | Divpd | Minpd | Maxpd | Sqrtpd | Cmppd
+        | Andpd | Andnpd | Orpd | Xorpd | Unpcklpd | Unpckhpd | Shufpd | Vmovapd | Vmovupd
+        | Vaddpd | Vsubpd | Vmulpd | Vdivpd | Vminpd | Vmaxpd | Vandpd | Vorpd | Vxorpd => {
+            Some(8)
+        }
+        _ => None,
+    }
+}
+
+/// Render a 128-bit packed constant (`lanes` little-endian elements of
+/// `width` bytes) as `v4f32 const [a, b, c, d]` / `v2f64 const [a, b]`.
+/// Lanes that are all equal collapse to `v4f32 const splat(a)`.
+fn format_packed(vals: &[f64], width: u32) -> String {
+    let ty = if width == 4 { "v4f32" } else { "v2f64" };
+    if vals.iter().any(|v| v.is_nan()) {
+        // Bit masks (abs / sign-flip tables for andps/xorps) are NaN as
+        // floats; show the raw lanes instead.
+        let parts: Vec<String> = vals
+            .iter()
+            .map(|v| {
+                if width == 4 {
+                    format!("{:#010x}", (*v as f32).to_bits())
+                } else {
+                    format!("{:#018x}", v.to_bits())
+                }
+            })
+            .collect();
+        return format!("{} mask [{}]", ty, parts.join(", "));
+    }
+    if vals.iter().all(|v| v.to_bits() == vals[0].to_bits()) {
+        return format!("{} const splat({})", ty, vals[0]);
+    }
+    let parts: Vec<String> = vals.iter().map(|v| format!("{}", v)).collect();
+    format!("{} const [{}]", ty, parts.join(", "))
+}
+
 /// Render a float with a short round-trip form plus a `1/N` reciprocal hint
 /// for clean values (the constants RE cares about are usually `1/2^k` scales
 /// or small rationals).
@@ -91,6 +140,34 @@ impl Analyzer for FloatConstantAnalyzer {
 
         let mut annotated = 0usize;
         for (addr, bytes) in &insns {
+            if let Some((target, width)) = decode_packed_const_load(*addr, bytes) {
+                if !ranges.iter().any(|(s, e)| target >= *s && target + 16 <= *e) {
+                    continue;
+                }
+                let lanes = 16 / width;
+                let mut vals = Vec::with_capacity(lanes as usize);
+                for k in 0..lanes {
+                    let a = target + (k * width) as u64;
+                    let v = match width {
+                        4 => program.info.memory.read_u32(a).ok().map(|b| f32::from_bits(b) as f64),
+                        _ => program.info.memory.read_u64(a).ok().map(f64::from_bits),
+                    };
+                    match v {
+                        Some(v) => vals.push(v),
+                        None => break,
+                    }
+                }
+                if vals.len() as u32 != lanes
+                    || program.comments.get(*addr, CommentType::Eol).is_some()
+                {
+                    continue;
+                }
+                program
+                    .comments
+                    .set(*addr, CommentType::Eol, format_packed(&vals, width));
+                annotated += 1;
+                continue;
+            }
             let Some((target, width)) = decode_float_const_load(*addr, bytes) else {
                 continue;
             };
@@ -171,6 +248,23 @@ fn decode_float_const_load(addr: u64, bytes: &[u8]) -> Option<(u64, u32)> {
     Some((ii.memory_displacement64(), width))
 }
 
+/// If `bytes` at `addr` decode to a packed-float op whose memory operand is a
+/// RIP-relative 128-bit constant, return `(target, element_width_bytes)`.
+fn decode_packed_const_load(addr: u64, bytes: &[u8]) -> Option<(u64, u32)> {
+    let mut dec = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);
+    let mut ii = IcedInsn::default();
+    dec.decode_out(&mut ii);
+    if ii.is_invalid() {
+        return None;
+    }
+    let width = packed_float_width(ii.mnemonic())?;
+    let mem = (0..ii.op_count()).any(|i| ii.op_kind(i) == OpKind::Memory);
+    if !mem || ii.memory_base() != Register::RIP || ii.memory_size().size() != 16 {
+        return None;
+    }
+    Some((ii.memory_displacement64(), width))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +291,53 @@ mod tests {
         // mov eax, [rip+0x10] = 8b 05 10 00 00 00 (not a float op)
         let bytes = [0x8b, 0x05, 0x10, 0x00, 0x00, 0x00];
         assert!(decode_float_const_load(0x1000, &bytes).is_none());
+    }
+
+    #[test]
+    fn detects_mulps_rip_relative_vector() {
+        // mulps xmm0, [rip+0x10] = 0f 59 05 10 00 00 00 (len 7)
+        let bytes = [0x0f, 0x59, 0x05, 0x10, 0x00, 0x00, 0x00];
+        let (target, width) = decode_packed_const_load(0x1000, &bytes).unwrap();
+        assert_eq!(target, 0x1017);
+        assert_eq!(width, 4);
+        // the scalar decoder must not claim it
+        assert!(decode_float_const_load(0x1000, &bytes).is_none());
+        // mulpd xmm0, [rip+0x10] = 66 0f 59 05 10 00 00 00
+        let pd = [0x66, 0x0f, 0x59, 0x05, 0x10, 0x00, 0x00, 0x00];
+        assert_eq!(decode_packed_const_load(0x1000, &pd).unwrap().1, 8);
+    }
+
+    #[test]
+    fn formats_packed() {
+        assert_eq!(format_packed(&[1.0, 2.5, -8.0, 0.0], 4), "v4f32 const [1, 2.5, -8, 0]");
+        assert_eq!(format_packed(&[0.5; 4], 4), "v4f32 const splat(0.5)");
+        assert_eq!(format_packed(&[684.412, 1.0], 8), "v2f64 const [684.412, 1]");
+        let abs = f32::from_bits(0x7fff_ffff) as f64;
+        assert_eq!(
+            format_packed(&[abs; 4], 4),
+            "v4f32 mask [0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff]"
+        );
+    }
+
+    #[test]
+    fn annotates_packed_constant_end_to_end() {
+        use crate::discovery::FunctionDiscoveryAnalyzer;
+        use crate::testutil::helpers::make_x86_64_program_with_data;
+
+        let code_addr = 0x1000u64;
+        let data_addr = 0x2000u64;
+        // mulps xmm0, [rip+0xff9] ; ret   (len 7 -> rip 0x1007 + 0xff9 = 0x2000)
+        let code = [0x0f, 0x59, 0x05, 0xf9, 0x0f, 0x00, 0x00, 0xc3];
+        let mut data = Vec::new();
+        for v in [1.0f32, 0.5, 0.25, -8.0] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut prog = make_x86_64_program_with_data(&code, &data, code_addr, data_addr);
+        FunctionDiscoveryAnalyzer.analyze(&mut prog).unwrap();
+        let res = FloatConstantAnalyzer.analyze(&mut prog).unwrap();
+        assert_eq!(res.references_found, 1);
+        let c = prog.comments.get(code_addr, CommentType::Eol).expect("eol comment");
+        assert_eq!(c, "v4f32 const [1, 0.5, 0.25, -8]");
     }
 
     #[test]

@@ -750,8 +750,26 @@ impl X86Lifter {
 
             Mul | Imul => {
                 let signed = insn.mnemonic() == Imul;
-                if signed && insn.op_count() >= 2 {
-                    // 2/3-operand imul: dst = dst * src (truncated low result).
+                if signed && insn.op_count() == 3 {
+                    // 3-operand imul: dst = src * imm (dst is NOT an input).
+                    // `imul ecx, ecx, 0x6C078965` (the MT19937 init step) used
+                    // to lift as `ecx = ecx * ecx`, dropping the immediate.
+                    let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                    let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                    let imm_raw = self.lift_operand(insn, 2, &mut ops, &mut seq_base, address)?;
+                    let imm = if imm_raw.space == CONST_SPACE && imm_raw.size != dst.size {
+                        constant(imm_raw.offset, dst.size)
+                    } else {
+                        imm_raw
+                    };
+                    ops.push(PcodeOp {
+                        opcode: OpCode::IntMult,
+                        seq: seq(seq_base),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[src, imm]),
+                    });
+                } else if signed && insn.op_count() == 2 {
+                    // 2-operand imul: dst = dst * src (truncated low result).
                     let (dst, src) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                     ops.push(PcodeOp {
                         opcode: OpCode::IntMult,
@@ -2330,7 +2348,11 @@ impl PcodeLift for X86Lifter {
             })
         };
 
-        let pcode_ops = self.lift_iced(&insn, address)?;
+        let mut pcode_ops = self.lift_iced(&insn, address)?;
+        if self.is_64 {
+            pcode_ops = zero_extend_gpr32_writes(pcode_ops);
+        }
+        pcode_ops = sync_xmm_views(pcode_ops, xmm_write_zeroes_upper(&insn));
 
         Ok(LiftedInstruction {
             address,
@@ -2341,12 +2363,187 @@ impl PcodeLift for X86Lifter {
     }
 }
 
+/// x86-64: every write to a 32-bit GPR (`eax`, `r8d`, …) zero-extends into
+/// the full 64-bit register. The SSA layer keys variables on
+/// (offset, size), so without an explicit `rax = zext(eax)` a later read of
+/// `rax` saw the *previous* 64-bit definition: `lea rax,[g]; mov eax,7;
+/// add rcx,rax` decompiled as `rcx + g`, and constant propagation then
+/// folded the MT19937 init loop's exit test to `if (0)`, deleting the loop.
+/// Emit the extension right after each such write and renumber the ops.
+///
+/// The converse alias is handled too: a 64-bit write (`add rcx, rax`)
+/// followed by a 32-bit read (`mov [..], ecx`) read the stale `ecx`, so the
+/// 64-bit arithmetic was dead-code-eliminated. After each 64-bit GPR write
+/// we also refresh the 32-bit view with `ecx = SUBPIECE(rcx, 0)` (dead
+/// copies are removed later by the decompiler when nothing reads them).
+fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
+    let is_gpr = |v: &VarnodeData, sz: u32| {
+        v.space == REG_SPACE && v.size == sz && v.offset < 0xC0 && v.offset % 8 == 0
+    };
+    if !ops
+        .iter()
+        .any(|o| o.output.as_ref().is_some_and(|v| is_gpr(v, 4) || is_gpr(v, 8)))
+    {
+        return ops;
+    }
+    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 2);
+    for op in ops {
+        let w32 = op.output.filter(|v| is_gpr(v, 4));
+        // rsp is excluded: 64-bit code never reads esp, and push/pop/call/ret
+        // would otherwise each grow an extra op.
+        let w64 = op.output.filter(|v| is_gpr(v, 8) && v.offset != 0x20);
+        let at = op.seq.addr;
+        out.push(op);
+        if let Some(r32) = w32 {
+            out.push(PcodeOp {
+                opcode: OpCode::IntZExt,
+                seq: SeqNum::new(at, 0),
+                output: Some(reg(r32.offset, 8)),
+                inputs: SmallVec::from_slice(&[r32]),
+            });
+        } else if let Some(r64) = w64 {
+            out.push(PcodeOp {
+                opcode: OpCode::Subpiece,
+                seq: SeqNum::new(at, 0),
+                output: Some(reg(r64.offset, 4)),
+                inputs: SmallVec::from_slice(&[r64, constant(0, 4)]),
+            });
+        }
+    }
+    for (i, op) in out.iter_mut().enumerate() {
+        op.seq.order = i as u32;
+    }
+    out
+}
+
+/// True when the instruction's XMM destination write clears the bits above
+/// the written element (`movss/movsd xmm, mem`, `movd/movq xmm, r/m`).
+fn xmm_write_zeroes_upper(insn: &iced_x86::Instruction) -> bool {
+    use iced_x86::Mnemonic::*;
+    use iced_x86::OpKind;
+    match insn.mnemonic() {
+        Movss | Movsd => insn.op_count() == 2 && insn.op_kind(1) == OpKind::Memory,
+        Movd | Movq => {
+            insn.op_count() == 2
+                && insn.op_kind(0) == OpKind::Register
+                && insn.op0_register().is_xmm()
+        }
+        // xorps/xorpd/pxor x, x: the zero idiom clears all 128 bits.
+        Xorps | Xorpd | Pxor => {
+            insn.op_count() == 2
+                && insn.op_kind(1) == OpKind::Register
+                && insn.op0_register() == insn.op1_register()
+        }
+        _ => false,
+    }
+}
+
+/// Keep the 4/8/16-byte views of an XMM register coherent. The lifter models
+/// scalar SSE (`mulss`) on the low 4/8 bytes and packed SSE (`mulps`,
+/// `movaps`) on the full 16, and SSA keys on (offset, size) -- so
+/// `movaps xmm0,[rsp+30h]; mulss xmm0,[c]; movaps [rsp+10h],xmm0` read a
+/// stale 4-byte xmm0 for the multiply and stored a 16-byte value that never
+/// saw it; the `mulss` was then removed as dead (BDS End density: the
+/// octave loop `freq *= 0.5` vanished).
+///
+/// After a 16-byte write the low views are refreshed with SUBPIECE; after a
+/// 4/8-byte write the wider views are rebuilt with PIECE(old_high, new_low),
+/// or ZEXT for the forms that clear the upper bits.
+fn sync_xmm_views(ops: Vec<PcodeOp>, zero_upper: bool) -> Vec<PcodeOp> {
+    let xmm_of = |v: &VarnodeData| -> Option<u64> {
+        let end = XMM_BASE + 16 * 0x10;
+        (v.space == REG_SPACE
+            && v.offset >= XMM_BASE
+            && v.offset < end
+            && (v.offset - XMM_BASE) % 0x10 == 0
+            && matches!(v.size, 4 | 8 | 16))
+            .then_some(v.offset)
+    };
+    if !ops.iter().any(|o| o.output.as_ref().and_then(xmm_of).is_some()) {
+        return ops;
+    }
+    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 4);
+    let mut tmp = 0x7f00u64;
+    for op in ops {
+        let w = op.output.filter(|v| xmm_of(v).is_some());
+        let at = op.seq.addr;
+        out.push(op);
+        let Some(w) = w else { continue };
+        let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
+            opcode,
+            seq: SeqNum::new(at, 0),
+            output: Some(output),
+            inputs: SmallVec::from_slice(inputs),
+        };
+        let r = |sz: u32| reg(w.offset, sz);
+        match w.size {
+            16 => {
+                out.push(mk(OpCode::Subpiece, r(8), &[r(16), constant(0, 4)]));
+                out.push(mk(OpCode::Subpiece, r(4), &[r(16), constant(0, 4)]));
+            }
+            8 => {
+                out.push(mk(OpCode::Subpiece, r(4), &[r(8), constant(0, 4)]));
+                if zero_upper {
+                    out.push(mk(OpCode::IntZExt, r(16), &[r(8)]));
+                } else {
+                    let hi = unique(tmp, 8);
+                    tmp += 0x10;
+                    out.push(mk(OpCode::Subpiece, hi, &[r(16), constant(8, 4)]));
+                    out.push(mk(OpCode::Piece, r(16), &[hi, r(8)]));
+                }
+            }
+            _ => {
+                if zero_upper {
+                    out.push(mk(OpCode::IntZExt, r(8), &[r(4)]));
+                    out.push(mk(OpCode::IntZExt, r(16), &[r(4)]));
+                } else {
+                    let hi4 = unique(tmp, 4);
+                    let hi8 = unique(tmp + 8, 8);
+                    tmp += 0x10;
+                    out.push(mk(OpCode::Subpiece, hi4, &[r(8), constant(4, 4)]));
+                    out.push(mk(OpCode::Piece, r(8), &[hi4, r(4)]));
+                    out.push(mk(OpCode::Subpiece, hi8, &[r(16), constant(8, 4)]));
+                    out.push(mk(OpCode::Piece, r(16), &[hi8, r(8)]));
+                }
+            }
+        }
+    }
+    for (i, op) in out.iter_mut().enumerate() {
+        op.seq.order = i as u32;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use reargo_core::address::Endian;
     use reargo_loader::memory::{MemoryBlock, MemoryFlags};
     use std::sync::Arc;
+
+    /// Drop the GPR alias-refresh ops added by `zero_extend_gpr32_writes`
+    /// (`rX = zext(eX)` / `eX = subpiece(rX, 0)`), for tests that assert the
+    /// exact shape of an instruction's semantics.
+    fn core_ops(ops: &[PcodeOp]) -> Vec<PcodeOp> {
+        ops.iter()
+            .filter(|o| {
+                let alias = matches!(o.opcode, OpCode::IntZExt | OpCode::Subpiece)
+                    && o.output.is_some_and(|out| {
+                        out.space == REG_SPACE
+                            && o.inputs[0].space == REG_SPACE
+                            && o.inputs[0].offset == out.offset
+                            && (out.offset < 0xC0 || out.offset >= XMM_BASE)
+                    });
+                // xmm view rebuild: hi = SUBPIECE(xmm, k) into a unique, PIECE(hi, low)
+                let xmm_view = o.output.is_some_and(|out| {
+                    (out.space == UNIQUE_SPACE && out.offset >= 0x7f00 && o.opcode == OpCode::Subpiece)
+                        || (o.opcode == OpCode::Piece && out.space == REG_SPACE && out.offset >= XMM_BASE)
+                });
+                !alias && !xmm_view
+            })
+            .cloned()
+            .collect()
+    }
 
     fn make_memory(data: &[u8], addr: u64) -> Memory {
         let mut mem = Memory::new(SpaceId(1), Endian::Little);
@@ -2385,7 +2582,8 @@ mod tests {
         let lifter = X86Lifter::new_64();
         // pop rbp = 0x5d
         let mem = make_memory(&[0x5d], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let mut lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.ops.len(), 3);
         assert_eq!(lifted.ops[0].opcode, OpCode::Load);
         assert_eq!(lifted.ops[1].opcode, OpCode::Copy);
@@ -2428,7 +2626,8 @@ mod tests {
         // mulsd xmm0, xmm1 = f2 0f 59 c1
         let lifter = X86Lifter::new_64();
         let mem = make_memory(&[0xf2, 0x0f, 0x59, 0xc1], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let mut lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.ops.len(), 1);
         assert_eq!(lifted.ops[0].opcode, OpCode::FloatMult);
         // dst = xmm0 (offset 0x1200, size 8 low lane)
@@ -2468,7 +2667,11 @@ mod tests {
         // xorps xmm0, xmm0 = 0f 57 c0
         let lifter = X86Lifter::new_64();
         let mem = make_memory(&[0x0f, 0x57, 0xc0], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let raw = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        // the zero idiom clears the whole register: no PIECE with the old high lanes
+        assert!(!raw.ops.iter().any(|o| o.opcode == OpCode::Piece), "{:?}", raw.ops);
+        let mut lifted = raw;
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.ops.len(), 1);
         assert_eq!(lifted.ops[0].opcode, OpCode::Copy);
         assert_eq!(lifted.ops[0].inputs[0].space, CONST_SPACE);
@@ -2506,7 +2709,8 @@ mod tests {
         let lifter = X86Lifter::new_64();
         // mov rbp, rsp = 48 89 e5
         let mem = make_memory(&[0x48, 0x89, 0xe5], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let mut lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.ops.len(), 1);
         assert_eq!(lifted.ops[0].opcode, OpCode::Copy);
     }
@@ -2595,7 +2799,8 @@ mod tests {
     fn lift_cmovcc_branchless_select_no_trap() {
         // cmove rax, rcx = 48 0f 44 c1 -> rax = ZF ? rcx : rax
         let lifter = X86Lifter::new_64();
-        let l = lifter.lift_instruction(&make_memory(&[0x48, 0x0f, 0x44, 0xc1], 0x1000), 0x1000).unwrap();
+        let mut l = lifter.lift_instruction(&make_memory(&[0x48, 0x0f, 0x44, 0xc1], 0x1000), 0x1000).unwrap();
+        l.ops = core_ops(&l.ops);
         assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther),
             "cmovcc must be lifted, not CallOther: {:?}", l.ops);
         // Branchless select shape: a 2COMP mask, an AND, and two XORs.
@@ -2663,7 +2868,8 @@ mod tests {
     fn lift_one_operand_mul_full_width() {
         // mul rcx = 48 f7 e1 -> {RDX:RAX} = RAX * RCX (unsigned, 128-bit)
         let lifter = X86Lifter::new_64();
-        let l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe1], 0x1000), 0x1000).unwrap();
+        let mut l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe1], 0x1000), 0x1000).unwrap();
+        l.ops = core_ops(&l.ops);
         assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
         assert_eq!(l.ops.iter().filter(|o| o.opcode == OpCode::IntZExt).count(), 2, "unsigned widening");
         let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
@@ -2676,6 +2882,98 @@ mod tests {
         // imul rcx = 48 f7 e9 -> signed widening.
         let l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe9], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntSExt));
+    }
+
+    #[test]
+    fn lift_gpr32_write_zero_extends_to_64() {
+        let lifter = X86Lifter::new_64();
+        // mov eax, 7 = b8 07 00 00 00 -> eax = 7 ; rax = zext(eax)
+        let l = lifter.lift_instruction(&make_memory(&[0xb8, 0x07, 0, 0, 0], 0x1000), 0x1000).unwrap();
+        let z = l.ops.iter().find(|o| o.opcode == OpCode::IntZExt).expect("zext to rax");
+        assert_eq!(z.output.unwrap().offset, 0x00);
+        assert_eq!(z.output.unwrap().size, 8);
+        assert_eq!(z.inputs[0].size, 4);
+        // orders are unique and increasing
+        for w in l.ops.windows(2) {
+            assert!(w[0].seq.order < w[1].seq.order);
+        }
+        // mov r9d, ecx = 41 89 c9 -> r9 = zext(r9d)
+        let l = lifter.lift_instruction(&make_memory(&[0x41, 0x89, 0xc9], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntZExt
+            && o.output.is_some_and(|v| v.offset == 0x88 && v.size == 8)));
+        // 16-bit writes are untouched: mov ax, 7
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0xb8, 0x07, 0x00], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt || o.opcode == OpCode::Subpiece));
+        // 64-bit write refreshes the 32-bit view: add rcx, rax = 48 01 c1
+        let l = lifter.lift_instruction(&make_memory(&[0x48, 0x01, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
+        let sp = l.ops.iter().find(|o| o.opcode == OpCode::Subpiece).expect("ecx = subpiece(rcx)");
+        assert_eq!(sp.output.unwrap().offset, 0x08);
+        assert_eq!(sp.output.unwrap().size, 4);
+        assert_eq!(sp.inputs[0].size, 8);
+        // 32-bit mode: no extension
+        let l32 = X86Lifter::new_32();
+        let l = l32.lift_instruction(&make_memory(&[0xb8, 0x07, 0, 0, 0], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
+    }
+
+    #[test]
+    fn lift_xmm_views_stay_coherent() {
+        let lifter = X86Lifter::new_64();
+        // mulss xmm0, xmm1 = f3 0f 59 c1 : 4-byte write -> xmm0(8)/(16) rebuilt by PIECE
+        let l = lifter.lift_instruction(&make_memory(&[0xf3, 0x0f, 0x59, 0xc1], 0x1000), 0x1000).unwrap();
+        let pieces: Vec<_> = l.ops.iter().filter(|o| o.opcode == OpCode::Piece).collect();
+        assert_eq!(pieces.len(), 2, "{:?}", l.ops);
+        assert!(pieces.iter().any(|o| o.output.unwrap().size == 16 && o.output.unwrap().offset == XMM_BASE));
+        // movaps xmm0, xmm1 = 0f 28 c1 : 16-byte write -> low views by SUBPIECE
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x28, 0xc1], 0x1000), 0x1000).unwrap();
+        let subs: Vec<_> = l.ops.iter().filter(|o| o.opcode == OpCode::Subpiece).collect();
+        assert!(subs.iter().any(|o| o.output.unwrap().size == 4 && o.inputs[0].size == 16));
+        assert!(subs.iter().any(|o| o.output.unwrap().size == 8 && o.inputs[0].size == 16));
+        // movss xmm0, [rax] = f3 0f 10 00 : load form clears the upper lanes -> ZEXT
+        let l = lifter.lift_instruction(&make_memory(&[0xf3, 0x0f, 0x10, 0x00], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntZExt
+            && o.output.is_some_and(|v| v.offset == XMM_BASE && v.size == 16)));
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::Piece));
+        for w in l.ops.windows(2) {
+            assert!(w[0].seq.order < w[1].seq.order);
+        }
+    }
+
+    #[test]
+    fn lift_three_operand_imul_uses_immediate() {
+        let lifter = X86Lifter::new_64();
+        // imul ecx, ecx, 0x6C078965 = 69 c9 65 89 07 6c  (MT19937 init step)
+        let l = lifter
+            .lift_instruction(&make_memory(&[0x69, 0xc9, 0x65, 0x89, 0x07, 0x6c], 0x1000), 0x1000)
+            .unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        assert!(
+            mul.inputs.iter().any(|v| v.space == CONST_SPACE && v.offset == 0x6C07_8965),
+            "immediate must be a multiplicand: {:?}",
+            mul
+        );
+        assert_eq!(mul.output.unwrap().size, 4);
+        // imul eax, ecx, 0xD6F = 69 c1 6f 0d 00 00 -> eax = ecx * 3439 (eax not read)
+        let l = lifter
+            .lift_instruction(&make_memory(&[0x69, 0xc1, 0x6f, 0x0d, 0x00, 0x00], 0x1000), 0x1000)
+            .unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        let out = mul.output.unwrap();
+        assert!(mul.inputs.iter().all(|v| v.space == CONST_SPACE || v.offset != out.offset),
+            "dst (eax) must not be an input: {:?}", mul);
+        assert!(mul.inputs.iter().any(|v| v.space == CONST_SPACE && v.offset == 0xD6F));
+        // imul r15, rax, 0x2AAAAAAB (imm32 sign-extended to 64) = 4c 69 f8 ab aa aa 2a
+        let l = lifter
+            .lift_instruction(&make_memory(&[0x4c, 0x69, 0xf8, 0xab, 0xaa, 0xaa, 0x2a], 0x1000), 0x1000)
+            .unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        assert_eq!(mul.output.unwrap().size, 8);
+        assert!(mul.inputs.iter().all(|v| v.size == 8), "operand sizes match: {:?}", mul);
+        // 2-operand form is unchanged: imul eax, ecx = 0f af c1 -> eax = eax * ecx
+        let l = lifter.lift_instruction(&make_memory(&[0x0f, 0xaf, 0xc1], 0x1000), 0x1000).unwrap();
+        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
+        assert_eq!(mul.inputs[0].offset, mul.output.unwrap().offset);
     }
 
     #[test]
@@ -2883,7 +3181,8 @@ mod tests {
         // lea rax, [rip+0x100]  =  48 8d 05 00 01 00 00
         // ip 0x1000, len 7, disp 0x100 -> effective 0x1000+7+0x100 = 0x1107
         let mem = make_memory(&[0x48, 0x8d, 0x05, 0x00, 0x01, 0x00, 0x00], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let mut lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.length, 7);
         assert_eq!(lifted.ops.len(), 1);
         let op = &lifted.ops[0];

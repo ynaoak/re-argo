@@ -634,6 +634,33 @@ impl<'a> CEmitter<'a> {
                 let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
                 Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
             }
+            OpCode::Piece if op.inputs.len() >= 2 => {
+                // PIECE(hi, lo): concatenation, `lo` in the low bytes (the
+                // lifter uses it to merge a scalar SSE result into the full
+                // XMM register). Previously the opaque `PIECE(...)`.
+                let dst = out_name?;
+                let hi = self.input_expr(func, op, 0);
+                let lo = self.input_expr(func, op, 1);
+                let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
+                Some(format!("{} = CONCAT({}, {}:{});", dst, hi, lo, lo_sz))
+            }
+            OpCode::Subpiece if op.inputs.len() >= 2 => {
+                // SUBPIECE(a, k) = the low `out_size` bytes of `a >> 8k` — a
+                // truncating cast (e.g. `ecx = (uint32_t)rcx` after a 64-bit
+                // write). Previously printed as the opaque `SUBPIECE(...)`.
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let k = &func.varnodes[op.inputs[1] as usize].data;
+                let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                if k.space == SpaceId::CONST && k.offset == 0 {
+                    Some(format!("{} = ({}){};", dst, dst_ty, a))
+                } else if k.space == SpaceId::CONST {
+                    Some(format!("{} = ({})({} >> {});", dst, dst_ty, a, k.offset * 8))
+                } else {
+                    let kexpr = self.input_expr(func, op, 1);
+                    Some(format!("{} = ({})({} >> ({} * 8));", dst, dst_ty, a, kexpr))
+                }
+            }
             OpCode::IntSExt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
@@ -902,14 +929,30 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x30, 4) => "esi".into(),
         (0x38, 8) => "rdi".into(),
         (0x38, 4) => "edi".into(),
-        (0x80, 8) => "r8".into(),
-        (0x88, 8) => "r9".into(),
-        (0x90, 8) => "r10".into(),
-        (0x98, 8) => "r11".into(),
+        // r8..r15 (offsets 0x80..0xB8): r12-r15 used to fall through to
+        // `var_a0`..`var_b8`, indistinguishable from stack locals.
+        (off, sz) if (0x80..0xC0).contains(&off) && off % 8 == 0 => {
+            let n = 8 + (off - 0x80) / 8;
+            match sz {
+                8 => format!("r{}", n),
+                4 => format!("r{}d", n),
+                2 => format!("r{}w", n),
+                1 => format!("r{}b", n),
+                _ => format!("r{}_{}", n, sz),
+            }
+        }
         // XMM register file (base 0x1200, stride 0x10). Scalar sd/ss views
         // share the offset, so name by offset regardless of size.
-        (off, _) if (0x1200..0x1300).contains(&off) && off % 0x10 == 0 => {
-            format!("xmm{}", (off - 0x1200) / 0x10)
+        (off, sz) if (0x1200..0x1300).contains(&off) && off % 0x10 == 0 => {
+            // Full register = `xmmN`; the scalar views get a suffix so a
+            // view refresh reads `xmm0_d = (uint32_t)xmm0`, not `xmm0 = xmm0`.
+            let n = (off - 0x1200) / 0x10;
+            match sz {
+                16 => format!("xmm{}", n),
+                8 => format!("xmm{}_q", n),
+                4 => format!("xmm{}_d", n),
+                _ => format!("xmm{}_{}", n, sz),
+            }
         }
         _ => format!("var_{:x}", offset),
     }
@@ -1018,6 +1061,84 @@ mod tests {
         assert!(output.contains("(int32_t)"), "4-byte SLess must use int32_t cast:\n{}", output);
         assert!(output.contains("(int64_t)"), "8-byte SLess must use int64_t cast:\n{}", output);
         assert!(!output.contains("(int)"), "bare (int) cast leaks implementation-defined width:\n{}", output);
+    }
+
+    #[test]
+    fn emit_subpiece_as_truncating_cast() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rcx = VarnodeData::new(SpaceId(2), 0x08, 8);
+        let ecx = VarnodeData::new(SpaceId(2), 0x08, 4);
+        let dx = VarnodeData::new(SpaceId(2), 0x10, 2);
+        let k0 = VarnodeData::new(SpaceId(0), 0, 4);
+        let k4 = VarnodeData::new(SpaceId(0), 4, 4);
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::Subpiece,
+                seq: seq(0x1000), output: Some(ecx),
+                inputs: SmallVec::from_slice(&[rcx, k0]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Subpiece,
+                seq: seq(0x1001), output: Some(dx),
+                inputs: SmallVec::from_slice(&[rcx, k4]),
+            }]),
+            make_lifted(0x1002, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1002), output: None,
+                inputs: SmallVec::from_slice(&[ecx, dx]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let ssa = SsaFunction::from_cfg("sp".into(), 0x1000, cfg);
+        let structured = structure_cfg(&ssa.cfg);
+        let output = CEmitter::new().emit_function(&ssa, &structured);
+        assert!(!output.contains("SUBPIECE("), "opaque fallback leaked:
+{}", output);
+        assert!(output.contains("(uint32_t)"), "low-dword cast:
+{}", output);
+        assert!(output.contains(">> 32"), "byte offset 4 = shift 32:
+{}", output);
+    }
+
+    #[test]
+    fn reg_names_cover_r8_r15_and_xmm_views() {
+        assert_eq!(reg_name(0xA0, 8), "r12");
+        assert_eq!(reg_name(0xB8, 8), "r15");
+        assert_eq!(reg_name(0x80, 4), "r8d");
+        assert_eq!(reg_name(0xB0, 1), "r14b");
+        assert_eq!(reg_name(0x1200, 16), "xmm0");
+        assert_eq!(reg_name(0x1210, 8), "xmm1_q");
+        assert_eq!(reg_name(0x1220, 4), "xmm2_d");
+        assert_eq!(reg_name(0x00, 8), "rax");
+    }
+
+    #[test]
+    fn emit_piece_as_concat() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let x16 = VarnodeData::new(SpaceId(2), 0x1200, 16);
+        let x4 = VarnodeData::new(SpaceId(2), 0x1200, 4);
+        let hi = VarnodeData::new(SpaceId(3), 0x7f00, 8);
+        let zero8 = VarnodeData::new(SpaceId(0), 0, 8);
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::Piece,
+                seq: seq(0x1000), output: Some(x16),
+                inputs: SmallVec::from_slice(&[hi, x4]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1001), output: None,
+                inputs: SmallVec::from_slice(&[zero8, x16]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let ssa = SsaFunction::from_cfg("pc".into(), 0x1000, cfg);
+        let structured = structure_cfg(&ssa.cfg);
+        let output = CEmitter::new().emit_function(&ssa, &structured);
+        assert!(!output.contains("PIECE("), "opaque fallback leaked:
+{}", output);
+        assert!(output.contains("CONCAT("), "concat form:
+{}", output);
     }
 
     #[test]

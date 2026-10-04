@@ -294,7 +294,13 @@ impl X86Arch {
         formatter.format_mnemonic(&instruction, &mut mnemonic_output);
 
         let mut operand_output = String::new();
-        let operand_count = instruction.op_count();
+        // Use the *formatter's* operand count: it differs from
+        // `instruction.op_count()` for pseudo-ops (`cmpltss` hides the
+        // predicate imm) and for 3-operand `imul r, r, imm` with dst == src,
+        // which iced prints in its 2-operand short form. Iterating the raw
+        // count printed `imul eax, 93h, ` / `cmpltss xmm3, xmm0, ` with a
+        // dangling separator and an empty operand.
+        let operand_count = formatter.operand_count(&instruction);
         for i in 0..operand_count {
             if i > 0 {
                 operand_output.push_str(", ");
@@ -437,6 +443,21 @@ mod tests {
         assert_eq!(insn.mnemonic, "nop");
         assert_eq!(insn.length, 1);
         assert_eq!(insn.flow_type, FlowType::Fall);
+    }
+
+    #[test]
+    fn decode_operands_have_no_dangling_separator() {
+        let arch = X86Arch::new_64();
+        // imul eax, eax, 93h = 69 c0 93 00 00 00
+        let mem = make_memory(&[0x69, 0xc0, 0x93, 0x00, 0x00, 0x00], 0x1000);
+        let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
+        assert!(!insn.operands.trim_end().ends_with(','), "got {:?}", insn.operands);
+        assert!(insn.operands.contains("93h"), "got {:?}", insn.operands);
+        // cmpltss xmm3, xmm0 = f3 0f c2 d8 01
+        let mem = make_memory(&[0xf3, 0x0f, 0xc2, 0xd8, 0x01], 0x1000);
+        let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
+        assert_eq!(insn.mnemonic, "cmpltss");
+        assert_eq!(insn.operands, "xmm3, xmm0");
     }
 
     #[test]
