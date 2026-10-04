@@ -597,6 +597,14 @@ impl<'a> RustEmitter<'a> {
                 let src_ty = size_to_rust_type(func.varnodes[op.inputs[0] as usize].data.size);
                 Some(format!("{} = ({} as {}) as u64;", dst, a, src_ty))
             }
+            OpCode::Piece if op.inputs.len() >= 2 => {
+                // PIECE(hi, lo): concatenation with `lo` in the low bytes.
+                let dst = out_name?;
+                let hi = self.input_expr(func, op, 0);
+                let lo = self.input_expr(func, op, 1);
+                let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
+                Some(format!("{} = concat({}, {} /* {} bytes */);", dst, hi, lo, lo_sz))
+            }
             OpCode::Subpiece if op.inputs.len() >= 2 => {
                 // Truncating extract: low `out_size` bytes of `a >> 8k`.
                 let dst = out_name?;
@@ -849,12 +857,28 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x30, 4) => "esi".into(),
         (0x38, 8) => "rdi".into(),
         (0x38, 4) => "edi".into(),
-        (0x80, 8) => "r8".into(),
-        (0x88, 8) => "r9".into(),
-        (0x90, 8) => "r10".into(),
-        (0x98, 8) => "r11".into(),
-        (off, _) if (0x1200..0x1300).contains(&off) && off % 0x10 == 0 => {
-            format!("xmm{}", (off - 0x1200) / 0x10)
+        // r8..r15 (offsets 0x80..0xB8): r12-r15 used to fall through to
+        // `var_a0`..`var_b8`, indistinguishable from stack locals.
+        (off, sz) if (0x80..0xC0).contains(&off) && off % 8 == 0 => {
+            let n = 8 + (off - 0x80) / 8;
+            match sz {
+                8 => format!("r{}", n),
+                4 => format!("r{}d", n),
+                2 => format!("r{}w", n),
+                1 => format!("r{}b", n),
+                _ => format!("r{}_{}", n, sz),
+            }
+        }
+        (off, sz) if (0x1200..0x1300).contains(&off) && off % 0x10 == 0 => {
+            // Full register = `xmmN`; the scalar views get a suffix so a
+            // view refresh reads `xmm0_d = (uint32_t)xmm0`, not `xmm0 = xmm0`.
+            let n = (off - 0x1200) / 0x10;
+            match sz {
+                16 => format!("xmm{}", n),
+                8 => format!("xmm{}_q", n),
+                4 => format!("xmm{}_d", n),
+                _ => format!("xmm{}_{}", n, sz),
+            }
         }
         _ => format!("var_{:x}", offset),
     }
