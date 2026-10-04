@@ -634,6 +634,23 @@ impl<'a> CEmitter<'a> {
                 let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
                 Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
             }
+            OpCode::Subpiece if op.inputs.len() >= 2 => {
+                // SUBPIECE(a, k) = the low `out_size` bytes of `a >> 8k` — a
+                // truncating cast (e.g. `ecx = (uint32_t)rcx` after a 64-bit
+                // write). Previously printed as the opaque `SUBPIECE(...)`.
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let k = &func.varnodes[op.inputs[1] as usize].data;
+                let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                if k.space == SpaceId::CONST && k.offset == 0 {
+                    Some(format!("{} = ({}){};", dst, dst_ty, a))
+                } else if k.space == SpaceId::CONST {
+                    Some(format!("{} = ({})({} >> {});", dst, dst_ty, a, k.offset * 8))
+                } else {
+                    let kexpr = self.input_expr(func, op, 1);
+                    Some(format!("{} = ({})({} >> ({} * 8));", dst, dst_ty, a, kexpr))
+                }
+            }
             OpCode::IntSExt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
@@ -1018,6 +1035,43 @@ mod tests {
         assert!(output.contains("(int32_t)"), "4-byte SLess must use int32_t cast:\n{}", output);
         assert!(output.contains("(int64_t)"), "8-byte SLess must use int64_t cast:\n{}", output);
         assert!(!output.contains("(int)"), "bare (int) cast leaks implementation-defined width:\n{}", output);
+    }
+
+    #[test]
+    fn emit_subpiece_as_truncating_cast() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rcx = VarnodeData::new(SpaceId(2), 0x08, 8);
+        let ecx = VarnodeData::new(SpaceId(2), 0x08, 4);
+        let dx = VarnodeData::new(SpaceId(2), 0x10, 2);
+        let k0 = VarnodeData::new(SpaceId(0), 0, 4);
+        let k4 = VarnodeData::new(SpaceId(0), 4, 4);
+        let insns = vec![
+            make_lifted(0x1000, vec![PcodeOp {
+                opcode: OpCode::Subpiece,
+                seq: seq(0x1000), output: Some(ecx),
+                inputs: SmallVec::from_slice(&[rcx, k0]),
+            }]),
+            make_lifted(0x1001, vec![PcodeOp {
+                opcode: OpCode::Subpiece,
+                seq: seq(0x1001), output: Some(dx),
+                inputs: SmallVec::from_slice(&[rcx, k4]),
+            }]),
+            make_lifted(0x1002, vec![PcodeOp {
+                opcode: OpCode::Return,
+                seq: seq(0x1002), output: None,
+                inputs: SmallVec::from_slice(&[ecx, dx]),
+            }]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let ssa = SsaFunction::from_cfg("sp".into(), 0x1000, cfg);
+        let structured = structure_cfg(&ssa.cfg);
+        let output = CEmitter::new().emit_function(&ssa, &structured);
+        assert!(!output.contains("SUBPIECE("), "opaque fallback leaked:
+{}", output);
+        assert!(output.contains("(uint32_t)"), "low-dword cast:
+{}", output);
+        assert!(output.contains(">> 32"), "byte offset 4 = shift 32:
+{}", output);
     }
 
     #[test]

@@ -597,6 +597,24 @@ impl<'a> RustEmitter<'a> {
                 let src_ty = size_to_rust_type(func.varnodes[op.inputs[0] as usize].data.size);
                 Some(format!("{} = ({} as {}) as u64;", dst, a, src_ty))
             }
+            OpCode::Subpiece if op.inputs.len() >= 2 => {
+                // Truncating extract: low `out_size` bytes of `a >> 8k`.
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let k = &func.varnodes[op.inputs[1] as usize].data;
+                let out_ty = size_to_rust_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                if k.space == SpaceId::CONST {
+                    let sh = k.offset * 8;
+                    if sh == 0 {
+                        Some(format!("{} = ({} as {}) as u64;", dst, a, out_ty))
+                    } else {
+                        Some(format!("{} = (({} >> {}) as {}) as u64;", dst, a, sh, out_ty))
+                    }
+                } else {
+                    let kexpr = self.input_expr(func, op, 1);
+                    Some(format!("{} = (({} >> ({} * 8)) as {}) as u64;", dst, a, kexpr, out_ty))
+                }
+            }
             OpCode::IntSExt => {
                 // Sign-extend from the source width — not from i64 — so a
                 // 1-byte 0xFF widens to -1, not +255.
