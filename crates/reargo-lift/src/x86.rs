@@ -2348,7 +2348,10 @@ impl PcodeLift for X86Lifter {
             })
         };
 
-        let pcode_ops = self.lift_iced(&insn, address)?;
+        let mut pcode_ops = self.lift_iced(&insn, address)?;
+        if self.is_64 {
+            pcode_ops = zero_extend_gpr32_writes(pcode_ops);
+        }
 
         Ok(LiftedInstruction {
             address,
@@ -2359,12 +2362,84 @@ impl PcodeLift for X86Lifter {
     }
 }
 
+/// x86-64: every write to a 32-bit GPR (`eax`, `r8d`, …) zero-extends into
+/// the full 64-bit register. The SSA layer keys variables on
+/// (offset, size), so without an explicit `rax = zext(eax)` a later read of
+/// `rax` saw the *previous* 64-bit definition: `lea rax,[g]; mov eax,7;
+/// add rcx,rax` decompiled as `rcx + g`, and constant propagation then
+/// folded the MT19937 init loop's exit test to `if (0)`, deleting the loop.
+/// Emit the extension right after each such write and renumber the ops.
+///
+/// The converse alias is handled too: a 64-bit write (`add rcx, rax`)
+/// followed by a 32-bit read (`mov [..], ecx`) read the stale `ecx`, so the
+/// 64-bit arithmetic was dead-code-eliminated. After each 64-bit GPR write
+/// we also refresh the 32-bit view with `ecx = SUBPIECE(rcx, 0)` (dead
+/// copies are removed later by the decompiler when nothing reads them).
+fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
+    let is_gpr = |v: &VarnodeData, sz: u32| {
+        v.space == REG_SPACE && v.size == sz && v.offset < 0xC0 && v.offset % 8 == 0
+    };
+    if !ops
+        .iter()
+        .any(|o| o.output.as_ref().is_some_and(|v| is_gpr(v, 4) || is_gpr(v, 8)))
+    {
+        return ops;
+    }
+    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 2);
+    for op in ops {
+        let w32 = op.output.filter(|v| is_gpr(v, 4));
+        // rsp is excluded: 64-bit code never reads esp, and push/pop/call/ret
+        // would otherwise each grow an extra op.
+        let w64 = op.output.filter(|v| is_gpr(v, 8) && v.offset != 0x20);
+        let at = op.seq.addr;
+        out.push(op);
+        if let Some(r32) = w32 {
+            out.push(PcodeOp {
+                opcode: OpCode::IntZExt,
+                seq: SeqNum::new(at, 0),
+                output: Some(reg(r32.offset, 8)),
+                inputs: SmallVec::from_slice(&[r32]),
+            });
+        } else if let Some(r64) = w64 {
+            out.push(PcodeOp {
+                opcode: OpCode::Subpiece,
+                seq: SeqNum::new(at, 0),
+                output: Some(reg(r64.offset, 4)),
+                inputs: SmallVec::from_slice(&[r64, constant(0, 4)]),
+            });
+        }
+    }
+    for (i, op) in out.iter_mut().enumerate() {
+        op.seq.order = i as u32;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use reargo_core::address::Endian;
     use reargo_loader::memory::{MemoryBlock, MemoryFlags};
     use std::sync::Arc;
+
+    /// Drop the GPR alias-refresh ops added by `zero_extend_gpr32_writes`
+    /// (`rX = zext(eX)` / `eX = subpiece(rX, 0)`), for tests that assert the
+    /// exact shape of an instruction's semantics.
+    fn core_ops(ops: &[PcodeOp]) -> Vec<PcodeOp> {
+        ops.iter()
+            .filter(|o| {
+                let alias = matches!(o.opcode, OpCode::IntZExt | OpCode::Subpiece)
+                    && o.output.is_some_and(|out| {
+                        out.space == REG_SPACE
+                            && o.inputs[0].space == REG_SPACE
+                            && o.inputs[0].offset == out.offset
+                            && out.offset < 0xC0
+                    });
+                !alias
+            })
+            .cloned()
+            .collect()
+    }
 
     fn make_memory(data: &[u8], addr: u64) -> Memory {
         let mut mem = Memory::new(SpaceId(1), Endian::Little);
@@ -2403,7 +2478,8 @@ mod tests {
         let lifter = X86Lifter::new_64();
         // pop rbp = 0x5d
         let mem = make_memory(&[0x5d], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let mut lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.ops.len(), 3);
         assert_eq!(lifted.ops[0].opcode, OpCode::Load);
         assert_eq!(lifted.ops[1].opcode, OpCode::Copy);
@@ -2524,7 +2600,8 @@ mod tests {
         let lifter = X86Lifter::new_64();
         // mov rbp, rsp = 48 89 e5
         let mem = make_memory(&[0x48, 0x89, 0xe5], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let mut lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.ops.len(), 1);
         assert_eq!(lifted.ops[0].opcode, OpCode::Copy);
     }
@@ -2613,7 +2690,8 @@ mod tests {
     fn lift_cmovcc_branchless_select_no_trap() {
         // cmove rax, rcx = 48 0f 44 c1 -> rax = ZF ? rcx : rax
         let lifter = X86Lifter::new_64();
-        let l = lifter.lift_instruction(&make_memory(&[0x48, 0x0f, 0x44, 0xc1], 0x1000), 0x1000).unwrap();
+        let mut l = lifter.lift_instruction(&make_memory(&[0x48, 0x0f, 0x44, 0xc1], 0x1000), 0x1000).unwrap();
+        l.ops = core_ops(&l.ops);
         assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther),
             "cmovcc must be lifted, not CallOther: {:?}", l.ops);
         // Branchless select shape: a 2COMP mask, an AND, and two XORs.
@@ -2681,7 +2759,8 @@ mod tests {
     fn lift_one_operand_mul_full_width() {
         // mul rcx = 48 f7 e1 -> {RDX:RAX} = RAX * RCX (unsigned, 128-bit)
         let lifter = X86Lifter::new_64();
-        let l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe1], 0x1000), 0x1000).unwrap();
+        let mut l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe1], 0x1000), 0x1000).unwrap();
+        l.ops = core_ops(&l.ops);
         assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
         assert_eq!(l.ops.iter().filter(|o| o.opcode == OpCode::IntZExt).count(), 2, "unsigned widening");
         let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
@@ -2694,6 +2773,39 @@ mod tests {
         // imul rcx = 48 f7 e9 -> signed widening.
         let l = lifter.lift_instruction(&make_memory(&[0x48, 0xf7, 0xe9], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntSExt));
+    }
+
+    #[test]
+    fn lift_gpr32_write_zero_extends_to_64() {
+        let lifter = X86Lifter::new_64();
+        // mov eax, 7 = b8 07 00 00 00 -> eax = 7 ; rax = zext(eax)
+        let l = lifter.lift_instruction(&make_memory(&[0xb8, 0x07, 0, 0, 0], 0x1000), 0x1000).unwrap();
+        let z = l.ops.iter().find(|o| o.opcode == OpCode::IntZExt).expect("zext to rax");
+        assert_eq!(z.output.unwrap().offset, 0x00);
+        assert_eq!(z.output.unwrap().size, 8);
+        assert_eq!(z.inputs[0].size, 4);
+        // orders are unique and increasing
+        for w in l.ops.windows(2) {
+            assert!(w[0].seq.order < w[1].seq.order);
+        }
+        // mov r9d, ecx = 41 89 c9 -> r9 = zext(r9d)
+        let l = lifter.lift_instruction(&make_memory(&[0x41, 0x89, 0xc9], 0x1000), 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntZExt
+            && o.output.is_some_and(|v| v.offset == 0x88 && v.size == 8)));
+        // 16-bit writes are untouched: mov ax, 7
+        let l = lifter.lift_instruction(&make_memory(&[0x66, 0xb8, 0x07, 0x00], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt || o.opcode == OpCode::Subpiece));
+        // 64-bit write refreshes the 32-bit view: add rcx, rax = 48 01 c1
+        let l = lifter.lift_instruction(&make_memory(&[0x48, 0x01, 0xc1], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
+        let sp = l.ops.iter().find(|o| o.opcode == OpCode::Subpiece).expect("ecx = subpiece(rcx)");
+        assert_eq!(sp.output.unwrap().offset, 0x08);
+        assert_eq!(sp.output.unwrap().size, 4);
+        assert_eq!(sp.inputs[0].size, 8);
+        // 32-bit mode: no extension
+        let l32 = X86Lifter::new_32();
+        let l = l32.lift_instruction(&make_memory(&[0xb8, 0x07, 0, 0, 0], 0x1000), 0x1000).unwrap();
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
     }
 
     #[test]
@@ -2937,7 +3049,8 @@ mod tests {
         // lea rax, [rip+0x100]  =  48 8d 05 00 01 00 00
         // ip 0x1000, len 7, disp 0x100 -> effective 0x1000+7+0x100 = 0x1107
         let mem = make_memory(&[0x48, 0x8d, 0x05, 0x00, 0x01, 0x00, 0x00], 0x1000);
-        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let mut lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        lifted.ops = core_ops(&lifted.ops);
         assert_eq!(lifted.length, 7);
         assert_eq!(lifted.ops.len(), 1);
         let op = &lifted.ops[0];
