@@ -168,6 +168,17 @@ pub fn decompile_function_with_maps(
     )
 }
 
+/// Second input of a call's `INDIRECT` that marks a clobbered (not returned) register.
+pub const CLOBBER_MARK: u64 = 1;
+
+/// Is `op` the `INDIRECT` of a register a call clobbers (as opposed to one it returns)?
+pub fn is_call_clobber(op: &reargo_core::pcode::OpCode, inputs: &[reargo_core::pcode::VarnodeData]) -> bool {
+    *op == reargo_core::pcode::OpCode::Indirect
+        && inputs.len() == 2
+        && inputs[1].space == reargo_core::address::SpaceId::CONST
+        && inputs[1].offset == CLOBBER_MARK
+}
+
 /// Give every call the calling convention's argument registers as inputs and
 /// define its return registers right after it (`INDIRECT(target)`, with the
 /// narrower views refreshed), so argument setup is not dead code and a use of
@@ -197,10 +208,19 @@ fn apply_call_convention(
             call.inputs.push(*a);
         }
         let mut after: Vec<PcodeOp> = Vec::new();
-        for (full, views) in &cc.returns {
+        // returns: `INDIRECT(target)`; clobbers: `INDIRECT(target, 1)` (WS76: a caller-saved
+        // register read after a call no longer shows the value it had before the call)
+        let clobber_mark = VarnodeData::new(reargo_core::address::SpaceId::CONST, CLOBBER_MARK, 1);
+        let defs = cc.returns.iter().map(|r| (r, false)).chain(cc.clobbers.iter().map(|r| (r, true)));
+        for ((full, views), clobber) in defs {
             let mut inputs = smallvec::SmallVec::new();
-            if let Some(t) = target {
-                inputs.push(t);
+            match target {
+                Some(t) => inputs.push(t),
+                None if clobber => inputs.push(VarnodeData::new(reargo_core::address::SpaceId::CONST, 0, 8)),
+                None => {}
+            }
+            if clobber {
+                inputs.push(clobber_mark);
             }
             after.push(PcodeOp { opcode: OpCode::Indirect, seq: at, output: Some(*full), inputs });
             for &sz in views {
@@ -632,6 +652,63 @@ mod tests {
         assert!(c.contains("edi = 5"), "{c}");
         // the store reads the call's result
         assert!(c.contains("__ret"), "{c}");
+    }
+
+    /// WS76: a caller-saved register read after a call is the call's clobber, not the value it
+    /// held before the call.
+    #[test]
+    fn call_clobbers_caller_saved_registers() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xb9, 0x07, 0x00, 0x00, 0x00, // mov ecx, 7
+            0xe8, 0xf6, 0x0f, 0x00, 0x00, // call 0x2000
+            0x89, 0x0d, 0xf0, 0x1f, 0x00, 0x00, // mov [0x3000], ecx
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("__clobbered"), "{c}");
+        assert!(!c.contains("0x3000 = 7"), "the pre-call constant must not reach the store: {c}");
+        let store = c.find("*(uint32_t*)0x3000").unwrap_or_else(|| panic!("{c}"));
+        assert!(c[..store].contains("rcx = __clobbered"), "{c}");
+    }
+
+    /// WS76: an argument set up in a block that dominates the call is the call's argument,
+    /// even though a branch separates the two.
+    #[test]
+    fn call_args_cross_blocks_from_a_dominator() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0x85, 0xc0, // test eax, eax
+            0x74, 0x01, // je 0x100a
+            0x90, // nop
+            0xe8, 0xf1, 0x0f, 0x00, 0x00, // 0x100a: call 0x2000
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call_line = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call_line.contains("rdi"), "{call_line}\n{c}");
+        assert!(c.contains("edi = 5"), "{c}");
+    }
+
+    /// WS76: an argument register left over from before an earlier call is not an argument.
+    #[test]
+    fn stale_argument_after_a_call_is_dropped() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xe8, 0xf6, 0x0f, 0x00, 0x00, // call 0x2000
+            0xe8, 0xf1, 0x10, 0x00, 0x00, // call 0x2100
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let first = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        let second = c.lines().find(|l| l.contains("0x2100(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(first.contains("rdi"), "{first}");
+        assert!(!second.contains("rdi"), "{second}\n{c}");
     }
 
     #[test]

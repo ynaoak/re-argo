@@ -36,6 +36,9 @@ pub struct CallConvention {
     /// Registers a call defines on return, each followed by the narrower views to refresh
     /// from it (`(full, [views])`).
     pub returns: Vec<(reargo_core::pcode::VarnodeData, Vec<u32>)>,
+    /// Caller-saved registers that do not carry the result: after a call they hold nothing the
+    /// caller set (`(full, [views])`, like `returns`).
+    pub clobbers: Vec<(reargo_core::pcode::VarnodeData, Vec<u32>)>,
 }
 
 pub trait PcodeLift: Send + Sync {

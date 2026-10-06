@@ -686,9 +686,18 @@ impl<'a> RustEmitter<'a> {
                 Some(format!("(*{})({});", target, args.join(", ")))
             }
             OpCode::Indirect => {
-                // a call's return register (see `pipeline::apply_call_convention`)
+                // a call's return register, or a caller-saved register it clobbers
+                // (see `pipeline::apply_call_convention`)
                 let dst = out_name?;
-                Some(format!("{} = __ret; // of {}", dst, self.input_expr(func, op, 0)))
+                let clobber = op.inputs.get(1).is_some_and(|&v| {
+                    let d = &func.varnodes[v as usize].data;
+                    d.space == reargo_core::address::SpaceId::CONST && d.offset == crate::pipeline::CLOBBER_MARK
+                });
+                if clobber {
+                    Some(format!("{} = __clobbered; // by {}", dst, self.input_expr(func, op, 0)))
+                } else {
+                    Some(format!("{} = __ret; // of {}", dst, self.input_expr(func, op, 0)))
+                }
             }
             OpCode::Return => {
                 let val = self.input_expr(func, op, 0);
