@@ -337,6 +337,8 @@ impl<'a> RustEmitter<'a> {
         let out_name = op.output.map(|id| varnode_name(&func.varnodes[id as usize]));
 
         match op.opcode {
+            // phi: same name on every incoming edge, nothing to print
+            OpCode::MultiEqual => None,
             OpCode::Copy => {
                 let dst = out_name?;
                 let src = self.input_expr(func, op, 0);

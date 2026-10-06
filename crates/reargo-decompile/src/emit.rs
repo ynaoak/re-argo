@@ -364,6 +364,9 @@ impl<'a> CEmitter<'a> {
         let out_name = op.output.map(|id| varnode_name(&func.varnodes[id as usize]));
 
         match op.opcode {
+            // A phi joins versions of one register / slot, which the C output
+            // names identically — nothing to print.
+            OpCode::MultiEqual => None,
             OpCode::Copy => {
                 let dst = out_name?;
                 let src = self.input_expr(func, op, 0);

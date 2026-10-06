@@ -346,6 +346,36 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
         }
     }
 
+    // Cycles through phi nodes (a loop counter nothing outside the loop
+    // reads) keep each other "used" above. Mark what the side-effecting ops
+    // actually need and drop the rest.
+    if func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::MultiEqual) {
+        let mut live = vec![false; n];
+        let mut stack: Vec<usize> = (0..n)
+            .filter(|&i| !func.ops[i].dead && (is_side_effecting(func.ops[i].opcode) || func.ops[i].output.is_none()))
+            .collect();
+        for &i in &stack {
+            live[i] = true;
+        }
+        while let Some(i) = stack.pop() {
+            for &inp in &func.ops[i].inputs {
+                if let Some(d) = func.varnodes[inp as usize].def_op
+                    && !live[d]
+                    && !func.ops[d].dead
+                {
+                    live[d] = true;
+                    stack.push(d);
+                }
+            }
+        }
+        for (i, alive) in live.iter().enumerate() {
+            if !alive && !func.ops[i].dead {
+                func.ops[i].dead = true;
+                removed += 1;
+            }
+        }
+    }
+
     removed
 }
 
@@ -460,7 +490,9 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
         let uses_len = func.varnodes[out_id as usize].uses.len();
         for k in 0..uses_len {
             let use_idx = func.varnodes[out_id as usize].uses[k];
-            if func.ops[use_idx].dead {
+            // A phi operand names the register on its edge; replacing it would
+            // leave the copy without a use and drop the assignment from the output.
+            if func.ops[use_idx].dead || func.ops[use_idx].opcode == OpCode::MultiEqual {
                 continue;
             }
             for inp in &mut func.ops[use_idx].inputs {
@@ -588,7 +620,14 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         let key = (func.ops[i].block, opcode.name(), out_size, in_keys);
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
-        if let Some(&existing) = seen.get(&key) {
+        // A value a phi reads keeps its own name (the phi prints as nothing).
+        let feeds_phi = func.varnodes[out_id as usize]
+            .uses
+            .iter()
+            .any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
+        if let Some(&existing) = seen.get(&key)
+            && !feeds_phi
+        {
             redirects.insert(out_key, existing);
             func.ops[i].dead = true;
             eliminated += 1;
@@ -1208,6 +1247,51 @@ mod tests {
         assert_eq!(removed, 0, "Copy of rax is live (Return reads rax)");
         let copy_live = ssa.ops.iter().any(|op| !op.dead && op.opcode == OpCode::Copy);
         assert!(copy_live, "the live Copy must survive DCE: {:?}", ssa.ops);
+    }
+
+    /// WS75: a value carried round a loop must survive. Layout:
+    ///   0x1000 rax = 0
+    ///   0x1001 [0x2000] = rax          <- loop head reads the carried rax
+    ///   0x1002 rax = rax + 8           <- latch def, read only by the head
+    ///   0x1003 rcx = rcx + 1; if (rcx != 8) goto 0x1001
+    ///   0x1004 return
+    /// Without phi nodes the head read the entry's rax and the latch add had
+    /// no use, so DCE deleted it (the `add r14, 0x818` of BDS's octave loop).
+    #[test]
+    fn loop_carried_value_survives_dce() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rcx = VarnodeData::new(SpaceId(2), 0x08, 8);
+        let zf = VarnodeData::new(SpaceId(2), 0x206, 1);
+        let c = |v: u64, sz: u32| VarnodeData::new(SpaceId(0), v, sz);
+        let op = |a: u64, opcode, output, inputs: &[VarnodeData]| PcodeOp {
+            opcode,
+            seq: seq(a),
+            output,
+            inputs: SmallVec::from_slice(inputs),
+        };
+        let insns = vec![
+            make_lifted(0x1000, vec![op(0x1000, OpCode::Copy, Some(rax), &[c(0, 8)])]),
+            make_lifted(0x1001, vec![op(0x1001, OpCode::Store, None, &[c(1, 4), c(0x2000, 8), rax])]),
+            make_lifted(0x1002, vec![op(0x1002, OpCode::IntAdd, Some(rax), &[rax, c(8, 8)])]),
+            make_lifted(0x1003, vec![
+                op(0x1003, OpCode::IntAdd, Some(rcx), &[rcx, c(1, 8)]),
+                op(0x1003, OpCode::IntNotEqual, Some(zf), &[rcx, c(8, 8)]),
+                op(0x1003, OpCode::CBranch, None, &[VarnodeData::new(SpaceId(1), 0x1001, 8), zf]),
+            ]),
+            make_lifted(0x1004, vec![op(0x1004, OpCode::Return, None, &[c(0, 8)])]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("loop".into(), 0x1000, cfg);
+        run_optimization_passes(&mut ssa);
+        let add = ssa.ops.iter().find(|o| o.opcode == OpCode::IntAdd && o.address == 0x1002).expect("add");
+        assert!(!add.dead, "latch add removed: {}", ssa.display_ssa());
+        // the store reads the phi, whose operands are the entry copy and the add
+        let store = ssa.ops.iter().find(|o| o.opcode == OpCode::Store).unwrap();
+        let v = store.inputs[2];
+        let phi = &ssa.ops[ssa.varnodes[v as usize].def_op.expect("phi def")];
+        assert_eq!(phi.opcode, OpCode::MultiEqual, "{}", ssa.display_ssa());
+        assert!(phi.inputs.iter().any(|&i| ssa.varnodes[i as usize].def_op == Some(add.index)));
     }
 
     /// copy_propagation pushes a constant Copy's value through to the
