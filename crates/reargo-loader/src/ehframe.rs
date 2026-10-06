@@ -296,8 +296,8 @@ mod tests {
         w32(&mut b, 0x204, 0x100u32.wrapping_sub(0x204));
         w32(&mut b, 0x208, 2);
         for (i, (loc, f)) in [(0x1000u32, 0x114u32), (0x1040, 0x128)].into_iter().enumerate() {
-            w32(&mut b, 0x20c + 8 * i, loc - 0x200);
-            w32(&mut b, 0x210 + 8 * i, f - 0x200);
+            w32(&mut b, 0x20c + 8 * i, loc.wrapping_sub(0x200));
+            w32(&mut b, 0x210 + 8 * i, f.wrapping_sub(0x200));
         }
         // .shstrtab @0x300
         let names = b"\0.eh_frame\0.eh_frame_hdr\0.shstrtab\0";
