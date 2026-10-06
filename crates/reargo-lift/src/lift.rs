@@ -25,7 +25,25 @@ impl std::fmt::Display for LiftedInstruction {
     }
 }
 
+/// The registers a call passes arguments in and returns its result in, for the
+/// decompiler (which otherwise sees a call as reading and writing nothing).
+/// Each register is given at its widest view; the lifter keeps the narrower
+/// views coherent with it.
+#[derive(Debug, Clone)]
+pub struct CallConvention {
+    /// Argument registers in parameter order (integer class first, then float).
+    pub args: Vec<reargo_core::pcode::VarnodeData>,
+    /// Registers a call defines on return, each followed by the narrower views to refresh
+    /// from it (`(full, [views])`).
+    pub returns: Vec<(reargo_core::pcode::VarnodeData, Vec<u32>)>,
+}
+
 pub trait PcodeLift: Send + Sync {
+    /// The calling convention calls follow, if the lifter knows it (x86-64: System V).
+    fn call_convention(&self) -> Option<CallConvention> {
+        None
+    }
+
     fn lift_instruction(
         &self,
         memory: &Memory,

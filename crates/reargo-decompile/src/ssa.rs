@@ -60,6 +60,10 @@ pub struct SsaFunction {
     /// onto the unrelated read-side varnodes), and copy_propagation
     /// couldn't match `*inp == out_id` because the ids never coincided.
     current_var: FxHashMap<(u32, u64, u32), VarId>,
+    /// Calls carry the calling convention's argument registers as inputs
+    /// `1..` (added by the pipeline); `optimize::prune_call_args` trims them
+    /// to the ones actually set up for the call.
+    pub implicit_call_args: bool,
 }
 
 impl SsaFunction {
@@ -86,6 +90,7 @@ impl SsaFunction {
             next_var_id: 0,
             var_versions: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
             current_var: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
+            implicit_call_args: false,
         };
         func.build_ssa();
         func
@@ -127,33 +132,103 @@ impl SsaFunction {
         // the same CFG back; no observable change to the public state.
         let cfg = std::mem::take(&mut self.cfg);
 
-        for (block_id, block) in cfg.blocks.iter().enumerate() {
+        // SSA with phi nodes (`MULTIEQUAL`, WS75).
+        //
+        // Earlier revisions renamed in linear block order with no phi nodes,
+        // so a value carried round a loop (`freq *= 0.5`, `add r14, 0x818`,
+        // a running minimum) was read at the loop head as the *last version
+        // defined in address order*, and its real definition at the latch had
+        // no use and was deleted as dead code.
+        //
+        // Textbook construction: semi-pruned phi placement (only names read
+        // before being written in some block get phis) on the iterated
+        // dominance frontier, then renaming along the dominator tree. Ops
+        // keep their linear block order in `self.ops` (phis first in each
+        // block); only the renaming walks the tree. Blocks the dominator tree
+        // does not reach are renamed afterwards with no incoming definitions.
+        use reargo_core::address::SpaceId;
+        type Key = (u32, u64, u32);
+        let key_of = |vn: &VarnodeData| (vn.space.0, vn.offset, vn.size);
+        let n = cfg.blocks.len();
+        self.ops.reserve(total_ops / 8);
+
+        // 1. global names (read before written in some block) and their def blocks
+        let mut globals: rustc_hash::FxHashSet<Key> = Default::default();
+        let mut defsites: FxHashMap<Key, Vec<usize>> = Default::default();
+        for (b, block) in cfg.blocks.iter().enumerate() {
+            let mut killed: rustc_hash::FxHashSet<Key> = Default::default();
+            for op in block.instructions.iter().flat_map(|i| i.ops.iter()) {
+                for inp in &op.inputs {
+                    if inp.space != SpaceId::CONST && !killed.contains(&key_of(inp)) {
+                        globals.insert(key_of(inp));
+                    }
+                }
+                if let Some(out) = op.output {
+                    let k = key_of(&out);
+                    if killed.insert(k) {
+                        defsites.entry(k).or_default().push(b);
+                    }
+                }
+            }
+        }
+
+        // 2. phi placement on the iterated dominance frontier
+        let idom = if n > 0 { crate::dominator::compute_idom(&cfg) } else { Vec::new() };
+        let df = if n > 0 {
+            crate::dominator::compute_dominance_frontier(&cfg, &idom)
+        } else {
+            Vec::new()
+        };
+        let mut phis: Vec<Vec<Key>> = vec![Vec::new(); n];
+        let mut keys: Vec<Key> = globals.iter().copied().collect();
+        keys.sort_unstable(); // deterministic phi order
+        for k in keys {
+            let Some(sites) = defsites.get(&k) else { continue };
+            let mut has_phi = vec![false; n];
+            let mut queued = vec![false; n];
+            let mut work: Vec<usize> = sites.clone();
+            for &b in sites {
+                queued[b] = true;
+            }
+            while let Some(b) = work.pop() {
+                for &f in &df[b] {
+                    if !has_phi[f] {
+                        has_phi[f] = true;
+                        phis[f].push(k);
+                        if !queued[f] {
+                            queued[f] = true;
+                            work.push(f);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. lay the ops out in linear block order (phis first); renaming fills them in
+        let mut block_start = vec![0usize; n];
+        for (b, block) in cfg.blocks.iter().enumerate() {
+            block_start[b] = self.ops.len();
+            for _ in &phis[b] {
+                let idx = self.ops.len();
+                self.ops.push(SsaOp {
+                    index: idx,
+                    opcode: OpCode::MultiEqual,
+                    output: None,
+                    inputs: smallvec::smallvec![VarId::MAX; block.predecessors.len()],
+                    block: b,
+                    address: block.start_addr,
+                    dead: false,
+                });
+            }
             for insn in &block.instructions {
                 for pcode_op in &insn.ops {
-                    let mut input_ids: InputVec = InputVec::with_capacity(pcode_op.inputs.len());
-                    for inp in &pcode_op.inputs {
-                        input_ids.push(self.get_or_create_var(inp));
-                    }
-
-                    let output_id = pcode_op.output.map(|out| self.create_new_version(&out));
-
-                    let op_idx = self.ops.len();
-
-                    // Update varnode def/use sides BEFORE pushing the
-                    // SsaOp so we can move `input_ids` into the op.
-                    if let Some(out_id) = output_id {
-                        self.varnodes[out_id as usize].def_op = Some(op_idx);
-                    }
-                    for &inp_id in &input_ids {
-                        self.varnodes[inp_id as usize].uses.push(op_idx);
-                    }
-
+                    let idx = self.ops.len();
                     self.ops.push(SsaOp {
-                        index: op_idx,
+                        index: idx,
                         opcode: pcode_op.opcode,
-                        output: output_id,
-                        inputs: input_ids,
-                        block: block_id,
+                        output: None,
+                        inputs: InputVec::new(),
+                        block: b,
                         address: insn.address,
                         dead: false,
                     });
@@ -161,7 +236,137 @@ impl SsaFunction {
             }
         }
 
+        // 4. rename along the dominator tree
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for b in 0..n {
+            if let Some(d) = idom[b]
+                && d != b
+            {
+                children[d].push(b);
+            }
+        }
+        let mut stacks: FxHashMap<Key, Vec<VarId>> = Default::default();
+        let mut visited = vec![false; n];
+        let mut roots: Vec<usize> = Vec::new();
+        if n > 0 {
+            roots.push(cfg.entry_block);
+        }
+        roots.extend((0..n).filter(|&b| b != cfg.entry_block && idom[b].is_none()));
+        let mut pushed_by: Vec<Vec<Key>> = vec![Vec::new(); n];
+        for root in roots {
+            // explicit DFS; on exit pop the names the block pushed
+            let mut dfs: Vec<(usize, bool)> = vec![(root, false)];
+            while let Some((b, exiting)) = dfs.pop() {
+                if exiting {
+                    for k in pushed_by[b].drain(..) {
+                        if let Some(st) = stacks.get_mut(&k) {
+                            st.pop();
+                        }
+                    }
+                    continue;
+                }
+                if visited[b] {
+                    continue;
+                }
+                visited[b] = true;
+                dfs.push((b, true));
+                let block = &cfg.blocks[b];
+                let mut idx = block_start[b];
+                for &k in &phis[b] {
+                    let vn = VarnodeData::new(SpaceId(k.0), k.1, k.2);
+                    let out = self.new_version_var(&vn);
+                    self.varnodes[out as usize].def_op = Some(idx);
+                    self.ops[idx].output = Some(out);
+                    stacks.entry(k).or_default().push(out);
+                    pushed_by[b].push(k);
+                    idx += 1;
+                }
+                for insn in &block.instructions {
+                    for pcode_op in &insn.ops {
+                        let mut input_ids: InputVec = InputVec::with_capacity(pcode_op.inputs.len());
+                        for inp in &pcode_op.inputs {
+                            let top = if inp.space == SpaceId::CONST {
+                                None
+                            } else {
+                                stacks.get(&key_of(inp)).and_then(|st| st.last().copied())
+                            };
+                            let id = match top {
+                                Some(id) => id,
+                                None => self.get_or_create_var(inp),
+                            };
+                            self.varnodes[id as usize].uses.push(idx);
+                            input_ids.push(id);
+                        }
+                        self.ops[idx].inputs = input_ids;
+                        if let Some(out) = pcode_op.output {
+                            let id = self.new_version_var(&out);
+                            self.varnodes[id as usize].def_op = Some(idx);
+                            self.ops[idx].output = Some(id);
+                            stacks.entry(key_of(&out)).or_default().push(id);
+                            pushed_by[b].push(key_of(&out));
+                        }
+                        idx += 1;
+                    }
+                }
+                // the successors' phi operands for the edges out of b
+                for &s in &block.successors {
+                    for (j, &p) in cfg.blocks[s].predecessors.iter().enumerate() {
+                        if p != b {
+                            continue;
+                        }
+                        for (pi, &k) in phis[s].iter().enumerate() {
+                            let phi_idx = block_start[s] + pi;
+                            if self.ops[phi_idx].inputs[j] != VarId::MAX {
+                                continue;
+                            }
+                            let top = stacks.get(&k).and_then(|st| st.last().copied());
+                            let id = match top {
+                                Some(id) => id,
+                                None => self.get_or_create_var(&VarnodeData::new(SpaceId(k.0), k.1, k.2)),
+                            };
+                            self.varnodes[id as usize].uses.push(phi_idx);
+                            self.ops[phi_idx].inputs[j] = id;
+                        }
+                    }
+                }
+                for &c in children[b].iter().rev() {
+                    dfs.push((c, false));
+                }
+            }
+        }
+        // phi operands on edges from blocks nothing reached: the incoming value
+        for b in 0..n {
+            for (pi, &k) in phis[b].iter().enumerate() {
+                let phi_idx = block_start[b] + pi;
+                for j in 0..self.ops[phi_idx].inputs.len() {
+                    if self.ops[phi_idx].inputs[j] == VarId::MAX {
+                        let id = self.get_or_create_var(&VarnodeData::new(SpaceId(k.0), k.1, k.2));
+                        self.varnodes[id as usize].uses.push(phi_idx);
+                        self.ops[phi_idx].inputs[j] = id;
+                    }
+                }
+            }
+        }
+
         self.cfg = cfg;
+    }
+
+    /// A fresh version of a register / RAM / unique slot (its def is set by the caller).
+    fn new_version_var(&mut self, vn: &VarnodeData) -> VarId {
+        let key = (vn.space.0, vn.offset, vn.size);
+        let version = self.var_versions.entry(key).or_insert(0);
+        *version += 1;
+        let cur_version = *version;
+        let id = self.next_var_id;
+        self.next_var_id += 1;
+        self.varnodes.push(SsaVarnode {
+            id,
+            data: *vn,
+            version: cur_version,
+            def_op: None,
+            uses: Vec::new(),
+        });
+        id
     }
 
     fn get_or_create_var(&mut self, vn: &VarnodeData) -> VarId {
@@ -206,26 +411,6 @@ impl SsaFunction {
         id
     }
 
-    fn create_new_version(&mut self, vn: &VarnodeData) -> VarId {
-        let key = (vn.space.0, vn.offset, vn.size);
-        let version = self.var_versions.entry(key).or_insert(0);
-        *version += 1;
-        let cur_version = *version;
-
-        let id = self.next_var_id;
-        self.next_var_id += 1;
-        self.varnodes.push(SsaVarnode {
-            id,
-            data: *vn,
-            version: cur_version,
-            def_op: None,
-            uses: Vec::new(),
-        });
-        // Subsequent reads of this slot resolve to this varnode until
-        // the next def rotates `current_var` again.
-        self.current_var.insert(key, id);
-        id
-    }
 
     pub fn op_count(&self) -> usize {
         self.ops.len()

@@ -42,7 +42,7 @@ pub fn decompile(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
 
-    let terminated = trim_to_return(lifted);
+    let terminated = apply_call_convention(trim_to_return(lifted), lifter);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None)
 }
@@ -155,6 +155,7 @@ pub fn decompile_function_with_maps(
     } else {
         trim_to_return(lifted)
     };
+    let terminated = apply_call_convention(terminated, lifter);
 
     build_decompile_result(
         terminated,
@@ -165,6 +166,60 @@ pub fn decompile_function_with_maps(
         annotations,
         call_renderings,
     )
+}
+
+/// Give every call the calling convention's argument registers as inputs and
+/// define its return registers right after it (`INDIRECT(target)`, with the
+/// narrower views refreshed), so argument setup is not dead code and a use of
+/// the result does not read the value from before the call (WS75).
+/// `optimize::prune_call_args` later keeps only the arguments set up for the
+/// call. No-op when the lifter has no convention.
+fn apply_call_convention(
+    mut instructions: Vec<LiftedInstruction>,
+    lifter: &dyn PcodeLift,
+) -> Vec<LiftedInstruction> {
+    use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
+    let Some(cc) = lifter.call_convention() else {
+        return instructions;
+    };
+    for insn in &mut instructions {
+        let Some(pos) = insn
+            .ops
+            .iter()
+            .position(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd))
+        else {
+            continue;
+        };
+        let call = &mut insn.ops[pos];
+        let at = call.seq;
+        let target = call.inputs.first().copied();
+        for a in &cc.args {
+            call.inputs.push(*a);
+        }
+        let mut after: Vec<PcodeOp> = Vec::new();
+        for (full, views) in &cc.returns {
+            let mut inputs = smallvec::SmallVec::new();
+            if let Some(t) = target {
+                inputs.push(t);
+            }
+            after.push(PcodeOp { opcode: OpCode::Indirect, seq: at, output: Some(*full), inputs });
+            for &sz in views {
+                after.push(PcodeOp {
+                    opcode: OpCode::Subpiece,
+                    seq: at,
+                    output: Some(VarnodeData::new(full.space, full.offset, sz)),
+                    inputs: smallvec::smallvec![*full, VarnodeData::new(reargo_core::address::SpaceId::CONST, 0, 4)],
+                });
+            }
+        }
+        let tail = insn.ops.split_off(pos + 1);
+        insn.ops.extend(after);
+        insn.ops.extend(tail);
+        for (i, op) in insn.ops.iter_mut().enumerate() {
+            op.seq.order = i as u32;
+        }
+    }
+    instructions
 }
 
 /// Decompile every function the program knows about, in parallel.
@@ -285,6 +340,15 @@ fn build_decompile_result(
     let block_count = cfg.block_count();
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
+    // `apply_call_convention` ran: calls carry the convention's argument registers.
+    ssa.implicit_call_args = ssa
+        .ops
+        .iter()
+        .any(|o| o.opcode == reargo_core::pcode::OpCode::Indirect)
+        && ssa
+            .ops
+            .iter()
+            .any(|o| matches!(o.opcode, reargo_core::pcode::OpCode::Call | reargo_core::pcode::OpCode::CallInd) && o.inputs.len() > 1);
 
     let opt_stats = run_optimization_passes(&mut ssa);
     let live_ops = ssa.live_op_count();
@@ -545,6 +609,29 @@ mod tests {
             data: Some(Arc::from(data)),
         });
         mem
+    }
+
+    /// WS75: a call shows the arguments set up for it and its result is the
+    /// call's return value, not the register's value from before the call.
+    #[test]
+    fn decompile_call_carries_args_and_return() {
+        let lifter = X86Lifter::new_64();
+        // 0x1000 mov edi, 5 ; 0x1005 call 0x2000 ; 0x100a mov [rip+0x1ff0], eax (= [0x3000]) ; ret
+        let code = [
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xe8, 0xf6, 0x0f, 0x00, 0x00, // call 0x2000
+            0x89, 0x05, 0xf0, 0x1f, 0x00, 0x00, // mov [0x3000], eax
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        let c = &r.c_code;
+        // the argument survives (it used to be dead code) and is the only one shown
+        let call_line = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call_line.contains("rdi") && !call_line.contains("rsi"), "{call_line}");
+        assert!(c.contains("edi = 5"), "{c}");
+        // the store reads the call's result
+        assert!(c.contains("__ret"), "{c}");
     }
 
     #[test]

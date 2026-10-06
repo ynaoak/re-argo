@@ -7,4 +7,4 @@ pub mod riscv;
 pub mod sparc;
 pub mod x86;
 
-pub use lift::{DelaySlot, ItBlock, LiftContext, LiftedInstruction, PcodeLift};
+pub use lift::{CallConvention, DelaySlot, ItBlock, LiftContext, LiftedInstruction, PcodeLift};

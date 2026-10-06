@@ -337,6 +337,8 @@ impl<'a> RustEmitter<'a> {
         let out_name = op.output.map(|id| varnode_name(&func.varnodes[id as usize]));
 
         match op.opcode {
+            // phi: same name on every incoming edge, nothing to print
+            OpCode::MultiEqual => None,
             OpCode::Copy => {
                 let dst = out_name?;
                 let src = self.input_expr(func, op, 0);
@@ -675,11 +677,18 @@ impl<'a> RustEmitter<'a> {
                 } else {
                     target_expr
                 };
-                Some(format!("{}();", call_name))
+                let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
+                Some(format!("{}({});", call_name, args.join(", ")))
             }
             OpCode::CallInd => {
                 let target = self.input_expr(func, op, 0);
-                Some(format!("(*{})();", target))
+                let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
+                Some(format!("(*{})({});", target, args.join(", ")))
+            }
+            OpCode::Indirect => {
+                // a call's return register (see `pipeline::apply_call_convention`)
+                let dst = out_name?;
+                Some(format!("{} = __ret; // of {}", dst, self.input_expr(func, op, 0)))
             }
             OpCode::Return => {
                 let val = self.input_expr(func, op, 0);

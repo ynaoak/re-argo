@@ -346,6 +346,36 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
         }
     }
 
+    // Cycles through phi nodes (a loop counter nothing outside the loop
+    // reads) keep each other "used" above. Mark what the side-effecting ops
+    // actually need and drop the rest.
+    if func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::MultiEqual) {
+        let mut live = vec![false; n];
+        let mut stack: Vec<usize> = (0..n)
+            .filter(|&i| !func.ops[i].dead && (is_side_effecting(func.ops[i].opcode) || func.ops[i].output.is_none()))
+            .collect();
+        for &i in &stack {
+            live[i] = true;
+        }
+        while let Some(i) = stack.pop() {
+            for &inp in &func.ops[i].inputs {
+                if let Some(d) = func.varnodes[inp as usize].def_op
+                    && !live[d]
+                    && !func.ops[d].dead
+                {
+                    live[d] = true;
+                    stack.push(d);
+                }
+            }
+        }
+        for (i, alive) in live.iter().enumerate() {
+            if !alive && !func.ops[i].dead {
+                func.ops[i].dead = true;
+                removed += 1;
+            }
+        }
+    }
+
     removed
 }
 
@@ -460,7 +490,9 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
         let uses_len = func.varnodes[out_id as usize].uses.len();
         for k in 0..uses_len {
             let use_idx = func.varnodes[out_id as usize].uses[k];
-            if func.ops[use_idx].dead {
+            // A phi operand names the register on its edge; replacing it would
+            // leave the copy without a use and drop the assignment from the output.
+            if func.ops[use_idx].dead || func.ops[use_idx].opcode == OpCode::MultiEqual {
                 continue;
             }
             for inp in &mut func.ops[use_idx].inputs {
@@ -563,18 +595,29 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx / 2, Default::default());
 
+    // The C output names a value by its register / temporary, not its SSA
+    // version, so a use may only be redirected to an earlier value whose slot
+    // has not been written since: `tmp_600 = rsp + 0xc; ...; tmp_600 = rsp + 4;
+    // ...; load [rsp + 0xc]` printed the last load as `*(tmp_600)` = rsp + 4.
+    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), u32> = Default::default();
+    let record = |func: &SsaFunction, i: usize, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), u32>| {
+        if let Some(o) = func.ops[i].output
+            && !func.ops[i].dead
+        {
+            let vn = &func.varnodes[o as usize];
+            latest.insert((vn.data.space.0, vn.data.offset, vn.data.size), vn.version);
+        }
+    };
     for i in 0..func.ops.len() {
         if func.ops[i].dead {
             continue;
         }
         let opcode = func.ops[i].opcode;
-        if !is_cse_pure(opcode) {
+        if !is_cse_pure(opcode) || func.ops[i].inputs.is_empty() {
+            record(func, i, &mut latest);
             continue;
         }
         let Some(out_id) = func.ops[i].output else { continue };
-        if func.ops[i].inputs.is_empty() {
-            continue;
-        }
 
         let mut in_keys: InKeys = func.ops[i]
             .inputs
@@ -588,12 +631,23 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         let key = (func.ops[i].block, opcode.name(), out_size, in_keys);
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
-        if let Some(&existing) = seen.get(&key) {
+        // A value a phi reads keeps its own name (the phi prints as nothing).
+        let feeds_phi = func.varnodes[out_id as usize]
+            .uses
+            .iter()
+            .any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
+        let name_still_holds =
+            |k: ValueKey| latest.get(&(k.0, k.1, k.2)).copied().unwrap_or(0) == k.3;
+        if let Some(&existing) = seen.get(&key)
+            && !feeds_phi
+            && name_still_holds(existing)
+        {
             redirects.insert(out_key, existing);
             func.ops[i].dead = true;
             eliminated += 1;
         } else {
             seen.insert(key, out_key);
+            record(func, i, &mut latest);
         }
     }
 
@@ -782,8 +836,61 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
     simplified
 }
 
+/// Keep only the argument registers a call actually set up.
+///
+/// The pipeline gives every call all of the convention's argument registers
+/// (see `pipeline::apply_call_convention`); a register counts as an argument
+/// of this call when its reaching definition is in the call's own block and
+/// after the previous call there (the usual "argument setup" window). The
+/// rest are dropped, so they neither print nor keep stale values alive.
+/// Returns the number of inputs removed.
+pub fn prune_call_args(func: &mut SsaFunction) -> usize {
+    if !func.implicit_call_args {
+        return 0;
+    }
+    let mut removed = 0;
+    let mut last_call_in_block: Option<(usize, usize)> = None; // (block, op index)
+    for i in 0..func.ops.len() {
+        let op = &func.ops[i];
+        if !matches!(op.opcode, OpCode::Call | OpCode::CallInd) || op.dead {
+            continue;
+        }
+        let block = op.block;
+        let window_start = match last_call_in_block {
+            Some((b, idx)) if b == block => idx + 1,
+            _ => func.ops.iter().position(|o| o.block == block).unwrap_or(i),
+        };
+        last_call_in_block = Some((block, i));
+        let inputs = func.ops[i].inputs.clone();
+        let mut kept: crate::ssa::InputVec = crate::ssa::InputVec::new();
+        for (k, &v) in inputs.iter().enumerate() {
+            let keep = k == 0
+                || func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST
+                || func.varnodes[v as usize].def_op.is_some_and(|d| {
+                    func.ops[d].block == block
+                        && d >= window_start
+                        && d < i
+                        && func.ops[d].opcode != OpCode::MultiEqual
+                });
+            if keep {
+                kept.push(v);
+            } else {
+                let uses = &mut func.varnodes[v as usize].uses;
+                if let Some(p) = uses.iter().position(|&u| u == i) {
+                    uses.swap_remove(p);
+                }
+                removed += 1;
+            }
+        }
+        func.ops[i].inputs = kept;
+    }
+    func.implicit_call_args = false;
+    removed
+}
+
 pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
     let mut stats = OptimizationStats::default();
+    prune_call_args(func);
 
     for _ in 0..10 {
         // Three passes (constant_fold, algebraic_simplification,
@@ -1099,6 +1206,31 @@ mod tests {
         assert_eq!(live_adds, 1);
     }
 
+    /// WS75: `rax = rdi + 12; rax = rdi + 4; rbx = rdi + 12` — the third add
+    /// must not become `rbx = rax`-by-name: `rax` no longer holds rdi + 12.
+    #[test]
+    fn cse_does_not_redirect_to_an_overwritten_name() {
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rbx = VarnodeData::new(SpaceId(2), 0x18, 8);
+        let rdi = VarnodeData::new(SpaceId(2), 0x38, 8);
+        let c = |v| VarnodeData::new(SpaceId(0), v, 8);
+        let add = |o, out, k| PcodeOp {
+            opcode: OpCode::IntAdd,
+            seq: seq(0x1000, o),
+            output: Some(out),
+            inputs: SmallVec::from_slice(&[rdi, c(k)]),
+        };
+        let insns = vec![make_lifted(0x1000, vec![add(0, rax, 12), add(1, rax, 4), add(2, rbx, 12)])];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
+        assert_eq!(common_subexpression_elimination(&mut ssa), 0);
+        // with the name intact the duplicate still goes
+        let insns = vec![make_lifted(0x1000, vec![add(0, rax, 12), add(1, rbx, 12)])];
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, ControlFlowGraph::build(&insns));
+        assert_eq!(common_subexpression_elimination(&mut ssa), 1);
+    }
+
     #[test]
     fn cse_keeps_extensions_of_different_width() {
         // xmm0_q = zext(xmm0_d); xmm0 = zext(xmm0_d): same input, different
@@ -1208,6 +1340,51 @@ mod tests {
         assert_eq!(removed, 0, "Copy of rax is live (Return reads rax)");
         let copy_live = ssa.ops.iter().any(|op| !op.dead && op.opcode == OpCode::Copy);
         assert!(copy_live, "the live Copy must survive DCE: {:?}", ssa.ops);
+    }
+
+    /// WS75: a value carried round a loop must survive. Layout:
+    ///   0x1000 rax = 0
+    ///   0x1001 [0x2000] = rax          <- loop head reads the carried rax
+    ///   0x1002 rax = rax + 8           <- latch def, read only by the head
+    ///   0x1003 rcx = rcx + 1; if (rcx != 8) goto 0x1001
+    ///   0x1004 return
+    /// Without phi nodes the head read the entry's rax and the latch add had
+    /// no use, so DCE deleted it (the `add r14, 0x818` of BDS's octave loop).
+    #[test]
+    fn loop_carried_value_survives_dce() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let rax = VarnodeData::new(SpaceId(2), 0x00, 8);
+        let rcx = VarnodeData::new(SpaceId(2), 0x08, 8);
+        let zf = VarnodeData::new(SpaceId(2), 0x206, 1);
+        let c = |v: u64, sz: u32| VarnodeData::new(SpaceId(0), v, sz);
+        let op = |a: u64, opcode, output, inputs: &[VarnodeData]| PcodeOp {
+            opcode,
+            seq: seq(a),
+            output,
+            inputs: SmallVec::from_slice(inputs),
+        };
+        let insns = vec![
+            make_lifted(0x1000, vec![op(0x1000, OpCode::Copy, Some(rax), &[c(0, 8)])]),
+            make_lifted(0x1001, vec![op(0x1001, OpCode::Store, None, &[c(1, 4), c(0x2000, 8), rax])]),
+            make_lifted(0x1002, vec![op(0x1002, OpCode::IntAdd, Some(rax), &[rax, c(8, 8)])]),
+            make_lifted(0x1003, vec![
+                op(0x1003, OpCode::IntAdd, Some(rcx), &[rcx, c(1, 8)]),
+                op(0x1003, OpCode::IntNotEqual, Some(zf), &[rcx, c(8, 8)]),
+                op(0x1003, OpCode::CBranch, None, &[VarnodeData::new(SpaceId(1), 0x1001, 8), zf]),
+            ]),
+            make_lifted(0x1004, vec![op(0x1004, OpCode::Return, None, &[c(0, 8)])]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let mut ssa = SsaFunction::from_cfg("loop".into(), 0x1000, cfg);
+        run_optimization_passes(&mut ssa);
+        let add = ssa.ops.iter().find(|o| o.opcode == OpCode::IntAdd && o.address == 0x1002).expect("add");
+        assert!(!add.dead, "latch add removed: {}", ssa.display_ssa());
+        // the store reads the phi, whose operands are the entry copy and the add
+        let store = ssa.ops.iter().find(|o| o.opcode == OpCode::Store).unwrap();
+        let v = store.inputs[2];
+        let phi = &ssa.ops[ssa.varnodes[v as usize].def_op.expect("phi def")];
+        assert_eq!(phi.opcode, OpCode::MultiEqual, "{}", ssa.display_ssa());
+        assert!(phi.inputs.iter().any(|&i| ssa.varnodes[i as usize].def_op == Some(add.index)));
     }
 
     /// copy_propagation pushes a constant Copy's value through to the
