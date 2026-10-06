@@ -60,6 +60,10 @@ pub struct SsaFunction {
     /// onto the unrelated read-side varnodes), and copy_propagation
     /// couldn't match `*inp == out_id` because the ids never coincided.
     current_var: FxHashMap<(u32, u64, u32), VarId>,
+    /// Calls carry the calling convention's argument registers as inputs
+    /// `1..` (added by the pipeline); `optimize::prune_call_args` trims them
+    /// to the ones actually set up for the call.
+    pub implicit_call_args: bool,
 }
 
 impl SsaFunction {
@@ -86,6 +90,7 @@ impl SsaFunction {
             next_var_id: 0,
             var_versions: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
             current_var: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
+            implicit_call_args: false,
         };
         func.build_ssa();
         func

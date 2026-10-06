@@ -1487,7 +1487,10 @@ impl X86Lifter {
             Addsd | Subsd | Mulsd | Divsd | Sqrtsd | Movsd | Comisd | Ucomisd | Cvtsd2ss
             | Minsd | Maxsd => 8,
             Addss | Subss | Mulss | Divss | Sqrtss | Movss | Comiss | Ucomiss | Cvtss2sd
-            | Minss | Maxss => 4,
+            | Minss | Maxss | Cvtsi2ss => 4,
+            // packed int <-> float conversions act on the whole register (they fell
+            // to the 8-byte default; `cvtsi2ss` likewise wrote an 8-byte "double")
+            Cvtdq2ps | Cvttps2dq | Cvtps2dq => 16,
             // Packed ops act on the full 128-bit register. We model packed
             // arithmetic as a single FLOAT op over the whole varnode — not
             // bit-exact SIMD, but it keeps the vectorized noise math readable
@@ -2334,6 +2337,19 @@ impl X86Lifter {
 }
 
 impl PcodeLift for X86Lifter {
+    /// System V AMD64 (64-bit only): rdi rsi rdx rcx r8 r9, xmm0-7; returns in rax / xmm0.
+    fn call_convention(&self) -> Option<crate::lift::CallConvention> {
+        if !self.is_64 {
+            return None;
+        }
+        let mut args = vec![rdi(8), rsi(8), rdx(8), rcx(8), reg(0x80, 8), reg(0x88, 8)];
+        args.extend((0..8).map(|i| reg(XMM_BASE + i * 0x10, 16)));
+        Some(crate::lift::CallConvention {
+            args,
+            returns: vec![(rax(8), vec![4, 2, 1]), (reg(XMM_BASE, 16), vec![8, 4])],
+        })
+    }
+
     fn lift_instruction(
         &self,
         memory: &Memory,
@@ -2707,6 +2723,13 @@ mod tests {
         let cvt = lifted.ops.iter().find(|o| o.opcode == OpCode::FloatInt2Float).unwrap();
         assert_eq!(cvt.output.unwrap().offset, 0x1200);
         assert_eq!(cvt.output.unwrap().size, 8);
+        // cvtsi2ss xmm0, eax = f3 0f 2a c0 : a float, 4 bytes (was an 8-byte "double")
+        let mem = make_memory(&[0xf3, 0x0f, 0x2a, 0xc0], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let cvt = lifted.ops.iter().find(|o| o.opcode == OpCode::FloatInt2Float).unwrap();
+        assert_eq!(cvt.output.unwrap().size, 4);
+        // the upper lanes are kept (PIECE), not zeroed
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Piece));
     }
 
     #[test]
