@@ -74,6 +74,30 @@ fn iced_reg_to_varnode(r: iced_x86::Register) -> Option<VarnodeData> {
         m.insert(Register::R13, reg(0xA8, 8)); m.insert(Register::R13D, reg(0xA8, 4));
         m.insert(Register::R14, reg(0xB0, 8)); m.insert(Register::R14D, reg(0xB0, 4));
         m.insert(Register::R15, reg(0xB8, 8)); m.insert(Register::R15D, reg(0xB8, 4));
+        // Byte views of rsp/rbp/rsi/rdi (REX) and the 16/8-bit views of r8..r15.
+        // Without them `mov r13w, 7FFFh`, `movzx esi, bpl`, `test r8b, dil`
+        // failed to lift and `lift_range` stopped there, so the decompiler saw
+        // the function only up to that instruction (BDS aquifer `computeFluid`
+        // 0x4bd0820: 20 of ~350 instructions).
+        m.insert(Register::SPL, rsp(1)); m.insert(Register::BPL, rbp(1));
+        m.insert(Register::SIL, rsi(1)); m.insert(Register::DIL, rdi(1));
+        for (i, (w, b)) in [
+            (Register::R8W, Register::R8L),
+            (Register::R9W, Register::R9L),
+            (Register::R10W, Register::R10L),
+            (Register::R11W, Register::R11L),
+            (Register::R12W, Register::R12L),
+            (Register::R13W, Register::R13L),
+            (Register::R14W, Register::R14L),
+            (Register::R15W, Register::R15L),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let off = 0x80 + 8 * i as u64;
+            m.insert(w, reg(off, 2));
+            m.insert(b, reg(off, 1));
+        }
         m
     });
     map.get(&r).copied()
@@ -2376,38 +2400,59 @@ impl PcodeLift for X86Lifter {
 /// 64-bit arithmetic was dead-code-eliminated. After each 64-bit GPR write
 /// we also refresh the 32-bit view with `ecx = SUBPIECE(rcx, 0)` (dead
 /// copies are removed later by the decompiler when nothing reads them).
+///
+/// The 16- and 8-bit views (`ax`/`al`, `r13w`, `dil`, …) are kept coherent the
+/// same way: a 64/32-bit write refreshes them with SUBPIECE, and a 16/8-bit
+/// write — which on x86 preserves the bits above it — rebuilds the 64-bit
+/// register as `PIECE(SUBPIECE(old, n), new)` and then the other views from
+/// it (`mov eax, ...; cmp r13w, ax` read a stale `ax` before).
 fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
-    let is_gpr = |v: &VarnodeData, sz: u32| {
-        v.space == REG_SPACE && v.size == sz && v.offset < 0xC0 && v.offset % 8 == 0
+    let gpr = |v: &VarnodeData| {
+        (v.space == REG_SPACE && v.offset < 0xC0 && v.offset % 8 == 0 && matches!(v.size, 1 | 2 | 4 | 8))
+            .then_some(*v)
     };
-    if !ops
-        .iter()
-        .any(|o| o.output.as_ref().is_some_and(|v| is_gpr(v, 4) || is_gpr(v, 8)))
-    {
+    if !ops.iter().any(|o| o.output.as_ref().and_then(gpr).is_some()) {
         return ops;
     }
-    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 2);
+    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 4);
+    let mut tmp = 0x7e00u64;
     for op in ops {
-        let w32 = op.output.filter(|v| is_gpr(v, 4));
-        // rsp is excluded: 64-bit code never reads esp, and push/pop/call/ret
-        // would otherwise each grow an extra op.
-        let w64 = op.output.filter(|v| is_gpr(v, 8) && v.offset != 0x20);
+        let w = op.output.as_ref().and_then(gpr);
         let at = op.seq.addr;
         out.push(op);
-        if let Some(r32) = w32 {
-            out.push(PcodeOp {
-                opcode: OpCode::IntZExt,
-                seq: SeqNum::new(at, 0),
-                output: Some(reg(r32.offset, 8)),
-                inputs: SmallVec::from_slice(&[r32]),
-            });
-        } else if let Some(r64) = w64 {
-            out.push(PcodeOp {
-                opcode: OpCode::Subpiece,
-                seq: SeqNum::new(at, 0),
-                output: Some(reg(r64.offset, 4)),
-                inputs: SmallVec::from_slice(&[r64, constant(0, 4)]),
-            });
+        let Some(w) = w else { continue };
+        let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
+            opcode,
+            seq: SeqNum::new(at, 0),
+            output: Some(output),
+            inputs: SmallVec::from_slice(inputs),
+        };
+        let r = |sz: u32| reg(w.offset, sz);
+        let low = |out: &mut Vec<PcodeOp>, from: u32, sizes: &[u32]| {
+            for &sz in sizes {
+                out.push(mk(OpCode::Subpiece, r(sz), &[r(from), constant(0, 4)]));
+            }
+        };
+        // rsp is excluded: 64-bit code never reads esp/sp/spl, and push/pop/call/ret
+        // would otherwise each grow extra ops.
+        let is_rsp = w.offset == 0x20;
+        match w.size {
+            8 if !is_rsp => low(&mut out, 8, &[4, 2, 1]),
+            8 => {}
+            4 => {
+                out.push(mk(OpCode::IntZExt, r(8), &[r(4)]));
+                if !is_rsp {
+                    low(&mut out, 4, &[2, 1]);
+                }
+            }
+            n if !is_rsp => {
+                let hi = unique(tmp, 8 - n);
+                tmp += 0x10;
+                out.push(mk(OpCode::Subpiece, hi, &[r(8), constant(n as u64, 4)]));
+                out.push(mk(OpCode::Piece, r(8), &[hi, r(n)]));
+                low(&mut out, 8, if n == 2 { &[4, 1] } else { &[4, 2] });
+            }
+            _ => {}
         }
     }
     for (i, op) in out.iter_mut().enumerate() {
@@ -2536,8 +2581,10 @@ mod tests {
                     });
                 // xmm view rebuild: hi = SUBPIECE(xmm, k) into a unique, PIECE(hi, low)
                 let xmm_view = o.output.is_some_and(|out| {
-                    (out.space == UNIQUE_SPACE && out.offset >= 0x7f00 && o.opcode == OpCode::Subpiece)
-                        || (o.opcode == OpCode::Piece && out.space == REG_SPACE && out.offset >= XMM_BASE)
+                    (out.space == UNIQUE_SPACE && out.offset >= 0x7e00 && o.opcode == OpCode::Subpiece)
+                        || (o.opcode == OpCode::Piece
+                            && out.space == REG_SPACE
+                            && (out.offset >= XMM_BASE || out.offset < 0xC0))
                 });
                 !alias && !xmm_view
             })
@@ -2901,9 +2948,11 @@ mod tests {
         let l = lifter.lift_instruction(&make_memory(&[0x41, 0x89, 0xc9], 0x1000), 0x1000).unwrap();
         assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntZExt
             && o.output.is_some_and(|v| v.offset == 0x88 && v.size == 8)));
-        // 16-bit writes are untouched: mov ax, 7
+        // 16-bit writes keep the upper bits: mov ax, 7 -> rax = PIECE(SUBPIECE(rax, 2), ax), no zext
         let l = lifter.lift_instruction(&make_memory(&[0x66, 0xb8, 0x07, 0x00], 0x1000), 0x1000).unwrap();
-        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt || o.opcode == OpCode::Subpiece));
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Piece
+            && o.output.is_some_and(|v| v.offset == 0x00 && v.size == 8)));
         // 64-bit write refreshes the 32-bit view: add rcx, rax = 48 01 c1
         let l = lifter.lift_instruction(&make_memory(&[0x48, 0x01, 0xc1], 0x1000), 0x1000).unwrap();
         assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
@@ -2915,6 +2964,39 @@ mod tests {
         let l32 = X86Lifter::new_32();
         let l = l32.lift_instruction(&make_memory(&[0xb8, 0x07, 0, 0, 0], 0x1000), 0x1000).unwrap();
         assert!(!l.ops.iter().any(|o| o.opcode == OpCode::IntZExt));
+    }
+
+    /// WS75: REX byte registers and r8w..r15w / r8b..r15b lift, and every width of
+    /// a GPR stays coherent after a partial write.
+    #[test]
+    fn lift_partial_gpr_registers() {
+        let lifter = X86Lifter::new_64();
+        let lift = |b: &[u8]| lifter.lift_instruction(&make_memory(b, 0x1000), 0x1000);
+        // mov r13w, 7FFFh = 66 41 bd ff 7f (stopped lift_range in BDS computeFluid)
+        let l = lift(&[0x66, 0x41, 0xbd, 0xff, 0x7f]).expect("mov r13w, imm16");
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Copy
+            && o.output.is_some_and(|v| v.offset == 0xA8 && v.size == 2)));
+        // r13 rebuilt from the untouched upper 6 bytes and the new low word
+        let p = l.ops.iter().find(|o| o.opcode == OpCode::Piece).expect("r13 = PIECE(hi, r13w)");
+        assert_eq!((p.output.unwrap().offset, p.output.unwrap().size), (0xA8, 8));
+        assert_eq!((p.inputs[0].size, p.inputs[1].size), (6, 2));
+        // ... and r13d / r13b refreshed from it
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Subpiece
+            && o.output.is_some_and(|v| v.offset == 0xA8 && v.size == 4)));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Subpiece
+            && o.output.is_some_and(|v| v.offset == 0xA8 && v.size == 1)));
+        // movzx esi, bpl = 40 0f b6 f5 ; test r8b, dil = 41 84 f8 ; sete dil = 40 0f 94 c7
+        lift(&[0x40, 0x0f, 0xb6, 0xf5]).expect("movzx esi, bpl");
+        lift(&[0x41, 0x84, 0xf8]).expect("test r8b, dil");
+        let l = lift(&[0x40, 0x0f, 0x94, 0xc7]).expect("sete dil");
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Piece
+            && o.output.is_some_and(|v| v.offset == 0x38 && v.size == 8)));
+        // a 32-bit write refreshes the 16/8-bit views: mov eax, 7 -> ax, al
+        let l = lift(&[0xb8, 0x07, 0, 0, 0]).unwrap();
+        for sz in [2, 1] {
+            assert!(l.ops.iter().any(|o| o.opcode == OpCode::Subpiece
+                && o.output.is_some_and(|v| v.offset == 0 && v.size == sz)), "al/ax view {sz}");
+        }
     }
 
     #[test]
