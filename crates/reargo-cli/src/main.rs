@@ -239,6 +239,11 @@ enum Commands {
         /// Annotate addresses in the output (import@plt / vtable[class] / fn / string / data)
         #[arg(short = 'A', long)]
         annotate: bool,
+        /// Skip the whole-binary analysis: take the function's bounds from the ELF's
+        /// `.eh_frame_hdr` (FDE) and decompile just that. Seconds instead of tens of minutes on
+        /// a 200 MB binary; names / comments that only the analysis finds are missing.
+        #[arg(long)]
+        fast: bool,
     },
     /// Decompile every discovered function in parallel
     DecompileAll {
@@ -898,7 +903,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             start,
             count,
         } => cmd_pcode(&file, start, count, cli.thumb),
-        Commands::Decompile { file, address, ssa, rust, annotate } => cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate),
+        Commands::Decompile { file, address, ssa, rust, annotate, fast } => cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate, fast),
         Commands::DecompileAll { file, output_dir, rust, skip_errors } => cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb),
         Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
@@ -2598,8 +2603,31 @@ fn cmd_pcode(path: &Path, start: Option<u64>, count: usize, thumb: bool) -> Resu
     Ok(())
 }
 
-fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let program = analyze_binary(path)?;
+/// The program for `decompile --fast`: the loaded binary without any analysis, plus one function
+/// whose body is the FDE covering `address` (WS76: the BDS full analysis takes > 25 minutes).
+fn fast_program(path: &Path, address: Option<u64>) -> Result<Program, Box<dyn std::error::Error>> {
+    use reargo_core::address::{Address, AddressRange, SpaceId};
+    let mut program = Program::from_binary(path)?;
+    let entry = address.unwrap_or(program.entry_point());
+    let data = std::fs::read(path)?;
+    match reargo_loader::elf_eh_frame_function(&data, entry) {
+        Some((start, len)) => {
+            if start != entry {
+                eprintln!("[fast] 0x{entry:x} is inside the FDE 0x{start:x}..0x{:x}; decompiling from 0x{entry:x}", start + len);
+            }
+            let name = program.function_name_at(entry);
+            let mut f = reargo_program::function::Function::new(entry, name);
+            f.body.add(AddressRange::new(Address::new(SpaceId::RAM, entry), start + len - entry));
+            program.listing.add_function(f);
+            eprintln!("[fast] function 0x{entry:x}..0x{:x} from .eh_frame_hdr", start + len);
+        }
+        None => eprintln!("[fast] no FDE covers 0x{entry:x}; falling back to reachability from the entry"),
+    }
+    Ok(program)
+}
+
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool, fast: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let program = if fast { fast_program(path, address)? } else { analyze_binary(path)? };
 
     let lifter = match make_lifter(&program.info, thumb) {
         Some(l) => l,

@@ -1,5 +1,6 @@
 pub mod coff;
 pub mod dwarf;
+pub mod ehframe;
 pub mod dwarf_types;
 pub mod error;
 pub mod loader;
@@ -15,6 +16,7 @@ pub mod source_map;
 pub mod symbols;
 
 pub use error::LoaderError;
+pub use ehframe::elf_eh_frame_function;
 pub use dwarf::{DwarfInfo, DwarfFunctionInfo};
 pub use loader::{elf_pointer_relocations, Architecture, BinaryFormat, BinaryInfo, BinaryLoader, DynamicInfo, ImportEntry, LoadSymbol, Section, SectionFlags, SymbolKind};
 pub use imports::{ImportExportTable, ImportedFunction, ExportedFunction};

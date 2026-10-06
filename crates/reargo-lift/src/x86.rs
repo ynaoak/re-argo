@@ -2347,6 +2347,12 @@ impl PcodeLift for X86Lifter {
         Some(crate::lift::CallConvention {
             args,
             returns: vec![(rax(8), vec![4, 2, 1]), (reg(XMM_BASE, 16), vec![8, 4])],
+            // System V: rcx, rdx, rsi, rdi, r8-r11 and xmm1-xmm15 are not preserved
+            clobbers: [rcx(8), rdx(8), rsi(8), rdi(8), reg(0x80, 8), reg(0x88, 8), reg(0x90, 8), reg(0x98, 8)]
+                .into_iter()
+                .map(|r| (r, vec![4, 2, 1]))
+                .chain((1..16).map(|i| (reg(XMM_BASE + i * 0x10, 16), vec![8, 4])))
+                .collect(),
         })
     }
 

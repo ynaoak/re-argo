@@ -848,29 +848,56 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
     if !func.implicit_call_args {
         return 0;
     }
+    // WS76: the window is no longer "this block, after the previous call". Calls clobber the
+    // caller-saved registers (`INDIRECT(target, CLOBBER_MARK)`), so an argument register still
+    // holding a value from before an earlier call reads that clobber and is dropped here, while
+    // one set up in a block that dominates the call (`mov edi, 5; test ..; jcc; call f`) — or
+    // on every path into it (a phi of such values) — is kept.
+    let idom = if func.cfg.block_count() > 0 {
+        crate::dominator::compute_idom(&func.cfg)
+    } else {
+        Vec::new()
+    };
+    let dominates = |a: usize, mut b: usize| -> bool {
+        for _ in 0..idom.len() + 1 {
+            if a == b {
+                return true;
+            }
+            match idom.get(b) {
+                Some(&Some(p)) if p != b => b = p,
+                _ => return false,
+            }
+        }
+        false
+    };
+    // Is `v` a value the function computed (not an incoming register, not a clobber)?
+    fn set_up(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> bool {
+        let Some(d) = func.varnodes[v as usize].def_op else { return false };
+        let op = &func.ops[d];
+        if op.opcode == OpCode::Indirect {
+            let ins: Vec<_> = op.inputs.iter().map(|&i| func.varnodes[i as usize].data).collect();
+            return !crate::pipeline::is_call_clobber(&op.opcode, &ins);
+        }
+        if op.opcode == OpCode::MultiEqual {
+            return depth < 4 && !op.inputs.is_empty() && op.inputs.iter().all(|&i| set_up(func, i, depth + 1));
+        }
+        true
+    }
     let mut removed = 0;
-    let mut last_call_in_block: Option<(usize, usize)> = None; // (block, op index)
     for i in 0..func.ops.len() {
         let op = &func.ops[i];
         if !matches!(op.opcode, OpCode::Call | OpCode::CallInd) || op.dead {
             continue;
         }
         let block = op.block;
-        let window_start = match last_call_in_block {
-            Some((b, idx)) if b == block => idx + 1,
-            _ => func.ops.iter().position(|o| o.block == block).unwrap_or(i),
-        };
-        last_call_in_block = Some((block, i));
         let inputs = func.ops[i].inputs.clone();
         let mut kept: crate::ssa::InputVec = crate::ssa::InputVec::new();
         for (k, &v) in inputs.iter().enumerate() {
             let keep = k == 0
                 || func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST
                 || func.varnodes[v as usize].def_op.is_some_and(|d| {
-                    func.ops[d].block == block
-                        && d >= window_start
-                        && d < i
-                        && func.ops[d].opcode != OpCode::MultiEqual
+                    let db = func.ops[d].block;
+                    (if db == block { d < i } else { dominates(db, block) }) && set_up(func, v, 0)
                 });
             if keep {
                 kept.push(v);

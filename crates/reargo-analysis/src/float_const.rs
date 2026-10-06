@@ -55,6 +55,19 @@ fn packed_float_width(m: Mnemonic) -> Option<u32> {
 /// Render a 128-bit packed constant (`lanes` little-endian elements of
 /// `width` bytes) as `v4f32 const [a, b, c, d]` / `v2f64 const [a, b]`.
 /// Lanes that are all equal collapse to `v4f32 const splat(a)`.
+/// The `f32` bit pattern an `f32` lane widened to `f64` came from, NaN payload included. `as f32`
+/// is free to return a canonical NaN (it does on Windows/MSVC builds), which turned the
+/// `0x7fffffff` abs mask into `0x7fc00000`; a widened `f32` keeps its 23 mantissa bits in the top
+/// of the `f64` mantissa, so they are recovered exactly.
+fn f64_to_f32_bits(v: f64) -> u32 {
+    if !v.is_nan() {
+        return (v as f32).to_bits();
+    }
+    let b = v.to_bits();
+    let sign = ((b >> 63) as u32) << 31;
+    sign | 0x7f80_0000 | ((b >> 29) as u32 & 0x007f_ffff)
+}
+
 fn format_packed(vals: &[f64], width: u32) -> String {
     let ty = if width == 4 { "v4f32" } else { "v2f64" };
     if vals.iter().any(|v| v.is_nan()) {
@@ -64,7 +77,7 @@ fn format_packed(vals: &[f64], width: u32) -> String {
             .iter()
             .map(|v| {
                 if width == 4 {
-                    format!("{:#010x}", (*v as f32).to_bits())
+                    format!("{:#010x}", f64_to_f32_bits(*v))
                 } else {
                     format!("{:#018x}", v.to_bits())
                 }
@@ -312,7 +325,9 @@ mod tests {
         assert_eq!(format_packed(&[1.0, 2.5, -8.0, 0.0], 4), "v4f32 const [1, 2.5, -8, 0]");
         assert_eq!(format_packed(&[0.5; 4], 4), "v4f32 const splat(0.5)");
         assert_eq!(format_packed(&[684.412, 1.0], 8), "v2f64 const [684.412, 1]");
-        let abs = f32::from_bits(0x7fff_ffff) as f64;
+        // `black_box`: a const-folded `as f64` may canonicalise the NaN (the analyzer widens
+        // lanes read at run time, which keeps the payload)
+        let abs = std::hint::black_box(f32::from_bits(0x7fff_ffff)) as f64;
         assert_eq!(
             format_packed(&[abs; 4], 4),
             "v4f32 mask [0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff]"
