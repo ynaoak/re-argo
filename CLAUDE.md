@@ -28,7 +28,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Fast xref to an address on a HUGE binary (no full analysis)" | `xref-scan <bin> 0x401000` |
 | "Recover a C++ class name + vmethods from a vtable slot (PIE)" | `vtable <bin> 0x401000` |
 | "Find a function's entry from an interior address (no full analysis)" | `func-start <bin> 0x401000` |
-| "List every C++ class in a stripped PIE binary (RTTI browser)" | `classes <bin> [--filter Foo]` |
+| "List every C++ class in a stripped PIE binary (RTTI browser)" | `classes <bin> [--filter Foo] [--derives Base --slot 6]` |
 | "Classify what an address is (code/data/import/vtable/string)" | `whatis <bin> 0x401000` |
 | "Map an object's field layout from a constructor/method" | `members <bin> 0x401000 [--base rbx]` |
 | "All call sites with resolved arguments" | `callsites <bin>` |
@@ -402,7 +402,7 @@ RELATIVE-reloc chain) the demangled class; a printable string; and a demangled `
 string. The fast first question to ask about any unknown address before reaching for `vtable` /
 `func-start` / `imports` individually.
 
-#### `classes <FILE> [--filter SUBSTR] [--limit N]`
+#### `classes <FILE> [--filter SUBSTR] [--derives SUBSTR] [--slot N]... [--limit N]`
 
 List every C++ class in a stripped **PIE** binary — a Ghidra-style RTTI class browser. Scans the
 RELATIVE relocations for Itanium `type_info` name strings, demangles them, and resolves each
@@ -410,6 +410,12 @@ class's vtable address. `--filter` keeps only classes whose demangled name conta
 `--limit` caps the count (0 = all). Loader-only; inventories tens of thousands of classes in
 ~1 s. Use it to locate any class instantly, then `vtable <base>` for its methods, or
 `vtable --name <substr>` for a single class's full vtable.
+
+`--derives <substr>` keeps only classes that (transitively) derive from a class whose name contains
+the substring, following the Itanium RTTI base pointers (`__si_class_type_info` at `ti+16`,
+`__vmi_class_type_info` base array from `ti+24`). `--slot N` (repeatable) appends the target of
+vtable slot N to each line — together they list every override of one virtual in one call, e.g.
+`classes bds --derives StructureFeature --slot 6` = all 15 BE `isFeatureChunk` implementations.
 
 #### `func-start <FILE> <ADDRESS> [--max-back N]`
 
