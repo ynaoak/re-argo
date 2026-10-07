@@ -836,6 +836,40 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
     simplified
 }
 
+/// What an argument register holds at a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgValue {
+    /// a value the function computed
+    SetUp,
+    /// the function's own incoming register (or a mix of that and computed values)
+    Incoming,
+}
+
+/// Classify the value `v` an argument register holds at a call; `None` when it
+/// holds nothing a callee could use (a call's clobber).
+fn arg_value(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> Option<ArgValue> {
+    let Some(d) = func.varnodes[v as usize].def_op else { return Some(ArgValue::Incoming) };
+    let op = &func.ops[d];
+    if op.opcode == OpCode::Indirect {
+        let ins: Vec<_> = op.inputs.iter().map(|&i| func.varnodes[i as usize].data).collect();
+        return (!crate::pipeline::is_call_clobber(&op.opcode, &ins)).then_some(ArgValue::SetUp);
+    }
+    if op.opcode == OpCode::MultiEqual {
+        if depth >= 4 || op.inputs.is_empty() {
+            return None;
+        }
+        let mut all_set_up = true;
+        for &x in &op.inputs {
+            match arg_value(func, x, depth + 1)? {
+                ArgValue::SetUp => {}
+                ArgValue::Incoming => all_set_up = false,
+            }
+        }
+        return Some(if all_set_up { ArgValue::SetUp } else { ArgValue::Incoming });
+    }
+    Some(ArgValue::SetUp)
+}
+
 /// Keep only the argument registers a call actually set up.
 ///
 /// The pipeline gives every call all of the convention's argument registers
@@ -859,19 +893,6 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
         Vec::new()
     };
     let dominates = |a: usize, b: usize| crate::dominator::dominates(&idom, a, b);
-    // Is `v` a value the function computed (not an incoming register, not a clobber)?
-    fn set_up(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> bool {
-        let Some(d) = func.varnodes[v as usize].def_op else { return false };
-        let op = &func.ops[d];
-        if op.opcode == OpCode::Indirect {
-            let ins: Vec<_> = op.inputs.iter().map(|&i| func.varnodes[i as usize].data).collect();
-            return !crate::pipeline::is_call_clobber(&op.opcode, &ins);
-        }
-        if op.opcode == OpCode::MultiEqual {
-            return depth < 4 && !op.inputs.is_empty() && op.inputs.iter().all(|&i| set_up(func, i, depth + 1));
-        }
-        true
-    }
     let mut removed = 0;
     for i in 0..func.ops.len() {
         let op = &func.ops[i];
@@ -879,15 +900,33 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
             continue;
         }
         let block = op.block;
+        // WS78: the callee's own parameter set, when its code could be analysed
+        let params = if op.opcode == OpCode::Call { func.call_params.get(&op.address).copied() } else { None };
         let inputs = func.ops[i].inputs.clone();
         let mut kept: crate::ssa::InputVec = crate::ssa::InputVec::new();
         for (k, &v) in inputs.iter().enumerate() {
+            let value = if k == 0 || func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST {
+                Some(ArgValue::SetUp)
+            } else {
+                arg_value(func, v, 0).filter(|_| {
+                    // a computed value must reach the call: defined before it in its block, or
+                    // in a block that dominates it
+                    func.varnodes[v as usize].def_op.is_none_or(|d| {
+                        let db = func.ops[d].block;
+                        if db == block { d < i } else { dominates(db, block) }
+                    })
+                })
+            };
+            let in_mask = k > 0 && params.is_some_and(|p| p.mask & (1 << (k - 1)) != 0);
             let keep = k == 0
-                || func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST
-                || func.varnodes[v as usize].def_op.is_some_and(|d| {
-                    let db = func.ops[d].block;
-                    (if db == block { d < i } else { dominates(db, block) }) && set_up(func, v, 0)
-                });
+                || match (params, value) {
+                    (_, None) => false,
+                    // the callee reads it: an argument, also when passed through unchanged
+                    (Some(_), Some(_)) if in_mask => true,
+                    // the callee does not read it: a leftover, not an argument
+                    (Some(p), Some(_)) if p.complete => false,
+                    (_, Some(val)) => val == ArgValue::SetUp,
+                };
             if keep {
                 kept.push(v);
             } else {

@@ -64,6 +64,10 @@ pub struct SsaFunction {
     /// `1..` (added by the pipeline); `optimize::prune_call_args` trims them
     /// to the ones actually set up for the call.
     pub implicit_call_args: bool,
+    /// Parameters of the callee of each direct call, keyed by the call
+    /// instruction's address (WS78, `callee_params`). Used by
+    /// `optimize::prune_call_args`; empty when unknown.
+    pub call_params: FxHashMap<u64, crate::callee_params::ParamInfo>,
 }
 
 impl SsaFunction {
@@ -91,6 +95,7 @@ impl SsaFunction {
             var_versions: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
             current_var: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
             implicit_call_args: false,
+            call_params: FxHashMap::default(),
         };
         func.build_ssa();
         func

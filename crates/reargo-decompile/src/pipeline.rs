@@ -3,6 +3,7 @@ use reargo_loader::Memory;
 use reargo_program::Program;
 use rayon::prelude::*;
 
+use crate::callee_params::{CalleeParams, ParamInfo};
 use crate::cfg::ControlFlowGraph;
 use crate::emit::CEmitter;
 use crate::rust_emit::RustEmitter;
@@ -42,9 +43,34 @@ pub fn decompile(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
 
-    let terminated = apply_call_convention(trim_to_return(lifted), lifter);
+    let trimmed = trim_to_return(lifted);
+    let call_params = callee_param_map(&trimmed, CalleeParams::new(lifter, memory).as_ref());
+    let terminated = apply_call_convention(trimmed, lifter);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None)
+    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params)
+}
+
+/// Parameters of every direct call's callee in `instructions`, keyed by the
+/// call instruction's address (WS78).
+fn callee_param_map(
+    instructions: &[LiftedInstruction],
+    oracle: Option<&CalleeParams<'_>>,
+) -> rustc_hash::FxHashMap<u64, ParamInfo> {
+    use reargo_core::pcode::OpCode;
+    let mut out = rustc_hash::FxHashMap::default();
+    let Some(oracle) = oracle else { return out };
+    for insn in instructions {
+        for op in &insn.ops {
+            if op.opcode == OpCode::Call
+                && let Some(t) = op.inputs.first()
+                && t.space == reargo_core::address::SpaceId::RAM
+                && let Some(info) = oracle.params(t.offset)
+            {
+                out.insert(insn.address, info);
+            }
+        }
+    }
+    out
 }
 
 pub fn decompile_function(
@@ -121,6 +147,30 @@ pub fn decompile_function_with_maps(
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
 ) -> Result<DecompileResult, String> {
+    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    decompile_function_inner(
+        lifter,
+        program,
+        func_entry,
+        symbols,
+        string_literals,
+        annotations,
+        call_renderings,
+        oracle.as_ref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decompile_function_inner(
+    lifter: &dyn PcodeLift,
+    program: &Program,
+    func_entry: u64,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    string_literals: &std::collections::BTreeMap<u64, String>,
+    annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
+    call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
+    oracle: Option<&CalleeParams<'_>>,
+) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
     let func_name = func
         .map(|f| f.name.clone())
@@ -155,6 +205,7 @@ pub fn decompile_function_with_maps(
     } else {
         trim_to_return(lifted)
     };
+    let call_params = callee_param_map(&terminated, oracle);
     let terminated = apply_call_convention(terminated, lifter);
 
     build_decompile_result(
@@ -165,6 +216,7 @@ pub fn decompile_function_with_maps(
         string_literals,
         annotations,
         call_renderings,
+        call_params,
     )
 }
 
@@ -278,13 +330,15 @@ pub fn decompile_all(
     // minus the rebuild.
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
+    // one callee-parameter memo for the whole batch
+    let oracle = CalleeParams::new(lifter, &program.info.memory);
 
     entries
         .par_iter()
         .map(|&entry| {
             (
                 entry,
-                decompile_function_with_maps(
+                decompile_function_inner(
                     lifter,
                     program,
                     entry,
@@ -292,6 +346,7 @@ pub fn decompile_all(
                     &string_literals,
                     Some(&annotations),
                     Some(&program.call_renderings),
+                    oracle.as_ref(),
                 ),
             )
         })
@@ -349,6 +404,7 @@ pub fn analyze_taint(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_decompile_result(
     instructions: Vec<LiftedInstruction>,
     func_name: &str,
@@ -357,6 +413,7 @@ fn build_decompile_result(
     string_literals: &std::collections::BTreeMap<u64, String>,
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
+    call_params: rustc_hash::FxHashMap<u64, ParamInfo>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -370,6 +427,7 @@ fn build_decompile_result(
     let block_count = cfg.block_count();
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
+    ssa.call_params = call_params;
     // `apply_call_convention` ran: calls carry the convention's argument registers.
     ssa.implicit_call_args = ssa
         .ops
@@ -719,6 +777,55 @@ mod tests {
         let second = c.lines().find(|l| l.contains("0x2100(")).unwrap_or_else(|| panic!("{c}"));
         assert!(first.contains("rdi"), "{first}");
         assert!(!second.contains("rdi"), "{second}\n{c}");
+    }
+
+    /// Code blobs at their addresses inside one `0xcc`-filled block.
+    fn make_memory_parts(parts: &[(u64, &[u8])]) -> Memory {
+        let base = parts.iter().map(|p| p.0).min().unwrap();
+        let end = parts.iter().map(|p| p.0 + p.1.len() as u64).max().unwrap();
+        let mut data = vec![0xccu8; (end - base) as usize + 16];
+        for (a, bytes) in parts {
+            let o = (a - base) as usize;
+            data[o..o + bytes.len()].copy_from_slice(bytes);
+        }
+        make_memory(&data, base)
+    }
+
+    /// WS78: an argument passed straight through from the function's own incoming register
+    /// (`rdi` here) is an argument when the callee reads it.
+    #[test]
+    fn pass_through_argument_is_kept() {
+        let lifter = X86Lifter::new_64();
+        let f = [
+            0xbe, 0x05, 0x00, 0x00, 0x00, // mov esi, 5
+            0xe8, 0xf6, 0x0f, 0x00, 0x00, // call 0x2000
+            0xc3,
+        ];
+        let g = [0x89, 0xf8, 0x01, 0xf0, 0xc3]; // mov eax, edi ; add eax, esi ; ret
+        let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi, rsi)") || call.contains("(param_1, rsi)"), "{call}
+{c}");
+    }
+
+    /// WS78: a register left over from other work is not an argument when the callee does not
+    /// read it.
+    #[test]
+    fn leftover_register_the_callee_ignores_is_dropped() {
+        let lifter = X86Lifter::new_64();
+        let f = [
+            0xb9, 0x09, 0x00, 0x00, 0x00, // mov ecx, 9
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xe8, 0xf1, 0x0f, 0x00, 0x00, // call 0x2000
+            0xc3,
+        ];
+        let g = [0x89, 0xf8, 0xc3]; // mov eax, edi ; ret
+        let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("rdi") && !call.contains("rcx"), "{call}
+{c}");
     }
 
     /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
