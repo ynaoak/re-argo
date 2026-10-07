@@ -884,6 +884,25 @@ mod tests {
         assert!(call.contains("(rdi);"), "{call}\n{c}");
     }
 
+    /// WS78: the 8/16-bit views of rbp/rsi/... have register names, not `var_<off>` (which
+    /// declared `bp` and `bpl` as two variables both called `var_28`).
+    #[test]
+    fn low_byte_registers_are_named() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x40, 0xb6, 0x01, // mov sil, 1
+            0x40, 0x88, 0x35, 0xf7, 0x1f, 0x00, 0x00, // mov [0x3000], sil
+            0x66, 0x89, 0x2d, 0xf0, 0x1f, 0x00, 0x00, // mov [0x3001], bp
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        for c in [&r.c_code, &r.rust_code] {
+            assert!(!c.contains("var_30") && !c.contains("var_28"), "{c}");
+            assert!(c.contains("sil") && c.contains("bp"), "{c}");
+        }
+    }
+
     /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
     /// loaded slot, not a silent `goto 0x0`.
     #[test]

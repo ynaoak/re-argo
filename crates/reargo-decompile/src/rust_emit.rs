@@ -872,6 +872,23 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x30, 4) => "esi".into(),
         (0x38, 8) => "rdi".into(),
         (0x38, 4) => "edi".into(),
+        // the 16/8-bit views of rcx..rdi (WS78): they used to fall through to `var_<off>`,
+        // so `bp` and `bpl` both became `var_28` (two declarations of one name, and a name
+        // that reads like a stack local)
+        (0x08, 2) => "cx".into(),
+        (0x08, 1) => "cl".into(),
+        (0x10, 2) => "dx".into(),
+        (0x10, 1) => "dl".into(),
+        (0x18, 2) => "bx".into(),
+        (0x18, 1) => "bl".into(),
+        (0x20, 2) => "sp".into(),
+        (0x20, 1) => "spl".into(),
+        (0x28, 2) => "bp".into(),
+        (0x28, 1) => "bpl".into(),
+        (0x30, 2) => "si".into(),
+        (0x30, 1) => "sil".into(),
+        (0x38, 2) => "di".into(),
+        (0x38, 1) => "dil".into(),
         // r8..r15 (offsets 0x80..0xB8): r12-r15 used to fall through to
         // `var_a0`..`var_b8`, indistinguishable from stack locals.
         (off, sz) if (0x80..0xC0).contains(&off) && off % 8 == 0 => {
