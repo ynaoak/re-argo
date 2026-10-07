@@ -539,7 +539,7 @@ fn trim_to_function_body(
 /// No CFG, no per-instruction clones for the traversal itself; the
 /// only clones we still pay are the `cloned()` in the final filter
 /// (the caller needs an owned Vec).
-fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<LiftedInstruction> {
+pub(crate) fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<LiftedInstruction> {
     let visited = reachability(&instructions);
     if visited.is_empty() {
         return instructions;
@@ -719,6 +719,23 @@ mod tests {
         let second = c.lines().find(|l| l.contains("0x2100(")).unwrap_or_else(|| panic!("{c}"));
         assert!(first.contains("rdi"), "{first}");
         assert!(!second.contains("rdi"), "{second}\n{c}");
+    }
+
+    /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
+    /// loaded slot, not a silent `goto 0x0`.
+    #[test]
+    fn indirect_jmp_is_rendered() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x60, 0x18, // jmp [rax+0x18]
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let j = c.lines().find(|l| l.contains("goto *")).unwrap_or_else(|| panic!("{c}"));
+        assert!(j.contains("vfn[3]"), "{j}
+{c}");
+        assert!(!c.contains("BRANCHIND"), "{c}");
     }
 
     /// WS77: a `ret` returns what `rax` holds, not the popped return address.

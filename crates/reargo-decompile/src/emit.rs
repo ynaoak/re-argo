@@ -764,6 +764,16 @@ impl<'a> CEmitter<'a> {
             },
             OpCode::Branch => None,
             OpCode::CBranch => None,
+            OpCode::BranchInd => {
+                // jump table / PLT stub / tail call through a function pointer
+                let ann = op
+                    .inputs
+                    .first()
+                    .and_then(|&t| self.vcall_vtable_offset(func, t))
+                    .map(|off| format!("  // vfn[{}] (vtable+0x{:x})", off / 8, off))
+                    .unwrap_or_else(|| "  // indirect jump".into());
+                Some(format!("goto *{};{}", self.input_expr(func, op, 0), ann))
+            }
             OpCode::CallOther => {
                 // The lifter tags CallOther via its first const input: 3 = int3
                 // (a real breakpoint/trap), 0x100+ = a named intrinsic (a known

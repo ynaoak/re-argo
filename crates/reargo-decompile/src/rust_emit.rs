@@ -704,6 +704,7 @@ impl<'a> RustEmitter<'a> {
                 None => Some("return;".into()),
             },
             OpCode::Branch => None,
+            OpCode::BranchInd => Some(format!("goto *{}; // indirect jump", self.input_expr(func, op, 0))),
             OpCode::CBranch => None,
             OpCode::CallOther => {
                 // Tag in the first const input: 3 = int3 (real trap), 0x100+ =
