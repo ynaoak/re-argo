@@ -193,6 +193,16 @@ fn apply_call_convention(
     let Some(cc) = lifter.call_convention() else {
         return instructions;
     };
+    // WS77: a `ret` lifts to `RETURN(target)` — the popped return address, not the value. Give
+    // it the convention's integer return register as a second input so the value reaching the
+    // `ret` is live and the emitter can print it (`emit::return_value`).
+    if let Some((rv, _)) = cc.returns.first() {
+        for op in instructions.iter_mut().flat_map(|i| i.ops.iter_mut()) {
+            if op.opcode == OpCode::Return && op.inputs.len() == 1 {
+                op.inputs.push(*rv);
+            }
+        }
+    }
     for insn in &mut instructions {
         let Some(pos) = insn
             .ops
@@ -711,6 +721,54 @@ mod tests {
         assert!(!second.contains("rdi"), "{second}\n{c}");
     }
 
+    /// WS77: a `ret` returns what `rax` holds, not the popped return address.
+    #[test]
+    fn ret_returns_rax_not_the_return_address() {
+        let lifter = X86Lifter::new_64();
+        let code = [0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3]; // mov eax, 7 ; ret
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("uint64_t f("), "{c}");
+        let ret = c.lines().find(|l| l.trim_start().starts_with("return")).unwrap_or_else(|| panic!("{c}"));
+        assert!(ret.contains("rax") || ret.contains('7'), "{ret}
+{c}");
+        assert!(!ret.contains("tmp_"), "the return address is not the value: {ret}
+{c}");
+    }
+
+    /// WS77: a function that never sets `rax` returns nothing.
+    #[test]
+    fn ret_without_rax_write_is_void() {
+        let lifter = X86Lifter::new_64();
+        let code = [0x89, 0x3d, 0xfa, 0x1f, 0x00, 0x00, 0xc3]; // mov [0x3000], edi ; ret
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("void f("), "{c}");
+        assert!(c.contains("return;"), "{c}");
+    }
+
+    /// WS77: every `goto label_X;` has its `label_X:` (a chain of compares jumping to one exit).
+    #[test]
+    fn goto_targets_get_labels() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, 0x74, 0x0f, // cmp edi, 1 ; je exit
+            0x83, 0xff, 0x02, 0x74, 0x0a, // cmp edi, 2 ; je exit
+            0x83, 0xff, 0x03, 0x74, 0x05, // cmp edi, 3 ; je exit
+            0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+            0xc3, // exit: ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let gotos: Vec<&str> = c.lines().filter_map(|l| l.trim().strip_prefix("goto ")).collect();
+        assert!(!gotos.is_empty(), "test needs a goto: {c}");
+        for g in gotos {
+            let label = format!("{}:", g.trim_end_matches(';'));
+            assert!(c.lines().any(|l| l.trim() == label), "missing {label}
+{c}");
+        }
+    }
+
     #[test]
     fn decompile_simple_function() {
         let lifter = X86Lifter::new_64();
@@ -719,7 +777,8 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
 
         let result = decompile(&lifter, &mem, 0x1000, "simple", 100).unwrap();
-        assert!(result.c_code.contains("void simple(void)"));
+        // `xor eax, eax` before the `ret`: the function returns 0 (WS77; it used to print `void`)
+        assert!(result.c_code.contains("uint64_t simple(void)"), "{}", result.c_code);
         assert!(result.c_code.contains("return"));
         assert!(result.stats.instructions_lifted > 0);
         assert!(result.stats.basic_blocks >= 1);

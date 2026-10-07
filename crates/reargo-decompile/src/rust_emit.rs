@@ -699,10 +699,10 @@ impl<'a> RustEmitter<'a> {
                     Some(format!("{} = __ret; // of {}", dst, self.input_expr(func, op, 0)))
                 }
             }
-            OpCode::Return => {
-                let val = self.input_expr(func, op, 0);
-                Some(format!("return {};", val))
-            }
+            OpCode::Return => match crate::emit::return_value(func, op) {
+                Some(i) => Some(format!("return {};", self.input_expr(func, op, i))),
+                None => Some("return;".into()),
+            },
             OpCode::Branch => None,
             OpCode::CBranch => None,
             OpCode::CallOther => {
@@ -804,11 +804,7 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
         if op.dead || op.opcode != OpCode::Return {
             return false;
         }
-        if op.inputs.is_empty() {
-            return false;
-        }
-        let ret_vn = &func.varnodes[op.inputs[0] as usize];
-        ret_vn.data.space == SpaceId::REGISTER && ret_vn.data.offset == 0x00
+        crate::emit::return_value(func, op).is_some()
     });
 
     let return_type = if has_return_value { Some("u64") } else { None };
