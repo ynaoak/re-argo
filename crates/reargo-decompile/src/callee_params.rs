@@ -160,6 +160,10 @@ impl<'a> CalleeParams<'a> {
         mut acc: Option<&mut Acc>,
     ) -> u32 {
         let all = (1u32 << self.args.len()) - 1;
+        // registers written since the block start / the last call: the setup window an unknown
+        // inner callee's argument prefix is judged by (a loop temporary written earlier is not
+        // an argument setup)
+        let mut window = 0u32;
         for insn in &cfg.blocks[b].instructions {
             let zeroed = zero_idiom_operands(insn);
             for op in &insn.ops {
@@ -171,9 +175,10 @@ impl<'a> CalleeParams<'a> {
                                 .flatten()
                                 .filter(|t| t.space == SpaceId::RAM)
                                 .map(|t| t.offset);
-                            a.reads |= self.inner_call_reads(direct, defined, depth_left) & !defined;
+                            a.reads |= self.inner_call_reads(direct, window, depth_left) & !defined;
                         }
                         defined = all; // every argument register is caller-saved
+                        window = 0;
                         continue;
                     }
                     OpCode::Branch => {
@@ -182,7 +187,7 @@ impl<'a> CalleeParams<'a> {
                             && cfg.block_at(t.offset).is_none()
                             && let Some(a) = acc.as_deref_mut()
                         {
-                            a.reads |= self.inner_call_reads(Some(t.offset), defined, depth_left) & !defined;
+                            a.reads |= self.inner_call_reads(Some(t.offset), window, depth_left) & !defined;
                         }
                         continue;
                     }
@@ -204,7 +209,9 @@ impl<'a> CalleeParams<'a> {
                     }
                 }
                 if let Some(out) = &op.output {
-                    defined |= self.covering(out.space, out.offset, out.offset + out.size as u64);
+                    let w = self.covering(out.space, out.offset, out.offset + out.size as u64);
+                    defined |= w;
+                    window |= w;
                 }
             }
         }
@@ -212,8 +219,8 @@ impl<'a> CalleeParams<'a> {
     }
 
     /// The argument registers an inner call reads (before masking by what the
-    /// caller already defined).
-    fn inner_call_reads(&self, target: Option<u64>, defined: u32, depth_left: u32) -> u32 {
+    /// caller already defined); `window` = registers set up just before it.
+    fn inner_call_reads(&self, target: Option<u64>, window: u32, depth_left: u32) -> u32 {
         if let Some(t) = target
             && depth_left > 0
             && let Some(info) = self.params_at(t, depth_left - 1)
@@ -223,16 +230,16 @@ impl<'a> CalleeParams<'a> {
             }
             // a lower bound (e.g. a PLT stub): add the prefix rule rather than give up on
             // the whole answer
-            return info.mask | self.prefix_reads(defined);
+            return info.mask | self.prefix_reads(window);
         }
-        self.prefix_reads(defined)
+        self.prefix_reads(window)
     }
 
-    /// Unknown callee: each class's prefix up to the highest register set up.
-    fn prefix_reads(&self, defined: u32) -> u32 {
+    /// Unknown callee: each class's prefix up to the highest register set up for it.
+    fn prefix_reads(&self, window: u32) -> u32 {
         let mut reads = 0;
         for members in &self.class_members {
-            if let Some(top) = members.iter().rposition(|&i| defined & (1 << i) != 0) {
+            if let Some(top) = members.iter().rposition(|&i| window & (1 << i) != 0) {
                 for &i in &members[..=top] {
                     reads |= 1 << i;
                 }
@@ -406,6 +413,15 @@ mod tests {
         let p = params(&[(0x2000, &code)], 0x2000);
         assert_eq!(p.mask, RDI | RSI, "rdx is set up here, rdi/rsi come from the caller");
         assert!(p.complete);
+    }
+
+    #[test]
+    fn unknown_inner_call_prefix_ignores_earlier_temporaries() {
+        // mov ecx, 3 ; test eax, eax ; je L ; L: mov edi, 1 ; call rax ; ret
+        // rcx was written in an earlier block (a temporary), so it does not stretch the
+        // inner call's argument prefix to rsi/rdx
+        let code = [0xb9, 0x03, 0, 0, 0, 0x85, 0xc0, 0x74, 0x00, 0xbf, 0x01, 0, 0, 0, 0xff, 0xd0, 0xc3];
+        assert_eq!(params(&[(0x2000, &code)], 0x2000).mask, 0);
     }
 
     #[test]
