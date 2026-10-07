@@ -903,6 +903,28 @@ mod tests {
         }
     }
 
+    /// WS78: locals are declared only for registers the body assigns, and a 16-byte value
+    /// has a type (`void xmm1;` / `*(void*)p` were invalid C).
+    #[test]
+    fn declarations_are_live_and_typed() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x0f, 0x28, 0x0f, // movaps xmm1, [rdi]
+            0x0f, 0x29, 0x0e, // movaps [rsi], xmm1
+            0xe8, 0xf5, 0x0f, 0x00, 0x00, // call 0x2000
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        let c = &r.c_code;
+        assert!(!c.contains("void xmm") && !c.contains("(void*)"), "{c}");
+        assert!(c.contains("uint128_t xmm1;"), "{c}");
+        // the call's clobbers nobody reads are not declared
+        assert!(!c.contains("xmm15") && !c.contains("r11"), "{c}");
+        let rs = &r.rust_code;
+        assert!(rs.contains("xmm1: u128") && !rs.contains("xmm15"), "{rs}");
+    }
+
     /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
     /// loaded slot, not a silent `goto 0x0`.
     #[test]

@@ -159,7 +159,9 @@ impl<'a> CEmitter<'a> {
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some() {
+            // only registers the body assigns: a dead definition (most of a call's clobbers,
+            // view syncs nobody reads) is not printed, so declaring it is noise
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead) {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
@@ -1091,6 +1093,8 @@ fn size_to_type(size: u32) -> &'static str {
         2 => "uint16_t",
         4 => "uint32_t",
         8 => "uint64_t",
+        // an XMM register / 128-bit memory access (it printed `void xmm0;`, `*(void*)p = ..`)
+        16 => "uint128_t",
         _ => "void",
     }
 }

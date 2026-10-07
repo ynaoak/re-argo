@@ -121,7 +121,7 @@ impl<'a> RustEmitter<'a> {
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some() {
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead) {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_rust_type(vn.data.size);
@@ -922,6 +922,7 @@ fn size_to_rust_type(size: u32) -> &'static str {
         2 => "u16",
         4 => "u32",
         8 => "u64",
+        16 => "u128",
         _ => "()",
     }
 }
@@ -1013,7 +1014,8 @@ mod tests {
         assert_eq!(size_to_rust_type(2), "u16");
         assert_eq!(size_to_rust_type(4), "u32");
         assert_eq!(size_to_rust_type(8), "u64");
-        assert_eq!(size_to_rust_type(16), "()");
+        assert_eq!(size_to_rust_type(16), "u128");
+        assert_eq!(size_to_rust_type(10), "()");
     }
 
     #[test]
