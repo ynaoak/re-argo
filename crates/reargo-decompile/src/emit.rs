@@ -149,14 +149,15 @@ impl<'a> CEmitter<'a> {
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
         self.indent += 1;
-        self.emit_var_declarations(func);
+        let params: std::collections::BTreeSet<&str> = sig.params.iter().map(|(_, n)| n.as_str()).collect();
+        self.emit_var_declarations(func, &params);
         self.emit_block(func, structured);
         self.indent -= 1;
         self.line("}");
         self.output.clone()
     }
 
-    fn emit_var_declarations(&mut self, func: &SsaFunction) {
+    fn emit_var_declarations(&mut self, func: &SsaFunction, params: &std::collections::BTreeSet<&str>) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
@@ -166,7 +167,9 @@ impl<'a> CEmitter<'a> {
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
                     let var_name = reg_name(vn.data.offset, vn.data.size);
-                    linef!(self, "{} {};", type_name, var_name);
+                    if !params.contains(var_name.as_str()) {
+                        linef!(self, "{} {};", type_name, var_name);
+                    }
                 }
             }
         }
@@ -978,6 +981,18 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
     });
 
     let return_type = if has_return_value { "uint64_t" } else { "void" };
+
+    // WS78: the parameters the analysis of the function's entry found, named like the
+    // registers the body reads (`rdi`, `xmm0`)
+    if let Some(regs) = &func.signature_params {
+        return FunctionSignature {
+            return_type,
+            params: regs
+                .iter()
+                .map(|r| (size_to_type(r.size).to_string(), reg_name(r.offset, r.size)))
+                .collect(),
+        };
+    }
 
     let param_regs: &[(u64, &str)] = &[
         (0x08, "param_1"),  // RCX (Win) / RDI (SysV) - simplified

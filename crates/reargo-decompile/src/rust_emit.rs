@@ -810,6 +810,17 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
 
     let return_type = if has_return_value { Some("u64") } else { None };
 
+    // WS78: see `emit::infer_signature`
+    if let Some(regs) = &func.signature_params {
+        return RustFunctionSignature {
+            return_type,
+            params: regs
+                .iter()
+                .map(|r| (reg_name(r.offset, r.size), size_to_rust_type(r.size).to_string()))
+                .collect(),
+        };
+    }
+
     let param_regs: &[(u64, &str)] = &[
         (0x08, "param_1"), // RCX (Win) / RDI (SysV) - simplified
         (0x10, "param_2"), // RDX / RSI

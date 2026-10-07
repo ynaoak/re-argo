@@ -44,10 +44,22 @@ pub fn decompile(
     }
 
     let trimmed = trim_to_return(lifted);
-    let call_params = callee_param_map(&trimmed, CalleeParams::new(lifter, memory).as_ref());
+    let oracle = CalleeParams::new(lifter, memory);
+    let call_params = callee_param_map(&trimmed, oracle.as_ref());
+    let own = own_params(oracle.as_ref(), entry);
     let terminated = apply_call_convention(trimmed, lifter);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params)
+    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own)
+}
+
+/// The function's own parameters (WS78): what the callee analysis finds for its entry,
+/// with the convention's argument registers.
+fn own_params(
+    oracle: Option<&CalleeParams<'_>>,
+    entry: u64,
+) -> Option<(ParamInfo, Vec<reargo_core::pcode::VarnodeData>)> {
+    let oracle = oracle?;
+    Some((oracle.params(entry)?, oracle.args().to_vec()))
 }
 
 /// Parameters of every direct call's callee in `instructions`, keyed by the
@@ -206,6 +218,7 @@ fn decompile_function_inner(
         trim_to_return(lifted)
     };
     let call_params = callee_param_map(&terminated, oracle);
+    let own = own_params(oracle, func_entry);
     let terminated = apply_call_convention(terminated, lifter);
 
     build_decompile_result(
@@ -217,6 +230,7 @@ fn decompile_function_inner(
         annotations,
         call_renderings,
         call_params,
+        own,
     )
 }
 
@@ -302,6 +316,30 @@ fn apply_call_convention(
         }
     }
     instructions
+}
+
+/// The argument registers that are the function's parameters: those the analysis of its
+/// entry found it reads, plus — when that answer is only a lower bound — those the
+/// decompiled body still reads on entry.
+fn signature_params(
+    ssa: &SsaFunction,
+    info: ParamInfo,
+    args: &[reargo_core::pcode::VarnodeData],
+) -> Vec<reargo_core::pcode::VarnodeData> {
+    args.iter()
+        .enumerate()
+        .filter(|&(i, a)| {
+            info.mask & (1 << i) != 0
+                || (!info.complete
+                    && ssa.varnodes.iter().any(|vn| {
+                        vn.def_op.is_none()
+                            && vn.data.space == a.space
+                            && vn.data.offset == a.offset
+                            && vn.uses.iter().any(|&u| !ssa.ops[u].dead)
+                    }))
+        })
+        .map(|(_, a)| *a)
+        .collect()
 }
 
 /// Decompile every function the program knows about, in parallel.
@@ -414,6 +452,7 @@ fn build_decompile_result(
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
     call_params: rustc_hash::FxHashMap<u64, ParamInfo>,
+    own_params: Option<(ParamInfo, Vec<reargo_core::pcode::VarnodeData>)>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -440,6 +479,9 @@ fn build_decompile_result(
 
     let opt_stats = run_optimization_passes(&mut ssa);
     let live_ops = ssa.live_op_count();
+    if let Some((info, args)) = own_params {
+        ssa.signature_params = Some(signature_params(&ssa, info, &args));
+    }
 
     // Render the SSA dump AFTER optimization. The previous call site
     // sat between `from_cfg` and `run_optimization_passes`, so it
@@ -923,6 +965,40 @@ mod tests {
         assert!(!c.contains("xmm15") && !c.contains("r11"), "{c}");
         let rs = &r.rust_code;
         assert!(rs.contains("xmm1: u128") && !rs.contains("xmm15"), "{rs}");
+    }
+
+    /// WS78: the signature lists the System V registers the function reads on entry, named
+    /// like the body names them (it used Windows-x64 offsets and only 8-byte reads, so
+    /// `mov eax, edi; add eax, esi` came out as `f(void)`).
+    #[test]
+    fn signature_lists_the_registers_read_on_entry() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xf8, // mov eax, edi
+            0x01, 0xf0, // add eax, esi
+            0xf3, 0x0f, 0x11, 0x05, 0xf4, 0x1f, 0x00, 0x00, // movss [0x3000], xmm0
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        assert!(r.c_code.contains("uint64_t f(uint64_t rdi, uint64_t rsi, uint128_t xmm0)"), "{}", r.c_code);
+        assert!(r.rust_code.contains("fn f(rdi: u64, rsi: u64, xmm0: u128) -> u64"), "{}", r.rust_code);
+    }
+
+    /// WS78: a parameter the body also assigns is not declared again as a local.
+    #[test]
+    fn parameter_is_not_redeclared() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x89, 0x3d, 0xf9, 0x1f, 0x00, 0x00, // mov [0x3000], rdi
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xff, 0xd0, // call rax
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("f(uint64_t rdi)"), "{c}");
+        assert!(!c.contains("    uint64_t rdi;"), "{c}");
     }
 
     /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
