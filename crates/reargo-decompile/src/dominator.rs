@@ -250,8 +250,8 @@ mod tests {
         assert_eq!(idom[b1], Some(b2));
         assert_eq!(idom[b2], Some(b0));
         assert_eq!(idom[b3], Some(b2), "the loop exit is dominated by the header");
-        for b in 0..cfg.blocks.len() {
-            assert_eq!(idom[b], Some(reference_idom(&cfg, b)), "block {b}");
+        for (b, d) in idom.iter().enumerate() {
+            assert_eq!(*d, Some(reference_idom(&cfg, b)), "block {b}");
         }
     }
 
