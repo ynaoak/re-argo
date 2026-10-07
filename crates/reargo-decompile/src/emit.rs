@@ -57,6 +57,9 @@ pub struct CEmitter<'a> {
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    /// Blocks some `goto` jumps to: each gets a `label_<addr>:` line where its code starts
+    /// (otherwise the `goto` names a label that is never printed).
+    goto_targets: std::collections::BTreeSet<usize>,
 }
 
 impl Default for CEmitter<'static> {
@@ -75,6 +78,7 @@ impl CEmitter<'static> {
             annotations: None,
             call_renderings: None,
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            goto_targets: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -105,6 +109,7 @@ impl<'a> CEmitter<'a> {
             annotations: None,
             call_renderings: None,
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            goto_targets: std::collections::BTreeSet::new(),
         }
     }
 
@@ -138,6 +143,8 @@ impl<'a> CEmitter<'a> {
         structured: &StructuredBlock,
     ) -> String {
         self.output.clear();
+        self.goto_targets.clear();
+        collect_goto_targets(structured, &mut self.goto_targets);
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -167,6 +174,16 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_block(&mut self, func: &SsaFunction, block: &StructuredBlock) {
+        if let Some(first) = leading_block(block) {
+            // A label only at the node that starts with the block itself (a `Sequence` / `Goto`
+            // has no leading block of its own); removing it prints each label once.
+            if self.goto_targets.remove(&first) {
+                let indent = self.indent;
+                self.indent = indent.saturating_sub(1);
+                linef!(self, "label_{:x}:", func.cfg.blocks[first].start_addr);
+                self.indent = indent;
+            }
+        }
         match block {
             StructuredBlock::Basic(block_id) => {
                 self.emit_basic_block(func, *block_id);
@@ -741,10 +758,10 @@ impl<'a> CEmitter<'a> {
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
                 Some(format!("(*{})({});{}", target, args.join(", "), ann))
             }
-            OpCode::Return => {
-                let val = self.input_expr(func, op, 0);
-                Some(format!("return {};", val))
-            }
+            OpCode::Return => match return_value(func, op) {
+                Some(i) => Some(format!("return {};", self.input_expr(func, op, i))),
+                None => Some("return;".into()),
+            },
             OpCode::Branch => None,
             OpCode::CBranch => None,
             OpCode::CallOther => {
@@ -857,6 +874,53 @@ struct FunctionSignature {
     params: Vec<(String, String)>,
 }
 
+/// Every block a `Goto` in the tree jumps to.
+fn collect_goto_targets(block: &StructuredBlock, out: &mut std::collections::BTreeSet<usize>) {
+    use StructuredBlock::*;
+    match block {
+        Goto(t) => {
+            out.insert(*t);
+        }
+        Basic(_) => {}
+        Sequence(xs) => xs.iter().for_each(|b| collect_goto_targets(b, out)),
+        IfThen { then_body, .. } => collect_goto_targets(then_body, out),
+        IfThenElse { then_body, else_body, .. } => {
+            collect_goto_targets(then_body, out);
+            collect_goto_targets(else_body, out);
+        }
+        WhileLoop { body, .. }
+        | DoWhileLoop { body, .. }
+        | ForLoop { body, .. }
+        | ShortCircuitAnd { body, .. }
+        | ShortCircuitOr { body, .. }
+        | Loop { body, .. } => collect_goto_targets(body, out),
+        Switch { cases, default, .. } => {
+            cases.iter().for_each(|(_, b)| collect_goto_targets(b, out));
+            if let Some(d) = default {
+                collect_goto_targets(d, out);
+            }
+        }
+    }
+}
+
+/// The block whose code a structured node prints first, for nodes that print one themselves.
+/// `None` for a `Sequence` (its first child carries the label) and a `Goto`.
+fn leading_block(block: &StructuredBlock) -> Option<usize> {
+    use StructuredBlock::*;
+    match block {
+        Basic(b) => Some(*b),
+        IfThen { condition_block, .. }
+        | IfThenElse { condition_block, .. }
+        | WhileLoop { condition_block, .. }
+        | Switch { condition_block, .. } => Some(*condition_block),
+        ForLoop { init_block, .. } => Some(*init_block),
+        ShortCircuitAnd { left_block, .. } | ShortCircuitOr { left_block, .. } => Some(*left_block),
+        Loop { header, .. } => Some(*header),
+        DoWhileLoop { body, .. } => leading_block(body),
+        Sequence(_) | Goto(_) => None,
+    }
+}
+
 impl FunctionSignature {
     fn to_c_declaration(&self, name: &str) -> String {
         if self.params.is_empty() {
@@ -872,16 +936,33 @@ impl FunctionSignature {
     }
 }
 
+/// The value a `RETURN` hands back, if any (WS77). A lifted x86-64 `ret` is
+/// `RETURN(target, rax)` (`pipeline::apply_call_convention` appends the return register):
+/// the value is the second input, and it is no value when that register still holds what the
+/// function was entered with (nothing on the path set it). A one-input `RETURN` counts as
+/// returning its input only when that is `rax` itself (hand-built p-code in tests).
+/// Returns the index of that input.
+pub(crate) fn return_value(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<usize> {
+    let reg_set = |v: u32| {
+        let vn = &func.varnodes[v as usize];
+        !(vn.data.space == SpaceId::REGISTER && vn.def_op.is_none())
+    };
+    match op.inputs.as_slice() {
+        [_, v, ..] => reg_set(*v).then_some(1),
+        [v] => {
+            let d = &func.varnodes[*v as usize].data;
+            (d.space == SpaceId::REGISTER && d.offset == 0x00).then_some(0)
+        }
+        [] => None,
+    }
+}
+
 fn infer_signature(func: &SsaFunction) -> FunctionSignature {
     let has_return_value = func.ops.iter().any(|op| {
         if op.dead || op.opcode != OpCode::Return {
             return false;
         }
-        if op.inputs.is_empty() {
-            return false;
-        }
-        let ret_vn = &func.varnodes[op.inputs[0] as usize];
-        ret_vn.data.space == SpaceId::REGISTER && ret_vn.data.offset == 0x00
+        return_value(func, op).is_some()
     });
 
     let return_type = if has_return_value { "uint64_t" } else { "void" };

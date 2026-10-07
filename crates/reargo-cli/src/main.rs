@@ -803,6 +803,16 @@ enum Commands {
         /// Only classes whose demangled name contains this substring
         #[arg(long)]
         filter: Option<String>,
+        /// Only classes that (transitively) derive from a class whose demangled
+        /// name contains this substring — read from the Itanium RTTI base
+        /// pointers (`__si_class_type_info` / `__vmi_class_type_info`). Lists
+        /// every override of a base class's virtual in one go with `--slot`.
+        #[arg(long)]
+        derives: Option<String>,
+        /// Also print the target of vtable slot N for each class (repeatable,
+        /// e.g. `--slot 6 --slot 7`) — the per-class implementation of one virtual.
+        #[arg(long)]
+        slot: Vec<usize>,
         /// Max classes to print (0 = unlimited)
         #[arg(long, default_value_t = 0)]
         limit: usize,
@@ -934,7 +944,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
         Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
         Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
-        Commands::Classes { file, filter, limit } => cmd_classes(&file, filter.as_deref(), limit),
+        Commands::Classes { file, filter, derives, slot, limit } => {
+            cmd_classes(&file, filter.as_deref(), derives.as_deref(), &slot, limit)
+        }
         Commands::Whatis { file, address } => cmd_whatis(&file, address),
         Commands::Members { file, address, insns, base, sub, ctor } => cmd_members(&file, address, insns, base.as_deref(), sub, ctor),
         Commands::Entropy { file } => cmd_entropy(&file),
@@ -4331,9 +4343,63 @@ fn cmd_whatis(path: &Path, address: u64) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Direct base classes of the Itanium `type_info` object at `ti`, read through
+/// RELATIVE relocations (`relocs`: slot -> target).
+///
+/// * `__si_class_type_info` — one base: a pointer at `ti+16`.
+/// * `__vmi_class_type_info` — `u32 flags` at `ti+16`, `u32 base_count` at
+///   `ti+20`, then `base_count` `{base pointer, offset_flags}` pairs of 16 bytes
+///   from `ti+24`.
+/// * `__class_type_info` (no bases) — 16 bytes, nothing after.
+///
+/// Only pointers that land on a known type_info (`type_infos`) count, so the
+/// bytes of whatever object follows a base-less `__class_type_info` are not
+/// mistaken for bases.
+fn rtti_direct_bases(
+    relocs: &std::collections::BTreeMap<u64, u64>,
+    type_infos: &std::collections::BTreeSet<u64>,
+    read_u32: &dyn Fn(u64) -> Option<u32>,
+    ti: u64,
+) -> Vec<u64> {
+    if let Some(&b) = relocs.get(&ti.wrapping_add(16)) {
+        return if type_infos.contains(&b) { vec![b] } else { Vec::new() };
+    }
+    let count = match read_u32(ti.wrapping_add(20)) {
+        Some(n) if (1..=64).contains(&n) => n as u64,
+        _ => return Vec::new(),
+    };
+    (0..count)
+        .filter_map(|i| relocs.get(&ti.wrapping_add(24 + 16 * i)).copied())
+        .filter(|b| type_infos.contains(b))
+        .collect()
+}
+
+/// Whether the class with type_info `ti` derives (transitively, excluding
+/// itself) from a class whose name satisfies `is_match`.
+fn rtti_derives_from(
+    ti: u64,
+    bases_of: &dyn Fn(u64) -> Vec<u64>,
+    is_match: &dyn Fn(u64) -> bool,
+) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = bases_of(ti);
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        if is_match(b) {
+            return true;
+        }
+        stack.extend(bases_of(b));
+    }
+    false
+}
+
 fn cmd_classes(
     path: &Path,
     filter: Option<&str>,
+    derives: Option<&str>,
+    slots: &[usize],
     limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::{BTreeMap, BTreeSet};
@@ -4366,10 +4432,9 @@ fn cmd_classes(
         reverse.entry(*target).or_default().push(*slot);
     }
 
-    // (class name, vtable base). A type_info name string is the target of a
-    // reloc at `type_info+8`; the vtable's `base-8` slot points at type_info.
-    let mut classes: BTreeSet<(String, u64)> = BTreeSet::new();
-    let filt = filter.map(|f| f.to_lowercase());
+    // Every type_info with a demangled name. A type_info name string is the
+    // target of a reloc at `type_info+8`.
+    let mut ti_name: BTreeMap<u64, String> = BTreeMap::new();
     for (slot, target) in &relocs {
         if is_code(*target) {
             continue;
@@ -4378,17 +4443,30 @@ fn cmd_classes(
         if raw.len() < 3 || !raw.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'N') {
             continue;
         }
-        let pretty = match reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw)) {
-            Some(s) => s.trim_start_matches("typeinfo name for ").to_string(),
-            None => continue,
-        };
+        if let Some(s) = reargo_analysis::demangle::try_demangle(&format!("_ZTS{}", raw)) {
+            ti_name.insert(slot.wrapping_sub(8), s.trim_start_matches("typeinfo name for ").to_string());
+        }
+    }
+    let type_infos: BTreeSet<u64> = ti_name.keys().copied().collect();
+    let read_u32 = |a: u64| info.memory.read_u32(a).ok();
+    let bases_of = |ti: u64| rtti_direct_bases(&relocs, &type_infos, &read_u32, ti);
+    let derives_l = derives.map(|d| d.to_lowercase());
+    let derives_match =
+        |ti: u64| derives_l.as_ref().is_some_and(|d| ti_name.get(&ti).is_some_and(|n| n.to_lowercase().contains(d)));
+
+    // (class name, vtable base); the vtable's `base-8` slot points at type_info.
+    let mut classes: BTreeSet<(String, u64)> = BTreeSet::new();
+    let filt = filter.map(|f| f.to_lowercase());
+    for (type_info, pretty) in &ti_name {
         if let Some(f) = &filt
             && !pretty.to_lowercase().contains(f)
         {
             continue;
         }
-        let type_info = slot.wrapping_sub(8);
-        if let Some(refs) = reverse.get(&type_info) {
+        if derives_l.is_some() && !rtti_derives_from(*type_info, &bases_of, &derives_match) {
+            continue;
+        }
+        if let Some(refs) = reverse.get(type_info) {
             for &r in refs {
                 let base = r.wrapping_add(8);
                 if relocs.get(&base).copied().is_some_and(is_code) {
@@ -4404,7 +4482,18 @@ fn cmd_classes(
             println!("  ... ({} more; raise --limit)", classes.len() - i);
             break;
         }
-        println!("  0x{:016x}  {}", base, name);
+        // A slot counts only inside the vtable's run of consecutive code
+        // pointers — past the end it would read the next vtable.
+        let code_at = |k: u64| relocs.get(&base.wrapping_add(8 * k)).copied().filter(|t| is_code(*t));
+        let mut cols = String::new();
+        for &n in slots {
+            let n = n as u64;
+            match code_at(n).filter(|_| (0..n).all(|k| code_at(k).is_some())) {
+                Some(t) => cols.push_str(&format!("  slot[{}]=0x{:x}", n, t)),
+                None => cols.push_str(&format!("  slot[{}]=-", n)),
+            }
+        }
+        println!("  0x{:016x}  {}{}", base, name, cols);
     }
     Ok(())
 }
@@ -5446,6 +5535,48 @@ fn find_file_offset(info: &reargo_loader::BinaryInfo, address: u64, data: &[u8])
 #[cfg(test)]
 mod cli_tests {
     use super::hex_literals_in_line;
+    use super::{rtti_derives_from, rtti_direct_bases};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// A tiny RTTI graph: 0x100 `Base` (no bases), 0x200 `Mid : Base` (si),
+    /// 0x300 `Leaf : Mid` (si), 0x400 `Multi : Base, Other` (vmi), 0x500 `Other`.
+    fn rtti_fixture() -> (BTreeMap<u64, u64>, BTreeSet<u64>, BTreeMap<u64, u32>) {
+        let mut relocs = BTreeMap::new();
+        relocs.insert(0x200 + 16, 0x100);
+        relocs.insert(0x300 + 16, 0x200);
+        relocs.insert(0x400 + 24, 0x100);
+        relocs.insert(0x400 + 40, 0x500);
+        // Right after the base-less `Base` lies another object whose pointer is
+        // not a type_info: must not be read as a base.
+        relocs.insert(0x500 + 16, 0x9999);
+        let tis: BTreeSet<u64> = [0x100, 0x200, 0x300, 0x400, 0x500].into_iter().collect();
+        let mut words = BTreeMap::new();
+        words.insert(0x400 + 20, 2u32); // vmi base_count
+        (relocs, tis, words)
+    }
+
+    #[test]
+    fn rtti_bases_si_vmi_and_none() {
+        let (relocs, tis, words) = rtti_fixture();
+        let rd = |a: u64| words.get(&a).copied();
+        assert_eq!(rtti_direct_bases(&relocs, &tis, &rd, 0x100), Vec::<u64>::new());
+        assert_eq!(rtti_direct_bases(&relocs, &tis, &rd, 0x200), vec![0x100]);
+        assert_eq!(rtti_direct_bases(&relocs, &tis, &rd, 0x400), vec![0x100, 0x500]);
+        // pointer at +16 that is not a type_info -> no base
+        assert_eq!(rtti_direct_bases(&relocs, &tis, &rd, 0x500), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn rtti_derives_transitive_and_not_self() {
+        let (relocs, tis, words) = rtti_fixture();
+        let rd = |a: u64| words.get(&a).copied();
+        let bases = |ti: u64| rtti_direct_bases(&relocs, &tis, &rd, ti);
+        let is_base = |ti: u64| ti == 0x100;
+        assert!(rtti_derives_from(0x300, &bases, &is_base)); // Leaf -> Mid -> Base
+        assert!(rtti_derives_from(0x400, &bases, &is_base)); // via vmi
+        assert!(!rtti_derives_from(0x100, &bases, &is_base)); // not itself
+        assert!(!rtti_derives_from(0x500, &bases, &is_base));
+    }
 
     #[test]
     fn hex_literals_basic() {
