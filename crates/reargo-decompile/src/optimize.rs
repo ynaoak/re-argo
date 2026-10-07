@@ -858,18 +858,7 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
     } else {
         Vec::new()
     };
-    let dominates = |a: usize, mut b: usize| -> bool {
-        for _ in 0..idom.len() + 1 {
-            if a == b {
-                return true;
-            }
-            match idom.get(b) {
-                Some(&Some(p)) if p != b => b = p,
-                _ => return false,
-            }
-        }
-        false
-    };
+    let dominates = |a: usize, b: usize| crate::dominator::dominates(&idom, a, b);
     // Is `v` a value the function computed (not an incoming register, not a clobber)?
     fn set_up(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> bool {
         let Some(d) = func.varnodes[v as usize].def_op else { return false };
