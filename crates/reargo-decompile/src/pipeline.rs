@@ -828,6 +828,62 @@ mod tests {
 {c}");
     }
 
+    fn call_line(c: &str, needle: &str) -> String {
+        c.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{c}")).trim().to_string()
+    }
+
+    /// WS78: a virtual call on the function's own `this` (`rdi`, never redefined) passes it.
+    #[test]
+    fn vcall_on_incoming_this_passes_it() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x10, // call [rax+0x10]
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = call_line(&c, "vfn[2]");
+        assert!(call.contains(")(rdi);"), "{call}\n{c}");
+    }
+
+    /// WS78: with an unknown callee, a set-up `rsi` means `rdi` is an argument too (System V
+    /// fills the integer registers in order) — here passed through unchanged.
+    #[test]
+    fn unknown_callee_takes_the_register_prefix() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xbe, 0x05, 0x00, 0x00, 0x00, // mov esi, 5
+            0xff, 0xd0, // call rax
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = call_line(&c, "(*rax)(");
+        assert!(call.contains("(rdi, rsi)"), "{call}\n{c}");
+    }
+
+    /// WS78: with an unknown callee, a register computed in an earlier block and used by other
+    /// code is a leftover, not an argument.
+    #[test]
+    fn unknown_callee_drops_a_leftover_from_an_earlier_block() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xb9, 0x09, 0x00, 0x00, 0x00, // 0x1000 mov ecx, 9
+            0x89, 0x0d, 0xf5, 0x1f, 0x00, 0x00, // 0x1005 mov [0x3000], ecx
+            0x85, 0xc0, // 0x100b test eax, eax
+            0x74, 0x01, // 0x100d je 0x1010
+            0x90, // 0x100f nop
+            0xbf, 0x05, 0x00, 0x00, 0x00, // 0x1010 mov edi, 5
+            0xff, 0xd0, // 0x1015 call rax
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = call_line(&c, "(*rax)(");
+        assert!(call.contains("(rdi);"), "{call}\n{c}");
+    }
+
     /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
     /// loaded slot, not a silent `goto 0x0`.
     #[test]

@@ -870,6 +870,114 @@ fn arg_value(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> Option<Arg
     Some(ArgValue::SetUp)
 }
 
+/// Is every use of `v` — looking through the lifter's register-view syncs
+/// (`rsi = zext(esi)`, `ecx = subpiece(rcx)`) — a call? Such a value was computed to be passed.
+fn only_calls_use(func: &SsaFunction, v: crate::ssa::VarId) -> bool {
+    let same_reg = |a: &reargo_core::pcode::VarnodeData, b: &reargo_core::pcode::VarnodeData| {
+        a.space == reargo_core::address::SpaceId::REGISTER && a.space == b.space && a.offset == b.offset
+    };
+    let is_view = |op: &crate::ssa::SsaOp| {
+        matches!(op.opcode, OpCode::IntZExt | OpCode::IntSExt | OpCode::Subpiece | OpCode::Piece)
+            && op.output.is_some_and(|o| {
+                let od = func.varnodes[o as usize].data;
+                op.inputs.iter().any(|&x| same_reg(&func.varnodes[x as usize].data, &od))
+            })
+    };
+    // the family of views of this value: walk view defs up and view uses down
+    let mut seen: Vec<crate::ssa::VarId> = vec![v];
+    let mut work = vec![v];
+    while let Some(x) = work.pop() {
+        if seen.len() > 16 {
+            return false;
+        }
+        let vn = &func.varnodes[x as usize];
+        let mut next: Vec<crate::ssa::VarId> = Vec::new();
+        if let Some(d) = vn.def_op
+            && is_view(&func.ops[d])
+        {
+            next.extend(
+                func.ops[d].inputs.iter().copied().filter(|&y| same_reg(&func.varnodes[y as usize].data, &vn.data)),
+            );
+        }
+        for &u in &vn.uses {
+            let op = &func.ops[u];
+            if op.dead || op.output.is_some_and(|o| !feeds_anything(func, o, 0)) {
+                // e.g. the ZF/SF the ALU op that computed `v` also derives from it
+                continue;
+            }
+            if is_view(op) {
+                next.extend(op.output);
+            } else if !matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
+                return false;
+            }
+        }
+        for y in next {
+            if !seen.contains(&y) {
+                seen.push(y);
+                work.push(y);
+            }
+        }
+    }
+    true
+}
+
+/// Does `v` reach anything with an effect (a store, call, branch, return, ...)? Before DCE
+/// runs, a value's flag computations are still uses; this sees through them. Conservative
+/// (`true`) past a small depth.
+fn feeds_anything(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> bool {
+    if depth > 4 {
+        return true;
+    }
+    func.varnodes[v as usize].uses.iter().any(|&u| {
+        let op = &func.ops[u];
+        !op.dead
+            && match op.output {
+                Some(o) if op.opcode != OpCode::Indirect => feeds_anything(func, o, depth + 1),
+                _ => true,
+            }
+    })
+}
+
+/// Is call `i` a virtual call on the object `v` (`call [[v] + off]`)? Then `v` is its
+/// `this`, also when passed through unchanged.
+fn op_is_vcall_on(func: &SsaFunction, i: usize, v: crate::ssa::VarId) -> bool {
+    let op = &func.ops[i];
+    if op.opcode != OpCode::CallInd {
+        return false;
+    }
+    // follow COPYs to the value they copy
+    let root = |mut x: crate::ssa::VarId| {
+        for _ in 0..8 {
+            match func.varnodes[x as usize].def_op.map(|d| &func.ops[d]) {
+                Some(o) if o.opcode == OpCode::Copy && o.inputs.len() == 1 => x = o.inputs[0],
+                _ => break,
+            }
+        }
+        x
+    };
+    let load_addr = |x: crate::ssa::VarId| -> Option<crate::ssa::VarId> {
+        let o = &func.ops[func.varnodes[root(x) as usize].def_op?];
+        if o.opcode == OpCode::Load { o.inputs.last().copied() } else { None }
+    };
+    let Some(slot) = op.inputs.first().and_then(|&t| load_addr(t)) else { return false };
+    // slot = vtable (+ offset)
+    let slot = root(slot);
+    let vtable = match func.varnodes[slot as usize].def_op.map(|d| &func.ops[d]) {
+        Some(o) if o.opcode == OpCode::IntAdd && o.inputs.len() == 2 => {
+            let c = o
+                .inputs
+                .iter()
+                .position(|&x| func.varnodes[x as usize].data.space == reargo_core::address::SpaceId::CONST);
+            match c {
+                Some(c) => o.inputs[1 - c],
+                None => return false,
+            }
+        }
+        _ => slot,
+    };
+    load_addr(vtable).is_some_and(|obj| root(obj) == root(v))
+}
+
 /// Keep only the argument registers a call actually set up.
 ///
 /// The pipeline gives every call all of the convention's argument registers
@@ -903,11 +1011,14 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
         // WS78: the callee's own parameter set, when its code could be analysed
         let params = if op.opcode == OpCode::Call { func.call_params.get(&op.address).copied() } else { None };
         let inputs = func.ops[i].inputs.clone();
-        let mut kept: crate::ssa::InputVec = crate::ssa::InputVec::new();
-        for (k, &v) in inputs.iter().enumerate() {
-            let value = if k == 0 || func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST {
-                Some(ArgValue::SetUp)
-            } else {
+        // what each argument register holds at the call (`None`: nothing usable)
+        let values: Vec<Option<ArgValue>> = inputs
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if k == 0 || func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST {
+                    return Some(ArgValue::SetUp);
+                }
                 arg_value(func, v, 0).filter(|_| {
                     // a computed value must reach the call: defined before it in its block, or
                     // in a block that dominates it
@@ -916,16 +1027,45 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
                         if db == block { d < i } else { dominates(db, block) }
                     })
                 })
-            };
+            })
+            .collect();
+        // WS78: without a complete answer from the callee, take each register class's
+        // contiguous prefix (System V) up to the last register clearly set up *for this
+        // call* — a value only calls use (`mov esi, 0x50`, `mov rdi, r14`). A value other
+        // code also uses (a loop's counter in rcx, a pointer the function keeps working
+        // with in r8) is a leftover unless a later argument needs its slot.
+        let in_prefix: Vec<bool> = if params.is_some_and(|p| p.complete) || inputs.len() < 2 {
+            Vec::new()
+        } else {
+            let arg_data: Vec<_> = inputs[1..].iter().map(|&v| func.varnodes[v as usize].data).collect();
+            let (class_of, members) = crate::callee_params::arg_classes(&arg_data);
+            let pos_in_class = |a: usize| members[class_of[a]].iter().position(|&m| m == a).unwrap_or(0);
+            let mut arity = vec![0usize; members.len()];
+            for (a, &c) in class_of.iter().enumerate() {
+                let k = a + 1;
+                let v = inputs[k];
+                let set_up_here = values[k] == Some(ArgValue::SetUp) && only_calls_use(func, v);
+                let strong = set_up_here
+                    || params.is_some_and(|p| p.mask & (1 << a) != 0)
+                    || (pos_in_class(a) == 0 && values[k].is_some() && op_is_vcall_on(func, i, v));
+                if strong {
+                    arity[c] = arity[c].max(pos_in_class(a) + 1);
+                }
+            }
+            (0..class_of.len()).map(|a| pos_in_class(a) < arity[class_of[a]]).collect()
+        };
+        let mut kept: crate::ssa::InputVec = crate::ssa::InputVec::new();
+        for (k, &v) in inputs.iter().enumerate() {
             let in_mask = k > 0 && params.is_some_and(|p| p.mask & (1 << (k - 1)) != 0);
             let keep = k == 0
-                || match (params, value) {
+                || match (params, values[k]) {
                     (_, None) => false,
                     // the callee reads it: an argument, also when passed through unchanged
                     (Some(_), Some(_)) if in_mask => true,
                     // the callee does not read it: a leftover, not an argument
                     (Some(p), Some(_)) if p.complete => false,
-                    (_, Some(val)) => val == ArgValue::SetUp,
+                    // no (complete) answer: the set-up prefix of its class
+                    (_, Some(_)) => in_prefix[k - 1],
                 };
             if keep {
                 kept.push(v);
