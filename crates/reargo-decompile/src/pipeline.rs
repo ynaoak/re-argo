@@ -1044,9 +1044,10 @@ mod tests {
         assert!(c.contains("return;"), "{c}");
     }
 
-    /// WS77: every `goto label_X;` has its `label_X:` (a chain of compares jumping to one exit).
+    /// WS79: a chain of compares jumping to one exit nests at the post-dominator (the exit)
+    /// instead of jumping there: no `goto`, no empty `if` arm.
     #[test]
-    fn goto_targets_get_labels() {
+    fn compare_chain_to_one_exit_needs_no_goto() {
         let lifter = X86Lifter::new_64();
         let code = [
             0x83, 0xff, 0x01, 0x74, 0x0f, // cmp edi, 1 ; je exit
@@ -1054,6 +1055,28 @@ mod tests {
             0x83, 0xff, 0x03, 0x74, 0x05, // cmp edi, 3 ; je exit
             0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
             0xc3, // exit: ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("goto"), "{c}");
+        assert!(!c.contains("} else {"), "{c}");
+        assert_eq!(c.matches("if (!").count(), 3, "{c}");
+        assert_eq!(c.matches("return").count(), 1, "{c}");
+    }
+
+    /// WS77: every `goto label_X;` has its `label_X:` (an irreducible loop entered at two
+    /// blocks cannot be nested).
+    #[test]
+    fn goto_targets_get_labels() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, // cmp edi, 1
+            0x74, 0x02, // je l2
+            0xff, 0xc0, // l1: inc eax
+            0xff, 0xc0, // l2: inc eax
+            0x83, 0xf8, 0x0a, // cmp eax, 10
+            0x7c, 0xf7, // jl l1
+            0xc3, // ret
         ];
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;

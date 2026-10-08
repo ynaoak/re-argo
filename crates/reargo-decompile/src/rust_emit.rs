@@ -148,10 +148,10 @@ impl<'a> RustEmitter<'a> {
             StructuredBlock::IfThen {
                 condition_block,
                 then_body,
+                negated,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if {} {{", self.get_branch_condition(func, *condition_block)
-                );
+                linef!(self, "if {} {{", self.condition_text(func, *condition_block, *negated));
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -163,8 +163,7 @@ impl<'a> RustEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if {} {{", self.get_branch_condition(func, *condition_block)
-                );
+                linef!(self, "if {} {{", self.condition_text(func, *condition_block, false));
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -177,11 +176,27 @@ impl<'a> RustEmitter<'a> {
             StructuredBlock::WhileLoop {
                 condition_block,
                 body,
+                negated,
             } => {
-                self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "while {} {{", self.get_branch_condition(func, *condition_block)
-                );
+                // `while c` only when the header has no statements of its own (they run on
+                // every iteration), else `loop { stmts; if !c { break; } … }`
                 self.indent += 1;
+                let mark = self.output.len();
+                self.emit_basic_block_no_branch(func, *condition_block);
+                let stmts = self.output.split_off(mark);
+                self.indent -= 1;
+                if stmts.lines().all(|l| l.trim_start().starts_with("//")) {
+                    for l in stmts.lines() {
+                        self.line(l.trim_start());
+                    }
+                    linef!(self, "while {} {{", self.condition_text(func, *condition_block, *negated));
+                    self.indent += 1;
+                } else {
+                    self.line("loop {");
+                    self.indent += 1;
+                    self.output.push_str(&stmts);
+                    linef!(self, "if {} {{ break; }}", self.condition_text(func, *condition_block, !*negated));
+                }
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -189,14 +204,14 @@ impl<'a> RustEmitter<'a> {
             StructuredBlock::DoWhileLoop {
                 body,
                 condition_block,
+                negated,
             } => {
                 // Rust has no do-while; emulate with loop + break
                 self.line("loop {");
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if !({}) {{ break; }}", self.get_branch_condition(func, *condition_block)
-                );
+                linef!(self, "if {} {{ break; }}", self.condition_text(func, *condition_block, !*negated));
                 self.indent -= 1;
                 self.line("}");
             }
@@ -270,10 +285,10 @@ impl<'a> RustEmitter<'a> {
                 self.indent -= 1;
                 self.line("}");
             }
-            StructuredBlock::Loop { header, body } => {
+            StructuredBlock::Loop { body, .. } => {
+                // the body starts with the header's own code
                 self.line("loop {");
                 self.indent += 1;
-                self.emit_basic_block(func, *header);
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -282,6 +297,8 @@ impl<'a> RustEmitter<'a> {
                 // Rust does not have goto; emit as a comment-annotated break/continue placeholder
                 linef!(self, "// goto label_{:x}; (unsupported in Rust)", func.cfg.blocks[*target].start_addr);
             }
+            StructuredBlock::Break => self.line("break;"),
+            StructuredBlock::Continue => self.line("continue;"),
         }
     }
 
@@ -752,6 +769,10 @@ impl<'a> RustEmitter<'a> {
             }
         }
         varnode_name(vn)
+    }
+
+    fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        crate::emit::negate_condition(self.get_branch_condition(func, block_id), negated)
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {

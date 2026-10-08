@@ -1,27 +1,54 @@
+//! Control-flow structuring: CFG -> nested `if` / loops / `break` / `continue` / `goto`.
+//!
+//! The structurer walks *regions*. A two-way branch is closed at its **immediate
+//! post-dominator** (the first block every path from the branch passes through, see
+//! [`crate::dominator::compute_post_dominators`]): both arms are walked up to that join and
+//! the walk continues after the `if` at the join. Loops are **natural loops** of the dominator
+//! tree (a back edge `n -> h` with `h` dominating `n`); the loop's *follow* (where the code
+//! after the loop starts) is the header's exit, else the single latch's exit, else the first
+//! post-dominator of the header outside the loop. Inside a loop, reaching the header prints
+//! `continue`, reaching the follow prints `break`; anything else that cannot be nested
+//! (irreducible flow, a jump to a block already printed elsewhere, a jump out of two loops)
+//! prints a `goto` to the block, which is printed exactly once with a label.
+//!
+//! Every reachable block is printed exactly once: as a `Basic`, or as the condition block of
+//! an `if` / `while` / `do … while`.
+
 use crate::cfg::{BlockId, ControlFlowGraph};
-use std::collections::BTreeSet;
+use crate::dominator::{compute_idom, compute_post_dominators, dominates, reverse_post_order};
 
 #[derive(Debug, Clone)]
 pub enum StructuredBlock {
     Basic(BlockId),
     Sequence(Vec<StructuredBlock>),
+    /// `if (cond) { then_body }` — `if (!cond)` when `negated`. The condition block's own
+    /// statements are printed before the `if`.
     IfThen {
         condition_block: BlockId,
         then_body: Box<StructuredBlock>,
+        negated: bool,
     },
+    /// `if (cond) { then_body } else { else_body }`; the then-arm is the branch's jump target.
     IfThenElse {
         condition_block: BlockId,
         then_body: Box<StructuredBlock>,
         else_body: Box<StructuredBlock>,
     },
+    /// `loop { <condition_block stmts>; if (!cond) break; body }` — printed as
+    /// `while (cond) { body }` when the condition block has no statements of its own.
+    /// `negated` inverts `cond`.
     WhileLoop {
         condition_block: BlockId,
         body: Box<StructuredBlock>,
+        negated: bool,
     },
+    /// `do { body; <condition_block stmts> } while (cond)` (`!cond` when `negated`).
     DoWhileLoop {
         body: Box<StructuredBlock>,
         condition_block: BlockId,
+        negated: bool,
     },
+    /// `while (true) { body }`. `body` starts with the header block's own code.
     Loop {
         header: BlockId,
         body: Box<StructuredBlock>,
@@ -48,286 +75,413 @@ pub enum StructuredBlock {
         default: Option<Box<StructuredBlock>>,
     },
     Goto(BlockId),
+    /// Leave the innermost loop.
+    Break,
+    /// Next iteration of the innermost loop.
+    Continue,
 }
 
 pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
     if cfg.blocks.is_empty() {
         return StructuredBlock::Sequence(Vec::new());
     }
-
-    let mut visited = BTreeSet::new();
-    let mut path = BTreeSet::new();
-    structure_from(cfg, cfg.entry_block, &mut visited, &mut path)
-}
-
-fn structure_from(
-    cfg: &ControlFlowGraph,
-    block_id: BlockId,
-    visited: &mut BTreeSet<BlockId>,
-    // The current DFS recursion stack (ancestors of `block_id` on the active
-    // path). Distinct from `visited`: a successor in `path` is a *back-edge*
-    // (loop), whereas one merely in `visited` is a forward cross/merge edge
-    // (an if-goto). Without this distinction every already-seen branch target
-    // was modeled as a `while`, turning forward merges into degenerate
-    // single-pass `while (cond) { goto L; }` loops.
-    path: &mut BTreeSet<BlockId>,
-) -> StructuredBlock {
-    if visited.contains(&block_id) {
-        return StructuredBlock::Goto(block_id);
+    let mut s = Structurer::new(cfg);
+    let mut items = s.walk(cfg.entry_block, None, false);
+    // Safety net: a `goto` whose target the walk never printed (it was left to a region
+    // owner that did not get there) — print the target region at the end.
+    loop {
+        let mut targets = Vec::new();
+        for it in &items {
+            collect_gotos(it, &mut targets);
+        }
+        let Some(&missing) = targets.iter().find(|&&t| !s.emitted[t]) else { break };
+        s.loop_stack.clear();
+        s.follow_stack.clear();
+        items.extend(s.walk(missing, None, false));
     }
-    visited.insert(block_id);
-    path.insert(block_id);
-    let result = structure_block_body(cfg, block_id, visited, path);
-    path.remove(&block_id);
-    result
+    seq(items)
 }
 
-fn structure_block_body(
-    cfg: &ControlFlowGraph,
-    block_id: BlockId,
-    visited: &mut BTreeSet<BlockId>,
-    path: &mut BTreeSet<BlockId>,
-) -> StructuredBlock {
-    let block = &cfg.blocks[block_id];
+struct LoopInfo {
+    body: Vec<bool>,
+    follow: Option<BlockId>,
+}
 
-    match block.successors.len() {
-        0 => StructuredBlock::Basic(block_id),
+struct Structurer<'a> {
+    cfg: &'a ControlFlowGraph,
+    ipdom: Vec<Option<BlockId>>,
+    pdom: crate::dominator::PostDominators,
+    /// header -> loop
+    loops: Vec<Option<LoopInfo>>,
+    emitted: Vec<bool>,
+    /// Headers of the loops being structured, innermost last.
+    loop_stack: Vec<BlockId>,
+    /// Joins of the `if`s whose arms are being structured (not yet printed).
+    follow_stack: Vec<BlockId>,
+}
 
-        1 => {
-            let next = block.successors[0];
-            if visited.contains(&next) {
-                StructuredBlock::Sequence(vec![
-                    StructuredBlock::Basic(block_id),
-                    StructuredBlock::Goto(next),
-                ])
-            } else {
-                let next_struct = structure_from(cfg, next, visited, path);
-                StructuredBlock::Sequence(vec![
-                    StructuredBlock::Basic(block_id),
-                    next_struct,
-                ])
-            }
+impl<'a> Structurer<'a> {
+    fn new(cfg: &'a ControlFlowGraph) -> Self {
+        let n = cfg.blocks.len();
+        let idom = compute_idom(cfg);
+        let pdom = compute_post_dominators(cfg);
+        let rpo = reverse_post_order(cfg);
+        let mut rpo_num = vec![usize::MAX; n];
+        for (i, &b) in rpo.iter().enumerate() {
+            rpo_num[b] = i;
         }
 
-        2 => {
-            let true_target = block.successors[0];
-            let false_target = block.successors[1];
-
-            let true_returns = block_eventually_returns(cfg, true_target, visited);
-            let false_returns = block_eventually_returns(cfg, false_target, visited);
-
-            if true_returns && false_returns {
-                let (then_body, else_body, join) =
-                    structure_diamond(cfg, true_target, false_target, visited, path);
-                let if_node = StructuredBlock::IfThenElse {
-                    condition_block: block_id,
-                    then_body: Box::new(then_body),
-                    else_body: Box::new(else_body),
-                };
-                join_into_sequence(if_node, join)
-            } else if visited.contains(&true_target) && !visited.contains(&false_target) {
-                let body = structure_from(cfg, false_target, visited, path);
-                if path.contains(&true_target) {
-                    // true_target is an ancestor on the active path → a real
-                    // back-edge. Express as `while (cond) { goto header; }` so
-                    // emit keeps the conditional exit through false_target.
-                    StructuredBlock::Sequence(vec![
-                        StructuredBlock::WhileLoop {
-                            condition_block: block_id,
-                            body: Box::new(StructuredBlock::Goto(true_target)),
-                        },
-                        body,
-                    ])
-                } else {
-                    // true_target is merely already-visited (a forward merge),
-                    // not a loop. `while (cond) { goto L; }` would be a
-                    // degenerate single-pass loop; emit the equivalent, clearer
-                    // `if (cond) goto L;` then fall through to false_target.
-                    StructuredBlock::Sequence(vec![
-                        StructuredBlock::IfThen {
-                            condition_block: block_id,
-                            then_body: Box::new(StructuredBlock::Goto(true_target)),
-                        },
-                        body,
-                    ])
+        // natural loops: back edge n -> h with h dominating n
+        let mut latches: Vec<Vec<BlockId>> = vec![Vec::new(); n];
+        for &b in &rpo {
+            for &s in &cfg.blocks[b].successors {
+                if s < n && idom[s].is_some() && dominates(&idom, s, b) {
+                    latches[s].push(b);
                 }
-            } else if !visited.contains(&true_target) && visited.contains(&false_target) {
-                if path.contains(&false_target) {
-                    // Mirror back-edge: the *false* branch loops back. Use
-                    // DoWhileLoop to preserve the conditional exit without
-                    // inverting the printed condition.
-                    let body = structure_from(cfg, true_target, visited, path);
-                    StructuredBlock::Sequence(vec![
-                        StructuredBlock::DoWhileLoop {
-                            body: Box::new(StructuredBlock::Goto(false_target)),
-                            condition_block: block_id,
-                        },
-                        body,
-                    ])
-                } else {
-                    // Forward merge on the false side: `if (cond) { <body> }
-                    // else goto L;`. The then-arm is the real fall-through
-                    // body; the else is the merge jump.
-                    let then_body = structure_from(cfg, true_target, visited, path);
-                    StructuredBlock::IfThenElse {
-                        condition_block: block_id,
-                        then_body: Box::new(then_body),
-                        else_body: Box::new(StructuredBlock::Goto(false_target)),
+            }
+        }
+        let mut loops: Vec<Option<LoopInfo>> = (0..n).map(|_| None).collect();
+        for h in 0..n {
+            if latches[h].is_empty() {
+                continue;
+            }
+            let mut body = vec![false; n];
+            body[h] = true;
+            let mut stack: Vec<BlockId> = latches[h].clone();
+            while let Some(x) = stack.pop() {
+                if body[x] || idom[x].is_none() {
+                    continue;
+                }
+                body[x] = true;
+                for &p in &cfg.blocks[x].predecessors {
+                    if !body[p] {
+                        stack.push(p);
                     }
                 }
-            } else {
-                let (then_body, else_body, join) =
-                    structure_diamond(cfg, true_target, false_target, visited, path);
-                let if_node = StructuredBlock::IfThenElse {
-                    condition_block: block_id,
-                    then_body: Box::new(then_body),
-                    else_body: Box::new(else_body),
-                };
-                join_into_sequence(if_node, join)
             }
+            let outside = |b: BlockId| !body[b];
+            let exit_of = |b: BlockId| -> Option<BlockId> {
+                let succ = &cfg.blocks[b].successors;
+                let exits: Vec<BlockId> = succ.iter().copied().filter(|&s| outside(s)).collect();
+                (exits.len() == 1 && succ.len() == 2).then(|| exits[0])
+            };
+            // 1. the header's exit (a `while`), 2. the single latch's exit (a `do … while`),
+            // 3. the header's first post-dominator outside the loop, 4. the exit target most
+            // edges leave to
+            let mut follow = exit_of(h);
+            if follow.is_none() && latches[h].len() == 1 {
+                follow = exit_of(latches[h][0]);
+            }
+            if follow.is_none() {
+                let mut p = pdom.ipdom[h];
+                while let Some(x) = p {
+                    if !body[x] {
+                        break;
+                    }
+                    p = pdom.ipdom[x];
+                }
+                follow = p;
+            }
+            if follow.is_none() {
+                let mut count: Vec<(usize, usize, BlockId)> = Vec::new();
+                for b in (0..n).filter(|&b| body[b]) {
+                    for &s in &cfg.blocks[b].successors {
+                        if outside(s) {
+                            match count.iter_mut().find(|c| c.2 == s) {
+                                Some(c) => c.0 += 1,
+                                None => count.push((1, usize::MAX - rpo_num[s], s)),
+                            }
+                        }
+                    }
+                }
+                follow = count.into_iter().max().map(|c| c.2);
+            }
+            loops[h] = Some(LoopInfo { body, follow });
         }
 
-        _ => {
-            // 3+ successors typically come from an indirect jump (jump table,
-            // switch dispatch). Without dedicated switch recovery, the safest
-            // thing is to emit the block's data ops, then list every target
-            // as a goto so emit doesn't fall through from one successor's
-            // body into the next (the previous code recursively structured
-            // the first un-visited successor inline, which produced fall-
-            // through into its body followed by dead goto stubs for the
-            // rest).
-            let mut seq = vec![StructuredBlock::Basic(block_id)];
-            for &succ in &block.successors {
-                seq.push(StructuredBlock::Goto(succ));
-            }
-            StructuredBlock::Sequence(seq)
+        Structurer {
+            cfg,
+            ipdom: pdom.ipdom.clone(),
+            pdom,
+            loops,
+            emitted: vec![false; n],
+            loop_stack: Vec::new(),
+            follow_stack: Vec::new(),
         }
+    }
+
+    fn succs(&self, b: BlockId) -> Vec<BlockId> {
+        let mut v: Vec<BlockId> = Vec::with_capacity(2);
+        for &s in &self.cfg.blocks[b].successors {
+            if !v.contains(&s) {
+                v.push(s);
+            }
+        }
+        v
+    }
+
+    fn loop_info(&self, h: BlockId) -> &LoopInfo {
+        self.loops[h].as_ref().expect("loop header")
+    }
+
+    /// The jump that reaching `b` turns into, given the loops and `if`s being structured.
+    fn jump_for(&self, b: BlockId) -> Option<StructuredBlock> {
+        if let Some((&inner, outer)) = self.loop_stack.split_last() {
+            if b == inner {
+                return Some(StructuredBlock::Continue);
+            }
+            let info = self.loop_info(inner);
+            if Some(b) == info.follow {
+                return Some(StructuredBlock::Break);
+            }
+            for &h in outer {
+                if b == h || Some(b) == self.loop_info(h).follow {
+                    return Some(StructuredBlock::Goto(b));
+                }
+            }
+            // code after a loop that the loop's normal exit also reaches: leave it to the
+            // walk after the loop instead of printing it inside the body
+            for &h in &self.loop_stack {
+                let info = self.loop_info(h);
+                if let Some(f) = info.follow
+                    && !info.body[b]
+                    && self.pdom.post_dominates(b, f)
+                {
+                    return Some(StructuredBlock::Goto(b));
+                }
+            }
+        }
+        if self.follow_stack.contains(&b) {
+            return Some(StructuredBlock::Goto(b));
+        }
+        None
+    }
+
+    /// The jump that walking into `b` would print right away, if any.
+    fn immediate_jump(&self, b: BlockId) -> Option<StructuredBlock> {
+        self.jump_for(b).or_else(|| self.emitted[b].then_some(StructuredBlock::Goto(b)))
+    }
+
+    /// Structure the code from `start` until `stop` (exclusive; `None` = until the flow ends).
+    /// `header_first`: `start` is the header of the innermost loop being entered (print it
+    /// rather than `continue`).
+    fn walk(&mut self, start: BlockId, stop: Option<BlockId>, header_first: bool) -> Vec<StructuredBlock> {
+        let mut out = Vec::new();
+        let mut cur = Some(start);
+        let mut first = header_first;
+        while let Some(b) = cur {
+            let is_first = std::mem::replace(&mut first, false);
+            if Some(b) == stop {
+                break;
+            }
+            if !is_first {
+                if let Some(j) = self.jump_for(b) {
+                    out.push(j);
+                    break;
+                }
+                if self.emitted[b] {
+                    out.push(StructuredBlock::Goto(b));
+                    break;
+                }
+                if self.loops[b].is_some() && !self.loop_stack.contains(&b) {
+                    let (node, next) = self.structure_loop(b);
+                    out.push(node);
+                    cur = next;
+                    continue;
+                }
+            }
+            self.emitted[b] = true;
+            let succs = self.succs(b);
+            match succs.len() {
+                0 => {
+                    out.push(StructuredBlock::Basic(b));
+                    cur = None;
+                }
+                1 => {
+                    out.push(StructuredBlock::Basic(b));
+                    cur = Some(succs[0]);
+                }
+                _ => {
+                    // (the CFG never builds more than two successors)
+                    let (items, next) = self.structure_if(b, succs[0], succs[1]);
+                    out.extend(items);
+                    cur = next;
+                }
+            }
+        }
+        out
+    }
+
+    fn structure_if(&mut self, b: BlockId, t: BlockId, f: BlockId) -> (Vec<StructuredBlock>, Option<BlockId>) {
+        // the join: the immediate post-dominator, unless it lies outside the innermost loop
+        // while the branch is inside it (then every arm ends in break / continue / return:
+        // `if (c) break;` rather than an empty arm that falls out to a `break` after the if)
+        let mut join = self.ipdom[b];
+        if let (Some(&h), Some(j)) = (self.loop_stack.last(), join) {
+            let body = &self.loop_info(h).body;
+            if body[b] && !body[j] {
+                join = None;
+            }
+        }
+        // the fall-through is only a jump (`break`, `continue`, a `goto` to code printed
+        // elsewhere): `if (!c) break;` and carry on with the taken branch in this sequence
+        if Some(f) != join && self.immediate_jump(f).is_some() && self.immediate_jump(t).is_none() {
+            let jump = self.immediate_jump(f).unwrap();
+            let node = StructuredBlock::IfThen { condition_block: b, then_body: Box::new(jump), negated: true };
+            return (vec![node], Some(t));
+        }
+        if let Some(j) = join {
+            self.follow_stack.push(j);
+        }
+        let then_items = self.walk(t, join, false);
+        let then_ends = ends_flow(self.cfg, &then_items);
+        if then_ends && !then_items.is_empty() {
+            // `if (c) { …; return; }` then carry on with the other arm in this sequence
+            if join.is_some() {
+                self.follow_stack.pop();
+            }
+            let node = StructuredBlock::IfThen { condition_block: b, then_body: Box::new(seq(then_items)), negated: false };
+            return (vec![node], Some(f));
+        }
+        let else_items = self.walk(f, join, false);
+        if join.is_some() {
+            self.follow_stack.pop();
+        }
+        let else_ends = ends_flow(self.cfg, &else_items);
+        let items = match (then_items.is_empty(), else_items.is_empty()) {
+            (true, true) => vec![StructuredBlock::Basic(b)],
+            (false, true) => vec![StructuredBlock::IfThen { condition_block: b, then_body: Box::new(seq(then_items)), negated: false }],
+            (true, false) => vec![StructuredBlock::IfThen { condition_block: b, then_body: Box::new(seq(else_items)), negated: true }],
+            (false, false) if else_ends => {
+                // guard clause: `if (!c) { …; return; }` then the then-arm inline
+                let mut v = vec![StructuredBlock::IfThen { condition_block: b, then_body: Box::new(seq(else_items)), negated: true }];
+                v.extend(then_items);
+                v
+            }
+            (false, false) => vec![StructuredBlock::IfThenElse {
+                condition_block: b,
+                then_body: Box::new(seq(then_items)),
+                else_body: Box::new(seq(else_items)),
+            }],
+        };
+        (items, join)
+    }
+
+    fn structure_loop(&mut self, h: BlockId) -> (StructuredBlock, Option<BlockId>) {
+        let follow = self.loop_info(h).follow;
+        self.loop_stack.push(h);
+        let mut body = self.walk(h, None, true);
+        self.loop_stack.pop();
+        if matches!(body.last(), Some(StructuredBlock::Continue)) {
+            body.pop();
+        }
+        let next = follow.filter(|&f| f != h);
+        (refine_loop(h, body), next)
     }
 }
 
-/// Reachability without structuring: walk successors collecting every
-/// BlockId reachable from `start` without crossing into `blocked`.
-fn collect_reachable(
-    cfg: &ControlFlowGraph,
-    start: BlockId,
-    blocked: &BTreeSet<BlockId>,
-) -> BTreeSet<BlockId> {
-    let mut reached = BTreeSet::new();
-    let mut stack = vec![start];
-    while let Some(b) = stack.pop() {
-        if blocked.contains(&b) || !reached.insert(b) {
-            continue;
+/// Turn `while (true) { … }` into `while (c)` / `do … while (c)` where the shape allows.
+fn refine_loop(h: BlockId, mut body: Vec<StructuredBlock>) -> StructuredBlock {
+    use StructuredBlock::*;
+    let is_break = |n: &StructuredBlock| matches!(n, Break) || matches!(n, Sequence(v) if v.len() == 1 && matches!(v[0], Break));
+    let is_continue = |n: &StructuredBlock| matches!(n, Continue) || matches!(n, Sequence(v) if v.len() == 1 && matches!(v[0], Continue));
+
+    // do … while: the body ends in the latch's test `if (c) break;` (or `if (c) continue;
+    // break;`) and nothing else continues the loop (a `continue` in a `do … while` would
+    // run the test instead of going back to the header)
+    let tail = match body.as_slice() {
+        [.., IfThen { condition_block, then_body, negated }] if is_break(then_body) => {
+            Some((body.len() - 1, *condition_block, !*negated))
         }
-        for &s in &cfg.blocks[b].successors {
-            stack.push(s);
+        [.., IfThen { condition_block, then_body, negated }, Break] if is_continue(then_body) => {
+            Some((body.len() - 2, *condition_block, *negated))
         }
-    }
-    reached
-}
-
-/// Drop a trailing `Goto(target)` from a structured node so the
-/// IfThenElse arm doesn't print an explicit `goto LABEL` immediately
-/// before the join block runs as the next statement after the if.
-fn strip_trailing_goto(node: StructuredBlock, target: BlockId) -> StructuredBlock {
-    match node {
-        StructuredBlock::Sequence(mut xs) => {
-            if matches!(xs.last(), Some(StructuredBlock::Goto(t)) if *t == target) {
-                xs.pop();
-            }
-            if xs.len() == 1 {
-                xs.into_iter().next().unwrap()
-            } else {
-                StructuredBlock::Sequence(xs)
-            }
-        }
-        StructuredBlock::Goto(t) if t == target => StructuredBlock::Sequence(Vec::new()),
-        n => n,
-    }
-}
-
-/// Structure both arms of an if-then-else and split off any shared
-/// post-dominator block as a join sequence. Previously both arms shared
-/// the same `visited` set, so the first one structured consumed everything
-/// the second one also needed to reach — the second arm collapsed to a
-/// single `Goto` and the join code only appeared in the first arm, leaving
-/// the other arm to fall through into it on emit. We now:
-///   1. find the join via independent reachability,
-///   2. block it in each arm's visited set so the arm body stops at the
-///      join boundary instead of structuring the join inline,
-///   3. strip the trailing `Goto(join)` stub the arm naturally produces,
-///   4. structure the join once after the if.
-fn structure_diamond(
-    cfg: &ControlFlowGraph,
-    true_target: BlockId,
-    false_target: BlockId,
-    parent_visited: &mut BTreeSet<BlockId>,
-    path: &mut BTreeSet<BlockId>,
-) -> (StructuredBlock, StructuredBlock, Vec<StructuredBlock>) {
-    let then_reach = collect_reachable(cfg, true_target, parent_visited);
-    let else_reach = collect_reachable(cfg, false_target, parent_visited);
-    let shared: BTreeSet<BlockId> = then_reach
-        .intersection(&else_reach)
-        .copied()
-        .collect();
-    // Approximate the post-dominator by the lowest BlockId reached by both
-    // arms. Without proper dominator analysis the topologically-earliest
-    // block usually corresponds to the join.
-    let join_id = shared.iter().min().copied();
-
-    let mut arm_blocked = parent_visited.clone();
-    if let Some(j) = join_id {
-        arm_blocked.insert(j);
-    }
-    let mut then_visited = arm_blocked.clone();
-    let mut else_visited = arm_blocked.clone();
-    let then_body = structure_from(cfg, true_target, &mut then_visited, path);
-    let else_body = structure_from(cfg, false_target, &mut else_visited, path);
-
-    parent_visited.extend(&then_visited);
-    parent_visited.extend(&else_visited);
-
-    let (then_body, else_body, join_seq) = if let Some(j) = join_id {
-        let then_body = strip_trailing_goto(then_body, j);
-        let else_body = strip_trailing_goto(else_body, j);
-        parent_visited.remove(&j);
-        let s = structure_from(cfg, j, parent_visited, path);
-        (then_body, else_body, vec![s])
-    } else {
-        (then_body, else_body, Vec::new())
+        _ => None,
     };
-
-    (then_body, else_body, join_seq)
+    // while: the body starts with the header's test `if (c) break;`
+    let head = match body.first() {
+        Some(IfThen { condition_block, then_body, negated }) if *condition_block == h && is_break(then_body) => {
+            Some(!*negated)
+        }
+        _ => None,
+    };
+    let single_block = body.len() <= 2 && tail.is_some_and(|(i, c, _)| i == 0 && c == h);
+    if let (Some(neg), false) = (head, single_block) {
+        body.remove(0);
+        return WhileLoop { condition_block: h, body: Box::new(seq(body)), negated: neg };
+    }
+    if let Some((i, cond, neg)) = tail {
+        let rest = &body[..i];
+        if !rest.iter().any(continues_loop) {
+            body.truncate(i);
+            return DoWhileLoop { body: Box::new(seq(body)), condition_block: cond, negated: neg };
+        }
+    }
+    Loop { header: h, body: Box::new(seq(body)) }
 }
 
-/// If the if/then/else has a continuation, wrap the conditional in a
-/// sequence followed by the continuation. Otherwise return the conditional
-/// node directly so the simple cases stay flat.
-fn join_into_sequence(if_node: StructuredBlock, join: Vec<StructuredBlock>) -> StructuredBlock {
-    if join.is_empty() {
-        if_node
+/// Does the node contain a `continue` for the loop it sits in (not one of a nested loop)?
+fn continues_loop(n: &StructuredBlock) -> bool {
+    use StructuredBlock::*;
+    match n {
+        Continue => true,
+        Sequence(v) => v.iter().any(continues_loop),
+        IfThen { then_body, .. } => continues_loop(then_body),
+        IfThenElse { then_body, else_body, .. } => continues_loop(then_body) || continues_loop(else_body),
+        Switch { cases, default, .. } => {
+            cases.iter().any(|(_, c)| continues_loop(c)) || default.as_ref().is_some_and(|d| continues_loop(d))
+        }
+        ShortCircuitAnd { body, .. } | ShortCircuitOr { body, .. } => continues_loop(body),
+        _ => false,
+    }
+}
+
+/// Control never falls out of the end of `items` (a return, a jump, `break`, `continue`).
+fn ends_flow(cfg: &ControlFlowGraph, items: &[StructuredBlock]) -> bool {
+    use StructuredBlock::*;
+    match items.last() {
+        Some(Goto(_)) | Some(Break) | Some(Continue) => true,
+        Some(Basic(b)) => cfg.blocks[*b].successors.is_empty(),
+        Some(Sequence(v)) => ends_flow(cfg, v),
+        Some(IfThenElse { then_body, else_body, .. }) => {
+            ends_flow(cfg, std::slice::from_ref(then_body)) && ends_flow(cfg, std::slice::from_ref(else_body))
+        }
+        _ => false,
+    }
+}
+
+fn seq(mut items: Vec<StructuredBlock>) -> StructuredBlock {
+    if items.len() == 1 {
+        items.pop().unwrap()
     } else {
-        let mut seq = vec![if_node];
-        seq.extend(join);
-        StructuredBlock::Sequence(seq)
+        StructuredBlock::Sequence(items)
     }
 }
 
-fn block_eventually_returns(
-    cfg: &ControlFlowGraph,
-    block_id: BlockId,
-    parent_visited: &BTreeSet<BlockId>,
-) -> bool {
-    if parent_visited.contains(&block_id) {
-        return false;
+fn collect_gotos(n: &StructuredBlock, out: &mut Vec<BlockId>) {
+    use StructuredBlock::*;
+    match n {
+        Goto(t) => out.push(*t),
+        Sequence(v) => v.iter().for_each(|x| collect_gotos(x, out)),
+        IfThen { then_body, .. } => collect_gotos(then_body, out),
+        IfThenElse { then_body, else_body, .. } => {
+            collect_gotos(then_body, out);
+            collect_gotos(else_body, out);
+        }
+        WhileLoop { body, .. }
+        | DoWhileLoop { body, .. }
+        | Loop { body, .. }
+        | ForLoop { body, .. }
+        | ShortCircuitAnd { body, .. }
+        | ShortCircuitOr { body, .. } => collect_gotos(body, out),
+        Switch { cases, default, .. } => {
+            cases.iter().for_each(|(_, c)| collect_gotos(c, out));
+            if let Some(d) = default {
+                collect_gotos(d, out);
+            }
+        }
+        Basic(_) | Break | Continue => {}
     }
-    let block = &cfg.blocks[block_id];
-    if block.is_return() {
-        return true;
-    }
-    if block.successors.is_empty() {
-        return true;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -520,5 +674,154 @@ mod tests {
         // 3+ successors (it depends on builder details), but we do guarantee
         // the routine doesn't panic or infinitely recurse.
         let _ = structure_cfg(&cfg);
+    }
+
+    fn nop(addr: u64) -> LiftedInstruction {
+        lifted(addr, vec![])
+    }
+
+    fn gotos(s: &StructuredBlock) -> usize {
+        count(s, &|n| matches!(n, StructuredBlock::Goto(_)))
+    }
+
+    fn empty_arms(s: &StructuredBlock) -> usize {
+        let empty = |b: &StructuredBlock| matches!(b, StructuredBlock::Sequence(v) if v.is_empty());
+        count(s, &|n| match n {
+            StructuredBlock::IfThen { then_body, .. } => empty(then_body),
+            StructuredBlock::IfThenElse { then_body, else_body, .. } => empty(then_body) || empty(else_body),
+            _ => false,
+        })
+    }
+
+    fn top_level(s: &StructuredBlock) -> Vec<&StructuredBlock> {
+        match s {
+            StructuredBlock::Sequence(v) => v.iter().collect(),
+            n => vec![n],
+        }
+    }
+
+    #[test]
+    fn if_join_is_post_dominator_not_lowest_shared_block() {
+        // A: jcc C ; B: jcc X else fall to J?  Layout:
+        // 0x1000 A: cbranch C(0x1003)        fall B
+        // 0x1001 B: cbranch J(0x1005)        fall X
+        // 0x1002 X: branch J... (X is shared by B and C but does not post-dominate A)
+        // 0x1003 C: branch X
+        // 0x1004 (dead)
+        // 0x1005 J: ret
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1003)]),
+            lifted(0x1001, vec![cbranch(0x1001, 0x1005)]),
+            lifted(0x1002, vec![branch(0x1002, 0x1005)]),
+            lifted(0x1003, vec![branch(0x1003, 0x1002)]),
+            lifted(0x1005, vec![ret(0x1005)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let j = cfg.block_at(0x1005).unwrap().id;
+        let s = structure_cfg(&cfg);
+        // the join J is printed once, after the if, not inside an arm
+        let top = top_level(&s);
+        assert!(matches!(top.last(), Some(StructuredBlock::Basic(b)) if *b == j), "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Basic(b) if *b == j)), 1, "{s:?}");
+        assert_eq!(empty_arms(&s), 0, "{s:?}");
+    }
+
+    #[test]
+    fn empty_then_arm_becomes_negated_if() {
+        // A: jcc J ; B: nop ; J: ret  — `if (c) {} else { B }` before
+        let insns = vec![lifted(0x1000, vec![cbranch(0x1000, 0x1002)]), nop(0x1001), lifted(0x1002, vec![ret(0x1002)])];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(empty_arms(&s), 0, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::IfThen { negated: true, .. })), 1, "{s:?}");
+        assert_eq!(gotos(&s), 0, "{s:?}");
+    }
+
+    #[test]
+    fn top_tested_loop_is_while_without_goto() {
+        // E: nop ; H: jcc X ; B: nop ; jmp H ; X: ret
+        let insns = vec![
+            nop(0x1000),
+            lifted(0x1001, vec![cbranch(0x1001, 0x1004)]),
+            nop(0x1002),
+            lifted(0x1003, vec![branch(0x1003, 0x1001)]),
+            lifted(0x1004, vec![ret(0x1004)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::WhileLoop { .. })), 1, "{s:?}");
+        assert_eq!(gotos(&s), 0, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Break | StructuredBlock::Continue)), 0, "{s:?}");
+    }
+
+    #[test]
+    fn bottom_tested_loop_is_do_while_without_goto() {
+        // E: nop ; B: nop ; L: jcc B ; X: ret   (`while (c) { goto B; }` before)
+        let insns = vec![
+            nop(0x1000),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1001)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::DoWhileLoop { negated: false, .. })), 1, "{s:?}");
+        assert_eq!(gotos(&s), 0, "{s:?}");
+    }
+
+    #[test]
+    fn early_exit_from_loop_is_break() {
+        // H: jcc X ; B1: jcc X (break) ; B2: jmp H ; X: ret
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1003)]),
+            lifted(0x1001, vec![cbranch(0x1001, 0x1003)]),
+            lifted(0x1002, vec![branch(0x1002, 0x1000)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Break)), 1, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::WhileLoop { .. })), 1, "{s:?}");
+    }
+
+    #[test]
+    fn every_reachable_block_printed_once() {
+        // irreducible: E: jcc L2 ; L1: nop ; L2: jcc L1 ; ret
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1002)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1001)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        fn printed(n: &StructuredBlock, out: &mut Vec<BlockId>) {
+            use StructuredBlock::*;
+            match n {
+                Basic(b) => out.push(*b),
+                Sequence(v) => v.iter().for_each(|x| printed(x, out)),
+                IfThen { condition_block, then_body, .. } => {
+                    out.push(*condition_block);
+                    printed(then_body, out);
+                }
+                IfThenElse { condition_block, then_body, else_body } => {
+                    out.push(*condition_block);
+                    printed(then_body, out);
+                    printed(else_body, out);
+                }
+                WhileLoop { condition_block, body, .. } | DoWhileLoop { condition_block, body, .. } => {
+                    out.push(*condition_block);
+                    printed(body, out);
+                }
+                Loop { body, .. } => printed(body, out),
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        printed(&s, &mut v);
+        v.sort();
+        assert_eq!(v, (0..cfg.blocks.len()).collect::<Vec<_>>(), "{s:?}");
+        assert!(gotos(&s) >= 1, "irreducible flow needs a goto: {s:?}");
     }
 }

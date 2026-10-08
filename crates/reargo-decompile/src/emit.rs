@@ -201,9 +201,10 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::IfThen {
                 condition_block,
                 then_body,
+                negated,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if ({}) {{", self.get_branch_condition(func, *condition_block));
+                linef!(self, "if ({}) {{", self.condition_text(func, *condition_block, *negated));
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -215,7 +216,7 @@ impl<'a> CEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if ({}) {{", self.get_branch_condition(func, *condition_block));
+                linef!(self, "if ({}) {{", self.condition_text(func, *condition_block, false));
                 self.indent += 1;
                 self.emit_block(func, then_body);
                 self.indent -= 1;
@@ -228,11 +229,28 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::WhileLoop {
                 condition_block,
                 body,
+                negated,
             } => {
-                self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "while ({}) {{", self.get_branch_condition(func, *condition_block)
-                );
+                // the header's statements run on every iteration: `while (c)` only when it
+                // has none, else `while (true) { stmts; if (!c) break; … }`
                 self.indent += 1;
+                let mark = self.output.len();
+                self.emit_basic_block_no_branch(func, *condition_block);
+                let stmts = self.output.split_off(mark);
+                self.indent -= 1;
+                let code_free = stmts.lines().all(|l| l.trim_start().starts_with("//"));
+                if code_free {
+                    for l in stmts.lines() {
+                        self.line(l.trim_start());
+                    }
+                    linef!(self, "while ({}) {{", self.condition_text(func, *condition_block, *negated));
+                    self.indent += 1;
+                } else {
+                    self.line("while (true) {");
+                    self.indent += 1;
+                    self.output.push_str(&stmts);
+                    linef!(self, "if ({}) break;", self.condition_text(func, *condition_block, !*negated));
+                }
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -240,14 +258,20 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::DoWhileLoop {
                 body,
                 condition_block,
+                negated,
             } => {
                 self.line("do {");
                 self.indent += 1;
                 self.emit_block(func, body);
+                if self.goto_targets.remove(condition_block) {
+                    let indent = self.indent;
+                    self.indent = indent.saturating_sub(1);
+                    linef!(self, "label_{:x}:", func.cfg.blocks[*condition_block].start_addr);
+                    self.indent = indent;
+                }
                 self.emit_basic_block_no_branch(func, *condition_block);
                 self.indent -= 1;
-                linef!(self, "}} while ({});", self.get_branch_condition(func, *condition_block)
-                );
+                linef!(self, "}} while ({});", self.condition_text(func, *condition_block, *negated));
             }
             StructuredBlock::ForLoop {
                 init_block,
@@ -318,10 +342,10 @@ impl<'a> CEmitter<'a> {
                 self.indent -= 1;
                 self.line("}");
             }
-            StructuredBlock::Loop { header, body } => {
+            StructuredBlock::Loop { body, .. } => {
+                // the body starts with the header's own code
                 self.line("while (true) {");
                 self.indent += 1;
-                self.emit_basic_block(func, *header);
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -329,6 +353,8 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::Goto(target) => {
                 linef!(self, "goto label_{:x};", func.cfg.blocks[*target].start_addr);
             }
+            StructuredBlock::Break => self.line("break;"),
+            StructuredBlock::Continue => self.line("continue;"),
         }
     }
 
@@ -874,6 +900,11 @@ impl<'a> CEmitter<'a> {
         "cond".into()
     }
 
+    /// The branch condition of `block_id`, inverted when `negated`.
+    fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        negate_condition(self.get_branch_condition(func, block_id), negated)
+    }
+
     fn line(&mut self, text: &str) {
         for _ in 0..self.indent {
             self.output.push_str("    ");
@@ -883,6 +914,17 @@ impl<'a> CEmitter<'a> {
     }
 }
 
+
+/// `cond` inverted when `negated`: `!x` for a plain name, `!(…)` otherwise.
+pub(crate) fn negate_condition(cond: String, negated: bool) -> String {
+    if !negated {
+        cond
+    } else if cond.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        format!("!{cond}")
+    } else {
+        format!("!({cond})")
+    }
+}
 
 struct FunctionSignature {
     return_type: &'static str,
@@ -896,7 +938,7 @@ fn collect_goto_targets(block: &StructuredBlock, out: &mut std::collections::BTr
         Goto(t) => {
             out.insert(*t);
         }
-        Basic(_) => {}
+        Basic(_) | Break | Continue => {}
         Sequence(xs) => xs.iter().for_each(|b| collect_goto_targets(b, out)),
         IfThen { then_body, .. } => collect_goto_targets(then_body, out),
         IfThenElse { then_body, else_body, .. } => {
@@ -932,7 +974,7 @@ fn leading_block(block: &StructuredBlock) -> Option<usize> {
         ShortCircuitAnd { left_block, .. } | ShortCircuitOr { left_block, .. } => Some(*left_block),
         Loop { header, .. } => Some(*header),
         DoWhileLoop { body, .. } => leading_block(body),
-        Sequence(_) | Goto(_) => None,
+        Sequence(_) | Goto(_) | Break | Continue => None,
     }
 }
 
