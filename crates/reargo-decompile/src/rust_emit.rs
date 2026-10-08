@@ -151,11 +151,13 @@ impl<'a> RustEmitter<'a> {
                 negated,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if {} {{", self.condition_text(func, *condition_block, *negated));
-                self.indent += 1;
-                self.emit_block(func, then_body);
-                self.indent -= 1;
-                self.line("}");
+                // an arm whose blocks print nothing (all their ops folded away) needs no `if`
+                let then_text = self.render_nested(func, then_body);
+                if !then_text.is_empty() {
+                    linef!(self, "if {} {{", self.condition_text(func, *condition_block, *negated));
+                    self.output.push_str(&then_text);
+                    self.line("}");
+                }
             }
             StructuredBlock::IfThenElse {
                 condition_block,
@@ -163,15 +165,24 @@ impl<'a> RustEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if {} {{", self.condition_text(func, *condition_block, false));
-                self.indent += 1;
-                self.emit_block(func, then_body);
-                self.indent -= 1;
-                self.line("} else {");
-                self.indent += 1;
-                self.emit_block(func, else_body);
-                self.indent -= 1;
-                self.line("}");
+                let then_text = self.render_nested(func, then_body);
+                let else_text = self.render_nested(func, else_body);
+                match (then_text.is_empty(), else_text.is_empty()) {
+                    (true, true) => {}
+                    (false, true) | (true, false) => {
+                        let negated = then_text.is_empty();
+                        linef!(self, "if {} {{", self.condition_text(func, *condition_block, negated));
+                        self.output.push_str(if negated { &else_text } else { &then_text });
+                        self.line("}");
+                    }
+                    (false, false) => {
+                        linef!(self, "if {} {{", self.condition_text(func, *condition_block, false));
+                        self.output.push_str(&then_text);
+                        self.line("} else {");
+                        self.output.push_str(&else_text);
+                        self.line("}");
+                    }
+                }
             }
             StructuredBlock::WhileLoop {
                 condition_block,
@@ -769,6 +780,15 @@ impl<'a> RustEmitter<'a> {
             }
         }
         varnode_name(vn)
+    }
+
+    /// Print `body` one level deeper and hand the text back instead of keeping it.
+    fn render_nested(&mut self, func: &SsaFunction, body: &StructuredBlock) -> String {
+        let mark = self.output.len();
+        self.indent += 1;
+        self.emit_block(func, body);
+        self.indent -= 1;
+        self.output.split_off(mark)
     }
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {

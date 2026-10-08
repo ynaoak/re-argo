@@ -1064,6 +1064,24 @@ mod tests {
         assert_eq!(c.matches("return").count(), 1, "{c}");
     }
 
+    /// WS79: an arm whose only instruction is folded away (a dead register write) prints
+    /// no `if (c) { }`.
+    #[test]
+    fn arm_without_statements_prints_no_if() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x85, 0xff, // test edi, edi
+            0x74, 0x05, // je skip
+            0xb9, 0x05, 0x00, 0x00, 0x00, // mov ecx, 5 (dead)
+            0xb8, 0x01, 0x00, 0x00, 0x00, // skip: mov eax, 1
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        assert!(!r.c_code.contains("if ("), "{}", r.c_code);
+        assert!(!r.rust_code.contains("if "), "{}", r.rust_code);
+    }
+
     /// WS77: every `goto label_X;` has its `label_X:` (an irreducible loop entered at two
     /// blocks cannot be nested).
     #[test]
