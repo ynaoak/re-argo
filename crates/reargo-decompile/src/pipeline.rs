@@ -47,7 +47,8 @@ pub fn decompile(
     let oracle = CalleeParams::new(lifter, memory);
     let call_params = callee_param_map(&trimmed, oracle.as_ref());
     let own = own_params(oracle.as_ref(), entry);
-    let terminated = apply_call_convention(trimmed, lifter);
+    let call_returns = callee_return_map(&trimmed, oracle.as_ref());
+    let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own)
 }
@@ -79,6 +80,31 @@ fn callee_param_map(
                 && let Some(info) = oracle.params(t.offset)
             {
                 out.insert(insn.address, info);
+            }
+        }
+    }
+    out
+}
+
+/// The return register of every direct call's callee, keyed by the call instruction's
+/// address (WS79); calls whose callee is not known are left out.
+fn callee_return_map(
+    instructions: &[LiftedInstruction],
+    oracle: Option<&CalleeParams<'_>>,
+) -> rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind> {
+    use reargo_core::pcode::OpCode;
+    let mut out = rustc_hash::FxHashMap::default();
+    let Some(oracle) = oracle else { return out };
+    for insn in instructions {
+        for op in &insn.ops {
+            if op.opcode == OpCode::Call
+                && let Some(t) = op.inputs.first()
+                && t.space == reargo_core::address::SpaceId::RAM
+            {
+                let k = oracle.return_kind(t.offset);
+                if k != crate::callee_params::ReturnKind::Unknown {
+                    out.insert(insn.address, k);
+                }
             }
         }
     }
@@ -219,7 +245,8 @@ fn decompile_function_inner(
     };
     let call_params = callee_param_map(&terminated, oracle);
     let own = own_params(oracle, func_entry);
-    let terminated = apply_call_convention(terminated, lifter);
+    let call_returns = callee_return_map(&terminated, oracle);
+    let terminated = apply_call_convention(terminated, lifter, &call_returns);
 
     build_decompile_result(
         terminated,
@@ -254,6 +281,7 @@ pub fn is_call_clobber(op: &reargo_core::pcode::OpCode, inputs: &[reargo_core::p
 fn apply_call_convention(
     mut instructions: Vec<LiftedInstruction>,
     lifter: &dyn PcodeLift,
+    call_returns: &rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind>,
 ) -> Vec<LiftedInstruction> {
     use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
     let Some(cc) = lifter.call_convention() else {
@@ -278,6 +306,7 @@ fn apply_call_convention(
         else {
             continue;
         };
+        let insn_addr = insn.address;
         let call = &mut insn.ops[pos];
         let at = call.seq;
         let target = call.inputs.first().copied();
@@ -288,7 +317,18 @@ fn apply_call_convention(
         // returns: `INDIRECT(target)`; clobbers: `INDIRECT(target, 1)` (WS76: a caller-saved
         // register read after a call no longer shows the value it had before the call)
         let clobber_mark = VarnodeData::new(reargo_core::address::SpaceId::CONST, CLOBBER_MARK, 1);
-        let defs = cc.returns.iter().map(|r| (r, false)).chain(cc.clobbers.iter().map(|r| (r, true)));
+        // WS79: a callee known to return in one register only clobbers the other
+        let returned = |i: usize| match call_returns.get(&insn_addr) {
+            Some(crate::callee_params::ReturnKind::Int) => i == 0,
+            Some(crate::callee_params::ReturnKind::Float) => i == 1,
+            _ => true,
+        };
+        let defs = cc
+            .returns
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r, !returned(i)))
+            .chain(cc.clobbers.iter().map(|r| (r, true)));
         for ((full, views), clobber) in defs {
             let mut inputs = smallvec::SmallVec::new();
             match target {
@@ -329,6 +369,8 @@ struct RetEvidence {
     addr: u64,
     /// Size of that write once the register views are looked through (`xmm0_d` = 4).
     size: u32,
+    /// The value is a call's result (its return `INDIRECT`, not a clobber).
+    call_result: bool,
 }
 
 /// The value `v` holds at a `ret`, looking through the lifter's view syncs (`xmm0 =
@@ -344,7 +386,10 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
     let op = &ssa.ops[d];
     let reg = |x: crate::ssa::VarId| ssa.varnodes[x as usize].data.space == reargo_core::address::SpaceId::REGISTER;
     match op.opcode {
-        OpCode::Indirect => RetEvidence::default(),
+        OpCode::Indirect => RetEvidence {
+            call_result: !is_call_clobber(&op.opcode, &op.inputs.iter().map(|&i| ssa.varnodes[i as usize].data).collect::<Vec<_>>()),
+            ..RetEvidence::default()
+        },
         OpCode::MultiEqual => {
             let mut best = RetEvidence::default();
             for &i in &op.inputs {
@@ -352,6 +397,7 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
                 if e.written && (!best.written || e.addr > best.addr) {
                     best = e;
                 }
+                best.call_result |= e.call_result;
             }
             best
         }
@@ -366,7 +412,7 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
             let e = return_evidence(ssa, op.inputs[0], seen);
             RetEvidence { addr: e.addr.max(op.address), ..e }
         }
-        _ => RetEvidence { written: true, addr: op.address, size: vn.data.size },
+        _ => RetEvidence { written: true, addr: op.address, size: vn.data.size, call_result: false },
     }
 }
 
@@ -400,9 +446,15 @@ fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
             size = size.max(f.size);
         } else if i.written {
             int_votes += 1;
+        } else if f.call_result && !i.call_result {
+            // `call g; ret` with `g` known to return a float (its `rax` is only clobbered)
+            float_votes += 1;
         }
     }
     let float = float_votes > 0 && int_votes == 0;
+    if size == 0 {
+        size = 8; // only call results: the width is not known, print it as a double
+    }
     let drop = if float { 1 } else { 2 };
     for &r in &rets {
         let v = ssa.ops[r].inputs.remove(drop);
@@ -906,6 +958,26 @@ mod tests {
         assert!(call_line.trim_start().starts_with("rax = "), "{c}");
     }
 
+    /// WS79: a call to a function that returns a float assigns `xmm0`; `rax` is only
+    /// clobbered by it.
+    #[test]
+    fn call_to_float_function_assigns_xmm0() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xe8, 0x0b, 0x00, 0x00, 0x00, // 0x1000 call 0x1010
+            0xf3, 0x0f, 0x11, 0x05, 0xf3, 0x1f, 0x00, 0x00, // 0x1005 movss [0x3000], xmm0
+            0xc3, // 0x100d ret
+            0x90, 0x90, // pad
+            0xf3, 0x0f, 0x2a, 0xc7, // 0x1010 cvtsi2ss xmm0, edi
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call_line = c.lines().find(|l| l.contains("0x1010(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call_line.trim_start().starts_with("xmm0 = "), "{c}");
+        assert!(!c.contains("rax = __ret"), "{c}");
+    }
+
     /// WS76: a caller-saved register read after a call is the call's clobber, not the value it
     /// held before the call.
     #[test]
@@ -1199,6 +1271,20 @@ mod tests {
         let c = c_of(&[0xf2, 0x0f, 0x2a, 0xc7, 0xf2, 0x0f, 0x59, 0xc0, 0xc3]);
         assert!(c.contains("double f("), "{c}");
         assert!(c.contains("return xmm0_q;"), "{c}");
+    }
+
+    /// `call g; ret` with `g` returning a float returns that float.
+    #[test]
+    fn tail_call_result_of_float_function_is_float_return() {
+        let c = c_of(&[
+            0xe8, 0x0b, 0x00, 0x00, 0x00, // 0x1000 call 0x1010
+            0xc3, // ret
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad to 0x1010
+            0xf3, 0x0f, 0x2a, 0xc7, // 0x1010 cvtsi2ss xmm0, edi
+            0xc3,
+        ]);
+        assert!(c.contains("double f(") || c.contains("float f("), "{c}");
+        assert!(c.contains("return xmm0"), "{c}");
     }
 
     /// An integer written after the last float write is the return value.

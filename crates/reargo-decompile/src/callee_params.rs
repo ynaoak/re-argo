@@ -70,6 +70,21 @@ pub struct CalleeParams<'a> {
     /// Arguments of each class, in parameter order.
     class_members: Vec<Vec<usize>>,
     memo: Mutex<FxHashMap<(u64, u32), Option<ParamInfo>>>,
+    /// The convention's return registers (`rax`, `xmm0`).
+    returns: Vec<VarnodeData>,
+    ret_memo: Mutex<FxHashMap<(u64, u32), ReturnKind>>,
+}
+
+/// Which return register a callee leaves its result in (WS79).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnKind {
+    /// The integer register (`rax`).
+    Int,
+    /// The vector register (`xmm0`): a `float` / `double`.
+    Float,
+    /// Not known (no `ret` found, a `ret` straight after a call to an unknown function, or
+    /// `ret`s that disagree).
+    Unknown,
 }
 
 impl<'a> CalleeParams<'a> {
@@ -77,7 +92,16 @@ impl<'a> CalleeParams<'a> {
     pub fn new(lifter: &'a dyn PcodeLift, memory: &'a Memory) -> Option<Self> {
         let cc = lifter.call_convention()?;
         let (class_of, class_members) = arg_classes(&cc.args);
-        Some(Self { lifter, memory, args: cc.args, class_of, class_members, memo: Mutex::new(FxHashMap::default()) })
+        Some(Self {
+            lifter,
+            memory,
+            args: cc.args,
+            class_of,
+            class_members,
+            memo: Mutex::new(FxHashMap::default()),
+            returns: cc.returns.iter().map(|(r, _)| *r).collect(),
+            ret_memo: Mutex::new(FxHashMap::default()),
+        })
     }
 
     pub fn args(&self) -> &[VarnodeData] {
@@ -88,6 +112,94 @@ impl<'a> CalleeParams<'a> {
     /// lifted.
     pub fn params(&self, target: u64) -> Option<ParamInfo> {
         self.params_at(target, MAX_DEPTH)
+    }
+
+    /// Which register the function at `target` returns its value in (WS79): at each `ret`,
+    /// the return register it wrote last (looking back through straight-line predecessors);
+    /// a `ret` right after a call returns what that callee returns (depth-limited).
+    pub fn return_kind(&self, target: u64) -> ReturnKind {
+        self.return_kind_at(target, MAX_DEPTH)
+    }
+
+    fn return_kind_at(&self, target: u64, depth_left: u32) -> ReturnKind {
+        if self.returns.len() < 2 {
+            return ReturnKind::Unknown;
+        }
+        if let Some(r) = self.ret_memo.lock().ok().and_then(|m| m.get(&(target, depth_left)).copied()) {
+            return r;
+        }
+        let r = self.analyze_return(target, depth_left);
+        if let Ok(mut m) = self.ret_memo.lock() {
+            m.insert((target, depth_left), r);
+        }
+        r
+    }
+
+    fn analyze_return(&self, target: u64, depth_left: u32) -> ReturnKind {
+        let Ok(lifted) = self.lifter.lift_range(self.memory, target, MAX_INSNS) else {
+            return ReturnKind::Unknown;
+        };
+        if lifted.is_empty() || lifted[0].address != target {
+            return ReturnKind::Unknown;
+        }
+        let cfg = ControlFlowGraph::build_owned(crate::pipeline::trim_to_return(lifted));
+        let (int_reg, float_reg) = (self.returns[0], self.returns[1]);
+        let mut kinds = Vec::new();
+        for b in 0..cfg.blocks.len() {
+            if !cfg.blocks[b].is_return() {
+                continue;
+            }
+            let mut cur = b;
+            let mut steps = 0;
+            let kind = 'search: loop {
+                for insn in cfg.blocks[cur].instructions.iter().rev() {
+                    for op in insn.ops.iter().rev() {
+                        if matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
+                            let callee = (op.opcode == OpCode::Call)
+                                .then(|| op.inputs.first())
+                                .flatten()
+                                .filter(|t| t.space == SpaceId::RAM);
+                            break 'search match callee {
+                                Some(t) if depth_left > 0 => self.return_kind_at(t.offset, depth_left - 1),
+                                _ => ReturnKind::Unknown,
+                            };
+                        }
+                        let Some(out) = op.output else { continue };
+                        if out.space != SpaceId::REGISTER {
+                            continue;
+                        }
+                        if out.offset == int_reg.offset && out.size <= int_reg.size {
+                            break 'search ReturnKind::Int;
+                        }
+                        // a scalar float result (`xmm0_d` / `xmm0_q`, not the lifter's view sync),
+                        // or a whole-register copy from another vector register
+                        let scalar = out.offset == float_reg.offset
+                            && (out.size == 4 || out.size == 8)
+                            && !matches!(op.opcode, OpCode::Piece | OpCode::Subpiece);
+                        let copy = out.offset == float_reg.offset
+                            && out.size == float_reg.size
+                            && op.opcode == OpCode::Copy
+                            && op.inputs.first().is_some_and(|i| i.space == SpaceId::REGISTER && i.size == float_reg.size);
+                        if scalar || copy {
+                            break 'search ReturnKind::Float;
+                        }
+                    }
+                }
+                let preds = &cfg.blocks[cur].predecessors;
+                steps += 1;
+                if preds.len() != 1 || steps > 8 {
+                    break ReturnKind::Unknown;
+                }
+                cur = preds[0];
+            };
+            kinds.push(kind);
+        }
+        let any = |k| kinds.contains(&k);
+        match (any(ReturnKind::Int), any(ReturnKind::Float)) {
+            (true, false) => ReturnKind::Int,
+            (false, true) => ReturnKind::Float,
+            _ => ReturnKind::Unknown,
+        }
     }
 
     fn params_at(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
@@ -358,6 +470,32 @@ mod tests {
         let lifter = X86Lifter::new_64();
         let mem = memory(parts);
         CalleeParams::new(&lifter, &mem).unwrap().params(at).unwrap()
+    }
+
+    fn kind(parts: &[(u64, &[u8])], at: u64) -> ReturnKind {
+        let lifter = X86Lifter::new_64();
+        let mem = memory(parts);
+        CalleeParams::new(&lifter, &mem).unwrap().return_kind(at)
+    }
+
+    #[test]
+    fn return_kind_from_the_last_return_register_write() {
+        // mov eax, 1 ; cvtsi2ss xmm0, edi ; ret  -> float
+        assert_eq!(kind(&[(0x1000, &[0xb8, 1, 0, 0, 0, 0xf3, 0x0f, 0x2a, 0xc7, 0xc3])], 0x1000), ReturnKind::Float);
+        // cvtsi2ss xmm0, edi ; mov eax, 1 ; ret  -> int
+        assert_eq!(kind(&[(0x1000, &[0xf3, 0x0f, 0x2a, 0xc7, 0xb8, 1, 0, 0, 0, 0xc3])], 0x1000), ReturnKind::Int);
+        // movaps xmm0, xmm1 ; ret  -> float (a whole-register copy from another vector register)
+        assert_eq!(kind(&[(0x1000, &[0x0f, 0x28, 0xc1, 0xc3])], 0x1000), ReturnKind::Float);
+        // ret alone -> unknown
+        assert_eq!(kind(&[(0x1000, &[0xc3])], 0x1000), ReturnKind::Unknown);
+    }
+
+    #[test]
+    fn return_kind_through_a_tail_call_result() {
+        // f: call g ; ret     g: cvtsi2sd xmm0, edi ; ret
+        let f: &[u8] = &[0xe8, 0xfb, 0x00, 0x00, 0x00, 0xc3]; // call 0x1100
+        let g: &[u8] = &[0xf2, 0x0f, 0x2a, 0xc7, 0xc3];
+        assert_eq!(kind(&[(0x1000, f), (0x1100, g)], 0x1000), ReturnKind::Float);
     }
 
     #[test]
