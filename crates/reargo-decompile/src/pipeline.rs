@@ -495,15 +495,18 @@ fn unuse(ssa: &mut SsaFunction, v: crate::ssa::VarId, r: usize) {
 
 /// The argument registers that are the function's parameters: those the analysis of its
 /// entry found it reads, plus — when that answer is only a lower bound — those the
-/// decompiled body still reads on entry.
+/// decompiled body still reads on entry. WS79: each register class keeps its whole prefix
+/// up to the highest parameter read (System V passes `f(a, b)` in `rdi, rsi` even when
+/// the body only reads `b`), so the signature shows the real arity and position.
 fn signature_params(
     ssa: &SsaFunction,
     info: ParamInfo,
     args: &[reargo_core::pcode::VarnodeData],
 ) -> Vec<reargo_core::pcode::VarnodeData> {
-    args.iter()
+    let used: Vec<bool> = args
+        .iter()
         .enumerate()
-        .filter(|&(i, a)| {
+        .map(|(i, a)| {
             info.mask & (1 << i) != 0
                 || (!info.complete
                     && ssa.varnodes.iter().any(|vn| {
@@ -512,6 +515,18 @@ fn signature_params(
                             && vn.data.offset == a.offset
                             && vn.uses.iter().any(|&u| !ssa.ops[u].dead)
                     }))
+        })
+        .collect();
+    let (class_of, members) = crate::callee_params::arg_classes(args);
+    let arity: Vec<usize> = members
+        .iter()
+        .map(|m| m.iter().rposition(|&i| used[i]).map_or(0, |p| p + 1))
+        .collect();
+    args.iter()
+        .enumerate()
+        .filter(|&(i, _)| {
+            let c = class_of[i];
+            members[c].iter().position(|&m| m == i).is_some_and(|p| p < arity[c])
         })
         .map(|(_, a)| *a)
         .collect()
@@ -1197,6 +1212,26 @@ mod tests {
         let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
         assert!(r.c_code.contains("uint64_t f(uint64_t rdi, uint64_t rsi, uint128_t xmm0)"), "{}", r.c_code);
         assert!(r.rust_code.contains("fn f(rdi: u64, rsi: u64, xmm0: u128) -> u64"), "{}", r.rust_code);
+    }
+
+    /// WS79: an unused leading parameter keeps its slot (`f(rdi, rsi)` when only `rsi` and
+    /// `xmm1` are read: `xmm0` too).
+    #[test]
+    fn signature_keeps_the_unused_leading_parameters() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xf0, // mov eax, esi
+            0xf3, 0x0f, 0x11, 0x0d, 0xf6, 0x1f, 0x00, 0x00, // movss [0x3000], xmm1
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        assert!(
+            r.c_code.contains("uint64_t f(uint64_t rdi, uint64_t rsi, uint128_t xmm0, uint128_t xmm1)"),
+            "{}",
+            r.c_code
+        );
+        assert!(!r.c_code.contains("rdx"), "{}", r.c_code);
     }
 
     /// WS78: a parameter the body also assigns is not declared again as a local.
