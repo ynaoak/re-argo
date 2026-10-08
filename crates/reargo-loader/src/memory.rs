@@ -58,6 +58,11 @@ pub struct Memory {
     blocks: BTreeMap<u64, MemoryBlock>,
     space_id: SpaceId,
     endian: Endian,
+    /// The raw dynamic relocation table (ELF64 `Elf64_Rela` entries of `.rela.dyn`), kept
+    /// beside the blocks rather than as one so byte scans over the image do not see it.
+    /// In a PIE the pointers in `.data.rel.ro` (vtables, …) are zero in the file and live
+    /// in its `R_*_RELATIVE` addends.
+    dynamic_relocations: Option<Arc<[u8]>>,
 }
 
 impl Memory {
@@ -66,7 +71,18 @@ impl Memory {
             blocks: BTreeMap::new(),
             space_id,
             endian,
+            dynamic_relocations: None,
         }
+    }
+
+    /// Attach the raw `Elf64_Rela` table of the dynamic relocations (see the field).
+    pub fn set_dynamic_relocations(&mut self, table: Arc<[u8]>) {
+        self.dynamic_relocations = Some(table);
+    }
+
+    /// The raw `Elf64_Rela` table of the dynamic relocations, if the loader attached one.
+    pub fn dynamic_relocations(&self) -> Option<&[u8]> {
+        self.dynamic_relocations.as_deref()
     }
 
     pub fn add_block(&mut self, block: MemoryBlock) {

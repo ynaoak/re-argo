@@ -245,6 +245,16 @@ impl BinaryLoader {
                 flags,
             });
 
+            // the dynamic relocations of a 64-bit image, for reading the pointers a PIE's
+            // loader writes (`Memory::dynamic_relocations`)
+            if sh.sh_type == goblin::elf::section_header::SHT_RELA
+                && name == ".rela.dyn"
+                && elf.is_64
+                && let Some(table) = data.get(sh.sh_offset as usize..(sh.sh_offset + sh.sh_size) as usize)
+            {
+                memory.set_dynamic_relocations(Arc::from(table));
+            }
+
             if sh.sh_type == goblin::elf::section_header::SHT_PROGBITS
                 && sh.sh_addr != 0
                 && sh.sh_size > 0

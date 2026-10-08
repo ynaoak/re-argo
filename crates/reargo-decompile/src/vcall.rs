@@ -10,8 +10,9 @@
 //!   is named in the call's comment. The call stays indirect (a derived class may override).
 //!
 //! In a PIE binary the pointers in `.data.rel.ro` are zero in the file and live in
-//! `R_X86_64_RELATIVE` relocations: [`pointer_at`] reads them from `.rela.dyn` (binary
-//! search, `lld` sorts the relative relocations by offset).
+//! `R_X86_64_RELATIVE` relocations: [`pointer_at`] reads them from the dynamic relocation
+//! table the loader keeps beside the memory (`Memory::dynamic_relocations`; binary search,
+//! `lld` sorts the relative relocations by offset).
 
 use reargo_core::address::SpaceId;
 use reargo_core::pcode::{OpCode, VarnodeData};
@@ -24,15 +25,10 @@ const RELA_SIZE: u64 = 24;
 const R_X86_64_RELATIVE: u64 = 8;
 const R_AARCH64_RELATIVE: u64 = 1027;
 
-/// The `.rela.dyn` table, when the binary has one in memory: `(start, entries)`.
-fn rela_table(memory: &Memory) -> Option<(u64, u64)> {
-    let block = memory.blocks().find(|b| b.name == ".rela.dyn" && b.data.is_some())?;
-    Some((block.start, block.size / RELA_SIZE))
-}
-
-fn rela_entry(memory: &Memory, start: u64, i: u64) -> Option<(u64, u64, u64)> {
-    let at = start + i * RELA_SIZE;
-    Some((memory.read_u64(at).ok()?, memory.read_u64(at + 8).ok()?, memory.read_u64(at + 16).ok()?))
+/// Entry `i` of a raw `Elf64_Rela` table: `(r_offset, r_info, r_addend)`.
+fn rela_entry(table: &[u8], i: usize) -> (u64, u64, u64) {
+    let w = |k: usize| u64::from_le_bytes(table[i * 24 + k * 8..i * 24 + k * 8 + 8].try_into().unwrap());
+    (w(0), w(1), w(2))
 }
 
 fn is_relative(info: u64) -> bool {
@@ -43,11 +39,11 @@ fn is_relative(info: u64) -> bool {
 /// The pointer stored at `addr` once the loader applied the relative relocations: the
 /// relocation's addend when one targets `addr`, else the bytes in the file (`None` for 0).
 pub fn pointer_at(memory: &Memory, addr: u64) -> Option<u64> {
-    if let Some((start, n)) = rela_table(memory) {
-        let (mut lo, mut hi) = (0u64, n);
+    if let Some(table) = memory.dynamic_relocations() {
+        let (mut lo, mut hi) = (0usize, table.len() / RELA_SIZE as usize);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let (off, info, addend) = rela_entry(memory, start, mid)?;
+            let (off, info, addend) = rela_entry(table, mid);
             if off == addr {
                 if is_relative(info) {
                     return Some(addend);
@@ -180,7 +176,7 @@ mod tests {
     /// A PIE: `.data.rel.ro` is zero in the file, its pointers are relative relocations.
     fn pie(code: &[u8]) -> Memory {
         let mut mem = Memory::new(SpaceId(1), Endian::Little);
-        mem.add_block(block(".rela.dyn", 0x100, rela(&[(0x2008, 8, 0x1100), (0x2010, 8, 0x1200)]), MemoryFlags::READ));
+        mem.set_dynamic_relocations(Arc::from(rela(&[(0x2008, 8, 0x1100), (0x2010, 8, 0x1200)])));
         let mut text = code.to_vec();
         text.resize(0x300, 0xcc);
         mem.add_block(block(".text", 0x1000, text, MemoryFlags::READ | MemoryFlags::EXECUTE));
