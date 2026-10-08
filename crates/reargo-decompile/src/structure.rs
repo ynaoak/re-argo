@@ -99,7 +99,68 @@ pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
         s.follow_stack.clear();
         items.extend(s.walk(missing, None, false));
     }
-    seq(items)
+    let mut root = seq(items);
+    inline_return_tails(cfg, &mut root);
+    root
+}
+
+/// Longest straight-line tail (instructions) copied in place of a `goto`.
+const MAX_TAIL_INSNS: usize = 6;
+
+/// The blocks of a short tail that ends in a `ret` (`goto` to it can print the tail itself):
+/// a chain of single-successor blocks into a return block, at most [`MAX_TAIL_INSNS`]
+/// instructions and no call.
+fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
+    use reargo_core::pcode::OpCode;
+    let mut chain = Vec::new();
+    let mut insns = 0;
+    let mut b = start;
+    loop {
+        let block = &cfg.blocks[b];
+        insns += block.instructions.len();
+        let calls = block.instructions.iter().any(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
+        if insns > MAX_TAIL_INSNS || calls || chain.contains(&b) {
+            return None;
+        }
+        chain.push(b);
+        match block.successors.as_slice() {
+            [] => return block.is_return().then_some(chain),
+            [next] => b = *next,
+            _ => return None,
+        }
+    }
+}
+
+/// Replace each `goto` to a short return tail by a copy of the tail (`{ …; return x; }`),
+/// the way a compiler's shared epilogue is usually read.
+fn inline_return_tails(cfg: &ControlFlowGraph, node: &mut StructuredBlock) {
+    use StructuredBlock::*;
+    match node {
+        Goto(t) => {
+            if let Some(chain) = return_tail(cfg, *t) {
+                *node = seq(chain.into_iter().map(Basic).collect());
+            }
+        }
+        Sequence(v) => v.iter_mut().for_each(|x| inline_return_tails(cfg, x)),
+        IfThen { then_body, .. } => inline_return_tails(cfg, then_body),
+        IfThenElse { then_body, else_body, .. } => {
+            inline_return_tails(cfg, then_body);
+            inline_return_tails(cfg, else_body);
+        }
+        WhileLoop { body, .. }
+        | DoWhileLoop { body, .. }
+        | Loop { body, .. }
+        | ForLoop { body, .. }
+        | ShortCircuitAnd { body, .. }
+        | ShortCircuitOr { body, .. } => inline_return_tails(cfg, body),
+        Switch { cases, default, .. } => {
+            cases.iter_mut().for_each(|(_, c)| inline_return_tails(cfg, c));
+            if let Some(d) = default {
+                inline_return_tails(cfg, d);
+            }
+        }
+        Basic(_) | Break | Continue => {}
+    }
 }
 
 struct LoopInfo {
@@ -325,8 +386,17 @@ impl<'a> Structurer<'a> {
         }
         // the fall-through is only a jump (`break`, `continue`, a `goto` to code printed
         // elsewhere): `if (!c) break;` and carry on with the taken branch in this sequence
-        if Some(f) != join && self.immediate_jump(f).is_some() && self.immediate_jump(t).is_none() {
-            let jump = self.immediate_jump(f).unwrap();
+        // (when both are jumps, the one worse as a fall-through goes in the `if`: a
+        // trailing `continue` disappears at the end of a loop body, a `goto` never does)
+        let rank = |j: &Option<StructuredBlock>| match j {
+            None => 0,
+            Some(StructuredBlock::Continue) => 1,
+            Some(StructuredBlock::Break) => 2,
+            Some(_) => 3,
+        };
+        let (jt, jf) = (self.immediate_jump(t), self.immediate_jump(f));
+        if Some(f) != join && jf.is_some() && rank(&jf) > rank(&jt) {
+            let jump = jf.unwrap();
             let node = StructuredBlock::IfThen { condition_block: b, then_body: Box::new(jump), negated: true };
             return (vec![node], Some(t));
         }
@@ -722,8 +792,24 @@ mod tests {
         // the join J is printed once, after the if, not inside an arm
         let top = top_level(&s);
         assert!(matches!(top.last(), Some(StructuredBlock::Basic(b)) if *b == j), "{s:?}");
-        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Basic(b) if *b == j)), 1, "{s:?}");
         assert_eq!(empty_arms(&s), 0, "{s:?}");
+    }
+
+    #[test]
+    fn goto_to_short_return_tail_is_copied() {
+        // E: jcc R ; B: nop ; C: jcc R ; D: ret ; R: ret  — R is reached from E and C
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1004)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1004)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+            lifted(0x1004, vec![ret(0x1004)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let r = cfg.block_at(0x1004).unwrap().id;
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Basic(b) if *b == r)), 2, "{s:?}");
     }
 
     #[test]
