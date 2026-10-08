@@ -21,6 +21,9 @@ use reargo_loader::memory::MemoryFlags;
 use reargo_loader::Memory;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::callee_params::CalleeParams;
+use crate::ssa::{SsaFunction, VarId};
+
 const RELA_SIZE: u64 = 24;
 const R_X86_64_RELATIVE: u64 = 8;
 const R_AARCH64_RELATIVE: u64 = 1027;
@@ -156,6 +159,150 @@ pub fn devirtualize_constant_calls(mut instructions: Vec<LiftedInstruction>, mem
     instructions
 }
 
+/// At most this many vtables are looked at for one method.
+const MAX_VTABLES: usize = 8;
+
+/// The vtables (address points: the address of slot 0) that list `entry` as a slot: the
+/// classes `entry` is a virtual method of. A slot is found through the relative relocations
+/// whose addend is `entry` (a PIE), or as the pointer itself in `.data.rel.ro` / `.rodata`;
+/// the address point is where the run of code pointers before it starts, behind the
+/// type_info pointer and an offset-to-top of 0 or a small negative number.
+pub fn this_vtables(memory: &Memory, entry: u64) -> Vec<u64> {
+    let mut slots = Vec::new();
+    if let Some(data) = memory.dynamic_relocations() {
+        for e in data.chunks_exact(RELA_SIZE as usize) {
+            let word = |i: usize| u64::from_le_bytes(e[i * 8..i * 8 + 8].try_into().unwrap());
+            if word(2) == entry && is_relative(word(1)) {
+                slots.push(word(0));
+            }
+        }
+    } else {
+        for b in memory.blocks() {
+            if !(b.name.starts_with(".data.rel.ro") || b.name.starts_with(".rodata")) {
+                continue;
+            }
+            let Some(data) = &b.data else { continue };
+            let skip = ((8 - b.start % 8) % 8) as usize;
+            for (i, w) in data.get(skip..).unwrap_or(&[]).chunks_exact(8).enumerate() {
+                if u64::from_le_bytes(w.try_into().unwrap()) == entry {
+                    slots.push(b.start + skip as u64 + i as u64 * 8);
+                }
+            }
+        }
+    }
+    let mut points = Vec::new();
+    for s in slots {
+        let mut p = s;
+        let mut steps = 0;
+        while steps < 4096 && pointer_at(memory, p - 8).is_some_and(|v| is_code(memory, v)) {
+            p -= 8;
+            steps += 1;
+        }
+        let type_info = pointer_at(memory, p - 8);
+        let offset_to_top = memory.read_u64(p - 16).ok().map(|v| v as i64);
+        let looks_like_vtable = type_info.is_some_and(|t| memory.find_block(t).is_some() && !is_code(memory, t))
+            && offset_to_top.is_some_and(|o| (-0x10_0000..=0).contains(&o));
+        if looks_like_vtable && !points.contains(&p) {
+            points.push(p);
+            if points.len() >= MAX_VTABLES {
+                break;
+            }
+        }
+    }
+    points
+}
+
+/// `v` with register / temporary copies looked through.
+fn strip_copies(ssa: &SsaFunction, mut v: VarId) -> VarId {
+    for _ in 0..16 {
+        match ssa.varnodes[v as usize].def_op.map(|d| &ssa.ops[d]) {
+            Some(op) if op.opcode == OpCode::Copy && op.inputs.len() == 1
+                && ssa.varnodes[op.inputs[0] as usize].data.space != SpaceId::CONST => v = op.inputs[0],
+            _ => break,
+        }
+    }
+    v
+}
+
+/// The vtable byte offset of an indirect call through the vtable of the object `this`
+/// points to on entry (`*(*this + off)`), if `target` is such a slot load.
+fn this_slot(ssa: &SsaFunction, target: VarId, this_reg: &VarnodeData) -> Option<u64> {
+    let def = |v: VarId| ssa.varnodes[v as usize].def_op.map(|d| &ssa.ops[d]);
+    let load = def(strip_copies(ssa, target)).filter(|o| o.opcode == OpCode::Load && o.inputs.len() == 2)?;
+    let addr = strip_copies(ssa, load.inputs[1]);
+    let (vt, off) = match def(addr) {
+        Some(o) if o.opcode == OpCode::IntAdd && o.inputs.len() == 2 => {
+            let c = |v: VarId| {
+                let d = &ssa.varnodes[v as usize].data;
+                (d.space == SpaceId::CONST).then_some(d.offset)
+            };
+            match (c(o.inputs[0]), c(o.inputs[1])) {
+                (None, Some(k)) => (strip_copies(ssa, o.inputs[0]), k),
+                (Some(k), None) => (strip_copies(ssa, o.inputs[1]), k),
+                _ => return None,
+            }
+        }
+        _ => (addr, 0),
+    };
+    let vload = def(vt).filter(|o| o.opcode == OpCode::Load && o.inputs.len() == 2)?;
+    let obj = &ssa.varnodes[strip_copies(ssa, vload.inputs[1]) as usize];
+    (obj.def_op.is_none()
+        && obj.data.space == this_reg.space
+        && obj.data.offset == this_reg.offset
+        && obj.data.size == this_reg.size
+        && off % 8 == 0
+        && off < 0x10000)
+        .then_some(off)
+}
+
+/// Virtual calls on `this` resolved through the vtables of the classes the function is a
+/// method of: the call's slot in each of those vtables holds an implementation of the called
+/// method (the class's own or an override). The first is named in the call's comment
+/// (`SsaFunction::vcall_targets`). When `oracle` analyses them, the call gets the union of
+/// their parameter sets (`SsaFunction::call_params`): every implementation takes the same
+/// parameters, but one may ignore some (a base class's `return false;`), so the union is
+/// the closest to the method's real arity.
+pub fn resolve_this_vcalls(
+    ssa: &mut SsaFunction,
+    memory: &Memory,
+    vtables: &[u64],
+    this_reg: &VarnodeData,
+    oracle: Option<&CalleeParams<'_>>,
+) {
+    let mut found = Vec::new();
+    for op in &ssa.ops {
+        if op.opcode != OpCode::CallInd {
+            continue;
+        }
+        let Some(&t) = op.inputs.first() else { continue };
+        let Some(off) = this_slot(ssa, t, this_reg) else { continue };
+        let mut targets: Vec<u64> = Vec::new();
+        for &p in vtables {
+            if let Some(f) = pointer_at(memory, p + off).filter(|&f| is_code(memory, f))
+                && !targets.contains(&f)
+            {
+                targets.push(f);
+            }
+        }
+        if !targets.is_empty() {
+            found.push((op.address, targets));
+        }
+    }
+    for (at, targets) in found {
+        ssa.vcall_targets.insert(at, targets[0]);
+        if let Some(o) = oracle {
+            let infos: Vec<_> = targets.iter().filter_map(|&f| o.params(f)).collect();
+            if !infos.is_empty() {
+                let info = crate::callee_params::ParamInfo {
+                    mask: infos.iter().fold(0, |m, i| m | i.mask),
+                    complete: infos.len() == targets.len() && infos.iter().all(|i| i.complete),
+                };
+                ssa.call_params.insert(at, info);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +360,65 @@ mod tests {
         let mem = pie(&[0xff, 0x15, 0xfa, 0x1f, 0x00, 0x00]);
         let insns = devirtualize_constant_calls(lift(&mem, 1), &mem);
         assert!(insns[0].ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+
+    /// A class with vtable at 0x2010: slot 0 = the method at 0x1000, slot 1 = 0x1200.
+    fn class_binary() -> Memory {
+        let mut text = vec![0xccu8; 0x300];
+        let m: &[u8] = &[
+            0x48, 0x8b, 0x07, // 0x1000 mov rax, [rdi]
+            0xba, 0x05, 0x00, 0x00, 0x00, // mov edx, 5 (a leftover, not an argument)
+            0xff, 0x50, 0x08, // call [rax+8]
+            0xc3,
+        ];
+        let f1: &[u8] = &[0x89, 0xf0, 0x01, 0xf8, 0xc3]; // 0x1200 mov eax, esi ; add eax, edi ; ret
+        text[..m.len()].copy_from_slice(m);
+        text[0x200..0x200 + f1.len()].copy_from_slice(f1);
+        let mut mem = Memory::new(SpaceId(1), Endian::Little);
+        mem.set_dynamic_relocations(Arc::from(rela(&[(0x2008, 8, 0x2100), (0x2010, 8, 0x1000), (0x2018, 8, 0x1200)])));
+        mem.add_block(block(".text", 0x1000, text, MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.add_block(block(".data.rel.ro", 0x2000, vec![0; 0x120], MemoryFlags::READ | MemoryFlags::WRITE));
+        mem
+    }
+
+    #[test]
+    fn method_finds_its_class_vtable() {
+        assert_eq!(this_vtables(&class_binary(), 0x1000), vec![0x2010]);
+        assert_eq!(this_vtables(&class_binary(), 0x1200), vec![0x2010]);
+        assert!(this_vtables(&class_binary(), 0x1100).is_empty());
+    }
+
+    #[test]
+    fn virtual_call_on_this_takes_the_slot_functions_parameters() {
+        let mem = class_binary();
+        let c = crate::pipeline::decompile(&X86Lifter::new_64(), &mem, 0x1000, "m", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("(*")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi, rsi)"), "{c}");
+        assert!(call.contains("e.g. 0x1200"), "{c}");
+    }
+
+    /// A derived class (vtable at 0x2050) inherits the method and overrides slot 1 with a
+    /// function that also reads `rdx`: the call's arguments are the union.
+    #[test]
+    fn virtual_call_arguments_are_the_union_over_overrides() {
+        let mut mem = class_binary();
+        let mut text = vec![0xccu8; 0x400];
+        let m: &[u8] = &[0x48, 0x8b, 0x07, 0xba, 0x05, 0x00, 0x00, 0x00, 0xff, 0x50, 0x08, 0xc3];
+        text[..m.len()].copy_from_slice(m);
+        text[0x200..0x205].copy_from_slice(&[0x89, 0xf0, 0x01, 0xf8, 0xc3]);
+        text[0x300..0x303].copy_from_slice(&[0x89, 0xd0, 0xc3]); // 0x1300 mov eax, edx ; ret
+        mem.add_block(block(".text", 0x1000, text, MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.set_dynamic_relocations(Arc::from(rela(&[
+            (0x2008, 8, 0x2100),
+            (0x2010, 8, 0x1000),
+            (0x2018, 8, 0x1200),
+            (0x2048, 8, 0x2100),
+            (0x2050, 8, 0x1000),
+            (0x2058, 8, 0x1300),
+        ])));
+        assert_eq!(this_vtables(&mem, 0x1000), vec![0x2010, 0x2050]);
+        let c = crate::pipeline::decompile(&X86Lifter::new_64(), &mem, 0x1000, "m", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("(*")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi, rsi, "), "{c}");
     }
 }

@@ -1009,7 +1009,8 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
         }
         let block = op.block;
         // WS78: the callee's own parameter set, when its code could be analysed
-        let params = if op.opcode == OpCode::Call { func.call_params.get(&op.address).copied() } else { None };
+        // (an indirect call has one when its target was resolved, `vcall`)
+        let params = func.call_params.get(&op.address).copied();
         let inputs = func.ops[i].inputs.clone();
         // what each argument register holds at the call (`None`: nothing usable)
         let values: Vec<Option<ArgValue>> = inputs

@@ -806,6 +806,15 @@ impl<'a> CEmitter<'a> {
                 let assign = call_result(func, op)
                     .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
                     .unwrap_or_default();
+                // WS79: an implementation of the slot, from the vtable of a class the function
+                // is a method of
+                let ann = match func.vcall_targets.get(&op.address) {
+                    Some(t) => {
+                        let name = self.symbol_names.get(t).cloned().unwrap_or_else(|| format!("0x{t:x}"));
+                        if ann.is_empty() { format!("  // e.g. {name}") } else { format!("{ann} e.g. {name}") }
+                    }
+                    None => ann,
+                };
                 Some(format!("{assign}(*{})({});{}", target, args.join(", "), ann))
             }
             OpCode::Return => match return_value(func, op) {

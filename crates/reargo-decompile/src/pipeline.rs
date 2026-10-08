@@ -50,7 +50,37 @@ pub fn decompile(
     let call_returns = callee_return_map(&trimmed, oracle.as_ref());
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own)
+    let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
+    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own, vcalls)
+}
+
+/// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
+struct ThisVcalls<'a> {
+    memory: &'a Memory,
+    vtables: Vec<u64>,
+    this_reg: reargo_core::pcode::VarnodeData,
+    oracle: Option<&'a CalleeParams<'a>>,
+}
+
+impl<'a> ThisVcalls<'a> {
+    /// `None` when the function makes no indirect call or is no virtual method of a class.
+    fn new(
+        lifter: &dyn PcodeLift,
+        memory: &'a Memory,
+        entry: u64,
+        instructions: &[LiftedInstruction],
+        oracle: Option<&'a CalleeParams<'a>>,
+    ) -> Option<Self> {
+        let has_vcall = instructions
+            .iter()
+            .any(|i| i.ops.iter().any(|o| o.opcode == reargo_core::pcode::OpCode::CallInd));
+        if !has_vcall {
+            return None;
+        }
+        let this_reg = *lifter.call_convention()?.args.first()?;
+        let vtables = crate::vcall::this_vtables(memory, entry);
+        (!vtables.is_empty()).then_some(Self { memory, vtables, this_reg, oracle })
+    }
 }
 
 /// The function's own parameters (WS78): what the callee analysis finds for its entry,
@@ -248,6 +278,7 @@ fn decompile_function_inner(
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle);
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
+    let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
 
     build_decompile_result(
         terminated,
@@ -259,6 +290,7 @@ fn decompile_function_inner(
         call_renderings,
         call_params,
         own,
+        vcalls,
     )
 }
 
@@ -644,6 +676,7 @@ fn build_decompile_result(
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
     call_params: rustc_hash::FxHashMap<u64, ParamInfo>,
     own_params: Option<(ParamInfo, Vec<reargo_core::pcode::VarnodeData>)>,
+    vcalls: Option<ThisVcalls<'_>>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -658,6 +691,9 @@ fn build_decompile_result(
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
     ssa.call_params = call_params;
+    if let Some(v) = &vcalls {
+        crate::vcall::resolve_this_vcalls(&mut ssa, v.memory, &v.vtables, &v.this_reg, v.oracle);
+    }
     // `apply_call_convention` ran: calls carry the convention's argument registers.
     ssa.implicit_call_args = ssa
         .ops
