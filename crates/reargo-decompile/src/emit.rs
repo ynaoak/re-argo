@@ -1042,7 +1042,12 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
         return_value(func, op).is_some()
     });
 
-    let return_type = if has_return_value { "uint64_t" } else { "void" };
+    let return_type = match (has_return_value, func.return_float) {
+        (false, _) => "void",
+        (true, Some(4)) => "float",
+        (true, Some(_)) => "double",
+        (true, None) => "uint64_t",
+    };
 
     // WS78: the parameters the analysis of the function's entry found, named like the
     // registers the body reads (`rdi`, `xmm0`)

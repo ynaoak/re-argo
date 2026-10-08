@@ -849,7 +849,12 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
         crate::emit::return_value(func, op).is_some()
     });
 
-    let return_type = if has_return_value { Some("u64") } else { None };
+    let return_type = match (has_return_value, func.return_float) {
+        (false, _) => None,
+        (true, Some(4)) => Some("f32"),
+        (true, Some(_)) => Some("f64"),
+        (true, None) => Some("u64"),
+    };
 
     // WS78: see `emit::infer_signature`
     if let Some(regs) = &func.signature_params {

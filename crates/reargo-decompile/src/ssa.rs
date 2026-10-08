@@ -71,6 +71,9 @@ pub struct SsaFunction {
     /// The function's own parameter registers in convention order (WS78), when the
     /// calling convention is known; the emitters' signature. `None`: use the old guess.
     pub signature_params: Option<Vec<VarnodeData>>,
+    /// The function returns a float in `xmm0` of this many bytes (4 = `float`, 8 =
+    /// `double`) rather than an integer in `rax` (WS79, `pipeline::choose_return_register`).
+    pub return_float: Option<u32>,
 }
 
 impl SsaFunction {
@@ -100,6 +103,7 @@ impl SsaFunction {
             implicit_call_args: false,
             call_params: FxHashMap::default(),
             signature_params: None,
+            return_float: None,
         };
         func.build_ssa();
         func

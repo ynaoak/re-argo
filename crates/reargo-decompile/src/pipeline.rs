@@ -260,12 +260,13 @@ fn apply_call_convention(
         return instructions;
     };
     // WS77: a `ret` lifts to `RETURN(target)` — the popped return address, not the value. Give
-    // it the convention's integer return register as a second input so the value reaching the
-    // `ret` is live and the emitter can print it (`emit::return_value`).
-    if let Some((rv, _)) = cc.returns.first() {
+    // it the convention's return registers (`rax`, then `xmm0`) as further inputs so the value
+    // reaching the `ret` is live and the emitter can print it (`emit::return_value`);
+    // `choose_return_register` keeps the one the function returns in (WS79).
+    if !cc.returns.is_empty() {
         for op in instructions.iter_mut().flat_map(|i| i.ops.iter_mut()) {
             if op.opcode == OpCode::Return && op.inputs.len() == 1 {
-                op.inputs.push(*rv);
+                op.inputs.extend(cc.returns.iter().map(|(r, _)| *r));
             }
         }
     }
@@ -316,6 +317,128 @@ fn apply_call_convention(
         }
     }
     instructions
+}
+
+/// What the function last wrote into a return register before a `ret` (WS79).
+#[derive(Debug, Clone, Copy, Default)]
+struct RetEvidence {
+    /// The function itself computed the value (not the entry value, a call's result or a
+    /// call's clobber).
+    written: bool,
+    /// Address of the latest such write.
+    addr: u64,
+    /// Size of that write once the register views are looked through (`xmm0_d` = 4).
+    size: u32,
+}
+
+/// The value `v` holds at a `ret`, looking through the lifter's view syncs (`xmm0 =
+/// PIECE(hi, xmm0_q)`), register copies (`movaps xmm0, xmm1`) and φ-nodes.
+fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate::ssa::VarId>) -> RetEvidence {
+    use reargo_core::pcode::OpCode;
+    if seen.contains(&v) || seen.len() > 64 {
+        return RetEvidence::default();
+    }
+    seen.push(v);
+    let vn = &ssa.varnodes[v as usize];
+    let Some(d) = vn.def_op else { return RetEvidence::default() };
+    let op = &ssa.ops[d];
+    let reg = |x: crate::ssa::VarId| ssa.varnodes[x as usize].data.space == reargo_core::address::SpaceId::REGISTER;
+    match op.opcode {
+        OpCode::Indirect => RetEvidence::default(),
+        OpCode::MultiEqual => {
+            let mut best = RetEvidence::default();
+            for &i in &op.inputs {
+                let e = return_evidence(ssa, i, seen);
+                if e.written && (!best.written || e.addr > best.addr) {
+                    best = e;
+                }
+            }
+            best
+        }
+        OpCode::Piece if op.inputs.len() == 2 && {
+            let lo = &ssa.varnodes[op.inputs[1] as usize].data;
+            lo.space == vn.data.space && lo.offset == vn.data.offset && lo.size < vn.data.size
+        } => return_evidence(ssa, op.inputs[1], seen),
+        OpCode::Copy if op.inputs.len() == 1 && reg(op.inputs[0]) && {
+            let src = &ssa.varnodes[op.inputs[0] as usize].data;
+            src.size == vn.data.size && src.offset != vn.data.offset
+        } => {
+            let e = return_evidence(ssa, op.inputs[0], seen);
+            RetEvidence { addr: e.addr.max(op.address), ..e }
+        }
+        _ => RetEvidence { written: true, addr: op.address, size: vn.data.size },
+    }
+}
+
+/// Which register does the function return its value in (WS79)? Every `RETURN` carries the
+/// convention's return registers (`RETURN(target, rax, xmm0)`, see `apply_call_convention`).
+/// A `ret` votes for `xmm0` when the function wrote a scalar float into it (a 4- or 8-byte
+/// `xmm0_d` / `xmm0_q` value — a full-width `xorps xmm0, xmm0` or `movups` of memory is no
+/// evidence) later than it last wrote `rax`; for `rax` when it wrote `rax` last. `xmm0`
+/// wins only when some `ret` votes for it and none for `rax`. The losing register is
+/// removed from every `RETURN`, so its computation is not kept alive. Returns the float
+/// size when `xmm0` won.
+fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
+    use reargo_core::pcode::OpCode;
+    let rets: Vec<usize> = ssa
+        .ops
+        .iter()
+        .filter(|o| o.opcode == OpCode::Return && o.inputs.len() == 3)
+        .map(|o| o.index)
+        .collect();
+    if rets.is_empty() {
+        return None;
+    }
+    let (mut float_votes, mut int_votes, mut size) = (0, 0, 0u32);
+    for &r in &rets {
+        let (iv, fv) = (ssa.ops[r].inputs[1], ssa.ops[r].inputs[2]);
+        let i = return_evidence(ssa, iv, &mut Vec::new());
+        let f = return_evidence(ssa, fv, &mut Vec::new());
+        let f_scalar = f.written && (f.size == 4 || f.size == 8);
+        if f_scalar && (!i.written || f.addr > i.addr) {
+            float_votes += 1;
+            size = size.max(f.size);
+        } else if i.written {
+            int_votes += 1;
+        }
+    }
+    let float = float_votes > 0 && int_votes == 0;
+    let drop = if float { 1 } else { 2 };
+    for &r in &rets {
+        let v = ssa.ops[r].inputs.remove(drop);
+        unuse(ssa, v, r);
+        if float {
+            // return the scalar view (`xmm0_d`) the value was computed in, not the
+            // whole register rebuilt from it
+            let mut x = ssa.ops[r].inputs[1];
+            while let Some(d) = ssa.varnodes[x as usize].def_op
+                && ssa.ops[d].opcode == OpCode::Piece
+                && ssa.ops[d].inputs.len() == 2
+                && ssa.varnodes[x as usize].data.size > size
+            {
+                let lo = ssa.ops[d].inputs[1];
+                let (lv, xv) = (&ssa.varnodes[lo as usize].data, &ssa.varnodes[x as usize].data);
+                if lv.space != xv.space || lv.offset != xv.offset {
+                    break;
+                }
+                x = lo;
+            }
+            if ssa.varnodes[x as usize].data.size == size && x != ssa.ops[r].inputs[1] {
+                let old = std::mem::replace(&mut ssa.ops[r].inputs[1], x);
+                unuse(ssa, old, r);
+                ssa.varnodes[x as usize].uses.push(r);
+            }
+        }
+    }
+    float.then_some(size)
+}
+
+/// Drop one use of `v` by op `r`.
+fn unuse(ssa: &mut SsaFunction, v: crate::ssa::VarId, r: usize) {
+    let uses = &mut ssa.varnodes[v as usize].uses;
+    if let Some(p) = uses.iter().position(|&u| u == r) {
+        uses.remove(p);
+    }
 }
 
 /// The argument registers that are the function's parameters: those the analysis of its
@@ -477,6 +600,7 @@ fn build_decompile_result(
             .iter()
             .any(|o| matches!(o.opcode, reargo_core::pcode::OpCode::Call | reargo_core::pcode::OpCode::CallInd) && o.inputs.len() > 1);
 
+    ssa.return_float = choose_return_register(&mut ssa);
     let opt_stats = run_optimization_passes(&mut ssa);
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
@@ -1031,6 +1155,48 @@ mod tests {
 {c}");
         assert!(!ret.contains("tmp_"), "the return address is not the value: {ret}
 {c}");
+    }
+
+    fn c_of(code: &[u8]) -> String {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(code, 0x1000);
+        decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code
+    }
+
+    /// WS79: a scalar float computed into `xmm0` last is the return value.
+    #[test]
+    fn float_return_in_xmm0() {
+        // mov eax, 5 (scratch) ; cvtsi2ss xmm0, edi ; addss xmm0, xmm0 ; ret
+        let c = c_of(&[0xb8, 0x05, 0, 0, 0, 0xf3, 0x0f, 0x2a, 0xc7, 0xf3, 0x0f, 0x58, 0xc0, 0xc3]);
+        assert!(c.contains("float f("), "{c}");
+        let ret = c.lines().find(|l| l.trim_start().starts_with("return")).unwrap();
+        assert!(ret.contains("xmm0_d"), "{ret}
+{c}");
+        assert!(!c.contains("rax ="), "the scratch rax write is dead: {c}");
+    }
+
+    #[test]
+    fn double_return_in_xmm0() {
+        // cvtsi2sd xmm0, edi ; mulsd xmm0, xmm0 ; ret
+        let c = c_of(&[0xf2, 0x0f, 0x2a, 0xc7, 0xf2, 0x0f, 0x59, 0xc0, 0xc3]);
+        assert!(c.contains("double f("), "{c}");
+        assert!(c.contains("return xmm0_q;"), "{c}");
+    }
+
+    /// An integer written after the last float write is the return value.
+    #[test]
+    fn int_written_after_float_returns_int() {
+        // cvtsi2ss xmm0, edi ; mov eax, 1 ; ret
+        let c = c_of(&[0xf3, 0x0f, 0x2a, 0xc7, 0xb8, 0x01, 0, 0, 0, 0xc3]);
+        assert!(c.contains("uint64_t f("), "{c}");
+    }
+
+    /// Zeroing memory through `xmm0` (`xorps` + `movups`) does not make a float return.
+    #[test]
+    fn xmm0_zeroing_is_not_a_float_return() {
+        // xorps xmm0, xmm0 ; movups [rdi], xmm0 ; ret
+        let c = c_of(&[0x0f, 0x57, 0xc0, 0x0f, 0x11, 0x07, 0xc3]);
+        assert!(c.contains("void f("), "{c}");
     }
 
     /// WS77: a function that never sets `rax` returns nothing.
