@@ -43,7 +43,7 @@ pub fn decompile(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
 
-    let trimmed = trim_to_return(lifted);
+    let trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
     let oracle = CalleeParams::new(lifter, memory);
     let call_params = callee_param_map(&trimmed, oracle.as_ref());
     let own = own_params(oracle.as_ref(), entry);
@@ -243,6 +243,7 @@ fn decompile_function_inner(
     } else {
         trim_to_return(lifted)
     };
+    let terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
     let call_params = callee_param_map(&terminated, oracle);
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle);
@@ -1051,6 +1052,26 @@ mod tests {
     }
 
     /// Code blobs at their addresses inside one `0xcc`-filled block.
+    /// WS79: `lea rax, [vtbl]; call [rax+8]` calls the function in the vtable's slot: a
+    /// direct call with that callee's parameters and return register.
+    #[test]
+    fn call_through_constant_vtable_becomes_direct() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x48, 0x8d, 0x05, 0xf9, 0x0f, 0x00, 0x00, // 0x1000 lea rax, [0x2000]
+            0xbf, 0x07, 0x00, 0x00, 0x00, // 0x1007 mov edi, 7
+            0xff, 0x50, 0x08, // 0x100c call [rax+8]
+            0xf3, 0x0f, 0x11, 0x05, 0xe9, 0x1f, 0x00, 0x00, // 0x100f movss [0x3000], xmm0
+            0xc3, // 0x1017
+        ];
+        let callee: &[u8] = &[0xf3, 0x0f, 0x2a, 0xc7, 0xc3]; // cvtsi2ss xmm0, edi ; ret
+        let vtbl: &[u8] = &[0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0, 0, 0, 0, 0, 0];
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, callee), (0x2000, vtbl)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call_line = c.lines().find(|l| l.contains("0x1100(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call_line.trim_start().starts_with("xmm0 = 0x1100(rdi)"), "{c}");
+    }
+
     fn make_memory_parts(parts: &[(u64, &[u8])]) -> Memory {
         let base = parts.iter().map(|p| p.0).min().unwrap();
         let end = parts.iter().map(|p| p.0 + p.1.len() as u64).max().unwrap();

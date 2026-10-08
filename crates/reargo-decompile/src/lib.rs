@@ -18,6 +18,7 @@ pub mod taint;
 pub mod token;
 pub mod typeinfer;
 pub mod varrecovery;
+pub mod vcall;
 
 pub use pipeline::{analyze_taint, decompile, decompile_all, decompile_function, DecompileResult, DecompileStats, TaintReport};
 pub use semantic_diff::{compare_programs, structural_hash, exact_hash, FunctionDiff, FunctionDiffKind};
