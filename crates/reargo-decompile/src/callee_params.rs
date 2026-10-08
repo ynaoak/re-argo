@@ -125,24 +125,20 @@ impl<'a> CalleeParams<'a> {
         if self.returns.len() < 2 {
             return ReturnKind::Unknown;
         }
-        if let Some(r) = self.ret_memo.lock().ok().and_then(|m| m.get(&(target, depth_left)).copied()) {
+        let memo = |s: &Self| s.ret_memo.lock().ok().and_then(|m| m.get(&(target, depth_left)).copied());
+        if let Some(r) = memo(self) {
             return r;
         }
-        let r = self.analyze_return(target, depth_left);
-        if let Ok(mut m) = self.ret_memo.lock() {
-            m.insert((target, depth_left), r);
-        }
-        r
+        // the parameter analysis lifts the body once and answers this too
+        self.params_at(target, depth_left);
+        memo(self).unwrap_or(ReturnKind::Unknown)
     }
 
-    fn analyze_return(&self, target: u64, depth_left: u32) -> ReturnKind {
-        let Ok(lifted) = self.lifter.lift_range(self.memory, target, MAX_INSNS) else {
-            return ReturnKind::Unknown;
-        };
-        if lifted.is_empty() || lifted[0].address != target {
+    /// The return register of a lifted body (see `return_kind`).
+    fn return_kind_of(&self, cfg: &ControlFlowGraph, depth_left: u32) -> ReturnKind {
+        if self.returns.len() < 2 {
             return ReturnKind::Unknown;
         }
-        let cfg = ControlFlowGraph::build_owned(crate::pipeline::trim_to_return(lifted));
         let (int_reg, float_reg) = (self.returns[0], self.returns[1]);
         let mut kinds = Vec::new();
         for b in 0..cfg.blocks.len() {
@@ -227,6 +223,10 @@ impl<'a> CalleeParams<'a> {
         // the body runs past the lift limit (its last lifted instruction is live)
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
         let cfg = ControlFlowGraph::build_owned(insns);
+        let kind = self.return_kind_of(&cfg, depth_left);
+        if let Ok(mut m) = self.ret_memo.lock() {
+            m.insert((target, depth_left), kind);
+        }
         let n = cfg.blocks.len();
         let rpo = crate::dominator::reverse_post_order(&cfg);
 
