@@ -752,10 +752,13 @@ impl<'a> CEmitter<'a> {
                 // (e.g. `printf("hello %d\n", 42)`). When present,
                 // use it; otherwise fall back to the bare
                 // `<callee>@plt()` stub from the symbol table.
+                let assign = call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
                 if let Some(renderings) = self.call_renderings
                     && let Some(rendering) = renderings.get(&op.address)
                 {
-                    return Some(format!("{};", rendering));
+                    return Some(format!("{assign}{};", rendering));
                 }
                 let target_expr = self.input_expr(func, op, 0);
                 let call_name = if let Some(target_vn) = op.inputs.first() {
@@ -768,7 +771,7 @@ impl<'a> CEmitter<'a> {
                     target_expr
                 };
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("{}({});", call_name, args.join(", ")))
+                Some(format!("{assign}{}({});", call_name, args.join(", ")))
             }
             OpCode::Indirect => {
                 // a call's return register, or a caller-saved register it clobbers
@@ -780,6 +783,8 @@ impl<'a> CEmitter<'a> {
                 });
                 if clobber {
                     Some(format!("{} = __clobbered;  // by {}", dst, self.input_expr(func, op, 0)))
+                } else if is_merged_call_result(func, op) {
+                    None // printed as `dst = call(…)`
                 } else {
                     Some(format!("{} = __ret;  // of {}", dst, self.input_expr(func, op, 0)))
                 }
@@ -798,7 +803,10 @@ impl<'a> CEmitter<'a> {
                     .map(|off| format!("  // vfn[{}] (vtable+0x{:x})", off / 8, off))
                     .unwrap_or_default();
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("(*{})({});{}", target, args.join(", "), ann))
+                let assign = call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
+                Some(format!("{assign}(*{})({});{}", target, args.join(", "), ann))
             }
             OpCode::Return => match return_value(func, op) {
                 Some(i) => Some(format!("return {};", self.input_expr(func, op, i))),
@@ -934,6 +942,71 @@ impl<'a> CEmitter<'a> {
     }
 }
 
+
+/// The register a call's result is used in, when exactly one of the return registers the
+/// call defines (its non-clobber `INDIRECT`s, right after it) is still live (WS79): the
+/// caller's use decides which register the callee returned in, and the call prints as
+/// `xmm0 = f(…)` instead of `f(…); xmm0 = __ret;`.
+pub(crate) fn call_result(func: &SsaFunction, call: &crate::ssa::SsaOp) -> Option<crate::ssa::VarId> {
+    let live: Vec<crate::ssa::VarId> = func.ops[call.index + 1..]
+        .iter()
+        .take_while(|o| o.address == call.address && o.block == call.block)
+        .filter(|o| o.opcode == OpCode::Indirect && !o.dead && !is_clobber(func, o))
+        .filter_map(|o| o.output)
+        .collect();
+    match live.as_slice() {
+        [v] => Some(*v),
+        // both `rax` and `xmm0` look live: the one whose value is really read (not only the
+        // upper lanes the lifter carries over when a later scalar write rebuilds the register)
+        [_, _, ..] => {
+            let real: Vec<_> = live.iter().copied().filter(|&v| really_used(func, v, 0)).collect();
+            (real.len() == 1).then(|| real[0])
+        }
+        [] => None,
+    }
+}
+
+/// Is the value of `v` read by something other than the lifter's register view syncs (a
+/// `SUBPIECE` of its upper bytes, the high half of a `PIECE`)?
+fn really_used(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> bool {
+    if depth > 4 {
+        return true;
+    }
+    func.varnodes[v as usize].uses.iter().any(|&u| {
+        let op = &func.ops[u];
+        if op.dead {
+            return false;
+        }
+        match op.opcode {
+            OpCode::Subpiece => {
+                let k = op.inputs.get(1).map(|&c| func.varnodes[c as usize].data);
+                match k {
+                    Some(k) if k.space == SpaceId::CONST && k.offset > 0 => false,
+                    _ => op.output.is_some_and(|o| really_used(func, o, depth + 1)),
+                }
+            }
+            OpCode::Piece => op.inputs.get(1) == Some(&v),
+            _ => true,
+        }
+    })
+}
+
+fn is_clobber(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    op.inputs.get(1).is_some_and(|&v| {
+        let d = &func.varnodes[v as usize].data;
+        d.space == SpaceId::CONST && d.offset == crate::pipeline::CLOBBER_MARK
+    })
+}
+
+/// Is `op` (a call's return `INDIRECT`) printed as part of its call (`call_result`)?
+pub(crate) fn is_merged_call_result(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    let call = func.ops[..op.index]
+        .iter()
+        .rev()
+        .take_while(|o| o.address == op.address && o.block == op.block)
+        .find(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd) && !o.dead);
+    call.is_some_and(|c| call_result(func, c) == op.output)
+}
 
 /// `cond` inverted when `negated`: `!x` for a plain name, `!(…)` otherwise.
 pub(crate) fn negate_condition(cond: String, negated: bool) -> String {

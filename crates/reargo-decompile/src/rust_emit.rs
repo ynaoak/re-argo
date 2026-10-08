@@ -690,10 +690,13 @@ impl<'a> RustEmitter<'a> {
                 // the C emitter — see emit.rs for the rationale.
                 // We strip the `@plt` suffix the symbol table uses
                 // since Rust identifiers can't contain `@`.
+                let assign = crate::emit::call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
                 if let Some(renderings) = self.call_renderings
                     && let Some(rendering) = renderings.get(&op.address)
                 {
-                    return Some(format!("{};", rendering));
+                    return Some(format!("{assign}{};", rendering));
                 }
                 let target_expr = self.input_expr(func, op, 0);
                 let call_name = if let Some(target_vn) = op.inputs.first() {
@@ -706,12 +709,15 @@ impl<'a> RustEmitter<'a> {
                     target_expr
                 };
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("{}({});", call_name, args.join(", ")))
+                Some(format!("{assign}{}({});", call_name, args.join(", ")))
             }
             OpCode::CallInd => {
                 let target = self.input_expr(func, op, 0);
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("(*{})({});", target, args.join(", ")))
+                let assign = crate::emit::call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
+                Some(format!("{assign}(*{})({});", target, args.join(", ")))
             }
             OpCode::Indirect => {
                 // a call's return register, or a caller-saved register it clobbers
@@ -723,6 +729,8 @@ impl<'a> RustEmitter<'a> {
                 });
                 if clobber {
                     Some(format!("{} = __clobbered; // by {}", dst, self.input_expr(func, op, 0)))
+                } else if crate::emit::is_merged_call_result(func, op) {
+                    None
                 } else {
                     Some(format!("{} = __ret; // of {}", dst, self.input_expr(func, op, 0)))
                 }

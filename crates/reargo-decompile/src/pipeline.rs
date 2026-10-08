@@ -884,8 +884,26 @@ mod tests {
         let call_line = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
         assert!(call_line.contains("rdi") && !call_line.contains("rsi"), "{call_line}");
         assert!(c.contains("edi = 5"), "{c}");
-        // the store reads the call's result
-        assert!(c.contains("__ret"), "{c}");
+        // the store reads the call's result (WS79: printed as the call's assignment)
+        assert!(call_line.trim_start().starts_with("rax = "), "{c}");
+        assert!(!c.contains("__ret"), "{c}");
+    }
+
+    /// WS79: an unknown callee whose `xmm0` is only carried over by a later scalar write
+    /// (the lifter's upper-lane sync) returns in `rax`, the register the caller reads.
+    #[test]
+    fn indirect_call_result_is_the_register_really_read() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xff, 0x17, // 0x1000 call [rdi]
+            0xf3, 0x0f, 0x2a, 0xc0, // 0x1002 cvtsi2ss xmm0, eax (keeps xmm0's upper lanes)
+            0xff, 0x15, 0x04, 0x20, 0x00, 0x00, // 0x1006 call [0x3010] (xmm0 is its argument)
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call_line = c.lines().find(|l| l.contains("(*tmp_500)")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call_line.trim_start().starts_with("rax = "), "{c}");
     }
 
     /// WS76: a caller-saved register read after a call is the call's clobber, not the value it
