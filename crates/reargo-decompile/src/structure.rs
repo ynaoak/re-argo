@@ -395,8 +395,10 @@ impl<'a> Structurer<'a> {
             Some(_) => 3,
         };
         let (jt, jf) = (self.immediate_jump(t), self.immediate_jump(f));
-        if Some(f) != join && jf.is_some() && rank(&jf) > rank(&jt) {
-            let jump = jf.unwrap();
+        if Some(f) != join
+            && rank(&jf) > rank(&jt)
+            && let Some(jump) = jf
+        {
             let node = StructuredBlock::IfThen { condition_block: b, then_body: Box::new(jump), negated: true };
             return (vec![node], Some(t));
         }
