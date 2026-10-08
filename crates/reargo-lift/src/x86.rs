@@ -1126,13 +1126,32 @@ impl X86Lifter {
             }
 
             Jmp => {
-                let target = insn.near_branch_target();
-                ops.push(PcodeOp {
-                    opcode: OpCode::Branch,
-                    seq: seq(seq_base),
-                    output: None,
-                    inputs: SmallVec::from_slice(&[ram(target, ps)]),
-                });
+                // `jmp rel` -> BRANCH to the target; `jmp reg` / `jmp [mem]` (a jump
+                // table, a PLT stub, a tail call through a vtable) -> BRANCHIND on the
+                // target operand. The indirect forms used to become `BRANCH 0x0`
+                // (`near_branch_target()` is 0 for them): the jump vanished from the
+                // decompile and the block looked like it fell off into address 0.
+                use iced_x86::OpKind;
+                if matches!(
+                    insn.op_kind(0),
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                ) {
+                    let target = insn.near_branch_target();
+                    ops.push(PcodeOp {
+                        opcode: OpCode::Branch,
+                        seq: seq(seq_base),
+                        output: None,
+                        inputs: SmallVec::from_slice(&[ram(target, ps)]),
+                    });
+                } else {
+                    let target = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                    ops.push(PcodeOp {
+                        opcode: OpCode::BranchInd,
+                        seq: seq(seq_base),
+                        output: None,
+                        inputs: SmallVec::from_slice(&[target]),
+                    });
+                }
             }
 
             Je => {
@@ -2678,6 +2697,28 @@ mod tests {
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
         assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::Load));
         assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::CallInd));
+    }
+
+    #[test]
+    fn lift_indirect_jmp_is_branchind() {
+        let lifter = X86Lifter::new_64();
+        // jmp rax = ff e0
+        let mem = make_memory(&[0xff, 0xe0], 0x1000);
+        let l = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let j = l.ops.iter().find(|o| o.opcode == OpCode::BranchInd).expect("BRANCHIND");
+        assert_eq!((j.inputs[0].space, j.inputs[0].offset), (REG_SPACE, 0x00)); // rax
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::Branch), "{:?}", l.ops);
+        // jmp [rip+0x1000] = ff 25 00 10 00 00 (a PLT stub): through a load of 0x2006
+        let mem = make_memory(&[0xff, 0x25, 0x00, 0x10, 0x00, 0x00], 0x1000);
+        let l = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Load));
+        assert!(l.ops.iter().any(|o| o.opcode == OpCode::BranchInd));
+        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::Branch), "{:?}", l.ops);
+        // jmp rel32 stays a direct BRANCH
+        let mem = make_memory(&[0xe9, 0x00, 0x01, 0x00, 0x00], 0x1000);
+        let l = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        let b = l.ops.iter().find(|o| o.opcode == OpCode::Branch).unwrap();
+        assert_eq!(b.inputs[0].offset, 0x1105);
     }
 
     #[test]

@@ -149,22 +149,27 @@ impl<'a> CEmitter<'a> {
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
         self.indent += 1;
-        self.emit_var_declarations(func);
+        let params: std::collections::BTreeSet<&str> = sig.params.iter().map(|(_, n)| n.as_str()).collect();
+        self.emit_var_declarations(func, &params);
         self.emit_block(func, structured);
         self.indent -= 1;
         self.line("}");
         self.output.clone()
     }
 
-    fn emit_var_declarations(&mut self, func: &SsaFunction) {
+    fn emit_var_declarations(&mut self, func: &SsaFunction, params: &std::collections::BTreeSet<&str>) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some() {
+            // only registers the body assigns: a dead definition (most of a call's clobbers,
+            // view syncs nobody reads) is not printed, so declaring it is noise
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead) {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
                     let var_name = reg_name(vn.data.offset, vn.data.size);
-                    linef!(self, "{} {};", type_name, var_name);
+                    if !params.contains(var_name.as_str()) {
+                        linef!(self, "{} {};", type_name, var_name);
+                    }
                 }
             }
         }
@@ -764,6 +769,16 @@ impl<'a> CEmitter<'a> {
             },
             OpCode::Branch => None,
             OpCode::CBranch => None,
+            OpCode::BranchInd => {
+                // jump table / PLT stub / tail call through a function pointer
+                let ann = op
+                    .inputs
+                    .first()
+                    .and_then(|&t| self.vcall_vtable_offset(func, t))
+                    .map(|off| format!("  // vfn[{}] (vtable+0x{:x})", off / 8, off))
+                    .unwrap_or_else(|| "  // indirect jump".into());
+                Some(format!("goto *{};{}", self.input_expr(func, op, 0), ann))
+            }
             OpCode::CallOther => {
                 // The lifter tags CallOther via its first const input: 3 = int3
                 // (a real breakpoint/trap), 0x100+ = a named intrinsic (a known
@@ -967,6 +982,18 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
 
     let return_type = if has_return_value { "uint64_t" } else { "void" };
 
+    // WS78: the parameters the analysis of the function's entry found, named like the
+    // registers the body reads (`rdi`, `xmm0`)
+    if let Some(regs) = &func.signature_params {
+        return FunctionSignature {
+            return_type,
+            params: regs
+                .iter()
+                .map(|r| (size_to_type(r.size).to_string(), reg_name(r.offset, r.size)))
+                .collect(),
+        };
+    }
+
     let param_regs: &[(u64, &str)] = &[
         (0x08, "param_1"),  // RCX (Win) / RDI (SysV) - simplified
         (0x10, "param_2"),  // RDX / RSI
@@ -1029,6 +1056,23 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x30, 4) => "esi".into(),
         (0x38, 8) => "rdi".into(),
         (0x38, 4) => "edi".into(),
+        // the 16/8-bit views of rcx..rdi (WS78): they used to fall through to `var_<off>`,
+        // so `bp` and `bpl` both became `var_28` (two declarations of one name, and a name
+        // that reads like a stack local)
+        (0x08, 2) => "cx".into(),
+        (0x08, 1) => "cl".into(),
+        (0x10, 2) => "dx".into(),
+        (0x10, 1) => "dl".into(),
+        (0x18, 2) => "bx".into(),
+        (0x18, 1) => "bl".into(),
+        (0x20, 2) => "sp".into(),
+        (0x20, 1) => "spl".into(),
+        (0x28, 2) => "bp".into(),
+        (0x28, 1) => "bpl".into(),
+        (0x30, 2) => "si".into(),
+        (0x30, 1) => "sil".into(),
+        (0x38, 2) => "di".into(),
+        (0x38, 1) => "dil".into(),
         // r8..r15 (offsets 0x80..0xB8): r12-r15 used to fall through to
         // `var_a0`..`var_b8`, indistinguishable from stack locals.
         (off, sz) if (0x80..0xC0).contains(&off) && off % 8 == 0 => {
@@ -1064,6 +1108,8 @@ fn size_to_type(size: u32) -> &'static str {
         2 => "uint16_t",
         4 => "uint32_t",
         8 => "uint64_t",
+        // an XMM register / 128-bit memory access (it printed `void xmm0;`, `*(void*)p = ..`)
+        16 => "uint128_t",
         _ => "void",
     }
 }

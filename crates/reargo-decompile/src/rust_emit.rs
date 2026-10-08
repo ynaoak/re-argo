@@ -121,7 +121,7 @@ impl<'a> RustEmitter<'a> {
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some() {
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead) {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_rust_type(vn.data.size);
@@ -704,6 +704,7 @@ impl<'a> RustEmitter<'a> {
                 None => Some("return;".into()),
             },
             OpCode::Branch => None,
+            OpCode::BranchInd => Some(format!("goto *{}; // indirect jump", self.input_expr(func, op, 0))),
             OpCode::CBranch => None,
             OpCode::CallOther => {
                 // Tag in the first const input: 3 = int3 (real trap), 0x100+ =
@@ -809,6 +810,17 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
 
     let return_type = if has_return_value { Some("u64") } else { None };
 
+    // WS78: see `emit::infer_signature`
+    if let Some(regs) = &func.signature_params {
+        return RustFunctionSignature {
+            return_type,
+            params: regs
+                .iter()
+                .map(|r| (reg_name(r.offset, r.size), size_to_rust_type(r.size).to_string()))
+                .collect(),
+        };
+    }
+
     let param_regs: &[(u64, &str)] = &[
         (0x08, "param_1"), // RCX (Win) / RDI (SysV) - simplified
         (0x10, "param_2"), // RDX / RSI
@@ -871,6 +883,23 @@ fn reg_name(offset: u64, size: u32) -> String {
         (0x30, 4) => "esi".into(),
         (0x38, 8) => "rdi".into(),
         (0x38, 4) => "edi".into(),
+        // the 16/8-bit views of rcx..rdi (WS78): they used to fall through to `var_<off>`,
+        // so `bp` and `bpl` both became `var_28` (two declarations of one name, and a name
+        // that reads like a stack local)
+        (0x08, 2) => "cx".into(),
+        (0x08, 1) => "cl".into(),
+        (0x10, 2) => "dx".into(),
+        (0x10, 1) => "dl".into(),
+        (0x18, 2) => "bx".into(),
+        (0x18, 1) => "bl".into(),
+        (0x20, 2) => "sp".into(),
+        (0x20, 1) => "spl".into(),
+        (0x28, 2) => "bp".into(),
+        (0x28, 1) => "bpl".into(),
+        (0x30, 2) => "si".into(),
+        (0x30, 1) => "sil".into(),
+        (0x38, 2) => "di".into(),
+        (0x38, 1) => "dil".into(),
         // r8..r15 (offsets 0x80..0xB8): r12-r15 used to fall through to
         // `var_a0`..`var_b8`, indistinguishable from stack locals.
         (off, sz) if (0x80..0xC0).contains(&off) && off % 8 == 0 => {
@@ -904,6 +933,7 @@ fn size_to_rust_type(size: u32) -> &'static str {
         2 => "u16",
         4 => "u32",
         8 => "u64",
+        16 => "u128",
         _ => "()",
     }
 }
@@ -995,7 +1025,8 @@ mod tests {
         assert_eq!(size_to_rust_type(2), "u16");
         assert_eq!(size_to_rust_type(4), "u32");
         assert_eq!(size_to_rust_type(8), "u64");
-        assert_eq!(size_to_rust_type(16), "()");
+        assert_eq!(size_to_rust_type(16), "u128");
+        assert_eq!(size_to_rust_type(10), "()");
     }
 
     #[test]
