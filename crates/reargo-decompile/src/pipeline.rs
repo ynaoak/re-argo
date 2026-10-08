@@ -938,7 +938,7 @@ fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
             }
         }
 
-        if !has_return_or_indjmp && !has_unconditional_transfer {
+        if !has_return_or_indjmp && !has_unconditional_transfer && !crate::cfg::is_trap(insn) {
             let fall = insn.address + insn.length as u64;
             if let Some(&f_idx) = addr_to_idx.get(&fall) {
                 stack.push(f_idx);
@@ -1393,6 +1393,25 @@ mod tests {
         // xorps xmm0, xmm0 ; movups [rdi], xmm0 ; ret
         let c = c_of(&[0x0f, 0x57, 0xc0, 0x0f, 0x11, 0x07, 0xc3]);
         assert!(c.contains("void f("), "{c}");
+    }
+
+    /// WS79: control does not fall through the `int3` padding after a `noreturn` call into
+    /// the code behind it (often the next function).
+    #[test]
+    fn int3_after_noreturn_call_ends_the_flow() {
+        let c = c_of(&[
+            0x85, 0xff, // 0x1000 test edi, edi
+            0x74, 0x0d, // je 0x1011
+            0xe8, 0xf7, 0x0f, 0x00, 0x00, // 0x1004 call 0x2000 (noreturn)
+            0xcc, // 0x1009 int3
+            0xb8, 0x2a, 0x00, 0x00, 0x00, // 0x100a mov eax, 0x2a (another function)
+            0xc3, // 0x100f
+            0xcc, // 0x1010
+            0x31, 0xc0, // 0x1011 xor eax, eax
+            0xc3,
+        ]);
+        assert!(!c.contains("0x2a"), "{c}");
+        assert!(c.contains("__builtin_trap();"), "{c}");
     }
 
     /// WS77: a function that never sets `rax` returns nothing.
