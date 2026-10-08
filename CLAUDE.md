@@ -362,6 +362,13 @@ Decompile a function to pseudocode.
 
 Output includes inline `// <comment>` lines from the analysis annotations and call-rendering substitutions (`printf("hi", 42)` instead of `printf@plt()`).
 
+How to read the structured output (x86-64 System V):
+
+* **Control flow** is structured with the post-dominator tree: an `if` closes at its immediate post-dominator, loops are natural loops (`while (c)`, `do … while (c)`, or `while (true)` with `break` / `continue`). A `goto label_X;` remains only where the flow cannot nest (irreducible loops, a jump out of two loops, a block shared by two arms that is not their join). A `goto` to a short `ret` tail is printed as a copy of the tail instead. `int3` / `ud2` / `hlt` end the flow (the padding after a `noreturn` call).
+* **Return type**: `float` / `double` (`return xmm0_d;`) when the function last wrote a scalar float into `xmm0`, else `uint64_t` (`rax`) or `void`.
+* **Calls**: `rax = f(…)` / `xmm0 = f(…)` — the return register the callee is found to use (or the one the caller reads). Arguments come from the callee's own code when it is known; an indirect call through a constant function pointer / vtable slot becomes a direct call, and a virtual call on `this` inside a method found in a vtable gets the union of the parameter sets of that slot's implementations (`// vfn[6] (vtable+0x30) e.g. 0x4c19c40`).
+* **Signature**: each register class lists its parameters up to the highest one read (`f(rdi, rsi)` even when only `rsi` is used).
+
 With `-A`, every line that still carries a raw `0x...` literal (an unresolved
 call target, vtable pointer, or data reference the renderer couldn't name) gets
 a trailing comment classifying it with the same scheme as `disasm -A`:
