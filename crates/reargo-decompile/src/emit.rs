@@ -201,13 +201,16 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::IfThen {
                 condition_block,
                 then_body,
+                negated,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if ({}) {{", self.get_branch_condition(func, *condition_block));
-                self.indent += 1;
-                self.emit_block(func, then_body);
-                self.indent -= 1;
-                self.line("}");
+                // an arm whose blocks print nothing (all their ops folded away) needs no `if`
+                let then_text = self.render_nested(func, then_body);
+                if !then_text.is_empty() {
+                    linef!(self, "if ({}) {{", self.condition_text(func, *condition_block, *negated));
+                    self.output.push_str(&then_text);
+                    self.line("}");
+                }
             }
             StructuredBlock::IfThenElse {
                 condition_block,
@@ -215,24 +218,50 @@ impl<'a> CEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if ({}) {{", self.get_branch_condition(func, *condition_block));
-                self.indent += 1;
-                self.emit_block(func, then_body);
-                self.indent -= 1;
-                self.line("} else {");
-                self.indent += 1;
-                self.emit_block(func, else_body);
-                self.indent -= 1;
-                self.line("}");
+                let then_text = self.render_nested(func, then_body);
+                let else_text = self.render_nested(func, else_body);
+                match (then_text.is_empty(), else_text.is_empty()) {
+                    (true, true) => {}
+                    (false, true) | (true, false) => {
+                        let negated = then_text.is_empty();
+                        linef!(self, "if ({}) {{", self.condition_text(func, *condition_block, negated));
+                        self.output.push_str(if negated { &else_text } else { &then_text });
+                        self.line("}");
+                    }
+                    (false, false) => {
+                        linef!(self, "if ({}) {{", self.condition_text(func, *condition_block, false));
+                        self.output.push_str(&then_text);
+                        self.line("} else {");
+                        self.output.push_str(&else_text);
+                        self.line("}");
+                    }
+                }
             }
             StructuredBlock::WhileLoop {
                 condition_block,
                 body,
+                negated,
             } => {
-                self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "while ({}) {{", self.get_branch_condition(func, *condition_block)
-                );
+                // the header's statements run on every iteration: `while (c)` only when it
+                // has none, else `while (true) { stmts; if (!c) break; … }`
                 self.indent += 1;
+                let mark = self.output.len();
+                self.emit_basic_block_no_branch(func, *condition_block);
+                let stmts = self.output.split_off(mark);
+                self.indent -= 1;
+                let code_free = stmts.lines().all(|l| l.trim_start().starts_with("//"));
+                if code_free {
+                    for l in stmts.lines() {
+                        self.line(l.trim_start());
+                    }
+                    linef!(self, "while ({}) {{", self.condition_text(func, *condition_block, *negated));
+                    self.indent += 1;
+                } else {
+                    self.line("while (true) {");
+                    self.indent += 1;
+                    self.output.push_str(&stmts);
+                    linef!(self, "if ({}) break;", self.condition_text(func, *condition_block, !*negated));
+                }
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -240,14 +269,20 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::DoWhileLoop {
                 body,
                 condition_block,
+                negated,
             } => {
                 self.line("do {");
                 self.indent += 1;
                 self.emit_block(func, body);
+                if self.goto_targets.remove(condition_block) {
+                    let indent = self.indent;
+                    self.indent = indent.saturating_sub(1);
+                    linef!(self, "label_{:x}:", func.cfg.blocks[*condition_block].start_addr);
+                    self.indent = indent;
+                }
                 self.emit_basic_block_no_branch(func, *condition_block);
                 self.indent -= 1;
-                linef!(self, "}} while ({});", self.get_branch_condition(func, *condition_block)
-                );
+                linef!(self, "}} while ({});", self.condition_text(func, *condition_block, *negated));
             }
             StructuredBlock::ForLoop {
                 init_block,
@@ -318,10 +353,10 @@ impl<'a> CEmitter<'a> {
                 self.indent -= 1;
                 self.line("}");
             }
-            StructuredBlock::Loop { header, body } => {
+            StructuredBlock::Loop { body, .. } => {
+                // the body starts with the header's own code
                 self.line("while (true) {");
                 self.indent += 1;
-                self.emit_basic_block(func, *header);
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -329,6 +364,8 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::Goto(target) => {
                 linef!(self, "goto label_{:x};", func.cfg.blocks[*target].start_addr);
             }
+            StructuredBlock::Break => self.line("break;"),
+            StructuredBlock::Continue => self.line("continue;"),
         }
     }
 
@@ -715,10 +752,13 @@ impl<'a> CEmitter<'a> {
                 // (e.g. `printf("hello %d\n", 42)`). When present,
                 // use it; otherwise fall back to the bare
                 // `<callee>@plt()` stub from the symbol table.
+                let assign = call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
                 if let Some(renderings) = self.call_renderings
                     && let Some(rendering) = renderings.get(&op.address)
                 {
-                    return Some(format!("{};", rendering));
+                    return Some(format!("{assign}{};", rendering));
                 }
                 let target_expr = self.input_expr(func, op, 0);
                 let call_name = if let Some(target_vn) = op.inputs.first() {
@@ -731,7 +771,7 @@ impl<'a> CEmitter<'a> {
                     target_expr
                 };
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("{}({});", call_name, args.join(", ")))
+                Some(format!("{assign}{}({});", call_name, args.join(", ")))
             }
             OpCode::Indirect => {
                 // a call's return register, or a caller-saved register it clobbers
@@ -743,6 +783,8 @@ impl<'a> CEmitter<'a> {
                 });
                 if clobber {
                     Some(format!("{} = __clobbered;  // by {}", dst, self.input_expr(func, op, 0)))
+                } else if is_merged_call_result(func, op) {
+                    None // printed as `dst = call(…)`
                 } else {
                     Some(format!("{} = __ret;  // of {}", dst, self.input_expr(func, op, 0)))
                 }
@@ -761,7 +803,19 @@ impl<'a> CEmitter<'a> {
                     .map(|off| format!("  // vfn[{}] (vtable+0x{:x})", off / 8, off))
                     .unwrap_or_default();
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("(*{})({});{}", target, args.join(", "), ann))
+                let assign = call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
+                // WS79: an implementation of the slot, from the vtable of a class the function
+                // is a method of
+                let ann = match func.vcall_targets.get(&op.address) {
+                    Some(t) => {
+                        let name = self.symbol_names.get(t).cloned().unwrap_or_else(|| format!("0x{t:x}"));
+                        if ann.is_empty() { format!("  // e.g. {name}") } else { format!("{ann} e.g. {name}") }
+                    }
+                    None => ann,
+                };
+                Some(format!("{assign}(*{})({});{}", target, args.join(", "), ann))
             }
             OpCode::Return => match return_value(func, op) {
                 Some(i) => Some(format!("return {};", self.input_expr(func, op, i))),
@@ -874,6 +928,20 @@ impl<'a> CEmitter<'a> {
         "cond".into()
     }
 
+    /// The branch condition of `block_id`, inverted when `negated`.
+    /// Print `body` one level deeper and hand the text back instead of keeping it.
+    fn render_nested(&mut self, func: &SsaFunction, body: &StructuredBlock) -> String {
+        let mark = self.output.len();
+        self.indent += 1;
+        self.emit_block(func, body);
+        self.indent -= 1;
+        self.output.split_off(mark)
+    }
+
+    fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        negate_condition(self.get_branch_condition(func, block_id), negated)
+    }
+
     fn line(&mut self, text: &str) {
         for _ in 0..self.indent {
             self.output.push_str("    ");
@@ -883,6 +951,82 @@ impl<'a> CEmitter<'a> {
     }
 }
 
+
+/// The register a call's result is used in, when exactly one of the return registers the
+/// call defines (its non-clobber `INDIRECT`s, right after it) is still live (WS79): the
+/// caller's use decides which register the callee returned in, and the call prints as
+/// `xmm0 = f(…)` instead of `f(…); xmm0 = __ret;`.
+pub(crate) fn call_result(func: &SsaFunction, call: &crate::ssa::SsaOp) -> Option<crate::ssa::VarId> {
+    let live: Vec<crate::ssa::VarId> = func.ops[call.index + 1..]
+        .iter()
+        .take_while(|o| o.address == call.address && o.block == call.block)
+        .filter(|o| o.opcode == OpCode::Indirect && !o.dead && !is_clobber(func, o))
+        .filter_map(|o| o.output)
+        .collect();
+    match live.as_slice() {
+        [v] => Some(*v),
+        // both `rax` and `xmm0` look live: the one whose value is really read (not only the
+        // upper lanes the lifter carries over when a later scalar write rebuilds the register)
+        [_, _, ..] => {
+            let real: Vec<_> = live.iter().copied().filter(|&v| really_used(func, v, 0)).collect();
+            (real.len() == 1).then(|| real[0])
+        }
+        [] => None,
+    }
+}
+
+/// Is the value of `v` read by something other than the lifter's register view syncs (a
+/// `SUBPIECE` of its upper bytes, the high half of a `PIECE`)?
+fn really_used(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> bool {
+    if depth > 4 {
+        return true;
+    }
+    func.varnodes[v as usize].uses.iter().any(|&u| {
+        let op = &func.ops[u];
+        if op.dead {
+            return false;
+        }
+        match op.opcode {
+            OpCode::Subpiece => {
+                let k = op.inputs.get(1).map(|&c| func.varnodes[c as usize].data);
+                match k {
+                    Some(k) if k.space == SpaceId::CONST && k.offset > 0 => false,
+                    _ => op.output.is_some_and(|o| really_used(func, o, depth + 1)),
+                }
+            }
+            OpCode::Piece => op.inputs.get(1) == Some(&v),
+            _ => true,
+        }
+    })
+}
+
+fn is_clobber(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    op.inputs.get(1).is_some_and(|&v| {
+        let d = &func.varnodes[v as usize].data;
+        d.space == SpaceId::CONST && d.offset == crate::pipeline::CLOBBER_MARK
+    })
+}
+
+/// Is `op` (a call's return `INDIRECT`) printed as part of its call (`call_result`)?
+pub(crate) fn is_merged_call_result(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    let call = func.ops[..op.index]
+        .iter()
+        .rev()
+        .take_while(|o| o.address == op.address && o.block == op.block)
+        .find(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd) && !o.dead);
+    call.is_some_and(|c| call_result(func, c) == op.output)
+}
+
+/// `cond` inverted when `negated`: `!x` for a plain name, `!(…)` otherwise.
+pub(crate) fn negate_condition(cond: String, negated: bool) -> String {
+    if !negated {
+        cond
+    } else if cond.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        format!("!{cond}")
+    } else {
+        format!("!({cond})")
+    }
+}
 
 struct FunctionSignature {
     return_type: &'static str,
@@ -896,7 +1040,7 @@ fn collect_goto_targets(block: &StructuredBlock, out: &mut std::collections::BTr
         Goto(t) => {
             out.insert(*t);
         }
-        Basic(_) => {}
+        Basic(_) | Break | Continue => {}
         Sequence(xs) => xs.iter().for_each(|b| collect_goto_targets(b, out)),
         IfThen { then_body, .. } => collect_goto_targets(then_body, out),
         IfThenElse { then_body, else_body, .. } => {
@@ -932,7 +1076,7 @@ fn leading_block(block: &StructuredBlock) -> Option<usize> {
         ShortCircuitAnd { left_block, .. } | ShortCircuitOr { left_block, .. } => Some(*left_block),
         Loop { header, .. } => Some(*header),
         DoWhileLoop { body, .. } => leading_block(body),
-        Sequence(_) | Goto(_) => None,
+        Sequence(_) | Goto(_) | Break | Continue => None,
     }
 }
 
@@ -980,7 +1124,12 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
         return_value(func, op).is_some()
     });
 
-    let return_type = if has_return_value { "uint64_t" } else { "void" };
+    let return_type = match (has_return_value, func.return_float) {
+        (false, _) => "void",
+        (true, Some(4)) => "float",
+        (true, Some(_)) => "double",
+        (true, None) => "uint64_t",
+    };
 
     // WS78: the parameters the analysis of the function's entry found, named like the
     // registers the body reads (`rdi`, `xmm0`)

@@ -133,6 +133,160 @@ pub fn compute_dominance_frontier(cfg: &ControlFlowGraph, idom: &[Option<BlockId
     df_sets.into_iter().map(|s| s.into_iter().collect()).collect()
 }
 
+/// Immediate post-dominators over the blocks reachable from the entry, computed as the
+/// dominator tree of the reversed CFG rooted at a *virtual exit*.
+///
+/// Every block without successors (a `ret`, a `jmp reg`, a block that falls off the lifted
+/// body, a call the lifter ended the block at) gets an edge to the virtual exit, so a function
+/// with several returns still has one root. A region that cannot reach any exit (an infinite
+/// loop, or a loop whose only way out is a `noreturn` call that still has a fall-through edge
+/// back in) would otherwise be missing from the tree: the deepest block (highest reverse
+/// post-order number) of such a region gets an edge to the exit too, repeated until every
+/// reachable block reaches it.
+///
+/// `ipdom[b]` is `None` when `b`'s immediate post-dominator is the virtual exit (or `b` is
+/// unreachable from the entry).
+#[derive(Debug, Clone)]
+pub struct PostDominators {
+    /// `Some(p)`: `p` is the immediate post-dominator of the block. `None`: the virtual exit.
+    pub ipdom: Vec<Option<BlockId>>,
+    /// Reachable from the entry (blocks that are not take no part).
+    pub reachable: Vec<bool>,
+}
+
+impl PostDominators {
+    /// Does `a` post-dominate `b` (reflexively)?
+    pub fn post_dominates(&self, a: BlockId, mut b: BlockId) -> bool {
+        loop {
+            if a == b {
+                return true;
+            }
+            match self.ipdom.get(b) {
+                Some(&Some(p)) if p != b => b = p,
+                _ => return false,
+            }
+        }
+    }
+}
+
+pub fn compute_post_dominators(cfg: &ControlFlowGraph) -> PostDominators {
+    let n = cfg.blocks.len();
+    let exit = n; // virtual node
+    let rpo = reverse_post_order(cfg);
+    let mut reachable = vec![false; n];
+    for &b in &rpo {
+        reachable[b] = true;
+    }
+    // reverse-graph successors of a node = CFG predecessors (restricted to reachable blocks);
+    // the virtual exit's reverse successors are the blocks wired to it
+    let mut to_exit: Vec<BlockId> = rpo
+        .iter()
+        .copied()
+        .filter(|&b| cfg.blocks[b].successors.iter().all(|&s| s >= n))
+        .collect();
+
+    // make every reachable block reach the exit (infinite loops)
+    let reaches_exit = |to_exit: &[BlockId]| {
+        let mut seen = vec![false; n];
+        let mut stack: Vec<BlockId> = to_exit.to_vec();
+        for &b in to_exit {
+            seen[b] = true;
+        }
+        while let Some(b) = stack.pop() {
+            for &p in &cfg.blocks[b].predecessors {
+                if p < n && reachable[p] && !seen[p] {
+                    seen[p] = true;
+                    stack.push(p);
+                }
+            }
+        }
+        seen
+    };
+    let mut seen = reaches_exit(&to_exit);
+    while let Some(&deepest) = rpo.iter().rev().find(|&&b| !seen[b]) {
+        to_exit.push(deepest);
+        // incremental: everything that reaches `deepest` now reaches the exit
+        let mut stack = vec![deepest];
+        seen[deepest] = true;
+        while let Some(b) = stack.pop() {
+            for &p in &cfg.blocks[b].predecessors {
+                if p < n && reachable[p] && !seen[p] {
+                    seen[p] = true;
+                    stack.push(p);
+                }
+            }
+        }
+    }
+
+    // reverse post-order of the reversed graph from the virtual exit
+    let rsucc = |v: usize| -> &[BlockId] {
+        if v == exit { &to_exit } else { &cfg.blocks[v].predecessors }
+    };
+    let mut order = vec![usize::MAX; n + 1];
+    let mut post: Vec<usize> = Vec::with_capacity(n + 1);
+    let mut visited = vec![false; n + 1];
+    let mut stack: Vec<(usize, usize)> = vec![(exit, 0)];
+    visited[exit] = true;
+    while let Some(top) = stack.last_mut() {
+        let (v, i) = *top;
+        let succs = rsucc(v);
+        if let Some(&s) = succs.get(i) {
+            top.1 += 1;
+            if s < n && reachable[s] && !visited[s] {
+                visited[s] = true;
+                stack.push((s, 0));
+            }
+        } else {
+            post.push(v);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    for (i, &v) in post.iter().enumerate() {
+        order[v] = i;
+    }
+    // reverse-graph predecessors of v = CFG successors of v (+ exit when wired)
+    let mut wired = vec![false; n];
+    for &b in &to_exit {
+        wired[b] = true;
+    }
+    let mut idom: Vec<Option<usize>> = vec![None; n + 1];
+    idom[exit] = Some(exit);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &v in post.iter().skip(1) {
+            let mut new_idom: Option<usize> = None;
+            let preds = cfg.blocks[v]
+                .successors
+                .iter()
+                .copied()
+                .filter(|&s| s < n)
+                .chain(wired[v].then_some(exit));
+            for p in preds {
+                if idom[p].is_none() {
+                    continue;
+                }
+                new_idom = Some(match new_idom {
+                    None => p,
+                    Some(cur) => intersect(&idom, &order, cur, p),
+                });
+            }
+            if new_idom.is_some() && new_idom != idom[v] {
+                idom[v] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    let ipdom = (0..n)
+        .map(|b| match idom[b] {
+            Some(p) if p != exit => Some(p),
+            _ => None,
+        })
+        .collect();
+    PostDominators { ipdom, reachable }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +434,82 @@ mod tests {
         let live = cfg.block_at(0x1002).unwrap().id;
         assert_eq!(idom[dead], None);
         assert_eq!(idom[live], Some(cfg.entry_block));
+    }
+}
+
+#[cfg(test)]
+mod post_dom_tests {
+    use super::*;
+    use crate::cfg::ControlFlowGraph;
+    use reargo_core::address::{Address, SpaceId};
+    use reargo_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
+    use reargo_lift::LiftedInstruction;
+    use smallvec::SmallVec;
+
+    fn insn(addr: u64, ops: Vec<PcodeOp>) -> LiftedInstruction {
+        LiftedInstruction { address: addr, length: 1, mnemonic: "t".into(), ops }
+    }
+    fn op(addr: u64, opcode: OpCode, inputs: &[VarnodeData]) -> PcodeOp {
+        PcodeOp {
+            opcode,
+            seq: SeqNum::new(Address::new(SpaceId(1), addr), 0),
+            output: None,
+            inputs: SmallVec::from_slice(inputs),
+        }
+    }
+    fn jcc(a: u64, t: u64) -> LiftedInstruction {
+        insn(a, vec![op(a, OpCode::CBranch, &[VarnodeData::new(SpaceId(1), t, 8), VarnodeData::new(SpaceId(0), 1, 1)])])
+    }
+    fn jmp(a: u64, t: u64) -> LiftedInstruction {
+        insn(a, vec![op(a, OpCode::Branch, &[VarnodeData::new(SpaceId(1), t, 8)])])
+    }
+    fn ret(a: u64) -> LiftedInstruction {
+        insn(a, vec![op(a, OpCode::Return, &[VarnodeData::new(SpaceId(0), 0, 8)])])
+    }
+    fn nop(a: u64) -> LiftedInstruction {
+        insn(a, vec![])
+    }
+
+    #[test]
+    fn diamond_join_is_ipdom_not_lowest_id() {
+        // B0: jcc B2 ; B1: jmp B3 ; B2: nop (falls into B3) ; B3: ret
+        let cfg = ControlFlowGraph::build(&[jcc(0x1000, 0x1002), jmp(0x1001, 0x1003), nop(0x1002), ret(0x1003)]);
+        let at = |a: u64| cfg.block_at(a).unwrap().id;
+        let pd = compute_post_dominators(&cfg);
+        assert_eq!(pd.ipdom[at(0x1000)], Some(at(0x1003)));
+        assert_eq!(pd.ipdom[at(0x1001)], Some(at(0x1003)));
+        assert_eq!(pd.ipdom[at(0x1002)], Some(at(0x1003)));
+        assert_eq!(pd.ipdom[at(0x1003)], None, "the return's ipdom is the virtual exit");
+    }
+
+    #[test]
+    fn two_returns_meet_at_virtual_exit() {
+        // B0: jcc B2 ; B1: ret ; B2: ret
+        let cfg = ControlFlowGraph::build(&[jcc(0x1000, 0x1002), ret(0x1001), ret(0x1002)]);
+        let pd = compute_post_dominators(&cfg);
+        assert_eq!(pd.ipdom[cfg.entry_block], None);
+    }
+
+    #[test]
+    fn loop_exit_post_dominates_header() {
+        // B0: nop ; B1 header: jcc B3 (exit) ; B2 body: jmp B1 ; B3: ret
+        let cfg = ControlFlowGraph::build(&[nop(0x1000), jcc(0x1001, 0x1003), jmp(0x1002, 0x1001), ret(0x1003)]);
+        let at = |a: u64| cfg.block_at(a).unwrap().id;
+        let pd = compute_post_dominators(&cfg);
+        assert_eq!(pd.ipdom[at(0x1001)], Some(at(0x1003)));
+        assert_eq!(pd.ipdom[at(0x1002)], Some(at(0x1001)));
+        assert!(pd.post_dominates(at(0x1003), at(0x1000)));
+    }
+
+    #[test]
+    fn infinite_loop_still_in_tree() {
+        // B0: jcc B2 ; B1: ret ; B2: nop ; B3: jmp B2 (no way out)
+        let cfg = ControlFlowGraph::build(&[jcc(0x1000, 0x1002), ret(0x1001), nop(0x1002), jmp(0x1003, 0x1002)]);
+        let at = |a: u64| cfg.block_at(a).unwrap().id;
+        let pd = compute_post_dominators(&cfg);
+        assert!(pd.reachable.iter().all(|&r| r));
+        // the loop is wired to the exit at its deepest block, so the entry's ipdom is the exit
+        assert_eq!(pd.ipdom[cfg.entry_block], None);
+        assert_eq!(pd.ipdom[at(0x1002)], None, "the self-loop block is wired to the exit");
     }
 }

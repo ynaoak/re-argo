@@ -148,14 +148,16 @@ impl<'a> RustEmitter<'a> {
             StructuredBlock::IfThen {
                 condition_block,
                 then_body,
+                negated,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if {} {{", self.get_branch_condition(func, *condition_block)
-                );
-                self.indent += 1;
-                self.emit_block(func, then_body);
-                self.indent -= 1;
-                self.line("}");
+                // an arm whose blocks print nothing (all their ops folded away) needs no `if`
+                let then_text = self.render_nested(func, then_body);
+                if !then_text.is_empty() {
+                    linef!(self, "if {} {{", self.condition_text(func, *condition_block, *negated));
+                    self.output.push_str(&then_text);
+                    self.line("}");
+                }
             }
             StructuredBlock::IfThenElse {
                 condition_block,
@@ -163,25 +165,49 @@ impl<'a> RustEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if {} {{", self.get_branch_condition(func, *condition_block)
-                );
-                self.indent += 1;
-                self.emit_block(func, then_body);
-                self.indent -= 1;
-                self.line("} else {");
-                self.indent += 1;
-                self.emit_block(func, else_body);
-                self.indent -= 1;
-                self.line("}");
+                let then_text = self.render_nested(func, then_body);
+                let else_text = self.render_nested(func, else_body);
+                match (then_text.is_empty(), else_text.is_empty()) {
+                    (true, true) => {}
+                    (false, true) | (true, false) => {
+                        let negated = then_text.is_empty();
+                        linef!(self, "if {} {{", self.condition_text(func, *condition_block, negated));
+                        self.output.push_str(if negated { &else_text } else { &then_text });
+                        self.line("}");
+                    }
+                    (false, false) => {
+                        linef!(self, "if {} {{", self.condition_text(func, *condition_block, false));
+                        self.output.push_str(&then_text);
+                        self.line("} else {");
+                        self.output.push_str(&else_text);
+                        self.line("}");
+                    }
+                }
             }
             StructuredBlock::WhileLoop {
                 condition_block,
                 body,
+                negated,
             } => {
-                self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "while {} {{", self.get_branch_condition(func, *condition_block)
-                );
+                // `while c` only when the header has no statements of its own (they run on
+                // every iteration), else `loop { stmts; if !c { break; } … }`
                 self.indent += 1;
+                let mark = self.output.len();
+                self.emit_basic_block_no_branch(func, *condition_block);
+                let stmts = self.output.split_off(mark);
+                self.indent -= 1;
+                if stmts.lines().all(|l| l.trim_start().starts_with("//")) {
+                    for l in stmts.lines() {
+                        self.line(l.trim_start());
+                    }
+                    linef!(self, "while {} {{", self.condition_text(func, *condition_block, *negated));
+                    self.indent += 1;
+                } else {
+                    self.line("loop {");
+                    self.indent += 1;
+                    self.output.push_str(&stmts);
+                    linef!(self, "if {} {{ break; }}", self.condition_text(func, *condition_block, !*negated));
+                }
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -189,14 +215,14 @@ impl<'a> RustEmitter<'a> {
             StructuredBlock::DoWhileLoop {
                 body,
                 condition_block,
+                negated,
             } => {
                 // Rust has no do-while; emulate with loop + break
                 self.line("loop {");
                 self.indent += 1;
                 self.emit_block(func, body);
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "if !({}) {{ break; }}", self.get_branch_condition(func, *condition_block)
-                );
+                linef!(self, "if {} {{ break; }}", self.condition_text(func, *condition_block, !*negated));
                 self.indent -= 1;
                 self.line("}");
             }
@@ -270,10 +296,10 @@ impl<'a> RustEmitter<'a> {
                 self.indent -= 1;
                 self.line("}");
             }
-            StructuredBlock::Loop { header, body } => {
+            StructuredBlock::Loop { body, .. } => {
+                // the body starts with the header's own code
                 self.line("loop {");
                 self.indent += 1;
-                self.emit_basic_block(func, *header);
                 self.emit_block(func, body);
                 self.indent -= 1;
                 self.line("}");
@@ -282,6 +308,8 @@ impl<'a> RustEmitter<'a> {
                 // Rust does not have goto; emit as a comment-annotated break/continue placeholder
                 linef!(self, "// goto label_{:x}; (unsupported in Rust)", func.cfg.blocks[*target].start_addr);
             }
+            StructuredBlock::Break => self.line("break;"),
+            StructuredBlock::Continue => self.line("continue;"),
         }
     }
 
@@ -662,10 +690,13 @@ impl<'a> RustEmitter<'a> {
                 // the C emitter — see emit.rs for the rationale.
                 // We strip the `@plt` suffix the symbol table uses
                 // since Rust identifiers can't contain `@`.
+                let assign = crate::emit::call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
                 if let Some(renderings) = self.call_renderings
                     && let Some(rendering) = renderings.get(&op.address)
                 {
-                    return Some(format!("{};", rendering));
+                    return Some(format!("{assign}{};", rendering));
                 }
                 let target_expr = self.input_expr(func, op, 0);
                 let call_name = if let Some(target_vn) = op.inputs.first() {
@@ -678,12 +709,15 @@ impl<'a> RustEmitter<'a> {
                     target_expr
                 };
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("{}({});", call_name, args.join(", ")))
+                Some(format!("{assign}{}({});", call_name, args.join(", ")))
             }
             OpCode::CallInd => {
                 let target = self.input_expr(func, op, 0);
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("(*{})({});", target, args.join(", ")))
+                let assign = crate::emit::call_result(func, op)
+                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .unwrap_or_default();
+                Some(format!("{assign}(*{})({});", target, args.join(", ")))
             }
             OpCode::Indirect => {
                 // a call's return register, or a caller-saved register it clobbers
@@ -695,6 +729,8 @@ impl<'a> RustEmitter<'a> {
                 });
                 if clobber {
                     Some(format!("{} = __clobbered; // by {}", dst, self.input_expr(func, op, 0)))
+                } else if crate::emit::is_merged_call_result(func, op) {
+                    None
                 } else {
                     Some(format!("{} = __ret; // of {}", dst, self.input_expr(func, op, 0)))
                 }
@@ -754,6 +790,19 @@ impl<'a> RustEmitter<'a> {
         varnode_name(vn)
     }
 
+    /// Print `body` one level deeper and hand the text back instead of keeping it.
+    fn render_nested(&mut self, func: &SsaFunction, body: &StructuredBlock) -> String {
+        let mark = self.output.len();
+        self.indent += 1;
+        self.emit_block(func, body);
+        self.indent -= 1;
+        self.output.split_off(mark)
+    }
+
+    fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        crate::emit::negate_condition(self.get_branch_condition(func, block_id), negated)
+    }
+
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
         for op in func.ops.iter().rev() {
             if op.block != block_id || op.dead {
@@ -808,7 +857,12 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
         crate::emit::return_value(func, op).is_some()
     });
 
-    let return_type = if has_return_value { Some("u64") } else { None };
+    let return_type = match (has_return_value, func.return_float) {
+        (false, _) => None,
+        (true, Some(4)) => Some("f32"),
+        (true, Some(_)) => Some("f64"),
+        (true, None) => Some("u64"),
+    };
 
     // WS78: see `emit::infer_signature`
     if let Some(regs) = &func.signature_params {
