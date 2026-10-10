@@ -2749,6 +2749,41 @@ mod tests {
         assert!(at("case 0:") < at("case 2:") && at("case 2:") < at("return 0x14;"), "{c}");
     }
 
+    /// A jump table with no bounds check (a switch over an enum, `default:` unreachable) runs
+    /// while its entries are the function's instructions, up to the next table the function
+    /// loads; a table base set once before a loop is that constant (WS84).
+    #[test]
+    fn jump_table_without_bounds_check() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x4c, 0x8d, 0x0d, 0xf9, 0x00, 0x00, 0x00, // 0x1000 lea r9, [0x1100] (hoisted base)
+            0x8b, 0x07, // 0x1007 mov eax, [rdi]
+            0x49, 0x63, 0x04, 0x81, // 0x1009 movsxd rax, [r9+rax*4]
+            0x4c, 0x01, 0xc8, // 0x100d add rax, r9
+            0xff, 0xe0, // 0x1010 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1012 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x1018 mov eax, 20; ret
+            0x48, 0x8d, 0x05, 0xff, 0x00, 0x00, 0x00, // 0x101e lea rax, [0x1124] (another table)
+            0xc3,
+        ];
+        // three entries, then the next table at 0x110c (loaded by the function)
+        let mut table: Vec<u8> = [0x1012u64, 0x1018, 0x1012].iter().flat_map(|&t| rel(t)).collect();
+        table.extend([0x1018u64, 0x1012].iter().flat_map(|&t| rel(t)));
+        let code2 = {
+            let mut c = code.to_vec();
+            // the second lea points at 0x110c: disp = 0x110c - 0x1025
+            c[0x1e + 3..0x1e + 7].copy_from_slice(&((0x110c - 0x1025i32).to_le_bytes()));
+            c
+        };
+        let mem = make_memory_parts(&[(0x1000, &code2), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        assert!(at("case 0:") < at("case 2:") && at("case 2:") < at("return 0xa;") && at("case 1:") < at("return 0x14;"), "{c}");
+        assert!(!c.contains("case 3:") && !c.contains("default:"), "the table ends at the next one: {c}");
+    }
+
     /// `needle` occurs after `marker` in `c`.
     fn at_least(c: &str, marker: &str, needle: &str) -> bool {
         c.find(marker).is_some_and(|m| c[m..].contains(needle))

@@ -95,6 +95,12 @@ fn evaluate(insns: &[LiftedInstruction]) -> FxHashMap<Key, E> {
                 }
                 (OpCode::IntLeft, Some(a), Some(E::Const(c))) if c < 8 => E::Mul(Box::new(a), 1 << c),
                 (OpCode::Load, _, Some(addr)) => E::Load(Box::new(addr), out.size),
+                // a constant widened is a constant (`lea edx, [T]` then `add rax, rdx`, WS84)
+                (OpCode::IntZExt, Some(E::Const(c)), _) => E::Const(c),
+                (OpCode::IntSExt, Some(E::Const(c)), _) => {
+                    let bits = op.inputs[0].size.min(8) * 8;
+                    E::Const(if bits >= 64 { c } else { (((c << (64 - bits)) as i64) >> (64 - bits)) as u64 })
+                }
                 (OpCode::IntSExt | OpCode::IntZExt, Some(a), _) => E::Ext(Box::new(a)),
                 _ => E::Other,
             };
@@ -104,6 +110,57 @@ fn evaluate(insns: &[LiftedInstruction]) -> FxHashMap<Key, E> {
         }
     }
     env
+}
+
+/// `e` with each register the function sets once, to a constant, replaced by that constant (a
+/// table base hoisted out of a loop: `lea r9, [T]` before it, `movsxd r14, [r9+r14*4]` in it).
+fn with_bases(e: &E, bases: &FxHashMap<u64, u64>) -> E {
+    match e {
+        E::Reg(r) if r.space == SpaceId::REGISTER && r.size >= 4 => bases.get(&r.offset).map_or(E::Reg(*r), |&c| E::Const(c)),
+        E::Add(a, b) => E::Add(Box::new(with_bases(a, bases)), Box::new(with_bases(b, bases))),
+        E::Mul(a, c) => E::Mul(Box::new(with_bases(a, bases)), *c),
+        E::Load(a, sz) => E::Load(Box::new(with_bases(a, bases)), *sz),
+        E::Ext(a) => match with_bases(a, bases) {
+            E::Const(c) => E::Const(c),
+            x => E::Ext(Box::new(x)),
+        },
+        x => x.clone(),
+    }
+}
+
+/// The general registers the function writes in exactly one instruction, with a constant
+/// (`lea r9, [T]`): offset -> value. And every constant address an instruction puts in a
+/// register (the bases of other tables).
+fn constant_registers(insns: &[LiftedInstruction]) -> (FxHashMap<u64, u64>, rustc_hash::FxHashSet<u64>) {
+    let mut writes: FxHashMap<u64, (u32, Option<u64>)> = FxHashMap::default();
+    let mut loaded = rustc_hash::FxHashSet::default();
+    for insn in insns {
+        let mut here: Vec<(u64, Option<u64>)> = Vec::new();
+        for op in &insn.ops {
+            let Some(out) = op.output else { continue };
+            if out.space != SpaceId::REGISTER || out.offset >= 0xC0 {
+                continue;
+            }
+            let base = out.offset & !7;
+            let c = (op.opcode == OpCode::Copy && out.size >= 4)
+                .then(|| op.inputs.first().filter(|v| v.space == SpaceId::CONST).map(|v| v.offset))
+                .flatten();
+            if let Some(c) = c {
+                loaded.insert(c);
+            }
+            match here.iter_mut().find(|h| h.0 == base) {
+                Some(h) => h.1 = h.1.or(c),
+                None => here.push((base, c)),
+            }
+        }
+        for (base, c) in here {
+            let w = writes.entry(base).or_insert((0, None));
+            w.0 += 1;
+            w.1 = c;
+        }
+    }
+    let once = writes.into_iter().filter_map(|(r, (n, c))| (n == 1).then_some((r, c?))).collect();
+    (once, loaded)
 }
 
 /// `(T, I)` when `addr` is `T + I * scale` (`T + I` for a byte table).
@@ -161,8 +218,9 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
         return out;
     }
     let addrs: rustc_hash::FxHashSet<u64> = insns.iter().map(|i| i.address).collect();
+    let (bases, loaded) = constant_registers(insns);
     for k in 0..insns.len() {
-        let Some(found) = recover_one(insns, k, &addrs, memory) else { continue };
+        let Some(found) = recover_one(insns, k, &addrs, &bases, &loaded, memory) else { continue };
         let (index, start, table) = found;
         // the index as the window starts, when the window reuses its register (WS84: `movsxd
         // rax, [rcx+rax*4]`; the BRANCHIND reads at the window's end)
@@ -222,6 +280,8 @@ fn recover_one(
     insns: &[LiftedInstruction],
     k: usize,
     addrs: &rustc_hash::FxHashSet<u64>,
+    bases: &FxHashMap<u64, u64>,
+    loaded: &rustc_hash::FxHashSet<u64>,
     memory: &Memory,
 ) -> Option<(VarnodeData, usize, JumpTable)> {
     let jmp = &insns[k];
@@ -239,20 +299,26 @@ fn recover_one(
         }
         start -= 1;
     }
-    // the window, the `jmp` included (`jmp [table+rax*8]` loads in the instruction itself)
-    let env = evaluate(&insns[start..=k]);
-    let target = env.get(&key(&target_vn)).cloned().unwrap_or(E::Reg(target_vn));
-    let (table, relative, index) = dispatch(&target)?;
-    let (index, level1) = match index_table(index) {
-        Some((t1, sz, i)) => (i, Some((t1, sz))),
-        None => (index, None),
-    };
-    let mut index = index;
-    while let E::Ext(x) = index {
-        index = x;
-    }
-    let E::Reg(r) = index else { return None };
-    let r = *r;
+    // the window, the `jmp` included (`jmp [table+rax*8]` loads in the instruction itself);
+    // started later when the index is computed in it (`mov eax, [rdi]` of an enum switch):
+    // the index is then the register holding it
+    let found = (start..=k).find_map(|st| {
+        let env = evaluate(&insns[st..=k]);
+        let target = env.get(&key(&target_vn)).cloned().unwrap_or(E::Reg(target_vn));
+        let target = with_bases(&target, bases);
+        let (table, relative, index) = dispatch(&target)?;
+        let (index, level1) = match index_table(index) {
+            Some((t1, sz, i)) => (i, Some((t1, sz))),
+            None => (index, None),
+        };
+        let mut index = index;
+        while let E::Ext(x) = index {
+            index = x;
+        }
+        let E::Reg(r) = index else { return None };
+        Some((st, table, relative, level1, *r))
+    });
+    let (start, table, relative, level1, r) = found?;
     // the bounds check: `cmp r, N` and a conditional jump into the window (falling into it, or
     // jumping to its start)
     let at = insns[start].address;
@@ -266,7 +332,37 @@ fn recover_one(
             cbranch_target(i) == Some(at) && bounds_kind(&i.mnemonic).is_some_and(|(_, to)| to)
         })
     };
-    let j = falls.or_else(jumps)?;
+    let read = |slot: u64| -> Option<u64> {
+        Some(if relative {
+            let e = memory.read_u32(table + 4 * slot).ok()? as i32 as i64;
+            table.wrapping_add(e as u64)
+        } else {
+            memory.read_u64(table + 8 * slot).ok()?
+        })
+    };
+    let Some(j) = falls.or_else(jumps) else {
+        // no bounds check: a switch over an enum the compiler knows the range of (`default:
+        // __builtin_unreachable()`). The table runs while its entries are instructions of the
+        // function, up to the next table the function loads (WS84).
+        if level1.is_some() || insns[start..k].iter().any(|i| has(i, OpCode::CBranch)) {
+            return None;
+        }
+        let width = if relative { 4 } else { 8 };
+        let mut targets = Vec::new();
+        for i in 0..MAX_ENTRIES {
+            if i > 0 && loaded.contains(&(table + width * i)) {
+                break;
+            }
+            match read(i) {
+                Some(t) if addrs.contains(&t) => targets.push(t),
+                _ => break,
+            }
+        }
+        if targets.len() < 2 {
+            return None;
+        }
+        return Some((r, start, JumpTable { jmp: jmp.address, targets, default: None }));
+    };
     let jcc = &insns[j];
     let (count, to_dispatch) = bounds_kind(&jcc.mnemonic)?;
     let default = if to_dispatch {
@@ -297,14 +393,6 @@ fn recover_one(
     if cases == 0 || cases > MAX_ENTRIES {
         return None;
     }
-    let read = |slot: u64| -> Option<u64> {
-        Some(if relative {
-            let e = memory.read_u32(table + 4 * slot).ok()? as i32 as i64;
-            table.wrapping_add(e as u64)
-        } else {
-            memory.read_u64(table + 8 * slot).ok()?
-        })
-    };
     // a target outside the function (a `.cold` part) jumps out: a tail-call stub, as a
     // conditional jump out of the code is (`pipeline::rewrite_tail_calls`); it must be code
     let executable = |t: u64| memory.find_block(t).is_some_and(|b| b.flags.contains(reargo_loader::memory::MemoryFlags::EXECUTE));
