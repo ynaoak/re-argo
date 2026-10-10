@@ -255,7 +255,28 @@ impl Emulator {
                 return Err(EmulatorError::Return(ret_val));
             }
 
-            OpCode::CallOther => {}
+            // the lifter's named intrinsics with a defined value (WS84); others are opaque
+            OpCode::CallOther => {
+                use reargo_core::pcode::intrinsic;
+                if let (Some(out), Some(tag), Some(src)) = (op.output.as_ref(), op.input(0), op.input(1))
+                    && tag.space == SpaceId::CONST
+                {
+                    let bits = src.size.min(8) * 8;
+                    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    let x = self.state.read_varnode(src) & mask;
+                    let value = match tag.offset {
+                        // bsf / bsr leave the destination as it was for a zero source
+                        intrinsic::BSF if x != 0 => Some(u64::from(x.trailing_zeros())),
+                        intrinsic::BSR if x != 0 => Some(u64::from(63 - x.leading_zeros())),
+                        intrinsic::TZCNT => Some(if x == 0 { u64::from(bits) } else { u64::from(x.trailing_zeros()) }),
+                        intrinsic::BSWAP => Some(x.swap_bytes() >> (64 - bits)),
+                        _ => None,
+                    };
+                    if let Some(v) = value {
+                        self.state.write_varnode(out, v);
+                    }
+                }
+            }
 
             OpCode::Piece => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("PIECE".into()))?;
@@ -287,8 +308,11 @@ impl Emulator {
 
             OpCode::LzCount => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("LZCOUNT".into()))?;
+                // at the input's width, not 64 bits
+                let bits = op.inputs.first().map(|v| v.size.min(8)).unwrap_or(8) * 8;
                 let a = self.read_input(op, 0)?;
-                self.state.write_varnode(out, a.leading_zeros() as u64);
+                let lz = if bits >= 64 { a.leading_zeros() } else { (a << (64 - bits)).leading_zeros().min(bits) };
+                self.state.write_varnode(out, u64::from(lz));
             }
 
             OpCode::BoolNegate => {
@@ -979,5 +1003,54 @@ mod tests {
             Err(EmulatorError::Return(0x9999)) => {}
             other => panic!("expected Return, got {:?}", other),
         }
+    }
+
+    /// LZCOUNT counts at the input's width (WS84: a 32-bit 1 gave 63, the 64-bit count).
+    #[test]
+    fn emu_lzcount_at_input_width() {
+        let mut emu = Emulator::new();
+        let op = |size| PcodeOp {
+            opcode: OpCode::LzCount,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, 4)),
+            inputs: SmallVec::from_slice(&[VarnodeData::new(REG, 0x00, size)]),
+        };
+        for (size, value, want) in [(4, 1, 31), (4, 0, 32), (2, 0x80, 8), (8, 1, 63), (8, 0, 64), (1, 0x10, 3)] {
+            emu.state.write_register(0x00, 8, value);
+            emu.execute_op(&op(size)).unwrap();
+            assert_eq!(emu.state.read_register(0x10, 4), want, "lzcount size {size} of {value:#x}");
+        }
+    }
+
+    /// The lifter's named intrinsics with a defined value are evaluated (WS84); bsf/bsr keep
+    /// the destination for a zero source.
+    #[test]
+    fn emu_evaluates_bit_intrinsics() {
+        use reargo_core::pcode::intrinsic;
+        let call = |tag, size| PcodeOp {
+            opcode: OpCode::CallOther,
+            seq: seq(),
+            output: Some(VarnodeData::new(REG, 0x10, size)),
+            inputs: SmallVec::from_slice(&[VarnodeData::new(CNST, tag, 8), VarnodeData::new(REG, 0x00, size)]),
+        };
+        let mut emu = Emulator::new();
+        for (tag, size, x, want) in [
+            (intrinsic::BSF, 4, 0x50u64, 4u64),
+            (intrinsic::BSR, 4, 0x50, 6),
+            (intrinsic::BSR, 8, 1 << 40, 40),
+            (intrinsic::TZCNT, 4, 0, 32),
+            (intrinsic::TZCNT, 2, 0x8000, 15),
+            (intrinsic::BSWAP, 4, 0x1122_3344, 0x4433_2211),
+            (intrinsic::BSWAP, 8, 0x0102_0304_0506_0708, 0x0807_0605_0403_0201),
+        ] {
+            emu.state.write_register(0x00, 8, x);
+            emu.state.write_register(0x10, 8, 0xdead);
+            emu.execute_op(&call(tag, size)).unwrap();
+            assert_eq!(emu.state.read_register(0x10, size), want, "tag {tag:#x} of {x:#x}");
+        }
+        emu.state.write_register(0x00, 8, 0);
+        emu.state.write_register(0x10, 8, 0x1234);
+        emu.execute_op(&call(intrinsic::BSF, 4)).unwrap();
+        assert_eq!(emu.state.read_register(0x10, 4), 0x1234, "bsf of 0 keeps the destination");
     }
 }

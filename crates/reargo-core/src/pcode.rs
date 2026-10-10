@@ -544,6 +544,10 @@ pub mod intrinsic {
     pub const BSF: u64 = 0x101;
     pub const PMOVMSKB: u64 = 0x102;
     pub const PCMPEQB: u64 = 0x103;
+    /// `tzcnt`: the number of trailing zero bits (the operand width for 0)
+    pub const TZCNT: u64 = 0x104;
+    /// `bswap`: the bytes in reverse order
+    pub const BSWAP: u64 = 0x105;
     /// Not an instruction: the decompiler's marker after a call that never returns
     /// (`reargo_decompile::noreturn`). Prints nothing; control does not fall through it.
     pub const NORETURN: u64 = 0xff;
@@ -556,6 +560,8 @@ pub mod intrinsic {
             BSF => "bsf",
             PMOVMSKB => "pmovmskb",
             PCMPEQB => "pcmpeqb",
+            TZCNT => "tzcnt",
+            BSWAP => "bswap",
             _ => return None,
         })
     }
