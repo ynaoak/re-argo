@@ -2269,4 +2269,32 @@ mod tests {
         let call = c.lines().find(|l| l.contains("pthread_mutex_unlock@plt(")).unwrap_or_else(|| panic!("{c}"));
         assert!(call.contains("(rdi)"), "{c}");
     }
+
+    /// An unknown callee: a register only partly written (`setne sil`) whose byte the
+    /// function reads itself is no argument (WS82), though only the call reads the full `rsi`.
+    #[test]
+    fn partial_register_write_used_locally_is_no_argument() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&setcc_leftover_code(), 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi)"), "{c}");
+    }
+
+    /// `setne sil; call f`: a byte written only to be passed is still an argument.
+    #[test]
+    fn setcc_into_an_argument_register_is_an_argument() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x85, 0xc9, // test ecx, ecx
+            0x40, 0x0f, 0x95, 0xc6, // setne sil
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xe8, 0xf0, 0x0f, 0x00, 0x00, // call 0x2000
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi, rsi)"), "{c}");
+    }
 }
