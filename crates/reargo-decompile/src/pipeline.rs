@@ -361,6 +361,12 @@ fn decompile_function_inner(
     if lifted.is_empty() {
         return Err(format!("no instructions at 0x{:x}", func_entry));
     }
+    // WS83: the function ends where its FDE does. Lifted further, a tail `jmp` into the next
+    // function was followed into that function's code (0x39f04e0 printed 0x39f0520's loop);
+    // dropped, the `jmp` leaves the code and becomes a tail call
+    if let Some((start, len)) = fde_bounds(&program.info.memory, &program.info.sections, func_entry) {
+        lifted.retain(|i| i.address >= start && i.address < start + len);
+    }
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
     let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));
@@ -401,6 +407,12 @@ fn decompile_function_inner(
         &handlers,
         &switches,
     )
+}
+
+/// `[start, start + len)` of the function covering `entry`, from the `.eh_frame_hdr` table.
+fn fde_bounds(memory: &Memory, sections: &[reargo_loader::Section], entry: u64) -> Option<(u64, u64)> {
+    let hdr = sections.iter().find(|s| s.name == ".eh_frame_hdr")?.address;
+    reargo_loader::fde_function(memory, hdr, entry)
 }
 
 /// Address of the stub [`rewrite_tail_calls`] makes for a conditional jump out of the code to
