@@ -234,7 +234,15 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
         }
         let combines = match op.opcode {
             BoolXor | BoolOr => true,
-            IntEqual | IntNotEqual => op.inputs.get(1).is_some_and(|&z| is_zero(func, z)),
+            // `(a - b) == 0` -> `a == b`, `(r & r) == 0` (`test r, r`) -> `r == 0`; a zero test of
+            // anything else is already the comparison
+            IntEqual | IntNotEqual => {
+                op.inputs.get(1).is_some_and(|&z| is_zero(func, z))
+                    && func.varnodes[op.inputs[0] as usize].def_op.is_some_and(|d| {
+                        let t = &func.ops[d];
+                        t.opcode == IntSub || (t.opcode == IntAnd && t.inputs.len() == 2 && t.inputs[0] == t.inputs[1])
+                    })
+            }
             _ => false,
         };
         let Some(out) = op.output else { continue };
