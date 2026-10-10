@@ -54,6 +54,10 @@ pub struct CEmitter<'a> {
     /// `CallSiteAnnotator` once the iterative resolver has pinned
     /// arg values + a `SignatureDatabase` signature.
     call_renderings: Option<&'a BTreeMap<u64, String>>,
+    /// Conditions of the blocks the short-circuit merge collapsed (`a || b`), by block.
+    conds: Option<&'a rustc_hash::FxHashMap<usize, crate::condition::Cond>>,
+    /// Folds a test block's ops into its condition expression while a leaf is printed.
+    inliner: crate::condition::Inliner,
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
@@ -77,6 +81,8 @@ impl CEmitter<'static> {
             string_literals: empty_u64_map(),
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
         }
@@ -108,6 +114,8 @@ impl<'a> CEmitter<'a> {
             string_literals,
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
         }
@@ -134,6 +142,12 @@ impl<'a> CEmitter<'a> {
         renderings: &'a BTreeMap<u64, String>,
     ) -> Self {
         self.call_renderings = Some(renderings);
+        self
+    }
+
+    /// Attach the merged short-circuit conditions (`condition::merge_short_circuits`).
+    pub fn with_conditions(mut self, conds: &'a rustc_hash::FxHashMap<usize, crate::condition::Cond>) -> Self {
+        self.conds = Some(conds);
         self
     }
 
@@ -903,6 +917,9 @@ impl<'a> CEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
+        if let Some(e) = self.inliner.get(op.inputs[idx]) {
+            return e;
+        }
         let vn = &func.varnodes[op.inputs[idx] as usize];
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
             if let Some(s) = self.string_literals.get(&vn.data.offset) {
@@ -939,6 +956,16 @@ impl<'a> CEmitter<'a> {
     }
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
+            let mut leaf = |b: usize| {
+                if b == block_id {
+                    self.get_branch_condition(func, b)
+                } else {
+                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+                }
+            };
+            return c.render(negated, &mut leaf);
+        }
         negate_condition(self.get_branch_condition(func, block_id), negated)
     }
 
@@ -1017,15 +1044,59 @@ pub(crate) fn is_merged_call_result(func: &SsaFunction, op: &crate::ssa::SsaOp) 
     call.is_some_and(|c| call_result(func, c) == op.output)
 }
 
-/// `cond` inverted when `negated`: `!x` for a plain name, `!(…)` otherwise.
+/// `cond` inverted when `negated`: `!x` for a plain name, `x` for `!x`, `a != b` for
+/// `a == b` (and back), `!(…)` otherwise.
 pub(crate) fn negate_condition(cond: String, negated: bool) -> String {
     if !negated {
-        cond
-    } else if cond.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        format!("!{cond}")
-    } else {
-        format!("!({cond})")
+        return cond;
     }
+    if cond.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return format!("!{cond}");
+    }
+    if let Some(rest) = cond.strip_prefix('!')
+        && crate::condition::is_atomic(rest)
+    {
+        return strip_outer_parens(rest).to_string();
+    }
+    if let Some(flipped) = flip_equality(&cond) {
+        return flipped;
+    }
+    format!("!({cond})")
+}
+
+/// `(x)` -> `x` when the parentheses enclose the whole expression.
+fn strip_outer_parens(s: &str) -> &str {
+    if s.starts_with('(') && crate::condition::is_atomic(s) { &s[1..s.len() - 1] } else { s }
+}
+
+/// `a == b` -> `a != b` (and back) when that comparison is the only operator at the top level
+/// (outside parentheses) that binds looser than arithmetic.
+fn flip_equality(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut found: Option<(usize, &str)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                for op in [" == ", " != ", " && ", " || ", " < ", " <= ", " > ", " >= ", " ? ", " & ", " | ", " ^ "] {
+                    if s[i..].starts_with(op) {
+                        if found.is_some() || !matches!(op, " == " | " != ") {
+                            return None;
+                        }
+                        found = Some((i, op));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let (at, op) = found?;
+    let flipped = if op == " == " { " != " } else { " == " };
+    Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
 }
 
 struct FunctionSignature {

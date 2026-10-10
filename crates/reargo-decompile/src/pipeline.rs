@@ -743,7 +743,9 @@ fn build_decompile_result(
         .map(|(i, s)| s.to_c_definition(&format!("recovered_{}", i)))
         .collect();
 
-    let structured = structure_cfg(&ssa.cfg);
+    // `if (a) goto X; if (b) goto X;` -> `if (a || b) goto X;` (on a copy of the CFG)
+    let short = crate::condition::merge_short_circuits(&ssa);
+    let structured = structure_cfg(short.as_ref().map_or(&ssa.cfg, |s| &s.cfg));
     // Both emitters borrow the same two maps -- the previous API took
     // owned BTreeMaps and forced four clones per decompile call (two
     // maps * two emitters). The borrow-based `with_maps` API is
@@ -755,6 +757,9 @@ fn build_decompile_result(
     if let Some(rend) = call_renderings {
         c_emitter = c_emitter.with_call_renderings(rend);
     }
+    if let Some(s) = &short {
+        c_emitter = c_emitter.with_conditions(&s.conds);
+    }
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
@@ -763,6 +768,9 @@ fn build_decompile_result(
     }
     if let Some(rend) = call_renderings {
         rust_emitter = rust_emitter.with_call_renderings(rend);
+    }
+    if let Some(s) = &short {
+        rust_emitter = rust_emitter.with_conditions(&s.conds);
     }
     let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
@@ -1426,7 +1434,8 @@ mod tests {
     }
 
     /// WS79: a chain of compares jumping to one exit nests at the post-dominator (the exit)
-    /// instead of jumping there: no `goto`, no empty `if` arm.
+    /// instead of jumping there: no `goto`, no empty `if` arm. WS80: the tests that hold
+    /// nothing but the compare merge into one `&&` condition.
     #[test]
     fn compare_chain_to_one_exit_needs_no_goto() {
         let lifter = X86Lifter::new_64();
@@ -1441,7 +1450,9 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("goto"), "{c}");
         assert!(!c.contains("} else {"), "{c}");
-        assert_eq!(c.matches("if (!").count(), 3, "{c}");
+        assert_eq!(c.matches("if (").count(), 1, "{c}");
+        assert_eq!(c.matches(" && ").count(), 2, "{c}");
+        assert!(c.contains("(edi - 2) != 0") && c.contains("(edi - 3) != 0"), "{c}");
         assert_eq!(c.matches("return").count(), 1, "{c}");
     }
 
@@ -1542,4 +1553,30 @@ mod tests {
             "all reachable instructions must survive trim: {:?}", result.stats.basic_blocks);
         assert_eq!(result.stats.basic_blocks, 3);
     }
+
+    /// `if (a || b)`: the second test's block holds nothing but the test, so the two jumps to
+    /// the shared target are one condition (WS80) instead of the target printed twice.
+    #[test]
+    fn decompile_merges_or_condition() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, // cmp edi, 1
+            0x74, 0x0b, // je L
+            0x83, 0xfe, 0x02, // cmp esi, 2
+            0x74, 0x06, // je L
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+            0xc3, // ret
+            0xb8, 0x07, 0x00, 0x00, 0x00, // L: mov eax, 7
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains(" || ") || cond.contains(" && "), "{c}");
+        assert!(cond.contains("esi") && cond.contains('2'), "the second test folds into the condition: {c}");
+        assert_eq!(c.matches("if (").count(), 1, "{c}");
+        assert!(!c.contains("goto"), "{c}");
+        assert_eq!(c.matches("(uint32_t)7;").count(), 1, "{c}");
+    }
+
 }

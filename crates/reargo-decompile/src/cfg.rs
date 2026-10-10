@@ -167,7 +167,7 @@ impl BasicBlock {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ControlFlowGraph {
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,

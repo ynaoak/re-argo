@@ -39,6 +39,10 @@ pub struct RustEmitter<'a> {
     /// Per-call-site C-syntax rendering map. Mirror of the C
     /// emitter's `call_renderings`; see `emit.rs` for the rationale.
     call_renderings: Option<&'a BTreeMap<u64, String>>,
+    /// Conditions of the blocks the short-circuit merge collapsed (`a || b`), by block.
+    conds: Option<&'a rustc_hash::FxHashMap<usize, crate::condition::Cond>>,
+    /// Folds a test block's ops into its condition expression while a leaf is printed.
+    inliner: crate::condition::Inliner,
     /// Per-address emit-once dedup, so multi-op instructions don't
     /// replay the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
@@ -59,6 +63,8 @@ impl RustEmitter<'static> {
             string_literals: empty_u64_map(),
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -77,6 +83,8 @@ impl<'a> RustEmitter<'a> {
             string_literals,
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -98,6 +106,12 @@ impl<'a> RustEmitter<'a> {
         renderings: &'a BTreeMap<u64, String>,
     ) -> Self {
         self.call_renderings = Some(renderings);
+        self
+    }
+
+    /// Attach the merged short-circuit conditions (`condition::merge_short_circuits`).
+    pub fn with_conditions(mut self, conds: &'a rustc_hash::FxHashMap<usize, crate::condition::Cond>) -> Self {
+        self.conds = Some(conds);
         self
     }
 
@@ -778,6 +792,9 @@ impl<'a> RustEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
+        if let Some(e) = self.inliner.get(op.inputs[idx]) {
+            return e;
+        }
         let vn = &func.varnodes[op.inputs[idx] as usize];
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
             if let Some(s) = self.string_literals.get(&vn.data.offset) {
@@ -800,6 +817,16 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
+            let mut leaf = |b: usize| {
+                if b == block_id {
+                    self.get_branch_condition(func, b)
+                } else {
+                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+                }
+            };
+            return c.render(negated, &mut leaf);
+        }
         crate::emit::negate_condition(self.get_branch_condition(func, block_id), negated)
     }
 
