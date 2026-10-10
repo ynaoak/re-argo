@@ -372,13 +372,13 @@ impl<'a> Structurer<'a> {
             return None;
         }
         *budget = budget.checked_sub(insns)?;
-        match self.succs(b).as_slice() {
-            &[s] if s != b => {
+        match *self.succs(b).as_slice() {
+            [s] if s != b => {
                 let mut v = vec![Basic(b)];
                 v.extend(self.copy_from(s, stop, depth - 1, budget, false)?);
                 Some(v)
             }
-            &[t, f] if t != b && f != b => {
+            [t, f] if t != b && f != b => {
                 let jt = self.copy_from(t, stop, depth - 1, budget, false)?;
                 let jf = self.copy_from(f, stop, depth - 1, budget, false)?;
                 let if_then = |body: Vec<StructuredBlock>, negated: bool| IfThen {
