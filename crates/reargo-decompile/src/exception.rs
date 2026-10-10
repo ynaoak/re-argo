@@ -9,6 +9,9 @@ use std::collections::BTreeMap;
 
 use reargo_loader::{EhAction, Memory, Section};
 
+/// The call ranges unwinding to a landing pad, and what it does.
+type Pad = (Vec<(u64, u64)>, Vec<EhAction>);
+
 /// A landing pad's address and its note (`cleanup for the calls at 0x41cc0da..0x41cc113`).
 pub type Handler = (u64, String);
 
@@ -19,7 +22,7 @@ pub fn handlers(memory: &Memory, sections: &[Section], symbols: &BTreeMap<u64, S
     };
     let Some(sites) = reargo_loader::landing_pads(memory, hdr, entry) else { return Vec::new() };
     // landing pad -> (the call ranges unwinding to it, its actions)
-    let mut pads: BTreeMap<u64, (Vec<(u64, u64)>, Vec<EhAction>)> = BTreeMap::new();
+    let mut pads: BTreeMap<u64, Pad> = BTreeMap::new();
     for s in sites.iter().filter(|s| s.landing_pad != 0) {
         let e = pads.entry(s.landing_pad).or_default();
         e.0.push((s.start, s.start + s.len));
