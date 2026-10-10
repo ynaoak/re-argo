@@ -20,11 +20,15 @@ fn empty_cfg() -> ControlFlowGraph {
 /// A trap the processor never returns from into the next instruction: `int3` (lifted as
 /// `CALLOTHER(3)`, the padding after a `noreturn` call) or `ud2` / `hlt`. Control does not
 /// fall through it (WS79), so code after a `noreturn` call's padding — often the next
-/// function — is not taken for part of this one.
+/// function — is not taken for part of this one. A call that never returns, marked by
+/// [`crate::noreturn::mark_noreturn_calls`], ends the flow the same way (WS81).
 pub fn is_trap(insn: &LiftedInstruction) -> bool {
     insn.ops.iter().any(|op| {
         op.opcode == OpCode::CallOther
-            && op.inputs.first().is_some_and(|c| c.space == reargo_core::address::SpaceId::CONST && c.offset == 3)
+            && op.inputs.first().is_some_and(|c| {
+                c.space == reargo_core::address::SpaceId::CONST
+                    && (c.offset == 3 || c.offset == reargo_core::pcode::intrinsic::NORETURN)
+            })
     }) || matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
 }
 

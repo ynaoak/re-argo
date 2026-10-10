@@ -35,15 +35,17 @@ pub fn decompile(
     func_name: &str,
     max_instructions: usize,
 ) -> Result<DecompileResult, String> {
-    let lifted = lifter
+    let mut lifted = lifter
         .lift_range(memory, entry, max_instructions)
         .map_err(|e| e.to_string())?;
 
     if lifted.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
     }
+    crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
 
-    let trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
+    let mut trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
+    rewrite_tail_calls(&mut trimmed);
     let oracle = CalleeParams::new(lifter, memory);
     let call_params = callee_param_map(&trimmed, oracle.as_ref());
     let own = own_params(oracle.as_ref(), entry);
@@ -260,20 +262,25 @@ fn decompile_function_inner(
         })
         .unwrap_or(500);
 
-    let lifted = lifter
+    let mut lifted = lifter
         .lift_range(&program.info.memory, func_entry, max_insns)
         .map_err(|e| e.to_string())?;
 
     if lifted.is_empty() {
         return Err(format!("no instructions at 0x{:x}", func_entry));
     }
+    // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
+    // not reached through it)
+    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));
+    crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
 
     let terminated = if func.is_some() {
         trim_to_function_body(lifted, func_entry, func)
     } else {
         trim_to_return(lifted)
     };
-    let terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
+    let mut terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
+    rewrite_tail_calls(&mut terminated);
     let call_params = callee_param_map(&terminated, oracle);
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle);
@@ -293,6 +300,32 @@ fn decompile_function_inner(
         vcalls,
         Some((lifter, &program.info.memory)),
     )
+}
+
+/// A `jmp` out of the code being decompiled is a tail call (WS81): rewrite its `BRANCH` into
+/// `CALL target; RETURN`, so it prints as `return f(…);` with the call's arguments instead of
+/// vanishing (a `BRANCH` prints nothing) with the argument setup left dead.
+pub(crate) fn rewrite_tail_calls(instructions: &mut [LiftedInstruction]) {
+    use reargo_core::address::SpaceId;
+    use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
+    let inside: rustc_hash::FxHashSet<u64> = instructions.iter().map(|i| i.address).collect();
+    for insn in instructions.iter_mut() {
+        let Some(pos) = insn.ops.iter().position(|o| {
+            o.opcode == OpCode::Branch
+                && o.inputs.first().is_some_and(|t| t.space == SpaceId::RAM && !inside.contains(&t.offset))
+        }) else {
+            continue;
+        };
+        let seq = insn.ops[pos].seq;
+        insn.ops[pos].opcode = OpCode::Call;
+        insn.ops.insert(
+            pos + 1,
+            PcodeOp { opcode: OpCode::Return, seq, output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::CONST, 0, 8)] },
+        );
+        for (i, op) in insn.ops.iter_mut().enumerate() {
+            op.seq.order = i as u32;
+        }
+    }
 }
 
 /// Second input of a call's `INDIRECT` that marks a clobbered (not returned) register.
@@ -1528,6 +1561,143 @@ mod tests {
         assert!(c.contains("__builtin_trap();"), "{c}");
     }
 
+    /// WS81: a call to a function that never returns (here: it only traps) ends the flow —
+    /// the code behind it is not its continuation.
+    #[test]
+    fn call_to_noreturn_function_ends_the_flow() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory_parts(&[
+            (0x1000, &[
+                0x85, 0xff, // 0x1000 test edi, edi
+                0x74, 0x0b, // 0x1002 je 0x100f
+                0xe8, 0xf7, 0x0f, 0x00, 0x00, // 0x1004 call 0x2000 (never returns)
+                0xb8, 0x2a, 0x00, 0x00, 0x00, // 0x1009 mov eax, 0x2a (not reached)
+                0xc3, // 0x100e
+                0x31, 0xc0, // 0x100f xor eax, eax
+                0xc3,
+            ]),
+            (0x2000, &[0x0f, 0x0b]), // ud2
+        ]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("0x2a"), "{c}");
+        assert!(c.contains("0x2000("), "{c}");
+        assert!(!c.contains("goto"), "{c}");
+    }
+
+    /// WS81: the temporaries that only compute an `if` condition fold into it.
+    #[test]
+    fn condition_temporaries_fold_into_the_if() {
+        let c = c_of(&[
+            0x83, 0xff, 0x06, // 0x1000 cmp edi, 6
+            0x72, 0x06, // 0x1003 jb 0x100b
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 0x1005 mov eax, 1
+            0xc3, // 0x100a
+            0x31, 0xc0, // 0x100b xor eax, eax
+            0xc3,
+        ]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(cond.contains("edi") && cond.contains('6'), "{c}");
+        assert!(!c.contains("var_") && !c.contains("tmp_"), "{c}");
+    }
+
+    /// `test r, r` reads as `r`, not `r & r`.
+    #[test]
+    fn test_of_a_register_with_itself_is_the_register() {
+        let c = c_of(&[
+            0x85, 0xff, // 0x1000 test edi, edi
+            0x74, 0x06, // 0x1002 je 0x100a
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 0x1004 mov eax, 1
+            0xc3, // 0x1009
+            0x31, 0xc0, // 0x100a xor eax, eax
+            0xc3,
+        ]);
+        assert!(!c.contains("edi & edi"), "{c}");
+        assert!(c.contains("edi == 0") || c.contains("edi != 0"), "{c}");
+    }
+
+    /// Readers are counted by value: one op reading a value twice (`test r, r`) is one reader,
+    /// and a value common subexpression elimination merged has readers under two names, so it
+    /// is not folded away while the other name still reads it.
+    #[test]
+    fn readers_are_counted_by_value() {
+        let c = c_of(&[
+            0x8d, 0x4f, 0x01, // 0x1000 lea ecx, [rdi + 1]
+            0x8d, 0x57, 0x01, // 0x1003 lea edx, [rdi + 1]   (the same sum: merged)
+            0x01, 0xd1, // 0x1006 add ecx, edx
+            0x85, 0xc9, // 0x1008 test ecx, ecx
+            0x74, 0x06, // 0x100a je 0x1012
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 0x100c mov eax, 1
+            0xc3, // 0x1011
+            0x31, 0xc0, // 0x1012 xor eax, eax
+            0xc3,
+        ]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(cond.contains('+'), "the sum folds into the test: {c}");
+        for name in ["tmp_600", "ecx", "edx"] {
+            if cond.contains(name) {
+                assert!(c.contains(&format!("{name} = ")), "{name} is read but never set:
+{c}");
+            }
+        }
+    }
+
+    /// WS81: the flags a conditional jump tests read as the comparison of `cmp`'s operands.
+    #[test]
+    fn flags_of_cmp_read_as_the_comparison() {
+        let cond_of = |jcc: u8| {
+            // cmp edi, 5 ; jcc +6 ; mov eax, 1 ; ret ; xor eax, eax ; ret
+            let c = c_of(&[0x83, 0xff, 0x05, jcc, 0x06, 0xb8, 0x01, 0, 0, 0, 0xc3, 0x31, 0xc0, 0xc3]);
+            let l = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}")).trim().to_string();
+            assert!(!c.contains("var_") && !c.contains("tmp_"), "{c}");
+            l
+        };
+        // the `if` holds the fall-through arm or the jump's arm, so accept either sense
+        let either = |l: &str, a: &str, b: &str| l.contains(a) || l.contains(b);
+        assert!(either(&cond_of(0x76), "edi <= 5", "edi > 5"), "jbe: {}", cond_of(0x76));
+        assert!(either(&cond_of(0x77), "edi > 5", "edi <= 5"), "ja: {}", cond_of(0x77));
+        assert!(either(&cond_of(0x7c), "(int32_t)edi < (int32_t)5", "(int32_t)edi >= (int32_t)5"), "jl: {}", cond_of(0x7c));
+        assert!(either(&cond_of(0x7e), "(int32_t)edi <= (int32_t)5", "(int32_t)edi > (int32_t)5"), "jle: {}", cond_of(0x7e));
+        assert!(either(&cond_of(0x7f), "(int32_t)edi > (int32_t)5", "(int32_t)edi <= (int32_t)5"), "jg: {}", cond_of(0x7f));
+    }
+
+    /// WS81: a `jmp` to another function is a tail call: `return f(…);` with its argument.
+    #[test]
+    fn tail_jump_is_a_call_and_return() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory_parts(&[
+            (0x1000, &[
+                0x53, // 0x1000 push rbx
+                0xbf, 0x05, 0x00, 0x00, 0x00, // 0x1001 mov edi, 5
+                0x5b, // 0x1006 pop rbx
+                0xe9, 0xf4, 0x0f, 0x00, 0x00, // 0x1007 jmp 0x2000
+            ]),
+            (0x2000, &[0x8d, 0x47, 0x01, 0xc3]), // lea eax, [rdi + 1] ; ret
+        ]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 4).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("rdi") || call.contains('5'), "{c}");
+        assert!(c.contains("return"), "{c}");
+        assert!(!c.contains("rbx = "), "the epilogue before the jump is not printed: {c}");
+    }
+
+    /// WS81: a negated integer comparison in a merged condition flips its operator.
+    #[test]
+    fn negated_comparison_flips_its_operator() {
+        let c = c_of(&[
+            0x83, 0xff, 0x01, // 0x1000 cmp edi, 1
+            0x74, 0x0b, // 0x1003 je 0x1010
+            0x83, 0xfe, 0x05, // 0x1005 cmp esi, 5
+            0x7e, 0x06, // 0x1008 jle 0x1010
+            0xb8, 0x03, 0x00, 0x00, 0x00, // 0x100a mov eax, 3
+            0xc3, // 0x100f
+            0xb8, 0x07, 0x00, 0x00, 0x00, // 0x1010 mov eax, 7
+            0xc3,
+        ]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(cond.contains("(int32_t)esi > (int32_t)5") || cond.contains("(int32_t)esi <= (int32_t)5"), "{c}");
+        assert!(!cond.contains("!("), "{c}");
+    }
+
     /// WS77: a function that never sets `rax` returns nothing.
     #[test]
     fn ret_without_rax_write_is_void() {
@@ -1558,7 +1728,8 @@ mod tests {
         assert!(!c.contains("} else {"), "{c}");
         assert_eq!(c.matches("if (").count(), 1, "{c}");
         assert_eq!(c.matches(" && ").count(), 2, "{c}");
-        assert!(c.contains("(edi - 2) != 0") && c.contains("(edi - 3) != 0"), "{c}");
+        // (WS81: the flags of `cmp` read as the comparison itself)
+        assert!(c.contains("edi != 2") && c.contains("edi != 3"), "{c}");
         assert_eq!(c.matches("return").count(), 1, "{c}");
     }
 
@@ -1795,8 +1966,8 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
-        assert!(cond.contains("(esi - 2) != 0") || cond.contains("(esi - 2) == 0"), "{c}");
-        assert!(!cond.contains("!((esi - 2)"), "{c}");
+        assert!(cond.contains("esi != 2") || cond.contains("esi == 2"), "{c}");
+        assert!(!cond.contains("!(esi"), "{c}");
     }
 
 }

@@ -9,6 +9,7 @@ pub mod dataflow;
 pub mod dominator;
 pub mod emit;
 pub mod rust_emit;
+pub mod noreturn;
 pub mod optimize;
 pub mod pipeline;
 pub mod printer;

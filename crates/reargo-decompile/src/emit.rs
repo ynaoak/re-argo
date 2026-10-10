@@ -66,6 +66,8 @@ pub struct CEmitter<'a> {
     goto_targets: std::collections::BTreeSet<usize>,
     /// Epilogue ops not printed (`epilogue_noise`).
     noise: rustc_hash::FxHashSet<usize>,
+    /// Ops folded into their block's own branch condition (WS81): not statements.
+    folded: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for CEmitter<'static> {
@@ -88,6 +90,7 @@ impl CEmitter<'static> {
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
+            folded: rustc_hash::FxHashSet::default(),
         }
     }
 }
@@ -122,6 +125,7 @@ impl<'a> CEmitter<'a> {
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
+            folded: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -164,6 +168,10 @@ impl<'a> CEmitter<'a> {
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
+        self.folded = (0..func.cfg.blocks.len())
+            .filter_map(|b| self.own_condition(func, b))
+            .flat_map(|(ops, _)| ops)
+            .collect();
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -181,7 +189,7 @@ impl<'a> CEmitter<'a> {
         for vn in &func.varnodes {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
             // view syncs nobody reads) is not printed, so declaring it is noise
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead) {
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d)) {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
@@ -390,7 +398,8 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
+            // (a folded op only feeds the branch, which prints nothing here)
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -402,7 +411,7 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
@@ -471,6 +480,10 @@ impl<'a> CEmitter<'a> {
             OpCode::IntAnd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
+                if op.inputs.len() == 2 && op.inputs[0] == op.inputs[1] {
+                    // `test r, r`: `r & r` is `r`
+                    return Some(format!("{} = {};", dst, a));
+                }
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {} & {};", dst, a, b))
             }
@@ -864,7 +877,10 @@ impl<'a> CEmitter<'a> {
                     .and_then(|&inp| func.varnodes.get(inp as usize))
                     .filter(|v| v.data.space == SpaceId::CONST)
                     .map(|v| v.data.offset);
-                if tag == Some(3) {
+                if tag == Some(reargo_core::pcode::intrinsic::NORETURN) {
+                    // the marker after a call that never returns (WS81)
+                    None
+                } else if tag == Some(3) {
                     Some("__builtin_trap();".into())
                 } else if let Some(name) = tag.and_then(reargo_core::pcode::intrinsic::name) {
                     // `out = name(operands…)` — the operands are inputs[1..].
@@ -922,7 +938,7 @@ impl<'a> CEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
-        if let Some(e) = self.inliner.get(op.inputs[idx]) {
+        if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
         }
         let vn = &func.varnodes[op.inputs[idx] as usize];
@@ -935,6 +951,17 @@ impl<'a> CEmitter<'a> {
             }
         }
         varnode_name(vn)
+    }
+
+    /// The block's branch condition with the ops that only compute it folded in (WS81).
+    fn own_condition(&self, func: &SsaFunction, block_id: usize) -> Option<(Vec<usize>, crate::condition::Folded)> {
+        self.inliner.own_condition(func, block_id, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+    }
+
+    fn branch_folded(&self, func: &SsaFunction, block_id: usize) -> crate::condition::Folded {
+        self.own_condition(func, block_id)
+            .map(|(_, f)| f)
+            .unwrap_or_else(|| crate::condition::Folded::plain(self.get_branch_condition(func, block_id)))
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
@@ -962,16 +989,16 @@ impl<'a> CEmitter<'a> {
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
         if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
-            let mut leaf = |b: usize| {
+            let mut leaf = |b: usize, neg: bool| {
                 if b == block_id {
-                    self.get_branch_condition(func, b)
+                    self.branch_folded(func, b).render(neg)
                 } else {
-                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op)).render(neg)
                 }
             };
             return c.render(negated, &mut leaf);
         }
-        negate_condition(self.get_branch_condition(func, block_id), negated)
+        self.branch_folded(func, block_id).render(negated)
     }
 
     fn line(&mut self, text: &str) {
@@ -1104,6 +1131,47 @@ fn flip_equality(s: &str) -> Option<String> {
     Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
 }
 
+/// The opposite of an integer comparison printed as `a OP b` (WS81): `<` <-> `>=`, `<=` <-> `>`,
+/// `==` <-> `!=`, when that comparison is the only operator at the top level (outside
+/// parentheses) that binds looser than arithmetic. Only for integers (`!(a < b)` is not
+/// `a >= b` for a NaN).
+pub(crate) fn flip_comparison(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut found: Option<(usize, &str)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                for op in [" == ", " != ", " <= ", " >= ", " < ", " > ", " && ", " || ", " ? ", " & ", " | ", " ^ "] {
+                    if s[i..].starts_with(op) {
+                        if found.is_some() || matches!(op, " && " | " || " | " ? " | " & " | " | " | " ^ ") {
+                            return None;
+                        }
+                        found = Some((i, op));
+                        i += op.len() - 1;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let (at, op) = found?;
+    let flipped = match op {
+        " == " => " != ",
+        " != " => " == ",
+        " < " => " >= ",
+        " >= " => " < ",
+        " <= " => " > ",
+        _ => " <= ",
+    };
+    Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
+}
+
 struct FunctionSignature {
     return_type: &'static str,
     params: Vec<(String, String)>,
@@ -1186,7 +1254,11 @@ pub(crate) fn epilogue_noise(func: &SsaFunction) -> rustc_hash::FxHashSet<usize>
     let mut addrs = rustc_hash::FxHashSet::default();
     for b in &func.cfg.blocks {
         if b.is_return() {
-            for insn in b.instructions.iter().rev() {
+            for (k, insn) in b.instructions.iter().rev().enumerate() {
+                // (a tail call's `jmp` ends the block: the frame restore is before it)
+                if k == 0 && insn.mnemonic.trim_start().starts_with("jmp") {
+                    continue;
+                }
                 if !crate::cfg::is_epilogue_insn(&insn.mnemonic) {
                     break;
                 }
