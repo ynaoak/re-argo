@@ -55,6 +55,7 @@ pub fn decompile_with_symbols(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
     crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
+    let switches = crate::switch::recover_jump_tables(&mut lifted, memory);
 
     let mut trimmed = trim_to_return(lifted);
     rewrite_tail_calls(&mut trimmed);
@@ -68,7 +69,7 @@ pub fn decompile_with_symbols(
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[])
+    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches)
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -360,10 +361,18 @@ fn decompile_function_inner(
     if lifted.is_empty() {
         return Err(format!("no instructions at 0x{:x}", func_entry));
     }
+    // WS83: the function ends where its FDE does. Lifted further, a tail `jmp` into the next
+    // function was followed into that function's code (0x39f04e0 printed 0x39f0520's loop);
+    // dropped, the `jmp` leaves the code and becomes a tail call
+    if let Some((start, len)) = fde_bounds(&program.info.memory, &program.info.sections, func_entry) {
+        lifted.retain(|i| i.address >= start && i.address < start + len);
+    }
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
     let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));
     crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
+    // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
+    let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);
 
     let terminated = if func.is_some() {
         trim_to_function_body(lifted, func_entry, func)
@@ -396,7 +405,14 @@ fn decompile_function_inner(
         vcalls,
         Some((lifter, &program.info.memory)),
         &handlers,
+        &switches,
     )
+}
+
+/// `[start, start + len)` of the function covering `entry`, from the `.eh_frame_hdr` table.
+fn fde_bounds(memory: &Memory, sections: &[reargo_loader::Section], entry: u64) -> Option<(u64, u64)> {
+    let hdr = sections.iter().find(|s| s.name == ".eh_frame_hdr")?.address;
+    reargo_loader::fde_function(memory, hdr, entry)
 }
 
 /// Address of the stub [`rewrite_tail_calls`] makes for a conditional jump out of the code to
@@ -964,6 +980,7 @@ fn build_decompile_result(
     vcalls: Option<ThisVcalls<'_>>,
     caller_hint: Option<(&dyn PcodeLift, &Memory)>,
     handlers: &[crate::exception::Handler],
+    switches: &[crate::switch::JumpTable],
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -973,7 +990,8 @@ fn build_decompile_result(
     // CFG, since `build_owned` consumes them.
     let total_pcode: usize = instructions.iter().map(|i| i.ops.len()).sum();
     let instructions_lifted = instructions.len();
-    let cfg = ControlFlowGraph::build_owned(instructions);
+    let mut cfg = ControlFlowGraph::build_owned(instructions);
+    cfg.attach_switches(switches);
     let block_count = cfg.block_count();
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
@@ -996,12 +1014,11 @@ fn build_decompile_result(
     settle_unknown_returns(&mut ssa);
     let mut opt_stats = run_optimization_passes(&mut ssa);
     // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
-    if crate::flags::recover_flag_compares(&mut ssa) > 0 {
-        // twice: a copy of a constant that copy propagation already replaced in its reader
-        // still lists that reader, which dies only in the first round (`OF = 0` of `test`)
-        for _ in 0..2 {
-            opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
-        }
+    // WS83: `cmovcc`'s branch-free mask becomes `dst = c ? src : dst` (after the flags: `c`
+    // may be a flag combination they rewrote into a comparison)
+    let flags = crate::flags::recover_flag_compares(&mut ssa);
+    if crate::select::recover_selects(&mut ssa) + flags > 0 {
+        opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
     }
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
@@ -1241,6 +1258,12 @@ fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
                 }
                 OpCode::Return | OpCode::BranchInd => {
                     has_return_or_indjmp = true;
+                    // a recovered jump table's cases (WS83, `switch`)
+                    for t in op.inputs.iter().skip(1).filter(|t| op.opcode == OpCode::BranchInd && t.space == reargo_core::address::SpaceId::RAM) {
+                        if let Some(&t_idx) = addr_to_idx.get(&t.offset) {
+                            stack.push(t_idx);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1292,10 +1315,11 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
         let c = &r.c_code;
-        // the argument survives (it used to be dead code) and is the only one shown
+        // the argument survives (it used to be dead code) and is the only one shown; WS83: a
+        // constant is printed in the call, its register's assignment is dropped
         let call_line = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call_line.contains("rdi") && !call_line.contains("rsi"), "{call_line}");
-        assert!(c.contains("edi = 5"), "{c}");
+        assert!(call_line.contains("0x2000(5)"), "{call_line}");
+        assert!(!c.contains("edi = 5"), "{c}");
         // the store reads the call's result (WS79: printed as the call's assignment)
         assert!(call_line.trim_start().starts_with("rax = "), "{c}");
         assert!(!c.contains("__ret"), "{c}");
@@ -1373,8 +1397,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call_line = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call_line.contains("rdi"), "{call_line}\n{c}");
-        assert!(c.contains("edi = 5"), "{c}");
+        assert!(call_line.contains("0x2000(5)"), "{call_line}\n{c}");
     }
 
     /// WS76: an argument register left over from before an earlier call is not an argument.
@@ -1391,8 +1414,8 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let first = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
         let second = c.lines().find(|l| l.contains("0x2100(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(first.contains("rdi"), "{first}");
-        assert!(!second.contains("rdi"), "{second}\n{c}");
+        assert!(first.contains("0x2000(5)"), "{first}");
+        assert!(!second.contains("rdi") && !second.contains("(5"), "{second}\n{c}");
     }
 
     /// Code blobs at their addresses inside one `0xcc`-filled block.
@@ -1413,7 +1436,7 @@ mod tests {
         let mem = make_memory_parts(&[(0x1000, code), (0x1100, callee), (0x2000, vtbl)]);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call_line = c.lines().find(|l| l.contains("0x1100(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call_line.trim_start().starts_with("xmm0 = 0x1100(rdi)"), "{c}");
+        assert!(call_line.trim_start().starts_with("xmm0 = 0x1100(7)"), "{c}");
     }
 
     fn make_memory_parts(parts: &[(u64, &[u8])]) -> Memory {
@@ -1441,7 +1464,7 @@ mod tests {
         let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi, rsi)") || call.contains("(param_1, rsi)"), "{call}
+        assert!(call.contains("(rdi, 5)") || call.contains("(param_1, 5)"), "{call}
 {c}");
     }
 
@@ -1460,7 +1483,7 @@ mod tests {
         let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("rdi") && !call.contains("rcx"), "{call}
+        assert!(call.contains("0x2000(5)"), "{call}
 {c}");
     }
 
@@ -1496,7 +1519,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = call_line(&c, "(*rax)(");
-        assert!(call.contains("(rdi, rsi)"), "{call}\n{c}");
+        assert!(call.contains("(rdi, 5)"), "{call}\n{c}");
     }
 
     /// WS78: with an unknown callee, a register computed in an earlier block and used by other
@@ -1517,7 +1540,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = call_line(&c, "(*rax)(");
-        assert!(call.contains("(rdi);"), "{call}\n{c}");
+        assert!(call.contains("(5);"), "{call}\n{c}");
     }
 
     /// WS78: the 8/16-bit views of rbp/rsi/... have register names, not `var_<off>` (which
@@ -1526,7 +1549,7 @@ mod tests {
     fn low_byte_registers_are_named() {
         let lifter = X86Lifter::new_64();
         let code = [
-            0x40, 0xb6, 0x01, // mov sil, 1
+            0x40, 0x88, 0xfe, // mov sil, dil (WS83: not a constant, which the store would take)
             0x40, 0x88, 0x35, 0xf7, 0x1f, 0x00, 0x00, // mov [0x3000], sil
             0x66, 0x89, 0x2d, 0xf0, 0x1f, 0x00, 0x00, // mov [0x3001], bp
             0xc3,
@@ -2015,7 +2038,7 @@ mod tests {
         assert!(cond.contains("esi") && cond.contains('2'), "the second test folds into the condition: {c}");
         assert_eq!(c.matches("if (").count(), 1, "{c}");
         assert!(!c.contains("goto"), "{c}");
-        assert_eq!(c.matches("(uint32_t)7;").count(), 1, "{c}");
+        assert_eq!(c.matches("7;").count(), 1, "{c}");
     }
 
 
@@ -2338,7 +2361,7 @@ mod tests {
         let symbols = std::collections::BTreeMap::from([(0x2000u64, "pthread_mutex_unlock@plt".to_string())]);
         let c = decompile_with_symbols(&lifter, &mem, 0x1000, "f", 100, &symbols).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("pthread_mutex_unlock@plt(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi)"), "{c}");
+        assert!(call.contains("(5)"), "{c}");
     }
 
     /// An unknown callee: a register only partly written (`setne sil`) whose byte the
@@ -2349,7 +2372,7 @@ mod tests {
         let mem = make_memory(&setcc_leftover_code(), 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi)"), "{c}");
+        assert!(call.contains("(5)"), "{c}");
     }
 
     /// `setne sil; call f`: a byte written only to be passed is still an argument.
@@ -2366,7 +2389,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi, rsi)"), "{c}");
+        assert!(call.contains("(5, rsi)"), "{c}");
     }
 
     /// A thunk whose only instruction is `jmp import@plt` is that import (WS82): its name and
@@ -2386,5 +2409,174 @@ mod tests {
         let c = decompile_with_symbols(&lifter, &mem, 0x1000, "f", 4, &symbols).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("pthread_cond_destroy@plt(")).unwrap_or_else(|| panic!("{c}"));
         assert!(call.contains("(rdi)"), "{c}");
+    }
+
+    /// `dec ebx; jne L` in a loop (WS83, BDS 0xc226df0): `ebx`'s new value is printed as the
+    /// statement `ebx = ebx - 1;`, so the condition must test it (`ebx != 0`), not the flags'
+    /// `old - 1 == 0` folded to `ebx == 1` with `ebx` already decremented.
+    #[test]
+    fn dec_in_a_loop_tests_the_new_value() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xfb, // 0x1000 mov ebx, edi
+            0x31, 0xc0, // 0x1002 xor eax, eax
+            0x01, 0xd8, // 0x1004 L: add eax, ebx
+            0xff, 0xcb, // 0x1006 dec ebx
+            0x75, 0xfa, // 0x1008 jne L
+            0xc3, // 0x100a ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("ebx = ebx - 1;"), "{c}");
+        assert!(!c.contains("ebx == 1") && !c.contains("ebx != 1"), "{c}");
+        assert!(c.contains("ebx != 0") || c.contains("ebx == 0"), "{c}");
+    }
+
+    /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
+    #[test]
+    fn cmov_is_a_select() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x39, 0xf7, // cmp edi, esi
+            0x0f, 0x4c, 0xfe, // cmovl edi, esi
+            0x48, 0x39, 0xd1, // cmp rcx, rdx
+            0x48, 0x0f, 0x43, 0xca, // cmovae rcx, rdx
+            0x01, 0xcf, // add edi, ecx
+            0x89, 0xf8, // mov eax, edi
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        let c = &r.c_code;
+        assert!(c.contains("edi = ((int32_t)edi < (int32_t)esi) ? esi : edi;"), "{c}");
+        // `cmovae`: moves when `!(rcx < rdx)`
+        assert!(c.contains("rcx = (rcx < rdx) ? rcx : rdx;"), "{c}");
+        assert!(!c.contains("tmp_4b") && !c.contains("var_201"), "{c}");
+        assert!(r.rust_code.contains("if ") && !r.rust_code.contains("tmp_4bc"), "{}", r.rust_code);
+    }
+
+    /// A constant copy whose reader took the constant dies (WS83): copy propagation used to
+    /// leave the reader in the copy's use list, so `ecx = 7;` stayed printed (and died only
+    /// in functions with a phi, in a second round of dead code elimination).
+    #[test]
+    fn propagated_constant_copy_is_dropped() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xb9, 0x07, 0x00, 0x00, 0x00, // mov ecx, 7
+            0x89, 0x0f, // mov [rdi], ecx
+            0x31, 0xc0, // xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("*(uint32_t*)rdi = 7;"), "{c}");
+        assert!(!c.contains("ecx"), "{c}");
+    }
+
+    /// A PIE jump table (`cmp; ja default; lea rcx, [table]; movsxd rax, [rcx+rax*4]; add rax,
+    /// rcx; jmp rax`) is a `switch` with its cases (WS83); the cases used to be unreachable,
+    /// so their code was not printed at all (`goto *rax;`).
+    #[test]
+    fn jump_table_is_a_switch() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x83, 0xff, 0x03, // 0x1000 cmp edi, 3
+            0x77, 0x24, // 0x1003 ja 0x1029
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x00, 0x00, 0x00, // 0x1007 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100e movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1012 add rax, rcx
+            0xff, 0xe0, // 0x1015 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1017 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101d mov eax, 20; ret
+            0xb8, 0x1e, 0x00, 0x00, 0x00, 0xc3, // 0x1023 mov eax, 30; ret (no case)
+            0x31, 0xc0, 0xc3, // 0x1029 xor eax, eax; ret
+        ];
+        // case 0 -> 0x1017, 1 -> 0x101d, 2 -> default, 3 -> 0x101d (relative to the table)
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let table: Vec<u8> = [0x1017u64, 0x101d, 0x1029, 0x101d].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        let c = &r.c_code;
+        assert!(c.contains("switch (edi) {"), "{c}");
+        assert!(!c.contains("goto *"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        assert!(at("case 0:") < at("return 0xa;"), "{c}");
+        assert!(at("case 1:") < at("case 3:") && at("case 3:") < at("return 0x14;"), "{c}");
+        assert!(!c.contains("case 2:") && at("default:") < at("return 0;"), "{c}");
+        assert!(!c.contains("0x1100") && !c.contains("0x1e"), "the table computation is gone: {c}");
+        assert!(r.rust_code.contains("match edi {") && r.rust_code.contains("1 | 3 =>"), "{}", r.rust_code);
+    }
+
+    /// A `switch` in a loop whose case leaves the loop (WS83): `break` inside the `switch`
+    /// would only leave the `switch`, so the exit is a `goto` and the other cases `break`.
+    #[test]
+    fn switch_case_leaving_a_loop_is_no_break() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x31, 0xc0, // 0x1000 xor eax, eax
+            0x83, 0xff, 0x01, // 0x1002 L: cmp edi, 1
+            0x77, 0x19, // 0x1005 ja 0x1020
+            0x89, 0xf9, // 0x1007 mov ecx, edi
+            0x48, 0x8d, 0x15, 0xf0, 0x00, 0x00, 0x00, // 0x1009 lea rdx, [0x1100]
+            0x48, 0x63, 0x0c, 0x8a, // 0x1010 movsxd rcx, [rdx+rcx*4]
+            0x48, 0x01, 0xd1, // 0x1014 add rcx, rdx
+            0xff, 0xe1, // 0x1017 jmp rcx
+            0x83, 0xc0, 0x01, // 0x1019 case 0: add eax, 1
+            0xeb, 0x05, // 0x101c jmp 0x1023
+            0xeb, 0x07, // 0x101e case 1: jmp 0x1027 (out of the loop)
+            0x83, 0xc0, 0x02, // 0x1020 default: add eax, 2
+            0xff, 0xcf, // 0x1023 dec edi
+            0x79, 0xdb, // 0x1025 jns L
+            0xc3, // 0x1027 ret
+        ];
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let table: Vec<u8> = [0x1019u64, 0x101e].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let sw = c.find("switch (edi) {").unwrap_or_else(|| panic!("{c}"));
+        let case1 = c[sw..].find("case 1:").unwrap_or_else(|| panic!("{c}")) + sw;
+        let next = c[case1..].find("default:").map_or(c.len(), |d| d + case1);
+        let arm = &c[case1..next];
+        assert!(!arm.contains("break;"), "case 1 leaves the loop, not the switch: {c}");
+        assert!(arm.contains("goto ") || arm.contains("return"), "{c}");
+        assert!(c.contains("eax = eax + 2"), "{c}");
+        assert!(!c.contains("label_"), "the cases join inside the loop: {c}");
+    }
+
+    /// A constant a float op reads prints as a float (WS83): `xorps xmm1, xmm1; ucomiss
+    /// xmm0, xmm1` compares with `0.0f`, `movd xmm1, 0x3f800000; addss` adds `1.0f`.
+    #[test]
+    fn float_constants_print_as_floats() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xb8, 0x00, 0x00, 0x80, 0x3f, // mov eax, 0x3f800000
+            0x66, 0x0f, 0x6e, 0xc8, // movd xmm1, eax
+            0xf3, 0x0f, 0x58, 0xc1, // addss xmm0, xmm1
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("+ 1.0f"), "{c}");
+        assert!(!c.contains("0x3f800000"), "{c}");
+        assert_eq!(crate::emit::float_literal(0x3dcc_cccd, 4).as_deref(), Some("0.1f"));
+        assert_eq!(crate::emit::float_literal(0x4000_0000_0000_0000, 8).as_deref(), Some("2.0"));
+        assert_eq!(crate::emit::float_literal(0x7f80_0000, 4), None);
+    }
+
+    /// Adding a negative constant prints as a subtraction (WS83): `lea ecx, [rdi-6]` is
+    /// `ecx = edi - 6`, not `edi + 0xfffffffa`.
+    #[test]
+    fn negative_constant_add_is_a_subtraction() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x83, 0xc7, 0xfa, // add rdi, -6
+            0x48, 0x89, 0x3e, // mov [rsi], rdi
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("rdi = rdi - 6;"), "{c}");
+        assert!(!c.contains("0xfffffffffffffffa"), "{c}");
     }
 }

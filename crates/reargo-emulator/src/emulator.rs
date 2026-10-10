@@ -520,6 +520,12 @@ impl Emulator {
                 let sz = if op.inputs.len() > 2 { self.read_input(op, 2)? as u32 } else { 1 };
                 self.state.write_varnode(out, (val >> pos) & ((1u64 << sz) - 1));
             }
+            OpCode::Select => {
+                let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SELECT".into()))?;
+                let c = self.read_input(op, 0)?;
+                let v = if c != 0 { self.read_input(op, 1)? } else { self.read_input(op, 2)? };
+                self.state.write_varnode(out, v);
+            }
             OpCode::SPull => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SPULL".into()))?;
                 let val = self.read_input(op, 0)? as i64;

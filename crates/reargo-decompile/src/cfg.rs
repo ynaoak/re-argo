@@ -14,7 +14,18 @@ fn empty_cfg() -> ControlFlowGraph {
         }],
         entry_block: 0,
         addr_to_block: BTreeMap::new(),
+        switches: BTreeMap::new(),
     }
+}
+
+/// The case targets a recovered jump table put on a `BRANCHIND` (WS83, `switch`): its `RAM`
+/// inputs after the first.
+fn switch_targets(op: &reargo_core::pcode::PcodeOp) -> impl Iterator<Item = u64> + '_ {
+    op.inputs
+        .iter()
+        .skip(1)
+        .filter(move |v| op.opcode == OpCode::BranchInd && v.space == reargo_core::address::SpaceId::RAM)
+        .map(|v| v.offset)
 }
 
 /// A trap the processor never returns from into the next instruction: `int3` (lifted as
@@ -62,6 +73,7 @@ fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
                 {
                     leaders.insert(target_vn.offset);
                 }
+                leaders.extend(switch_targets(op));
             }
             let fall = insn.address + insn.length as u64;
             leaders.insert(fall);
@@ -87,7 +99,20 @@ fn finalize_cfg(
             last_insn.is_some_and(|insn| insn.ops.iter().any(|op| op.opcode == OpCode::Return));
         let has_branch_ind = last_insn
             .is_some_and(|insn| insn.ops.iter().any(|op| op.opcode == OpCode::BranchInd));
-        if has_return || has_branch_ind || last_insn.is_some_and(is_trap) {
+        if has_branch_ind {
+            // a recovered jump table's cases (WS83)
+            let targets: Vec<u64> =
+                last_insn.into_iter().flat_map(|i| i.ops.iter()).flat_map(switch_targets).collect();
+            for t in targets {
+                if let Some(&id) = addr_to_block.get(&t)
+                    && !blocks[i].successors.contains(&id)
+                {
+                    blocks[i].successors.push(id);
+                }
+            }
+            continue;
+        }
+        if has_return || last_insn.is_some_and(is_trap) {
             continue;
         }
         if has_unconditional_branch && !has_cbranch {
@@ -126,7 +151,16 @@ fn finalize_cfg(
         blocks,
         entry_block,
         addr_to_block,
+        switches: BTreeMap::new(),
     }
+}
+
+/// A block that ends in a recovered jump table (WS83): the block each case value goes to,
+/// and the block the bounds check sends the other values to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchInfo {
+    pub cases: Vec<(u64, BlockId)>,
+    pub default: Option<BlockId>,
 }
 
 pub type BlockId = usize;
@@ -190,6 +224,8 @@ pub struct ControlFlowGraph {
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
     addr_to_block: BTreeMap<u64, BlockId>,
+    /// Blocks ending in a recovered jump table (WS83, [`ControlFlowGraph::attach_switches`]).
+    pub switches: BTreeMap<BlockId, SwitchInfo>,
 }
 
 impl ControlFlowGraph {
@@ -293,6 +329,31 @@ impl ControlFlowGraph {
     }
 
 
+
+    /// Record the jump tables the CFG was built with (their `BRANCHIND`s carry the case
+    /// targets, see [`crate::switch`]) and strip the targets from the ops: from here on the
+    /// edges and [`ControlFlowGraph::switches`] say where the cases go.
+    pub fn attach_switches(&mut self, tables: &[crate::switch::JumpTable]) {
+        for t in tables {
+            let Some(b) = self.blocks.iter().position(|b| b.instructions.last().is_some_and(|i| i.address == t.jmp)) else {
+                continue;
+            };
+            let cases: Option<Vec<(u64, BlockId)>> =
+                t.targets.iter().enumerate().map(|(v, a)| Some((v as u64, *self.addr_to_block.get(a)?))).collect();
+            let Some(cases) = cases else { continue };
+            let default = t.default.and_then(|d| self.addr_to_block.get(&d).copied());
+            self.switches.insert(b, SwitchInfo { cases, default });
+        }
+        for block in &mut self.blocks {
+            for insn in &mut block.instructions {
+                for op in &mut insn.ops {
+                    if op.opcode == OpCode::BranchInd {
+                        op.inputs.truncate(1);
+                    }
+                }
+            }
+        }
+    }
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()

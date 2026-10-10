@@ -296,6 +296,15 @@ pub struct CallSite {
     pub actions: Vec<EhAction>,
 }
 
+/// `[start, start + len)` of the function whose FDE covers `addr`, read from loaded memory;
+/// `hdr` is the address of `.eh_frame_hdr` (WS83: the decompiler keeps a function to it, so a
+/// tail `jmp` into the next function is a call, not that function's code).
+pub fn fde_function(mem: &crate::memory::Memory, hdr: u64, addr: u64) -> Option<(u64, u64)> {
+    let fde = find_fde(mem, hdr, addr)?;
+    let (start, len) = fde_range(mem, fde)?;
+    (addr >= start && addr < start + len).then_some((start, len))
+}
+
 /// The call-site table of the LSDA (`.gcc_except_table`) of the function whose FDE covers
 /// `addr`, read from loaded memory; `hdr` is the address of `.eh_frame_hdr`. `None` when
 /// the function has no LSDA or its encodings are unsupported.
@@ -500,6 +509,23 @@ mod tests {
         assert_eq!(elf_eh_frame_function(&elf, 0x105f), Some((0x1040, 0x20)));
         assert_eq!(elf_eh_frame_function(&elf, 0x1060), None, "past the last FDE");
         assert_eq!(elf_eh_frame_function(&elf, 0xfff), None, "before the first FDE");
+    }
+
+    /// The same FDEs read from loaded memory (WS83).
+    #[test]
+    fn finds_fdes_in_memory() {
+        let elf = synthetic_elf();
+        let mut mem = crate::memory::Memory::new(reargo_core::address::SpaceId(1), reargo_core::address::Endian::Little);
+        mem.add_block(crate::memory::MemoryBlock {
+            name: "all".into(),
+            start: 0,
+            size: elf.len() as u64,
+            flags: crate::memory::MemoryFlags::READ,
+            data: Some(std::sync::Arc::from(elf.as_slice())),
+        });
+        assert_eq!(fde_function(&mem, 0x200, 0x1010), Some((0x1000, 0x40)));
+        assert_eq!(fde_function(&mem, 0x200, 0x1040), Some((0x1040, 0x20)));
+        assert_eq!(fde_function(&mem, 0x200, 0x1060), None);
     }
 
     #[test]

@@ -265,7 +265,8 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
             }
             let a = cfg.blocks[b].predecessors[0];
             let (sa, sb) = (cfg.blocks[a].successors.clone(), cfg.blocks[b].successors.clone());
-            if a == b || !two(&sa) || !two(&sb) {
+            // (a jump table's successors are its cases, WS83)
+            if a == b || !two(&sa) || !two(&sb) || cfg.switches.contains_key(&a) || cfg.switches.contains_key(&b) {
                 continue;
             }
             // S: the successor both share; A's other one is B
@@ -313,6 +314,10 @@ fn thread_empty_blocks(cfg: &mut ControlFlowGraph, empty: &[bool]) {
     };
     let mut changed = false;
     for b in 0..n {
+        // a jump table's successors stay its cases (WS83: `switches` names them)
+        if cfg.switches.contains_key(&b) {
+            continue;
+        }
         let succs = cfg.blocks[b].successors.clone();
         let mut new: Vec<BlockId> = succs.iter().map(|&s| resolve(cfg, s)).collect();
         if new != succs {
@@ -427,8 +432,13 @@ fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKe
     })
 }
 
-/// `Sub(a, b)` when `v` is `a - b` computed in `block` and nothing after it in the block
+/// `Sub(a, b)` when `v` is `a - b` computed in `block` and nothing from it on in the block
 /// writes over `a` or `b` (so their names, printed later in the condition, still mean them).
+///
+/// The sub itself counts (WS83): it is printed as a statement (it is not one of the folded
+/// ops), and `dec ebx` / `sub eax, esi` write their result over `a`. `dec ebx; jne L` used to
+/// print `ebx = ebx - 1; … while (ebx != 1)` — the flags' `old - 1 != 0` read with `ebx`
+/// already decremented.
 fn earlier_sub(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
     let d = func.varnodes[v as usize].def_op?;
     let sub = &func.ops[d];
@@ -443,7 +453,7 @@ fn earlier_sub(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
             && x.offset < w.offset + w.size as u64
             && w.offset < x.offset + x.size as u64
     };
-    for later in func.ops[d + 1..].iter().take_while(|o| o.block == block) {
+    for later in func.ops[d..].iter().take_while(|o| o.block == block) {
         if let Some(out) = later.output
             && !later.dead
             && (overlaps(a, &func.varnodes[out as usize].data) || overlaps(b, &func.varnodes[out as usize].data))

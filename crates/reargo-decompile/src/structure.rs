@@ -69,9 +69,12 @@ pub enum StructuredBlock {
         right_block: BlockId,
         body: Box<StructuredBlock>,
     },
+    /// `switch (index) { case v…: body … default: … }` of a recovered jump table (WS83).
+    /// `condition_block` ends in the table's `jmp` (its statements print before the
+    /// `switch`); each case lists the values that go to its body.
     Switch {
         condition_block: BlockId,
-        cases: Vec<(u64, StructuredBlock)>,
+        cases: Vec<(Vec<u64>, StructuredBlock)>,
         default: Option<Box<StructuredBlock>>,
     },
     Goto(BlockId),
@@ -231,6 +234,10 @@ struct Structurer<'a> {
     loop_stack: Vec<BlockId>,
     /// Joins of the `if`s whose arms are being structured (not yet printed).
     follow_stack: Vec<BlockId>,
+    /// For each `switch` whose cases are being structured, how many loops were open when it
+    /// started: inside its cases `break` leaves the `switch`, so leaving those loops needs a
+    /// `goto`.
+    switch_marks: Vec<usize>,
 }
 
 impl<'a> Structurer<'a> {
@@ -320,6 +327,7 @@ impl<'a> Structurer<'a> {
             emitted: vec![false; n],
             loop_stack: Vec::new(),
             follow_stack: Vec::new(),
+            switch_marks: Vec::new(),
         }
     }
 
@@ -337,8 +345,19 @@ impl<'a> Structurer<'a> {
         self.loops[h].as_ref().expect("loop header")
     }
 
-    /// The jump that reaching `b` turns into, given the loops and `if`s being structured.
+    /// The jump that reaching `b` turns into, given the loops, `if`s and `switch`es being
+    /// structured.
     fn jump_for(&self, b: BlockId) -> Option<StructuredBlock> {
+        match self.loop_jump_for(b) {
+            // in a `switch` in the innermost loop, `break` would leave the `switch`
+            Some(StructuredBlock::Break) if self.switch_marks.last() == Some(&self.loop_stack.len()) => {
+                Some(StructuredBlock::Goto(b))
+            }
+            j => j,
+        }
+    }
+
+    fn loop_jump_for(&self, b: BlockId) -> Option<StructuredBlock> {
         if let Some((&inner, outer)) = self.loop_stack.split_last() {
             if b == inner {
                 return Some(StructuredBlock::Continue);
@@ -489,6 +508,21 @@ impl<'a> Structurer<'a> {
                 }
             }
             self.emitted[b] = true;
+            // a jump table (WS83), maybe after its bounds check
+            if self.cfg.switches.contains_key(&b) {
+                let (node, next) = self.structure_switch(b, None, None);
+                out.push(node);
+                cur = next;
+                continue;
+            }
+            if let Some((s, d)) = self.bounds_check_of(b) {
+                self.emitted[s] = true;
+                let (node, next) = self.structure_switch(s, Some(d), self.ipdom[b]);
+                out.push(StructuredBlock::Basic(b));
+                out.push(node);
+                cur = next;
+                continue;
+            }
             let succs = self.succs(b);
             match succs.len() {
                 0 => {
@@ -583,6 +617,84 @@ impl<'a> Structurer<'a> {
             }],
         };
         (items, join)
+    }
+
+    /// `(switch block, default)` when `b` is the bounds check of a jump table: it goes to the
+    /// table's default or to the table's `jmp`, which nothing else reaches. The `switch` then
+    /// takes the default as its `default:` (the check's own branch prints nothing).
+    fn bounds_check_of(&self, b: BlockId) -> Option<(BlockId, BlockId)> {
+        let succs = self.succs(b);
+        let [x, y] = succs.as_slice() else { return None };
+        [(*x, *y), (*y, *x)].into_iter().find(|&(s, d)| {
+            self.cfg.switches.get(&s).is_some_and(|sw| sw.default == Some(d))
+                && self.cfg.blocks[s].predecessors == [b]
+                && !self.emitted[s]
+                && self.jump_for(s).is_none()
+                && self.loops[s].is_none()
+        })
+    }
+
+    /// Structure the jump table ending block `s`: each case's code up to the join, `default`
+    /// (the bounds check's other target) as `default:`. `join`: where the code after the
+    /// `switch` starts (the bounds check's post-dominator when there is one, else `s`'s).
+    fn structure_switch(&mut self, s: BlockId, default: Option<BlockId>, join: Option<BlockId>) -> (StructuredBlock, Option<BlockId>) {
+        let mut join = if default.is_some() { join } else { self.ipdom[s] };
+        let info = self.cfg.switches[&s].clone();
+        if let Some(&h) = self.loop_stack.last()
+            && self.loop_info(h).body[s]
+            && join.is_none_or(|j| !self.loop_info(h).body[j])
+        {
+            // the post-dominator lies outside the loop (a case leaves it): join the cases where
+            // most of them meet inside the loop (`next: i--; if (…) continue;`) instead
+            let body = &self.loop_info(h).body;
+            let mut met: Vec<(BlockId, usize)> = Vec::new();
+            let arms = info.cases.iter().map(|c| c.1).chain(default);
+            let mut seen_arms: Vec<BlockId> = Vec::new();
+            for t in arms {
+                if seen_arms.contains(&t) {
+                    continue;
+                }
+                seen_arms.push(t);
+                let mut p = Some(t);
+                while let Some(x) = p.filter(|&x| body[x] && x != h) {
+                    match met.iter_mut().find(|m| m.0 == x) {
+                        Some(m) => m.1 += 1,
+                        None => met.push((x, 1)),
+                    }
+                    p = self.ipdom[x];
+                }
+            }
+            join = met.iter().filter(|m| m.1 >= 2).max_by_key(|m| m.1).map(|m| m.0);
+        }
+        // the values of each target, in the order of their first value
+        let mut groups: Vec<(Vec<u64>, BlockId)> = Vec::new();
+        for (v, t) in info.cases {
+            if Some(t) == default {
+                continue;
+            }
+            match groups.iter_mut().find(|g| g.1 == t) {
+                Some(g) => g.0.push(v),
+                None => groups.push((vec![v], t)),
+            }
+        }
+        if let Some(j) = join {
+            self.follow_stack.push(j);
+        }
+        self.switch_marks.push(self.loop_stack.len());
+        let mut cases = Vec::with_capacity(groups.len());
+        for (values, t) in groups {
+            let body = if Some(t) == join { Vec::new() } else { self.walk(t, join, false) };
+            cases.push((values, seq(body)));
+        }
+        let default = default.map(|d| {
+            let body = if Some(d) == join { Vec::new() } else { self.walk(d, join, false) };
+            Box::new(seq(body))
+        });
+        self.switch_marks.pop();
+        if join.is_some() {
+            self.follow_stack.pop();
+        }
+        (StructuredBlock::Switch { condition_block: s, cases, default }, join)
     }
 
     fn structure_loop(&mut self, h: BlockId) -> (StructuredBlock, Option<BlockId>) {

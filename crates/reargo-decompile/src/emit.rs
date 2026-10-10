@@ -68,6 +68,9 @@ pub struct CEmitter<'a> {
     noise: rustc_hash::FxHashSet<usize>,
     /// Ops folded into their block's own branch condition (WS81): not statements.
     folded: rustc_hash::FxHashSet<usize>,
+    /// The condition of a select (`cmovcc`) folded into it (WS83): the comparison's text, by
+    /// the value it computes. Its op is in `folded`.
+    select_conds: rustc_hash::FxHashMap<crate::condition::ValueKey, String>,
 }
 
 impl Default for CEmitter<'static> {
@@ -87,6 +90,7 @@ impl CEmitter<'static> {
             call_renderings: None,
             conds: None,
             inliner: crate::condition::Inliner::default(),
+            select_conds: Default::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
@@ -122,6 +126,7 @@ impl<'a> CEmitter<'a> {
             call_renderings: None,
             conds: None,
             inliner: crate::condition::Inliner::default(),
+            select_conds: Default::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
@@ -172,6 +177,13 @@ impl<'a> CEmitter<'a> {
             .filter_map(|b| self.own_condition(func, b))
             .flat_map(|(ops, _)| ops)
             .collect();
+        self.select_conds.clear();
+        for (d, text) in select_conditions(func, &self.folded, &|op| self.emit_op(func, op)) {
+            self.folded.insert(d);
+            if let Some(out) = func.ops[d].output {
+                self.select_conds.insert(crate::condition::value_key(func, out), text);
+            }
+        }
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -360,24 +372,28 @@ impl<'a> CEmitter<'a> {
                 default,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "switch ({}) {{", self.get_branch_condition(func, *condition_block)
-                );
-                self.indent += 1;
-                for (val, body) in cases {
-                    linef!(self, "case 0x{:x}:", val);
+                linef!(self, "switch ({}) {{", self.switch_index(func, *condition_block));
+                let arms = cases.iter().map(|(v, b)| (Some(v), b)).chain(default.iter().map(|d| (None, &**d)));
+                for (values, body) in arms {
+                    match values {
+                        Some(vs) => {
+                            for v in vs {
+                                linef!(self, "case {}:", case_label(*v));
+                            }
+                        }
+                        None => self.line("default:"),
+                    }
                     self.indent += 1;
+                    let mark = self.output.len();
                     self.emit_block(func, body);
-                    self.line("break;");
+                    // no `break` after a body that leaves on its own
+                    let last = self.output[mark..].lines().map(str::trim).rfind(|l| !l.is_empty() && !l.starts_with("//")).unwrap_or("");
+                    let ends = last.starts_with("return") || last.starts_with("goto ") || last == "continue;" || last == "break;";
+                    if !ends {
+                        self.line("break;");
+                    }
                     self.indent -= 1;
                 }
-                if let Some(def) = default {
-                    self.line("default:");
-                    self.indent += 1;
-                    self.emit_block(func, def);
-                    self.line("break;");
-                    self.indent -= 1;
-                }
-                self.indent -= 1;
                 self.line("}");
             }
             StructuredBlock::Loop { body, .. } => {
@@ -426,6 +442,10 @@ impl<'a> CEmitter<'a> {
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
                 continue;
             }
+            // a recovered jump table's `jmp` is the `switch` (WS83)
+            if op.opcode == OpCode::BranchInd && func.cfg.switches.contains_key(&block_id) {
+                continue;
+            }
             self.emit_annotations_for(op.address);
             if let Some(line) = self.emit_op(func, op) {
                 self.line(&line);
@@ -471,6 +491,10 @@ impl<'a> CEmitter<'a> {
             OpCode::IntAdd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
+                // `x + 0xfffffffffffffffa` is `x - 6` (WS83)
+                if let Some(k) = op.inputs.get(1).and_then(|&v| negative_constant(&func.varnodes[v as usize].data)) {
+                    return Some(format!("{} = {} - {};", dst, a, small_hex(k)));
+                }
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {} + {};", dst, a, b))
             }
@@ -728,6 +752,14 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = !{};", dst, a))
             }
+            // `cmovcc` (WS83, `select`)
+            OpCode::Select if op.inputs.len() == 3 => {
+                let dst = out_name?;
+                let c = self.input_expr(func, op, 0);
+                let a = self.input_expr(func, op, 1);
+                let b = self.input_expr(func, op, 2);
+                Some(format!("{} = {} ? {} : {};", dst, c, a, b))
+            }
             OpCode::IntZExt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
@@ -950,7 +982,20 @@ impl<'a> CEmitter<'a> {
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
         }
+        if !self.select_conds.is_empty()
+            && let Some(e) = self.select_conds.get(&crate::condition::value_key(func, op.inputs[idx]))
+        {
+            return if crate::condition::is_atomic(e) { e.clone() } else { format!("({e})") };
+        }
         let vn = &func.varnodes[op.inputs[idx] as usize];
+        // a constant a float op reads is the bits of a float (WS83: constants now reach their
+        // readers, `xmm3_d = 0; x <= xmm3_d` -> `x <= 0.0f`)
+        if vn.data.space == SpaceId::CONST
+            && is_float_op(op.opcode)
+            && let Some(f) = float_literal(vn.data.offset, vn.data.size)
+        {
+            return f;
+        }
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
             if let Some(s) = self.string_literals.get(&vn.data.offset) {
                 return format!("\"{}\"", s.escape_default());
@@ -971,6 +1016,15 @@ impl<'a> CEmitter<'a> {
         self.own_condition(func, block_id)
             .map(|(_, f)| f)
             .unwrap_or_else(|| crate::condition::Folded::plain(self.get_branch_condition(func, block_id)))
+    }
+
+    /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83).
+    fn switch_index(&self, func: &SsaFunction, block_id: usize) -> String {
+        func.ops
+            .iter()
+            .rev()
+            .find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd)
+            .map_or_else(|| "cond".into(), |op| self.input_expr(func, op, 0))
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
@@ -1474,6 +1528,135 @@ fn size_to_signed_type(size: u32) -> &'static str {
         8 => "int64_t",
         _ => "int64_t",
     }
+}
+
+/// The comparisons to print inside the select (`cmovcc`, WS83) that reads them, as
+/// `(op, text)`: `edi = (int32_t)edi < (int32_t)esi ? esi : edi;` rather than a flag variable
+/// set the line before. Only a comparison in the select's block whose result nothing else
+/// reads, with no write over its operands between it and the select (the C output names the
+/// operands by register, so they must still hold their values there).
+pub(crate) fn select_conditions(
+    func: &SsaFunction,
+    folded: &rustc_hash::FxHashSet<usize>,
+    emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
+) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
+        return out;
+    }
+    let readers = crate::condition::Readers::new(func);
+    for (s, op) in func.ops.iter().enumerate() {
+        if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
+            continue;
+        }
+        let c = op.inputs[0];
+        let Some(d) = func.varnodes[c as usize].def_op else { continue };
+        let cmp = &func.ops[d];
+        let comparison = matches!(
+            cmp.opcode,
+            OpCode::IntEqual
+                | OpCode::IntNotEqual
+                | OpCode::IntLess
+                | OpCode::IntLessEqual
+                | OpCode::IntSLess
+                | OpCode::IntSLessEqual
+                | OpCode::FloatEqual
+                | OpCode::FloatNotEqual
+                | OpCode::FloatLess
+                | OpCode::FloatLessEqual
+        );
+        if cmp.dead || !comparison || cmp.block != op.block || d >= s || folded.contains(&d) || readers.of(func, c) != [s] {
+            continue;
+        }
+        let operand_overwritten = func.ops[d + 1..s].iter().any(|o| {
+            !o.dead
+                && o.output.is_some_and(|w| {
+                    let w = &func.varnodes[w as usize].data;
+                    cmp.inputs.iter().any(|&x| {
+                        let x = &func.varnodes[x as usize].data;
+                        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
+                    })
+                })
+        });
+        if operand_overwritten {
+            continue;
+        }
+        let Some(out_v) = cmp.output else { continue };
+        let prefix = format!("{} = ", varnode_name(&func.varnodes[out_v as usize]));
+        if let Some(rhs) = emit(cmp).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
+            out.push((d, rhs));
+        }
+    }
+    out
+}
+
+/// A `case` value: decimal, hex from 0x100 on.
+pub(crate) fn case_label(v: u64) -> String {
+    if v < 0x100 { v.to_string() } else { format!("0x{v:x}") }
+}
+
+/// An op whose operands are floats (arithmetic and comparisons, not conversions from an
+/// integer).
+fn is_float_op(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::FloatEqual
+            | OpCode::FloatNotEqual
+            | OpCode::FloatLess
+            | OpCode::FloatLessEqual
+            | OpCode::FloatAdd
+            | OpCode::FloatSub
+            | OpCode::FloatMult
+            | OpCode::FloatDiv
+            | OpCode::FloatNeg
+            | OpCode::FloatAbs
+            | OpCode::FloatSqrt
+            | OpCode::FloatNan
+            | OpCode::FloatFloat2Float
+            | OpCode::FloatTrunc
+            | OpCode::FloatCeil
+            | OpCode::FloatFloor
+            | OpCode::FloatRound
+    )
+}
+
+/// The C literal of the float whose bits are `bits` (`size` 4 = `float`, 8 = `double`).
+pub(crate) fn float_literal(bits: u64, size: u32) -> Option<String> {
+    let (mut t, suffix) = match size {
+        4 => {
+            let v = f32::from_bits(bits as u32);
+            (v.is_finite().then(|| format!("{v:?}"))?, "f")
+        }
+        8 => {
+            let v = f64::from_bits(bits);
+            (v.is_finite().then(|| format!("{v:?}"))?, "")
+        }
+        _ => return None,
+    };
+    if !t.contains(['.', 'e']) {
+        t.push_str(".0");
+    }
+    Some(format!("{t}{suffix}"))
+}
+
+/// `k` when `v` is the constant `-k` of its width, `k` small (below 2^31): an addition of it
+/// reads as a subtraction.
+fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u64> {
+    if v.space != SpaceId::CONST || v.size == 0 || v.size > 8 {
+        return None;
+    }
+    let bits = v.size * 8;
+    let x = if bits == 64 { v.offset } else { v.offset & ((1u64 << bits) - 1) };
+    if x >> (bits - 1) & 1 == 0 {
+        return None;
+    }
+    let k = if bits == 64 { x.wrapping_neg() } else { (1u64 << bits) - x };
+    (k != 0 && k < 1 << 31 && bits > 8).then_some(k)
+}
+
+/// A constant as the C output prints it: decimal below 10, else hex.
+fn small_hex(k: u64) -> String {
+    if k < 10 { k.to_string() } else { format!("0x{k:x}") }
 }
 
 #[cfg(test)]
