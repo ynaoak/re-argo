@@ -479,6 +479,9 @@ impl Folded {
     }
 }
 
+/// The ops folded into a block's own branch condition, and the condition.
+pub type OwnCondition = (Vec<OpIdx>, Folded);
+
 /// Prints the leaves of merged conditions: the ops of a test block are emitted in order and
 /// each result's right-hand side is substituted where it is read (`input_expr` asks
 /// [`Inliner::get`]), so the block's statements collapse into its condition expression.
@@ -488,7 +491,7 @@ pub struct Inliner {
     by_block: std::cell::OnceCell<Vec<Vec<OpIdx>>>,
     readers: std::cell::OnceCell<Readers>,
     /// block -> (the ops folded into its own condition, the condition's text)
-    own: std::cell::RefCell<FxHashMap<BlockId, Option<(Vec<OpIdx>, Folded)>>>,
+    own: std::cell::RefCell<FxHashMap<BlockId, Option<OwnCondition>>>,
 }
 
 impl Inliner {
@@ -516,7 +519,7 @@ impl Inliner {
         block: BlockId,
         name: &dyn Fn(VarId) -> String,
         emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
-    ) -> Option<(Vec<OpIdx>, Folded)> {
+    ) -> Option<OwnCondition> {
         if let Some(r) = self.own.borrow().get(&block) {
             return r.clone();
         }
