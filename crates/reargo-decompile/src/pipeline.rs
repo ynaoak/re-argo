@@ -51,7 +51,7 @@ pub fn decompile(
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own, vcalls)
+    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)))
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -291,6 +291,7 @@ fn decompile_function_inner(
         call_params,
         own,
         vcalls,
+        Some((lifter, &program.info.memory)),
     )
 }
 
@@ -535,7 +536,10 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
 /// wins only when some `ret` votes for it and none for `rax`. The losing register is
 /// removed from every `RETURN`, so its computation is not kept alive. Returns the float
 /// size when `xmm0` won.
-fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
+fn choose_return_register(
+    ssa: &mut SsaFunction,
+    callers: &mut dyn FnMut() -> Option<crate::callers::ReturnHint>,
+) -> Option<u32> {
     use reargo_core::pcode::OpCode;
     let rets: Vec<usize> = ssa
         .ops
@@ -547,6 +551,7 @@ fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
         return None;
     }
     let (mut float_votes, mut int_votes, mut size) = (0, 0, 0u32);
+    let mut passes_call_result = false;
     for &r in &rets {
         let (iv, fv) = (ssa.ops[r].inputs[1], ssa.ops[r].inputs[2]);
         let i = return_evidence(ssa, iv, &mut Vec::new());
@@ -560,9 +565,29 @@ fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
         } else if f.call_result && !i.call_result {
             // `call g; ret` with `g` known to return a float (its `rax` is only clobbered)
             float_votes += 1;
+        } else if i.call_result {
+            passes_call_result = true;
         }
     }
-    let float = float_votes > 0 && int_votes == 0;
+    // WS80: `return g();` with `g`'s return register unknown: ask what the callers read
+    let mut float = float_votes > 0 && int_votes == 0;
+    if float_votes == 0 && int_votes == 0 && passes_call_result {
+        match callers() {
+            Some(crate::callers::ReturnHint::Float(s)) => {
+                float = true;
+                size = s;
+            }
+            Some(crate::callers::ReturnHint::Void) => {
+                for &r in &rets {
+                    for v in ssa.ops[r].inputs.drain(1..).collect::<Vec<_>>() {
+                        unuse(ssa, v, r);
+                    }
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
     if size == 0 {
         size = 8; // only call results: the width is not known, print it as a double
     }
@@ -755,6 +780,7 @@ fn build_decompile_result(
     call_params: rustc_hash::FxHashMap<u64, ParamInfo>,
     own_params: Option<(ParamInfo, Vec<reargo_core::pcode::VarnodeData>)>,
     vcalls: Option<ThisVcalls<'_>>,
+    caller_hint: Option<(&dyn PcodeLift, &Memory)>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -782,7 +808,8 @@ fn build_decompile_result(
             .iter()
             .any(|o| matches!(o.opcode, reargo_core::pcode::OpCode::Call | reargo_core::pcode::OpCode::CallInd) && o.inputs.len() > 1);
 
-    ssa.return_float = choose_return_register(&mut ssa);
+    let mut hint = || caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, entry));
+    ssa.return_float = choose_return_register(&mut ssa, &mut hint);
     settle_unknown_returns(&mut ssa);
     let opt_stats = run_optimization_passes(&mut ssa);
     let live_ops = ssa.live_op_count();
@@ -1724,6 +1751,30 @@ mod tests {
         assert!(!c.contains("__ret"), "{c}");
         assert!(c.contains("rax = 0x2000("), "{c}");
         assert!(!c.contains("xmm0"), "{c}");
+    }
+
+
+    /// `return g();` with `g` unknown: the function's own code cannot tell what it returns,
+    /// its callers can (WS80) — one that ignores the result makes it `void`, one that tests
+    /// `eax` keeps `uint64_t`.
+    #[test]
+    fn return_type_from_what_callers_read() {
+        let lifter = X86Lifter::new_64();
+        let f = |after: &[u8]| {
+            let mut code = vec![
+                0xe8, 0xfb, 0x0f, 0x00, 0x00, // 1000: call 0x2000
+                0xc3, // 1005: ret
+                0xe8, 0xf5, 0xff, 0xff, 0xff, // 1006: caller: call 0x1000
+            ];
+            code.extend_from_slice(after);
+            let mem = make_memory(&code, 0x1000);
+            decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code
+        };
+        let ignored = f(&[0x31, 0xc0, 0xc3]); // xor eax, eax ; ret
+        assert!(ignored.contains("void f("), "{ignored}");
+        assert!(!ignored.contains("return rax"), "{ignored}");
+        let tested = f(&[0x85, 0xc0, 0xc3]); // test eax, eax ; ret
+        assert!(tested.contains("uint64_t f("), "{tested}");
     }
 
 }
