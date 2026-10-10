@@ -19,6 +19,7 @@ pub mod printer;
 pub mod scope;
 pub mod select;
 pub mod semantic_diff;
+pub mod switch;
 pub mod ssa;
 pub mod structure;
 pub mod taint;

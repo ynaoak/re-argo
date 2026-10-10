@@ -55,6 +55,7 @@ pub fn decompile_with_symbols(
         return Err(format!("no instructions at 0x{:x}", entry));
     }
     crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
+    let switches = crate::switch::recover_jump_tables(&mut lifted, memory);
 
     let mut trimmed = trim_to_return(lifted);
     rewrite_tail_calls(&mut trimmed);
@@ -68,7 +69,7 @@ pub fn decompile_with_symbols(
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[])
+    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches)
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -364,6 +365,8 @@ fn decompile_function_inner(
     // not reached through it)
     let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));
     crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
+    // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
+    let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);
 
     let terminated = if func.is_some() {
         trim_to_function_body(lifted, func_entry, func)
@@ -396,6 +399,7 @@ fn decompile_function_inner(
         vcalls,
         Some((lifter, &program.info.memory)),
         &handlers,
+        &switches,
     )
 }
 
@@ -964,6 +968,7 @@ fn build_decompile_result(
     vcalls: Option<ThisVcalls<'_>>,
     caller_hint: Option<(&dyn PcodeLift, &Memory)>,
     handlers: &[crate::exception::Handler],
+    switches: &[crate::switch::JumpTable],
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -973,7 +978,8 @@ fn build_decompile_result(
     // CFG, since `build_owned` consumes them.
     let total_pcode: usize = instructions.iter().map(|i| i.ops.len()).sum();
     let instructions_lifted = instructions.len();
-    let cfg = ControlFlowGraph::build_owned(instructions);
+    let mut cfg = ControlFlowGraph::build_owned(instructions);
+    cfg.attach_switches(switches);
     let block_count = cfg.block_count();
 
     let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
@@ -1240,6 +1246,12 @@ fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
                 }
                 OpCode::Return | OpCode::BranchInd => {
                     has_return_or_indjmp = true;
+                    // a recovered jump table's cases (WS83, `switch`)
+                    for t in op.inputs.iter().skip(1).filter(|t| op.opcode == OpCode::BranchInd && t.space == reargo_core::address::SpaceId::RAM) {
+                        if let Some(&t_idx) = addr_to_idx.get(&t.offset) {
+                            stack.push(t_idx);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2448,4 +2460,76 @@ mod tests {
         assert!(c.contains("*(uint32_t*)rdi = 7;"), "{c}");
         assert!(!c.contains("ecx"), "{c}");
     }
+
+    /// A PIE jump table (`cmp; ja default; lea rcx, [table]; movsxd rax, [rcx+rax*4]; add rax,
+    /// rcx; jmp rax`) is a `switch` with its cases (WS83); the cases used to be unreachable,
+    /// so their code was not printed at all (`goto *rax;`).
+    #[test]
+    fn jump_table_is_a_switch() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x83, 0xff, 0x03, // 0x1000 cmp edi, 3
+            0x77, 0x24, // 0x1003 ja 0x1029
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x00, 0x00, 0x00, // 0x1007 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100e movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1012 add rax, rcx
+            0xff, 0xe0, // 0x1015 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1017 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101d mov eax, 20; ret
+            0xb8, 0x1e, 0x00, 0x00, 0x00, 0xc3, // 0x1023 mov eax, 30; ret (no case)
+            0x31, 0xc0, 0xc3, // 0x1029 xor eax, eax; ret
+        ];
+        // case 0 -> 0x1017, 1 -> 0x101d, 2 -> default, 3 -> 0x101d (relative to the table)
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let table: Vec<u8> = [0x1017u64, 0x101d, 0x1029, 0x101d].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        let c = &r.c_code;
+        assert!(c.contains("switch (edi) {"), "{c}");
+        assert!(!c.contains("goto *"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        assert!(at("case 0:") < at("return 0xa;"), "{c}");
+        assert!(at("case 1:") < at("case 3:") && at("case 3:") < at("return 0x14;"), "{c}");
+        assert!(!c.contains("case 2:") && at("default:") < at("return 0;"), "{c}");
+        assert!(!c.contains("0x1100") && !c.contains("0x1e"), "the table computation is gone: {c}");
+        assert!(r.rust_code.contains("match edi {") && r.rust_code.contains("1 | 3 =>"), "{}", r.rust_code);
+    }
+
+    /// A `switch` in a loop whose case leaves the loop (WS83): `break` inside the `switch`
+    /// would only leave the `switch`, so the exit is a `goto` and the other cases `break`.
+    #[test]
+    fn switch_case_leaving_a_loop_is_no_break() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x31, 0xc0, // 0x1000 xor eax, eax
+            0x83, 0xff, 0x01, // 0x1002 L: cmp edi, 1
+            0x77, 0x19, // 0x1005 ja 0x1020
+            0x89, 0xf9, // 0x1007 mov ecx, edi
+            0x48, 0x8d, 0x15, 0xf0, 0x00, 0x00, 0x00, // 0x1009 lea rdx, [0x1100]
+            0x48, 0x63, 0x0c, 0x8a, // 0x1010 movsxd rcx, [rdx+rcx*4]
+            0x48, 0x01, 0xd1, // 0x1014 add rcx, rdx
+            0xff, 0xe1, // 0x1017 jmp rcx
+            0x83, 0xc0, 0x01, // 0x1019 case 0: add eax, 1
+            0xeb, 0x05, // 0x101c jmp 0x1023
+            0xeb, 0x07, // 0x101e case 1: jmp 0x1027 (out of the loop)
+            0x83, 0xc0, 0x02, // 0x1020 default: add eax, 2
+            0xff, 0xcf, // 0x1023 dec edi
+            0x79, 0xdb, // 0x1025 jns L
+            0xc3, // 0x1027 ret
+        ];
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let table: Vec<u8> = [0x1019u64, 0x101e].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let sw = c.find("switch (edi) {").unwrap_or_else(|| panic!("{c}"));
+        let case1 = c[sw..].find("case 1:").unwrap_or_else(|| panic!("{c}")) + sw;
+        let next = c[case1..].find("default:").map_or(c.len(), |d| d + case1);
+        let arm = &c[case1..next];
+        assert!(!arm.contains("break;"), "case 1 leaves the loop, not the switch: {c}");
+        assert!(arm.contains("goto ") || arm.contains("return"), "{c}");
+        assert!(c.contains("eax = eax + 2"), "{c}");
+        assert!(!c.contains("label_"), "the cases join inside the loop: {c}");
+    }
+
 }

@@ -265,7 +265,8 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
             }
             let a = cfg.blocks[b].predecessors[0];
             let (sa, sb) = (cfg.blocks[a].successors.clone(), cfg.blocks[b].successors.clone());
-            if a == b || !two(&sa) || !two(&sb) {
+            // (a jump table's successors are its cases, WS83)
+            if a == b || !two(&sa) || !two(&sb) || cfg.switches.contains_key(&a) || cfg.switches.contains_key(&b) {
                 continue;
             }
             // S: the successor both share; A's other one is B
@@ -313,6 +314,10 @@ fn thread_empty_blocks(cfg: &mut ControlFlowGraph, empty: &[bool]) {
     };
     let mut changed = false;
     for b in 0..n {
+        // a jump table's successors stay its cases (WS83: `switches` names them)
+        if cfg.switches.contains_key(&b) {
+            continue;
+        }
         let succs = cfg.blocks[b].successors.clone();
         let mut new: Vec<BlockId> = succs.iter().map(|&s| resolve(cfg, s)).collect();
         if new != succs {

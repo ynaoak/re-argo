@@ -303,22 +303,31 @@ impl<'a> RustEmitter<'a> {
                 default,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "match {} {{", self.get_branch_condition(func, *condition_block)
-                );
+                let index = func
+                    .ops
+                    .iter()
+                    .rev()
+                    .find(|op| op.block == *condition_block && !op.dead && op.opcode == OpCode::BranchInd)
+                    .map_or_else(|| self.get_branch_condition(func, *condition_block), |op| self.input_expr(func, op, 0));
+                linef!(self, "match {} {{", index);
                 self.indent += 1;
-                for (val, body) in cases {
-                    linef!(self, "0x{:x} => {{", val);
+                for (vals, body) in cases {
+                    let pat: Vec<String> = vals.iter().map(|v| crate::emit::case_label(*v)).collect();
+                    linef!(self, "{} => {{", pat.join(" | "));
                     self.indent += 1;
                     self.emit_block(func, body);
                     self.indent -= 1;
                     self.line("}");
                 }
-                if let Some(def) = default {
-                    self.line("_ => {");
-                    self.indent += 1;
-                    self.emit_block(func, def);
-                    self.indent -= 1;
-                    self.line("}");
+                match default {
+                    Some(def) => {
+                        self.line("_ => {");
+                        self.indent += 1;
+                        self.emit_block(func, def);
+                        self.indent -= 1;
+                        self.line("}");
+                    }
+                    None => self.line("_ => {}"),
                 }
                 self.indent -= 1;
                 self.line("}");
@@ -389,6 +398,10 @@ impl<'a> RustEmitter<'a> {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
+                continue;
+            }
+            // a recovered jump table's `jmp` is the `match` (WS83)
+            if op.opcode == OpCode::BranchInd && func.cfg.switches.contains_key(&block_id) {
                 continue;
             }
             self.emit_annotations_for(op.address);

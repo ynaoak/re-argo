@@ -372,24 +372,28 @@ impl<'a> CEmitter<'a> {
                 default,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                linef!(self, "switch ({}) {{", self.get_branch_condition(func, *condition_block)
-                );
-                self.indent += 1;
-                for (val, body) in cases {
-                    linef!(self, "case 0x{:x}:", val);
+                linef!(self, "switch ({}) {{", self.switch_index(func, *condition_block));
+                let arms = cases.iter().map(|(v, b)| (Some(v), b)).chain(default.iter().map(|d| (None, &**d)));
+                for (values, body) in arms {
+                    match values {
+                        Some(vs) => {
+                            for v in vs {
+                                linef!(self, "case {}:", case_label(*v));
+                            }
+                        }
+                        None => self.line("default:"),
+                    }
                     self.indent += 1;
+                    let mark = self.output.len();
                     self.emit_block(func, body);
-                    self.line("break;");
+                    // no `break` after a body that leaves on its own
+                    let last = self.output[mark..].lines().map(str::trim).rfind(|l| !l.is_empty() && !l.starts_with("//")).unwrap_or("");
+                    let ends = last.starts_with("return") || last.starts_with("goto ") || last == "continue;" || last == "break;";
+                    if !ends {
+                        self.line("break;");
+                    }
                     self.indent -= 1;
                 }
-                if let Some(def) = default {
-                    self.line("default:");
-                    self.indent += 1;
-                    self.emit_block(func, def);
-                    self.line("break;");
-                    self.indent -= 1;
-                }
-                self.indent -= 1;
                 self.line("}");
             }
             StructuredBlock::Loop { body, .. } => {
@@ -436,6 +440,10 @@ impl<'a> CEmitter<'a> {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
+                continue;
+            }
+            // a recovered jump table's `jmp` is the `switch` (WS83)
+            if op.opcode == OpCode::BranchInd && func.cfg.switches.contains_key(&block_id) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -996,6 +1004,15 @@ impl<'a> CEmitter<'a> {
         self.own_condition(func, block_id)
             .map(|(_, f)| f)
             .unwrap_or_else(|| crate::condition::Folded::plain(self.get_branch_condition(func, block_id)))
+    }
+
+    /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83).
+    fn switch_index(&self, func: &SsaFunction, block_id: usize) -> String {
+        func.ops
+            .iter()
+            .rev()
+            .find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd)
+            .map_or_else(|| "cond".into(), |op| self.input_expr(func, op, 0))
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
@@ -1753,4 +1770,9 @@ pub(crate) fn select_conditions(
         }
     }
     out
+}
+
+/// A `case` value: decimal, hex from 0x100 on.
+pub(crate) fn case_label(v: u64) -> String {
+    if v < 0x100 { v.to_string() } else { format!("0x{v:x}") }
 }
