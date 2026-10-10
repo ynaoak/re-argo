@@ -537,6 +537,9 @@ pub mod intrinsic {
     pub const BSF: u64 = 0x101;
     pub const PMOVMSKB: u64 = 0x102;
     pub const PCMPEQB: u64 = 0x103;
+    /// Not an instruction: the decompiler's marker after a call that never returns
+    /// (`reargo_decompile::noreturn`). Prints nothing; control does not fall through it.
+    pub const NORETURN: u64 = 0xff;
 
     /// Map an intrinsic tag to its rendered name, or None if `tag` is not a
     /// named intrinsic (e.g. 0 generic / 3 int3).

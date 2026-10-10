@@ -35,13 +35,14 @@ pub fn decompile(
     func_name: &str,
     max_instructions: usize,
 ) -> Result<DecompileResult, String> {
-    let lifted = lifter
+    let mut lifted = lifter
         .lift_range(memory, entry, max_instructions)
         .map_err(|e| e.to_string())?;
 
     if lifted.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
     }
+    crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
 
     let trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
     let oracle = CalleeParams::new(lifter, memory);
@@ -260,13 +261,17 @@ fn decompile_function_inner(
         })
         .unwrap_or(500);
 
-    let lifted = lifter
+    let mut lifted = lifter
         .lift_range(&program.info.memory, func_entry, max_insns)
         .map_err(|e| e.to_string())?;
 
     if lifted.is_empty() {
         return Err(format!("no instructions at 0x{:x}", func_entry));
     }
+    // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
+    // not reached through it)
+    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));
+    crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
 
     let terminated = if func.is_some() {
         trim_to_function_body(lifted, func_entry, func)
@@ -1526,6 +1531,29 @@ mod tests {
         ]);
         assert!(!c.contains("0x2a"), "{c}");
         assert!(c.contains("__builtin_trap();"), "{c}");
+    }
+
+    /// WS81: a call to a function that never returns (here: it only traps) ends the flow —
+    /// the code behind it is not its continuation.
+    #[test]
+    fn call_to_noreturn_function_ends_the_flow() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory_parts(&[
+            (0x1000, &[
+                0x85, 0xff, // 0x1000 test edi, edi
+                0x74, 0x0b, // 0x1002 je 0x100f
+                0xe8, 0xf7, 0x0f, 0x00, 0x00, // 0x1004 call 0x2000 (never returns)
+                0xb8, 0x2a, 0x00, 0x00, 0x00, // 0x1009 mov eax, 0x2a (not reached)
+                0xc3, // 0x100e
+                0x31, 0xc0, // 0x100f xor eax, eax
+                0xc3,
+            ]),
+            (0x2000, &[0x0f, 0x0b]), // ud2
+        ]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("0x2a"), "{c}");
+        assert!(c.contains("0x2000("), "{c}");
+        assert!(!c.contains("goto"), "{c}");
     }
 
     /// WS77: a function that never sets `rax` returns nothing.

@@ -771,7 +771,10 @@ impl<'a> RustEmitter<'a> {
                     .and_then(|&inp| func.varnodes.get(inp as usize))
                     .filter(|v| v.data.space == SpaceId::CONST)
                     .map(|v| v.data.offset);
-                if tag == Some(3) {
+                if tag == Some(reargo_core::pcode::intrinsic::NORETURN) {
+                    // the marker after a call that never returns (WS81)
+                    None
+                } else if tag == Some(3) {
                     Some("core::intrinsics::abort();".into())
                 } else if let Some(name) = tag.and_then(reargo_core::pcode::intrinsic::name) {
                     let args: Vec<String> = (1..op.inputs.len())
