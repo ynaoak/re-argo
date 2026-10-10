@@ -190,7 +190,8 @@ impl SsaFunction {
         }
 
         // 2. phi placement on the iterated dominance frontier
-        let idom = if n > 0 { crate::dominator::compute_idom(&cfg) } else { Vec::new() };
+        // WS82: landing pads are roots too, so their values reach the code after them
+        let idom = if n > 0 { crate::dominator::compute_idom_forest(&cfg) } else { Vec::new() };
         let df = if n > 0 {
             crate::dominator::compute_dominance_frontier(&cfg, &idom)
         } else {
@@ -268,7 +269,7 @@ impl SsaFunction {
         if n > 0 {
             roots.push(cfg.entry_block);
         }
-        roots.extend((0..n).filter(|&b| b != cfg.entry_block && idom[b].is_none()));
+        roots.extend((0..n).filter(|&b| b != cfg.entry_block && idom[b].is_none_or(|d| d == b)));
         let mut pushed_by: Vec<Vec<Key>> = vec![Vec::new(); n];
         for root in roots {
             // explicit DFS; on exit pop the names the block pushed

@@ -921,6 +921,30 @@ fn only_calls_use(func: &SsaFunction, v: crate::ssa::VarId) -> bool {
     true
 }
 
+/// Is `v` a register only partly written (`setne sil` merges a byte into `rsi`) whose narrow
+/// part the function reads itself (`and al, sil`, a compare)? The byte was computed for the
+/// function's own use, so the full register is no argument set up for a call (WS82). A byte
+/// written only to be passed (`setne sil; call f(bool)`) is still one.
+fn narrow_write_used_locally(func: &SsaFunction, v: crate::ssa::VarId) -> bool {
+    let Some(d) = func.varnodes[v as usize].def_op else { return false };
+    let op = &func.ops[d];
+    if op.opcode != OpCode::Piece || op.inputs.len() != 2 {
+        return false;
+    }
+    let lo = op.inputs[1];
+    if func.varnodes[lo as usize].data.size > 2 {
+        return false;
+    }
+    func.varnodes[lo as usize].uses.iter().any(|&u| {
+        let r = &func.ops[u];
+        !r.dead
+            && !matches!(
+                r.opcode,
+                OpCode::Piece | OpCode::IntZExt | OpCode::IntSExt | OpCode::Subpiece | OpCode::Call | OpCode::CallInd
+            )
+    })
+}
+
 /// Does `v` reach anything with an effect (a store, call, branch, return, ...)? Before DCE
 /// runs, a value's flag computations are still uses; this sees through them. Conservative
 /// (`true`) past a small depth.
@@ -1045,7 +1069,7 @@ pub fn prune_call_args(func: &mut SsaFunction) -> usize {
             for (a, &c) in class_of.iter().enumerate() {
                 let k = a + 1;
                 let v = inputs[k];
-                let set_up_here = values[k] == Some(ArgValue::SetUp) && only_calls_use(func, v);
+                let set_up_here = values[k] == Some(ArgValue::SetUp) && only_calls_use(func, v) && !narrow_write_used_locally(func, v);
                 let strong = set_up_here
                     || params.is_some_and(|p| p.mask & (1 << a) != 0)
                     || (pos_in_class(a) == 0 && values[k].is_some() && op_is_vcall_on(func, i, v));

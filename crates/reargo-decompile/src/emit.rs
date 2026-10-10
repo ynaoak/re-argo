@@ -391,6 +391,15 @@ impl<'a> CEmitter<'a> {
             StructuredBlock::Goto(target) => {
                 linef!(self, "goto label_{:x};", func.cfg.blocks[*target].start_addr);
             }
+            StructuredBlock::Handler { landing_pad, note, body } => {
+                // reached only by unwinding (WS82)
+                linef!(self, "/* landing pad 0x{:x}: {} */", func.cfg.blocks[*landing_pad].start_addr, note);
+                self.line("{");
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.indent -= 1;
+                self.line("}");
+            }
             StructuredBlock::Break => self.line("break;"),
             StructuredBlock::Continue => self.line("continue;"),
         }
@@ -1196,7 +1205,8 @@ fn collect_goto_targets(block: &StructuredBlock, out: &mut std::collections::BTr
         | ForLoop { body, .. }
         | ShortCircuitAnd { body, .. }
         | ShortCircuitOr { body, .. }
-        | Loop { body, .. } => collect_goto_targets(body, out),
+        | Loop { body, .. }
+        | Handler { body, .. } => collect_goto_targets(body, out),
         Switch { cases, default, .. } => {
             cases.iter().for_each(|(_, b)| collect_goto_targets(b, out));
             if let Some(d) = default {
@@ -1220,7 +1230,7 @@ fn leading_block(block: &StructuredBlock) -> Option<usize> {
         ShortCircuitAnd { left_block, .. } | ShortCircuitOr { left_block, .. } => Some(*left_block),
         Loop { header, .. } => Some(*header),
         DoWhileLoop { body, .. } => leading_block(body),
-        Sequence(_) | Goto(_) | Break | Continue => None,
+        Sequence(_) | Goto(_) | Break | Continue | Handler { .. } => None,
     }
 }
 
@@ -1370,6 +1380,10 @@ fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
     }
     if vn.data.space == SpaceId::RAM {
         return format!("0x{:x}", vn.data.offset);
+    }
+    if vn.data.space == SpaceId::UNIQUE && vn.data.offset >= crate::flags::SAVED_BASE {
+        // a compared value kept before the compare's result overwrote it (WS82)
+        return format!("old_{}", (vn.data.offset - crate::flags::SAVED_BASE) / 0x10 + 1);
     }
     format!("tmp_{:x}", vn.data.offset)
 }

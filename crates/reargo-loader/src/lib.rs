@@ -16,7 +16,7 @@ pub mod source_map;
 pub mod symbols;
 
 pub use error::LoaderError;
-pub use ehframe::elf_eh_frame_function;
+pub use ehframe::{elf_eh_frame_function, landing_pads, CallSite, EhAction};
 pub use dwarf::{DwarfInfo, DwarfFunctionInfo};
 pub use loader::{elf_pointer_relocations, Architecture, BinaryFormat, BinaryInfo, BinaryLoader, DynamicInfo, ImportEntry, LoadSymbol, Section, SectionFlags, SymbolKind};
 pub use imports::{ImportExportTable, ImportedFunction, ExportedFunction};

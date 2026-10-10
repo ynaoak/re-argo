@@ -9,7 +9,7 @@ use crate::emit::CEmitter;
 use crate::rust_emit::RustEmitter;
 use crate::optimize::{run_optimization_passes, OptimizationStats};
 use crate::ssa::SsaFunction;
-use crate::structure::structure_cfg;
+use crate::structure::structure_cfg_with_handlers;
 
 pub struct DecompileResult {
     pub c_code: String,
@@ -35,6 +35,18 @@ pub fn decompile(
     func_name: &str,
     max_instructions: usize,
 ) -> Result<DecompileResult, String> {
+    decompile_with_symbols(lifter, memory, entry, func_name, max_instructions, &std::collections::BTreeMap::new())
+}
+
+/// [`decompile`] with the names of other addresses (imports get their known prototypes).
+pub fn decompile_with_symbols(
+    lifter: &dyn PcodeLift,
+    memory: &Memory,
+    entry: u64,
+    func_name: &str,
+    max_instructions: usize,
+    symbols: &std::collections::BTreeMap<u64, String>,
+) -> Result<DecompileResult, String> {
     let mut lifted = lifter
         .lift_range(memory, entry, max_instructions)
         .map_err(|e| e.to_string())?;
@@ -44,16 +56,19 @@ pub fn decompile(
     }
     crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
 
-    let mut trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
+    let mut trimmed = trim_to_return(lifted);
     rewrite_tail_calls(&mut trimmed);
+    let trimmed = crate::vcall::devirtualize_constant_calls(trimmed, memory);
     let oracle = CalleeParams::new(lifter, memory);
-    let call_params = callee_param_map(&trimmed, oracle.as_ref());
+    let imports = Imports { symbols, code: Some((lifter, memory)) };
+    let call_params = callee_param_map(&trimmed, oracle.as_ref(), &imports);
     let own = own_params(oracle.as_ref(), entry);
-    let call_returns = callee_return_map(&trimmed, oracle.as_ref());
+    let call_returns = callee_return_map(&trimmed, oracle.as_ref(), &imports);
+    let symbols = &with_thunk_names(symbols, imports.thunk_names(&trimmed));
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)))
+    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[])
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -95,11 +110,77 @@ fn own_params(
     Some((oracle.params(entry)?, oracle.args().to_vec()))
 }
 
+/// `symbols` with the names of import thunks added (borrowed when there are none).
+fn with_thunk_names(
+    symbols: &std::collections::BTreeMap<u64, String>,
+    extra: std::collections::BTreeMap<u64, String>,
+) -> std::borrow::Cow<'_, std::collections::BTreeMap<u64, String>> {
+    if extra.is_empty() {
+        return std::borrow::Cow::Borrowed(symbols);
+    }
+    let mut all = symbols.clone();
+    all.extend(extra);
+    std::borrow::Cow::Owned(all)
+}
+
 /// Parameters of every direct call's callee in `instructions`, keyed by the
 /// call instruction's address (WS78).
+/// The callee of a direct call is a known import (WS82): its prototype.
+fn import_proto(imports: &Imports<'_>, target: u64) -> Option<crate::prototypes::Proto> {
+    crate::prototypes::import_prototype(&imports.name(target)?)
+}
+
+/// Names of call targets that are imports (WS82): an import's own name, or — for a thunk
+/// whose only instruction is `jmp import@plt` (`0x3a60420: jmp pthread_cond_destroy@plt`) —
+/// the import's.
+struct Imports<'a> {
+    symbols: &'a std::collections::BTreeMap<u64, String>,
+    code: Option<(&'a dyn PcodeLift, &'a Memory)>,
+}
+
+impl Imports<'_> {
+    fn name(&self, target: u64) -> Option<String> {
+        if let Some(n) = self.symbols.get(&target) {
+            return Some(n.clone());
+        }
+        let n = self.symbols.get(&self.thunk_target(target)?)?;
+        crate::prototypes::import_prototype(n).is_some().then(|| n.clone())
+    }
+
+    /// `jmp t` as the first instruction of `target`: `t`.
+    fn thunk_target(&self, target: u64) -> Option<u64> {
+        let (lifter, memory) = self.code?;
+        let insn = lifter.lift_instruction(memory, target).ok()?;
+        match insn.ops.as_slice() {
+            [op] if op.opcode == reargo_core::pcode::OpCode::Branch => {
+                op.inputs.first().filter(|t| t.space == reargo_core::address::SpaceId::RAM).map(|t| t.offset)
+            }
+            _ => None,
+        }
+    }
+
+    /// The names of the thunks to imports that `instructions` call, for the call rendering.
+    fn thunk_names(&self, instructions: &[LiftedInstruction]) -> std::collections::BTreeMap<u64, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for op in instructions.iter().flat_map(|i| i.ops.iter()) {
+            if op.opcode == reargo_core::pcode::OpCode::Call
+                && let Some(t) = op.inputs.first()
+                && t.space == reargo_core::address::SpaceId::RAM
+                && !self.symbols.contains_key(&t.offset)
+                && !out.contains_key(&t.offset)
+                && let Some(n) = self.name(t.offset)
+            {
+                out.insert(t.offset, n);
+            }
+        }
+        out
+    }
+}
+
 fn callee_param_map(
     instructions: &[LiftedInstruction],
     oracle: Option<&CalleeParams<'_>>,
+    imports: &Imports<'_>,
 ) -> rustc_hash::FxHashMap<u64, ParamInfo> {
     use reargo_core::pcode::OpCode;
     let mut out = rustc_hash::FxHashMap::default();
@@ -109,9 +190,15 @@ fn callee_param_map(
             if op.opcode == OpCode::Call
                 && let Some(t) = op.inputs.first()
                 && t.space == reargo_core::address::SpaceId::RAM
-                && let Some(info) = oracle.params(t.offset)
             {
-                out.insert(insn.address, info);
+                // an import's code is not in the binary: its known prototype, if any
+                let info = match import_proto(imports, t.offset) {
+                    Some(p) => Some(p.params(oracle.args())),
+                    None => oracle.params(t.offset),
+                };
+                if let Some(info) = info {
+                    out.insert(insn.address, info);
+                }
             }
         }
     }
@@ -123,6 +210,7 @@ fn callee_param_map(
 fn callee_return_map(
     instructions: &[LiftedInstruction],
     oracle: Option<&CalleeParams<'_>>,
+    imports: &Imports<'_>,
 ) -> rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind> {
     use reargo_core::pcode::OpCode;
     let mut out = rustc_hash::FxHashMap::default();
@@ -133,7 +221,10 @@ fn callee_return_map(
                 && let Some(t) = op.inputs.first()
                 && t.space == reargo_core::address::SpaceId::RAM
             {
-                let k = oracle.return_kind(t.offset);
+                let k = match import_proto(imports, t.offset) {
+                    Some(p) => p.return_kind().unwrap_or(crate::callee_params::ReturnKind::Unknown),
+                    None => oracle.return_kind(t.offset),
+                };
                 if k != crate::callee_params::ReturnKind::Unknown {
                     out.insert(insn.address, k);
                 }
@@ -279,13 +370,18 @@ fn decompile_function_inner(
     } else {
         trim_to_return(lifted)
     };
-    let mut terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
+    let mut terminated = terminated;
     rewrite_tail_calls(&mut terminated);
-    let call_params = callee_param_map(&terminated, oracle);
+    let terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
+    let imports = Imports { symbols, code: Some((lifter, &program.info.memory)) };
+    let call_params = callee_param_map(&terminated, oracle, &imports);
     let own = own_params(oracle, func_entry);
-    let call_returns = callee_return_map(&terminated, oracle);
+    let call_returns = callee_return_map(&terminated, oracle, &imports);
+    let symbols = &with_thunk_names(symbols, imports.thunk_names(&terminated));
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
+    // WS82: the exception landing pads, printed after the body
+    let handlers = crate::exception::handlers(&program.info.memory, &program.info.sections, symbols, func_entry);
 
     build_decompile_result(
         terminated,
@@ -299,33 +395,86 @@ fn decompile_function_inner(
         own,
         vcalls,
         Some((lifter, &program.info.memory)),
+        &handlers,
     )
 }
+
+/// Address of the stub [`rewrite_tail_calls`] makes for a conditional jump out of the code to
+/// `target`: far from any real code, so nothing keyed by address (annotations, call
+/// renderings) matches it.
+pub const TAIL_STUB_BASE: u64 = 0xffff_0000_0000_0000;
 
 /// A `jmp` out of the code being decompiled is a tail call (WS81): rewrite its `BRANCH` into
 /// `CALL target; RETURN`, so it prints as `return f(…);` with the call's arguments instead of
 /// vanishing (a `BRANCH` prints nothing) with the argument setup left dead.
-pub(crate) fn rewrite_tail_calls(instructions: &mut [LiftedInstruction]) {
+///
+/// WS82: a conditional jump out of the code (`jne free@plt` before the prologue) used to lose
+/// its condition (the CFG only kept the fall-through); it now jumps to a stub `CALL target;
+/// RETURN` at [`TAIL_STUB_BASE`]` + target`, so it prints as `if (c) { return f(…); }`. An
+/// indirect `jmp` that is not a jump-table dispatch (`jmp [rax+0x20]`, a vtable slot) is a
+/// tail call too: `CALLIND; RETURN` instead of `goto *tmp;`.
+pub(crate) fn rewrite_tail_calls(instructions: &mut Vec<LiftedInstruction>) {
     use reargo_core::address::SpaceId;
     use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
     let inside: rustc_hash::FxHashSet<u64> = instructions.iter().map(|i| i.address).collect();
-    for insn in instructions.iter_mut() {
+    let ret = |seq| PcodeOp { opcode: OpCode::Return, seq, output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::CONST, 0, 8)] };
+    let outside = |t: &VarnodeData| t.space == SpaceId::RAM && !inside.contains(&t.offset) && t.offset < TAIL_STUB_BASE;
+    let mut stubs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for k in 0..instructions.len() {
+        let table = jump_table_dispatch(instructions, k);
+        let insn = &mut instructions[k];
+        for op in insn.ops.iter_mut() {
+            if op.opcode == OpCode::CBranch
+                && let Some(t) = op.inputs.first_mut()
+                && outside(t)
+            {
+                stubs.insert(t.offset);
+                t.offset += TAIL_STUB_BASE;
+            }
+        }
         let Some(pos) = insn.ops.iter().position(|o| {
-            o.opcode == OpCode::Branch
-                && o.inputs.first().is_some_and(|t| t.space == SpaceId::RAM && !inside.contains(&t.offset))
+            (o.opcode == OpCode::Branch && o.inputs.first().is_some_and(outside))
+                || (o.opcode == OpCode::BranchInd && !table)
         }) else {
             continue;
         };
         let seq = insn.ops[pos].seq;
-        insn.ops[pos].opcode = OpCode::Call;
-        insn.ops.insert(
-            pos + 1,
-            PcodeOp { opcode: OpCode::Return, seq, output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::CONST, 0, 8)] },
-        );
+        insn.ops[pos].opcode = if insn.ops[pos].opcode == OpCode::BranchInd { OpCode::CallInd } else { OpCode::Call };
+        insn.ops.insert(pos + 1, ret(seq));
         for (i, op) in insn.ops.iter_mut().enumerate() {
             op.seq.order = i as u32;
         }
     }
+    // the stubs go after the code (their addresses are above it), in address order
+    for t in stubs {
+        let at = TAIL_STUB_BASE + t;
+        let seq = |order| reargo_core::pcode::SeqNum::new(reargo_core::address::Address::new(SpaceId::RAM, at), order);
+        let call = PcodeOp { opcode: OpCode::Call, seq: seq(0), output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::RAM, t, 8)] };
+        let pos = instructions.partition_point(|i| i.address < at);
+        instructions.insert(
+            pos,
+            LiftedInstruction { address: at, length: 1, mnemonic: format!("jmp 0x{t:x}"), ops: vec![call, ret(seq(1))] },
+        );
+    }
+}
+
+/// Is the indirect `jmp` of `instructions[k]` a jump-table dispatch (`jmp [table + i*8]`, or
+/// `movsxd rax, [rcx + rax*4]; add rax, rcx; jmp rax`) rather than a tail call? A scaled
+/// index in the `jmp` or in the instructions right before it marks a table.
+fn jump_table_dispatch(instructions: &[LiftedInstruction], k: usize) -> bool {
+    let scaled = |m: &str| m.contains("*2]") || m.contains("*4]") || m.contains("*8]") || m.contains("*2+") || m.contains("*4+") || m.contains("*8+");
+    let insn = &instructions[k];
+    if !insn.ops.iter().any(|o| o.opcode == reargo_core::pcode::OpCode::BranchInd) {
+        return false;
+    }
+    if scaled(&insn.mnemonic) {
+        return true;
+    }
+    // `jmp [mem]` reads its target from memory: a table only with a scaled index
+    if insn.mnemonic.contains('[') {
+        return false;
+    }
+    instructions[..k].iter().rev().take(6).any(|i| scaled(&i.mnemonic))
 }
 
 /// Second input of a call's `INDIRECT` that marks a clobbered (not returned) register.
@@ -814,6 +963,7 @@ fn build_decompile_result(
     own_params: Option<(ParamInfo, Vec<reargo_core::pcode::VarnodeData>)>,
     vcalls: Option<ThisVcalls<'_>>,
     caller_hint: Option<(&dyn PcodeLift, &Memory)>,
+    handlers: &[crate::exception::Handler],
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -844,7 +994,15 @@ fn build_decompile_result(
     let mut hint = || caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, entry));
     ssa.return_float = choose_return_register(&mut ssa, &mut hint);
     settle_unknown_returns(&mut ssa);
-    let opt_stats = run_optimization_passes(&mut ssa);
+    let mut opt_stats = run_optimization_passes(&mut ssa);
+    // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
+    if crate::flags::recover_flag_compares(&mut ssa) > 0 {
+        // twice: a copy of a constant that copy propagation already replaced in its reader
+        // still lists that reader, which dies only in the first round (`OF = 0` of `test`)
+        for _ in 0..2 {
+            opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
+        }
+    }
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
         ssa.signature_params = Some(signature_params(&ssa, info, &args));
@@ -884,7 +1042,10 @@ fn build_decompile_result(
 
     // `if (a) goto X; if (b) goto X;` -> `if (a || b) goto X;` (on a copy of the CFG)
     let short = crate::condition::merge_short_circuits(&ssa);
-    let structured = structure_cfg(short.as_ref().map_or(&ssa.cfg, |s| &s.cfg));
+    let cfg = short.as_ref().map_or(&ssa.cfg, |s| &s.cfg);
+    let handler_blocks: Vec<(usize, String)> =
+        handlers.iter().filter_map(|(a, note)| Some((cfg.block_at(*a).filter(|b| b.start_addr == *a)?.id, note.clone()))).collect();
+    let structured = structure_cfg_with_handlers(cfg, &handler_blocks);
     // Both emitters borrow the same two maps -- the previous API took
     // owned BTreeMaps and forced four clones per decompile call (two
     // maps * two emitters). The borrow-based `with_maps` API is
@@ -1454,8 +1615,8 @@ mod tests {
         assert!(!c.contains("    uint64_t rdi;"), "{c}");
     }
 
-    /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
-    /// loaded slot, not a silent `goto 0x0`.
+    /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is a jump on the loaded slot,
+    /// not a silent `goto 0x0`.
     #[test]
     fn indirect_jmp_is_rendered() {
         let lifter = X86Lifter::new_64();
@@ -1465,10 +1626,11 @@ mod tests {
         ];
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
-        let j = c.lines().find(|l| l.contains("goto *")).unwrap_or_else(|| panic!("{c}"));
+        // WS82: printed as the tail call it is, `rax = (*tmp)(rdi); // vfn[3]; return rax;`
+        let j = c.lines().find(|l| l.contains("(*")).unwrap_or_else(|| panic!("{c}"));
         assert!(j.contains("vfn[3]"), "{j}
 {c}");
-        assert!(!c.contains("BRANCHIND"), "{c}");
+        assert!(!c.contains("BRANCHIND") && !c.contains("goto"), "{c}");
     }
 
     /// WS77: a `ret` returns what `rax` holds, not the popped return address.
@@ -1970,4 +2132,259 @@ mod tests {
         assert!(!cond.contains("!(esi"), "{c}");
     }
 
+
+    /// `cmp a, b; je L1; jl L2`: the second block reads the SF / OF the first block's `cmp`
+    /// set (WS82); it prints `a < b`, not `!var_207 != !var_20b` with `INT_SBORROW` kept alive.
+    #[test]
+    fn flags_read_in_next_block_are_a_comparison() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x39, 0xf7, // cmp edi, esi
+            0x74, 0x08, // je L1 (100c)
+            0x7c, 0x0c, // jl L2 (1012)
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xc3, // ret
+            0xb8, 0x02, 0x00, 0x00, 0x00, // L1: mov eax, 2
+            0xc3, // ret
+            0xb8, 0x03, 0x00, 0x00, 0x00, // L2: mov eax, 3
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW"), "{c}");
+        assert!(!c.contains("var_2"), "no flag variable is left: {c}");
+        assert!(
+            c.contains("(int32_t)edi < (int32_t)esi") || c.contains("(int32_t)edi >= (int32_t)esi"),
+            "{c}"
+        );
+        assert!(c.contains("edi == esi") || c.contains("edi != esi"), "{c}");
+    }
+
+    /// The flags of a `cmp` read in a later block whose operand was overwritten in between
+    /// stay flags (WS82): `edi` no longer holds the compared value.
+    #[test]
+    fn flags_read_after_operand_changes_are_kept() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x39, 0xf7, // cmp edi, esi
+            0x74, 0x0a, // je L1 (100e)
+            0x8d, 0x7f, 0x01, // lea edi, [rdi+1] (no flags)
+            0x7c, 0x0b, // jl L2 (1014)
+            0x89, 0xf8, // mov eax, edi
+            0xc3, // ret
+            0x90, 0x90, // pad
+            0xb8, 0x02, 0x00, 0x00, 0x00, // L1: mov eax, 2
+            0xc3, // ret
+            0xb8, 0x03, 0x00, 0x00, 0x00, // L2: mov eax, 3
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("(int32_t)edi < (int32_t)esi") && !c.contains("(int32_t)edi >= (int32_t)esi"), "{c}");
+    }
+
+    /// `mov eax, edi; sub eax, esi; jl`: the compared register is overwritten by the result,
+    /// but the register it was copied from still holds the value (WS82).
+    #[test]
+    fn flags_of_a_copied_operand_compare_the_source() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xf8, // mov eax, edi
+            0x29, 0xf0, // sub eax, esi
+            0x7c, 0x01, // jl L
+            0xc3, // ret
+            0x31, 0xc0, // L: xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW"), "{c}");
+        assert!(c.contains("(int32_t)edi < (int32_t)esi") || c.contains("(int32_t)edi >= (int32_t)esi"), "{c}");
+    }
+
+    /// `sub dword [rdi], 1; jle`: the old value is kept as `old_1` where the flags were
+    /// computed, and the condition compares it (WS82).
+    #[test]
+    fn flags_of_an_overwritten_operand_keep_its_value() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0x2f, 0x01, // sub dword [rdi], 1
+            0x7e, 0x01, // jle L
+            0xc3, // ret
+            0x31, 0xc0, // L: xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW"), "{c}");
+        assert!(c.contains("old_1 = "), "{c}");
+        assert!(c.contains("(int32_t)old_1 <= (int32_t)1") || c.contains("(int32_t)old_1 > (int32_t)1"), "{c}");
+    }
+
+    /// `sub edi, esi; jl; jo`: the overflow flag is read twice, so `edi`'s old value cannot
+    /// be kept; the `jl` must not read as `edi < esi` with `edi` already the difference.
+    #[test]
+    fn flags_of_a_sub_into_its_operand_do_not_compare_the_result() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x29, 0xf7, // sub edi, esi
+            0x7c, 0x05, // jl 1009
+            0x70, 0x06, // jo 100c
+            0x89, 0xf8, // mov eax, edi
+            0xc3, // ret
+            0x31, 0xc0, // 1009: xor eax, eax
+            0xc3, // ret
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 100c: mov eax, 1
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        for bad in ["(int32_t)edi < (int32_t)esi", "(int32_t)edi >= (int32_t)esi"] {
+            assert!(!c.contains(bad), "{c}");
+        }
+    }
+
+    /// `test edi, edi; jne f` jumps out of the function: a conditional tail call (WS82). The
+    /// CFG used to keep only the fall-through, so the test and the call vanished.
+    #[test]
+    fn conditional_jump_out_is_a_conditional_tail_call() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x85, 0xff, // test edi, edi
+            0x0f, 0x85, 0xf8, 0x0f, 0x00, 0x00, // jne 0x2000
+            0x31, 0xc0, // xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains("edi"), "{c}");
+        assert!(c.contains("0x2000("), "{c}");
+        assert!(c.matches("return").count() >= 2, "{c}");
+        assert!(!c.contains("label_"), "{c}");
+    }
+
+    /// `jmp [rax+0x20]` through a vtable is a tail call (WS82): `return (*f)(rdi);`, not
+    /// `goto *tmp;`.
+    #[test]
+    fn indirect_tail_jump_is_a_call() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x60, 0x20, // jmp qword ptr [rax+0x20]
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("goto"), "{c}");
+        assert!(c.contains("return"), "{c}");
+        assert!(c.contains("(*"), "{c}");
+    }
+
+    /// A jump-table dispatch (`jmp [table + rax*8]`) stays an indirect jump.
+    #[test]
+    fn jump_table_dispatch_is_no_tail_call() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xff, 0x24, 0xc5, 0x00, 0x20, 0x00, 0x00, // jmp qword ptr [rax*8 + 0x2000]
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("goto *"), "{c}");
+    }
+
+    /// `dec dword [rdi]; mov ecx, [rdi]; test ecx, ecx; jg`: `test` clears OF, so the `jg`
+    /// reads `ecx > 0`, not the `dec`'s overflow flag (WS82, a lifter fix).
+    #[test]
+    fn jg_after_test_reads_no_stale_overflow() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xf0, 0xff, 0x0f, // lock dec dword ptr [rdi]
+            0x8b, 0x0f, // mov ecx, [rdi]
+            0x85, 0xc9, // test ecx, ecx
+            0x7f, 0x01, // jg L
+            0xc3, // ret
+            0x31, 0xc0, // L: xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW") && !c.contains("var_20b"), "{c}");
+        // (`ecx` is read only by the test: its load folds into the condition)
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains(" > (int32_t)0") || cond.contains(" <= (int32_t)0"), "{c}");
+        assert!(!cond.contains("!0") && !cond.contains("||"), "{c}");
+    }
+
+    /// `setne sil; and al, sil; mov edi, 5; call f`: the byte `sil` holds is a flag the
+    /// function computes for itself, not an argument for `f`.
+    fn setcc_leftover_code() -> Vec<u8> {
+        vec![
+            0x85, 0xc9, // test ecx, ecx
+            0x40, 0x0f, 0x95, 0xc6, // setne sil
+            0x40, 0x20, 0xf0, // and al, sil
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xe8, 0xed, 0x0f, 0x00, 0x00, // call 0x2000
+            0x88, 0x05, 0xe9, 0x1f, 0x00, 0x00, // mov [0x3000], al
+            0xc3, // ret
+        ]
+    }
+
+    /// A known import takes the parameters of its prototype (WS82):
+    /// `pthread_mutex_unlock(rdi)`, not `(rdi, rsi)` because `sil` was written.
+    #[test]
+    fn import_prototype_sets_the_arguments() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&setcc_leftover_code(), 0x1000);
+        let symbols = std::collections::BTreeMap::from([(0x2000u64, "pthread_mutex_unlock@plt".to_string())]);
+        let c = decompile_with_symbols(&lifter, &mem, 0x1000, "f", 100, &symbols).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("pthread_mutex_unlock@plt(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi)"), "{c}");
+    }
+
+    /// An unknown callee: a register only partly written (`setne sil`) whose byte the
+    /// function reads itself is no argument (WS82), though only the call reads the full `rsi`.
+    #[test]
+    fn partial_register_write_used_locally_is_no_argument() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&setcc_leftover_code(), 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi)"), "{c}");
+    }
+
+    /// `setne sil; call f`: a byte written only to be passed is still an argument.
+    #[test]
+    fn setcc_into_an_argument_register_is_an_argument() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x85, 0xc9, // test ecx, ecx
+            0x40, 0x0f, 0x95, 0xc6, // setne sil
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xe8, 0xf0, 0x0f, 0x00, 0x00, // call 0x2000
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi, rsi)"), "{c}");
+    }
+
+    /// A thunk whose only instruction is `jmp import@plt` is that import (WS82): its name and
+    /// its prototype (`pthread_cond_destroy@plt(rdi)`, not `0x1010()`).
+    #[test]
+    fn call_to_an_import_thunk_takes_the_import() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8d, 0x7b, 0x10, // lea rdi, [rbx+0x10]
+            0xe8, 0x07, 0x00, 0x00, 0x00, // call 0x1010
+            0xc3, // ret
+            0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // pad
+            0xe9, 0xeb, 0x0f, 0x00, 0x00, // 0x1010: jmp 0x2000
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let symbols = std::collections::BTreeMap::from([(0x2000u64, "pthread_cond_destroy@plt".to_string())]);
+        let c = decompile_with_symbols(&lifter, &mem, 0x1000, "f", 4, &symbols).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("pthread_cond_destroy@plt(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi)"), "{c}");
+    }
 }

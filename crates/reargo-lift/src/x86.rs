@@ -981,6 +981,10 @@ impl X86Lifter {
                     output: Some(sf),
                     inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
                 });
+                seq_base += 1;
+                // TEST clears CF and OF (x86 manual). Without this a `jg` / `jle` after
+                // `test` read the OF of an earlier `dec` / `sub` (WS82).
+                self.emit_clear_cf_of(&mut ops, &mut seq_base, address);
             }
 
             Lea => {
@@ -3549,5 +3553,18 @@ mod tests {
         let touches_of = (in0.space, in0.offset) == (REG_SPACE, OF_OFFSET)
             || (in1.space, in1.offset) == (REG_SPACE, OF_OFFSET);
         assert!(touches_sf && touches_of, "JL's BoolXor must combine SF and OF: {:?}", lifted.ops);
+    }
+
+    #[test]
+    fn test_clears_cf_and_of() {
+        // 85 c9 = test ecx, ecx: CF = OF = 0, so a later `jg` does not read a stale OF
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&[0x85, 0xc9], 0x1000);
+        let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
+        for off in [OF_OFFSET, CF_OFFSET] {
+            let op = op_writing(&lifted, off);
+            assert_eq!(op.opcode, OpCode::Copy, "{:?}", lifted.ops);
+            assert_eq!(op.inputs[0].offset, 0);
+        }
     }
 }
