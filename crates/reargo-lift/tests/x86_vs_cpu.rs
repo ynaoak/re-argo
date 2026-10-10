@@ -207,7 +207,7 @@ fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
             }
             for _ in 0..400 {
                 let (a, b, c) = (rng.value(), rng.value(), rng.value());
-                let b = if rng.next() % 4 == 0 { a } else { b };
+                let b = if rng.next().is_multiple_of(4) { a } else { b };
                 for fl in flag_inputs(rng) {
                     v.push((a, b, c, fl));
                 }
@@ -236,7 +236,7 @@ fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
             }
             for &x in &vals {
                 for &y in &vals {
-                    let (a, b) = if rng.next() % 2 == 0 {
+                    let (a, b) = if rng.next().is_multiple_of(2) {
                         (x.to_bits(), y.to_bits())
                     } else {
                         (u64::from((x as f32).to_bits()), u64::from((y as f32).to_bits()))
@@ -247,12 +247,8 @@ fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
         }
         Inputs::Flags | Inputs::Jump => {
             for bits in 0..32u64 {
-                let fl = 0x2
-                    | (bits & 1) * CF
-                    | (bits >> 1 & 1) * 0x4
-                    | (bits >> 2 & 1) * ZF
-                    | (bits >> 3 & 1) * SF
-                    | (bits >> 4 & 1) * OF;
+                let bit = |k: u64, flag: u64| ((bits >> k) & 1) * flag;
+                let fl = 0x2 | bit(0, CF) | bit(1, 0x4) | bit(2, ZF) | bit(3, SF) | bit(4, OF);
                 for _ in 0..4 {
                     v.push((rng.value(), rng.value(), rng.value(), fl));
                 }

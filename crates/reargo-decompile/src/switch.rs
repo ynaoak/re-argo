@@ -131,7 +131,10 @@ fn with_bases(e: &E, bases: &FxHashMap<u64, u64>) -> E {
 /// The general registers the function writes in exactly one instruction, with a constant
 /// (`lea r9, [T]`): offset -> value. And every constant address an instruction puts in a
 /// register (the bases of other tables).
-fn constant_registers(insns: &[LiftedInstruction]) -> (FxHashMap<u64, u64>, rustc_hash::FxHashSet<u64>) {
+/// (registers set once to a constant, every constant put in a register)
+type Constants = (FxHashMap<u64, u64>, rustc_hash::FxHashSet<u64>);
+
+fn constant_registers(insns: &[LiftedInstruction]) -> Constants {
     let mut writes: FxHashMap<u64, (u32, Option<u64>)> = FxHashMap::default();
     let mut loaded = rustc_hash::FxHashSet::default();
     for insn in insns {
@@ -255,14 +258,17 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     out
 }
 
+/// The number of cases a bounds check `cmp r, N` lets through.
+type CaseCount = fn(u64) -> Option<u64>;
+
 /// The bounds check before a dispatch, as the mnemonic of its conditional jump says it:
 /// `(cases for "cmp r, N", jumps to the dispatch)`. `ja`/`jae` (`jg`/`jge`) jump to the
 /// default and fall into the dispatch; `jbe`/`jb` (`jle`/`jl`) jump to the dispatch and fall
 /// into the default (WS84). A signed check is one the compiler emits when the index is known
 /// not to be negative.
-fn bounds_kind(mnemonic: &str) -> Option<(fn(u64) -> Option<u64>, bool)> {
-    let plus1: fn(u64) -> Option<u64> = |n| n.checked_add(1);
-    let same: fn(u64) -> Option<u64> = Some;
+fn bounds_kind(mnemonic: &str) -> Option<(CaseCount, bool)> {
+    let plus1: CaseCount = |n| n.checked_add(1);
+    let same: CaseCount = Some;
     Some(match mnemonic.split_whitespace().next()? {
         "ja" | "jnbe" | "jg" | "jnle" => (plus1, false),
         "jae" | "jnb" | "jnc" | "jge" | "jnl" => (same, false),

@@ -2057,7 +2057,7 @@ impl PcodeLift for X86Lifter {
 /// rax from ax as a 16-bit write would (WS84).
 fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
     let gpr = |v: &VarnodeData| {
-        (v.space == REG_SPACE && v.offset < 0xC0 && v.offset % 8 == 0 && matches!(v.size, 1 | 2 | 4 | 8))
+        (v.space == REG_SPACE && v.offset < 0xC0 && v.offset.is_multiple_of(8) && matches!(v.size, 1 | 2 | 4 | 8))
             .then_some(*v)
     };
     // ah/ch/dh/bh: byte 1 of rax..rbx (WS84)
@@ -2171,7 +2171,7 @@ fn sync_xmm_views(ops: Vec<PcodeOp>, zero_upper: bool) -> Vec<PcodeOp> {
         (v.space == REG_SPACE
             && v.offset >= XMM_BASE
             && v.offset < end
-            && (v.offset - XMM_BASE) % 0x10 == 0
+            && (v.offset - XMM_BASE).is_multiple_of(0x10)
             && matches!(v.size, 4 | 8 | 16))
             .then_some(v.offset)
     };
