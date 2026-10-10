@@ -491,6 +491,10 @@ impl<'a> CEmitter<'a> {
             OpCode::IntAdd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
+                // `x + 0xfffffffffffffffa` is `x - 6` (WS83)
+                if let Some(k) = op.inputs.get(1).and_then(|&v| negative_constant(&func.varnodes[v as usize].data)) {
+                    return Some(format!("{} = {} - {};", dst, a, small_hex(k)));
+                }
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {} + {};", dst, a, b))
             }
@@ -1827,4 +1831,24 @@ pub(crate) fn float_literal(bits: u64, size: u32) -> Option<String> {
         t.push_str(".0");
     }
     Some(format!("{t}{suffix}"))
+}
+
+/// `k` when `v` is the constant `-k` of its width, `k` small (below 2^31): an addition of it
+/// reads as a subtraction.
+fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u64> {
+    if v.space != SpaceId::CONST || v.size == 0 || v.size > 8 {
+        return None;
+    }
+    let bits = v.size * 8;
+    let x = if bits == 64 { v.offset } else { v.offset & ((1u64 << bits) - 1) };
+    if x >> (bits - 1) & 1 == 0 {
+        return None;
+    }
+    let k = if bits == 64 { x.wrapping_neg() } else { (1u64 << bits) - x };
+    (k != 0 && k < 1 << 31 && bits > 8).then_some(k)
+}
+
+/// A constant as the C output prints it: decimal below 10, else hex.
+fn small_hex(k: u64) -> String {
+    if k < 10 { k.to_string() } else { format!("0x{k:x}") }
 }

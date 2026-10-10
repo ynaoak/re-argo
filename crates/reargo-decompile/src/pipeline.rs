@@ -2563,4 +2563,20 @@ mod tests {
         assert_eq!(crate::emit::float_literal(0x4000_0000_0000_0000, 8).as_deref(), Some("2.0"));
         assert_eq!(crate::emit::float_literal(0x7f80_0000, 4), None);
     }
+
+    /// Adding a negative constant prints as a subtraction (WS83): `lea ecx, [rdi-6]` is
+    /// `ecx = edi - 6`, not `edi + 0xfffffffa`.
+    #[test]
+    fn negative_constant_add_is_a_subtraction() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x83, 0xc7, 0xfa, // add rdi, -6
+            0x48, 0x89, 0x3e, // mov [rsi], rdi
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("rdi = rdi - 6;"), "{c}");
+        assert!(!c.contains("0xfffffffffffffffa"), "{c}");
+    }
 }
