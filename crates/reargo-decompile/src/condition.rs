@@ -134,29 +134,52 @@ pub fn ops_by_block(func: &SsaFunction) -> Vec<Vec<OpIdx>> {
     v
 }
 
+/// The identity of an SSA value: `(space, offset, size, version)`. Common subexpression
+/// elimination renames a removed op's result to the earlier value instead of rewriting its
+/// readers, so two varnode ids can name one value; their `uses` lists are separate.
+pub type ValueKey = (u32, u64, u32, u32);
+
+pub fn value_key(func: &SsaFunction, v: VarId) -> ValueKey {
+    let vn = &func.varnodes[v as usize];
+    (vn.data.space.0, vn.data.offset, vn.data.size, vn.version)
+}
+
+/// The live ops reading each value (by [`ValueKey`], so every name of a value counts).
+pub struct Readers(FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>>);
+
+impl Readers {
+    pub fn new(func: &SsaFunction) -> Self {
+        let mut m: FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>> = FxHashMap::default();
+        for op in func.ops.iter().filter(|o| !o.dead) {
+            for &i in &op.inputs {
+                if func.varnodes[i as usize].data.space == reargo_core::address::SpaceId::CONST {
+                    continue;
+                }
+                let r = m.entry(value_key(func, i)).or_default();
+                if r.last() != Some(&op.index) {
+                    r.push(op.index);
+                }
+            }
+        }
+        Readers(m)
+    }
+
+    /// The one live op reading `v`, if exactly one does.
+    pub fn single(&self, func: &SsaFunction, v: VarId) -> Option<OpIdx> {
+        match self.0.get(&value_key(func, v))?.as_slice() {
+            [u] => Some(*u),
+            _ => None,
+        }
+    }
+}
+
 /// When `block` holds nothing but its test, the ops computing the condition (in order, the
 /// `CBRANCH` excluded): every live op but the branch is pure and its result is read exactly
 /// once, by a later op of the same block — so the ops fold into one expression, nothing else
 /// sees their results and nothing is lost by not printing them as statements.
-pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx]) -> Option<Vec<OpIdx>> {
-    let (&last, body) = ops.split_last()?;
-    let br = &func.ops[last];
-    if br.opcode != OpCode::CBranch || br.inputs.len() < 2 {
-        return None;
-    }
-    for (i, &o) in body.iter().enumerate() {
-        let op = &func.ops[o];
-        if !is_pure(op.opcode) {
-            return None;
-        }
-        let out = op.output?;
-        let mut uses = func.varnodes[out as usize].uses.iter().filter(|&&u| !func.ops[u].dead);
-        let (Some(&u), None) = (uses.next(), uses.next()) else { return None };
-        if !ops[i + 1..].contains(&u) {
-            return None;
-        }
-    }
-    Some(body.to_vec())
+pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> Option<Vec<OpIdx>> {
+    let tail = condition_tail(func, ops, readers);
+    (tail.len() + 1 == ops.len()).then(|| tail.to_vec())
 }
 
 /// The trailing ops of `ops` (a block's live ops) that only compute its branch condition
@@ -165,7 +188,7 @@ pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx]) -> Option<Vec<OpIdx>> {
 /// and the branch, and nothing else reads their results, so they fold into the condition
 /// expression (`var_201 = edi < 6; if (var_201)` -> `if (edi < 6)`). Empty when the block does
 /// not end in a `CBRANCH`.
-pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx]) -> &'o [OpIdx] {
+pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx], readers: &Readers) -> &'o [OpIdx] {
     let Some((&last, body)) = ops.split_last() else { return &[] };
     let br = &func.ops[last];
     if br.opcode != OpCode::CBranch || br.inputs.len() < 2 {
@@ -178,8 +201,7 @@ pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx]) -> &'o [OpIdx] {
         if !is_pure(op.opcode) {
             break;
         }
-        let mut uses = func.varnodes[out as usize].uses.iter().filter(|&&u| !func.ops[u].dead);
-        let (Some(&u), None) = (uses.next(), uses.next()) else { break };
+        let Some(u) = readers.single(func, out) else { break };
         if !ops[start..].contains(&u) {
             break;
         }
@@ -200,7 +222,8 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
     let src = &func.cfg;
     let n = src.blocks.len();
     let by_block = ops_by_block(func);
-    let pure: Vec<bool> = by_block.iter().map(|ops| condition_ops(func, ops).is_some()).collect();
+    let readers = Readers::new(func);
+    let pure: Vec<bool> = by_block.iter().map(|ops| condition_ops(func, ops, &readers).is_some()).collect();
     let two = |s: &[BlockId]| s.len() == 2 && s[0] != s[1];
     // a block that prints nothing and goes on to one other block (a lone `jmp`)
     let empty: Vec<bool> = (0..n)
@@ -330,18 +353,26 @@ fn thread_empty_blocks(cfg: &mut ControlFlowGraph, empty: &[bool]) {
 /// [`Inliner::get`]), so the block's statements collapse into its condition expression.
 #[derive(Default)]
 pub struct Inliner {
-    exprs: std::cell::RefCell<FxHashMap<VarId, String>>,
+    exprs: std::cell::RefCell<FxHashMap<ValueKey, String>>,
     by_block: std::cell::OnceCell<Vec<Vec<OpIdx>>>,
+    readers: std::cell::OnceCell<Readers>,
     /// block -> (the ops folded into its own condition, the condition's text)
     own: std::cell::RefCell<FxHashMap<BlockId, Option<(Vec<OpIdx>, String)>>>,
 }
 
 impl Inliner {
     /// The folded expression of `v` (parenthesised unless atomic), while a leaf is printed.
-    pub fn get(&self, v: VarId) -> Option<String> {
+    pub fn get(&self, func: &SsaFunction, v: VarId) -> Option<String> {
         let exprs = self.exprs.borrow();
-        let s = exprs.get(&v)?;
+        if exprs.is_empty() {
+            return None;
+        }
+        let s = exprs.get(&value_key(func, v))?;
         Some(if is_atomic(s) { s.clone() } else { format!("({s})") })
+    }
+
+    fn parts(&self, func: &SsaFunction) -> (&Vec<Vec<OpIdx>>, &Readers) {
+        (self.by_block.get_or_init(|| ops_by_block(func)), self.readers.get_or_init(|| Readers::new(func)))
     }
 
     /// A block's own branch condition with its [`condition_tail`] folded in (WS81): the ops
@@ -358,9 +389,9 @@ impl Inliner {
         if let Some(r) = self.own.borrow().get(&block) {
             return r.clone();
         }
-        let by_block = self.by_block.get_or_init(|| ops_by_block(func));
+        let (by_block, readers) = self.parts(func);
         let ops = &by_block[block];
-        let tail = condition_tail(func, ops);
+        let tail = condition_tail(func, ops, readers);
         let r = if tail.is_empty() {
             None
         } else {
@@ -384,20 +415,26 @@ impl Inliner {
         let mut ok = true;
         for &o in ops {
             let op = &func.ops[o];
+            let Some(out) = op.output else {
+                ok = false;
+                break;
+            };
+            let key = value_key(func, out);
             if op.opcode == OpCode::BoolNegate
-                && let (Some(out), Some(inner)) = (op.output, op.inputs.first().and_then(|i| self.exprs.borrow().get(i).cloned()))
+                && let Some(inner) = op.inputs.first().and_then(|&i| self.exprs.borrow().get(&value_key(func, i)).cloned())
             {
-                self.exprs.borrow_mut().insert(out, crate::emit::negate_condition(inner, true));
+                // `!(a == b)` reads better as `a != b`
+                self.exprs.borrow_mut().insert(key, crate::emit::negate_condition(inner, true));
                 continue;
             }
-            let (Some(line), Some(out)) = (emit(op), op.output) else {
+            let Some(line) = emit(op) else {
                 ok = false;
                 break;
             };
             let prefix = format!("{} = ", name(out));
             match line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')) {
                 Some(rhs) => {
-                    self.exprs.borrow_mut().insert(out, rhs.to_string());
+                    self.exprs.borrow_mut().insert(key, rhs.to_string());
                 }
                 None => {
                     ok = false;
@@ -405,7 +442,7 @@ impl Inliner {
                 }
             }
         }
-        let text = ok.then(|| self.exprs.borrow().get(&cv).cloned().unwrap_or_else(|| name(cv)));
+        let text = ok.then(|| self.exprs.borrow().get(&value_key(func, cv)).cloned().unwrap_or_else(|| name(cv)));
         self.exprs.borrow_mut().clear();
         text
     }
@@ -419,44 +456,17 @@ impl Inliner {
         name: &dyn Fn(VarId) -> String,
         emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
     ) -> String {
-        let by_block = self.by_block.get_or_init(|| ops_by_block(func));
+        let (by_block, readers) = self.parts(func);
         let ops = &by_block[block];
         let Some(&br) = ops.last() else { return "cond".into() };
         let Some(&cv) = func.ops[br].inputs.get(1) else { return "cond".into() };
-        let mut lines = Vec::new();
-        let mut folded = true;
-        for o in condition_ops(func, ops).unwrap_or_default() {
-            let op = &func.ops[o];
-            // `!(a == b)` reads better as `a != b`
-            if op.opcode == OpCode::BoolNegate
-                && folded
-                && let (Some(out), Some(inner)) = (op.output, op.inputs.first().and_then(|i| self.exprs.borrow().get(i).cloned()))
-            {
-                self.exprs.borrow_mut().insert(out, crate::emit::negate_condition(inner, true));
-                continue;
-            }
-            let Some(line) = emit(op) else { continue };
-            let (Some(out), true) = (op.output, folded) else {
-                lines.push(line);
-                continue;
-            };
-            let prefix = format!("{} = ", name(out));
-            match line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')) {
-                Some(rhs) => {
-                    self.exprs.borrow_mut().insert(out, rhs.to_string());
-                }
-                None => folded = false,
-            }
-            lines.push(line);
+        let body = condition_ops(func, ops, readers).unwrap_or_default();
+        if let Some(text) = self.fold_ops(func, &body, cv, name, emit) {
+            return text;
         }
-        let text = if folded {
-            self.exprs.borrow().get(&cv).cloned().unwrap_or_else(|| name(cv))
-        } else {
-            // an op printed in another shape: keep the statements, as a statement expression
-            format!("({{ {} {}; }})", lines.join(" "), name(cv))
-        };
-        self.exprs.borrow_mut().clear();
-        text
+        // an op printed in another shape: keep the statements, as a statement expression
+        let lines: Vec<String> = body.iter().filter_map(|&o| emit(&func.ops[o])).collect();
+        format!("({{ {} {}; }})", lines.join(" "), name(cv))
     }
 }
 

@@ -1587,6 +1587,32 @@ mod tests {
         assert!(c.contains("edi == 0") || c.contains("edi != 0"), "{c}");
     }
 
+    /// Readers are counted by value: one op reading a value twice (`test r, r`) is one reader,
+    /// and a value common subexpression elimination merged has readers under two names, so it
+    /// is not folded away while the other name still reads it.
+    #[test]
+    fn readers_are_counted_by_value() {
+        let c = c_of(&[
+            0x8d, 0x4f, 0x01, // 0x1000 lea ecx, [rdi + 1]
+            0x8d, 0x57, 0x01, // 0x1003 lea edx, [rdi + 1]   (the same sum: merged)
+            0x01, 0xd1, // 0x1006 add ecx, edx
+            0x85, 0xc9, // 0x1008 test ecx, ecx
+            0x74, 0x06, // 0x100a je 0x1012
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 0x100c mov eax, 1
+            0xc3, // 0x1011
+            0x31, 0xc0, // 0x1012 xor eax, eax
+            0xc3,
+        ]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(cond.contains('+'), "the sum folds into the test: {c}");
+        for name in ["tmp_600", "ecx", "edx"] {
+            if cond.contains(name) {
+                assert!(c.contains(&format!("{name} = ")), "{name} is read but never set:
+{c}");
+            }
+        }
+    }
+
     /// WS77: a function that never sets `rax` returns nothing.
     #[test]
     fn ret_without_rax_write_is_void() {

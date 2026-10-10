@@ -938,7 +938,7 @@ impl<'a> CEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
-        if let Some(e) = self.inliner.get(op.inputs[idx]) {
+        if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
         }
         let vn = &func.varnodes[op.inputs[idx] as usize];
