@@ -13,6 +13,7 @@ pub mod rust_emit;
 pub mod noreturn;
 pub mod optimize;
 pub mod pipeline;
+pub mod prototypes;
 pub mod printer;
 pub mod scope;
 pub mod semantic_diff;

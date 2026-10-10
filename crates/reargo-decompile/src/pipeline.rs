@@ -35,6 +35,18 @@ pub fn decompile(
     func_name: &str,
     max_instructions: usize,
 ) -> Result<DecompileResult, String> {
+    decompile_with_symbols(lifter, memory, entry, func_name, max_instructions, &std::collections::BTreeMap::new())
+}
+
+/// [`decompile`] with the names of other addresses (imports get their known prototypes).
+pub fn decompile_with_symbols(
+    lifter: &dyn PcodeLift,
+    memory: &Memory,
+    entry: u64,
+    func_name: &str,
+    max_instructions: usize,
+    symbols: &std::collections::BTreeMap<u64, String>,
+) -> Result<DecompileResult, String> {
     let mut lifted = lifter
         .lift_range(memory, entry, max_instructions)
         .map_err(|e| e.to_string())?;
@@ -48,13 +60,13 @@ pub fn decompile(
     rewrite_tail_calls(&mut trimmed);
     let trimmed = crate::vcall::devirtualize_constant_calls(trimmed, memory);
     let oracle = CalleeParams::new(lifter, memory);
-    let call_params = callee_param_map(&trimmed, oracle.as_ref());
+    let call_params = callee_param_map(&trimmed, oracle.as_ref(), symbols);
     let own = own_params(oracle.as_ref(), entry);
-    let call_returns = callee_return_map(&trimmed, oracle.as_ref());
+    let call_returns = callee_return_map(&trimmed, oracle.as_ref(), symbols);
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)))
+    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)))
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -98,9 +110,15 @@ fn own_params(
 
 /// Parameters of every direct call's callee in `instructions`, keyed by the
 /// call instruction's address (WS78).
+/// The callee of a direct call is a known import (WS82): its prototype.
+fn import_proto(symbols: &std::collections::BTreeMap<u64, String>, target: u64) -> Option<crate::prototypes::Proto> {
+    crate::prototypes::import_prototype(symbols.get(&target)?)
+}
+
 fn callee_param_map(
     instructions: &[LiftedInstruction],
     oracle: Option<&CalleeParams<'_>>,
+    symbols: &std::collections::BTreeMap<u64, String>,
 ) -> rustc_hash::FxHashMap<u64, ParamInfo> {
     use reargo_core::pcode::OpCode;
     let mut out = rustc_hash::FxHashMap::default();
@@ -110,9 +128,15 @@ fn callee_param_map(
             if op.opcode == OpCode::Call
                 && let Some(t) = op.inputs.first()
                 && t.space == reargo_core::address::SpaceId::RAM
-                && let Some(info) = oracle.params(t.offset)
             {
-                out.insert(insn.address, info);
+                // an import's code is not in the binary: its known prototype, if any
+                let info = match import_proto(symbols, t.offset) {
+                    Some(p) => Some(p.params(oracle.args())),
+                    None => oracle.params(t.offset),
+                };
+                if let Some(info) = info {
+                    out.insert(insn.address, info);
+                }
             }
         }
     }
@@ -124,6 +148,7 @@ fn callee_param_map(
 fn callee_return_map(
     instructions: &[LiftedInstruction],
     oracle: Option<&CalleeParams<'_>>,
+    symbols: &std::collections::BTreeMap<u64, String>,
 ) -> rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind> {
     use reargo_core::pcode::OpCode;
     let mut out = rustc_hash::FxHashMap::default();
@@ -134,7 +159,10 @@ fn callee_return_map(
                 && let Some(t) = op.inputs.first()
                 && t.space == reargo_core::address::SpaceId::RAM
             {
-                let k = oracle.return_kind(t.offset);
+                let k = match import_proto(symbols, t.offset) {
+                    Some(p) => p.return_kind().unwrap_or(crate::callee_params::ReturnKind::Unknown),
+                    None => oracle.return_kind(t.offset),
+                };
                 if k != crate::callee_params::ReturnKind::Unknown {
                     out.insert(insn.address, k);
                 }
@@ -283,9 +311,9 @@ fn decompile_function_inner(
     let mut terminated = terminated;
     rewrite_tail_calls(&mut terminated);
     let terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
-    let call_params = callee_param_map(&terminated, oracle);
+    let call_params = callee_param_map(&terminated, oracle, symbols);
     let own = own_params(oracle, func_entry);
-    let call_returns = callee_return_map(&terminated, oracle);
+    let call_returns = callee_return_map(&terminated, oracle, symbols);
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
 
@@ -2214,5 +2242,31 @@ mod tests {
         let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
         assert!(cond.contains(" > (int32_t)0") || cond.contains(" <= (int32_t)0"), "{c}");
         assert!(!cond.contains("!0") && !cond.contains("||"), "{c}");
+    }
+
+    /// `setne sil; and al, sil; mov edi, 5; call f`: the byte `sil` holds is a flag the
+    /// function computes for itself, not an argument for `f`.
+    fn setcc_leftover_code() -> Vec<u8> {
+        vec![
+            0x85, 0xc9, // test ecx, ecx
+            0x40, 0x0f, 0x95, 0xc6, // setne sil
+            0x40, 0x20, 0xf0, // and al, sil
+            0xbf, 0x05, 0x00, 0x00, 0x00, // mov edi, 5
+            0xe8, 0xed, 0x0f, 0x00, 0x00, // call 0x2000
+            0x88, 0x05, 0xe9, 0x1f, 0x00, 0x00, // mov [0x3000], al
+            0xc3, // ret
+        ]
+    }
+
+    /// A known import takes the parameters of its prototype (WS82):
+    /// `pthread_mutex_unlock(rdi)`, not `(rdi, rsi)` because `sil` was written.
+    #[test]
+    fn import_prototype_sets_the_arguments() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(&setcc_leftover_code(), 0x1000);
+        let symbols = std::collections::BTreeMap::from([(0x2000u64, "pthread_mutex_unlock@plt".to_string())]);
+        let c = decompile_with_symbols(&lifter, &mem, 0x1000, "f", 100, &symbols).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("pthread_mutex_unlock@plt(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi)"), "{c}");
     }
 }
