@@ -119,6 +119,8 @@ struct Case {
     inputs: Inputs,
     /// a CPU feature the instruction needs (`is_x86_feature_detected!`)
     needs: Option<fn() -> bool>,
+    /// inputs the instruction accepts (a `div` that would fault is not run)
+    valid: Option<fn(u64, u64, u64) -> bool>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -236,6 +238,7 @@ fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
     v
 }
 
+/// Lift the instructions between `start` and `end` (usually one).
 fn lift(start: usize, end: usize) -> (Vec<PcodeOp>, String) {
     let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) }.to_vec();
     let mut mem = Memory::new(SpaceId(1), Endian::Little);
@@ -246,11 +249,18 @@ fn lift(start: usize, end: usize) -> (Vec<PcodeOp>, String) {
         flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
         data: Some(Arc::from(bytes.as_slice())),
     });
-    let l = X86Lifter::new_64()
-        .lift_instruction(&mem, start as u64)
-        .unwrap_or_else(|e| panic!("lift {bytes:02x?}: {e:?}"));
-    assert_eq!(l.length as usize, bytes.len(), "{}: one instruction expected", l.mnemonic);
-    (l.ops, l.mnemonic)
+    let (mut ops, mut text) = (Vec::new(), Vec::new());
+    let mut at = start as u64;
+    while at < end as u64 {
+        let l = X86Lifter::new_64()
+            .lift_instruction(&mem, at)
+            .unwrap_or_else(|e| panic!("lift {bytes:02x?}: {e:?}"));
+        at += u64::from(l.length);
+        ops.extend(l.ops);
+        text.push(l.mnemonic);
+    }
+    assert_eq!(at, end as u64, "{text:?}: instruction boundaries");
+    (ops, text.join("; "))
 }
 
 /// Run the lifted ops: (registers and flags after, whether a CBRANCH was taken).
@@ -295,10 +305,13 @@ fn check(cases: &[Case]) {
             eprintln!("skip {} (CPU feature missing)", case.asm);
             continue;
         }
-        let (_, s, e) = (case.f)(0, 0, 0, 0x2);
+        let (_, s, e) = (case.f)(0, 1, 0, 0x2); // (where its code is; 1 does not divide by 0)
         let (ops, mnemonic) = lift(s, e);
         let mut shown = 0;
         for (a, b, c, fl) in inputs(case.inputs, &mut rng) {
+            if case.valid.is_some_and(|v| !v(a, b, c)) {
+                continue;
+            }
             let (cpu, _, _) = (case.f)(a, b, c, fl);
             let (emu, taken) = emulate(&ops, a, b, c, fl);
             let mut bad = Vec::new();
@@ -427,10 +440,10 @@ fn popcnt() -> bool {
 
 macro_rules! case {
     ($asm:expr, $d:expr, $inputs:expr) => {
-        Case { asm: $asm, f: cpu!($asm), defined: $d, inputs: $inputs, needs: None }
+        Case { asm: $asm, f: cpu!($asm), defined: $d, inputs: $inputs, needs: None, valid: None }
     };
     ($asm:expr, $d:expr, $inputs:expr, $needs:expr) => {
-        Case { asm: $asm, f: cpu!($asm), defined: $d, inputs: $inputs, needs: Some($needs) }
+        Case { asm: $asm, f: cpu!($asm), defined: $d, inputs: $inputs, needs: Some($needs), valid: None }
     };
 }
 
@@ -501,7 +514,7 @@ fn conditions_match_the_cpu() {
     macro_rules! cc {
         ($($c:literal),+) => {
             vec![$(
-                Case { asm: concat!("j", $c), f: cpu_jcc!($c), defined: d_arith, inputs: Inputs::Jump, needs: None },
+                Case { asm: concat!("j", $c), f: cpu_jcc!($c), defined: d_arith, inputs: Inputs::Jump, needs: None, valid: None },
                 case!(concat!("set", $c, " al"), d_arith, Inputs::Flags),
                 case!(concat!("cmov", $c, " eax, ecx"), d_arith, Inputs::Flags),
                 case!(concat!("cmov", $c, " ax, cx"), d_arith, Inputs::Flags),
@@ -633,6 +646,61 @@ fn bit_ops_match_the_cpu() {
         case!("popcnt ax, cx", d_arith, Inputs::Values, popcnt),
         case!("bswap eax", d_arith, Inputs::Values),
         case!("bswap rax", d_arith, Inputs::Values),
+    ];
+    check(&cases);
+}
+
+fn d_div(_: u64, _: u64, _: u64) -> (u64, u8) {
+    (0, RAX | RDX) // all flags undefined
+}
+
+/// A division and the inputs it does not fault on.
+macro_rules! div {
+    ($asm:expr, $valid:expr) => {
+        Case { asm: $asm, f: cpu!($asm), defined: d_div, inputs: Inputs::Values, needs: None, valid: Some($valid) }
+    };
+}
+
+#[test]
+fn divisions_match_the_cpu() {
+    let cases = vec![
+        // byte form: AX / cl -> AL, remainder AH
+        div!("div cl", |a, b, _| b as u8 != 0 && (a as u16) / u16::from(b as u8) <= 0xff),
+        div!("idiv cl", |a, b, _| {
+            let d = i16::from(b as u8 as i8);
+            (a as u16 as i16).checked_div(d).is_some_and(|q| (-128..=127).contains(&q))
+        }),
+        // wider forms with the dividend's high half set up the way compilers do
+        div!("xor edx, edx
+ div ecx", |_, b, _| b as u32 != 0),
+        div!("cdq
+ idiv ecx", |a, b, _| b as u32 != 0 && !(a as u32 == 0x8000_0000 && b as u32 == u32::MAX)),
+        div!("xor edx, edx
+ div rcx", |_, b, _| b != 0),
+        div!("cqo
+ idiv rcx", |a, b, _| b != 0 && !(a == 1 << 63 && b == u64::MAX)),
+        div!("xor edx, edx
+ div cx", |_, b, _| b as u16 != 0),
+    ];
+    check(&cases);
+}
+
+#[test]
+fn high_byte_registers_match_the_cpu() {
+    let cases = vec![
+        case!("mov ah, cl", d_arith, Inputs::Values),
+        case!("mov ch, al", d_arith_all_regs, Inputs::Values),
+        case!("movzx eax, ch", d_arith, Inputs::Values),
+        case!("movzx ecx, ah", d_arith_all_regs, Inputs::Values),
+        case!("add ah, cl", d_arith, Inputs::Values),
+        case!("xor ah, ah", d_arith, Inputs::Values),
+        case!("test ah, 0x41", d_arith, Inputs::Values),
+        case!("cmp dh, ch", d_arith, Inputs::Values),
+        case!("mov ah, 1
+ mov al, ah", d_arith, Inputs::Values),
+        case!("mov dh, cl
+ add eax, edx", d_arith_all_regs, Inputs::Values),
+        case!("xchg ah, al", d_arith, Inputs::Values),
     ];
     check(&cases);
 }

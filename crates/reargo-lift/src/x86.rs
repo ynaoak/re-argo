@@ -52,6 +52,11 @@ fn iced_reg_to_varnode(r: iced_x86::Register) -> Option<VarnodeData> {
     static REG_MAP: OnceLock<HashMap<Register, VarnodeData>> = OnceLock::new();
     let map = REG_MAP.get_or_init(|| {
         let mut m = HashMap::with_capacity(48);
+        // AH/CH/DH/BH = byte 1 of rax/rcx/rdx/rbx (Ghidra's offsets). They were missing, so
+        // `movzx eax, ah` failed to lift and the function stopped there (WS84). Reads and
+        // writes are tied to the full register by `zero_extend_gpr32_writes`.
+        m.insert(Register::AH, reg(0x01, 1)); m.insert(Register::CH, reg(0x09, 1));
+        m.insert(Register::DH, reg(0x11, 1)); m.insert(Register::BH, reg(0x19, 1));
         m.insert(Register::RAX, rax(8)); m.insert(Register::EAX, rax(4));
         m.insert(Register::AX, rax(2)); m.insert(Register::AL, rax(1));
         m.insert(Register::RCX, rcx(8)); m.insert(Register::ECX, rcx(4));
@@ -406,11 +411,31 @@ impl X86Lifter {
                 use iced_x86::Register as R;
                 let signed = insn.mnemonic() == Idiv;
                 let src = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                let (div_op, rem_op) = if signed {
+                    (OpCode::IntSDiv, OpCode::IntSRem)
+                } else {
+                    (OpCode::IntDiv, OpCode::IntRem)
+                };
+                if src.size == 1 {
+                    // byte form: AX / src, quotient -> AL, remainder -> AH (WS84: the
+                    // dividend was AL and the remainder was written to a constant)
+                    let mut push = |opcode: OpCode, out: VarnodeData, ins: &[VarnodeData]| {
+                        ops.push(PcodeOp { opcode, seq: seq(seq_base), output: Some(out), inputs: SmallVec::from_slice(ins) });
+                        seq_base += 1;
+                    };
+                    let wide = unique(0x740, 2);
+                    push(if signed { OpCode::IntSExt } else { OpCode::IntZExt }, wide, &[src]);
+                    let (q, r) = (unique(0x750, 2), unique(0x760, 2));
+                    push(div_op, q, &[rax(2), wide]);
+                    push(rem_op, r, &[rax(2), wide]);
+                    push(OpCode::Subpiece, rax(1), &[q, constant(0, 4)]);
+                    push(OpCode::Subpiece, reg(0x01, 1), &[r, constant(0, 4)]);
+                    return Ok(ops);
+                }
                 let (acc_r, hi_r) = match src.size {
                     8 => (R::RAX, R::RDX),
                     4 => (R::EAX, R::EDX),
-                    2 => (R::AX, R::DX),
-                    _ => (R::AL, R::AH), // byte form: dividend AX, quot AL, rem AH
+                    _ => (R::AX, R::DX),
                 };
                 let acc = iced_reg_to_varnode(acc_r).unwrap_or_else(|| constant(0, ps));
                 let hi = iced_reg_to_varnode(hi_r).unwrap_or_else(|| constant(0, ps));
@@ -422,11 +447,6 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[acc]),
                 });
                 seq_base += 1;
-                let (div_op, rem_op) = if signed {
-                    (OpCode::IntSDiv, OpCode::IntSRem)
-                } else {
-                    (OpCode::IntDiv, OpCode::IntRem)
-                };
                 ops.push(PcodeOp {
                     opcode: div_op,
                     seq: seq(seq_base),
@@ -434,17 +454,14 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[old, src]),
                 });
                 seq_base += 1;
-                // Remainder to the D register (skip for the byte form, whose AH
-                // high-byte varnode may be unavailable in the register map).
-                if src.size >= 2 {
-                    ops.push(PcodeOp {
-                        opcode: rem_op,
-                        seq: seq(seq_base),
-                        output: Some(hi),
-                        inputs: SmallVec::from_slice(&[old, src]),
-                    });
-                    seq_base += 1;
-                }
+                // Remainder to the D register.
+                ops.push(PcodeOp {
+                    opcode: rem_op,
+                    seq: seq(seq_base),
+                    output: Some(hi),
+                    inputs: SmallVec::from_slice(&[old, src]),
+                });
+                seq_base += 1;
             }
 
             Not => {
@@ -1993,27 +2010,53 @@ impl PcodeLift for X86Lifter {
 /// write — which on x86 preserves the bits above it — rebuilds the 64-bit
 /// register as `PIECE(SUBPIECE(old, n), new)` and then the other views from
 /// it (`mov eax, ...; cmp r13w, ax` read a stale `ax` before).
+///
+/// `ah`/`ch`/`dh`/`bh` are never kept as views: a read is preceded by
+/// `ah = SUBPIECE(rax, 1)`, and a write rebuilds `ax = PIECE(ah, al)` and then
+/// rax from ax as a 16-bit write would (WS84).
 fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
     let gpr = |v: &VarnodeData| {
         (v.space == REG_SPACE && v.offset < 0xC0 && v.offset % 8 == 0 && matches!(v.size, 1 | 2 | 4 | 8))
             .then_some(*v)
     };
-    if !ops.iter().any(|o| o.output.as_ref().and_then(gpr).is_some()) {
+    // ah/ch/dh/bh: byte 1 of rax..rbx (WS84)
+    let high = |v: &VarnodeData| v.space == REG_SPACE && v.offset < 0x20 && v.offset % 8 == 1 && v.size == 1;
+    if !ops.iter().any(|o| {
+        o.output.as_ref().is_some_and(|v| gpr(v).is_some() || high(v)) || o.inputs.iter().any(high)
+    }) {
         return ops;
     }
     let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 4);
     let mut tmp = 0x7e00u64;
     for op in ops {
-        let w = op.output.as_ref().and_then(gpr);
         let at = op.seq.addr;
-        out.push(op);
-        let Some(w) = w else { continue };
         let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
             opcode,
             seq: SeqNum::new(at, 0),
             output: Some(output),
             inputs: SmallVec::from_slice(inputs),
         };
+        // a high byte is read from its register: `ah = (uint8_t)(rax >> 8)` first
+        let mut read_high: Vec<VarnodeData> = op.inputs.iter().copied().filter(high).collect();
+        read_high.dedup();
+        for h in read_high {
+            out.push(mk(OpCode::Subpiece, h, &[reg(h.offset - 1, 8), constant(1, 4)]));
+        }
+        let wrote_high = op.output.filter(high);
+        let w = op.output.as_ref().and_then(gpr);
+        out.push(op);
+        if let Some(h) = wrote_high {
+            // ax = ah:al, then rebuild rax from ax like a 16-bit write
+            let base = h.offset - 1;
+            out.push(mk(OpCode::Piece, reg(base, 2), &[h, reg(base, 1)]));
+            let hi = unique(tmp, 6);
+            tmp += 0x10;
+            out.push(mk(OpCode::Subpiece, hi, &[reg(base, 8), constant(2, 4)]));
+            out.push(mk(OpCode::Piece, reg(base, 8), &[hi, reg(base, 2)]));
+            out.push(mk(OpCode::Subpiece, reg(base, 4), &[reg(base, 8), constant(0, 4)]));
+            continue;
+        }
+        let Some(w) = w else { continue };
         let r = |sz: u32| reg(w.offset, sz);
         let low = |out: &mut Vec<PcodeOp>, from: u32, sizes: &[u32]| {
             for &sz in sizes {

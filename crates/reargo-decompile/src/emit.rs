@@ -1472,6 +1472,10 @@ fn reg_name(offset: u64, size: u32) -> String {
         // the 16/8-bit views of rcx..rdi (WS78): they used to fall through to `var_<off>`,
         // so `bp` and `bpl` both became `var_28` (two declarations of one name, and a name
         // that reads like a stack local)
+        (0x01, 1) => "ah".into(),
+        (0x09, 1) => "ch".into(),
+        (0x11, 1) => "dh".into(),
+        (0x19, 1) => "bh".into(),
         (0x08, 2) => "cx".into(),
         (0x08, 1) => "cl".into(),
         (0x10, 2) => "dx".into(),

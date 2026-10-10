@@ -2454,6 +2454,23 @@ mod tests {
         assert!(!c.contains("__unmodeled_insn"), "{c}");
     }
 
+    /// `ah` lifts (WS84: the register was missing and the function stopped at the first
+    /// instruction that used it) and reads byte 1 of rax.
+    #[test]
+    fn high_byte_register_reads_byte_one() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xf8, // mov eax, edi
+            0x0f, 0xb6, 0xc4, // movzx eax, ah
+            0x01, 0xf0, // add eax, esi
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains(">> 8"), "{c}");
+        assert!(c.contains("esi"), "the function goes on after `movzx eax, ah`: {c}");
+    }
+
     /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
     #[test]
     fn cmov_is_a_select() {
