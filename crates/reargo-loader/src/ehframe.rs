@@ -21,18 +21,45 @@ impl Image<'_> {
             .find(|&&(a, _, s)| va >= a && va < a + s)
             .map(|&(a, o, _)| (va - a + o) as usize)
     }
-    fn bytes(&self, va: u64, n: usize) -> Option<&[u8]> {
+}
+
+impl Reader for Image<'_> {
+    fn read_into(&self, va: u64, buf: &mut [u8]) -> Option<()> {
         let o = self.offset_of(va)?;
-        self.data.get(o..o + n)
+        buf.copy_from_slice(self.data.get(o..o + buf.len())?);
+        Some(())
     }
+}
+
+impl Reader for crate::memory::Memory {
+    fn read_into(&self, va: u64, buf: &mut [u8]) -> Option<()> {
+        self.read_bytes(va, buf).ok()
+    }
+}
+
+/// Byte access by virtual address: the file's sections ([`Image`]) or a loaded [`Memory`].
+trait Reader {
+    fn read_into(&self, va: u64, buf: &mut [u8]) -> Option<()>;
+
     fn u8(&self, va: u64) -> Option<u8> {
-        self.bytes(va, 1).map(|b| b[0])
+        let mut b = [0u8; 1];
+        self.read_into(va, &mut b)?;
+        Some(b[0])
+    }
+    fn u16(&self, va: u64) -> Option<u16> {
+        let mut b = [0u8; 2];
+        self.read_into(va, &mut b)?;
+        Some(u16::from_le_bytes(b))
     }
     fn u32(&self, va: u64) -> Option<u32> {
-        self.bytes(va, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        let mut b = [0u8; 4];
+        self.read_into(va, &mut b)?;
+        Some(u32::from_le_bytes(b))
     }
     fn u64(&self, va: u64) -> Option<u64> {
-        self.bytes(va, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        let mut b = [0u8; 8];
+        self.read_into(va, &mut b)?;
+        Some(u64::from_le_bytes(b))
     }
     fn uleb(&self, va: &mut u64) -> Option<u64> {
         let (mut v, mut shift) = (0u64, 0);
@@ -68,7 +95,8 @@ impl Image<'_> {
         }
     }
     /// Read a pointer with encoding `enc` at `*va`. `datarel` is the base for
-    /// `DW_EH_PE_datarel` (the `.eh_frame_hdr` start).
+    /// `DW_EH_PE_datarel` (the `.eh_frame_hdr` start). `DW_EH_PE_indirect` is not followed
+    /// (the caller does: in a PIE the slot is a relocation).
     fn encoded(&self, va: &mut u64, enc: u8, datarel: u64) -> Option<u64> {
         let at = *va;
         let raw: u64 = match enc & 0x0f {
@@ -79,7 +107,7 @@ impl Image<'_> {
             0x01 => self.uleb(va)?,
             0x02 => {
                 *va += 2;
-                u64::from(u16::from_le_bytes(self.bytes(at, 2)?.try_into().ok()?))
+                u64::from(self.u16(at)?)
             }
             0x03 => {
                 *va += 4;
@@ -92,7 +120,7 @@ impl Image<'_> {
             0x09 => self.sleb(va)? as u64,
             0x0a => {
                 *va += 2;
-                i16::from_le_bytes(self.bytes(at, 2)?.try_into().ok()?) as i64 as u64
+                self.u16(at)? as i16 as i64 as u64
             }
             0x0b => {
                 *va += 4;
@@ -131,7 +159,14 @@ pub fn elf_eh_frame_function(data: &[u8], addr: u64) -> Option<(u64, u64)> {
         }
     }
     let img = Image { data, sections };
-    let hdr = hdr?;
+    let fde = find_fde(&img, hdr?, addr)?;
+    let (start, len) = fde_range(&img, fde)?;
+    (addr >= start && addr < start + len).then_some((start, len))
+}
+
+/// The FDE whose initial location is the last one at or before `addr`, from the sorted
+/// table of the `.eh_frame_hdr` at `hdr`.
+fn find_fde(img: &impl Reader, hdr: u64, addr: u64) -> Option<u64> {
     if img.u8(hdr)? != 1 {
         return None;
     }
@@ -161,27 +196,35 @@ pub fn elf_eh_frame_function(data: &[u8], addr: u64) -> Option<(u64, u64)> {
     if lo == 0 {
         return None;
     }
-    let (_, fde) = entry(lo - 1)?;
-    let (start, len) = fde_range(&img, fde)?;
-    (addr >= start && addr < start + len).then_some((start, len))
+    Some(entry(lo - 1)?.1)
 }
 
 /// Parse one FDE: its CIE's `R` augmentation gives the pointer encoding.
-fn fde_range(img: &Image, fde: u64) -> Option<(u64, u64)> {
+fn fde_range(img: &impl Reader, fde: u64) -> Option<(u64, u64)> {
     let len = img.u32(fde)?;
     if len == 0 || len == 0xffff_ffff {
         return None;
     }
     let cie_ptr = img.u32(fde + 4)?;
     let cie = (fde + 4).wrapping_sub(u64::from(cie_ptr));
-    let enc = cie_fde_encoding(img, cie)?;
+    let enc = cie_info(img, cie)?.fde_enc;
     let mut p = fde + 8;
     let start = img.encoded(&mut p, enc, 0)?;
     let range = img.encoded(&mut p, enc & 0x0f, 0)?;
     Some((start, range))
 }
 
-fn cie_fde_encoding(img: &Image, cie: u64) -> Option<u8> {
+/// What an FDE needs from its CIE.
+struct CieInfo {
+    /// `R`: the encoding of the FDE's address range
+    fde_enc: u8,
+    /// `L`: the encoding of the FDE's LSDA pointer
+    lsda_enc: Option<u8>,
+    /// `z`: the FDE has augmentation data (its length first)
+    has_aug_data: bool,
+}
+
+fn cie_info(img: &impl Reader, cie: u64) -> Option<CieInfo> {
     if img.u32(cie)? == 0xffff_ffff || img.u32(cie + 4)? != 0 {
         return None;
     }
@@ -203,24 +246,146 @@ fn cie_fde_encoding(img: &Image, cie: u64) -> Option<u8> {
     } else {
         img.uleb(&mut p)?;
     }
+    let mut info = CieInfo { fde_enc: 0x00, lsda_enc: None, has_aug_data: false };
     if aug.first() != Some(&b'z') {
-        return Some(0x00); // absptr
+        return Some(info); // absptr
     }
+    info.has_aug_data = true;
     img.uleb(&mut p)?; // augmentation data length
     for &c in &aug[1..] {
         match c {
-            b'R' => return img.u8(p),
-            b'L' => p += 1,
+            b'R' => {
+                info.fde_enc = img.u8(p)?;
+                p += 1;
+            }
+            b'L' => {
+                info.lsda_enc = Some(img.u8(p)?);
+                p += 1;
+            }
             b'P' => {
                 let penc = img.u8(p)?;
                 p += 1;
-                img.encoded(&mut p, penc, 0)?;
+                img.encoded(&mut p, penc & 0x7f, 0)?;
             }
             b'S' | b'B' | b'G' => {}
             _ => return None,
         }
     }
-    Some(0x00)
+    Some(info)
+}
+
+/// What a call site's landing pad does with an exception (an LSDA action record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EhAction {
+    /// runs destructors and resumes unwinding
+    Cleanup,
+    /// `catch (T)`: the typeinfo of `T` (0: `catch (...)`); when `indirect`, `typeinfo` is
+    /// the address of a pointer to it (a relocation in a PIE)
+    Catch { typeinfo: u64, indirect: bool },
+    /// an exception specification (`noexcept` / `throw(...)`)
+    Filter,
+}
+
+/// A call-site record of a function's LSDA: the calls in `[start, start + len)` unwind to
+/// `landing_pad` (0: none, the exception propagates).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    pub start: u64,
+    pub len: u64,
+    pub landing_pad: u64,
+    pub actions: Vec<EhAction>,
+}
+
+/// The call-site table of the LSDA (`.gcc_except_table`) of the function whose FDE covers
+/// `addr`, read from loaded memory; `hdr` is the address of `.eh_frame_hdr`. `None` when
+/// the function has no LSDA or its encodings are unsupported.
+pub fn landing_pads(mem: &crate::memory::Memory, hdr: u64, addr: u64) -> Option<Vec<CallSite>> {
+    let img = mem;
+    let fde = find_fde(img, hdr, addr)?;
+    let (start, len) = fde_range(img, fde)?;
+    if addr < start || addr >= start + len {
+        return None;
+    }
+    let cie = (fde + 4).wrapping_sub(u64::from(img.u32(fde + 4)?));
+    let info = cie_info(img, cie)?;
+    let lsda_enc = info.lsda_enc.filter(|&e| e != DW_EH_PE_OMIT)?;
+    if !info.has_aug_data {
+        return None;
+    }
+    let mut p = fde + 8;
+    img.encoded(&mut p, info.fde_enc, 0)?;
+    img.encoded(&mut p, info.fde_enc & 0x0f, 0)?;
+    img.uleb(&mut p)?; // augmentation data length
+    let lsda = img.encoded(&mut p, lsda_enc & 0x7f, 0)?;
+    if lsda == 0 {
+        return None;
+    }
+    parse_lsda(img, lsda, start)
+}
+
+/// The call-site table of the LSDA at `lsda` (GCC / LLVM `.gcc_except_table` format).
+fn parse_lsda(img: &impl Reader, lsda: u64, func_start: u64) -> Option<Vec<CallSite>> {
+    let mut p = lsda;
+    let lp_enc = img.u8(p)?;
+    p += 1;
+    let lp_start = if lp_enc == DW_EH_PE_OMIT { func_start } else { img.encoded(&mut p, lp_enc, 0)? };
+    let tt_enc = img.u8(p)?;
+    p += 1;
+    let tt_base = if tt_enc == DW_EH_PE_OMIT {
+        None
+    } else {
+        let off = img.uleb(&mut p)?;
+        Some(p + off)
+    };
+    let cs_enc = img.u8(p)?;
+    p += 1;
+    let cs_len = img.uleb(&mut p)?;
+    let cs_end = p + cs_len;
+    let action_table = cs_end;
+    let tt_size = match tt_enc & 0x0f {
+        0x02 | 0x0a => 2,
+        0x03 | 0x0b => 4,
+        _ => 8,
+    };
+    let mut out = Vec::new();
+    while p < cs_end && out.len() < 100_000 {
+        // offsets from the landing-pad base: the encoding's size, no base applied
+        let start = img.encoded(&mut p, cs_enc & 0x0f, 0)?;
+        let len = img.encoded(&mut p, cs_enc & 0x0f, 0)?;
+        let lp = img.encoded(&mut p, cs_enc & 0x0f, 0)?;
+        let action = img.uleb(&mut p)?;
+        let mut actions = Vec::new();
+        if action != 0 {
+            let mut a = action_table + action - 1;
+            for _ in 0..32 {
+                let filter = img.sleb(&mut a)?;
+                let here = a;
+                let next = img.sleb(&mut a)?;
+                actions.push(match filter {
+                    0 => EhAction::Cleanup,
+                    f if f > 0 => {
+                        let mut slot = tt_base?.wrapping_sub(f as u64 * tt_size);
+                        let typeinfo = img.encoded(&mut slot, tt_enc & 0x7f, 0)?;
+                        EhAction::Catch { typeinfo, indirect: tt_enc & 0x80 != 0 }
+                    }
+                    _ => EhAction::Filter,
+                });
+                if next == 0 {
+                    break;
+                }
+                a = here.wrapping_add(next as u64);
+            }
+        } else if lp != 0 {
+            actions.push(EhAction::Cleanup);
+        }
+        out.push(CallSite {
+            start: lp_start + start,
+            len,
+            landing_pad: if lp == 0 { 0 } else { lp_start + lp },
+            actions,
+        });
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -334,5 +499,50 @@ mod tests {
     #[test]
     fn non_elf_input_is_none() {
         assert_eq!(elf_eh_frame_function(b"MZ not an elf", 0x1000), None);
+    }
+
+    /// Bytes at a base address, for parsing hand-built tables.
+    struct At(u64, Vec<u8>);
+
+    impl Reader for At {
+        fn read_into(&self, va: u64, buf: &mut [u8]) -> Option<()> {
+            let o = va.checked_sub(self.0)? as usize;
+            buf.copy_from_slice(self.1.get(o..o + buf.len())?);
+            Some(())
+        }
+    }
+
+    /// An LSDA with a cleanup, a `catch` (indirect pcrel typeinfo) and a call site with no
+    /// landing pad.
+    #[test]
+    fn parses_an_lsda_call_site_table() {
+        let mut b = vec![0xff, 0x9b, 20, 0x01, 12];
+        b.extend([0x10, 0x08, 0x40, 0x00, 0x20, 0x05, 0x50, 0x01, 0x30, 0x05, 0x00, 0x00]);
+        b.extend([0x01, 0x00]); // action 1: catch type filter 1, no next
+        b.extend((0x6000u32.wrapping_sub(0x5000 + 19)).to_le_bytes()); // ttype[1]
+        let sites = parse_lsda(&At(0x5000, b), 0x5000, 0x1000).unwrap();
+        assert_eq!(sites.len(), 3);
+        assert_eq!((sites[0].start, sites[0].len, sites[0].landing_pad), (0x1010, 8, 0x1040));
+        assert_eq!(sites[0].actions, vec![EhAction::Cleanup]);
+        assert_eq!(sites[1].landing_pad, 0x1050);
+        assert_eq!(sites[1].actions, vec![EhAction::Catch { typeinfo: 0x6000, indirect: true }]);
+        assert_eq!((sites[2].landing_pad, sites[2].actions.len()), (0, 0));
+    }
+
+    /// A known LSDA of the binary named by `REARGO_TEST_BDS`. Skipped when unset.
+    #[test]
+    fn reads_landing_pads_in_bds() {
+        let Ok(path) = std::env::var("REARGO_TEST_BDS") else { return };
+        let info = crate::BinaryLoader::load(std::path::Path::new(&path)).unwrap();
+        let hdr = info.sections.iter().find(|s| s.name == ".eh_frame_hdr").unwrap().address;
+        // a function whose calls unwind to cleanups (its CIE is `zPLR`)
+        let sites = landing_pads(&info.memory, hdr, 0x41cc080).unwrap();
+        assert!(sites.iter().any(|s| s.landing_pad != 0 && s.actions == [EhAction::Cleanup]), "{sites:?}");
+        for s in &sites {
+            assert!(s.start >= 0x41cc080 && s.start + s.len <= 0x41cc080 + 0x17e, "{s:?}");
+            assert!(s.landing_pad == 0 || (s.landing_pad > 0x41cc080 && s.landing_pad < 0x41cc080 + 0x17e), "{s:?}");
+        }
+        // a CIE without `L`: no LSDA
+        assert_eq!(landing_pads(&info.memory, hdr, 0x4bd0820), None);
     }
 }
