@@ -44,8 +44,9 @@ pub fn decompile(
     }
     crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
 
-    let mut trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
+    let mut trimmed = trim_to_return(lifted);
     rewrite_tail_calls(&mut trimmed);
+    let trimmed = crate::vcall::devirtualize_constant_calls(trimmed, memory);
     let oracle = CalleeParams::new(lifter, memory);
     let call_params = callee_param_map(&trimmed, oracle.as_ref());
     let own = own_params(oracle.as_ref(), entry);
@@ -279,8 +280,9 @@ fn decompile_function_inner(
     } else {
         trim_to_return(lifted)
     };
-    let mut terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
+    let mut terminated = terminated;
     rewrite_tail_calls(&mut terminated);
+    let terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
     let call_params = callee_param_map(&terminated, oracle);
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle);
@@ -302,30 +304,82 @@ fn decompile_function_inner(
     )
 }
 
+/// Address of the stub [`rewrite_tail_calls`] makes for a conditional jump out of the code to
+/// `target`: far from any real code, so nothing keyed by address (annotations, call
+/// renderings) matches it.
+pub const TAIL_STUB_BASE: u64 = 0xffff_0000_0000_0000;
+
 /// A `jmp` out of the code being decompiled is a tail call (WS81): rewrite its `BRANCH` into
 /// `CALL target; RETURN`, so it prints as `return f(…);` with the call's arguments instead of
 /// vanishing (a `BRANCH` prints nothing) with the argument setup left dead.
-pub(crate) fn rewrite_tail_calls(instructions: &mut [LiftedInstruction]) {
+///
+/// WS82: a conditional jump out of the code (`jne free@plt` before the prologue) used to lose
+/// its condition (the CFG only kept the fall-through); it now jumps to a stub `CALL target;
+/// RETURN` at [`TAIL_STUB_BASE`]` + target`, so it prints as `if (c) { return f(…); }`. An
+/// indirect `jmp` that is not a jump-table dispatch (`jmp [rax+0x20]`, a vtable slot) is a
+/// tail call too: `CALLIND; RETURN` instead of `goto *tmp;`.
+pub(crate) fn rewrite_tail_calls(instructions: &mut Vec<LiftedInstruction>) {
     use reargo_core::address::SpaceId;
     use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
     let inside: rustc_hash::FxHashSet<u64> = instructions.iter().map(|i| i.address).collect();
-    for insn in instructions.iter_mut() {
+    let ret = |seq| PcodeOp { opcode: OpCode::Return, seq, output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::CONST, 0, 8)] };
+    let outside = |t: &VarnodeData| t.space == SpaceId::RAM && !inside.contains(&t.offset) && t.offset < TAIL_STUB_BASE;
+    let mut stubs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for k in 0..instructions.len() {
+        let table = jump_table_dispatch(instructions, k);
+        let insn = &mut instructions[k];
+        for op in insn.ops.iter_mut() {
+            if op.opcode == OpCode::CBranch
+                && let Some(t) = op.inputs.first_mut()
+                && outside(t)
+            {
+                stubs.insert(t.offset);
+                t.offset += TAIL_STUB_BASE;
+            }
+        }
         let Some(pos) = insn.ops.iter().position(|o| {
-            o.opcode == OpCode::Branch
-                && o.inputs.first().is_some_and(|t| t.space == SpaceId::RAM && !inside.contains(&t.offset))
+            (o.opcode == OpCode::Branch && o.inputs.first().is_some_and(outside))
+                || (o.opcode == OpCode::BranchInd && !table)
         }) else {
             continue;
         };
         let seq = insn.ops[pos].seq;
-        insn.ops[pos].opcode = OpCode::Call;
-        insn.ops.insert(
-            pos + 1,
-            PcodeOp { opcode: OpCode::Return, seq, output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::CONST, 0, 8)] },
-        );
+        insn.ops[pos].opcode = if insn.ops[pos].opcode == OpCode::BranchInd { OpCode::CallInd } else { OpCode::Call };
+        insn.ops.insert(pos + 1, ret(seq));
         for (i, op) in insn.ops.iter_mut().enumerate() {
             op.seq.order = i as u32;
         }
     }
+    // the stubs go after the code (their addresses are above it), in address order
+    for t in stubs {
+        let at = TAIL_STUB_BASE + t;
+        let seq = |order| reargo_core::pcode::SeqNum::new(reargo_core::address::Address::new(SpaceId::RAM, at), order);
+        let call = PcodeOp { opcode: OpCode::Call, seq: seq(0), output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::RAM, t, 8)] };
+        let pos = instructions.partition_point(|i| i.address < at);
+        instructions.insert(
+            pos,
+            LiftedInstruction { address: at, length: 1, mnemonic: format!("jmp 0x{t:x}"), ops: vec![call, ret(seq(1))] },
+        );
+    }
+}
+
+/// Is the indirect `jmp` of `instructions[k]` a jump-table dispatch (`jmp [table + i*8]`, or
+/// `movsxd rax, [rcx + rax*4]; add rax, rcx; jmp rax`) rather than a tail call? A scaled
+/// index in the `jmp` or in the instructions right before it marks a table.
+fn jump_table_dispatch(instructions: &[LiftedInstruction], k: usize) -> bool {
+    let scaled = |m: &str| m.contains("*2]") || m.contains("*4]") || m.contains("*8]") || m.contains("*2+") || m.contains("*4+") || m.contains("*8+");
+    let insn = &instructions[k];
+    if !insn.ops.iter().any(|o| o.opcode == reargo_core::pcode::OpCode::BranchInd) {
+        return false;
+    }
+    if scaled(&insn.mnemonic) {
+        return true;
+    }
+    // `jmp [mem]` reads its target from memory: a table only with a scaled index
+    if insn.mnemonic.contains('[') {
+        return false;
+    }
+    instructions[..k].iter().rev().take(6).any(|i| scaled(&i.mnemonic))
 }
 
 /// Second input of a call's `INDIRECT` that marks a clobbered (not returned) register.
@@ -1462,8 +1516,8 @@ mod tests {
         assert!(!c.contains("    uint64_t rdi;"), "{c}");
     }
 
-    /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is an indirect jump on the
-    /// loaded slot, not a silent `goto 0x0`.
+    /// WS78: `jmp [rax+0x18]` (a tail call through a vtable) is a jump on the loaded slot,
+    /// not a silent `goto 0x0`.
     #[test]
     fn indirect_jmp_is_rendered() {
         let lifter = X86Lifter::new_64();
@@ -1473,10 +1527,11 @@ mod tests {
         ];
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
-        let j = c.lines().find(|l| l.contains("goto *")).unwrap_or_else(|| panic!("{c}"));
+        // WS82: printed as the tail call it is, `rax = (*tmp)(rdi); // vfn[3]; return rax;`
+        let j = c.lines().find(|l| l.contains("(*")).unwrap_or_else(|| panic!("{c}"));
         assert!(j.contains("vfn[3]"), "{j}
 {c}");
-        assert!(!c.contains("BRANCHIND"), "{c}");
+        assert!(!c.contains("BRANCHIND") && !c.contains("goto"), "{c}");
     }
 
     /// WS77: a `ret` returns what `rax` holds, not the popped return address.
@@ -2089,6 +2144,55 @@ mod tests {
             assert!(!c.contains(bad), "{c}");
         }
     }
+
+    /// `test edi, edi; jne f` jumps out of the function: a conditional tail call (WS82). The
+    /// CFG used to keep only the fall-through, so the test and the call vanished.
+    #[test]
+    fn conditional_jump_out_is_a_conditional_tail_call() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x85, 0xff, // test edi, edi
+            0x0f, 0x85, 0xf8, 0x0f, 0x00, 0x00, // jne 0x2000
+            0x31, 0xc0, // xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains("edi"), "{c}");
+        assert!(c.contains("0x2000("), "{c}");
+        assert!(c.matches("return").count() >= 2, "{c}");
+        assert!(!c.contains("label_"), "{c}");
+    }
+
+    /// `jmp [rax+0x20]` through a vtable is a tail call (WS82): `return (*f)(rdi);`, not
+    /// `goto *tmp;`.
+    #[test]
+    fn indirect_tail_jump_is_a_call() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x60, 0x20, // jmp qword ptr [rax+0x20]
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("goto"), "{c}");
+        assert!(c.contains("return"), "{c}");
+        assert!(c.contains("(*"), "{c}");
+    }
+
+    /// A jump-table dispatch (`jmp [table + rax*8]`) stays an indirect jump.
+    #[test]
+    fn jump_table_dispatch_is_no_tail_call() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xff, 0x24, 0xc5, 0x00, 0x20, 0x00, 0x00, // jmp qword ptr [rax*8 + 0x2000]
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("goto *"), "{c}");
+    }
+
     /// `dec dword [rdi]; mov ecx, [rdi]; test ecx, ecx; jg`: `test` clears OF, so the `jg`
     /// reads `ecx > 0`, not the `dec`'s overflow flag (WS82, a lifter fix).
     #[test]
