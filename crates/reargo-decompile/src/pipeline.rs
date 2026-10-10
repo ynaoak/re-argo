@@ -447,6 +447,14 @@ pub(crate) fn rewrite_tail_calls(instructions: &mut Vec<LiftedInstruction>) {
                 stubs.insert(t.offset);
                 t.offset += TAIL_STUB_BASE;
             }
+            // a jump table's case out of the function (WS84, `switch::recover_jump_tables`)
+            if op.opcode == OpCode::BranchInd {
+                for t in op.inputs.iter().skip(1) {
+                    if t.space == SpaceId::RAM && t.offset >= TAIL_STUB_BASE {
+                        stubs.insert(t.offset - TAIL_STUB_BASE);
+                    }
+                }
+            }
         }
         let Some(pos) = insn.ops.iter().position(|o| {
             (o.opcode == OpCode::Branch && o.inputs.first().is_some_and(outside))
@@ -2664,6 +2672,86 @@ mod tests {
         assert!(!c.contains("case 2:") && at("default:") < at("return 0;"), "{c}");
         assert!(!c.contains("0x1100") && !c.contains("0x1e"), "the table computation is gone: {c}");
         assert!(r.rust_code.contains("match edi {") && r.rust_code.contains("1 | 3 =>"), "{}", r.rust_code);
+    }
+
+    /// Jump tables beyond `cmp; ja; lea; movsxd; add; jmp` with a separate index register
+    /// (WS84): the window reusing the compared register (`movsxd rsi, [rdi+rsi*4]`, the
+    /// BRANCHIND reads the computed target), a `jbe` to the dispatch with the default falling
+    /// through, a signed `jg`, a byte table choosing the slot, and a case outside the function.
+    #[test]
+    fn jump_table_shapes() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        // jbe to the dispatch, the compared register reused by the window
+        let code: &[u8] = &[
+            0x83, 0xfe, 0x02, // 0x1000 cmp esi, 2
+            0x76, 0x03, // 0x1003 jbe 0x1008
+            0x31, 0xc0, 0xc3, // 0x1005 xor eax, eax; ret (default)
+            0x48, 0x8d, 0x3d, 0xf1, 0x00, 0x00, 0x00, // 0x1008 lea rdi, [0x1100]
+            0x48, 0x63, 0x34, 0xb7, // 0x100f movsxd rsi, [rdi+rsi*4]
+            0x48, 0x01, 0xfe, // 0x1013 add rsi, rdi
+            0xff, 0xe6, // 0x1016 jmp rsi
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1018 case 0: mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101e case 1
+            0xb8, 0x1e, 0x00, 0x00, 0x00, 0xc3, // 0x1024 case 2
+        ];
+        let table: Vec<u8> = [0x1018u64, 0x101e, 0x1024].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (rsi) {") || c.contains("switch (esi) {"), "{c}");
+        assert!(!c.contains("goto *") && !c.contains("tmp_6f00") && !c.contains("0x1100"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        assert!(at("case 0:") < at("return 0xa;") && at("case 2:") < at("return 0x1e;"), "{c}");
+        assert!(at("default:") < at("return 0;"), "{c}");
+
+        // signed bound (`jg`), and case 3 jumps out of the function (0x5000)
+        let code: &[u8] = &[
+            0x83, 0xff, 0x03, // 0x1000 cmp edi, 3
+            0x7f, 0x24, // 0x1003 jg 0x1029
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x00, 0x00, 0x00, // 0x1007 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100e movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1012 add rax, rcx
+            0xff, 0xe0, // 0x1015 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1017 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101d mov eax, 20; ret
+            0xb8, 0x1e, 0x00, 0x00, 0x00, 0xc3, // 0x1023
+            0x31, 0xc0, 0xc3, // 0x1029 xor eax, eax; ret
+        ];
+        let table: Vec<u8> = [0x1017u64, 0x101d, 0x1029, 0x5000].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table), (0x5000, &[0xc3])]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (edi) {") && !c.contains("goto *"), "{c}");
+        assert!(at_least(&c, "case 3:", "0x5000("), "case 3 is a tail call to 0x5000: {c}");
+
+        // a byte table picks the slot: case i -> targets[B[i]]
+        let code: &[u8] = &[
+            0x83, 0xff, 0x03, // 0x1000 cmp edi, 3
+            0x77, 0x29, // 0x1003 ja 0x102e
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x01, 0x00, 0x00, // 0x1007 lea rcx, [0x1200]
+            0x0f, 0xb6, 0x04, 0x01, // 0x100e movzx eax, byte [rcx+rax]
+            0x48, 0x8d, 0x0d, 0xe7, 0x00, 0x00, 0x00, // 0x1012 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x1019 movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x101d add rax, rcx
+            0xff, 0xe0, // 0x1020 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1022 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x1028 mov eax, 20; ret
+            0x31, 0xc0, 0xc3, // 0x102e xor eax, eax; ret
+        ];
+        let table: Vec<u8> = [0x1022u64, 0x1028].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table), (0x1200, &[1, 0, 1, 0])]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (edi) {") && !c.contains("goto *"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        // 0 and 2 -> 20, 1 and 3 -> 10
+        assert!(at("case 1:") < at("case 3:") && at("case 3:") < at("return 0xa;"), "{c}");
+        assert!(at("case 0:") < at("case 2:") && at("case 2:") < at("return 0x14;"), "{c}");
+    }
+
+    /// `needle` occurs after `marker` in `c`.
+    fn at_least(c: &str, marker: &str, needle: &str) -> bool {
+        c.find(marker).is_some_and(|m| c[m..].contains(needle))
     }
 
     /// A `switch` in a loop whose case leaves the loop (WS83): `break` inside the `switch`

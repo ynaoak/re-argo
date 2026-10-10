@@ -19,6 +19,14 @@
 //! index register (`r13d`) and carry the case targets as extra inputs (`RAM` addresses, case
 //! `i` = input `i + 1`). The CFG takes them as the block's successors; the pipeline strips them
 //! before SSA. The table computation then has no reader and dead code elimination drops it.
+//!
+//! WS84 widened the shapes: the bounds check may jump to the dispatch with the default falling
+//! through (`cmp r, N; jbe dispatch`), be signed (`jg` / `jle`, emitted when the index is known
+//! not to be negative), the window may reuse the compared register (`movsxd rsi,
+//! [rdi+rsi*4]`: the index is then copied at the window's start, [`INDEX_TMP`]), a byte /
+//! word table may pick the slot (`movzx eax, byte [B + i]`: case `i` jumps to `T[B[i]]`), and
+//! a target out of the function (a `.cold` part) becomes a tail-call stub like a conditional
+//! jump out of the code.
 
 use rustc_hash::FxHashMap;
 
@@ -40,6 +48,8 @@ pub struct JumpTable {
 const MAX_ENTRIES: u64 = 1024;
 /// Most instructions between the bounds check's jump and the `jmp`.
 const MAX_WINDOW: usize = 8;
+/// The temporary holding a dispatch's index as its window starts.
+pub(crate) const INDEX_TMP: u64 = 0x6f00;
 /// The x86 carry flag's register offset (`CF = a <u b` of a `cmp`).
 const CF_OFFSET: u64 = 0x201;
 
@@ -96,11 +106,12 @@ fn evaluate(insns: &[LiftedInstruction]) -> FxHashMap<Key, E> {
     env
 }
 
-/// `(T, I)` when `addr` is `T + I * scale`.
+/// `(T, I)` when `addr` is `T + I * scale` (`T + I` for a byte table).
 fn table_slot(addr: &E, scale: u64) -> Option<(u64, &E)> {
     let E::Add(a, b) = addr else { return None };
     match (&**a, &**b) {
         (E::Const(t), E::Mul(i, s)) | (E::Mul(i, s), E::Const(t)) if *s == scale => Some((*t, i)),
+        (E::Const(t), i) | (i, E::Const(t)) if scale == 1 && !matches!(i, E::Const(_)) => Some((*t, i)),
         _ => None,
     }
 }
@@ -127,6 +138,18 @@ fn dispatch(target: &E) -> Option<(u64, bool, &E)> {
     }
 }
 
+/// The index of a two-level table (WS84): `movzx eax, byte [T1 + i]` picks the slot of the
+/// target table, so case `i` jumps to `targets[T1[i]]`. `(T1, entry size, i)`.
+fn index_table(index: &E) -> Option<(u64, u32, &E)> {
+    let mut x = index;
+    while let E::Ext(inner) = x {
+        x = inner;
+    }
+    let E::Load(addr, sz @ (1 | 2)) = x else { return None };
+    let (t1, i) = table_slot(addr, u64::from(*sz))?;
+    Some((t1, *sz, i))
+}
+
 fn has(insn: &LiftedInstruction, opcode: OpCode) -> bool {
     insn.ops.iter().any(|o| o.opcode == opcode)
 }
@@ -140,9 +163,33 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     let addrs: rustc_hash::FxHashSet<u64> = insns.iter().map(|i| i.address).collect();
     for k in 0..insns.len() {
         let Some(found) = recover_one(insns, k, &addrs, memory) else { continue };
-        let (index, table) = found;
+        let (index, start, table) = found;
+        // the index as the window starts, when the window reuses its register (WS84: `movsxd
+        // rax, [rcx+rax*4]`; the BRANCHIND reads at the window's end)
+        let reused = insns[start..=k].iter().flat_map(|i| i.ops.iter()).any(|o| o.output.is_some_and(|w| overlaps(&index, &w)));
+        if !reused {
+            let op = insns[k].ops.iter_mut().find(|o| o.opcode == OpCode::BranchInd).expect("checked");
+            op.inputs = std::iter::once(index)
+                .chain(table.targets.iter().map(|&t| VarnodeData::new(SpaceId::RAM, t, 8)))
+                .collect();
+            out.push(table);
+            continue;
+        }
+        let at_start = VarnodeData::new(SpaceId::UNIQUE, INDEX_TMP, index.size);
+        let first = &mut insns[start].ops;
+        let seq = first.first().map(|o| o.seq).unwrap_or(reargo_core::pcode::SeqNum::new(
+            reargo_core::address::Address::new(SpaceId::RAM, insns[start].address),
+            0,
+        ));
+        first.insert(
+            0,
+            reargo_core::pcode::PcodeOp { opcode: OpCode::Copy, seq, output: Some(at_start), inputs: smallvec::smallvec![index] },
+        );
+        for (i, op) in first.iter_mut().enumerate() {
+            op.seq.order = i as u32;
+        }
         let op = insns[k].ops.iter_mut().find(|o| o.opcode == OpCode::BranchInd).expect("checked");
-        op.inputs = std::iter::once(index)
+        op.inputs = std::iter::once(at_start)
             .chain(table.targets.iter().map(|&t| VarnodeData::new(SpaceId::RAM, t, 8)))
             .collect();
         out.push(table);
@@ -150,49 +197,85 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     out
 }
 
+/// The bounds check before a dispatch, as the mnemonic of its conditional jump says it:
+/// `(cases for "cmp r, N", jumps to the dispatch)`. `ja`/`jae` (`jg`/`jge`) jump to the
+/// default and fall into the dispatch; `jbe`/`jb` (`jle`/`jl`) jump to the dispatch and fall
+/// into the default (WS84). A signed check is one the compiler emits when the index is known
+/// not to be negative.
+fn bounds_kind(mnemonic: &str) -> Option<(fn(u64) -> Option<u64>, bool)> {
+    let plus1: fn(u64) -> Option<u64> = |n| n.checked_add(1);
+    let same: fn(u64) -> Option<u64> = Some;
+    Some(match mnemonic.split_whitespace().next()? {
+        "ja" | "jnbe" | "jg" | "jnle" => (plus1, false),
+        "jae" | "jnb" | "jnc" | "jge" | "jnl" => (same, false),
+        "jbe" | "jna" | "jle" | "jng" => (plus1, true),
+        "jb" | "jnae" | "jc" | "jl" | "jnge" => (same, true),
+        _ => return None,
+    })
+}
+
+fn cbranch_target(insn: &LiftedInstruction) -> Option<u64> {
+    insn.ops.iter().find(|o| o.opcode == OpCode::CBranch)?.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset)
+}
+
 fn recover_one(
     insns: &[LiftedInstruction],
     k: usize,
     addrs: &rustc_hash::FxHashSet<u64>,
     memory: &Memory,
-) -> Option<(VarnodeData, JumpTable)> {
+) -> Option<(VarnodeData, usize, JumpTable)> {
     let jmp = &insns[k];
     let target_vn = *jmp.ops.iter().find(|o| o.opcode == OpCode::BranchInd)?.inputs.first()?;
-    // the straight-line run from the bounds check's jump to the `jmp`
+    // the straight-line run before the `jmp`: from the bounds check's fall-through, or from
+    // the target of a jump to the dispatch (after an unconditional jump / return / call)
     let mut start = k;
     while start > 0 && k - start < MAX_WINDOW {
         let p = &insns[start - 1];
-        if has(p, OpCode::CBranch) {
+        let control = [OpCode::CBranch, OpCode::Branch, OpCode::Return, OpCode::Call, OpCode::CallInd, OpCode::BranchInd]
+            .iter()
+            .any(|&o| has(p, o));
+        if control || p.address + p.length as u64 != insns[start].address {
             break;
         }
-        if has(p, OpCode::Branch) || has(p, OpCode::Return) || has(p, OpCode::Call) || has(p, OpCode::CallInd) || has(p, OpCode::BranchInd) {
-            return None;
-        }
         start -= 1;
-    }
-    let jcc = start.checked_sub(1).map(|j| &insns[j])?;
-    if !has(jcc, OpCode::CBranch) || jcc.address + jcc.length as u64 != insns[start].address {
-        return None;
     }
     // the window, the `jmp` included (`jmp [table+rax*8]` loads in the instruction itself)
     let env = evaluate(&insns[start..=k]);
     let target = env.get(&key(&target_vn)).cloned().unwrap_or(E::Reg(target_vn));
     let (table, relative, index) = dispatch(&target)?;
+    let (index, level1) = match index_table(index) {
+        Some((t1, sz, i)) => (i, Some((t1, sz))),
+        None => (index, None),
+    };
     let mut index = index;
     while let E::Ext(x) = index {
         index = x;
     }
     let E::Reg(r) = index else { return None };
     let r = *r;
-    // the bounds check: `cmp r, N` (CF = r <u N) then `ja` (N + 1 cases) / `jae` (N)
+    // the bounds check: `cmp r, N` and a conditional jump into the window (falling into it, or
+    // jumping to its start)
+    let at = insns[start].address;
+    let falls = start.checked_sub(1).filter(|&j| {
+        has(&insns[j], OpCode::CBranch)
+            && insns[j].address + insns[j].length as u64 == at
+            && bounds_kind(&insns[j].mnemonic).is_some_and(|(_, to)| !to)
+    });
+    let jumps = || {
+        insns.iter().position(|i| {
+            cbranch_target(i) == Some(at) && bounds_kind(&i.mnemonic).is_some_and(|(_, to)| to)
+        })
+    };
+    let j = falls.or_else(jumps)?;
+    let jcc = &insns[j];
+    let (count, to_dispatch) = bounds_kind(&jcc.mnemonic)?;
+    let default = if to_dispatch {
+        Some(jcc.address + jcc.length as u64)
+    } else {
+        cbranch_target(jcc)
+    };
     let cases = {
-        let ja = match jcc.mnemonic.split_whitespace().next()? {
-            "ja" | "jnbe" => true,
-            "jae" | "jnb" | "jnc" => false,
-            _ => return None,
-        };
-        let j = start - 1;
-        let cmp = (j.saturating_sub(3)..=j).rev().find_map(|c| {
+        let cmp = (j.saturating_sub(3)..j).rev().find_map(|c| {
             insns[c].ops.iter().find_map(|o| {
                 let out = o.output?;
                 (o.opcode == OpCode::IntLess && out.space == SpaceId::REGISTER && out.offset == CF_OFFSET && o.inputs.len() == 2)
@@ -203,32 +286,49 @@ fn recover_one(
         if n.space != SpaceId::CONST || x.space != r.space || x.offset != r.offset {
             return None;
         }
-        // the compared register keeps its value up to the `jmp`
-        let written = insns[c + 1..k].iter().flat_map(|i| i.ops.iter()).any(|o| o.output.is_some_and(|w| overlaps(&r, &w)));
+        // the compared register keeps its value up to the window, whose evaluation reads it
+        // (the window itself may reuse it: `movsxd rsi, [rdi+rsi*4]`)
+        let written = insns[c + 1..=j].iter().flat_map(|i| i.ops.iter()).any(|o| o.output.is_some_and(|w| overlaps(&r, &w)));
         if written {
             return None;
         }
-        if ja { n.offset.checked_add(1)? } else { n.offset }
+        count(n.offset)?
     };
     if cases == 0 || cases > MAX_ENTRIES {
         return None;
     }
-    let default = jcc.ops.iter().find(|o| o.opcode == OpCode::CBranch)?.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset);
-    let mut targets = Vec::with_capacity(cases as usize);
-    for i in 0..cases {
-        let t = if relative {
-            let e = memory.read_u32(table + 4 * i).ok()? as i32 as i64;
+    let read = |slot: u64| -> Option<u64> {
+        Some(if relative {
+            let e = memory.read_u32(table + 4 * slot).ok()? as i32 as i64;
             table.wrapping_add(e as u64)
         } else {
-            memory.read_u64(table + 8 * i).ok()?
+            memory.read_u64(table + 8 * slot).ok()?
+        })
+    };
+    // a target outside the function (a `.cold` part) jumps out: a tail-call stub, as a
+    // conditional jump out of the code is (`pipeline::rewrite_tail_calls`); it must be code
+    let executable = |t: u64| memory.find_block(t).is_some_and(|b| b.flags.contains(reargo_loader::memory::MemoryFlags::EXECUTE));
+    let mut targets = Vec::with_capacity(cases as usize);
+    for i in 0..cases {
+        let slot = match level1 {
+            Some((t1, 1)) => u64::from(memory.read_byte(t1 + i)?),
+            Some((t1, _)) => u64::from(memory.read_u16(t1 + 2 * i).ok()?),
+            None => i,
         };
-        if !addrs.contains(&t) {
+        if slot > MAX_ENTRIES {
             return None;
         }
-        targets.push(t);
+        let t = read(slot)?;
+        if addrs.contains(&t) {
+            targets.push(t);
+        } else if executable(t) {
+            targets.push(crate::pipeline::TAIL_STUB_BASE + t);
+        } else {
+            return None;
+        }
     }
     if default.is_some_and(|d| !addrs.contains(&d)) {
         return None;
     }
-    Some((r, JumpTable { jmp: jmp.address, targets, default }))
+    Some((r, start, JumpTable { jmp: jmp.address, targets, default }))
 }

@@ -484,6 +484,10 @@ impl<'a> CEmitter<'a> {
             OpCode::MultiEqual => None,
             OpCode::Copy => {
                 let dst = out_name?;
+                // the copy of a jump table's index the `switch` prints by its register (WS84)
+                if is_switch_index_copy(func, op) {
+                    return None;
+                }
                 let src = self.input_expr(func, op, 0);
                 Some(format!("{} = {};", dst, src))
             }
@@ -1056,13 +1060,16 @@ impl<'a> CEmitter<'a> {
             .unwrap_or_else(|| crate::condition::Folded::plain(self.get_branch_condition(func, block_id)))
     }
 
-    /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83).
+    /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83), or the
+    /// register the index was copied from when that still holds it (WS84).
     fn switch_index(&self, func: &SsaFunction, block_id: usize) -> String {
-        func.ops
-            .iter()
-            .rev()
-            .find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd)
-            .map_or_else(|| "cond".into(), |op| self.input_expr(func, op, 0))
+        let Some(op) = func.ops.iter().rev().find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd) else {
+            return "cond".into();
+        };
+        match switch_index_source(func, op) {
+            Some(src) => varnode_name(&func.varnodes[src as usize]),
+            None => self.input_expr(func, op, 0),
+        }
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
@@ -1111,6 +1118,45 @@ impl<'a> CEmitter<'a> {
     }
 }
 
+
+/// The register a jump table's index was copied from at the dispatch window's start
+/// (`switch::INDEX_TMP`), when no live op between the copy and the `BRANCHIND` writes it — the
+/// window's table computation is dead once the dispatch reads the copy (WS84).
+fn switch_index_source(func: &SsaFunction, br: &crate::ssa::SsaOp) -> Option<crate::ssa::VarId> {
+    let v = *br.inputs.first()?;
+    let d = func.varnodes[v as usize].data;
+    if d.space != SpaceId::UNIQUE || d.offset != crate::switch::INDEX_TMP {
+        return None;
+    }
+    let c = func.varnodes[v as usize].def_op?;
+    let copy = &func.ops[c];
+    if copy.dead || copy.opcode != OpCode::Copy || c >= br.index {
+        return None;
+    }
+    let src = *copy.inputs.first()?;
+    let sd = func.varnodes[src as usize].data;
+    let overwritten = func.ops[c + 1..br.index].iter().any(|o| {
+        !o.dead
+            && o.output.is_some_and(|w| {
+                let w = func.varnodes[w as usize].data;
+                w.space == sd.space && w.offset < sd.offset + sd.size as u64 && sd.offset < w.offset + w.size as u64
+            })
+    });
+    (!overwritten).then_some(src)
+}
+
+/// Is `op` the index copy [`switch_index_source`] prints through?
+fn is_switch_index_copy(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    let Some(v) = op.output else { return false };
+    let d = func.varnodes[v as usize].data;
+    if d.space != SpaceId::UNIQUE || d.offset != crate::switch::INDEX_TMP {
+        return false;
+    }
+    let readers: Vec<&crate::ssa::SsaOp> =
+        func.varnodes[v as usize].uses.iter().map(|&u| &func.ops[u]).filter(|o| !o.dead && o.inputs.contains(&v)).collect();
+    !readers.is_empty()
+        && readers.iter().all(|r| r.opcode == OpCode::BranchInd && r.inputs.first() == Some(&v) && switch_index_source(func, r).is_some())
+}
 
 /// How a `PIECE` that rebuilds a register after a write to its low view prints (WS84).
 enum ViewMerge {
