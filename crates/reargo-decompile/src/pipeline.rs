@@ -2387,4 +2387,25 @@ mod tests {
         let call = c.lines().find(|l| l.contains("pthread_cond_destroy@plt(")).unwrap_or_else(|| panic!("{c}"));
         assert!(call.contains("(rdi)"), "{c}");
     }
+
+    /// `dec ebx; jne L` in a loop (WS83, BDS 0xc226df0): `ebx`'s new value is printed as the
+    /// statement `ebx = ebx - 1;`, so the condition must test it (`ebx != 0`), not the flags'
+    /// `old - 1 == 0` folded to `ebx == 1` with `ebx` already decremented.
+    #[test]
+    fn dec_in_a_loop_tests_the_new_value() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xfb, // 0x1000 mov ebx, edi
+            0x31, 0xc0, // 0x1002 xor eax, eax
+            0x01, 0xd8, // 0x1004 L: add eax, ebx
+            0xff, 0xcb, // 0x1006 dec ebx
+            0x75, 0xfa, // 0x1008 jne L
+            0xc3, // 0x100a ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("ebx = ebx - 1;"), "{c}");
+        assert!(!c.contains("ebx == 1") && !c.contains("ebx != 1"), "{c}");
+        assert!(c.contains("ebx != 0") || c.contains("ebx == 0"), "{c}");
+    }
 }
