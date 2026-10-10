@@ -1530,6 +1530,135 @@ fn size_to_signed_type(size: u32) -> &'static str {
     }
 }
 
+/// The comparisons to print inside the select (`cmovcc`, WS83) that reads them, as
+/// `(op, text)`: `edi = (int32_t)edi < (int32_t)esi ? esi : edi;` rather than a flag variable
+/// set the line before. Only a comparison in the select's block whose result nothing else
+/// reads, with no write over its operands between it and the select (the C output names the
+/// operands by register, so they must still hold their values there).
+pub(crate) fn select_conditions(
+    func: &SsaFunction,
+    folded: &rustc_hash::FxHashSet<usize>,
+    emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
+) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
+        return out;
+    }
+    let readers = crate::condition::Readers::new(func);
+    for (s, op) in func.ops.iter().enumerate() {
+        if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
+            continue;
+        }
+        let c = op.inputs[0];
+        let Some(d) = func.varnodes[c as usize].def_op else { continue };
+        let cmp = &func.ops[d];
+        let comparison = matches!(
+            cmp.opcode,
+            OpCode::IntEqual
+                | OpCode::IntNotEqual
+                | OpCode::IntLess
+                | OpCode::IntLessEqual
+                | OpCode::IntSLess
+                | OpCode::IntSLessEqual
+                | OpCode::FloatEqual
+                | OpCode::FloatNotEqual
+                | OpCode::FloatLess
+                | OpCode::FloatLessEqual
+        );
+        if cmp.dead || !comparison || cmp.block != op.block || d >= s || folded.contains(&d) || readers.of(func, c) != [s] {
+            continue;
+        }
+        let operand_overwritten = func.ops[d + 1..s].iter().any(|o| {
+            !o.dead
+                && o.output.is_some_and(|w| {
+                    let w = &func.varnodes[w as usize].data;
+                    cmp.inputs.iter().any(|&x| {
+                        let x = &func.varnodes[x as usize].data;
+                        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
+                    })
+                })
+        });
+        if operand_overwritten {
+            continue;
+        }
+        let Some(out_v) = cmp.output else { continue };
+        let prefix = format!("{} = ", varnode_name(&func.varnodes[out_v as usize]));
+        if let Some(rhs) = emit(cmp).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
+            out.push((d, rhs));
+        }
+    }
+    out
+}
+
+/// A `case` value: decimal, hex from 0x100 on.
+pub(crate) fn case_label(v: u64) -> String {
+    if v < 0x100 { v.to_string() } else { format!("0x{v:x}") }
+}
+
+/// An op whose operands are floats (arithmetic and comparisons, not conversions from an
+/// integer).
+fn is_float_op(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::FloatEqual
+            | OpCode::FloatNotEqual
+            | OpCode::FloatLess
+            | OpCode::FloatLessEqual
+            | OpCode::FloatAdd
+            | OpCode::FloatSub
+            | OpCode::FloatMult
+            | OpCode::FloatDiv
+            | OpCode::FloatNeg
+            | OpCode::FloatAbs
+            | OpCode::FloatSqrt
+            | OpCode::FloatNan
+            | OpCode::FloatFloat2Float
+            | OpCode::FloatTrunc
+            | OpCode::FloatCeil
+            | OpCode::FloatFloor
+            | OpCode::FloatRound
+    )
+}
+
+/// The C literal of the float whose bits are `bits` (`size` 4 = `float`, 8 = `double`).
+pub(crate) fn float_literal(bits: u64, size: u32) -> Option<String> {
+    let (mut t, suffix) = match size {
+        4 => {
+            let v = f32::from_bits(bits as u32);
+            (v.is_finite().then(|| format!("{v:?}"))?, "f")
+        }
+        8 => {
+            let v = f64::from_bits(bits);
+            (v.is_finite().then(|| format!("{v:?}"))?, "")
+        }
+        _ => return None,
+    };
+    if !t.contains(['.', 'e']) {
+        t.push_str(".0");
+    }
+    Some(format!("{t}{suffix}"))
+}
+
+/// `k` when `v` is the constant `-k` of its width, `k` small (below 2^31): an addition of it
+/// reads as a subtraction.
+fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u64> {
+    if v.space != SpaceId::CONST || v.size == 0 || v.size > 8 {
+        return None;
+    }
+    let bits = v.size * 8;
+    let x = if bits == 64 { v.offset } else { v.offset & ((1u64 << bits) - 1) };
+    if x >> (bits - 1) & 1 == 0 {
+        return None;
+    }
+    let k = if bits == 64 { x.wrapping_neg() } else { (1u64 << bits) - x };
+    (k != 0 && k < 1 << 31 && bits > 8).then_some(k)
+}
+
+/// A constant as the C output prints it: decimal below 10, else hex.
+fn small_hex(k: u64) -> String {
+    if k < 10 { k.to_string() } else { format!("0x{k:x}") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,133 +1851,4 @@ mod tests {
         assert!(output.contains("(int32_t)") && output.contains(">> 3"),
             "ASR must cast LHS to int32_t and use >>:\n{}", output);
     }
-}
-
-/// The comparisons to print inside the select (`cmovcc`, WS83) that reads them, as
-/// `(op, text)`: `edi = (int32_t)edi < (int32_t)esi ? esi : edi;` rather than a flag variable
-/// set the line before. Only a comparison in the select's block whose result nothing else
-/// reads, with no write over its operands between it and the select (the C output names the
-/// operands by register, so they must still hold their values there).
-pub(crate) fn select_conditions(
-    func: &SsaFunction,
-    folded: &rustc_hash::FxHashSet<usize>,
-    emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
-) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
-        return out;
-    }
-    let readers = crate::condition::Readers::new(func);
-    for (s, op) in func.ops.iter().enumerate() {
-        if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
-            continue;
-        }
-        let c = op.inputs[0];
-        let Some(d) = func.varnodes[c as usize].def_op else { continue };
-        let cmp = &func.ops[d];
-        let comparison = matches!(
-            cmp.opcode,
-            OpCode::IntEqual
-                | OpCode::IntNotEqual
-                | OpCode::IntLess
-                | OpCode::IntLessEqual
-                | OpCode::IntSLess
-                | OpCode::IntSLessEqual
-                | OpCode::FloatEqual
-                | OpCode::FloatNotEqual
-                | OpCode::FloatLess
-                | OpCode::FloatLessEqual
-        );
-        if cmp.dead || !comparison || cmp.block != op.block || d >= s || folded.contains(&d) || readers.of(func, c) != [s] {
-            continue;
-        }
-        let operand_overwritten = func.ops[d + 1..s].iter().any(|o| {
-            !o.dead
-                && o.output.is_some_and(|w| {
-                    let w = &func.varnodes[w as usize].data;
-                    cmp.inputs.iter().any(|&x| {
-                        let x = &func.varnodes[x as usize].data;
-                        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
-                    })
-                })
-        });
-        if operand_overwritten {
-            continue;
-        }
-        let Some(out_v) = cmp.output else { continue };
-        let prefix = format!("{} = ", varnode_name(&func.varnodes[out_v as usize]));
-        if let Some(rhs) = emit(cmp).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
-            out.push((d, rhs));
-        }
-    }
-    out
-}
-
-/// A `case` value: decimal, hex from 0x100 on.
-pub(crate) fn case_label(v: u64) -> String {
-    if v < 0x100 { v.to_string() } else { format!("0x{v:x}") }
-}
-
-/// An op whose operands are floats (arithmetic and comparisons, not conversions from an
-/// integer).
-fn is_float_op(op: OpCode) -> bool {
-    matches!(
-        op,
-        OpCode::FloatEqual
-            | OpCode::FloatNotEqual
-            | OpCode::FloatLess
-            | OpCode::FloatLessEqual
-            | OpCode::FloatAdd
-            | OpCode::FloatSub
-            | OpCode::FloatMult
-            | OpCode::FloatDiv
-            | OpCode::FloatNeg
-            | OpCode::FloatAbs
-            | OpCode::FloatSqrt
-            | OpCode::FloatNan
-            | OpCode::FloatFloat2Float
-            | OpCode::FloatTrunc
-            | OpCode::FloatCeil
-            | OpCode::FloatFloor
-            | OpCode::FloatRound
-    )
-}
-
-/// The C literal of the float whose bits are `bits` (`size` 4 = `float`, 8 = `double`).
-pub(crate) fn float_literal(bits: u64, size: u32) -> Option<String> {
-    let (mut t, suffix) = match size {
-        4 => {
-            let v = f32::from_bits(bits as u32);
-            (v.is_finite().then(|| format!("{v:?}"))?, "f")
-        }
-        8 => {
-            let v = f64::from_bits(bits);
-            (v.is_finite().then(|| format!("{v:?}"))?, "")
-        }
-        _ => return None,
-    };
-    if !t.contains(['.', 'e']) {
-        t.push_str(".0");
-    }
-    Some(format!("{t}{suffix}"))
-}
-
-/// `k` when `v` is the constant `-k` of its width, `k` small (below 2^31): an addition of it
-/// reads as a subtraction.
-fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u64> {
-    if v.space != SpaceId::CONST || v.size == 0 || v.size > 8 {
-        return None;
-    }
-    let bits = v.size * 8;
-    let x = if bits == 64 { v.offset } else { v.offset & ((1u64 << bits) - 1) };
-    if x >> (bits - 1) & 1 == 0 {
-        return None;
-    }
-    let k = if bits == 64 { x.wrapping_neg() } else { (1u64 << bits) - x };
-    (k != 0 && k < 1 << 31 && bits > 8).then_some(k)
-}
-
-/// A constant as the C output prints it: decimal below 10, else hex.
-fn small_hex(k: u64) -> String {
-    if k < 10 { k.to_string() } else { format!("0x{k:x}") }
 }
