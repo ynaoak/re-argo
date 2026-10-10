@@ -763,8 +763,17 @@ impl<'a> CEmitter<'a> {
             OpCode::Select if op.inputs.len() == 3 => {
                 let dst = out_name?;
                 let c = self.input_expr(func, op, 0);
-                let a = self.input_expr(func, op, 1);
-                let b = self.input_expr(func, op, 2);
+                // a constant arm of an XMM select (`maxss`, WS84) is a float: `0.0f`, not `0`
+                let out = func.varnodes[op.output.unwrap() as usize].data;
+                let arm = |i: usize| {
+                    let v = func.varnodes[op.inputs[i] as usize].data;
+                    let xmm = out.space == SpaceId::REGISTER && (0x1200..0x1300).contains(&out.offset);
+                    match (xmm && v.space == SpaceId::CONST).then(|| float_literal(v.offset, out.size)).flatten() {
+                        Some(f) => f,
+                        None => self.input_expr(func, op, i),
+                    }
+                };
+                let (a, b) = (arm(1), arm(2));
                 Some(format!("{} = {} ? {} : {};", dst, c, a, b))
             }
             OpCode::IntZExt => {
@@ -781,6 +790,24 @@ impl<'a> CEmitter<'a> {
                 // lifter uses it to merge a scalar SSE result into the full
                 // XMM register). Previously the opaque `PIECE(...)`.
                 let dst = out_name?;
+                // a write to a register's low view (WS84): `al = x` / `xmm0_d = x`
+                match view_merge(func, op) {
+                    Some(ViewMerge::Keep { view }) => {
+                        let lo = self.input_expr(func, op, 1);
+                        return (lo != view).then(|| format!("{view} = {lo};"));
+                    }
+                    Some(ViewMerge::Const(c)) => {
+                        let lo = self.input_expr(func, op, 1);
+                        let ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                        let shifted = c << (8 * func.varnodes[op.inputs[1] as usize].data.size);
+                        return Some(if c == 0 {
+                            format!("{dst} = ({ty}){lo};")
+                        } else {
+                            format!("{dst} = 0x{shifted:x} | ({ty}){lo};")
+                        });
+                    }
+                    None => {}
+                }
                 let hi = self.input_expr(func, op, 0);
                 let lo = self.input_expr(func, op, 1);
                 let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
@@ -791,6 +818,10 @@ impl<'a> CEmitter<'a> {
                 // truncating cast (e.g. `ecx = (uint32_t)rcx` after a 64-bit
                 // write). Previously printed as the opaque `SUBPIECE(...)`.
                 let dst = out_name?;
+                // the kept upper bytes of a view write, read only by the merge (WS84)
+                if kept_upper_only(func, op) {
+                    return None;
+                }
                 let a = self.input_expr(func, op, 0);
                 let k = &func.varnodes[op.inputs[1] as usize].data;
                 let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
@@ -1080,6 +1111,60 @@ impl<'a> CEmitter<'a> {
     }
 }
 
+
+/// How a `PIECE` that rebuilds a register after a write to its low view prints (WS84).
+enum ViewMerge {
+    /// `R = PIECE(SUBPIECE(R, n), lo)`: the upper bytes are kept, it is the write `view = lo`
+    Keep { view: String },
+    /// `R = PIECE(c, lo)` with the upper bytes a known constant
+    Const(u64),
+}
+
+/// The lifter rebuilds a register after a write to its low byte / word (`mov al, 1` ->
+/// `rax = PIECE(SUBPIECE(rax, 1), al)`) and an XMM register after a scalar write. Printed as
+/// is that was `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`; it is the write of
+/// the view, which the register names already alias.
+fn view_merge(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<ViewMerge> {
+    let out = func.varnodes[op.output? as usize].data;
+    let (hi, lo) = (*op.inputs.first()?, *op.inputs.get(1)?);
+    let (hi_d, lo_d) = (func.varnodes[hi as usize].data, func.varnodes[lo as usize].data);
+    if out.space != SpaceId::REGISTER || lo_d.size >= out.size {
+        return None;
+    }
+    if hi_d.space == SpaceId::CONST {
+        return Some(ViewMerge::Const(hi_d.offset));
+    }
+    if !is_kept_upper(func, hi, out, lo_d.size) {
+        return None;
+    }
+    Some(ViewMerge::Keep { view: reg_name(out.offset, lo_d.size) })
+}
+
+/// Is `hi` the upper bytes of the register `out` itself, `SUBPIECE(out, n)`?
+fn is_kept_upper(func: &SsaFunction, hi: crate::ssa::VarId, out: reargo_core::pcode::VarnodeData, n: u32) -> bool {
+    let Some(d) = func.varnodes[hi as usize].def_op else { return false };
+    let sub = &func.ops[d];
+    if sub.dead || sub.opcode != OpCode::Subpiece || sub.inputs.len() != 2 {
+        return false;
+    }
+    let (x, k) = (func.varnodes[sub.inputs[0] as usize].data, func.varnodes[sub.inputs[1] as usize].data);
+    x.space == SpaceId::REGISTER && x.offset == out.offset && x.size == out.size && k.space == SpaceId::CONST && k.offset == u64::from(n)
+}
+
+/// Is `op` (a SUBPIECE) the kept upper bytes of view writes only, so it needs no statement?
+fn kept_upper_only(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    let Some(v) = op.output else { return false };
+    let readers: Vec<&crate::ssa::SsaOp> = func.varnodes[v as usize]
+        .uses
+        .iter()
+        .map(|&u| &func.ops[u])
+        .filter(|o| !o.dead && o.inputs.contains(&v))
+        .collect();
+    !readers.is_empty()
+        && readers.iter().all(|r| {
+            r.opcode == OpCode::Piece && r.inputs.first() == Some(&v) && matches!(view_merge(func, r), Some(ViewMerge::Keep { .. }))
+        })
+}
 
 /// The register a call's result is used in, when exactly one of the return registers the
 /// call defines (its non-clobber `INDIRECT`s, right after it) is still live (WS79): the

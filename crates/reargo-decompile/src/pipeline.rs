@@ -2486,6 +2486,14 @@ mod tests {
         assert!(!c.contains("__unmodeled_insn"), "{c}");
         assert!(c.contains("(xmm1_d < xmm0_d) ? xmm0_d : xmm1_d"), "{c}");
         assert!(c.contains("(xmm0_d < xmm2_d) ? xmm0_d : xmm2_d"), "{c}");
+        // max(x, 0): the constant arm is a float
+        let code = [
+            0x0f, 0x57, 0xc0, // xorps xmm0, xmm0
+            0xf3, 0x0f, 0x5f, 0xc1, // maxss xmm0, xmm1
+            0xc3, // ret
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("? 0.0f : xmm1_d") || c.contains("? xmm1_d : 0.0f"), "{c}");
     }
 
     /// `ucomiss a, b; ja` is `a > b` — false for a NaN, like the CPU (WS84: printed
@@ -2506,6 +2514,30 @@ mod tests {
             let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
             assert!(c.contains(want), "{jcc:#x} {want}: {c}");
         }
+    }
+
+    /// A write to a register's low byte prints as that write (WS84: it printed the lifter's
+    /// rebuild `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`).
+    #[test]
+    fn low_byte_write_prints_as_the_view() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0x48, 0x39, 0xf0, // cmp rax, rsi
+            0x0f, 0x94, 0xc0, // sete al
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0xb0, 0x01, // mov al, 1
+            0x48, 0x89, 0x01, // mov [rcx], rax
+            0x31, 0xc0, // xor eax, eax
+            0x40, 0x88, 0xf0, // mov al, sil
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("CONCAT"), "{c}");
+        assert!(!c.contains("(void)"), "{c}");
+        assert!(c.contains("al = 1;"), "{c}");
+        assert!(c.contains("rax = (uint64_t)al;"), "{c}");
     }
 
     /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
