@@ -70,7 +70,9 @@ pub struct CEmitter<'a> {
     folded: rustc_hash::FxHashSet<usize>,
     /// The condition of a select (`cmovcc`) folded into it (WS83): the comparison's text, by
     /// the value it computes. Its op is in `folded`.
-    select_conds: rustc_hash::FxHashMap<crate::condition::ValueKey, String>,
+    /// a select's folded condition, by the select op (WS84: by op, not by value — two selects
+    /// on one flag can see its operands in different states)
+    select_conds: rustc_hash::FxHashMap<usize, String>,
 }
 
 impl Default for CEmitter<'static> {
@@ -178,12 +180,9 @@ impl<'a> CEmitter<'a> {
             .flat_map(|(ops, _)| ops)
             .collect();
         self.select_conds.clear();
-        for (d, text) in select_conditions(func, &self.folded, &|op| self.emit_op(func, op)) {
-            self.folded.insert(d);
-            if let Some(out) = func.ops[d].output {
-                self.select_conds.insert(crate::condition::value_key(func, out), text);
-            }
-        }
+        let (conds, hidden) = select_conditions(func, &self.inliner, &|op| self.emit_op(func, op));
+        self.folded.extend(hidden);
+        self.select_conds = conds;
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -1020,8 +1019,9 @@ impl<'a> CEmitter<'a> {
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
         }
-        if !self.select_conds.is_empty()
-            && let Some(e) = self.select_conds.get(&crate::condition::value_key(func, op.inputs[idx]))
+        if idx == 0
+            && op.opcode == OpCode::Select
+            && let Some(e) = self.select_conds.get(&op.index)
         {
             return if crate::condition::is_atomic(e) { e.clone() } else { format!("({e})") };
         }
@@ -1626,64 +1626,136 @@ fn size_to_signed_type(size: u32) -> &'static str {
     }
 }
 
-/// The comparisons to print inside the select (`cmovcc`, WS83) that reads them, as
-/// `(op, text)`: `edi = (int32_t)edi < (int32_t)esi ? esi : edi;` rather than a flag variable
-/// set the line before. Only a comparison in the select's block whose result nothing else
-/// reads, with no write over its operands between it and the select (the C output names the
-/// operands by register, so they must still hold their values there).
+/// Add to `chain` the ops defining `v` that fold into a condition read at op `s`: temporaries
+/// and flags of the block (not loads or calls, which stay named), each kept only when what it
+/// reads keeps its value up to `s`. False when `v` itself does not fold (it is then printed by
+/// name, which the caller checks is still valid). The values the folded text names are added
+/// to `leaves` (their definitions must stay printed).
+#[allow(clippy::too_many_arguments)]
+fn fold_chain(
+    func: &SsaFunction,
+    v: crate::ssa::VarId,
+    s: usize,
+    block: usize,
+    temp: &dyn Fn(crate::ssa::VarId) -> bool,
+    unchanged: &dyn Fn(crate::ssa::VarId, usize, usize) -> bool,
+    chain: &mut Vec<usize>,
+    leaves: &mut Vec<crate::ssa::VarId>,
+    depth: u32,
+) -> bool {
+    let Some(d) = func.varnodes[v as usize].def_op else { return false };
+    if chain.contains(&d) {
+        return true;
+    }
+    let dop = &func.ops[d];
+    if depth > 6
+        || dop.dead
+        || dop.block != block
+        || d >= s
+        || !temp(v)
+        || matches!(dop.opcode, OpCode::Load | OpCode::Call | OpCode::CallInd | OpCode::CallOther | OpCode::MultiEqual | OpCode::Indirect)
+    {
+        return false;
+    }
+    let mark = chain.len();
+    chain.push(d);
+    for &x in &dop.inputs {
+        if func.varnodes[x as usize].data.space == SpaceId::CONST {
+            continue;
+        }
+        let folds = temp(x) && fold_chain(func, x, s, block, temp, unchanged, chain, leaves, depth + 1);
+        // a value printed by name must still hold it at the select
+        if !folds && !unchanged(x, d, s) {
+            chain.truncate(mark);
+            return false;
+        }
+        if !folds {
+            leaves.push(x);
+        }
+    }
+    true
+}
+
+/// The conditions of `cmov` selects (WS83, generalised in WS84): the select's condition with
+/// its definition chain in the block folded in, as a branch condition is — `(a == b) ? x : y`
+/// instead of `var_206 ? x : y`, `(tmp_100 == 0) ? …`. The chain is the temporaries and flags
+/// defining the condition (not loads, calls or other registers), and folds only when none of
+/// the registers it reads is written between its op and the select. Returns each select's text
+/// and the ops no longer printed: those every live reader of which folds them.
 pub(crate) fn select_conditions(
     func: &SsaFunction,
-    folded: &rustc_hash::FxHashSet<usize>,
+    inliner: &crate::condition::Inliner,
     emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
-) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
+) -> (rustc_hash::FxHashMap<usize, String>, Vec<usize>) {
+    let mut texts = rustc_hash::FxHashMap::default();
     if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
-        return out;
+        return (texts, Vec::new());
     }
-    let readers = crate::condition::Readers::new(func);
+    let temp = |v: crate::ssa::VarId| {
+        let d = &func.varnodes[v as usize].data;
+        d.space == SpaceId::UNIQUE || (d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset) && d.size == 1)
+    };
+    let overlaps = |x: &reargo_core::pcode::VarnodeData, w: &reargo_core::pcode::VarnodeData| {
+        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
+    };
+    // `x` keeps its value from op `from` up to op `to`
+    let unchanged = |x: crate::ssa::VarId, from: usize, to: usize| {
+        let xd = &func.varnodes[x as usize].data;
+        !func.ops[from + 1..to].iter().any(|o| !o.dead && o.output.is_some_and(|w| overlaps(xd, &func.varnodes[w as usize].data)))
+    };
+    let mut folded_by: rustc_hash::FxHashMap<usize, Vec<usize>> = rustc_hash::FxHashMap::default();
+    let mut named: Vec<crate::ssa::VarId> = Vec::new();
     for (s, op) in func.ops.iter().enumerate() {
         if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
             continue;
         }
         let c = op.inputs[0];
-        let Some(d) = func.varnodes[c as usize].def_op else { continue };
-        let cmp = &func.ops[d];
-        let comparison = matches!(
-            cmp.opcode,
-            OpCode::IntEqual
-                | OpCode::IntNotEqual
-                | OpCode::IntLess
-                | OpCode::IntLessEqual
-                | OpCode::IntSLess
-                | OpCode::IntSLessEqual
-                | OpCode::FloatEqual
-                | OpCode::FloatNotEqual
-                | OpCode::FloatLess
-                | OpCode::FloatLessEqual
-        );
-        if cmp.dead || !comparison || cmp.block != op.block || d >= s || folded.contains(&d) || readers.of(func, c) != [s] {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut leaves = Vec::new();
+        if !fold_chain(func, c, s, op.block, &temp, &unchanged, &mut chain, &mut leaves, 0) {
             continue;
         }
-        let operand_overwritten = func.ops[d + 1..s].iter().any(|o| {
-            !o.dead
-                && o.output.is_some_and(|w| {
-                    let w = &func.varnodes[w as usize].data;
-                    cmp.inputs.iter().any(|&x| {
-                        let x = &func.varnodes[x as usize].data;
-                        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
-                    })
-                })
-        });
-        if operand_overwritten {
-            continue;
-        }
-        let Some(out_v) = cmp.output else { continue };
-        let prefix = format!("{} = ", varnode_name(&func.varnodes[out_v as usize]));
-        if let Some(rhs) = emit(cmp).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
-            out.push((d, rhs));
+        chain.sort_unstable();
+        let name = |v: crate::ssa::VarId| varnode_name(&func.varnodes[v as usize]);
+        if let Some(f) = inliner.fold_value(func, &chain, c, &name, emit)
+            && f.text != name(c)
+        {
+            texts.insert(s, f.text);
+            folded_by.insert(s, chain);
+            named.extend(leaves);
         }
     }
-    out
+    // an op is not printed when every live reader of it folds it (and no folded text names
+    // its value)
+    let mut hidden: rustc_hash::FxHashSet<usize> = folded_by.values().flatten().copied().collect();
+    for v in named {
+        if let Some(d) = func.varnodes[v as usize].def_op {
+            hidden.remove(&d);
+        }
+    }
+    loop {
+        let keep: Vec<usize> = hidden
+            .iter()
+            .copied()
+            .filter(|&d| {
+                let Some(v) = func.ops[d].output else { return true };
+                func.varnodes[v as usize].uses.iter().any(|&u| {
+                    let r = &func.ops[u];
+                    !r.dead
+                        && r.inputs.contains(&v)
+                        && !hidden.contains(&u)
+                        && !folded_by.get(&u).is_some_and(|ch| ch.contains(&d))
+                })
+            })
+            .collect();
+        if keep.is_empty() {
+            break;
+        }
+        for d in keep {
+            hidden.remove(&d);
+        }
+    }
+    (texts, hidden.into_iter().collect())
 }
 
 /// A `case` value: decimal, hex from 0x100 on.

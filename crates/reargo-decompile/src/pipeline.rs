@@ -2540,6 +2540,56 @@ mod tests {
         assert!(c.contains("rax = (uint64_t)al;"), "{c}");
     }
 
+    /// A `cmov` prints its comparison, not a flag variable (WS84): a flag two `cmov`s read
+    /// (`var_206 ? rsi : …` twice), `cmove` after `cmp` (`(tmp_100 == 0) ? …`), and the sign
+    /// of `test` (`(int32_t)tmp_100 < 0`).
+    #[test]
+    fn cmov_condition_is_the_comparison() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xa8, 0x01, // test al, 1
+            0x48, 0x0f, 0x45, 0x37, // cmovne rsi, [rdi]
+            0x48, 0x0f, 0x45, 0x57, 0x08, // cmovne rdx, [rdi+8]
+            0x48, 0x39, 0xd6, // cmp rsi, rdx
+            0x48, 0x0f, 0x44, 0xf1, // cmove rsi, rcx
+            0x85, 0xc9, // test ecx, ecx
+            0x0f, 0x49, 0xc1, // cmovns eax, ecx
+            0x48, 0x01, 0xf0, // add rax, rsi
+            0x48, 0x01, 0xd0, // add rax, rdx
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("var_206"), "{c}");
+        assert!(!c.contains("var_207"), "{c}");
+        assert!(!c.contains("tmp_100"), "{c}");
+        assert_eq!(c.matches("((al & 1) == 0) ?").count(), 2, "{c}");
+        assert!(c.contains("(rsi == rdx) ?"), "{c}");
+        assert!(c.contains("((int32_t)ecx < (int32_t)0) ?"), "{c}");
+    }
+
+    /// Two `cmov`s on one `test` with its register overwritten between them: the second names
+    /// the test's value, whose statement must then stay printed (WS84).
+    #[test]
+    fn cmov_condition_names_a_printed_value() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x41, 0xf6, 0xc7, 0x01, // test r15b, 1
+            0x48, 0x0f, 0x45, 0xcd, // cmovne rcx, rbp
+            0x4c, 0x8d, 0x7c, 0x24, 0x0b, // lea r15, [rsp+0xb]
+            0x4c, 0x0f, 0x45, 0xf8, // cmovne r15, rax
+            0x4c, 0x01, 0xf9, // add rcx, r15
+            0x48, 0x89, 0xc8, // mov rax, rcx
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("((r15b & 1) == 0) ? rcx : rbp"), "{c}");
+        if c.contains("(tmp_100 == 0) ?") {
+            assert!(c.contains("tmp_100 = r15b & 1;"), "a named value is defined: {c}");
+        }
+    }
+
     /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
     #[test]
     fn cmov_is_a_select() {

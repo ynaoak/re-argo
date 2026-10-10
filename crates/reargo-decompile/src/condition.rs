@@ -642,6 +642,19 @@ impl Inliner {
         folded
     }
 
+    /// `cv` with `ops` (its definition chain, in order) folded in, as for a branch condition
+    /// (WS84: a `cmov`'s condition).
+    pub fn fold_value(
+        &self,
+        func: &SsaFunction,
+        ops: &[OpIdx],
+        cv: VarId,
+        name: &dyn Fn(VarId) -> String,
+        emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
+    ) -> Option<Folded> {
+        self.fold_ops(func, ops, cv, name, emit, Some(MAX_FOLDED_LEN))
+    }
+
     /// The condition of `block` (to its first CFG successor) as one expression. `name` prints
     /// a variable, `emit` an op as the emitter does (`dst = rhs;`).
     pub fn fold(
