@@ -109,7 +109,8 @@ const MAX_TAIL_INSNS: usize = 6;
 
 /// The blocks of a short tail that ends in a `ret` (`goto` to it can print the tail itself):
 /// a chain of single-successor blocks into a return block, at most [`MAX_TAIL_INSNS`]
-/// instructions and no call.
+/// instructions and no call. The epilogue's frame restore (`pop`, `add rsp`, `ret`, see
+/// [`crate::cfg::is_epilogue_insn`]) prints nothing and does not count.
 fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
     use reargo_core::pcode::OpCode;
     let mut chain = Vec::new();
@@ -117,7 +118,7 @@ fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
     let mut b = start;
     loop {
         let block = &cfg.blocks[b];
-        insns += block.instructions.len();
+        insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
         let calls = block.instructions.iter().any(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
         if insns > MAX_TAIL_INSNS || calls || chain.contains(&b) {
             return None;
@@ -912,4 +913,26 @@ mod tests {
         assert_eq!(v, (0..cfg.blocks.len()).collect::<Vec<_>>(), "{s:?}");
         assert!(gotos(&s) >= 1, "irreducible flow needs a goto: {s:?}");
     }
+
+    #[test]
+    fn epilogue_does_not_count_against_the_return_tail() {
+        // E: jcc R ; B: nop ; C: jcc R ; D: ret ; R: nop + six pops + ret — R is reached from
+        // E and C, copied in place of the `goto` although it has 8 instructions
+        let named = |addr: u64, m: &str, ops: Vec<PcodeOp>| LiftedInstruction { address: addr, length: 1, mnemonic: m.into(), ops };
+        let mut insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1004)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1004)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+            nop(0x1004),
+        ];
+        for (i, r) in ["rbx", "rbp", "r12", "r13", "r14", "r15"].iter().enumerate() {
+            insns.push(named(0x1005 + i as u64, &format!("pop {r}"), vec![]));
+        }
+        insns.push(named(0x100b, "ret", vec![ret(0x100b)]));
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+    }
+
 }

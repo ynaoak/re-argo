@@ -64,6 +64,8 @@ pub struct CEmitter<'a> {
     /// Blocks some `goto` jumps to: each gets a `label_<addr>:` line where its code starts
     /// (otherwise the `goto` names a label that is never printed).
     goto_targets: std::collections::BTreeSet<usize>,
+    /// Epilogue ops not printed (`epilogue_noise`).
+    noise: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for CEmitter<'static> {
@@ -85,6 +87,7 @@ impl CEmitter<'static> {
             inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
+            noise: rustc_hash::FxHashSet::default(),
         }
     }
 }
@@ -118,6 +121,7 @@ impl<'a> CEmitter<'a> {
             inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
+            noise: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -159,6 +163,7 @@ impl<'a> CEmitter<'a> {
         self.output.clear();
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
+        self.noise = epilogue_noise(func);
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -385,7 +390,7 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -397,7 +402,7 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
@@ -1172,6 +1177,47 @@ impl FunctionSignature {
 /// function was entered with (nothing on the path set it). A one-input `RETURN` counts as
 /// returning its input only when that is `rax` itself (hand-built p-code in tests).
 /// Returns the index of that input.
+/// The ops of the function's epilogues that print only frame bookkeeping (WS80): in the run
+/// of [`crate::cfg::is_epilogue_insn`] instructions that ends a return block, a write of the
+/// stack pointer, the load of the return address the `ret` jumps to, and anything read only by
+/// such ops. A `pop` whose value is returned (`pop rax` before `ret`) is kept.
+pub(crate) fn epilogue_noise(func: &SsaFunction) -> rustc_hash::FxHashSet<usize> {
+    let mut noise = rustc_hash::FxHashSet::default();
+    let mut addrs = rustc_hash::FxHashSet::default();
+    for b in &func.cfg.blocks {
+        if b.is_return() {
+            for insn in b.instructions.iter().rev() {
+                if !crate::cfg::is_epilogue_insn(&insn.mnemonic) {
+                    break;
+                }
+                addrs.insert(insn.address);
+            }
+        }
+    }
+    if addrs.is_empty() {
+        return noise;
+    }
+    // backwards, so an op's readers are classified before it
+    for op in func.ops.iter().rev() {
+        if op.dead || op.opcode == OpCode::Return || !addrs.contains(&op.address) {
+            continue;
+        }
+        let Some(out) = op.output else { continue };
+        let vn = &func.varnodes[out as usize];
+        let is_sp = vn.data.space == SpaceId::REGISTER && matches!(varnode_name(vn).as_str(), "rsp" | "esp");
+        let only_noise = vn.uses.iter().all(|&u| {
+            let r = &func.ops[u];
+            r.dead
+                || noise.contains(&u)
+                || (r.opcode == OpCode::Return && r.inputs.first() == Some(&out) && return_value(func, r) != Some(0))
+        });
+        if is_sp || only_noise {
+            noise.insert(op.index);
+        }
+    }
+    noise
+}
+
 pub(crate) fn return_value(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<usize> {
     let reg_set = |v: u32| {
         let vn = &func.varnodes[v as usize];

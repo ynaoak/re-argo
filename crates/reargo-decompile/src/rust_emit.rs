@@ -43,6 +43,8 @@ pub struct RustEmitter<'a> {
     conds: Option<&'a rustc_hash::FxHashMap<usize, crate::condition::Cond>>,
     /// Folds a test block's ops into its condition expression while a leaf is printed.
     inliner: crate::condition::Inliner,
+    /// Epilogue ops not printed (`emit::epilogue_noise`).
+    noise: rustc_hash::FxHashSet<usize>,
     /// Per-address emit-once dedup, so multi-op instructions don't
     /// replay the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
@@ -65,6 +67,7 @@ impl RustEmitter<'static> {
             call_renderings: None,
             conds: None,
             inliner: crate::condition::Inliner::default(),
+            noise: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -85,6 +88,7 @@ impl<'a> RustEmitter<'a> {
             call_renderings: None,
             conds: None,
             inliner: crate::condition::Inliner::default(),
+            noise: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -121,6 +125,7 @@ impl<'a> RustEmitter<'a> {
         structured: &StructuredBlock,
     ) -> String {
         self.output.clear();
+        self.noise = crate::emit::epilogue_noise(func);
         let sig = infer_signature(func);
         self.line(&sig.to_rust_declaration(&func.name));
         self.line("{");
@@ -329,7 +334,7 @@ impl<'a> RustEmitter<'a> {
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -362,7 +367,7 @@ impl<'a> RustEmitter<'a> {
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {

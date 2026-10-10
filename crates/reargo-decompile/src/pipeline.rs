@@ -1605,4 +1605,25 @@ mod tests {
         assert_eq!(c.matches("0x2000(").count(), 1, "{c}");
     }
 
+    /// The epilogue's frame restore prints nothing (WS80): no `rsp = rsp + 8` from the `pop`,
+    /// no load of the return address for the `ret`.
+    #[test]
+    fn epilogue_frame_restore_is_not_printed() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x53, // push rbx
+            0x89, 0xfb, // mov ebx, edi
+            0xe8, 0xf8, 0x0f, 0x00, 0x00, // call 0x2000
+            0x89, 0xd8, // mov eax, ebx
+            0x5b, // pop rbx
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("rsp = rsp + 8"), "{c}");
+        assert!(!c.contains("= *(uint64_t*)rsp;"), "{c}");
+        assert!(c.contains("return rax;"), "{c}");
+        assert!(c.contains("rsp = rsp - 8"), "the prologue is kept: {c}");
+    }
+
 }
