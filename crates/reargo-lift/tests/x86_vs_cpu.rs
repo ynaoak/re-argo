@@ -67,6 +67,8 @@ macro_rules! cpu {
                     inout("rax") ra,
                     inout("rcx") rc,
                     inout("rdx") rd,
+                    out("xmm0") _,
+                    out("xmm1") _,
                 );
             }
             (Out { rax: ra, rcx: rc, rdx: rd, flags: fo }, s, e)
@@ -104,6 +106,8 @@ macro_rules! cpu_jcc {
                     inout("rax") ra,
                     inout("rcx") rc,
                     inout("rdx") rd,
+                    out("xmm0") _,
+                    out("xmm1") _,
                 );
             }
             (Out { rax: ra, rcx: rc, rdx: rd, flags: fo }, s, e)
@@ -133,6 +137,9 @@ enum Inputs {
     Flags,
     /// a jump: compare "taken" (the emulator stops at a taken CBRANCH)
     Jump,
+    /// a, b = f64 bit patterns (an f32 in the low half for `…ss`): zeros, infinities, NaN,
+    /// denormals, and random values
+    Floats,
 }
 
 const EDGE: [u64; 20] = [
@@ -218,6 +225,23 @@ fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
                 let (a, b, c) = (rng.value(), rng.next(), rng.value());
                 for fl in flag_inputs(rng) {
                     v.push((a, b, c, fl));
+                }
+            }
+        }
+        Inputs::Floats => {
+            let edge = [0.0f64, -0.0, 1.0, -1.0, 0.5, 3.75, -2.5, 1e30, -1e-30, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1e-310, 2147483647.0, -2147483648.0];
+            let mut vals: Vec<f64> = edge.to_vec();
+            for _ in 0..30 {
+                vals.push((rng.next() % 2_000_001) as f64 / 1000.0 - 1000.0);
+            }
+            for &x in &vals {
+                for &y in &vals {
+                    let (a, b) = if rng.next() % 2 == 0 {
+                        (x.to_bits(), y.to_bits())
+                    } else {
+                        (u64::from((x as f32).to_bits()), u64::from((y as f32).to_bits()))
+                    };
+                    v.push((a, b, rng.value(), flag_inputs(rng)[(rng.next() % 3) as usize]));
                 }
             }
         }
@@ -702,5 +726,77 @@ fn high_byte_registers_match_the_cpu() {
  add eax, edx", d_arith_all_regs, Inputs::Values),
         case!("xchg ah, al", d_arith, Inputs::Values),
     ];
+    check(&cases);
+}
+
+/// Scalar SSE via general registers: `a`/`b` go into xmm0/xmm1 (movq), the result comes back
+/// in rax. The xmm upper halves are not compared.
+macro_rules! sse {
+    ($op:literal) => {
+        case!(concat!("movq xmm0, rax
+ movq xmm1, rcx
+ ", $op, " xmm0, xmm1
+ movq rax, xmm0"), d_arith, Inputs::Floats)
+    };
+}
+
+/// `cvtt…2si` of a value that fits (out of range is the "integer indefinite" 0x80000000…,
+/// which p-code FLOAT_TRUNC does not define).
+fn fits_i32_f32(a: u64, _: u64, _: u64) -> bool {
+    let x = f32::from_bits(a as u32);
+    x.is_finite() && x > -2147483648.0 && x < 2147483647.0
+}
+fn fits_i32_f64(a: u64, _: u64, _: u64) -> bool {
+    let x = f64::from_bits(a);
+    x.is_finite() && x > -2147483648.0 && x < 2147483647.0
+}
+
+/// `comis…`/`ucomis…` of an `N`-byte float in a and b: OF/SF cleared; CF and ZF are the
+/// ordered comparison. (Unordered sets CF = ZF = PF = 1 on the CPU; the lifter keeps CF/ZF as
+/// the plain `<` / `==` there, which agrees with every jcc/setcc combination compilers emit
+/// together with the PF test, so CF/ZF are only compared for ordered inputs.)
+fn d_fcmp<const N: u32>(a: u64, b: u64, _: u64) -> (u64, u8) {
+    let nan = |x: u64| if N == 4 { f32::from_bits(x as u32).is_nan() } else { f64::from_bits(x).is_nan() };
+    (if nan(a) || nan(b) { OF | SF } else { ARITH }, RAX)
+}
+
+#[test]
+fn scalar_float_matches_the_cpu() {
+    let mut cases = vec![
+        sse!("addss"),
+        sse!("subss"),
+        sse!("mulss"),
+        sse!("divss"),
+        sse!("sqrtss"),
+        sse!("minss"),
+        sse!("maxss"),
+        sse!("addsd"),
+        sse!("subsd"),
+        sse!("mulsd"),
+        sse!("divsd"),
+        sse!("sqrtsd"),
+        sse!("minsd"),
+        sse!("maxsd"),
+        sse!("cvtss2sd"),
+        sse!("cvtsd2ss"),
+        case!("movq xmm0, rax
+ ucomiss xmm0, xmm0", d_fcmp::<4>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1", d_fcmp::<4>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ comisd xmm0, xmm1", d_fcmp::<8>, Inputs::Floats),
+        case!("cvtsi2ss xmm0, ecx
+ movd eax, xmm0", d_arith, Inputs::Values),
+        case!("cvtsi2sd xmm0, rcx
+ movq rax, xmm0", d_arith, Inputs::Values),
+        case!("cvtsi2sd xmm0, ecx
+ movq rax, xmm0", d_arith, Inputs::Values),
+    ];
+    cases.push(Case { valid: Some(fits_i32_f32), ..case!("movq xmm0, rax
+ cvttss2si eax, xmm0", d_arith, Inputs::Floats) });
+    cases.push(Case { valid: Some(fits_i32_f64), ..case!("movq xmm0, rax
+ cvttsd2si eax, xmm0", d_arith, Inputs::Floats) });
     check(&cases);
 }

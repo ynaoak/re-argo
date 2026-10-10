@@ -2471,6 +2471,23 @@ mod tests {
         assert!(c.contains("esi"), "the function goes on after `movzx eax, ah`: {c}");
     }
 
+    /// `maxss` / `minss` print as a float select (WS84: `__unmodeled_insn()` and the result
+    /// was lost).
+    #[test]
+    fn sse_min_max_is_a_select() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xf3, 0x0f, 0x5f, 0xc1, // maxss xmm0, xmm1
+            0xf3, 0x0f, 0x5d, 0xc2, // minss xmm0, xmm2
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+        assert!(c.contains("(xmm1_d < xmm0_d) ? xmm0_d : xmm1_d"), "{c}");
+        assert!(c.contains("(xmm0_d < xmm2_d) ? xmm0_d : xmm2_d"), "{c}");
+    }
+
     /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
     #[test]
     fn cmov_is_a_select() {

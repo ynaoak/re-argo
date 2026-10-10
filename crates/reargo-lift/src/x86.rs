@@ -1246,6 +1246,23 @@ impl X86Lifter {
                 sb += 1;
                 ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(PF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[na, nb]) });
+                sb += 1;
+                // OF and SF are cleared (WS84: they kept an earlier integer op's value)
+                self.emit_clear_of_sf(&mut ops, &mut sb, address);
+            }
+
+            // minss/maxss/minsd/maxsd: `dst < src ? dst : src` (`>` for max). The second
+            // operand is the answer when either is a NaN or both are zero, as on the CPU.
+            Minss | Minsd | Maxss | Maxsd => {
+                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                let c = unique(0x548, 1);
+                let (x, y) = if matches!(m, Minss | Minsd) { (dst, src) } else { (src, dst) };
+                ops.push(PcodeOp { opcode: OpCode::FloatLess, seq: seq(sb), output: Some(c),
+                    inputs: SmallVec::from_slice(&[x, y]) });
+                sb += 1;
+                ops.push(PcodeOp { opcode: OpCode::Select, seq: seq(sb), output: Some(dst),
+                    inputs: SmallVec::from_slice(&[c, dst, src]) });
             }
 
             // xorps/pxor self-zero idiom -> 0; otherwise low-lane xor.
@@ -1560,6 +1577,19 @@ impl X86Lifter {
             inputs: SmallVec::from_slice(&[constant(0, 1)]),
         });
         *seq_base += 1;
+    }
+
+    /// `comiss`/`ucomiss` clear OF and SF (CF/ZF/PF carry the result).
+    fn emit_clear_of_sf(&self, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, address: u64) {
+        for off in [OF_OFFSET, SF_OFFSET] {
+            ops.push(PcodeOp {
+                opcode: OpCode::Copy,
+                seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
+                output: Some(reg(off, 1)),
+                inputs: SmallVec::from_slice(&[constant(0, 1)]),
+            });
+            *seq_base += 1;
+        }
     }
 
     /// CF/OF for ADD computed from the pre-op operands.
