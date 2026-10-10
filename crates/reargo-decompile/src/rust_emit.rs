@@ -39,6 +39,12 @@ pub struct RustEmitter<'a> {
     /// Per-call-site C-syntax rendering map. Mirror of the C
     /// emitter's `call_renderings`; see `emit.rs` for the rationale.
     call_renderings: Option<&'a BTreeMap<u64, String>>,
+    /// Conditions of the blocks the short-circuit merge collapsed (`a || b`), by block.
+    conds: Option<&'a rustc_hash::FxHashMap<usize, crate::condition::Cond>>,
+    /// Folds a test block's ops into its condition expression while a leaf is printed.
+    inliner: crate::condition::Inliner,
+    /// Epilogue ops not printed (`emit::epilogue_noise`).
+    noise: rustc_hash::FxHashSet<usize>,
     /// Per-address emit-once dedup, so multi-op instructions don't
     /// replay the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
@@ -59,6 +65,9 @@ impl RustEmitter<'static> {
             string_literals: empty_u64_map(),
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
+            noise: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -77,6 +86,9 @@ impl<'a> RustEmitter<'a> {
             string_literals,
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
+            noise: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -101,12 +113,19 @@ impl<'a> RustEmitter<'a> {
         self
     }
 
+    /// Attach the merged short-circuit conditions (`condition::merge_short_circuits`).
+    pub fn with_conditions(mut self, conds: &'a rustc_hash::FxHashMap<usize, crate::condition::Cond>) -> Self {
+        self.conds = Some(conds);
+        self
+    }
+
     pub fn emit_function(
         &mut self,
         func: &SsaFunction,
         structured: &StructuredBlock,
     ) -> String {
         self.output.clear();
+        self.noise = crate::emit::epilogue_noise(func);
         let sig = infer_signature(func);
         self.line(&sig.to_rust_declaration(&func.name));
         self.line("{");
@@ -315,7 +334,7 @@ impl<'a> RustEmitter<'a> {
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -348,7 +367,7 @@ impl<'a> RustEmitter<'a> {
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
@@ -778,6 +797,9 @@ impl<'a> RustEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
+        if let Some(e) = self.inliner.get(op.inputs[idx]) {
+            return e;
+        }
         let vn = &func.varnodes[op.inputs[idx] as usize];
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
             if let Some(s) = self.string_literals.get(&vn.data.offset) {
@@ -800,6 +822,16 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
+            let mut leaf = |b: usize| {
+                if b == block_id {
+                    self.get_branch_condition(func, b)
+                } else {
+                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+                }
+            };
+            return c.render(negated, &mut leaf);
+        }
         crate::emit::negate_condition(self.get_branch_condition(func, block_id), negated)
     }
 

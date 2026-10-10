@@ -28,6 +28,20 @@ pub fn is_trap(insn: &LiftedInstruction) -> bool {
     }) || matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
 }
 
+/// An instruction of a function epilogue that only restores the caller's frame: `pop reg`,
+/// `add rsp, n`, `leave`, `lea rsp, [...]`, `mov rsp, rbp`, `ret`, `vzeroupper` (WS80). Its
+/// effect (the stack pointer, callee-saved registers) is not part of what the C code does.
+pub fn is_epilogue_insn(mnemonic: &str) -> bool {
+    let m = mnemonic.trim();
+    m.starts_with("pop ")
+        || m.starts_with("add rsp,")
+        || m.starts_with("lea rsp,")
+        || m.starts_with("mov rsp,")
+        || m.starts_with("ret")
+        || m == "leave"
+        || m == "vzeroupper"
+}
+
 fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
     let mut leaders: BTreeSet<u64> = BTreeSet::new();
     leaders.insert(instructions[0].address);
@@ -167,7 +181,7 @@ impl BasicBlock {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ControlFlowGraph {
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,

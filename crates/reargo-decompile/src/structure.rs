@@ -107,9 +107,17 @@ pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
 /// Longest straight-line tail (instructions) copied in place of a `goto`.
 const MAX_TAIL_INSNS: usize = 6;
 
+/// Longest block (instructions) printed a second time in place of a `goto` to it.
+const MAX_COPY_INSNS: usize = 4;
+/// Most instructions of a region printed a second time in place of a `goto` to it.
+const MAX_COPY_REGION_INSNS: usize = 6;
+/// Most blocks on a path through a region printed a second time.
+const MAX_COPY_DEPTH: usize = 2;
+
 /// The blocks of a short tail that ends in a `ret` (`goto` to it can print the tail itself):
 /// a chain of single-successor blocks into a return block, at most [`MAX_TAIL_INSNS`]
-/// instructions and no call.
+/// instructions and no call. The epilogue's frame restore (`pop`, `add rsp`, `ret`, see
+/// [`crate::cfg::is_epilogue_insn`]) prints nothing and does not count.
 fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
     use reargo_core::pcode::OpCode;
     let mut chain = Vec::new();
@@ -117,7 +125,7 @@ fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
     let mut b = start;
     loop {
         let block = &cfg.blocks[b];
-        insns += block.instructions.len();
+        insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
         let calls = block.instructions.iter().any(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
         if insns > MAX_TAIL_INSNS || calls || chain.contains(&b) {
             return None;
@@ -323,6 +331,79 @@ impl<'a> Structurer<'a> {
         self.jump_for(b).or_else(|| self.emitted[b].then_some(StructuredBlock::Goto(b)))
     }
 
+    /// Print the short region from `b` (already printed elsewhere) again instead of a `goto`
+    /// to it: blocks of at most [`MAX_COPY_INSNS`] instructions without a call, at most
+    /// [`MAX_COPY_REGION_INSNS`] in all and [`MAX_COPY_DEPTH`] deep, whose every way out is
+    /// reachable here without a `goto` of its own — the end of the region being walked
+    /// (`stop`), a `break` / `continue`, or a return tail (copied later). A `goto` that
+    /// still names a copied block lands on either copy; both go on the same way.
+    fn copy_region(&self, b: BlockId, stop: Option<BlockId>) -> Option<Vec<StructuredBlock>> {
+        let mut budget = MAX_COPY_REGION_INSNS;
+        self.copy_from(b, stop, MAX_COPY_DEPTH, &mut budget, true)
+    }
+
+    fn copy_from(
+        &self,
+        b: BlockId,
+        stop: Option<BlockId>,
+        depth: usize,
+        budget: &mut usize,
+        first: bool,
+    ) -> Option<Vec<StructuredBlock>> {
+        use reargo_core::pcode::OpCode;
+        use StructuredBlock::*;
+        if !first {
+            if Some(b) == stop {
+                return Some(Vec::new());
+            }
+            match self.jump_for(b) {
+                Some(j @ (Break | Continue)) => return Some(vec![j]),
+                Some(_) => return None,
+                None => {}
+            }
+            if self.emitted[b] && return_tail(self.cfg, b).is_some() {
+                return Some(vec![Goto(b)]);
+            }
+        }
+        let block = &self.cfg.blocks[b];
+        let insns = block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
+        let calls = block.instructions.iter().any(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
+        if depth == 0 || insns > MAX_COPY_INSNS || calls || self.loops[b].is_some() {
+            return None;
+        }
+        *budget = budget.checked_sub(insns)?;
+        match *self.succs(b).as_slice() {
+            [s] if s != b => {
+                let mut v = vec![Basic(b)];
+                v.extend(self.copy_from(s, stop, depth - 1, budget, false)?);
+                Some(v)
+            }
+            [t, f] if t != b && f != b => {
+                let jt = self.copy_from(t, stop, depth - 1, budget, false)?;
+                let jf = self.copy_from(f, stop, depth - 1, budget, false)?;
+                let if_then = |body: Vec<StructuredBlock>, negated: bool| IfThen {
+                    condition_block: b,
+                    then_body: Box::new(seq(body)),
+                    negated,
+                };
+                Some(if ends_flow(self.cfg, &jt) {
+                    let mut v = vec![if_then(jt, false)];
+                    v.extend(jf);
+                    v
+                } else if ends_flow(self.cfg, &jf) || jt.is_empty() {
+                    let mut v = vec![if_then(jf, true)];
+                    v.extend(jt);
+                    v
+                } else if jf.is_empty() {
+                    vec![if_then(jt, false)]
+                } else {
+                    vec![IfThenElse { condition_block: b, then_body: Box::new(seq(jt)), else_body: Box::new(seq(jf)) }]
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Structure the code from `start` until `stop` (exclusive; `None` = until the flow ends).
     /// `header_first`: `start` is the header of the innermost loop being entered (print it
     /// rather than `continue`).
@@ -341,6 +422,12 @@ impl<'a> Structurer<'a> {
                     break;
                 }
                 if self.emitted[b] {
+                    // a short block printed elsewhere, whose successor is reachable from
+                    // here too: print it again instead of `goto` to it
+                    if let Some(copy) = self.copy_region(b, stop) {
+                        out.extend(copy);
+                        break;
+                    }
                     out.push(StructuredBlock::Goto(b));
                     break;
                 }
@@ -912,4 +999,84 @@ mod tests {
         assert_eq!(v, (0..cfg.blocks.len()).collect::<Vec<_>>(), "{s:?}");
         assert!(gotos(&s) >= 1, "irreducible flow needs a goto: {s:?}");
     }
+
+    #[test]
+    fn epilogue_does_not_count_against_the_return_tail() {
+        // E: jcc R ; B: nop ; C: jcc R ; D: ret ; R: nop + six pops + ret — R is reached from
+        // E and C, copied in place of the `goto` although it has 8 instructions
+        let named = |addr: u64, m: &str, ops: Vec<PcodeOp>| LiftedInstruction { address: addr, length: 1, mnemonic: m.into(), ops };
+        let mut insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1004)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1004)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+            nop(0x1004),
+        ];
+        for (i, r) in ["rbx", "rbp", "r12", "r13", "r14", "r15"].iter().enumerate() {
+            insns.push(named(0x1005 + i as u64, &format!("pop {r}"), vec![]));
+        }
+        insns.push(named(0x100b, "ret", vec![ret(0x100b)]));
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+    }
+
+
+    #[test]
+    fn short_shared_block_is_copied_instead_of_goto() {
+        // A: jcc L ; X: nop ; B: jcc L ; Y: jmp J ; L: nop nop ; J: call ; ret
+        // L is shared by A's then-arm and B (in A's else-arm) and falls into the join J
+        let call = PcodeOp {
+            opcode: OpCode::Call,
+            seq: seq(0x1007),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId(1), 0x2000, 8)]),
+        };
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1005)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1005)]),
+            nop(0x1003),
+            lifted(0x1004, vec![branch(0x1004, 0x1007)]),
+            nop(0x1005),
+            nop(0x1006),
+            lifted(0x1007, vec![call]),
+            lifted(0x1008, vec![ret(0x1008)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let l = cfg.block_at(0x1005).unwrap().id;
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Basic(b) if *b == l)), 2, "{s:?}");
+    }
+
+
+    #[test]
+    fn shared_test_that_breaks_or_continues_is_copied() {
+        // loop: H: jcc X ; A: jcc S ; B: nop ; C: jcc S ; D: jmp H ;
+        //       S: nop ; T: jcc X ; U: jmp H ;  X: call ; ret
+        // S..T is shared by A and C; its ways out are `break` (X) and `continue` (H)
+        let call = PcodeOp {
+            opcode: OpCode::Call,
+            seq: seq(0x1008),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId(1), 0x2000, 8)]),
+        };
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1008)]),
+            lifted(0x1001, vec![cbranch(0x1001, 0x1005)]),
+            nop(0x1002),
+            lifted(0x1003, vec![cbranch(0x1003, 0x1005)]),
+            lifted(0x1004, vec![branch(0x1004, 0x1000)]),
+            nop(0x1005),
+            lifted(0x1006, vec![cbranch(0x1006, 0x1008)]),
+            lifted(0x1007, vec![branch(0x1007, 0x1000)]),
+            lifted(0x1008, vec![call]),
+            lifted(0x1009, vec![ret(0x1009)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+    }
+
 }

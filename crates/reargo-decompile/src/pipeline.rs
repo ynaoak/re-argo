@@ -51,7 +51,7 @@ pub fn decompile(
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own, vcalls)
+    build_decompile_result(terminated, func_name, entry, &empty, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)))
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -291,6 +291,7 @@ fn decompile_function_inner(
         call_params,
         own,
         vcalls,
+        Some((lifter, &program.info.memory)),
     )
 }
 
@@ -392,6 +393,84 @@ fn apply_call_convention(
     instructions
 }
 
+/// Is `v` read by something other than a call it is handed to as an (implicit) argument?
+/// Looks through the lifter's register-view syncs (a `SUBPIECE` of the low bytes, a zero
+/// extension, the low half of a `PIECE`); the upper lanes a later scalar write carries over
+/// (`SUBPIECE(xmm0, 4)`) and a φ-node (which merges other paths' values too) are not
+/// evidence of a read.
+fn read_beyond_call_args(ssa: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> bool {
+    use reargo_core::pcode::OpCode;
+    if depth > 6 {
+        return true;
+    }
+    ssa.varnodes[v as usize].uses.iter().any(|&u| {
+        let op = &ssa.ops[u];
+        let deeper = |o: Option<crate::ssa::VarId>| o.is_some_and(|o| read_beyond_call_args(ssa, o, depth + 1));
+        match op.opcode {
+            _ if op.dead => false,
+            OpCode::Call | OpCode::CallInd => op.inputs.first() == Some(&v),
+            OpCode::Subpiece => {
+                let k = op.inputs.get(1).map(|&c| ssa.varnodes[c as usize].data);
+                match k {
+                    Some(k) if k.space == reargo_core::address::SpaceId::CONST && k.offset > 0 => false,
+                    _ => deeper(op.output),
+                }
+            }
+            // the upper lanes a `PIECE` keeps; a φ also merges other paths' values: no evidence
+            OpCode::Piece if op.inputs.first() == Some(&v) => false,
+            OpCode::MultiEqual => false,
+            OpCode::Piece | OpCode::IntZExt => deeper(op.output),
+            _ => true,
+        }
+    })
+}
+
+/// A call whose return register is unknown (an import, an indirect call nobody resolved)
+/// defines both `rax` and `xmm0` as its result. When the caller really reads one of them and
+/// only hands the other on to later calls as a guessed argument, the callee returned in the
+/// one read (WS80): the other becomes a clobber, so it is neither printed as a second
+/// `__ret` nor passed to the next call.
+fn settle_unknown_returns(ssa: &mut SsaFunction) {
+    use reargo_core::pcode::OpCode;
+    let mut to_clobber = Vec::new();
+    for call in ssa.ops.iter().filter(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)) {
+        let rets: Vec<usize> = ssa.ops[call.index + 1..]
+            .iter()
+            .take_while(|o| o.address == call.address && o.block == call.block)
+            .filter(|o| {
+                o.opcode == OpCode::Indirect
+                    && o.output.is_some()
+                    && !is_call_clobber(&o.opcode, &o.inputs.iter().map(|&i| ssa.varnodes[i as usize].data).collect::<Vec<_>>())
+            })
+            .map(|o| o.index)
+            .collect();
+        let [a, b] = rets[..] else { continue };
+        let read = |i: usize| read_beyond_call_args(ssa, ssa.ops[i].output.unwrap(), 0);
+        match (read(a), read(b)) {
+            (true, false) => to_clobber.push(b),
+            (false, true) => to_clobber.push(a),
+            _ => {}
+        }
+    }
+    for i in to_clobber {
+        let add_const = |ssa: &mut SsaFunction, value: u64, size: u32| {
+            let id = ssa.varnodes.len() as crate::ssa::VarId;
+            ssa.varnodes.push(crate::ssa::SsaVarnode {
+                id,
+                data: reargo_core::pcode::VarnodeData::new(reargo_core::address::SpaceId::CONST, value, size),
+                version: 0,
+                def_op: None,
+                uses: vec![i],
+            });
+            ssa.ops[i].inputs.push(id);
+        };
+        if ssa.ops[i].inputs.is_empty() {
+            add_const(ssa, 0, 8);
+        }
+        add_const(ssa, CLOBBER_MARK, 1);
+    }
+}
+
 /// What the function last wrote into a return register before a `ret` (WS79).
 #[derive(Debug, Clone, Copy, Default)]
 struct RetEvidence {
@@ -457,7 +536,10 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
 /// wins only when some `ret` votes for it and none for `rax`. The losing register is
 /// removed from every `RETURN`, so its computation is not kept alive. Returns the float
 /// size when `xmm0` won.
-fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
+fn choose_return_register(
+    ssa: &mut SsaFunction,
+    callers: &mut dyn FnMut() -> Option<crate::callers::ReturnHint>,
+) -> Option<u32> {
     use reargo_core::pcode::OpCode;
     let rets: Vec<usize> = ssa
         .ops
@@ -469,6 +551,7 @@ fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
         return None;
     }
     let (mut float_votes, mut int_votes, mut size) = (0, 0, 0u32);
+    let mut passes_call_result = false;
     for &r in &rets {
         let (iv, fv) = (ssa.ops[r].inputs[1], ssa.ops[r].inputs[2]);
         let i = return_evidence(ssa, iv, &mut Vec::new());
@@ -482,9 +565,29 @@ fn choose_return_register(ssa: &mut SsaFunction) -> Option<u32> {
         } else if f.call_result && !i.call_result {
             // `call g; ret` with `g` known to return a float (its `rax` is only clobbered)
             float_votes += 1;
+        } else if i.call_result {
+            passes_call_result = true;
         }
     }
-    let float = float_votes > 0 && int_votes == 0;
+    // WS80: `return g();` with `g`'s return register unknown: ask what the callers read
+    let mut float = float_votes > 0 && int_votes == 0;
+    if float_votes == 0 && int_votes == 0 && passes_call_result {
+        match callers() {
+            Some(crate::callers::ReturnHint::Float(s)) => {
+                float = true;
+                size = s;
+            }
+            Some(crate::callers::ReturnHint::Void) => {
+                for &r in &rets {
+                    for v in ssa.ops[r].inputs.drain(1..).collect::<Vec<_>>() {
+                        unuse(ssa, v, r);
+                    }
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
     if size == 0 {
         size = 8; // only call results: the width is not known, print it as a double
     }
@@ -677,6 +780,7 @@ fn build_decompile_result(
     call_params: rustc_hash::FxHashMap<u64, ParamInfo>,
     own_params: Option<(ParamInfo, Vec<reargo_core::pcode::VarnodeData>)>,
     vcalls: Option<ThisVcalls<'_>>,
+    caller_hint: Option<(&dyn PcodeLift, &Memory)>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -704,7 +808,9 @@ fn build_decompile_result(
             .iter()
             .any(|o| matches!(o.opcode, reargo_core::pcode::OpCode::Call | reargo_core::pcode::OpCode::CallInd) && o.inputs.len() > 1);
 
-    ssa.return_float = choose_return_register(&mut ssa);
+    let mut hint = || caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, entry));
+    ssa.return_float = choose_return_register(&mut ssa, &mut hint);
+    settle_unknown_returns(&mut ssa);
     let opt_stats = run_optimization_passes(&mut ssa);
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
@@ -743,7 +849,9 @@ fn build_decompile_result(
         .map(|(i, s)| s.to_c_definition(&format!("recovered_{}", i)))
         .collect();
 
-    let structured = structure_cfg(&ssa.cfg);
+    // `if (a) goto X; if (b) goto X;` -> `if (a || b) goto X;` (on a copy of the CFG)
+    let short = crate::condition::merge_short_circuits(&ssa);
+    let structured = structure_cfg(short.as_ref().map_or(&ssa.cfg, |s| &s.cfg));
     // Both emitters borrow the same two maps -- the previous API took
     // owned BTreeMaps and forced four clones per decompile call (two
     // maps * two emitters). The borrow-based `with_maps` API is
@@ -755,6 +863,9 @@ fn build_decompile_result(
     if let Some(rend) = call_renderings {
         c_emitter = c_emitter.with_call_renderings(rend);
     }
+    if let Some(s) = &short {
+        c_emitter = c_emitter.with_conditions(&s.conds);
+    }
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
@@ -763,6 +874,9 @@ fn build_decompile_result(
     }
     if let Some(rend) = call_renderings {
         rust_emitter = rust_emitter.with_call_renderings(rend);
+    }
+    if let Some(s) = &short {
+        rust_emitter = rust_emitter.with_conditions(&s.conds);
     }
     let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
@@ -1426,7 +1540,8 @@ mod tests {
     }
 
     /// WS79: a chain of compares jumping to one exit nests at the post-dominator (the exit)
-    /// instead of jumping there: no `goto`, no empty `if` arm.
+    /// instead of jumping there: no `goto`, no empty `if` arm. WS80: the tests that hold
+    /// nothing but the compare merge into one `&&` condition.
     #[test]
     fn compare_chain_to_one_exit_needs_no_goto() {
         let lifter = X86Lifter::new_64();
@@ -1441,7 +1556,9 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("goto"), "{c}");
         assert!(!c.contains("} else {"), "{c}");
-        assert_eq!(c.matches("if (!").count(), 3, "{c}");
+        assert_eq!(c.matches("if (").count(), 1, "{c}");
+        assert_eq!(c.matches(" && ").count(), 2, "{c}");
+        assert!(c.contains("(edi - 2) != 0") && c.contains("(edi - 3) != 0"), "{c}");
         assert_eq!(c.matches("return").count(), 1, "{c}");
     }
 
@@ -1542,4 +1659,144 @@ mod tests {
             "all reachable instructions must survive trim: {:?}", result.stats.basic_blocks);
         assert_eq!(result.stats.basic_blocks, 3);
     }
+
+    /// `if (a || b)`: the second test's block holds nothing but the test, so the two jumps to
+    /// the shared target are one condition (WS80) instead of the target printed twice.
+    #[test]
+    fn decompile_merges_or_condition() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, // cmp edi, 1
+            0x74, 0x0b, // je L
+            0x83, 0xfe, 0x02, // cmp esi, 2
+            0x74, 0x06, // je L
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+            0xc3, // ret
+            0xb8, 0x07, 0x00, 0x00, 0x00, // L: mov eax, 7
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains(" || ") || cond.contains(" && "), "{c}");
+        assert!(cond.contains("esi") && cond.contains('2'), "the second test folds into the condition: {c}");
+        assert_eq!(c.matches("if (").count(), 1, "{c}");
+        assert!(!c.contains("goto"), "{c}");
+        assert_eq!(c.matches("(uint32_t)7;").count(), 1, "{c}");
+    }
+
+
+    /// A lone `jmp` shared by two arms (not their join) is threaded through (WS80): both
+    /// arms go straight to where it leads, so no `goto` to the empty block is needed.
+    #[test]
+    fn shared_lone_jmp_needs_no_goto() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, // 1000: cmp edi, 1
+            0x75, 0x07, // 1003: jne 100c
+            0xb8, 0x05, 0x00, 0x00, 0x00, // 1005: mov eax, 5
+            0xeb, 0x0e, // 100a: jmp T (101a)
+            0xb8, 0x06, 0x00, 0x00, 0x00, // 100c: mov eax, 6
+            0x83, 0xfe, 0x03, // 1011: cmp esi, 3
+            0x74, 0x04, // 1014: je T (101a)
+            0xff, 0xc0, // 1016: inc eax
+            0xeb, 0x02, // 1018: jmp J (101c)
+            0xeb, 0x00, // 101a: T: jmp J
+            0xe8, 0xdf, 0x0f, 0x00, 0x00, // 101c: J: call 0x2000
+            0xc3, // 1021: ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("goto"), "{c}");
+        assert_eq!(c.matches("0x2000(").count(), 1, "{c}");
+    }
+
+    /// The epilogue's frame restore prints nothing (WS80): no `rsp = rsp + 8` from the `pop`,
+    /// no load of the return address for the `ret`.
+    #[test]
+    fn epilogue_frame_restore_is_not_printed() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x53, // push rbx
+            0x89, 0xfb, // mov ebx, edi
+            0xe8, 0xf8, 0x0f, 0x00, 0x00, // call 0x2000
+            0x89, 0xd8, // mov eax, ebx
+            0x5b, // pop rbx
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("rsp = rsp + 8"), "{c}");
+        assert!(!c.contains("= *(uint64_t*)rsp;"), "{c}");
+        assert!(c.contains("return rax;"), "{c}");
+        assert!(c.contains("rsp = rsp - 8"), "the prologue is kept: {c}");
+    }
+
+
+    /// After a call whose return register is unknown (an import, an unresolved indirect
+    /// call), `rax` tested and `xmm0` only handed on to the next call: the call returned in
+    /// `rax` (WS80) — one `rax = f()`, no `xmm0 = __ret`, no `xmm0` argument.
+    #[test]
+    fn unknown_callee_returns_in_the_register_really_read() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xe8, 0xfb, 0x0f, 0x00, 0x00, // 1000: call 0x2000
+            0x85, 0xc0, // 1005: test eax, eax
+            0x74, 0x05, // 1007: je 100e
+            0xe8, 0xfd, 0x0f, 0x00, 0x00, // 1009: call 0x200b
+            0xc3, // 100e: ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("__ret"), "{c}");
+        assert!(c.contains("rax = 0x2000("), "{c}");
+        assert!(!c.contains("xmm0"), "{c}");
+    }
+
+
+    /// `return g();` with `g` unknown: the function's own code cannot tell what it returns,
+    /// its callers can (WS80) — one that ignores the result makes it `void`, one that tests
+    /// `eax` keeps `uint64_t`.
+    #[test]
+    fn return_type_from_what_callers_read() {
+        let lifter = X86Lifter::new_64();
+        let f = |after: &[u8]| {
+            let mut code = vec![
+                0xe8, 0xfb, 0x0f, 0x00, 0x00, // 1000: call 0x2000
+                0xc3, // 1005: ret
+                0xe8, 0xf5, 0xff, 0xff, 0xff, // 1006: caller: call 0x1000
+            ];
+            code.extend_from_slice(after);
+            let mem = make_memory(&code, 0x1000);
+            decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code
+        };
+        let ignored = f(&[0x31, 0xc0, 0xc3]); // xor eax, eax ; ret
+        assert!(ignored.contains("void f("), "{ignored}");
+        assert!(!ignored.contains("return rax"), "{ignored}");
+        let tested = f(&[0x85, 0xc0, 0xc3]); // test eax, eax ; ret
+        assert!(tested.contains("uint64_t f("), "{tested}");
+    }
+
+
+    /// A folded `jne` test reads `a != b`, not `!(a == b)` (WS80).
+    #[test]
+    fn folded_jne_reads_not_equal() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, // cmp edi, 1
+            0x74, 0x0b, // je L
+            0x83, 0xfe, 0x02, // cmp esi, 2
+            0x75, 0x06, // jne L
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+            0xc3, // ret
+            0xb8, 0x07, 0x00, 0x00, 0x00, // L: mov eax, 7
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains("(esi - 2) != 0") || cond.contains("(esi - 2) == 0"), "{c}");
+        assert!(!cond.contains("!((esi - 2)"), "{c}");
+    }
+
 }

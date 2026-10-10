@@ -54,12 +54,18 @@ pub struct CEmitter<'a> {
     /// `CallSiteAnnotator` once the iterative resolver has pinned
     /// arg values + a `SignatureDatabase` signature.
     call_renderings: Option<&'a BTreeMap<u64, String>>,
+    /// Conditions of the blocks the short-circuit merge collapsed (`a || b`), by block.
+    conds: Option<&'a rustc_hash::FxHashMap<usize, crate::condition::Cond>>,
+    /// Folds a test block's ops into its condition expression while a leaf is printed.
+    inliner: crate::condition::Inliner,
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// Blocks some `goto` jumps to: each gets a `label_<addr>:` line where its code starts
     /// (otherwise the `goto` names a label that is never printed).
     goto_targets: std::collections::BTreeSet<usize>,
+    /// Epilogue ops not printed (`epilogue_noise`).
+    noise: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for CEmitter<'static> {
@@ -77,8 +83,11 @@ impl CEmitter<'static> {
             string_literals: empty_u64_map(),
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
+            noise: rustc_hash::FxHashSet::default(),
         }
     }
 }
@@ -108,8 +117,11 @@ impl<'a> CEmitter<'a> {
             string_literals,
             annotations: None,
             call_renderings: None,
+            conds: None,
+            inliner: crate::condition::Inliner::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
+            noise: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -137,6 +149,12 @@ impl<'a> CEmitter<'a> {
         self
     }
 
+    /// Attach the merged short-circuit conditions (`condition::merge_short_circuits`).
+    pub fn with_conditions(mut self, conds: &'a rustc_hash::FxHashMap<usize, crate::condition::Cond>) -> Self {
+        self.conds = Some(conds);
+        self
+    }
+
     pub fn emit_function(
         &mut self,
         func: &SsaFunction,
@@ -145,6 +163,7 @@ impl<'a> CEmitter<'a> {
         self.output.clear();
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
+        self.noise = epilogue_noise(func);
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -371,7 +390,7 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -383,7 +402,7 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
@@ -903,6 +922,9 @@ impl<'a> CEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
+        if let Some(e) = self.inliner.get(op.inputs[idx]) {
+            return e;
+        }
         let vn = &func.varnodes[op.inputs[idx] as usize];
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
             if let Some(s) = self.string_literals.get(&vn.data.offset) {
@@ -939,6 +961,16 @@ impl<'a> CEmitter<'a> {
     }
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
+        if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
+            let mut leaf = |b: usize| {
+                if b == block_id {
+                    self.get_branch_condition(func, b)
+                } else {
+                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+                }
+            };
+            return c.render(negated, &mut leaf);
+        }
         negate_condition(self.get_branch_condition(func, block_id), negated)
     }
 
@@ -1017,15 +1049,59 @@ pub(crate) fn is_merged_call_result(func: &SsaFunction, op: &crate::ssa::SsaOp) 
     call.is_some_and(|c| call_result(func, c) == op.output)
 }
 
-/// `cond` inverted when `negated`: `!x` for a plain name, `!(…)` otherwise.
+/// `cond` inverted when `negated`: `!x` for a plain name, `x` for `!x`, `a != b` for
+/// `a == b` (and back), `!(…)` otherwise.
 pub(crate) fn negate_condition(cond: String, negated: bool) -> String {
     if !negated {
-        cond
-    } else if cond.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        format!("!{cond}")
-    } else {
-        format!("!({cond})")
+        return cond;
     }
+    if cond.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return format!("!{cond}");
+    }
+    if let Some(rest) = cond.strip_prefix('!')
+        && crate::condition::is_atomic(rest)
+    {
+        return strip_outer_parens(rest).to_string();
+    }
+    if let Some(flipped) = flip_equality(&cond) {
+        return flipped;
+    }
+    format!("!({cond})")
+}
+
+/// `(x)` -> `x` when the parentheses enclose the whole expression.
+fn strip_outer_parens(s: &str) -> &str {
+    if s.starts_with('(') && crate::condition::is_atomic(s) { &s[1..s.len() - 1] } else { s }
+}
+
+/// `a == b` -> `a != b` (and back) when that comparison is the only operator at the top level
+/// (outside parentheses) that binds looser than arithmetic.
+fn flip_equality(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut found: Option<(usize, &str)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                for op in [" == ", " != ", " && ", " || ", " < ", " <= ", " > ", " >= ", " ? ", " & ", " | ", " ^ "] {
+                    if s[i..].starts_with(op) {
+                        if found.is_some() || !matches!(op, " == " | " != ") {
+                            return None;
+                        }
+                        found = Some((i, op));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let (at, op) = found?;
+    let flipped = if op == " == " { " != " } else { " == " };
+    Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
 }
 
 struct FunctionSignature {
@@ -1101,6 +1177,47 @@ impl FunctionSignature {
 /// function was entered with (nothing on the path set it). A one-input `RETURN` counts as
 /// returning its input only when that is `rax` itself (hand-built p-code in tests).
 /// Returns the index of that input.
+/// The ops of the function's epilogues that print only frame bookkeeping (WS80): in the run
+/// of [`crate::cfg::is_epilogue_insn`] instructions that ends a return block, a write of the
+/// stack pointer, the load of the return address the `ret` jumps to, and anything read only by
+/// such ops. A `pop` whose value is returned (`pop rax` before `ret`) is kept.
+pub(crate) fn epilogue_noise(func: &SsaFunction) -> rustc_hash::FxHashSet<usize> {
+    let mut noise = rustc_hash::FxHashSet::default();
+    let mut addrs = rustc_hash::FxHashSet::default();
+    for b in &func.cfg.blocks {
+        if b.is_return() {
+            for insn in b.instructions.iter().rev() {
+                if !crate::cfg::is_epilogue_insn(&insn.mnemonic) {
+                    break;
+                }
+                addrs.insert(insn.address);
+            }
+        }
+    }
+    if addrs.is_empty() {
+        return noise;
+    }
+    // backwards, so an op's readers are classified before it
+    for op in func.ops.iter().rev() {
+        if op.dead || op.opcode == OpCode::Return || !addrs.contains(&op.address) {
+            continue;
+        }
+        let Some(out) = op.output else { continue };
+        let vn = &func.varnodes[out as usize];
+        let is_sp = vn.data.space == SpaceId::REGISTER && matches!(varnode_name(vn).as_str(), "rsp" | "esp");
+        let only_noise = vn.uses.iter().all(|&u| {
+            let r = &func.ops[u];
+            r.dead
+                || noise.contains(&u)
+                || (r.opcode == OpCode::Return && r.inputs.first() == Some(&out) && return_value(func, r) != Some(0))
+        });
+        if is_sp || only_noise {
+            noise.insert(op.index);
+        }
+    }
+    noise
+}
+
 pub(crate) fn return_value(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<usize> {
     let reg_set = |v: u32| {
         let vn = &func.varnodes[v as usize];
