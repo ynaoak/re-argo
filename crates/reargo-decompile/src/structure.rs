@@ -505,7 +505,16 @@ impl<'a> Structurer<'a> {
             && rank(&jf) > rank(&jt)
             && let Some(jump) = jf
         {
-            let node = StructuredBlock::IfThen { condition_block: b, then_body: Box::new(jump), negated: true };
+            // a `goto` to a short region printed elsewhere that ends the flow (in `break`,
+            // `continue` or a return tail): print the region again instead (WS81)
+            let body = match jump {
+                StructuredBlock::Goto(x) => self
+                    .copy_region(x, None)
+                    .filter(|c| ends_flow(self.cfg, c))
+                    .map_or(jump, seq),
+                j => j,
+            };
+            let node = StructuredBlock::IfThen { condition_block: b, then_body: Box::new(body), negated: true };
             return (vec![node], Some(t));
         }
         if let Some(j) = join {
@@ -905,6 +914,25 @@ mod tests {
             lifted(0x1006, vec![call(0x1006, 0x3000)]),
             lifted(0x1007, vec![call(0x1007, 0x2000)]),
             lifted(0x1008, vec![ret(0x1008)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+    }
+
+    /// WS81: a test whose fall-through is a short "next iteration" region already printed
+    /// (`n = n->next; if (!n) break; continue;`) prints the region again instead of a `goto`.
+    #[test]
+    fn jump_to_short_loop_step_is_copied() {
+        // H: nop ; P: jcc N ; Q: jcc R ; N: nop ; jcc H ; E: ret ; R: ret
+        let insns = vec![
+            nop(0x1000),
+            lifted(0x1001, vec![cbranch(0x1001, 0x1003)]),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1006)]),
+            nop(0x1003),
+            lifted(0x1004, vec![cbranch(0x1004, 0x1000)]),
+            lifted(0x1005, vec![ret(0x1005)]),
+            lifted(0x1006, vec![ret(0x1006)]),
         ];
         let cfg = ControlFlowGraph::build(&insns);
         let s = structure_cfg(&cfg);
