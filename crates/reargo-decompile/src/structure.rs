@@ -107,6 +107,9 @@ pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
 /// Longest straight-line tail (instructions) copied in place of a `goto`.
 const MAX_TAIL_INSNS: usize = 6;
 
+/// Longest block (instructions) printed a second time in place of a `goto` to it.
+const MAX_COPY_INSNS: usize = 4;
+
 /// The blocks of a short tail that ends in a `ret` (`goto` to it can print the tail itself):
 /// a chain of single-successor blocks into a return block, at most [`MAX_TAIL_INSNS`]
 /// instructions and no call. The epilogue's frame restore (`pop`, `add rsp`, `ret`, see
@@ -324,6 +327,29 @@ impl<'a> Structurer<'a> {
         self.jump_for(b).or_else(|| self.emitted[b].then_some(StructuredBlock::Goto(b)))
     }
 
+    /// `b` (already printed) is a short straight-line block (at most [`MAX_COPY_INSNS`]
+    /// instructions, no call) whose successor this walk can reach without a `goto`: the end
+    /// of the region (`stop`), a `break` / `continue`, or a return tail (copied later). The
+    /// jump to print after the copy (`None` for a block that is not copied).
+    fn copy_instead_of_goto(&self, b: BlockId, stop: Option<BlockId>) -> Option<Vec<StructuredBlock>> {
+        use reargo_core::pcode::OpCode;
+        let block = &self.cfg.blocks[b];
+        let [s] = block.successors.as_slice() else { return None };
+        let insns = block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
+        let calls = block.instructions.iter().any(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
+        if insns > MAX_COPY_INSNS || calls || *s == b || self.loops[b].is_some() {
+            return None;
+        }
+        if Some(*s) == stop {
+            return Some(Vec::new());
+        }
+        match self.jump_for(*s) {
+            Some(j @ (StructuredBlock::Break | StructuredBlock::Continue)) => Some(vec![j]),
+            None if self.emitted[*s] && return_tail(self.cfg, *s).is_some() => Some(vec![StructuredBlock::Goto(*s)]),
+            _ => None,
+        }
+    }
+
     /// Structure the code from `start` until `stop` (exclusive; `None` = until the flow ends).
     /// `header_first`: `start` is the header of the innermost loop being entered (print it
     /// rather than `continue`).
@@ -342,6 +368,13 @@ impl<'a> Structurer<'a> {
                     break;
                 }
                 if self.emitted[b] {
+                    // a short block printed elsewhere, whose successor is reachable from
+                    // here too: print it again instead of `goto` to it
+                    if let Some(after) = self.copy_instead_of_goto(b, stop) {
+                        out.push(StructuredBlock::Basic(b));
+                        out.extend(after);
+                        break;
+                    }
                     out.push(StructuredBlock::Goto(b));
                     break;
                 }
@@ -933,6 +966,35 @@ mod tests {
         let cfg = ControlFlowGraph::build(&insns);
         let s = structure_cfg(&cfg);
         assert_eq!(gotos(&s), 0, "{s:?}");
+    }
+
+
+    #[test]
+    fn short_shared_block_is_copied_instead_of_goto() {
+        // A: jcc L ; X: nop ; B: jcc L ; Y: jmp J ; L: nop nop ; J: call ; ret
+        // L is shared by A's then-arm and B (in A's else-arm) and falls into the join J
+        let call = PcodeOp {
+            opcode: OpCode::Call,
+            seq: seq(0x1007),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId(1), 0x2000, 8)]),
+        };
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1005)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1005)]),
+            nop(0x1003),
+            lifted(0x1004, vec![branch(0x1004, 0x1007)]),
+            nop(0x1005),
+            nop(0x1006),
+            lifted(0x1007, vec![call]),
+            lifted(0x1008, vec![ret(0x1008)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let l = cfg.block_at(0x1005).unwrap().id;
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Basic(b) if *b == l)), 2, "{s:?}");
     }
 
 }
