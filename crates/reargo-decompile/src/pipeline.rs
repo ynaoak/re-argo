@@ -60,9 +60,11 @@ pub fn decompile_with_symbols(
     rewrite_tail_calls(&mut trimmed);
     let trimmed = crate::vcall::devirtualize_constant_calls(trimmed, memory);
     let oracle = CalleeParams::new(lifter, memory);
-    let call_params = callee_param_map(&trimmed, oracle.as_ref(), symbols);
+    let imports = Imports { symbols, code: Some((lifter, memory)) };
+    let call_params = callee_param_map(&trimmed, oracle.as_ref(), &imports);
     let own = own_params(oracle.as_ref(), entry);
-    let call_returns = callee_return_map(&trimmed, oracle.as_ref(), symbols);
+    let call_returns = callee_return_map(&trimmed, oracle.as_ref(), &imports);
+    let symbols = &with_thunk_names(symbols, imports.thunk_names(&trimmed));
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
@@ -108,17 +110,77 @@ fn own_params(
     Some((oracle.params(entry)?, oracle.args().to_vec()))
 }
 
+/// `symbols` with the names of import thunks added (borrowed when there are none).
+fn with_thunk_names(
+    symbols: &std::collections::BTreeMap<u64, String>,
+    extra: std::collections::BTreeMap<u64, String>,
+) -> std::borrow::Cow<'_, std::collections::BTreeMap<u64, String>> {
+    if extra.is_empty() {
+        return std::borrow::Cow::Borrowed(symbols);
+    }
+    let mut all = symbols.clone();
+    all.extend(extra);
+    std::borrow::Cow::Owned(all)
+}
+
 /// Parameters of every direct call's callee in `instructions`, keyed by the
 /// call instruction's address (WS78).
 /// The callee of a direct call is a known import (WS82): its prototype.
-fn import_proto(symbols: &std::collections::BTreeMap<u64, String>, target: u64) -> Option<crate::prototypes::Proto> {
-    crate::prototypes::import_prototype(symbols.get(&target)?)
+fn import_proto(imports: &Imports<'_>, target: u64) -> Option<crate::prototypes::Proto> {
+    crate::prototypes::import_prototype(&imports.name(target)?)
+}
+
+/// Names of call targets that are imports (WS82): an import's own name, or — for a thunk
+/// whose only instruction is `jmp import@plt` (`0x3a60420: jmp pthread_cond_destroy@plt`) —
+/// the import's.
+struct Imports<'a> {
+    symbols: &'a std::collections::BTreeMap<u64, String>,
+    code: Option<(&'a dyn PcodeLift, &'a Memory)>,
+}
+
+impl Imports<'_> {
+    fn name(&self, target: u64) -> Option<String> {
+        if let Some(n) = self.symbols.get(&target) {
+            return Some(n.clone());
+        }
+        let n = self.symbols.get(&self.thunk_target(target)?)?;
+        crate::prototypes::import_prototype(n).is_some().then(|| n.clone())
+    }
+
+    /// `jmp t` as the first instruction of `target`: `t`.
+    fn thunk_target(&self, target: u64) -> Option<u64> {
+        let (lifter, memory) = self.code?;
+        let insn = lifter.lift_instruction(memory, target).ok()?;
+        match insn.ops.as_slice() {
+            [op] if op.opcode == reargo_core::pcode::OpCode::Branch => {
+                op.inputs.first().filter(|t| t.space == reargo_core::address::SpaceId::RAM).map(|t| t.offset)
+            }
+            _ => None,
+        }
+    }
+
+    /// The names of the thunks to imports that `instructions` call, for the call rendering.
+    fn thunk_names(&self, instructions: &[LiftedInstruction]) -> std::collections::BTreeMap<u64, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for op in instructions.iter().flat_map(|i| i.ops.iter()) {
+            if op.opcode == reargo_core::pcode::OpCode::Call
+                && let Some(t) = op.inputs.first()
+                && t.space == reargo_core::address::SpaceId::RAM
+                && !self.symbols.contains_key(&t.offset)
+                && !out.contains_key(&t.offset)
+                && let Some(n) = self.name(t.offset)
+            {
+                out.insert(t.offset, n);
+            }
+        }
+        out
+    }
 }
 
 fn callee_param_map(
     instructions: &[LiftedInstruction],
     oracle: Option<&CalleeParams<'_>>,
-    symbols: &std::collections::BTreeMap<u64, String>,
+    imports: &Imports<'_>,
 ) -> rustc_hash::FxHashMap<u64, ParamInfo> {
     use reargo_core::pcode::OpCode;
     let mut out = rustc_hash::FxHashMap::default();
@@ -130,7 +192,7 @@ fn callee_param_map(
                 && t.space == reargo_core::address::SpaceId::RAM
             {
                 // an import's code is not in the binary: its known prototype, if any
-                let info = match import_proto(symbols, t.offset) {
+                let info = match import_proto(imports, t.offset) {
                     Some(p) => Some(p.params(oracle.args())),
                     None => oracle.params(t.offset),
                 };
@@ -148,7 +210,7 @@ fn callee_param_map(
 fn callee_return_map(
     instructions: &[LiftedInstruction],
     oracle: Option<&CalleeParams<'_>>,
-    symbols: &std::collections::BTreeMap<u64, String>,
+    imports: &Imports<'_>,
 ) -> rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind> {
     use reargo_core::pcode::OpCode;
     let mut out = rustc_hash::FxHashMap::default();
@@ -159,7 +221,7 @@ fn callee_return_map(
                 && let Some(t) = op.inputs.first()
                 && t.space == reargo_core::address::SpaceId::RAM
             {
-                let k = match import_proto(symbols, t.offset) {
+                let k = match import_proto(imports, t.offset) {
                     Some(p) => p.return_kind().unwrap_or(crate::callee_params::ReturnKind::Unknown),
                     None => oracle.return_kind(t.offset),
                 };
@@ -311,9 +373,11 @@ fn decompile_function_inner(
     let mut terminated = terminated;
     rewrite_tail_calls(&mut terminated);
     let terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
-    let call_params = callee_param_map(&terminated, oracle, symbols);
+    let imports = Imports { symbols, code: Some((lifter, &program.info.memory)) };
+    let call_params = callee_param_map(&terminated, oracle, &imports);
     let own = own_params(oracle, func_entry);
-    let call_returns = callee_return_map(&terminated, oracle, symbols);
+    let call_returns = callee_return_map(&terminated, oracle, &imports);
+    let symbols = &with_thunk_names(symbols, imports.thunk_names(&terminated));
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
     // WS82: the exception landing pads, printed after the body
@@ -2303,5 +2367,24 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
         assert!(call.contains("(rdi, rsi)"), "{c}");
+    }
+
+    /// A thunk whose only instruction is `jmp import@plt` is that import (WS82): its name and
+    /// its prototype (`pthread_cond_destroy@plt(rdi)`, not `0x1010()`).
+    #[test]
+    fn call_to_an_import_thunk_takes_the_import() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8d, 0x7b, 0x10, // lea rdi, [rbx+0x10]
+            0xe8, 0x07, 0x00, 0x00, 0x00, // call 0x1010
+            0xc3, // ret
+            0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // pad
+            0xe9, 0xeb, 0x0f, 0x00, 0x00, // 0x1010: jmp 0x2000
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let symbols = std::collections::BTreeMap::from([(0x2000u64, "pthread_cond_destroy@plt".to_string())]);
+        let c = decompile_with_symbols(&lifter, &mem, 0x1000, "f", 4, &symbols).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("pthread_cond_destroy@plt(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("(rdi)"), "{c}");
     }
 }
