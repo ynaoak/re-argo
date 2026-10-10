@@ -344,100 +344,103 @@ impl Emulator {
 
             OpCode::FloatAdd => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_ADD".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
-                self.state.write_varnode(out, (a + b).to_bits());
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
+                self.write_float(out, a + b);
             }
             OpCode::FloatSub => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_SUB".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
-                self.state.write_varnode(out, (a - b).to_bits());
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
+                self.write_float(out, a - b);
             }
             OpCode::FloatMult => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_MULT".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
-                self.state.write_varnode(out, (a * b).to_bits());
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
+                self.write_float(out, a * b);
             }
             OpCode::FloatDiv => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_DIV".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
-                self.state.write_varnode(out, (a / b).to_bits());
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
+                self.write_float(out, a / b);
             }
             OpCode::FloatNeg => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_NEG".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                self.state.write_varnode(out, (-a).to_bits());
+                let a = self.read_float(op, 0)?;
+                self.write_float(out, -a);
             }
             OpCode::FloatAbs => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_ABS".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                self.state.write_varnode(out, a.abs().to_bits());
+                let a = self.read_float(op, 0)?;
+                self.write_float(out, a.abs());
             }
             OpCode::FloatSqrt => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_SQRT".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                self.state.write_varnode(out, a.sqrt().to_bits());
+                let a = self.read_float(op, 0)?;
+                self.write_float(out, a.sqrt());
             }
             OpCode::FloatEqual => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_EQUAL".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
                 self.state.write_varnode(out, if a == b { 1 } else { 0 });
             }
             OpCode::FloatNotEqual => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_NOTEQUAL".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
                 self.state.write_varnode(out, if a != b { 1 } else { 0 });
             }
             OpCode::FloatLess => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_LESS".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
                 self.state.write_varnode(out, if a < b { 1 } else { 0 });
             }
             OpCode::FloatLessEqual => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_LESSEQUAL".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                let b = f64::from_bits(self.read_input(op, 1)?);
+                let a = self.read_float(op, 0)?;
+                let b = self.read_float(op, 1)?;
                 self.state.write_varnode(out, if a <= b { 1 } else { 0 });
             }
             OpCode::FloatNan => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_NAN".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
+                let a = self.read_float(op, 0)?;
                 self.state.write_varnode(out, if a.is_nan() { 1 } else { 0 });
             }
             OpCode::FloatInt2Float => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_INT2FLOAT".into()))?;
-                let a = self.read_input(op, 0)? as i64;
-                self.state.write_varnode(out, (a as f64).to_bits());
+                // a signed integer of the input's width
+                let size = op.inputs.first().map(|v| v.size.min(8)).unwrap_or(8);
+                let extend = 64 - size * 8;
+                let a = ((self.read_input(op, 0)? << extend) as i64) >> extend;
+                self.write_float(out, a as f64);
             }
             OpCode::FloatFloat2Float => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_FLOAT2FLOAT".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
-                self.state.write_varnode(out, a.to_bits());
+                let a = self.read_float(op, 0)?;
+                self.write_float(out, a);
             }
             OpCode::FloatTrunc => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_TRUNC".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
+                let a = self.read_float(op, 0)?;
                 self.state.write_varnode(out, a.trunc() as i64 as u64);
             }
             OpCode::FloatCeil => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_CEIL".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
+                let a = self.read_float(op, 0)?;
                 self.state.write_varnode(out, a.ceil() as i64 as u64);
             }
             OpCode::FloatFloor => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_FLOOR".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
+                let a = self.read_float(op, 0)?;
                 self.state.write_varnode(out, a.floor() as i64 as u64);
             }
             OpCode::FloatRound => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("FLOAT_ROUND".into()))?;
-                let a = f64::from_bits(self.read_input(op, 0)?);
+                let a = self.read_float(op, 0)?;
                 self.state.write_varnode(out, a.round() as i64 as u64);
             }
             OpCode::IntCarry => {
@@ -590,6 +593,22 @@ impl Emulator {
             self.execute_op(op)?;
         }
         Ok(())
+    }
+
+    /// A float input: 4 bytes are an f32, else an f64 (WS84: a 4-byte float was read as the
+    /// low bits of an f64).
+    fn read_float(&self, op: &PcodeOp, index: usize) -> Result<f64, EmulatorError> {
+        let bits = self.read_input(op, index)?;
+        Ok(match op.input(index).map(|v| v.size) {
+            Some(4) => f64::from(f32::from_bits(bits as u32)),
+            _ => f64::from_bits(bits),
+        })
+    }
+
+    /// Write a float result at the output's width (4 bytes = f32).
+    fn write_float(&mut self, out: &reargo_core::pcode::VarnodeData, v: f64) {
+        let bits = if out.size == 4 { u64::from((v as f32).to_bits()) } else { v.to_bits() };
+        self.state.write_varnode(out, bits);
     }
 
     fn read_input(&self, op: &PcodeOp, index: usize) -> Result<u64, EmulatorError> {
@@ -1052,5 +1071,25 @@ mod tests {
         emu.state.write_register(0x10, 8, 0x1234);
         emu.execute_op(&call(intrinsic::BSF, 4)).unwrap();
         assert_eq!(emu.state.read_register(0x10, 4), 0x1234, "bsf of 0 keeps the destination");
+    }
+
+    /// 4-byte float ops are f32 (WS84: they were read as the low bits of an f64), and
+    /// INT2FLOAT sign-extends its input's width.
+    #[test]
+    fn emu_float_ops_at_f32_width() {
+        let mut emu = Emulator::new();
+        let f = |off| VarnodeData::new(REG, off, 4);
+        emu.state.write_register(0x1200, 4, u64::from(1.5f32.to_bits()));
+        emu.state.write_register(0x1210, 4, u64::from(2.25f32.to_bits()));
+        let bin = |opcode| PcodeOp { opcode, seq: seq(), output: Some(f(0x1220)), inputs: SmallVec::from_slice(&[f(0x1200), f(0x1210)]) };
+        emu.execute_op(&bin(OpCode::FloatMult)).unwrap();
+        assert_eq!(emu.state.read_register(0x1220, 4), u64::from(3.375f32.to_bits()));
+        let less = PcodeOp { opcode: OpCode::FloatLess, seq: seq(), output: Some(VarnodeData::new(REG, 0x300, 1)), inputs: SmallVec::from_slice(&[f(0x1200), f(0x1210)]) };
+        emu.execute_op(&less).unwrap();
+        assert_eq!(emu.state.read_register(0x300, 1), 1);
+        emu.state.write_register(0x00, 4, (-3i32) as u32 as u64);
+        let conv = PcodeOp { opcode: OpCode::FloatInt2Float, seq: seq(), output: Some(f(0x1220)), inputs: SmallVec::from_slice(&[VarnodeData::new(REG, 0x00, 4)]) };
+        emu.execute_op(&conv).unwrap();
+        assert_eq!(emu.state.read_register(0x1220, 4), u64::from((-3.0f32).to_bits()));
     }
 }
