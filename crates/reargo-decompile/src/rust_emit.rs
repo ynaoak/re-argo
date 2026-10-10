@@ -421,6 +421,10 @@ impl<'a> RustEmitter<'a> {
             OpCode::IntAnd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
+                if op.inputs.len() == 2 && op.inputs[0] == op.inputs[1] {
+                    // `test r, r`: `r & r` is `r`
+                    return Some(format!("{} = {};", dst, a));
+                }
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {} & {};", dst, a, b))
             }

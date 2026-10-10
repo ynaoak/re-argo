@@ -1572,6 +1572,21 @@ mod tests {
         assert!(!c.contains("var_") && !c.contains("tmp_"), "{c}");
     }
 
+    /// `test r, r` reads as `r`, not `r & r`.
+    #[test]
+    fn test_of_a_register_with_itself_is_the_register() {
+        let c = c_of(&[
+            0x85, 0xff, // 0x1000 test edi, edi
+            0x74, 0x06, // 0x1002 je 0x100a
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 0x1004 mov eax, 1
+            0xc3, // 0x1009
+            0x31, 0xc0, // 0x100a xor eax, eax
+            0xc3,
+        ]);
+        assert!(!c.contains("edi & edi"), "{c}");
+        assert!(c.contains("edi == 0") || c.contains("edi != 0"), "{c}");
+    }
+
     /// WS77: a function that never sets `rax` returns nothing.
     #[test]
     fn ret_without_rax_write_is_void() {
