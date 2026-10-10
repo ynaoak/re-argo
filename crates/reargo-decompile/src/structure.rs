@@ -106,6 +106,8 @@ pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
 
 /// Longest straight-line tail (instructions) copied in place of a `goto`.
 const MAX_TAIL_INSNS: usize = 6;
+/// Most calls in a tail copied in place of a `goto`.
+const MAX_TAIL_CALLS: usize = 1;
 
 /// Longest block (instructions) printed a second time in place of a `goto` to it.
 const MAX_COPY_INSNS: usize = 4;
@@ -114,25 +116,34 @@ const MAX_COPY_REGION_INSNS: usize = 6;
 /// Most blocks on a path through a region printed a second time.
 const MAX_COPY_DEPTH: usize = 2;
 
-/// The blocks of a short tail that ends in a `ret` (`goto` to it can print the tail itself):
-/// a chain of single-successor blocks into a return block, at most [`MAX_TAIL_INSNS`]
-/// instructions and no call. The epilogue's frame restore (`pop`, `add rsp`, `ret`, see
-/// [`crate::cfg::is_epilogue_insn`]) prints nothing and does not count.
+/// The blocks of a short tail that ends the function (`goto` to it can print the tail
+/// itself): a chain of single-successor blocks into a `ret`, a trap or a call that never
+/// returns (WS81), at most [`MAX_TAIL_INSNS`] instructions and [`MAX_TAIL_CALLS`] call
+/// (`unlock(m); return x;`, `throw_length_error("vector");`). The epilogue's frame restore
+/// (`pop`, `add rsp`, `ret`, see [`crate::cfg::is_epilogue_insn`]) prints nothing and does
+/// not count.
 fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
     use reargo_core::pcode::OpCode;
     let mut chain = Vec::new();
-    let mut insns = 0;
+    let (mut insns, mut calls) = (0, 0);
     let mut b = start;
     loop {
         let block = &cfg.blocks[b];
         insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
-        let calls = block.instructions.iter().any(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
-        if insns > MAX_TAIL_INSNS || calls || chain.contains(&b) {
+        calls += block
+            .instructions
+            .iter()
+            .filter(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)))
+            .count();
+        if insns > MAX_TAIL_INSNS || calls > MAX_TAIL_CALLS || chain.contains(&b) {
             return None;
         }
         chain.push(b);
         match block.successors.as_slice() {
-            [] => return block.is_return().then_some(chain),
+            [] => {
+                let ends = block.is_return() || block.instructions.last().is_some_and(crate::cfg::is_trap);
+                return ends.then_some(chain);
+            }
             [next] => b = *next,
             _ => return None,
         }
@@ -833,6 +844,36 @@ mod tests {
         // 3+ successors (it depends on builder details), but we do guarantee
         // the routine doesn't panic or infinitely recurse.
         let _ = structure_cfg(&cfg);
+    }
+
+    /// WS81: a shared tail that ends in a call that never returns is copied like a `ret` tail.
+    #[test]
+    fn goto_to_short_noreturn_tail_is_copied() {
+        let call = |addr: u64| PcodeOp {
+            opcode: OpCode::Call,
+            seq: seq(addr),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId(1), 0x5000, 8)]),
+        };
+        let mark = |addr: u64| PcodeOp {
+            opcode: OpCode::CallOther,
+            seq: seq(addr),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId::CONST, reargo_core::pcode::intrinsic::NORETURN, 4)]),
+        };
+        // E: jcc T ; B: nop ; C: jcc T ; D: ret ; T: call abort (never returns)
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1004)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1004)]),
+            lifted(0x1003, vec![ret(0x1003)]),
+            lifted(0x1004, vec![call(0x1004), mark(0x1004)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let t = cfg.block_at(0x1004).unwrap().id;
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
+        assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Basic(b) if *b == t)), 2, "{s:?}");
     }
 
     fn nop(addr: u64) -> LiftedInstruction {
