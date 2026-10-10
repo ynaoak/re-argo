@@ -847,7 +847,11 @@ fn build_decompile_result(
     let mut opt_stats = run_optimization_passes(&mut ssa);
     // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
     if crate::flags::recover_flag_compares(&mut ssa) > 0 {
-        opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
+        // twice: a copy of a constant that copy propagation already replaced in its reader
+        // still lists that reader, which dies only in the first round (`OF = 0` of `test`)
+        for _ in 0..2 {
+            opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
+        }
     }
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
@@ -2084,5 +2088,27 @@ mod tests {
         for bad in ["(int32_t)edi < (int32_t)esi", "(int32_t)edi >= (int32_t)esi"] {
             assert!(!c.contains(bad), "{c}");
         }
+    }
+    /// `dec dword [rdi]; mov ecx, [rdi]; test ecx, ecx; jg`: `test` clears OF, so the `jg`
+    /// reads `ecx > 0`, not the `dec`'s overflow flag (WS82, a lifter fix).
+    #[test]
+    fn jg_after_test_reads_no_stale_overflow() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xf0, 0xff, 0x0f, // lock dec dword ptr [rdi]
+            0x8b, 0x0f, // mov ecx, [rdi]
+            0x85, 0xc9, // test ecx, ecx
+            0x7f, 0x01, // jg L
+            0xc3, // ret
+            0x31, 0xc0, // L: xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW") && !c.contains("var_20b"), "{c}");
+        // (`ecx` is read only by the test: its load folds into the condition)
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains(" > (int32_t)0") || cond.contains(" <= (int32_t)0"), "{c}");
+        assert!(!cond.contains("!0") && !cond.contains("||"), "{c}");
     }
 }

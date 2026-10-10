@@ -85,17 +85,25 @@ fn relation_uncached(
     match op.opcode {
         IntSub if op.inputs.len() == 2 => leaf(Rel::Sub(in0?, in1?)),
         IntSBorrow if op.inputs.len() == 2 => leaf(Rel::Of(in0?, in1?)),
-        IntEqual | IntNotEqual if is_zero(func, in1?) => {
+        IntEqual | IntNotEqual if is_zero(func, in1?) && sub_of(in0?, memo).is_some() => {
             let (a, b, an) = sub_of(in0?, memo)?;
             Some((Rel::Cmp(op.opcode, a, b), an))
         }
-        IntSLess if is_zero(func, in1?) => {
+        IntSLess if is_zero(func, in1?) && sub_of(in0?, memo).is_some() => {
             let (a, b, an) = sub_of(in0?, memo)?;
             Some((Rel::Sf(a, b), an))
         }
         IntEqual | IntNotEqual | IntLess | IntLessEqual | IntSLess | IntSLessEqual if op.inputs.len() == 2 => {
-            leaf(Rel::Cmp(op.opcode, in0?, in1?))
+            // the flags of `test r, r` compare `r & r`, which is `r`
+            let a = match func.varnodes[in0? as usize].def_op.map(|t| &func.ops[t]) {
+                Some(t) if t.opcode == IntAnd && t.inputs.len() == 2 && same(t.inputs[0], t.inputs[1]) && !t.dead => t.inputs[0],
+                _ => in0?,
+            };
+            leaf(Rel::Cmp(op.opcode, a, in1?))
         }
+        // `SF != 0`: after `test` / `and`, which clear OF, `jl` is the sign flag
+        BoolXor if is_zero(func, in1?) => relation(func, in0?, depth + 1, memo),
+        BoolXor if is_zero(func, in0?) => relation(func, in1?, depth + 1, memo),
         // SF != OF: signed less
         BoolXor => {
             let (x, ax) = relation(func, in0?, depth + 1, memo)?;
