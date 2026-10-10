@@ -203,9 +203,9 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
     let mut changed = true;
     while changed {
         changed = false;
-        for b in 0..n {
+        for (b, &pure_b) in pure.iter().enumerate() {
             // `b` is the inner test `B`
-            if !pure[b] || b == cfg.entry_block || cfg.blocks[b].predecessors.len() != 1 {
+            if !pure_b || b == cfg.entry_block || cfg.blocks[b].predecessors.len() != 1 {
                 continue;
             }
             let a = cfg.blocks[b].predecessors[0];
@@ -280,11 +280,11 @@ fn thread_empty_blocks(cfg: &mut ControlFlowGraph, empty: &[bool]) {
         }
         stack.extend(cfg.blocks[b].successors.iter().copied().filter(|&s| !reach[s]));
     }
-    for b in 0..n {
-        if !reach[b] {
-            cfg.blocks[b].successors.clear();
+    for (block, &r) in cfg.blocks.iter_mut().zip(&reach) {
+        if !r {
+            block.successors.clear();
         }
-        cfg.blocks[b].predecessors.clear();
+        block.predecessors.clear();
     }
     for b in 0..n {
         for i in 0..cfg.blocks[b].successors.len() {
