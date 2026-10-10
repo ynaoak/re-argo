@@ -2432,6 +2432,28 @@ mod tests {
         assert!(c.contains("ebx != 0") || c.contains("ebx == 0"), "{c}");
     }
 
+    /// `popcnt` / `lzcnt` / `tzcnt` / `bswap` keep their dataflow and print by name (WS84: they
+    /// were `__unmodeled_insn()` and the result register was never written).
+    #[test]
+    fn bit_count_instructions_print_by_name() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xf3, 0x0f, 0xb8, 0xc7, // popcnt eax, edi
+            0xf3, 0x0f, 0xbd, 0xce, // lzcnt ecx, esi
+            0x01, 0xc8, // add eax, ecx
+            0xf3, 0x0f, 0xbc, 0xca, // tzcnt ecx, edx
+            0x01, 0xc8, // add eax, ecx
+            0x0f, 0xc8, // bswap eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        for f in ["popcount(edi)", "lzcount(esi)", "tzcnt(edx)", "bswap(eax)"] {
+            assert!(c.contains(f), "{f}: {c}");
+        }
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+    }
+
     /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
     #[test]
     fn cmov_is_a_select() {

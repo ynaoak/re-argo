@@ -12,3 +12,6 @@ smallvec = { workspace = true }
 thiserror = { workspace = true }
 iced-x86 = { workspace = true }
 capstone = { workspace = true }
+
+[dev-dependencies]
+reargo-emulator = { workspace = true }

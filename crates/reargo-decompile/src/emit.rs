@@ -752,6 +752,13 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = !{};", dst, a))
             }
+            // `popcnt` / `lzcnt` (WS84)
+            OpCode::PopCount | OpCode::LzCount if !op.inputs.is_empty() => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let f = if op.opcode == OpCode::PopCount { "popcount" } else { "lzcount" };
+                Some(format!("{dst} = {f}({a});"))
+            }
             // `cmovcc` (WS83, `select`)
             OpCode::Select if op.inputs.len() == 3 => {
                 let dst = out_name?;

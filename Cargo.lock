@@ -561,6 +561,7 @@ dependencies = [
  "capstone",
  "iced-x86",
  "reargo-core",
+ "reargo-emulator",
  "reargo-loader",
  "smallvec",
  "thiserror",
