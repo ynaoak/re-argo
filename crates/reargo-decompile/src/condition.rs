@@ -330,6 +330,14 @@ impl Inliner {
         let mut folded = true;
         for o in condition_ops(func, ops).unwrap_or_default() {
             let op = &func.ops[o];
+            // `!(a == b)` reads better as `a != b`
+            if op.opcode == OpCode::BoolNegate
+                && folded
+                && let (Some(out), Some(inner)) = (op.output, op.inputs.first().and_then(|i| self.exprs.borrow().get(i).cloned()))
+            {
+                self.exprs.borrow_mut().insert(out, crate::emit::negate_condition(inner, true));
+                continue;
+            }
             let Some(line) = emit(op) else { continue };
             let (Some(out), true) = (op.output, folded) else {
                 lines.push(line);

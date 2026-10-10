@@ -1777,4 +1777,26 @@ mod tests {
         assert!(tested.contains("uint64_t f("), "{tested}");
     }
 
+
+    /// A folded `jne` test reads `a != b`, not `!(a == b)` (WS80).
+    #[test]
+    fn folded_jne_reads_not_equal() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, // cmp edi, 1
+            0x74, 0x0b, // je L
+            0x83, 0xfe, 0x02, // cmp esi, 2
+            0x75, 0x06, // jne L
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+            0xc3, // ret
+            0xb8, 0x07, 0x00, 0x00, 0x00, // L: mov eax, 7
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
+        assert!(cond.contains("(esi - 2) != 0") || cond.contains("(esi - 2) == 0"), "{c}");
+        assert!(!cond.contains("!((esi - 2)"), "{c}");
+    }
+
 }
