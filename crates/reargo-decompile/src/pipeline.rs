@@ -44,7 +44,8 @@ pub fn decompile(
     }
     crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
 
-    let trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
+    let mut trimmed = crate::vcall::devirtualize_constant_calls(trim_to_return(lifted), memory);
+    rewrite_tail_calls(&mut trimmed);
     let oracle = CalleeParams::new(lifter, memory);
     let call_params = callee_param_map(&trimmed, oracle.as_ref());
     let own = own_params(oracle.as_ref(), entry);
@@ -278,7 +279,8 @@ fn decompile_function_inner(
     } else {
         trim_to_return(lifted)
     };
-    let terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
+    let mut terminated = crate::vcall::devirtualize_constant_calls(terminated, &program.info.memory);
+    rewrite_tail_calls(&mut terminated);
     let call_params = callee_param_map(&terminated, oracle);
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle);
@@ -298,6 +300,32 @@ fn decompile_function_inner(
         vcalls,
         Some((lifter, &program.info.memory)),
     )
+}
+
+/// A `jmp` out of the code being decompiled is a tail call (WS81): rewrite its `BRANCH` into
+/// `CALL target; RETURN`, so it prints as `return f(…);` with the call's arguments instead of
+/// vanishing (a `BRANCH` prints nothing) with the argument setup left dead.
+pub(crate) fn rewrite_tail_calls(instructions: &mut [LiftedInstruction]) {
+    use reargo_core::address::SpaceId;
+    use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
+    let inside: rustc_hash::FxHashSet<u64> = instructions.iter().map(|i| i.address).collect();
+    for insn in instructions.iter_mut() {
+        let Some(pos) = insn.ops.iter().position(|o| {
+            o.opcode == OpCode::Branch
+                && o.inputs.first().is_some_and(|t| t.space == SpaceId::RAM && !inside.contains(&t.offset))
+        }) else {
+            continue;
+        };
+        let seq = insn.ops[pos].seq;
+        insn.ops[pos].opcode = OpCode::Call;
+        insn.ops.insert(
+            pos + 1,
+            PcodeOp { opcode: OpCode::Return, seq, output: None, inputs: smallvec::smallvec![VarnodeData::new(SpaceId::CONST, 0, 8)] },
+        );
+        for (i, op) in insn.ops.iter_mut().enumerate() {
+            op.seq.order = i as u32;
+        }
+    }
 }
 
 /// Second input of a call's `INDIRECT` that marks a clobbered (not returned) register.
@@ -1630,6 +1658,26 @@ mod tests {
         assert!(either(&cond_of(0x7c), "(int32_t)edi < (int32_t)5", "(int32_t)edi >= (int32_t)5"), "jl: {}", cond_of(0x7c));
         assert!(either(&cond_of(0x7e), "(int32_t)edi <= (int32_t)5", "(int32_t)edi > (int32_t)5"), "jle: {}", cond_of(0x7e));
         assert!(either(&cond_of(0x7f), "(int32_t)edi > (int32_t)5", "(int32_t)edi <= (int32_t)5"), "jg: {}", cond_of(0x7f));
+    }
+
+    /// WS81: a `jmp` to another function is a tail call: `return f(…);` with its argument.
+    #[test]
+    fn tail_jump_is_a_call_and_return() {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory_parts(&[
+            (0x1000, &[
+                0x53, // 0x1000 push rbx
+                0xbf, 0x05, 0x00, 0x00, 0x00, // 0x1001 mov edi, 5
+                0x5b, // 0x1006 pop rbx
+                0xe9, 0xf4, 0x0f, 0x00, 0x00, // 0x1007 jmp 0x2000
+            ]),
+            (0x2000, &[0x8d, 0x47, 0x01, 0xc3]), // lea eax, [rdi + 1] ; ret
+        ]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 4).unwrap().c_code;
+        let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("rdi") || call.contains('5'), "{c}");
+        assert!(c.contains("return"), "{c}");
+        assert!(!c.contains("rbx = "), "the epilogue before the jump is not printed: {c}");
     }
 
     /// WS81: a negated integer comparison in a merged condition flips its operator.
