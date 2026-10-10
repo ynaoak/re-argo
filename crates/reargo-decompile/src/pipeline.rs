@@ -2532,4 +2532,23 @@ mod tests {
         assert!(!c.contains("label_"), "the cases join inside the loop: {c}");
     }
 
+    /// A constant a float op reads prints as a float (WS83): `xorps xmm1, xmm1; ucomiss
+    /// xmm0, xmm1` compares with `0.0f`, `movd xmm1, 0x3f800000; addss` adds `1.0f`.
+    #[test]
+    fn float_constants_print_as_floats() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xb8, 0x00, 0x00, 0x80, 0x3f, // mov eax, 0x3f800000
+            0x66, 0x0f, 0x6e, 0xc8, // movd xmm1, eax
+            0xf3, 0x0f, 0x58, 0xc1, // addss xmm0, xmm1
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("+ 1.0f"), "{c}");
+        assert!(!c.contains("0x3f800000"), "{c}");
+        assert_eq!(crate::emit::float_literal(0x3dcc_cccd, 4).as_deref(), Some("0.1f"));
+        assert_eq!(crate::emit::float_literal(0x4000_0000_0000_0000, 8).as_deref(), Some("2.0"));
+        assert_eq!(crate::emit::float_literal(0x7f80_0000, 4), None);
+    }
 }

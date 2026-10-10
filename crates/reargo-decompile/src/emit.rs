@@ -984,6 +984,14 @@ impl<'a> CEmitter<'a> {
             return if crate::condition::is_atomic(e) { e.clone() } else { format!("({e})") };
         }
         let vn = &func.varnodes[op.inputs[idx] as usize];
+        // a constant a float op reads is the bits of a float (WS83: constants now reach their
+        // readers, `xmm3_d = 0; x <= xmm3_d` -> `x <= 0.0f`)
+        if vn.data.space == SpaceId::CONST
+            && is_float_op(op.opcode)
+            && let Some(f) = float_literal(vn.data.offset, vn.data.size)
+        {
+            return f;
+        }
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
             if let Some(s) = self.string_literals.get(&vn.data.offset) {
                 return format!("\"{}\"", s.escape_default());
@@ -1775,4 +1783,48 @@ pub(crate) fn select_conditions(
 /// A `case` value: decimal, hex from 0x100 on.
 pub(crate) fn case_label(v: u64) -> String {
     if v < 0x100 { v.to_string() } else { format!("0x{v:x}") }
+}
+
+/// An op whose operands are floats (arithmetic and comparisons, not conversions from an
+/// integer).
+fn is_float_op(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::FloatEqual
+            | OpCode::FloatNotEqual
+            | OpCode::FloatLess
+            | OpCode::FloatLessEqual
+            | OpCode::FloatAdd
+            | OpCode::FloatSub
+            | OpCode::FloatMult
+            | OpCode::FloatDiv
+            | OpCode::FloatNeg
+            | OpCode::FloatAbs
+            | OpCode::FloatSqrt
+            | OpCode::FloatNan
+            | OpCode::FloatFloat2Float
+            | OpCode::FloatTrunc
+            | OpCode::FloatCeil
+            | OpCode::FloatFloor
+            | OpCode::FloatRound
+    )
+}
+
+/// The C literal of the float whose bits are `bits` (`size` 4 = `float`, 8 = `double`).
+pub(crate) fn float_literal(bits: u64, size: u32) -> Option<String> {
+    let (mut t, suffix) = match size {
+        4 => {
+            let v = f32::from_bits(bits as u32);
+            (v.is_finite().then(|| format!("{v:?}"))?, "f")
+        }
+        8 => {
+            let v = f64::from_bits(bits);
+            (v.is_finite().then(|| format!("{v:?}"))?, "")
+        }
+        _ => return None,
+    };
+    if !t.contains(['.', 'e']) {
+        t.push_str(".0");
+    }
+    Some(format!("{t}{suffix}"))
 }
