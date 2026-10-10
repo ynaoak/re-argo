@@ -173,19 +173,29 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
     let by_block = ops_by_block(func);
     let pure: Vec<bool> = by_block.iter().map(|ops| condition_ops(func, ops).is_some()).collect();
     let two = |s: &[BlockId]| s.len() == 2 && s[0] != s[1];
+    // a block that prints nothing and goes on to one other block (a lone `jmp`)
+    let empty: Vec<bool> = (0..n)
+        .map(|b| {
+            b != src.entry_block
+                && matches!(src.blocks[b].successors.as_slice(), [s] if *s != b)
+                && by_block[b].iter().all(|&o| matches!(func.ops[o].opcode, OpCode::Branch | OpCode::MultiEqual))
+        })
+        .collect();
     // quick check before copying the CFG
-    let any = (0..n).any(|b| {
-        pure[b]
-            && b != src.entry_block
-            && src.blocks[b].predecessors.len() == 1
-            && two(&src.blocks[b].successors)
-            && two(&src.blocks[src.blocks[b].predecessors[0]].successors)
-    });
+    let any = empty.iter().any(|&e| e)
+        || (0..n).any(|b| {
+            pure[b]
+                && b != src.entry_block
+                && src.blocks[b].predecessors.len() == 1
+                && two(&src.blocks[b].successors)
+                && two(&src.blocks[src.blocks[b].predecessors[0]].successors)
+        });
     if !any {
         return None;
     }
 
     let mut cfg = src.clone();
+    thread_empty_blocks(&mut cfg, &empty);
     let mut conds: FxHashMap<BlockId, Cond> = FxHashMap::default();
     let cond_of = |conds: &FxHashMap<BlockId, Cond>, b: BlockId| {
         conds.get(&b).cloned().unwrap_or(Cond::Leaf { block: b, negated: false })
@@ -230,6 +240,60 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
         }
     }
     Some(ShortCircuits { cfg, conds })
+}
+
+/// Jump threading of the blocks that print nothing (`empty`, a lone `jmp`): every edge into
+/// one goes straight to where it leads. Printing such a block is free, but as a block it is
+/// a join of its own — shared by two arms without being their join, it needs a `goto`.
+/// Blocks no longer reachable lose their edges; predecessor lists are rebuilt.
+fn thread_empty_blocks(cfg: &mut ControlFlowGraph, empty: &[bool]) {
+    let n = cfg.blocks.len();
+    let resolve = |cfg: &ControlFlowGraph, mut b: BlockId| {
+        let mut steps = 0;
+        while empty[b] && steps < n {
+            b = cfg.blocks[b].successors[0];
+            steps += 1;
+        }
+        b
+    };
+    let mut changed = false;
+    for b in 0..n {
+        let succs = cfg.blocks[b].successors.clone();
+        let mut new: Vec<BlockId> = succs.iter().map(|&s| resolve(cfg, s)).collect();
+        if new != succs {
+            // both arms reach the same block now: the test decides nothing
+            if new.len() == 2 && new[0] == new[1] {
+                new.pop();
+            }
+            cfg.blocks[b].successors = new;
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    let mut reach = vec![false; n];
+    let mut stack = vec![cfg.entry_block];
+    while let Some(b) = stack.pop() {
+        if std::mem::replace(&mut reach[b], true) {
+            continue;
+        }
+        stack.extend(cfg.blocks[b].successors.iter().copied().filter(|&s| !reach[s]));
+    }
+    for b in 0..n {
+        if !reach[b] {
+            cfg.blocks[b].successors.clear();
+        }
+        cfg.blocks[b].predecessors.clear();
+    }
+    for b in 0..n {
+        for i in 0..cfg.blocks[b].successors.len() {
+            let s = cfg.blocks[b].successors[i];
+            if !cfg.blocks[s].predecessors.contains(&b) {
+                cfg.blocks[s].predecessors.push(b);
+            }
+        }
+    }
 }
 
 /// Prints the leaves of merged conditions: the ops of a test block are emitted in order and

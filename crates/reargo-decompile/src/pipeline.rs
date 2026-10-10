@@ -1579,4 +1579,30 @@ mod tests {
         assert_eq!(c.matches("(uint32_t)7;").count(), 1, "{c}");
     }
 
+
+    /// A lone `jmp` shared by two arms (not their join) is threaded through (WS80): both
+    /// arms go straight to where it leads, so no `goto` to the empty block is needed.
+    #[test]
+    fn shared_lone_jmp_needs_no_goto() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0xff, 0x01, // 1000: cmp edi, 1
+            0x75, 0x07, // 1003: jne 100c
+            0xb8, 0x05, 0x00, 0x00, 0x00, // 1005: mov eax, 5
+            0xeb, 0x0e, // 100a: jmp T (101a)
+            0xb8, 0x06, 0x00, 0x00, 0x00, // 100c: mov eax, 6
+            0x83, 0xfe, 0x03, // 1011: cmp esi, 3
+            0x74, 0x04, // 1014: je T (101a)
+            0xff, 0xc0, // 1016: inc eax
+            0xeb, 0x02, // 1018: jmp J (101c)
+            0xeb, 0x00, // 101a: T: jmp J
+            0xe8, 0xdf, 0x0f, 0x00, 0x00, // 101c: J: call 0x2000
+            0xc3, // 1021: ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("goto"), "{c}");
+        assert_eq!(c.matches("0x2000(").count(), 1, "{c}");
+    }
+
 }
