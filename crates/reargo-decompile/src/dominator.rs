@@ -78,6 +78,73 @@ pub fn compute_idom(cfg: &ControlFlowGraph) -> Vec<Option<BlockId>> {
     idom
 }
 
+/// Immediate dominators over the entry and every block without predecessors (an exception
+/// landing pad, reached only by unwinding) as the roots of one forest (WS82): a virtual root
+/// precedes them all. A root, and a block two roots both reach first (a cleanup tail shared
+/// by two landing pads), is its own `idom`; `None` for blocks no root reaches. SSA renames
+/// along this forest, so a value set in a landing pad reaches the code after it.
+pub fn compute_idom_forest(cfg: &ControlFlowGraph) -> Vec<Option<BlockId>> {
+    let n = cfg.blocks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let v = n; // the virtual root
+    let mut roots = vec![cfg.entry_block];
+    roots.extend((0..n).filter(|&b| b != cfg.entry_block && cfg.blocks[b].predecessors.is_empty()));
+    if roots.len() == 1 {
+        return compute_idom(cfg);
+    }
+    let succs = |b: usize| -> &[BlockId] { if b == v { &roots } else { &cfg.blocks[b].successors } };
+    // reverse post-order from the virtual root
+    let mut seen = vec![false; n + 1];
+    let mut post: Vec<BlockId> = Vec::with_capacity(n + 1);
+    let mut stack: Vec<(BlockId, usize)> = vec![(v, 0)];
+    seen[v] = true;
+    while let Some(top) = stack.last_mut() {
+        let (b, i) = *top;
+        if let Some(&s) = succs(b).get(i) {
+            top.1 += 1;
+            if s < n && !seen[s] {
+                seen[s] = true;
+                stack.push((s, 0));
+            }
+        } else {
+            post.push(b);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    let mut order = vec![usize::MAX; n + 1];
+    for (i, &b) in post.iter().enumerate() {
+        order[b] = i;
+    }
+    let mut idom: Vec<Option<BlockId>> = vec![None; n + 1];
+    idom[v] = Some(v);
+    let is_root: Vec<bool> = (0..n).map(|b| roots.contains(&b)).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in post.iter().skip(1) {
+            let mut new_idom: Option<BlockId> = is_root[b].then_some(v);
+            for &p in &cfg.blocks[b].predecessors {
+                if idom[p].is_none() {
+                    continue;
+                }
+                new_idom = Some(match new_idom {
+                    None => p,
+                    Some(cur) => intersect(&idom, &order, cur, p),
+                });
+            }
+            if new_idom.is_some() && new_idom != idom[b] {
+                idom[b] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    idom.truncate(n);
+    idom.iter().enumerate().map(|(b, d)| d.map(|d| if d == v { b } else { d })).collect()
+}
+
 fn intersect(idom: &[Option<BlockId>], order: &[usize], mut a: BlockId, mut b: BlockId) -> BlockId {
     while a != b {
         while order[a] > order[b] {
@@ -434,6 +501,47 @@ mod tests {
         let live = cfg.block_at(0x1002).unwrap().id;
         assert_eq!(idom[dead], None);
         assert_eq!(idom[live], Some(cfg.entry_block));
+    }
+    /// Two landing pads (no predecessors) sharing a cleanup tail (WS82): each pad is a root
+    /// of the forest and the tail, reached first from both, is its own; a register a pad
+    /// sets reaches the tail through a phi instead of reading the function's input.
+    #[test]
+    fn landing_pads_are_roots_of_the_dominator_forest() {
+        let reg = |off| VarnodeData::new(SpaceId(2), off, 8);
+        let copy = |addr: u64, dst: u64, src: u64| LiftedInstruction {
+            address: addr,
+            length: 1,
+            mnemonic: "mov".into(),
+            ops: vec![PcodeOp {
+                opcode: OpCode::Copy,
+                seq: SeqNum::new(Address::new(SpaceId(1), addr), 0),
+                output: Some(reg(dst)),
+                inputs: SmallVec::from_slice(&[reg(src)]),
+            }],
+        };
+        let insns = vec![
+            ret_insn(0x1000),
+            copy(0x1001, 0x60, 0x00), // pad 1: mov r12, rax
+            jmp_insn(0x1002, 0x1005),
+            copy(0x1003, 0x60, 0x00), // pad 2: mov r12, rax
+            jmp_insn(0x1004, 0x1005),
+            copy(0x1005, 0x38, 0x60), // tail: mov rdi, r12
+            ret_insn(0x1006),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let at = |a: u64| cfg.block_at(a).unwrap().id;
+        let plain = compute_idom(&cfg);
+        assert_eq!(plain[at(0x1005)], None);
+        let idom = compute_idom_forest(&cfg);
+        assert_eq!(idom[at(0x1000)], Some(at(0x1000)));
+        assert_eq!(idom[at(0x1001)], Some(at(0x1001)));
+        assert_eq!(idom[at(0x1003)], Some(at(0x1003)));
+        assert_eq!(idom[at(0x1005)], Some(at(0x1005)), "reached first from both pads");
+        let ssa = crate::ssa::SsaFunction::from_cfg("f".into(), 0x1000, cfg);
+        let read = ssa.ops.iter().find(|o| o.address == 0x1005 && o.opcode == OpCode::Copy).unwrap();
+        let r12 = &ssa.varnodes[read.inputs[0] as usize];
+        let def = r12.def_op.map(|d| ssa.ops[d].opcode);
+        assert_eq!(def, Some(OpCode::MultiEqual), "the tail reads the pads' r12: {}", ssa.display_ssa());
     }
 }
 
