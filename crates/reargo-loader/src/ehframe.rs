@@ -364,9 +364,15 @@ fn parse_lsda(img: &impl Reader, lsda: u64, func_start: u64) -> Option<Vec<CallS
                 actions.push(match filter {
                     0 => EhAction::Cleanup,
                     f if f > 0 => {
-                        let mut slot = tt_base?.wrapping_sub(f as u64 * tt_size);
-                        let typeinfo = img.encoded(&mut slot, tt_enc & 0x7f, 0)?;
-                        EhAction::Catch { typeinfo, indirect: tt_enc & 0x80 != 0 }
+                        let slot = tt_base?.wrapping_sub(f as u64 * tt_size);
+                        // a raw 0 is a null typeinfo (`catch (...)`) whatever the base
+                        let (mut raw_at, mut at) = (slot, slot);
+                        if img.encoded(&mut raw_at, tt_enc & 0x0f, 0)? == 0 {
+                            EhAction::Catch { typeinfo: 0, indirect: false }
+                        } else {
+                            let typeinfo = img.encoded(&mut at, tt_enc & 0x7f, 0)?;
+                            EhAction::Catch { typeinfo, indirect: tt_enc & 0x80 != 0 }
+                        }
                     }
                     _ => EhAction::Filter,
                 });
@@ -520,13 +526,17 @@ mod tests {
         b.extend([0x10, 0x08, 0x40, 0x00, 0x20, 0x05, 0x50, 0x01, 0x30, 0x05, 0x00, 0x00]);
         b.extend([0x01, 0x00]); // action 1: catch type filter 1, no next
         b.extend((0x6000u32.wrapping_sub(0x5000 + 19)).to_le_bytes()); // ttype[1]
-        let sites = parse_lsda(&At(0x5000, b), 0x5000, 0x1000).unwrap();
+        let sites = parse_lsda(&At(0x5000, b.clone()), 0x5000, 0x1000).unwrap();
         assert_eq!(sites.len(), 3);
         assert_eq!((sites[0].start, sites[0].len, sites[0].landing_pad), (0x1010, 8, 0x1040));
         assert_eq!(sites[0].actions, vec![EhAction::Cleanup]);
         assert_eq!(sites[1].landing_pad, 0x1050);
         assert_eq!(sites[1].actions, vec![EhAction::Catch { typeinfo: 0x6000, indirect: true }]);
         assert_eq!((sites[2].landing_pad, sites[2].actions.len()), (0, 0));
+        // a null typeinfo is `catch (...)`, not the pc-relative base
+        b[19..23].copy_from_slice(&[0; 4]);
+        let sites = parse_lsda(&At(0x5000, b), 0x5000, 0x1000).unwrap();
+        assert_eq!(sites[1].actions, vec![EhAction::Catch { typeinfo: 0, indirect: false }]);
     }
 
     /// A known LSDA of the binary named by `REARGO_TEST_BDS`. Skipped when unset.
