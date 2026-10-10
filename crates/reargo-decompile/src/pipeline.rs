@@ -996,7 +996,10 @@ fn build_decompile_result(
     settle_unknown_returns(&mut ssa);
     let mut opt_stats = run_optimization_passes(&mut ssa);
     // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
-    if crate::flags::recover_flag_compares(&mut ssa) > 0 {
+    // WS83: `cmovcc`'s branch-free mask becomes `dst = c ? src : dst` (after the flags: `c`
+    // may be a flag combination they rewrote into a comparison)
+    let flags = crate::flags::recover_flag_compares(&mut ssa);
+    if crate::select::recover_selects(&mut ssa) + flags > 0 {
         // twice: a copy of a constant that copy propagation already replaced in its reader
         // still lists that reader, which dies only in the first round (`OF = 0` of `test`)
         for _ in 0..2 {
@@ -2407,5 +2410,28 @@ mod tests {
         assert!(c.contains("ebx = ebx - 1;"), "{c}");
         assert!(!c.contains("ebx == 1") && !c.contains("ebx != 1"), "{c}");
         assert!(c.contains("ebx != 0") || c.contains("ebx == 0"), "{c}");
+    }
+
+    /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
+    #[test]
+    fn cmov_is_a_select() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x39, 0xf7, // cmp edi, esi
+            0x0f, 0x4c, 0xfe, // cmovl edi, esi
+            0x48, 0x39, 0xd1, // cmp rcx, rdx
+            0x48, 0x0f, 0x43, 0xca, // cmovae rcx, rdx
+            0x01, 0xcf, // add edi, ecx
+            0x89, 0xf8, // mov eax, edi
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
+        let c = &r.c_code;
+        assert!(c.contains("edi = ((int32_t)edi < (int32_t)esi) ? esi : edi;"), "{c}");
+        // `cmovae`: moves when `!(rcx < rdx)`
+        assert!(c.contains("rcx = (rcx < rdx) ? rcx : rdx;"), "{c}");
+        assert!(!c.contains("tmp_4b") && !c.contains("var_201"), "{c}");
+        assert!(r.rust_code.contains("if ") && !r.rust_code.contains("tmp_4bc"), "{}", r.rust_code);
     }
 }

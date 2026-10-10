@@ -660,6 +660,14 @@ impl<'a> RustEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = {} == 0;", dst, a))
             }
+            // `cmovcc` (WS83, `select`)
+            OpCode::Select if op.inputs.len() == 3 => {
+                let dst = out_name?;
+                let c = self.input_expr(func, op, 0);
+                let a = self.input_expr(func, op, 1);
+                let b = self.input_expr(func, op, 2);
+                Some(format!("{} = if {} != 0 {{ {} }} else {{ {} }};", dst, c, a, b))
+            }
             OpCode::IntZExt => {
                 // Mask to the source width before widening so high bits of the
                 // u64 storage cell don't leak through.

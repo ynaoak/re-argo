@@ -68,6 +68,9 @@ pub struct CEmitter<'a> {
     noise: rustc_hash::FxHashSet<usize>,
     /// Ops folded into their block's own branch condition (WS81): not statements.
     folded: rustc_hash::FxHashSet<usize>,
+    /// The condition of a select (`cmovcc`) folded into it (WS83): the comparison's text, by
+    /// the value it computes. Its op is in `folded`.
+    select_conds: rustc_hash::FxHashMap<crate::condition::ValueKey, String>,
 }
 
 impl Default for CEmitter<'static> {
@@ -87,6 +90,7 @@ impl CEmitter<'static> {
             call_renderings: None,
             conds: None,
             inliner: crate::condition::Inliner::default(),
+            select_conds: Default::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
@@ -122,6 +126,7 @@ impl<'a> CEmitter<'a> {
             call_renderings: None,
             conds: None,
             inliner: crate::condition::Inliner::default(),
+            select_conds: Default::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
@@ -172,6 +177,13 @@ impl<'a> CEmitter<'a> {
             .filter_map(|b| self.own_condition(func, b))
             .flat_map(|(ops, _)| ops)
             .collect();
+        self.select_conds.clear();
+        for (d, text) in select_conditions(func, &self.folded, &|op| self.emit_op(func, op)) {
+            self.folded.insert(d);
+            if let Some(out) = func.ops[d].output {
+                self.select_conds.insert(crate::condition::value_key(func, out), text);
+            }
+        }
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -728,6 +740,14 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = !{};", dst, a))
             }
+            // `cmovcc` (WS83, `select`)
+            OpCode::Select if op.inputs.len() == 3 => {
+                let dst = out_name?;
+                let c = self.input_expr(func, op, 0);
+                let a = self.input_expr(func, op, 1);
+                let b = self.input_expr(func, op, 2);
+                Some(format!("{} = {} ? {} : {};", dst, c, a, b))
+            }
             OpCode::IntZExt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
@@ -949,6 +969,11 @@ impl<'a> CEmitter<'a> {
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
+        }
+        if !self.select_conds.is_empty()
+            && let Some(e) = self.select_conds.get(&crate::condition::value_key(func, op.inputs[idx]))
+        {
+            return if crate::condition::is_atomic(e) { e.clone() } else { format!("({e})") };
         }
         let vn = &func.varnodes[op.inputs[idx] as usize];
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
@@ -1668,4 +1693,64 @@ mod tests {
         assert!(output.contains("(int32_t)") && output.contains(">> 3"),
             "ASR must cast LHS to int32_t and use >>:\n{}", output);
     }
+}
+
+/// The comparisons to print inside the select (`cmovcc`, WS83) that reads them, as
+/// `(op, text)`: `edi = (int32_t)edi < (int32_t)esi ? esi : edi;` rather than a flag variable
+/// set the line before. Only a comparison in the select's block whose result nothing else
+/// reads, with no write over its operands between it and the select (the C output names the
+/// operands by register, so they must still hold their values there).
+pub(crate) fn select_conditions(
+    func: &SsaFunction,
+    folded: &rustc_hash::FxHashSet<usize>,
+    emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
+) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
+        return out;
+    }
+    let readers = crate::condition::Readers::new(func);
+    for (s, op) in func.ops.iter().enumerate() {
+        if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
+            continue;
+        }
+        let c = op.inputs[0];
+        let Some(d) = func.varnodes[c as usize].def_op else { continue };
+        let cmp = &func.ops[d];
+        let comparison = matches!(
+            cmp.opcode,
+            OpCode::IntEqual
+                | OpCode::IntNotEqual
+                | OpCode::IntLess
+                | OpCode::IntLessEqual
+                | OpCode::IntSLess
+                | OpCode::IntSLessEqual
+                | OpCode::FloatEqual
+                | OpCode::FloatNotEqual
+                | OpCode::FloatLess
+                | OpCode::FloatLessEqual
+        );
+        if cmp.dead || !comparison || cmp.block != op.block || d >= s || folded.contains(&d) || readers.of(func, c) != [s] {
+            continue;
+        }
+        let operand_overwritten = func.ops[d + 1..s].iter().any(|o| {
+            !o.dead
+                && o.output.is_some_and(|w| {
+                    let w = &func.varnodes[w as usize].data;
+                    cmp.inputs.iter().any(|&x| {
+                        let x = &func.varnodes[x as usize].data;
+                        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
+                    })
+                })
+        });
+        if operand_overwritten {
+            continue;
+        }
+        let Some(out_v) = cmp.output else { continue };
+        let prefix = format!("{} = ", varnode_name(&func.varnodes[out_v as usize]));
+        if let Some(rhs) = emit(cmp).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
+            out.push((d, rhs));
+        }
+    }
+    out
 }

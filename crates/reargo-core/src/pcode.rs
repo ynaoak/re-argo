@@ -91,6 +91,10 @@ pub enum OpCode {
     PopCount = 72,
     LzCount = 73,
     SPull = 74,
+
+    /// `out = in0 ? in1 : in2` (`in0` a boolean). Not a Ghidra p-code op: the decompiler
+    /// rewrites the branchless select a `cmovcc` is lifted to into it (WS83).
+    Select = 75,
 }
 
 impl OpCode {
@@ -169,6 +173,7 @@ impl OpCode {
             72 => Some(Self::PopCount),
             73 => Some(Self::LzCount),
             74 => Some(Self::SPull),
+            75 => Some(Self::Select),
             _ => None,
         }
     }
@@ -248,6 +253,7 @@ impl OpCode {
             Self::PopCount => "POPCOUNT",
             Self::LzCount => "LZCOUNT",
             Self::SPull => "SPULL",
+            Self::Select => "SELECT",
         }
     }
 
@@ -326,6 +332,7 @@ impl OpCode {
             "POPCOUNT" => Some(Self::PopCount),
             "LZCOUNT" => Some(Self::LzCount),
             "SPULL" => Some(Self::SPull),
+            "SELECT" => Some(Self::Select),
             _ => None,
         }
     }
@@ -560,7 +567,7 @@ mod tests {
 
     #[test]
     fn opcode_roundtrip() {
-        for val in 1..=74 {
+        for val in 1..=75 {
             if val == 45 {
                 assert!(OpCode::from_u32(val).is_none());
                 continue;
@@ -576,7 +583,7 @@ mod tests {
     #[test]
     fn opcode_max() {
         assert!(OpCode::from_u32(0).is_none());
-        assert!(OpCode::from_u32(75).is_none());
+        assert!(OpCode::from_u32(76).is_none());
         assert!(OpCode::from_u32(45).is_none());
     }
 
