@@ -113,6 +113,8 @@ const MAX_TAIL_CALLS: usize = 1;
 const MAX_COPY_INSNS: usize = 4;
 /// Most instructions of a region printed a second time in place of a `goto` to it.
 const MAX_COPY_REGION_INSNS: usize = 6;
+/// Most calls in a region printed a second time (the call is printed on both paths).
+const MAX_COPY_CALLS: usize = 1;
 /// Most blocks on a path through a region printed a second time.
 const MAX_COPY_DEPTH: usize = 2;
 
@@ -343,13 +345,14 @@ impl<'a> Structurer<'a> {
     }
 
     /// Print the short region from `b` (already printed elsewhere) again instead of a `goto`
-    /// to it: blocks of at most [`MAX_COPY_INSNS`] instructions without a call, at most
-    /// [`MAX_COPY_REGION_INSNS`] in all and [`MAX_COPY_DEPTH`] deep, whose every way out is
+    /// to it: blocks of at most [`MAX_COPY_INSNS`] instructions, at most
+    /// [`MAX_COPY_REGION_INSNS`] and [`MAX_COPY_CALLS`] call in all and [`MAX_COPY_DEPTH`]
+    /// deep (`rdi = r12; …; memcpy(rdi, rsi, rdx);` shared by two arms), whose every way out is
     /// reachable here without a `goto` of its own — the end of the region being walked
     /// (`stop`), a `break` / `continue`, or a return tail (copied later). A `goto` that
     /// still names a copied block lands on either copy; both go on the same way.
     fn copy_region(&self, b: BlockId, stop: Option<BlockId>) -> Option<Vec<StructuredBlock>> {
-        let mut budget = MAX_COPY_REGION_INSNS;
+        let mut budget = (MAX_COPY_REGION_INSNS, MAX_COPY_CALLS);
         self.copy_from(b, stop, MAX_COPY_DEPTH, &mut budget, true)
     }
 
@@ -358,7 +361,7 @@ impl<'a> Structurer<'a> {
         b: BlockId,
         stop: Option<BlockId>,
         depth: usize,
-        budget: &mut usize,
+        budget: &mut (usize, usize),
         first: bool,
     ) -> Option<Vec<StructuredBlock>> {
         use reargo_core::pcode::OpCode;
@@ -378,11 +381,16 @@ impl<'a> Structurer<'a> {
         }
         let block = &self.cfg.blocks[b];
         let insns = block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
-        let calls = block.instructions.iter().any(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
-        if depth == 0 || insns > MAX_COPY_INSNS || calls || self.loops[b].is_some() {
+        let calls = block
+            .instructions
+            .iter()
+            .filter(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)))
+            .count();
+        if depth == 0 || insns > MAX_COPY_INSNS || self.loops[b].is_some() {
             return None;
         }
-        *budget = budget.checked_sub(insns)?;
+        budget.0 = budget.0.checked_sub(insns)?;
+        budget.1 = budget.1.checked_sub(calls)?;
         match *self.succs(b).as_slice() {
             [s] if s != b => {
                 let mut v = vec![Basic(b)];
@@ -874,6 +882,33 @@ mod tests {
         let s = structure_cfg(&cfg);
         assert_eq!(gotos(&s), 0, "{s:?}");
         assert_eq!(count(&s, &|n| matches!(n, StructuredBlock::Basic(b) if *b == t)), 2, "{s:?}");
+    }
+
+    /// WS81: a short shared block with one call (`memcpy(…)` set up and called in both arms)
+    /// is copied too.
+    #[test]
+    fn short_shared_block_with_a_call_is_copied() {
+        // A: jcc L ; X: nop ; B: jcc L ; Y: jmp J ; L: nop ; call g ; J: call ; ret
+        let call = |addr: u64, target: u64| PcodeOp {
+            opcode: OpCode::Call,
+            seq: seq(addr),
+            output: None,
+            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId(1), target, 8)]),
+        };
+        let insns = vec![
+            lifted(0x1000, vec![cbranch(0x1000, 0x1005)]),
+            nop(0x1001),
+            lifted(0x1002, vec![cbranch(0x1002, 0x1005)]),
+            nop(0x1003),
+            lifted(0x1004, vec![branch(0x1004, 0x1007)]),
+            nop(0x1005),
+            lifted(0x1006, vec![call(0x1006, 0x3000)]),
+            lifted(0x1007, vec![call(0x1007, 0x2000)]),
+            lifted(0x1008, vec![ret(0x1008)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let s = structure_cfg(&cfg);
+        assert_eq!(gotos(&s), 0, "{s:?}");
     }
 
     fn nop(addr: u64) -> LiftedInstruction {
