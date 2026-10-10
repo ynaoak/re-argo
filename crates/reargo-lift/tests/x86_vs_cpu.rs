@@ -546,7 +546,12 @@ fn conditions_match_the_cpu() {
         };
     }
     // (parity conditions are not modelled: PF is not tracked for integer ops)
-    let cases = cc!("o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "l", "ge", "le", "g");
+    let mut cases = cc!("o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "l", "ge", "le", "g");
+    cases.extend([
+        case!("clc", d_arith, Inputs::Flags),
+        case!("stc", d_arith, Inputs::Flags),
+        case!("cmc", d_arith, Inputs::Flags),
+    ]);
     check(&cases);
 }
 

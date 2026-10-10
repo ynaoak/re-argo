@@ -199,6 +199,19 @@ impl X86Lifter {
             Cmpxchg => self.lift_cmpxchg(insn, address),
             Bsf | Bsr | Tzcnt | Lzcnt | Popcnt => self.lift_bit_count(insn, address),
             Bswap => self.lift_bswap(insn, address),
+            Clc | Stc | Cmc => {
+                // CF = 0 / 1 / !CF (they fell to __unmodeled_insn and left CF stale)
+                let mut ops = Vec::new();
+                let mut sb = 0u32;
+                let mut e = Emit::new(&mut ops, &mut sb, address);
+                let cf = reg(CF_OFFSET, 1);
+                match insn.mnemonic() {
+                    Clc => e.set(OpCode::Copy, cf, &[constant(0, 1)]),
+                    Stc => e.set(OpCode::Copy, cf, &[constant(1, 1)]),
+                    _ => e.set(OpCode::BoolNegate, cf, &[cf]),
+                }
+                Ok(ops)
+            }
             Cmova | Cmovae | Cmovb | Cmovbe | Cmove | Cmovne | Cmovg | Cmovge | Cmovl | Cmovle
             | Cmovo | Cmovno | Cmovs | Cmovns => self.lift_cmov(insn, address),
             _ => return None,
