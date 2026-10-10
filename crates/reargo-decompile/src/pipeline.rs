@@ -844,7 +844,11 @@ fn build_decompile_result(
     let mut hint = || caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, entry));
     ssa.return_float = choose_return_register(&mut ssa, &mut hint);
     settle_unknown_returns(&mut ssa);
-    let opt_stats = run_optimization_passes(&mut ssa);
+    let mut opt_stats = run_optimization_passes(&mut ssa);
+    // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
+    if crate::flags::recover_flag_compares(&mut ssa) > 0 {
+        opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
+    }
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
         ssa.signature_params = Some(signature_params(&ssa, info, &args));
@@ -1970,4 +1974,115 @@ mod tests {
         assert!(!cond.contains("!(esi"), "{c}");
     }
 
+
+    /// `cmp a, b; je L1; jl L2`: the second block reads the SF / OF the first block's `cmp`
+    /// set (WS82); it prints `a < b`, not `!var_207 != !var_20b` with `INT_SBORROW` kept alive.
+    #[test]
+    fn flags_read_in_next_block_are_a_comparison() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x39, 0xf7, // cmp edi, esi
+            0x74, 0x08, // je L1 (100c)
+            0x7c, 0x0c, // jl L2 (1012)
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xc3, // ret
+            0xb8, 0x02, 0x00, 0x00, 0x00, // L1: mov eax, 2
+            0xc3, // ret
+            0xb8, 0x03, 0x00, 0x00, 0x00, // L2: mov eax, 3
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW"), "{c}");
+        assert!(!c.contains("var_2"), "no flag variable is left: {c}");
+        assert!(
+            c.contains("(int32_t)edi < (int32_t)esi") || c.contains("(int32_t)edi >= (int32_t)esi"),
+            "{c}"
+        );
+        assert!(c.contains("edi == esi") || c.contains("edi != esi"), "{c}");
+    }
+
+    /// The flags of a `cmp` read in a later block whose operand was overwritten in between
+    /// stay flags (WS82): `edi` no longer holds the compared value.
+    #[test]
+    fn flags_read_after_operand_changes_are_kept() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x39, 0xf7, // cmp edi, esi
+            0x74, 0x0a, // je L1 (100e)
+            0x8d, 0x7f, 0x01, // lea edi, [rdi+1] (no flags)
+            0x7c, 0x0b, // jl L2 (1014)
+            0x89, 0xf8, // mov eax, edi
+            0xc3, // ret
+            0x90, 0x90, // pad
+            0xb8, 0x02, 0x00, 0x00, 0x00, // L1: mov eax, 2
+            0xc3, // ret
+            0xb8, 0x03, 0x00, 0x00, 0x00, // L2: mov eax, 3
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("(int32_t)edi < (int32_t)esi") && !c.contains("(int32_t)edi >= (int32_t)esi"), "{c}");
+    }
+
+    /// `mov eax, edi; sub eax, esi; jl`: the compared register is overwritten by the result,
+    /// but the register it was copied from still holds the value (WS82).
+    #[test]
+    fn flags_of_a_copied_operand_compare_the_source() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xf8, // mov eax, edi
+            0x29, 0xf0, // sub eax, esi
+            0x7c, 0x01, // jl L
+            0xc3, // ret
+            0x31, 0xc0, // L: xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW"), "{c}");
+        assert!(c.contains("(int32_t)edi < (int32_t)esi") || c.contains("(int32_t)edi >= (int32_t)esi"), "{c}");
+    }
+
+    /// `sub dword [rdi], 1; jle`: the old value is kept as `old_1` where the flags were
+    /// computed, and the condition compares it (WS82).
+    #[test]
+    fn flags_of_an_overwritten_operand_keep_its_value() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x83, 0x2f, 0x01, // sub dword [rdi], 1
+            0x7e, 0x01, // jle L
+            0xc3, // ret
+            0x31, 0xc0, // L: xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("SBORROW"), "{c}");
+        assert!(c.contains("old_1 = "), "{c}");
+        assert!(c.contains("(int32_t)old_1 <= (int32_t)1") || c.contains("(int32_t)old_1 > (int32_t)1"), "{c}");
+    }
+
+    /// `sub edi, esi; jl; jo`: the overflow flag is read twice, so `edi`'s old value cannot
+    /// be kept; the `jl` must not read as `edi < esi` with `edi` already the difference.
+    #[test]
+    fn flags_of_a_sub_into_its_operand_do_not_compare_the_result() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x29, 0xf7, // sub edi, esi
+            0x7c, 0x05, // jl 1009
+            0x70, 0x06, // jo 100c
+            0x89, 0xf8, // mov eax, edi
+            0xc3, // ret
+            0x31, 0xc0, // 1009: xor eax, eax
+            0xc3, // ret
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 100c: mov eax, 1
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        for bad in ["(int32_t)edi < (int32_t)esi", "(int32_t)edi >= (int32_t)esi"] {
+            assert!(!c.contains(bad), "{c}");
+        }
+    }
 }

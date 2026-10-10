@@ -1371,6 +1371,10 @@ fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
     if vn.data.space == SpaceId::RAM {
         return format!("0x{:x}", vn.data.offset);
     }
+    if vn.data.space == SpaceId::UNIQUE && vn.data.offset >= crate::flags::SAVED_BASE {
+        // a compared value kept before the compare's result overwrote it (WS82)
+        return format!("old_{}", (vn.data.offset - crate::flags::SAVED_BASE) / 0x10 + 1);
+    }
     format!("tmp_{:x}", vn.data.offset)
 }
 
