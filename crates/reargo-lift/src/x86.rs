@@ -855,8 +855,11 @@ impl X86Lifter {
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
+            // NEG sets the flags of `0 - dst` (WS83: it set none, so `neg esi; cmovs esi, ecx`
+            // — `abs` — read a stale SF)
             Neg => {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
+                self.emit_sub_carry_flags(constant(0, dst.size), dst, &mut ops, &mut seq_base, address);
                 ops.push(PcodeOp {
                     opcode: OpCode::Int2Comp,
                     seq: seq(seq_base),
@@ -864,6 +867,7 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[dst]),
                 });
                 seq_base += 1;
+                self.emit_zf_sf_from(dst, &mut ops, &mut seq_base, address);
                 self.write_back_if_memory(insn, 0, dst, &mut ops, &mut seq_base, address)?;
             }
 
@@ -2932,6 +2936,25 @@ mod tests {
         let last = l.ops.last().unwrap();
         assert_eq!(last.opcode, OpCode::IntXor);
         assert_eq!(last.output.unwrap().offset, 0x0, "result -> RAX");
+    }
+
+    /// `neg` sets the flags of `0 - dst` (WS83): `neg esi; cmovs esi, ecx` is `abs`.
+    #[test]
+    fn lift_neg_sets_flags() {
+        let lifter = X86Lifter::new_64();
+        // neg esi = f7 de
+        let l = lifter.lift_instruction(&make_memory(&[0xf7, 0xde], 0x1000), 0x1000).unwrap();
+        let ops = core_ops(&l.ops);
+        for (flag, name) in [(CF_OFFSET, "CF"), (OF_OFFSET, "OF"), (ZF_OFFSET, "ZF"), (SF_OFFSET, "SF")] {
+            assert!(
+                ops.iter().any(|o| o.output.is_some_and(|v| v.space == REG_SPACE && v.offset == flag && v.size == 1)),
+                "neg must set {name}: {ops:?}"
+            );
+        }
+        // the flags of the result: SF / ZF are computed after the negation
+        let neg = ops.iter().position(|o| o.opcode == OpCode::Int2Comp).unwrap();
+        let sf = ops.iter().position(|o| o.output.is_some_and(|v| v.offset == SF_OFFSET && v.size == 1)).unwrap();
+        assert!(sf > neg);
     }
 
     #[test]
