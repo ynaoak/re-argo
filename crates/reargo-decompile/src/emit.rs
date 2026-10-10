@@ -954,12 +954,14 @@ impl<'a> CEmitter<'a> {
     }
 
     /// The block's branch condition with the ops that only compute it folded in (WS81).
-    fn own_condition(&self, func: &SsaFunction, block_id: usize) -> Option<(Vec<usize>, String)> {
+    fn own_condition(&self, func: &SsaFunction, block_id: usize) -> Option<(Vec<usize>, crate::condition::Folded)> {
         self.inliner.own_condition(func, block_id, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
     }
 
-    fn branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
-        self.own_condition(func, block_id).map(|(_, t)| t).unwrap_or_else(|| self.get_branch_condition(func, block_id))
+    fn branch_folded(&self, func: &SsaFunction, block_id: usize) -> crate::condition::Folded {
+        self.own_condition(func, block_id)
+            .map(|(_, f)| f)
+            .unwrap_or_else(|| crate::condition::Folded::plain(self.get_branch_condition(func, block_id)))
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
@@ -987,16 +989,16 @@ impl<'a> CEmitter<'a> {
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
         if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
-            let mut leaf = |b: usize| {
+            let mut leaf = |b: usize, neg: bool| {
                 if b == block_id {
-                    self.branch_condition(func, b)
+                    self.branch_folded(func, b).render(neg)
                 } else {
-                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+                    self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op)).render(neg)
                 }
             };
             return c.render(negated, &mut leaf);
         }
-        negate_condition(self.branch_condition(func, block_id), negated)
+        self.branch_folded(func, block_id).render(negated)
     }
 
     fn line(&mut self, text: &str) {
@@ -1126,6 +1128,47 @@ fn flip_equality(s: &str) -> Option<String> {
     }
     let (at, op) = found?;
     let flipped = if op == " == " { " != " } else { " == " };
+    Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
+}
+
+/// The opposite of an integer comparison printed as `a OP b` (WS81): `<` <-> `>=`, `<=` <-> `>`,
+/// `==` <-> `!=`, when that comparison is the only operator at the top level (outside
+/// parentheses) that binds looser than arithmetic. Only for integers (`!(a < b)` is not
+/// `a >= b` for a NaN).
+pub(crate) fn flip_comparison(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut found: Option<(usize, &str)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                for op in [" == ", " != ", " <= ", " >= ", " < ", " > ", " && ", " || ", " ? ", " & ", " | ", " ^ "] {
+                    if s[i..].starts_with(op) {
+                        if found.is_some() || matches!(op, " && " | " || " | " ? " | " & " | " | " | " ^ ") {
+                            return None;
+                        }
+                        found = Some((i, op));
+                        i += op.len() - 1;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let (at, op) = found?;
+    let flipped = match op {
+        " == " => " != ",
+        " != " => " == ",
+        " < " => " >= ",
+        " >= " => " < ",
+        " <= " => " > ",
+        _ => " <= ",
+    };
     Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
 }
 

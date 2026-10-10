@@ -1613,6 +1613,43 @@ mod tests {
         }
     }
 
+    /// WS81: the flags a conditional jump tests read as the comparison of `cmp`'s operands.
+    #[test]
+    fn flags_of_cmp_read_as_the_comparison() {
+        let cond_of = |jcc: u8| {
+            // cmp edi, 5 ; jcc +6 ; mov eax, 1 ; ret ; xor eax, eax ; ret
+            let c = c_of(&[0x83, 0xff, 0x05, jcc, 0x06, 0xb8, 0x01, 0, 0, 0, 0xc3, 0x31, 0xc0, 0xc3]);
+            let l = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}")).trim().to_string();
+            assert!(!c.contains("var_") && !c.contains("tmp_"), "{c}");
+            l
+        };
+        // the `if` holds the fall-through arm or the jump's arm, so accept either sense
+        let either = |l: &str, a: &str, b: &str| l.contains(a) || l.contains(b);
+        assert!(either(&cond_of(0x76), "edi <= 5", "edi > 5"), "jbe: {}", cond_of(0x76));
+        assert!(either(&cond_of(0x77), "edi > 5", "edi <= 5"), "ja: {}", cond_of(0x77));
+        assert!(either(&cond_of(0x7c), "(int32_t)edi < (int32_t)5", "(int32_t)edi >= (int32_t)5"), "jl: {}", cond_of(0x7c));
+        assert!(either(&cond_of(0x7e), "(int32_t)edi <= (int32_t)5", "(int32_t)edi > (int32_t)5"), "jle: {}", cond_of(0x7e));
+        assert!(either(&cond_of(0x7f), "(int32_t)edi > (int32_t)5", "(int32_t)edi <= (int32_t)5"), "jg: {}", cond_of(0x7f));
+    }
+
+    /// WS81: a negated integer comparison in a merged condition flips its operator.
+    #[test]
+    fn negated_comparison_flips_its_operator() {
+        let c = c_of(&[
+            0x83, 0xff, 0x01, // 0x1000 cmp edi, 1
+            0x74, 0x0b, // 0x1003 je 0x1010
+            0x83, 0xfe, 0x05, // 0x1005 cmp esi, 5
+            0x7e, 0x06, // 0x1008 jle 0x1010
+            0xb8, 0x03, 0x00, 0x00, 0x00, // 0x100a mov eax, 3
+            0xc3, // 0x100f
+            0xb8, 0x07, 0x00, 0x00, 0x00, // 0x1010 mov eax, 7
+            0xc3,
+        ]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(cond.contains("(int32_t)esi > (int32_t)5") || cond.contains("(int32_t)esi <= (int32_t)5"), "{c}");
+        assert!(!cond.contains("!("), "{c}");
+    }
+
     /// WS77: a function that never sets `rax` returns nothing.
     #[test]
     fn ret_without_rax_write_is_void() {
@@ -1643,7 +1680,8 @@ mod tests {
         assert!(!c.contains("} else {"), "{c}");
         assert_eq!(c.matches("if (").count(), 1, "{c}");
         assert_eq!(c.matches(" && ").count(), 2, "{c}");
-        assert!(c.contains("(edi - 2) != 0") && c.contains("(edi - 3) != 0"), "{c}");
+        // (WS81: the flags of `cmp` read as the comparison itself)
+        assert!(c.contains("edi != 2") && c.contains("edi != 3"), "{c}");
         assert_eq!(c.matches("return").count(), 1, "{c}");
     }
 
@@ -1880,8 +1918,8 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
-        assert!(cond.contains("(esi - 2) != 0") || cond.contains("(esi - 2) == 0"), "{c}");
-        assert!(!cond.contains("!((esi - 2)"), "{c}");
+        assert!(cond.contains("esi != 2") || cond.contains("esi == 2"), "{c}");
+        assert!(!cond.contains("!(esi"), "{c}");
     }
 
 }

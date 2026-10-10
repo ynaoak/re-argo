@@ -50,14 +50,14 @@ impl Cond {
         Cond::Or(v)
     }
 
-    /// Print the tree. `leaf(block)` is the text of `block`'s own condition (to its first
-    /// successor, not negated).
-    pub fn render(&self, negated: bool, leaf: &mut dyn FnMut(BlockId) -> String) -> String {
+    /// Print the tree. `leaf(block, negated)` is the text of `block`'s own condition (to its
+    /// first successor), inverted when `negated`.
+    pub fn render(&self, negated: bool, leaf: &mut dyn FnMut(BlockId, bool) -> String) -> String {
         if negated {
             return self.clone().negate().render(false, leaf);
         }
         match self {
-            Cond::Leaf { block, negated } => crate::emit::negate_condition(leaf(*block), *negated),
+            Cond::Leaf { block, negated } => leaf(*block, *negated),
             Cond::Or(v) | Cond::And(v) => {
                 let op = if matches!(self, Cond::Or(_)) { " || " } else { " && " };
                 let parts: Vec<String> = v
@@ -134,6 +134,9 @@ pub fn ops_by_block(func: &SsaFunction) -> Vec<Vec<OpIdx>> {
     v
 }
 
+/// Longest expression folded into a condition; a longer one stays a statement.
+const MAX_FOLDED_LEN: usize = 240;
+
 /// The identity of an SSA value: `(space, offset, size, version)`. Common subexpression
 /// elimination renames a removed op's result to the earlier value instead of rewriting its
 /// readers, so two varnode ids can name one value; their `uses` lists are separate.
@@ -164,18 +167,15 @@ impl Readers {
         Readers(m)
     }
 
-    /// The one live op reading `v`, if exactly one does.
-    pub fn single(&self, func: &SsaFunction, v: VarId) -> Option<OpIdx> {
-        match self.0.get(&value_key(func, v))?.as_slice() {
-            [u] => Some(*u),
-            _ => None,
-        }
+    /// The live ops reading `v`.
+    pub fn of(&self, func: &SsaFunction, v: VarId) -> &[OpIdx] {
+        self.0.get(&value_key(func, v)).map_or(&[], |r| r.as_slice())
     }
 }
 
 /// When `block` holds nothing but its test, the ops computing the condition (in order, the
-/// `CBRANCH` excluded): every live op but the branch is pure and its result is read exactly
-/// once, by a later op of the same block — so the ops fold into one expression, nothing else
+/// `CBRANCH` excluded): every live op but the branch is pure and its result is read only by
+/// later ops of the same block — so the ops fold into one expression, nothing else
 /// sees their results and nothing is lost by not printing them as statements.
 pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> Option<Vec<OpIdx>> {
     let tail = condition_tail(func, ops, readers);
@@ -183,9 +183,10 @@ pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> Op
 }
 
 /// The trailing ops of `ops` (a block's live ops) that only compute its branch condition
-/// (WS81): the longest run right before the `CBRANCH` of pure ops whose result is read exactly
-/// once, by a later op of the run or the branch. Nothing with a side effect runs between them
-/// and the branch, and nothing else reads their results, so they fold into the condition
+/// (WS81): the longest run right before the `CBRANCH` of pure ops whose result is read only by
+/// later ops of the run or the branch (by one of them, or — `a - b` / `a & b` of a `cmp` /
+/// `test` — by the flags computed from it). Nothing with a side effect runs between them and
+/// the branch, and nothing else reads their results, so they fold into the condition
 /// expression (`var_201 = edi < 6; if (var_201)` -> `if (edi < 6)`). Empty when the block does
 /// not end in a `CBRANCH`.
 pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx], readers: &Readers) -> &'o [OpIdx] {
@@ -201,8 +202,10 @@ pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx], readers: &Reader
         if !is_pure(op.opcode) {
             break;
         }
-        let Some(u) = readers.single(func, out) else { break };
-        if !ops[start..].contains(&u) {
+        // read by several ops only when it is what a compare's flags are computed from
+        let r = readers.of(func, out);
+        let shared_ok = r.len() == 1 || matches!(op.opcode, OpCode::IntSub | OpCode::IntAnd);
+        if r.is_empty() || !shared_ok || !r.iter().all(|u| ops[start..].contains(u)) {
             break;
         }
         start -= 1;
@@ -348,6 +351,134 @@ fn thread_empty_blocks(cfg: &mut ControlFlowGraph, empty: &[bool]) {
     }
 }
 
+/// What a flag computation of a condition stands for (WS81), so `cmp a, b; jbe` prints
+/// `a <= b` rather than the flags' formula `a < b || (a - b) == 0`.
+#[derive(Debug, Clone, Copy)]
+enum Rel {
+    /// `a - b`
+    Sub(VarId, VarId),
+    /// the sign flag of `a - b`
+    Sf(VarId, VarId),
+    /// the signed-overflow flag of `a - b`
+    Of(VarId, VarId),
+    /// `a <op> b` (an integer comparison), inverted when `negated`
+    Cmp { op: OpCode, a: VarId, b: VarId, negated: bool },
+}
+
+/// The relation `op` computes from the relations of its inputs (`rels`), if it is one.
+fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKey, Rel>) -> Option<Rel> {
+    use OpCode::*;
+    // a relation of the condition's ops, or `a - b` computed earlier in the block (a `cmp`
+    // whose result several flags read) when `a` and `b` still hold their values at the end
+    let rel = |i: usize| {
+        let v = *op.inputs.get(i)?;
+        rels.get(&value_key(func, v)).copied().or_else(|| earlier_sub(func, v, op.block))
+    };
+    let zero = |i: usize| {
+        op.inputs.get(i).is_some_and(|&v| {
+            let d = &func.varnodes[v as usize].data;
+            d.space == reargo_core::address::SpaceId::CONST && d.offset == 0
+        })
+    };
+    let same = |x: VarId, y: VarId| value_key(func, x) == value_key(func, y);
+    let pair = |a1: VarId, b1: VarId, a2: VarId, b2: VarId| same(a1, a2) && same(b1, b2);
+    let (in0, in1) = (op.inputs.first().copied(), op.inputs.get(1).copied());
+    Some(match op.opcode {
+        IntSub => Rel::Sub(in0?, in1?),
+        IntEqual | IntNotEqual if zero(1) && matches!(rel(0), Some(Rel::Sub(..))) => {
+            let Some(Rel::Sub(a, b)) = rel(0) else { return None };
+            Rel::Cmp { op: op.opcode, a, b, negated: false }
+        }
+        IntSLess if zero(1) && matches!(rel(0), Some(Rel::Sub(..))) => {
+            let Some(Rel::Sub(a, b)) = rel(0) else { return None };
+            Rel::Sf(a, b)
+        }
+        IntSBorrow => Rel::Of(in0?, in1?),
+        IntEqual | IntNotEqual | IntLess | IntLessEqual | IntSLess | IntSLessEqual | FloatEqual | FloatNotEqual
+        | FloatLess | FloatLessEqual => Rel::Cmp { op: op.opcode, a: in0?, b: in1?, negated: false },
+        // SF != OF: signed less
+        BoolXor => match (rel(0)?, rel(1)?) {
+            (Rel::Sf(a, b), Rel::Of(c, d)) | (Rel::Of(c, d), Rel::Sf(a, b)) if pair(a, b, c, d) => {
+                Rel::Cmp { op: IntSLess, a, b, negated: false }
+            }
+            _ => return None,
+        },
+        // a < b || a == b: a <= b
+        BoolOr => {
+            let (Rel::Cmp { op: x, a, b, negated: false }, Rel::Cmp { op: y, a: c, b: d, negated: false }) = (rel(0)?, rel(1)?) else {
+                return None;
+            };
+            if !pair(a, b, c, d) {
+                return None;
+            }
+            let le = match (x, y) {
+                (IntLess, IntEqual) | (IntEqual, IntLess) => IntLessEqual,
+                (IntSLess, IntEqual) | (IntEqual, IntSLess) => IntSLessEqual,
+                (FloatLess, FloatEqual) | (FloatEqual, FloatLess) => FloatLessEqual,
+                _ => return None,
+            };
+            Rel::Cmp { op: le, a, b, negated: false }
+        }
+        BoolNegate => match rel(0)? {
+            Rel::Cmp { op, a, b, negated } => Rel::Cmp { op, a, b, negated: !negated },
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// `Sub(a, b)` when `v` is `a - b` computed in `block` and nothing after it in the block
+/// writes over `a` or `b` (so their names, printed later in the condition, still mean them).
+fn earlier_sub(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
+    let d = func.varnodes[v as usize].def_op?;
+    let sub = &func.ops[d];
+    if sub.dead || sub.opcode != OpCode::IntSub || sub.block != block || sub.inputs.len() != 2 {
+        return None;
+    }
+    let (a, b) = (sub.inputs[0], sub.inputs[1]);
+    let overlaps = |x: VarId, w: &reargo_core::pcode::VarnodeData| {
+        let x = &func.varnodes[x as usize].data;
+        x.space != reargo_core::address::SpaceId::CONST
+            && x.space == w.space
+            && x.offset < w.offset + w.size as u64
+            && w.offset < x.offset + x.size as u64
+    };
+    for later in func.ops[d + 1..].iter().take_while(|o| o.block == block) {
+        if let Some(out) = later.output
+            && !later.dead
+            && (overlaps(a, &func.varnodes[out as usize].data) || overlaps(b, &func.varnodes[out as usize].data))
+        {
+            return None;
+        }
+    }
+    Some(Rel::Sub(a, b))
+}
+
+/// A condition folded into one expression.
+#[derive(Debug, Clone)]
+pub struct Folded {
+    pub text: String,
+    /// The text is an integer comparison `a OP b`: its negation flips `OP`.
+    pub int_cmp: bool,
+}
+
+impl Folded {
+    pub fn plain(text: String) -> Self {
+        Folded { text, int_cmp: false }
+    }
+
+    /// The text, inverted when `negated` (`a < b` -> `a >= b` for an integer comparison).
+    pub fn render(&self, negated: bool) -> String {
+        if negated
+            && self.int_cmp
+            && let Some(t) = crate::emit::flip_comparison(&self.text)
+        {
+            return t;
+        }
+        crate::emit::negate_condition(self.text.clone(), negated)
+    }
+}
+
 /// Prints the leaves of merged conditions: the ops of a test block are emitted in order and
 /// each result's right-hand side is substituted where it is read (`input_expr` asks
 /// [`Inliner::get`]), so the block's statements collapse into its condition expression.
@@ -357,7 +488,7 @@ pub struct Inliner {
     by_block: std::cell::OnceCell<Vec<Vec<OpIdx>>>,
     readers: std::cell::OnceCell<Readers>,
     /// block -> (the ops folded into its own condition, the condition's text)
-    own: std::cell::RefCell<FxHashMap<BlockId, Option<(Vec<OpIdx>, String)>>>,
+    own: std::cell::RefCell<FxHashMap<BlockId, Option<(Vec<OpIdx>, Folded)>>>,
 }
 
 impl Inliner {
@@ -385,7 +516,7 @@ impl Inliner {
         block: BlockId,
         name: &dyn Fn(VarId) -> String,
         emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
-    ) -> Option<(Vec<OpIdx>, String)> {
+    ) -> Option<(Vec<OpIdx>, Folded)> {
         if let Some(r) = self.own.borrow().get(&block) {
             return r.clone();
         }
@@ -396,14 +527,15 @@ impl Inliner {
             None
         } else {
             let cv = func.ops[*ops.last().unwrap()].inputs[1];
-            self.fold_ops(func, tail, cv, name, emit).map(|text| (tail.to_vec(), text))
+            self.fold_ops(func, tail, cv, name, emit, Some(MAX_FOLDED_LEN)).map(|f| (tail.to_vec(), f))
         };
         self.own.borrow_mut().insert(block, r.clone());
         r
     }
 
-    /// Fold `ops` (each read once, by a later one or the condition `cv`) into `cv`'s
-    /// expression; `None` when an op does not print as `dst = rhs;`.
+    /// Fold `ops` (each read only by later ones or the condition `cv`) into `cv`'s
+    /// expression; `None` when an op does not print as `dst = rhs;` or an expression grows
+    /// past `max_len`.
     fn fold_ops(
         &self,
         func: &SsaFunction,
@@ -411,8 +543,11 @@ impl Inliner {
         cv: VarId,
         name: &dyn Fn(VarId) -> String,
         emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
-    ) -> Option<String> {
+        max_len: Option<usize>,
+    ) -> Option<Folded> {
         let mut ok = true;
+        let mut rels: FxHashMap<ValueKey, Rel> = FxHashMap::default();
+        let mut int_cmp: rustc_hash::FxHashSet<ValueKey> = rustc_hash::FxHashSet::default();
         for &o in ops {
             let op = &func.ops[o];
             let Some(out) = op.output else {
@@ -420,6 +555,38 @@ impl Inliner {
                 break;
             };
             let key = value_key(func, out);
+            if let Some(rel) = relation(func, op, &rels) {
+                rels.insert(key, rel);
+                if let Rel::Cmp { op: cmp, a, b, negated } = rel {
+                    let int = !matches!(cmp, OpCode::FloatEqual | OpCode::FloatNotEqual | OpCode::FloatLess | OpCode::FloatLessEqual);
+                    // print the comparison the flags test (`a <= b`, not `a < b || a - b == 0`)
+                    let fake = crate::ssa::SsaOp {
+                        index: op.index,
+                        opcode: cmp,
+                        output: Some(out),
+                        inputs: smallvec::smallvec![a, b],
+                        block: op.block,
+                        address: op.address,
+                        dead: false,
+                    };
+                    let prefix = format!("{} = ", name(out));
+                    if let Some(rhs) = emit(&fake).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
+                        // (`!(a < b)` is not `a >= b` for a NaN)
+                        let text = match (negated, int) {
+                            (false, _) => Some(rhs),
+                            (true, true) => crate::emit::flip_comparison(&rhs),
+                            (true, false) => Some(format!("!({rhs})")),
+                        };
+                        if let Some(text) = text {
+                            self.exprs.borrow_mut().insert(key, text);
+                            if int {
+                                int_cmp.insert(key);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             if op.opcode == OpCode::BoolNegate
                 && let Some(inner) = op.inputs.first().and_then(|&i| self.exprs.borrow().get(&value_key(func, i)).cloned())
             {
@@ -433,18 +600,23 @@ impl Inliner {
             };
             let prefix = format!("{} = ", name(out));
             match line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')) {
-                Some(rhs) => {
+                // (a value read twice is printed twice: keep the expression readable)
+                Some(rhs) if max_len.is_none_or(|m| rhs.len() <= m) => {
                     self.exprs.borrow_mut().insert(key, rhs.to_string());
                 }
-                None => {
+                _ => {
                     ok = false;
                     break;
                 }
             }
         }
-        let text = ok.then(|| self.exprs.borrow().get(&value_key(func, cv)).cloned().unwrap_or_else(|| name(cv)));
+        let cvk = value_key(func, cv);
+        let folded = ok.then(|| Folded {
+            text: self.exprs.borrow().get(&cvk).cloned().unwrap_or_else(|| name(cv)),
+            int_cmp: int_cmp.contains(&cvk),
+        });
         self.exprs.borrow_mut().clear();
-        text
+        folded
     }
 
     /// The condition of `block` (to its first CFG successor) as one expression. `name` prints
@@ -455,18 +627,18 @@ impl Inliner {
         block: BlockId,
         name: &dyn Fn(VarId) -> String,
         emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
-    ) -> String {
+    ) -> Folded {
         let (by_block, readers) = self.parts(func);
         let ops = &by_block[block];
-        let Some(&br) = ops.last() else { return "cond".into() };
-        let Some(&cv) = func.ops[br].inputs.get(1) else { return "cond".into() };
+        let Some(&br) = ops.last() else { return Folded::plain("cond".into()) };
+        let Some(&cv) = func.ops[br].inputs.get(1) else { return Folded::plain("cond".into()) };
         let body = condition_ops(func, ops, readers).unwrap_or_default();
-        if let Some(text) = self.fold_ops(func, &body, cv, name, emit) {
-            return text;
+        if let Some(f) = self.fold_ops(func, &body, cv, name, emit, None) {
+            return f;
         }
         // an op printed in another shape: keep the statements, as a statement expression
         let lines: Vec<String> = body.iter().filter_map(|&o| emit(&func.ops[o])).collect();
-        format!("({{ {} {}; }})", lines.join(" "), name(cv))
+        Folded::plain(format!("({{ {} {}; }})", lines.join(" "), name(cv)))
     }
 }
 
@@ -489,11 +661,12 @@ mod tests {
             Cond::Leaf { block: 1, negated: false },
             Cond::And(vec![Cond::Leaf { block: 2, negated: false }, Cond::Leaf { block: 3, negated: true }]),
         ]);
-        let mut leaf = |b: BlockId| match b {
+        let leaf_text = |b: BlockId| match b {
             1 => "x".to_string(),
             2 => "y == 0".to_string(),
             _ => "z".to_string(),
         };
+        let mut leaf = |b: BlockId, neg: bool| crate::emit::negate_condition(leaf_text(b), neg);
         assert_eq!(c.render(false, &mut leaf), "x || ((y == 0) && !z)");
         assert_eq!(c.render(true, &mut leaf), "!x && ((y != 0) || z)");
     }
