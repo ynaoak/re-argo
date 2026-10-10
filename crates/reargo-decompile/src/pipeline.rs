@@ -1000,11 +1000,7 @@ fn build_decompile_result(
     // may be a flag combination they rewrote into a comparison)
     let flags = crate::flags::recover_flag_compares(&mut ssa);
     if crate::select::recover_selects(&mut ssa) + flags > 0 {
-        // twice: a copy of a constant that copy propagation already replaced in its reader
-        // still lists that reader, which dies only in the first round (`OF = 0` of `test`)
-        for _ in 0..2 {
-            opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
-        }
+        opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
     }
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
@@ -1295,10 +1291,11 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let r = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap();
         let c = &r.c_code;
-        // the argument survives (it used to be dead code) and is the only one shown
+        // the argument survives (it used to be dead code) and is the only one shown; WS83: a
+        // constant is printed in the call, its register's assignment is dropped
         let call_line = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call_line.contains("rdi") && !call_line.contains("rsi"), "{call_line}");
-        assert!(c.contains("edi = 5"), "{c}");
+        assert!(call_line.contains("0x2000(5)"), "{call_line}");
+        assert!(!c.contains("edi = 5"), "{c}");
         // the store reads the call's result (WS79: printed as the call's assignment)
         assert!(call_line.trim_start().starts_with("rax = "), "{c}");
         assert!(!c.contains("__ret"), "{c}");
@@ -1376,8 +1373,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call_line = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call_line.contains("rdi"), "{call_line}\n{c}");
-        assert!(c.contains("edi = 5"), "{c}");
+        assert!(call_line.contains("0x2000(5)"), "{call_line}\n{c}");
     }
 
     /// WS76: an argument register left over from before an earlier call is not an argument.
@@ -1394,8 +1390,8 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let first = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
         let second = c.lines().find(|l| l.contains("0x2100(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(first.contains("rdi"), "{first}");
-        assert!(!second.contains("rdi"), "{second}\n{c}");
+        assert!(first.contains("0x2000(5)"), "{first}");
+        assert!(!second.contains("rdi") && !second.contains("(5"), "{second}\n{c}");
     }
 
     /// Code blobs at their addresses inside one `0xcc`-filled block.
@@ -1416,7 +1412,7 @@ mod tests {
         let mem = make_memory_parts(&[(0x1000, code), (0x1100, callee), (0x2000, vtbl)]);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call_line = c.lines().find(|l| l.contains("0x1100(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call_line.trim_start().starts_with("xmm0 = 0x1100(rdi)"), "{c}");
+        assert!(call_line.trim_start().starts_with("xmm0 = 0x1100(7)"), "{c}");
     }
 
     fn make_memory_parts(parts: &[(u64, &[u8])]) -> Memory {
@@ -1444,7 +1440,7 @@ mod tests {
         let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi, rsi)") || call.contains("(param_1, rsi)"), "{call}
+        assert!(call.contains("(rdi, 5)") || call.contains("(param_1, 5)"), "{call}
 {c}");
     }
 
@@ -1463,7 +1459,7 @@ mod tests {
         let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("rdi") && !call.contains("rcx"), "{call}
+        assert!(call.contains("0x2000(5)"), "{call}
 {c}");
     }
 
@@ -1499,7 +1495,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = call_line(&c, "(*rax)(");
-        assert!(call.contains("(rdi, rsi)"), "{call}\n{c}");
+        assert!(call.contains("(rdi, 5)"), "{call}\n{c}");
     }
 
     /// WS78: with an unknown callee, a register computed in an earlier block and used by other
@@ -1520,7 +1516,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = call_line(&c, "(*rax)(");
-        assert!(call.contains("(rdi);"), "{call}\n{c}");
+        assert!(call.contains("(5);"), "{call}\n{c}");
     }
 
     /// WS78: the 8/16-bit views of rbp/rsi/... have register names, not `var_<off>` (which
@@ -1529,7 +1525,7 @@ mod tests {
     fn low_byte_registers_are_named() {
         let lifter = X86Lifter::new_64();
         let code = [
-            0x40, 0xb6, 0x01, // mov sil, 1
+            0x40, 0x88, 0xfe, // mov sil, dil (WS83: not a constant, which the store would take)
             0x40, 0x88, 0x35, 0xf7, 0x1f, 0x00, 0x00, // mov [0x3000], sil
             0x66, 0x89, 0x2d, 0xf0, 0x1f, 0x00, 0x00, // mov [0x3001], bp
             0xc3,
@@ -2018,7 +2014,7 @@ mod tests {
         assert!(cond.contains("esi") && cond.contains('2'), "the second test folds into the condition: {c}");
         assert_eq!(c.matches("if (").count(), 1, "{c}");
         assert!(!c.contains("goto"), "{c}");
-        assert_eq!(c.matches("(uint32_t)7;").count(), 1, "{c}");
+        assert_eq!(c.matches("7;").count(), 1, "{c}");
     }
 
 
@@ -2341,7 +2337,7 @@ mod tests {
         let symbols = std::collections::BTreeMap::from([(0x2000u64, "pthread_mutex_unlock@plt".to_string())]);
         let c = decompile_with_symbols(&lifter, &mem, 0x1000, "f", 100, &symbols).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("pthread_mutex_unlock@plt(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi)"), "{c}");
+        assert!(call.contains("(5)"), "{c}");
     }
 
     /// An unknown callee: a register only partly written (`setne sil`) whose byte the
@@ -2352,7 +2348,7 @@ mod tests {
         let mem = make_memory(&setcc_leftover_code(), 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi)"), "{c}");
+        assert!(call.contains("(5)"), "{c}");
     }
 
     /// `setne sil; call f`: a byte written only to be passed is still an argument.
@@ -2369,7 +2365,7 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = c.lines().find(|l| l.contains("0x2000(")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi, rsi)"), "{c}");
+        assert!(call.contains("(5, rsi)"), "{c}");
     }
 
     /// A thunk whose only instruction is `jmp import@plt` is that import (WS82): its name and
@@ -2433,5 +2429,23 @@ mod tests {
         assert!(c.contains("rcx = (rcx < rdx) ? rcx : rdx;"), "{c}");
         assert!(!c.contains("tmp_4b") && !c.contains("var_201"), "{c}");
         assert!(r.rust_code.contains("if ") && !r.rust_code.contains("tmp_4bc"), "{}", r.rust_code);
+    }
+
+    /// A constant copy whose reader took the constant dies (WS83): copy propagation used to
+    /// leave the reader in the copy's use list, so `ecx = 7;` stayed printed (and died only
+    /// in functions with a phi, in a second round of dead code elimination).
+    #[test]
+    fn propagated_constant_copy_is_dropped() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xb9, 0x07, 0x00, 0x00, 0x00, // mov ecx, 7
+            0x89, 0x0f, // mov [rdi], ecx
+            0x31, 0xc0, // xor eax, eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("*(uint32_t*)rdi = 7;"), "{c}");
+        assert!(!c.contains("ecx"), "{c}");
     }
 }

@@ -66,6 +66,20 @@ fn try_constant_fold_op(func: &mut SsaFunction, i: usize) -> bool {
             let b = func.varnodes[inputs[1] as usize].data.offset;
             Some(a.wrapping_mul(b))
         }
+        // WS83: `mov edi, 5` writes `rdi = zext(edi)`; folded, the argument reads `5`
+        OpCode::IntZExt | OpCode::IntSExt => {
+            let v = &func.varnodes[inputs[0] as usize].data;
+            let bits = v.size * 8;
+            let a = if bits >= 64 { v.offset } else { v.offset & ((1u64 << bits) - 1) };
+            Some(if func.ops[i].opcode == OpCode::IntSExt && bits < 64 && a >> (bits - 1) & 1 == 1 { a | !((1u64 << bits) - 1) } else { a })
+        }
+        // the upper half of a zero-extended constant (`xmm1 = 0; … (uint64_t)(xmm1 >> 64)`);
+        // a constant holds at most 64 bits
+        OpCode::Subpiece if inputs.len() == 2 => {
+            let v = func.varnodes[inputs[0] as usize].data.offset;
+            let k = func.varnodes[inputs[1] as usize].data.offset;
+            Some(if k >= 8 { 0 } else { v >> (k * 8) })
+        }
         _ => None,
     };
 
@@ -381,81 +395,8 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
 
 pub fn constant_fold(func: &mut SsaFunction) -> usize {
     let mut folded = 0;
-
     for i in 0..func.ops.len() {
-        if func.ops[i].dead || func.ops[i].output.is_none() {
-            continue;
-        }
-
-        let all_const = func.ops[i]
-            .inputs
-            .iter()
-            .all(|&id| func.varnodes[id as usize].data.space == reargo_core::address::SpaceId::CONST);
-
-        if !all_const || func.ops[i].inputs.is_empty() {
-            continue;
-        }
-
-        let result = match func.ops[i].opcode {
-            OpCode::IntAdd => {
-                let a = func.varnodes[func.ops[i].inputs[0] as usize].data.offset;
-                let b = func.varnodes[func.ops[i].inputs[1] as usize].data.offset;
-                Some(a.wrapping_add(b))
-            }
-            OpCode::IntSub => {
-                let a = func.varnodes[func.ops[i].inputs[0] as usize].data.offset;
-                let b = func.varnodes[func.ops[i].inputs[1] as usize].data.offset;
-                Some(a.wrapping_sub(b))
-            }
-            OpCode::IntAnd => {
-                let a = func.varnodes[func.ops[i].inputs[0] as usize].data.offset;
-                let b = func.varnodes[func.ops[i].inputs[1] as usize].data.offset;
-                Some(a & b)
-            }
-            OpCode::IntOr => {
-                let a = func.varnodes[func.ops[i].inputs[0] as usize].data.offset;
-                let b = func.varnodes[func.ops[i].inputs[1] as usize].data.offset;
-                Some(a | b)
-            }
-            OpCode::IntXor => {
-                let a = func.varnodes[func.ops[i].inputs[0] as usize].data.offset;
-                let b = func.varnodes[func.ops[i].inputs[1] as usize].data.offset;
-                Some(a ^ b)
-            }
-            OpCode::IntEqual => {
-                let a = func.varnodes[func.ops[i].inputs[0] as usize].data.offset;
-                let b = func.varnodes[func.ops[i].inputs[1] as usize].data.offset;
-                Some(if a == b { 1 } else { 0 })
-            }
-            OpCode::IntMult => {
-                let a = func.varnodes[func.ops[i].inputs[0] as usize].data.offset;
-                let b = func.varnodes[func.ops[i].inputs[1] as usize].data.offset;
-                Some(a.wrapping_mul(b))
-            }
-            _ => None,
-        };
-
-        if let Some(val) = result {
-            let out_id = func.ops[i].output.expect("output checked above");
-            let out_size = func.varnodes[out_id as usize].data.size;
-            // Truncate to the operand width: a folded 32-bit `0xFFFFFFFF + 1`
-            // must be 0, not 0x1_0000_0000. The constant is emitted from its
-            // raw offset, so an unmasked value would print (and re-fold) wrong.
-            let masked = if out_size >= 8 {
-                val
-            } else {
-                val & ((1u64 << (out_size * 8)) - 1)
-            };
-            let const_id = func.varnodes.len() as u32;
-            func.varnodes.push(crate::ssa::SsaVarnode {
-                id: const_id,
-                data: reargo_core::pcode::VarnodeData::new(reargo_core::address::SpaceId::CONST, masked, out_size),
-                version: 0,
-                def_op: None,
-                uses: vec![i],
-            });
-            func.ops[i].opcode = OpCode::Copy;
-            func.ops[i].inputs = smallvec::smallvec![const_id];
+        if !func.ops[i].dead && func.ops[i].output.is_some() && try_constant_fold_op(func, i) {
             folded += 1;
         }
     }
@@ -502,6 +443,10 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
                 }
             }
         }
+        // the readers rewritten no longer read the copy (WS83): dead code elimination can
+        // drop it once nothing else does
+        let ops = &func.ops;
+        func.varnodes[out_id as usize].uses.retain(|&u| ops[u].dead || ops[u].inputs.contains(&out_id));
     }
     propagated
 }
@@ -1252,6 +1197,30 @@ mod tests {
         let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, cfg);
         let folded = constant_fold(&mut ssa);
         assert!(folded > 0);
+    }
+
+    /// WS83: `INT_ZEXT` / `INT_SEXT` / `SUBPIECE` of a constant fold, so `mov edi, 5`'s
+    /// `rdi = zext(edi)` passes `5`, and the upper half of a zeroed `xmm` is `0`.
+    #[test]
+    fn constant_folding_extensions_and_pieces() {
+        let seq = |a| SeqNum::new(Address::new(SpaceId(1), a), 0);
+        let fold = |opcode: OpCode, inputs: &[VarnodeData], out_size: u32| {
+            let out = VarnodeData::new(SpaceId(2), 0x00, out_size);
+            let insns = vec![
+                make_lifted(0x1000, vec![PcodeOp { opcode, seq: seq(0x1000), output: Some(out), inputs: SmallVec::from_slice(inputs) }]),
+                make_lifted(0x1001, vec![PcodeOp { opcode: OpCode::Return, seq: seq(0x1001), output: None, inputs: SmallVec::from_slice(&[out]) }]),
+            ];
+            let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, ControlFlowGraph::build(&insns));
+            assert!(constant_fold(&mut ssa) > 0, "{opcode:?}");
+            let op = ssa.ops.iter().find(|o| o.opcode == OpCode::Copy && !o.dead).unwrap();
+            ssa.varnodes[op.inputs[0] as usize].data.offset
+        };
+        let c = |v: u64, size: u32| VarnodeData::new(SpaceId(0), v, size);
+        assert_eq!(fold(OpCode::IntZExt, &[c(5, 4)], 8), 5);
+        assert_eq!(fold(OpCode::IntSExt, &[c(0xff, 1)], 4), 0xffff_ffff);
+        assert_eq!(fold(OpCode::IntSExt, &[c(0x7f, 1)], 8), 0x7f);
+        assert_eq!(fold(OpCode::Subpiece, &[c(0, 16), c(8, 4)], 8), 0);
+        assert_eq!(fold(OpCode::Subpiece, &[c(0x1122_3344_5566_7788, 8), c(4, 4)], 4), 0x1122_3344);
     }
 
     #[test]
