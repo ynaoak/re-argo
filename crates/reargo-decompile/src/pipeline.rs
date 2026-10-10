@@ -9,7 +9,7 @@ use crate::emit::CEmitter;
 use crate::rust_emit::RustEmitter;
 use crate::optimize::{run_optimization_passes, OptimizationStats};
 use crate::ssa::SsaFunction;
-use crate::structure::structure_cfg;
+use crate::structure::structure_cfg_with_handlers;
 
 pub struct DecompileResult {
     pub c_code: String,
@@ -66,7 +66,7 @@ pub fn decompile_with_symbols(
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)))
+    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[])
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -316,6 +316,8 @@ fn decompile_function_inner(
     let call_returns = callee_return_map(&terminated, oracle, symbols);
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
+    // WS82: the exception landing pads, printed after the body
+    let handlers = crate::exception::handlers(&program.info.memory, &program.info.sections, symbols, func_entry);
 
     build_decompile_result(
         terminated,
@@ -329,6 +331,7 @@ fn decompile_function_inner(
         own,
         vcalls,
         Some((lifter, &program.info.memory)),
+        &handlers,
     )
 }
 
@@ -896,6 +899,7 @@ fn build_decompile_result(
     own_params: Option<(ParamInfo, Vec<reargo_core::pcode::VarnodeData>)>,
     vcalls: Option<ThisVcalls<'_>>,
     caller_hint: Option<(&dyn PcodeLift, &Memory)>,
+    handlers: &[crate::exception::Handler],
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -974,7 +978,10 @@ fn build_decompile_result(
 
     // `if (a) goto X; if (b) goto X;` -> `if (a || b) goto X;` (on a copy of the CFG)
     let short = crate::condition::merge_short_circuits(&ssa);
-    let structured = structure_cfg(short.as_ref().map_or(&ssa.cfg, |s| &s.cfg));
+    let cfg = short.as_ref().map_or(&ssa.cfg, |s| &s.cfg);
+    let handler_blocks: Vec<(usize, String)> =
+        handlers.iter().filter_map(|(a, note)| Some((cfg.block_at(*a).filter(|b| b.start_addr == *a)?.id, note.clone()))).collect();
+    let structured = structure_cfg_with_handlers(cfg, &handler_blocks);
     // Both emitters borrow the same two maps -- the previous API took
     // owned BTreeMaps and forced four clones per decompile call (two
     // maps * two emitters). The borrow-based `with_maps` API is

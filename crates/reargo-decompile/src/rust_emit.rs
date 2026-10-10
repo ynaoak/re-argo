@@ -335,6 +335,15 @@ impl<'a> RustEmitter<'a> {
                 // Rust does not have goto; emit as a comment-annotated break/continue placeholder
                 linef!(self, "// goto label_{:x}; (unsupported in Rust)", func.cfg.blocks[*target].start_addr);
             }
+            StructuredBlock::Handler { landing_pad, note, body } => {
+                // reached only by unwinding (WS82)
+                linef!(self, "// landing pad 0x{:x}: {}", func.cfg.blocks[*landing_pad].start_addr, note);
+                self.line("{");
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.indent -= 1;
+                self.line("}");
+            }
             StructuredBlock::Break => self.line("break;"),
             StructuredBlock::Continue => self.line("continue;"),
         }

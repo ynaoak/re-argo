@@ -75,6 +75,13 @@ pub enum StructuredBlock {
         default: Option<Box<StructuredBlock>>,
     },
     Goto(BlockId),
+    /// An exception landing pad (WS82): code reached only by unwinding, printed after the
+    /// function's body under `note` (what it handles, for which calls).
+    Handler {
+        landing_pad: BlockId,
+        note: String,
+        body: Box<StructuredBlock>,
+    },
     /// Leave the innermost loop.
     Break,
     /// Next iteration of the innermost loop.
@@ -82,26 +89,49 @@ pub enum StructuredBlock {
 }
 
 pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
+    structure_cfg_with_handlers(cfg, &[])
+}
+
+/// [`structure_cfg`], then each exception landing pad `(block, note)` the walk from the entry
+/// did not reach (WS82), as a [`StructuredBlock::Handler`] after the body. A jump from a
+/// landing pad back into the body is a `goto`.
+pub fn structure_cfg_with_handlers(cfg: &ControlFlowGraph, handlers: &[(BlockId, String)]) -> StructuredBlock {
     if cfg.blocks.is_empty() {
         return StructuredBlock::Sequence(Vec::new());
     }
     let mut s = Structurer::new(cfg);
     let mut items = s.walk(cfg.entry_block, None, false);
-    // Safety net: a `goto` whose target the walk never printed (it was left to a region
-    // owner that did not get there) — print the target region at the end.
-    loop {
-        let mut targets = Vec::new();
-        for it in &items {
-            collect_gotos(it, &mut targets);
+    s.print_missing_gotos(&mut items);
+    for (b, note) in handlers {
+        if *b >= cfg.blocks.len() || s.emitted[*b] {
+            continue;
         }
-        let Some(&missing) = targets.iter().find(|&&t| !s.emitted[t]) else { break };
         s.loop_stack.clear();
         s.follow_stack.clear();
-        items.extend(s.walk(missing, None, false));
+        let mut body = s.walk(*b, None, false);
+        s.print_missing_gotos(&mut body);
+        items.push(StructuredBlock::Handler { landing_pad: *b, note: note.clone(), body: Box::new(seq(body)) });
     }
     let mut root = seq(items);
     inline_return_tails(cfg, &mut root);
     root
+}
+
+impl Structurer<'_> {
+    /// Safety net: a `goto` whose target the walk never printed (it was left to a region
+    /// owner that did not get there) — print the target region at the end.
+    fn print_missing_gotos(&mut self, items: &mut Vec<StructuredBlock>) {
+        loop {
+            let mut targets = Vec::new();
+            for it in items.iter() {
+                collect_gotos(it, &mut targets);
+            }
+            let Some(&missing) = targets.iter().find(|&&t| !self.emitted[t]) else { break };
+            self.loop_stack.clear();
+            self.follow_stack.clear();
+            items.extend(self.walk(missing, None, false));
+        }
+    }
 }
 
 /// Longest straight-line tail (instructions) copied in place of a `goto`.
@@ -173,7 +203,8 @@ fn inline_return_tails(cfg: &ControlFlowGraph, node: &mut StructuredBlock) {
         | Loop { body, .. }
         | ForLoop { body, .. }
         | ShortCircuitAnd { body, .. }
-        | ShortCircuitOr { body, .. } => inline_return_tails(cfg, body),
+        | ShortCircuitOr { body, .. }
+        | Handler { body, .. } => inline_return_tails(cfg, body),
         Switch { cases, default, .. } => {
             cases.iter_mut().for_each(|(_, c)| inline_return_tails(cfg, c));
             if let Some(d) = default {
@@ -660,7 +691,8 @@ fn collect_gotos(n: &StructuredBlock, out: &mut Vec<BlockId>) {
         | Loop { body, .. }
         | ForLoop { body, .. }
         | ShortCircuitAnd { body, .. }
-        | ShortCircuitOr { body, .. } => collect_gotos(body, out),
+        | ShortCircuitOr { body, .. }
+        | Handler { body, .. } => collect_gotos(body, out),
         Switch { cases, default, .. } => {
             cases.iter().for_each(|(_, c)| collect_gotos(c, out));
             if let Some(d) = default {
@@ -731,7 +763,8 @@ mod tests {
             | StructuredBlock::Loop { body, .. }
             | StructuredBlock::ForLoop { body, .. }
             | StructuredBlock::ShortCircuitAnd { body, .. }
-            | StructuredBlock::ShortCircuitOr { body, .. } => n += count(body, pred),
+            | StructuredBlock::ShortCircuitOr { body, .. }
+            | StructuredBlock::Handler { body, .. } => n += count(body, pred),
             StructuredBlock::Switch { cases, default, .. } => {
                 for (_, b) in cases { n += count(b, pred); }
                 if let Some(d) = default { n += count(d, pred); }
@@ -1183,4 +1216,26 @@ mod tests {
         assert_eq!(gotos(&s), 0, "{s:?}");
     }
 
+
+    /// A landing pad (no predecessor) is printed after the body as a handler (WS82); its jump
+    /// back into the body is a `goto`.
+    #[test]
+    fn landing_pad_is_a_handler_after_the_body() {
+        // 0: cbranch 3 / 1: ret ... 2: (landing pad) jmp 3 / 3: ret
+        let insns = vec![
+            lifted(0x10, vec![cbranch(0x10, 0x13)]),
+            lifted(0x11, vec![ret(0x11)]),
+            lifted(0x12, vec![branch(0x12, 0x13)]),
+            lifted(0x13, vec![ret(0x13)]),
+        ];
+        let cfg = ControlFlowGraph::build(&insns);
+        let lp = cfg.block_at(0x12).unwrap().id;
+        let plain = structure_cfg(&cfg);
+        assert_eq!(count(&plain, &|n| matches!(n, StructuredBlock::Basic(b) if *b == lp)), 0, "{plain:?}");
+        let s = structure_cfg_with_handlers(&cfg, &[(lp, "cleanup".into())]);
+        let StructuredBlock::Sequence(items) = &s else { panic!("{s:?}") };
+        let Some(StructuredBlock::Handler { landing_pad, note, body }) = items.last() else { panic!("{s:?}") };
+        assert_eq!((*landing_pad, note.as_str()), (lp, "cleanup"));
+        assert_eq!(count(body, &|n| matches!(n, StructuredBlock::Basic(b) if *b == lp)), 1, "{s:?}");
+    }
 }

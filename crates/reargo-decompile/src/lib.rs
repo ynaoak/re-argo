@@ -8,6 +8,7 @@ pub mod comments_gen;
 pub mod dataflow;
 pub mod dominator;
 pub mod emit;
+pub mod exception;
 pub mod flags;
 pub mod rust_emit;
 pub mod noreturn;
