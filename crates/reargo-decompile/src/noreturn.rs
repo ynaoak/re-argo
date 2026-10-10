@@ -8,15 +8,16 @@
 //! [`NoReturn`] answers "does the function at `target` never return?":
 //! * by name, for imports whose contract is `noreturn` ([`NORETURN_NAMES`], exact match of the
 //!   symbol without its `@plt` / `@GLIBC_…` suffix);
-//! * by its code: lifted from `target`, no path from the entry reaches a `ret`, an indirect
-//!   jump, a tail jump to a function that returns, or the end of what was lifted — every path
-//!   ends in a trap (`int3` / `ud2` / `hlt`) or in a call to a function that never returns
-//!   (decided the same way, depth-limited). An unknown answer counts as "returns", so a
-//!   mistake can only leave a fall-through in, never cut real code out.
+//! * by its code: no path from `target` reaches a `ret`, an indirect jump, or code that
+//!   cannot be lifted (or past the instruction budget) — every path ends in a trap (`int3` /
+//!   `ud2` / `hlt`) or in a call to a function that never returns (decided the same way,
+//!   depth-limited); a tail jump is followed as part of the path. An unknown answer counts as
+//!   "returns", so a mistake can only leave a fall-through in, never cut real code out.
 //!
 //! The search is a 0-1 BFS over the instructions where passing a call costs 1: an exit
 //! reachable with fewer calls is found first, and only the calls in front of it are looked
-//! into. Results are cached per function.
+//! into. Instructions are lifted as the search reaches them, and results are cached per
+//! function.
 //!
 //! [`mark_noreturn_calls`] appends a [`NORETURN_MARK`] op to each such call instruction;
 //! [`crate::cfg::is_trap`] treats it like a trap (control does not fall through) and the
@@ -89,8 +90,8 @@ pub fn is_noreturn_name(name: &str) -> bool {
     NORETURN_NAMES.contains(&base)
 }
 
-/// Instructions lifted per function looked into.
-const MAX_INSNS: usize = 512;
+/// Most instructions lifted per function looked into.
+const MAX_INSNS: usize = 1024;
 /// Call levels followed below the function asked about.
 const MAX_DEPTH: u32 = 6;
 
@@ -147,23 +148,18 @@ impl<'a> NoReturn<'a> {
     }
 
     fn analyze(&self, target: u64, depth: u32, stack: &mut Vec<u64>) -> Verdict {
-        let Ok(insns) = self.lifter.lift_range(self.memory, target, MAX_INSNS) else {
-            return Verdict::Returns;
-        };
-        if insns.first().map(|i| i.address) != Some(target) {
-            return Verdict::Returns;
-        }
+        let mut code = Code { lifter: self.lifter, memory: self.memory, insns: Vec::new(), index: FxHashMap::default() };
+        let Some(entry) = code.at(target) else { return Verdict::Returns };
         let mut unsure = false;
-        let exit = search(&insns, |t, s: &mut Vec<u64>| {
-            match self.verdict(t, depth - 1, s) {
-                Verdict::NoReturn => true,
-                Verdict::Returns => false,
-                Verdict::Unsure => {
-                    unsure = true;
-                    false
-                }
+        let mut stops = |t: u64, s: &mut Vec<u64>| match self.verdict(t, depth - 1, s) {
+            Verdict::NoReturn => true,
+            Verdict::Returns => false,
+            Verdict::Unsure => {
+                unsure = true;
+                false
             }
-        }, stack);
+        };
+        let exit = search(&mut code, entry, &|t| self.named(t), &mut stops, stack);
         match (exit, unsure) {
             (false, _) => Verdict::NoReturn,
             (true, false) => Verdict::Returns,
@@ -172,49 +168,83 @@ impl<'a> NoReturn<'a> {
     }
 }
 
-enum Item {
-    Insn(usize),
-    /// A direct call (`fall` = the instruction after it) or, with `tail`, a jump out of the
-    /// lifted code.
-    Call { target: u64, fall: Option<usize>, tail: bool },
+/// The instructions of a function, lifted as the search reaches them.
+struct Code<'a> {
+    lifter: &'a dyn PcodeLift,
+    memory: &'a Memory,
+    insns: Vec<LiftedInstruction>,
+    index: FxHashMap<u64, usize>,
 }
 
-/// Can control leave the function (see the module doc) from `insns[0]`? `stops(t)` answers
-/// whether a call to `t` never returns.
+/// Instructions lifted at a time.
+const CHUNK: usize = 24;
+
+impl Code<'_> {
+    /// The instruction at `addr`, lifting from there when it is not lifted yet; `None` when it
+    /// cannot be lifted or the budget ([`MAX_INSNS`]) is spent.
+    fn at(&mut self, addr: u64) -> Option<usize> {
+        if let Some(&i) = self.index.get(&addr) {
+            return Some(i);
+        }
+        if self.insns.len() >= MAX_INSNS {
+            return None;
+        }
+        for insn in self.lifter.lift_range(self.memory, addr, CHUNK).ok()? {
+            if self.index.contains_key(&insn.address) {
+                break; // runs into code lifted before
+            }
+            self.index.insert(insn.address, self.insns.len());
+            self.insns.push(insn);
+        }
+        self.index.get(&addr).copied()
+    }
+}
+
+enum Item {
+    Insn(usize),
+    /// A direct call to `target`; `fall` = the address after it.
+    Call { target: u64, fall: u64 },
+}
+
+/// Can control leave the function (see the module doc) from `entry`? `named(t)`: `t` is an
+/// import that never returns; `stops(t)`: a call to `t` never returns. A jump to another
+/// function (a tail call) is followed as part of this one.
 fn search(
-    insns: &[LiftedInstruction],
-    mut stops: impl FnMut(u64, &mut Vec<u64>) -> bool,
+    code: &mut Code<'_>,
+    entry: usize,
+    named: &dyn Fn(u64) -> bool,
+    stops: &mut dyn FnMut(u64, &mut Vec<u64>) -> bool,
     stack: &mut Vec<u64>,
 ) -> bool {
-    let index: FxHashMap<u64, usize> = insns.iter().enumerate().map(|(i, x)| (x.address, i)).collect();
-    let mut seen = vec![false; insns.len()];
-    let mut queue: VecDeque<Item> = VecDeque::from([Item::Insn(0)]);
+    let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    let mut queue: VecDeque<Item> = VecDeque::from([Item::Insn(entry)]);
     while let Some(item) = queue.pop_front() {
         let i = match item {
             Item::Insn(i) => i,
-            Item::Call { target, fall, tail } => {
+            Item::Call { target, fall } => {
                 if stops(target, stack) {
                     continue;
                 }
-                match (tail, fall) {
-                    (false, Some(f)) => {
+                match code.at(fall) {
+                    Some(f) => {
                         queue.push_front(Item::Insn(f));
                         continue;
                     }
-                    _ => return true,
+                    None => return true,
                 }
             }
         };
-        if std::mem::replace(&mut seen[i], true) {
+        if !seen.insert(i) {
             continue;
         }
-        let insn = &insns[i];
+        let insn = &code.insns[i];
         if crate::cfg::is_trap(insn) {
             continue;
         }
-        let fall = index.get(&(insn.address + insn.length as u64)).copied();
+        let next = insn.address + insn.length as u64;
         let ram = |op: &PcodeOp| op.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset);
         let mut falls = true;
+        let mut targets: SmallVec<[u64; 2]> = SmallVec::new();
         for op in &insn.ops {
             match op.opcode {
                 OpCode::Return | OpCode::BranchInd => return true,
@@ -222,18 +252,16 @@ fn search(
                     if op.opcode == OpCode::Branch {
                         falls = false;
                     }
-                    match ram(op) {
-                        Some(t) => match index.get(&t) {
-                            Some(&j) => queue.push_front(Item::Insn(j)),
-                            None => queue.push_back(Item::Call { target: t, fall: None, tail: true }),
-                        },
-                        // a branch inside the instruction's own p-code (rep, cmov): carry on
-                        None => {}
+                    // (a branch inside the instruction's own p-code — rep, cmov — has none)
+                    if let Some(t) = ram(op) {
+                        targets.push(t);
                     }
                 }
                 OpCode::Call => {
                     if let Some(t) = ram(op) {
-                        queue.push_back(Item::Call { target: t, fall, tail: false });
+                        if !named(t) {
+                            queue.push_back(Item::Call { target: t, fall: next });
+                        }
                         falls = false;
                     }
                 }
@@ -241,8 +269,14 @@ fn search(
             }
         }
         if falls {
-            match fall {
-                Some(f) => queue.push_front(Item::Insn(f)),
+            targets.push(next);
+        }
+        for t in targets {
+            if named(t) {
+                continue; // a tail call to an import that never returns
+            }
+            match code.at(t) {
+                Some(j) => queue.push_front(Item::Insn(j)),
                 None => return true,
             }
         }
@@ -367,6 +401,24 @@ mod tests {
         assert!(o.is_noreturn(0x3000));
         assert!(o.is_noreturn(0x2000));
         assert!(!o.is_noreturn(0x5000));
+        assert!(!o.is_noreturn(0x6000));
+    }
+
+    #[test]
+    fn tail_jumps_are_followed() {
+        let lifter = X86Lifter::new_64();
+        let m = mem(&[
+            (0x2000, &[0xe9, 0xfb, 0x0f, 0, 0]), // jmp 0x3000
+            (0x3000, &[0x0f, 0x0b]),             // ud2
+            (0x4000, &[0xe9, 0xfb, 0x0f, 0, 0]), // jmp 0x5000 (abort@plt)
+            (0x5000, &[0xff, 0x25, 0, 0, 0, 0]),
+            (0x6000, &[0xe9, 0xfb, 0x0f, 0, 0]), // jmp 0x7000
+            (0x7000, &[0xc3]),
+        ]);
+        let syms = BTreeMap::from([(0x5000u64, "abort@plt".to_string())]);
+        let o = NoReturn::new(&lifter, &m, Some(&syms));
+        assert!(o.is_noreturn(0x2000));
+        assert!(o.is_noreturn(0x4000));
         assert!(!o.is_noreturn(0x6000));
     }
 
