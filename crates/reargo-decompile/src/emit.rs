@@ -66,6 +66,8 @@ pub struct CEmitter<'a> {
     goto_targets: std::collections::BTreeSet<usize>,
     /// Epilogue ops not printed (`epilogue_noise`).
     noise: rustc_hash::FxHashSet<usize>,
+    /// Ops folded into their block's own branch condition (WS81): not statements.
+    folded: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for CEmitter<'static> {
@@ -88,6 +90,7 @@ impl CEmitter<'static> {
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
+            folded: rustc_hash::FxHashSet::default(),
         }
     }
 }
@@ -122,6 +125,7 @@ impl<'a> CEmitter<'a> {
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
+            folded: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -164,6 +168,10 @@ impl<'a> CEmitter<'a> {
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
+        self.folded = (0..func.cfg.blocks.len())
+            .filter_map(|b| self.own_condition(func, b))
+            .flat_map(|(ops, _)| ops)
+            .collect();
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -181,7 +189,7 @@ impl<'a> CEmitter<'a> {
         for vn in &func.varnodes {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
             // view syncs nobody reads) is not printed, so declaring it is noise
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead) {
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d)) {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
@@ -390,7 +398,8 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
+            // (a folded op only feeds the branch, which prints nothing here)
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -402,7 +411,7 @@ impl<'a> CEmitter<'a> {
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
@@ -940,6 +949,15 @@ impl<'a> CEmitter<'a> {
         varnode_name(vn)
     }
 
+    /// The block's branch condition with the ops that only compute it folded in (WS81).
+    fn own_condition(&self, func: &SsaFunction, block_id: usize) -> Option<(Vec<usize>, String)> {
+        self.inliner.own_condition(func, block_id, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+    }
+
+    fn branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
+        self.own_condition(func, block_id).map(|(_, t)| t).unwrap_or_else(|| self.get_branch_condition(func, block_id))
+    }
+
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
         for op in func.ops.iter().rev() {
             if op.block != block_id || op.dead {
@@ -967,14 +985,14 @@ impl<'a> CEmitter<'a> {
         if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
             let mut leaf = |b: usize| {
                 if b == block_id {
-                    self.get_branch_condition(func, b)
+                    self.branch_condition(func, b)
                 } else {
                     self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
                 }
             };
             return c.render(negated, &mut leaf);
         }
-        negate_condition(self.get_branch_condition(func, block_id), negated)
+        negate_condition(self.branch_condition(func, block_id), negated)
     }
 
     fn line(&mut self, text: &str) {

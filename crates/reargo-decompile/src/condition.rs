@@ -159,6 +159,35 @@ pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx]) -> Option<Vec<OpIdx>> {
     Some(body.to_vec())
 }
 
+/// The trailing ops of `ops` (a block's live ops) that only compute its branch condition
+/// (WS81): the longest run right before the `CBRANCH` of pure ops whose result is read exactly
+/// once, by a later op of the run or the branch. Nothing with a side effect runs between them
+/// and the branch, and nothing else reads their results, so they fold into the condition
+/// expression (`var_201 = edi < 6; if (var_201)` -> `if (edi < 6)`). Empty when the block does
+/// not end in a `CBRANCH`.
+pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx]) -> &'o [OpIdx] {
+    let Some((&last, body)) = ops.split_last() else { return &[] };
+    let br = &func.ops[last];
+    if br.opcode != OpCode::CBranch || br.inputs.len() < 2 {
+        return &[];
+    }
+    let mut start = body.len();
+    while start > 0 {
+        let op = &func.ops[body[start - 1]];
+        let Some(out) = op.output else { break };
+        if !is_pure(op.opcode) {
+            break;
+        }
+        let mut uses = func.varnodes[out as usize].uses.iter().filter(|&&u| !func.ops[u].dead);
+        let (Some(&u), None) = (uses.next(), uses.next()) else { break };
+        if !ops[start..].contains(&u) {
+            break;
+        }
+        start -= 1;
+    }
+    &body[start..]
+}
+
 /// The CFG with short-circuit tests merged, and the condition of each merged block.
 pub struct ShortCircuits {
     pub cfg: ControlFlowGraph,
@@ -303,6 +332,8 @@ fn thread_empty_blocks(cfg: &mut ControlFlowGraph, empty: &[bool]) {
 pub struct Inliner {
     exprs: std::cell::RefCell<FxHashMap<VarId, String>>,
     by_block: std::cell::OnceCell<Vec<Vec<OpIdx>>>,
+    /// block -> (the ops folded into its own condition, the condition's text)
+    own: std::cell::RefCell<FxHashMap<BlockId, Option<(Vec<OpIdx>, String)>>>,
 }
 
 impl Inliner {
@@ -311,6 +342,72 @@ impl Inliner {
         let exprs = self.exprs.borrow();
         let s = exprs.get(&v)?;
         Some(if is_atomic(s) { s.clone() } else { format!("({s})") })
+    }
+
+    /// A block's own branch condition with its [`condition_tail`] folded in (WS81): the ops
+    /// not to print as statements and the condition's text, or `None` when nothing folds (or
+    /// an op of the tail does not print as `dst = rhs;`). Cached: the statements and the
+    /// condition are printed separately.
+    pub fn own_condition(
+        &self,
+        func: &SsaFunction,
+        block: BlockId,
+        name: &dyn Fn(VarId) -> String,
+        emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
+    ) -> Option<(Vec<OpIdx>, String)> {
+        if let Some(r) = self.own.borrow().get(&block) {
+            return r.clone();
+        }
+        let by_block = self.by_block.get_or_init(|| ops_by_block(func));
+        let ops = &by_block[block];
+        let tail = condition_tail(func, ops);
+        let r = if tail.is_empty() {
+            None
+        } else {
+            let cv = func.ops[*ops.last().unwrap()].inputs[1];
+            self.fold_ops(func, tail, cv, name, emit).map(|text| (tail.to_vec(), text))
+        };
+        self.own.borrow_mut().insert(block, r.clone());
+        r
+    }
+
+    /// Fold `ops` (each read once, by a later one or the condition `cv`) into `cv`'s
+    /// expression; `None` when an op does not print as `dst = rhs;`.
+    fn fold_ops(
+        &self,
+        func: &SsaFunction,
+        ops: &[OpIdx],
+        cv: VarId,
+        name: &dyn Fn(VarId) -> String,
+        emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
+    ) -> Option<String> {
+        let mut ok = true;
+        for &o in ops {
+            let op = &func.ops[o];
+            if op.opcode == OpCode::BoolNegate
+                && let (Some(out), Some(inner)) = (op.output, op.inputs.first().and_then(|i| self.exprs.borrow().get(i).cloned()))
+            {
+                self.exprs.borrow_mut().insert(out, crate::emit::negate_condition(inner, true));
+                continue;
+            }
+            let (Some(line), Some(out)) = (emit(op), op.output) else {
+                ok = false;
+                break;
+            };
+            let prefix = format!("{} = ", name(out));
+            match line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')) {
+                Some(rhs) => {
+                    self.exprs.borrow_mut().insert(out, rhs.to_string());
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        let text = ok.then(|| self.exprs.borrow().get(&cv).cloned().unwrap_or_else(|| name(cv)));
+        self.exprs.borrow_mut().clear();
+        text
     }
 
     /// The condition of `block` (to its first CFG successor) as one expression. `name` prints

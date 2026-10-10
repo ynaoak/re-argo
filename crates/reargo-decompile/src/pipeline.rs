@@ -1556,6 +1556,22 @@ mod tests {
         assert!(!c.contains("goto"), "{c}");
     }
 
+    /// WS81: the temporaries that only compute an `if` condition fold into it.
+    #[test]
+    fn condition_temporaries_fold_into_the_if() {
+        let c = c_of(&[
+            0x83, 0xff, 0x06, // 0x1000 cmp edi, 6
+            0x72, 0x06, // 0x1003 jb 0x100b
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 0x1005 mov eax, 1
+            0xc3, // 0x100a
+            0x31, 0xc0, // 0x100b xor eax, eax
+            0xc3,
+        ]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(cond.contains("edi") && cond.contains('6'), "{c}");
+        assert!(!c.contains("var_") && !c.contains("tmp_"), "{c}");
+    }
+
     /// WS77: a function that never sets `rax` returns nothing.
     #[test]
     fn ret_without_rax_write_is_void() {

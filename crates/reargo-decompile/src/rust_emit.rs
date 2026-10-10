@@ -45,6 +45,8 @@ pub struct RustEmitter<'a> {
     inliner: crate::condition::Inliner,
     /// Epilogue ops not printed (`emit::epilogue_noise`).
     noise: rustc_hash::FxHashSet<usize>,
+    /// Ops folded into their block's own branch condition (WS81): not statements.
+    folded: rustc_hash::FxHashSet<usize>,
     /// Per-address emit-once dedup, so multi-op instructions don't
     /// replay the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
@@ -68,6 +70,7 @@ impl RustEmitter<'static> {
             conds: None,
             inliner: crate::condition::Inliner::default(),
             noise: rustc_hash::FxHashSet::default(),
+            folded: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -89,6 +92,7 @@ impl<'a> RustEmitter<'a> {
             conds: None,
             inliner: crate::condition::Inliner::default(),
             noise: rustc_hash::FxHashSet::default(),
+            folded: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         }
     }
@@ -126,6 +130,10 @@ impl<'a> RustEmitter<'a> {
     ) -> String {
         self.output.clear();
         self.noise = crate::emit::epilogue_noise(func);
+        self.folded = (0..func.cfg.blocks.len())
+            .filter_map(|b| self.own_condition(func, b))
+            .flat_map(|(ops, _)| ops)
+            .collect();
         let sig = infer_signature(func);
         self.line(&sig.to_rust_declaration(&func.name));
         self.line("{");
@@ -140,7 +148,7 @@ impl<'a> RustEmitter<'a> {
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead) {
+            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d)) {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_rust_type(vn.data.size);
@@ -334,7 +342,8 @@ impl<'a> RustEmitter<'a> {
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
+            // (a folded op only feeds the branch, which prints nothing here)
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -367,7 +376,7 @@ impl<'a> RustEmitter<'a> {
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for op in &func.ops {
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
@@ -828,14 +837,23 @@ impl<'a> RustEmitter<'a> {
         if let Some(c) = self.conds.and_then(|m| m.get(&block_id)) {
             let mut leaf = |b: usize| {
                 if b == block_id {
-                    self.get_branch_condition(func, b)
+                    self.branch_condition(func, b)
                 } else {
                     self.inliner.fold(func, b, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
                 }
             };
             return c.render(negated, &mut leaf);
         }
-        crate::emit::negate_condition(self.get_branch_condition(func, block_id), negated)
+        crate::emit::negate_condition(self.branch_condition(func, block_id), negated)
+    }
+
+    /// The block's branch condition with the ops that only compute it folded in (WS81).
+    fn own_condition(&self, func: &SsaFunction, block_id: usize) -> Option<(Vec<usize>, String)> {
+        self.inliner.own_condition(func, block_id, &|v| varnode_name(&func.varnodes[v as usize]), &|op| self.emit_op(func, op))
+    }
+
+    fn branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
+        self.own_condition(func, block_id).map(|(_, t)| t).unwrap_or_else(|| self.get_branch_condition(func, block_id))
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
