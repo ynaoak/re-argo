@@ -410,6 +410,16 @@ fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKe
         },
         // a < b || a == b: a <= b
         BoolOr => {
+            // a float compare's CF is "below or unordered" = !(b <= a) (WS84); with ZF's
+            // a == b it is `jbe`: !(b < a), true for a NaN like the CPU
+            for (i, j) in [(0, 1), (1, 0)] {
+                if let (Some(Rel::Cmp { op: FloatLessEqual, a: b0, b: a0, negated: true }), Some(Rel::Cmp { op: FloatEqual, a: c, b: d, negated: false })) =
+                    (rel(i), rel(j))
+                    && (pair(a0, b0, c, d) || pair(b0, a0, c, d))
+                {
+                    return Some(Rel::Cmp { op: FloatLess, a: b0, b: a0, negated: true });
+                }
+            }
             let (Rel::Cmp { op: x, a, b, negated: false }, Rel::Cmp { op: y, a: c, b: d, negated: false }) = (rel(0)?, rel(1)?) else {
                 return None;
             };
@@ -630,6 +640,19 @@ impl Inliner {
         });
         self.exprs.borrow_mut().clear();
         folded
+    }
+
+    /// `cv` with `ops` (its definition chain, in order) folded in, as for a branch condition
+    /// (WS84: a `cmov`'s condition).
+    pub fn fold_value(
+        &self,
+        func: &SsaFunction,
+        ops: &[OpIdx],
+        cv: VarId,
+        name: &dyn Fn(VarId) -> String,
+        emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
+    ) -> Option<Folded> {
+        self.fold_ops(func, ops, cv, name, emit, Some(MAX_FOLDED_LEN))
     }
 
     /// The condition of `block` (to its first CFG successor) as one expression. `name` prints

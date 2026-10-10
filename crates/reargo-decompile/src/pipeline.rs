@@ -447,6 +447,14 @@ pub(crate) fn rewrite_tail_calls(instructions: &mut Vec<LiftedInstruction>) {
                 stubs.insert(t.offset);
                 t.offset += TAIL_STUB_BASE;
             }
+            // a jump table's case out of the function (WS84, `switch::recover_jump_tables`)
+            if op.opcode == OpCode::BranchInd {
+                for t in op.inputs.iter().skip(1) {
+                    if t.space == SpaceId::RAM && t.offset >= TAIL_STUB_BASE {
+                        stubs.insert(t.offset - TAIL_STUB_BASE);
+                    }
+                }
+            }
         }
         let Some(pos) = insn.ops.iter().position(|o| {
             (o.opcode == OpCode::Branch && o.inputs.first().is_some_and(outside))
@@ -2432,6 +2440,164 @@ mod tests {
         assert!(c.contains("ebx != 0") || c.contains("ebx == 0"), "{c}");
     }
 
+    /// `popcnt` / `lzcnt` / `tzcnt` / `bswap` keep their dataflow and print by name (WS84: they
+    /// were `__unmodeled_insn()` and the result register was never written).
+    #[test]
+    fn bit_count_instructions_print_by_name() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xf3, 0x0f, 0xb8, 0xc7, // popcnt eax, edi
+            0xf3, 0x0f, 0xbd, 0xce, // lzcnt ecx, esi
+            0x01, 0xc8, // add eax, ecx
+            0xf3, 0x0f, 0xbc, 0xca, // tzcnt ecx, edx
+            0x01, 0xc8, // add eax, ecx
+            0x0f, 0xc8, // bswap eax
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        for f in ["popcount(edi)", "lzcount(esi)", "tzcnt(edx)", "bswap(eax)"] {
+            assert!(c.contains(f), "{f}: {c}");
+        }
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+    }
+
+    /// `ah` lifts (WS84: the register was missing and the function stopped at the first
+    /// instruction that used it) and reads byte 1 of rax.
+    #[test]
+    fn high_byte_register_reads_byte_one() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x89, 0xf8, // mov eax, edi
+            0x0f, 0xb6, 0xc4, // movzx eax, ah
+            0x01, 0xf0, // add eax, esi
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains(">> 8"), "{c}");
+        assert!(c.contains("esi"), "the function goes on after `movzx eax, ah`: {c}");
+    }
+
+    /// `maxss` / `minss` print as a float select (WS84: `__unmodeled_insn()` and the result
+    /// was lost).
+    #[test]
+    fn sse_min_max_is_a_select() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xf3, 0x0f, 0x5f, 0xc1, // maxss xmm0, xmm1
+            0xf3, 0x0f, 0x5d, 0xc2, // minss xmm0, xmm2
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+        assert!(c.contains("(xmm1_d < xmm0_d) ? xmm0_d : xmm1_d"), "{c}");
+        assert!(c.contains("(xmm0_d < xmm2_d) ? xmm0_d : xmm2_d"), "{c}");
+        // max(x, 0): the constant arm is a float
+        let code = [
+            0x0f, 0x57, 0xc0, // xorps xmm0, xmm0
+            0xf3, 0x0f, 0x5f, 0xc1, // maxss xmm0, xmm1
+            0xc3, // ret
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("? 0.0f : xmm1_d") || c.contains("? xmm1_d : 0.0f"), "{c}");
+    }
+
+    /// `ucomiss a, b; ja` is `a > b` — false for a NaN, like the CPU (WS84: printed
+    /// `!(a <= b)`, true for a NaN) — and `jbe` its NaN-true complement `!(b < a)`.
+    #[test]
+    fn float_compare_above_is_ordered() {
+        let lifter = X86Lifter::new_64();
+        for (jcc, want) in [(0x77u8, "xmm1_d < xmm0_d"), (0x76, "!(xmm1_d < xmm0_d)"), (0x73, "xmm1_d <= xmm0_d")] {
+            let code = [
+                0x0f, 0x2e, 0xc1, // ucomiss xmm0, xmm1
+                jcc, 0x03, // ja / jbe / jae L
+                0x31, 0xc0, // xor eax, eax
+                0xc3, // ret
+                0xb8, 0x01, 0x00, 0x00, 0x00, // L: mov eax, 1
+                0xc3, // ret
+            ];
+            let mem = make_memory(&code, 0x1000);
+            let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+            assert!(c.contains(want), "{jcc:#x} {want}: {c}");
+        }
+    }
+
+    /// A write to a register's low byte prints as that write (WS84: it printed the lifter's
+    /// rebuild `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`).
+    #[test]
+    fn low_byte_write_prints_as_the_view() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0x48, 0x39, 0xf0, // cmp rax, rsi
+            0x0f, 0x94, 0xc0, // sete al
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0xb0, 0x01, // mov al, 1
+            0x48, 0x89, 0x01, // mov [rcx], rax
+            0x31, 0xc0, // xor eax, eax
+            0x40, 0x88, 0xf0, // mov al, sil
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("CONCAT"), "{c}");
+        assert!(!c.contains("(void)"), "{c}");
+        assert!(c.contains("al = 1;"), "{c}");
+        assert!(c.contains("rax = (uint64_t)al;"), "{c}");
+    }
+
+    /// A `cmov` prints its comparison, not a flag variable (WS84): a flag two `cmov`s read
+    /// (`var_206 ? rsi : …` twice), `cmove` after `cmp` (`(tmp_100 == 0) ? …`), and the sign
+    /// of `test` (`(int32_t)tmp_100 < 0`).
+    #[test]
+    fn cmov_condition_is_the_comparison() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0xa8, 0x01, // test al, 1
+            0x48, 0x0f, 0x45, 0x37, // cmovne rsi, [rdi]
+            0x48, 0x0f, 0x45, 0x57, 0x08, // cmovne rdx, [rdi+8]
+            0x48, 0x39, 0xd6, // cmp rsi, rdx
+            0x48, 0x0f, 0x44, 0xf1, // cmove rsi, rcx
+            0x85, 0xc9, // test ecx, ecx
+            0x0f, 0x49, 0xc1, // cmovns eax, ecx
+            0x48, 0x01, 0xf0, // add rax, rsi
+            0x48, 0x01, 0xd0, // add rax, rdx
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("var_206"), "{c}");
+        assert!(!c.contains("var_207"), "{c}");
+        assert!(!c.contains("tmp_100"), "{c}");
+        assert_eq!(c.matches("((al & 1) == 0) ?").count(), 2, "{c}");
+        assert!(c.contains("(rsi == rdx) ?"), "{c}");
+        assert!(c.contains("((int32_t)ecx < (int32_t)0) ?"), "{c}");
+    }
+
+    /// Two `cmov`s on one `test` with its register overwritten between them: the second names
+    /// the test's value, whose statement must then stay printed (WS84).
+    #[test]
+    fn cmov_condition_names_a_printed_value() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x41, 0xf6, 0xc7, 0x01, // test r15b, 1
+            0x48, 0x0f, 0x45, 0xcd, // cmovne rcx, rbp
+            0x4c, 0x8d, 0x7c, 0x24, 0x0b, // lea r15, [rsp+0xb]
+            0x4c, 0x0f, 0x45, 0xf8, // cmovne r15, rax
+            0x4c, 0x01, 0xf9, // add rcx, r15
+            0x48, 0x89, 0xc8, // mov rax, rcx
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("((r15b & 1) == 0) ? rcx : rbp"), "{c}");
+        if c.contains("(tmp_100 == 0) ?") {
+            assert!(c.contains("tmp_100 = r15b & 1;"), "a named value is defined: {c}");
+        }
+    }
+
     /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
     #[test]
     fn cmov_is_a_select() {
@@ -2506,6 +2672,121 @@ mod tests {
         assert!(!c.contains("case 2:") && at("default:") < at("return 0;"), "{c}");
         assert!(!c.contains("0x1100") && !c.contains("0x1e"), "the table computation is gone: {c}");
         assert!(r.rust_code.contains("match edi {") && r.rust_code.contains("1 | 3 =>"), "{}", r.rust_code);
+    }
+
+    /// Jump tables beyond `cmp; ja; lea; movsxd; add; jmp` with a separate index register
+    /// (WS84): the window reusing the compared register (`movsxd rsi, [rdi+rsi*4]`, the
+    /// BRANCHIND reads the computed target), a `jbe` to the dispatch with the default falling
+    /// through, a signed `jg`, a byte table choosing the slot, and a case outside the function.
+    #[test]
+    fn jump_table_shapes() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        // jbe to the dispatch, the compared register reused by the window
+        let code: &[u8] = &[
+            0x83, 0xfe, 0x02, // 0x1000 cmp esi, 2
+            0x76, 0x03, // 0x1003 jbe 0x1008
+            0x31, 0xc0, 0xc3, // 0x1005 xor eax, eax; ret (default)
+            0x48, 0x8d, 0x3d, 0xf1, 0x00, 0x00, 0x00, // 0x1008 lea rdi, [0x1100]
+            0x48, 0x63, 0x34, 0xb7, // 0x100f movsxd rsi, [rdi+rsi*4]
+            0x48, 0x01, 0xfe, // 0x1013 add rsi, rdi
+            0xff, 0xe6, // 0x1016 jmp rsi
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1018 case 0: mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101e case 1
+            0xb8, 0x1e, 0x00, 0x00, 0x00, 0xc3, // 0x1024 case 2
+        ];
+        let table: Vec<u8> = [0x1018u64, 0x101e, 0x1024].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (rsi) {") || c.contains("switch (esi) {"), "{c}");
+        assert!(!c.contains("goto *") && !c.contains("tmp_6f00") && !c.contains("0x1100"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        assert!(at("case 0:") < at("return 0xa;") && at("case 2:") < at("return 0x1e;"), "{c}");
+        assert!(at("default:") < at("return 0;"), "{c}");
+
+        // signed bound (`jg`), and case 3 jumps out of the function (0x5000)
+        let code: &[u8] = &[
+            0x83, 0xff, 0x03, // 0x1000 cmp edi, 3
+            0x7f, 0x24, // 0x1003 jg 0x1029
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x00, 0x00, 0x00, // 0x1007 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100e movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1012 add rax, rcx
+            0xff, 0xe0, // 0x1015 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1017 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101d mov eax, 20; ret
+            0xb8, 0x1e, 0x00, 0x00, 0x00, 0xc3, // 0x1023
+            0x31, 0xc0, 0xc3, // 0x1029 xor eax, eax; ret
+        ];
+        let table: Vec<u8> = [0x1017u64, 0x101d, 0x1029, 0x5000].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table), (0x5000, &[0xc3])]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (edi) {") && !c.contains("goto *"), "{c}");
+        assert!(at_least(&c, "case 3:", "0x5000("), "case 3 is a tail call to 0x5000: {c}");
+
+        // a byte table picks the slot: case i -> targets[B[i]]
+        let code: &[u8] = &[
+            0x83, 0xff, 0x03, // 0x1000 cmp edi, 3
+            0x77, 0x29, // 0x1003 ja 0x102e
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x01, 0x00, 0x00, // 0x1007 lea rcx, [0x1200]
+            0x0f, 0xb6, 0x04, 0x01, // 0x100e movzx eax, byte [rcx+rax]
+            0x48, 0x8d, 0x0d, 0xe7, 0x00, 0x00, 0x00, // 0x1012 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x1019 movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x101d add rax, rcx
+            0xff, 0xe0, // 0x1020 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1022 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x1028 mov eax, 20; ret
+            0x31, 0xc0, 0xc3, // 0x102e xor eax, eax; ret
+        ];
+        let table: Vec<u8> = [0x1022u64, 0x1028].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table), (0x1200, &[1, 0, 1, 0])]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (edi) {") && !c.contains("goto *"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        // 0 and 2 -> 20, 1 and 3 -> 10
+        assert!(at("case 1:") < at("case 3:") && at("case 3:") < at("return 0xa;"), "{c}");
+        assert!(at("case 0:") < at("case 2:") && at("case 2:") < at("return 0x14;"), "{c}");
+    }
+
+    /// A jump table with no bounds check (a switch over an enum, `default:` unreachable) runs
+    /// while its entries are the function's instructions, up to the next table the function
+    /// loads; a table base set once before a loop is that constant (WS84).
+    #[test]
+    fn jump_table_without_bounds_check() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x4c, 0x8d, 0x0d, 0xf9, 0x00, 0x00, 0x00, // 0x1000 lea r9, [0x1100] (hoisted base)
+            0x8b, 0x07, // 0x1007 mov eax, [rdi]
+            0x49, 0x63, 0x04, 0x81, // 0x1009 movsxd rax, [r9+rax*4]
+            0x4c, 0x01, 0xc8, // 0x100d add rax, r9
+            0xff, 0xe0, // 0x1010 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1012 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x1018 mov eax, 20; ret
+            0x48, 0x8d, 0x05, 0xff, 0x00, 0x00, 0x00, // 0x101e lea rax, [0x1124] (another table)
+            0xc3,
+        ];
+        // three entries, then the next table at 0x110c (loaded by the function)
+        let mut table: Vec<u8> = [0x1012u64, 0x1018, 0x1012].iter().flat_map(|&t| rel(t)).collect();
+        table.extend([0x1018u64, 0x1012].iter().flat_map(|&t| rel(t)));
+        let code2 = {
+            let mut c = code.to_vec();
+            // the second lea points at 0x110c: disp = 0x110c - 0x1025
+            c[0x1e + 3..0x1e + 7].copy_from_slice(&((0x110c - 0x1025i32).to_le_bytes()));
+            c
+        };
+        let mem = make_memory_parts(&[(0x1000, &code2), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
+        assert!(at("case 0:") < at("case 2:") && at("case 2:") < at("return 0xa;") && at("case 1:") < at("return 0x14;"), "{c}");
+        assert!(!c.contains("case 3:") && !c.contains("default:"), "the table ends at the next one: {c}");
+    }
+
+    /// `needle` occurs after `marker` in `c`.
+    fn at_least(c: &str, marker: &str, needle: &str) -> bool {
+        c.find(marker).is_some_and(|m| c[m..].contains(needle))
     }
 
     /// A `switch` in a loop whose case leaves the loop (WS83): `break` inside the `switch`

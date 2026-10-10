@@ -256,8 +256,8 @@ impl SsaFunction {
 
         // 4. rename along the dominator tree
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for b in 0..n {
-            if let Some(d) = idom[b]
+        for (b, &d) in idom.iter().enumerate().take(n) {
+            if let Some(d) = d
                 && d != b
             {
                 children[d].push(b);

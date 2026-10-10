@@ -553,6 +553,50 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             latest.insert((vn.data.space.0, vn.data.offset, vn.data.size), vn.version);
         }
     };
+    // WS84: ... and still holds it at every reader of the removed value, not only where the
+    // duplicate is (`rax = rdi + 12; rbx = rdi + 12; rax = 5; rcx = rbx + 1` read `rax` for
+    // `rbx`). The readers of each value, and how many live ops write each slot.
+    let mut readers: rustc_hash::FxHashMap<ValueKey, SmallVec<[usize; 4]>> = Default::default();
+    let mut writers: rustc_hash::FxHashMap<(u32, u64, u32), u32> = Default::default();
+    for (k, op) in func.ops.iter().enumerate() {
+        if op.dead {
+            continue;
+        }
+        for &v in &op.inputs {
+            readers.entry(value_key(func, v)).or_default().push(k);
+        }
+        if let Some(o) = op.output {
+            let d = &func.varnodes[o as usize].data;
+            *writers.entry((d.space.0, d.offset, d.size)).or_default() += 1;
+        }
+    }
+    // the slot of `existing` is not written after op `i` before any reader of `dup`: a reader
+    // later in the block is checked op by op; one elsewhere (another block, or back around a
+    // loop) needs `existing` to be the slot's only definition (the block runs it, then the
+    // duplicate, without leaving)
+    let holds_at_readers = |func: &SsaFunction, i: usize, dup: ValueKey, existing: ValueKey| {
+        let slot = (existing.0, existing.1, existing.2);
+        let writes_slot = |o: &crate::ssa::SsaOp| {
+            !o.dead
+                && o.output.is_some_and(|w| {
+                    let d = &func.varnodes[w as usize].data;
+                    (d.space.0, d.offset, d.size) == slot
+                })
+        };
+        readers.get(&dup).is_none_or(|rs| {
+            rs.iter().all(|&r| {
+                let ro = &func.ops[r];
+                if ro.dead {
+                    return true;
+                }
+                if ro.block == func.ops[i].block && r > i {
+                    !func.ops[i + 1..r].iter().any(writes_slot)
+                } else {
+                    writers.get(&slot).copied().unwrap_or(0) <= 1
+                }
+            })
+        })
+    };
     for i in 0..func.ops.len() {
         if func.ops[i].dead {
             continue;
@@ -586,6 +630,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         if let Some(&existing) = seen.get(&key)
             && !feeds_phi
             && name_still_holds(existing)
+            && holds_at_readers(func, i, value_key(func, out_id), existing)
         {
             redirects.insert(out_key, existing);
             func.ops[i].dead = true;
@@ -1416,6 +1461,51 @@ mod tests {
         assert_eq!(common_subexpression_elimination(&mut ssa), 0);
         // with the name intact the duplicate still goes
         let insns = vec![make_lifted(0x1000, vec![add(0, rax, 12), add(1, rbx, 12)])];
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, ControlFlowGraph::build(&insns));
+        assert_eq!(common_subexpression_elimination(&mut ssa), 1);
+    }
+
+    /// WS84: the name of the earlier value must still hold it at every reader of the removed
+    /// one, not only where the duplicate is: `rax = rdi + 12; rbx = rdi + 12; rax = 5;
+    /// rcx = rbx + 1` must not read `rax` for `rbx`.
+    #[test]
+    fn cse_checks_the_name_at_each_reader() {
+        let seq = |a, o| SeqNum::new(Address::new(SpaceId(1), a), o);
+        let (rax, rbx, rcx, rdi) = (
+            VarnodeData::new(SpaceId(2), 0x00, 8),
+            VarnodeData::new(SpaceId(2), 0x18, 8),
+            VarnodeData::new(SpaceId(2), 0x08, 8),
+            VarnodeData::new(SpaceId(2), 0x38, 8),
+        );
+        let c = |v| VarnodeData::new(SpaceId(0), v, 8);
+        let op = |o, opcode, out, a, b| PcodeOp { opcode, seq: seq(0x1000, o), output: Some(out), inputs: SmallVec::from_slice(&[a, b]) };
+        let ret = |o, v| PcodeOp { opcode: OpCode::Return, seq: seq(0x1000, o), output: None, inputs: SmallVec::from_slice(&[v]) };
+        let copy = |o, out, v| PcodeOp { opcode: OpCode::Copy, seq: seq(0x1000, o), output: Some(out), inputs: SmallVec::from_slice(&[v]) };
+        let insns = vec![make_lifted(
+            0x1000,
+            vec![
+                op(0, OpCode::IntAdd, rax, rdi, c(12)),
+                op(1, OpCode::IntAdd, rbx, rdi, c(12)),
+                copy(2, rax, c(5)),
+                op(3, OpCode::IntAdd, rcx, rbx, c(1)),
+                op(4, OpCode::IntAdd, rcx, rcx, rax),
+                ret(5, rcx),
+            ],
+        )];
+        let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, ControlFlowGraph::build(&insns));
+        assert_eq!(common_subexpression_elimination(&mut ssa), 0, "rax is 5 when rbx is read");
+        // read before the overwrite: the duplicate still goes
+        let insns = vec![make_lifted(
+            0x1000,
+            vec![
+                op(0, OpCode::IntAdd, rax, rdi, c(12)),
+                op(1, OpCode::IntAdd, rbx, rdi, c(12)),
+                op(2, OpCode::IntAdd, rcx, rbx, c(1)),
+                copy(3, rax, c(5)),
+                op(4, OpCode::IntAdd, rcx, rcx, rax),
+                ret(5, rcx),
+            ],
+        )];
         let mut ssa = SsaFunction::from_cfg("test".into(), 0x1000, ControlFlowGraph::build(&insns));
         assert_eq!(common_subexpression_elimination(&mut ssa), 1);
     }

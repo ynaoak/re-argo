@@ -70,7 +70,9 @@ pub struct CEmitter<'a> {
     folded: rustc_hash::FxHashSet<usize>,
     /// The condition of a select (`cmovcc`) folded into it (WS83): the comparison's text, by
     /// the value it computes. Its op is in `folded`.
-    select_conds: rustc_hash::FxHashMap<crate::condition::ValueKey, String>,
+    /// a select's folded condition, by the select op (WS84: by op, not by value — two selects
+    /// on one flag can see its operands in different states)
+    select_conds: rustc_hash::FxHashMap<usize, String>,
 }
 
 impl Default for CEmitter<'static> {
@@ -178,12 +180,9 @@ impl<'a> CEmitter<'a> {
             .flat_map(|(ops, _)| ops)
             .collect();
         self.select_conds.clear();
-        for (d, text) in select_conditions(func, &self.folded, &|op| self.emit_op(func, op)) {
-            self.folded.insert(d);
-            if let Some(out) = func.ops[d].output {
-                self.select_conds.insert(crate::condition::value_key(func, out), text);
-            }
-        }
+        let (conds, hidden) = select_conditions(func, &self.inliner, &|op| self.emit_op(func, op));
+        self.folded.extend(hidden);
+        self.select_conds = conds;
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
@@ -485,6 +484,10 @@ impl<'a> CEmitter<'a> {
             OpCode::MultiEqual => None,
             OpCode::Copy => {
                 let dst = out_name?;
+                // the copy of a jump table's index the `switch` prints by its register (WS84)
+                if is_switch_index_copy(func, op) {
+                    return None;
+                }
                 let src = self.input_expr(func, op, 0);
                 Some(format!("{} = {};", dst, src))
             }
@@ -752,12 +755,28 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = !{};", dst, a))
             }
+            // `popcnt` / `lzcnt` (WS84)
+            OpCode::PopCount | OpCode::LzCount if !op.inputs.is_empty() => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                let f = if op.opcode == OpCode::PopCount { "popcount" } else { "lzcount" };
+                Some(format!("{dst} = {f}({a});"))
+            }
             // `cmovcc` (WS83, `select`)
             OpCode::Select if op.inputs.len() == 3 => {
                 let dst = out_name?;
                 let c = self.input_expr(func, op, 0);
-                let a = self.input_expr(func, op, 1);
-                let b = self.input_expr(func, op, 2);
+                // a constant arm of an XMM select (`maxss`, WS84) is a float: `0.0f`, not `0`
+                let out = func.varnodes[op.output.unwrap() as usize].data;
+                let arm = |i: usize| {
+                    let v = func.varnodes[op.inputs[i] as usize].data;
+                    let xmm = out.space == SpaceId::REGISTER && (0x1200..0x1300).contains(&out.offset);
+                    match (xmm && v.space == SpaceId::CONST).then(|| float_literal(v.offset, out.size)).flatten() {
+                        Some(f) => f,
+                        None => self.input_expr(func, op, i),
+                    }
+                };
+                let (a, b) = (arm(1), arm(2));
                 Some(format!("{} = {} ? {} : {};", dst, c, a, b))
             }
             OpCode::IntZExt => {
@@ -774,6 +793,24 @@ impl<'a> CEmitter<'a> {
                 // lifter uses it to merge a scalar SSE result into the full
                 // XMM register). Previously the opaque `PIECE(...)`.
                 let dst = out_name?;
+                // a write to a register's low view (WS84): `al = x` / `xmm0_d = x`
+                match view_merge(func, op) {
+                    Some(ViewMerge::Keep { view }) => {
+                        let lo = self.input_expr(func, op, 1);
+                        return (lo != view).then(|| format!("{view} = {lo};"));
+                    }
+                    Some(ViewMerge::Const(c)) => {
+                        let lo = self.input_expr(func, op, 1);
+                        let ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                        let shifted = c << (8 * func.varnodes[op.inputs[1] as usize].data.size);
+                        return Some(if c == 0 {
+                            format!("{dst} = ({ty}){lo};")
+                        } else {
+                            format!("{dst} = 0x{shifted:x} | ({ty}){lo};")
+                        });
+                    }
+                    None => {}
+                }
                 let hi = self.input_expr(func, op, 0);
                 let lo = self.input_expr(func, op, 1);
                 let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
@@ -784,6 +821,10 @@ impl<'a> CEmitter<'a> {
                 // truncating cast (e.g. `ecx = (uint32_t)rcx` after a 64-bit
                 // write). Previously printed as the opaque `SUBPIECE(...)`.
                 let dst = out_name?;
+                // the kept upper bytes of a view write, read only by the merge (WS84)
+                if kept_upper_only(func, op) {
+                    return None;
+                }
                 let a = self.input_expr(func, op, 0);
                 let k = &func.varnodes[op.inputs[1] as usize].data;
                 let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
@@ -982,8 +1023,9 @@ impl<'a> CEmitter<'a> {
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
         }
-        if !self.select_conds.is_empty()
-            && let Some(e) = self.select_conds.get(&crate::condition::value_key(func, op.inputs[idx]))
+        if idx == 0
+            && op.opcode == OpCode::Select
+            && let Some(e) = self.select_conds.get(&op.index)
         {
             return if crate::condition::is_atomic(e) { e.clone() } else { format!("({e})") };
         }
@@ -1018,13 +1060,16 @@ impl<'a> CEmitter<'a> {
             .unwrap_or_else(|| crate::condition::Folded::plain(self.get_branch_condition(func, block_id)))
     }
 
-    /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83).
+    /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83), or the
+    /// register the index was copied from when that still holds it (WS84).
     fn switch_index(&self, func: &SsaFunction, block_id: usize) -> String {
-        func.ops
-            .iter()
-            .rev()
-            .find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd)
-            .map_or_else(|| "cond".into(), |op| self.input_expr(func, op, 0))
+        let Some(op) = func.ops.iter().rev().find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd) else {
+            return "cond".into();
+        };
+        match switch_index_source(func, op) {
+            Some(src) => varnode_name(&func.varnodes[src as usize]),
+            None => self.input_expr(func, op, 0),
+        }
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
@@ -1073,6 +1118,99 @@ impl<'a> CEmitter<'a> {
     }
 }
 
+
+/// The register a jump table's index was copied from at the dispatch window's start
+/// (`switch::INDEX_TMP`), when no live op between the copy and the `BRANCHIND` writes it — the
+/// window's table computation is dead once the dispatch reads the copy (WS84).
+fn switch_index_source(func: &SsaFunction, br: &crate::ssa::SsaOp) -> Option<crate::ssa::VarId> {
+    let v = *br.inputs.first()?;
+    let d = func.varnodes[v as usize].data;
+    if d.space != SpaceId::UNIQUE || d.offset != crate::switch::INDEX_TMP {
+        return None;
+    }
+    let c = func.varnodes[v as usize].def_op?;
+    let copy = &func.ops[c];
+    if copy.dead || copy.opcode != OpCode::Copy || c >= br.index {
+        return None;
+    }
+    let src = *copy.inputs.first()?;
+    let sd = func.varnodes[src as usize].data;
+    let overwritten = func.ops[c + 1..br.index].iter().any(|o| {
+        !o.dead
+            && o.output.is_some_and(|w| {
+                let w = func.varnodes[w as usize].data;
+                w.space == sd.space && w.offset < sd.offset + sd.size as u64 && sd.offset < w.offset + w.size as u64
+            })
+    });
+    (!overwritten).then_some(src)
+}
+
+/// Is `op` the index copy [`switch_index_source`] prints through?
+fn is_switch_index_copy(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    let Some(v) = op.output else { return false };
+    let d = func.varnodes[v as usize].data;
+    if d.space != SpaceId::UNIQUE || d.offset != crate::switch::INDEX_TMP {
+        return false;
+    }
+    let readers: Vec<&crate::ssa::SsaOp> =
+        func.varnodes[v as usize].uses.iter().map(|&u| &func.ops[u]).filter(|o| !o.dead && o.inputs.contains(&v)).collect();
+    !readers.is_empty()
+        && readers.iter().all(|r| r.opcode == OpCode::BranchInd && r.inputs.first() == Some(&v) && switch_index_source(func, r).is_some())
+}
+
+/// How a `PIECE` that rebuilds a register after a write to its low view prints (WS84).
+enum ViewMerge {
+    /// `R = PIECE(SUBPIECE(R, n), lo)`: the upper bytes are kept, it is the write `view = lo`
+    Keep { view: String },
+    /// `R = PIECE(c, lo)` with the upper bytes a known constant
+    Const(u64),
+}
+
+/// The lifter rebuilds a register after a write to its low byte / word (`mov al, 1` ->
+/// `rax = PIECE(SUBPIECE(rax, 1), al)`) and an XMM register after a scalar write. Printed as
+/// is that was `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`; it is the write of
+/// the view, which the register names already alias.
+fn view_merge(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<ViewMerge> {
+    let out = func.varnodes[op.output? as usize].data;
+    let (hi, lo) = (*op.inputs.first()?, *op.inputs.get(1)?);
+    let (hi_d, lo_d) = (func.varnodes[hi as usize].data, func.varnodes[lo as usize].data);
+    if out.space != SpaceId::REGISTER || lo_d.size >= out.size {
+        return None;
+    }
+    if hi_d.space == SpaceId::CONST {
+        return Some(ViewMerge::Const(hi_d.offset));
+    }
+    if !is_kept_upper(func, hi, out, lo_d.size) {
+        return None;
+    }
+    Some(ViewMerge::Keep { view: reg_name(out.offset, lo_d.size) })
+}
+
+/// Is `hi` the upper bytes of the register `out` itself, `SUBPIECE(out, n)`?
+fn is_kept_upper(func: &SsaFunction, hi: crate::ssa::VarId, out: reargo_core::pcode::VarnodeData, n: u32) -> bool {
+    let Some(d) = func.varnodes[hi as usize].def_op else { return false };
+    let sub = &func.ops[d];
+    if sub.dead || sub.opcode != OpCode::Subpiece || sub.inputs.len() != 2 {
+        return false;
+    }
+    let (x, k) = (func.varnodes[sub.inputs[0] as usize].data, func.varnodes[sub.inputs[1] as usize].data);
+    x.space == SpaceId::REGISTER && x.offset == out.offset && x.size == out.size && k.space == SpaceId::CONST && k.offset == u64::from(n)
+}
+
+/// Is `op` (a SUBPIECE) the kept upper bytes of view writes only, so it needs no statement?
+fn kept_upper_only(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+    let Some(v) = op.output else { return false };
+    let readers: Vec<&crate::ssa::SsaOp> = func.varnodes[v as usize]
+        .uses
+        .iter()
+        .map(|&u| &func.ops[u])
+        .filter(|o| !o.dead && o.inputs.contains(&v))
+        .collect();
+    !readers.is_empty()
+        && readers.iter().all(|r| {
+            r.opcode == OpCode::Piece && r.inputs.first() == Some(&v) && matches!(view_merge(func, r), Some(ViewMerge::Keep { .. }))
+        })
+}
 
 /// The register a call's result is used in, when exactly one of the return registers the
 /// call defines (its non-clobber `INDIRECT`s, right after it) is still live (WS79): the
@@ -1465,6 +1603,10 @@ fn reg_name(offset: u64, size: u32) -> String {
         // the 16/8-bit views of rcx..rdi (WS78): they used to fall through to `var_<off>`,
         // so `bp` and `bpl` both became `var_28` (two declarations of one name, and a name
         // that reads like a stack local)
+        (0x01, 1) => "ah".into(),
+        (0x09, 1) => "ch".into(),
+        (0x11, 1) => "dh".into(),
+        (0x19, 1) => "bh".into(),
         (0x08, 2) => "cx".into(),
         (0x08, 1) => "cl".into(),
         (0x10, 2) => "dx".into(),
@@ -1530,64 +1672,136 @@ fn size_to_signed_type(size: u32) -> &'static str {
     }
 }
 
-/// The comparisons to print inside the select (`cmovcc`, WS83) that reads them, as
-/// `(op, text)`: `edi = (int32_t)edi < (int32_t)esi ? esi : edi;` rather than a flag variable
-/// set the line before. Only a comparison in the select's block whose result nothing else
-/// reads, with no write over its operands between it and the select (the C output names the
-/// operands by register, so they must still hold their values there).
+/// Add to `chain` the ops defining `v` that fold into a condition read at op `s`: temporaries
+/// and flags of the block (not loads or calls, which stay named), each kept only when what it
+/// reads keeps its value up to `s`. False when `v` itself does not fold (it is then printed by
+/// name, which the caller checks is still valid). The values the folded text names are added
+/// to `leaves` (their definitions must stay printed).
+#[allow(clippy::too_many_arguments)]
+fn fold_chain(
+    func: &SsaFunction,
+    v: crate::ssa::VarId,
+    s: usize,
+    block: usize,
+    temp: &dyn Fn(crate::ssa::VarId) -> bool,
+    unchanged: &dyn Fn(crate::ssa::VarId, usize, usize) -> bool,
+    chain: &mut Vec<usize>,
+    leaves: &mut Vec<crate::ssa::VarId>,
+    depth: u32,
+) -> bool {
+    let Some(d) = func.varnodes[v as usize].def_op else { return false };
+    if chain.contains(&d) {
+        return true;
+    }
+    let dop = &func.ops[d];
+    if depth > 6
+        || dop.dead
+        || dop.block != block
+        || d >= s
+        || !temp(v)
+        || matches!(dop.opcode, OpCode::Load | OpCode::Call | OpCode::CallInd | OpCode::CallOther | OpCode::MultiEqual | OpCode::Indirect)
+    {
+        return false;
+    }
+    let mark = chain.len();
+    chain.push(d);
+    for &x in &dop.inputs {
+        if func.varnodes[x as usize].data.space == SpaceId::CONST {
+            continue;
+        }
+        let folds = temp(x) && fold_chain(func, x, s, block, temp, unchanged, chain, leaves, depth + 1);
+        // a value printed by name must still hold it at the select
+        if !folds && !unchanged(x, d, s) {
+            chain.truncate(mark);
+            return false;
+        }
+        if !folds {
+            leaves.push(x);
+        }
+    }
+    true
+}
+
+/// The conditions of `cmov` selects (WS83, generalised in WS84): the select's condition with
+/// its definition chain in the block folded in, as a branch condition is — `(a == b) ? x : y`
+/// instead of `var_206 ? x : y`, `(tmp_100 == 0) ? …`. The chain is the temporaries and flags
+/// defining the condition (not loads, calls or other registers), and folds only when none of
+/// the registers it reads is written between its op and the select. Returns each select's text
+/// and the ops no longer printed: those every live reader of which folds them.
 pub(crate) fn select_conditions(
     func: &SsaFunction,
-    folded: &rustc_hash::FxHashSet<usize>,
+    inliner: &crate::condition::Inliner,
     emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
-) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
+) -> (rustc_hash::FxHashMap<usize, String>, Vec<usize>) {
+    let mut texts = rustc_hash::FxHashMap::default();
     if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
-        return out;
+        return (texts, Vec::new());
     }
-    let readers = crate::condition::Readers::new(func);
+    let temp = |v: crate::ssa::VarId| {
+        let d = &func.varnodes[v as usize].data;
+        d.space == SpaceId::UNIQUE || (d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset) && d.size == 1)
+    };
+    let overlaps = |x: &reargo_core::pcode::VarnodeData, w: &reargo_core::pcode::VarnodeData| {
+        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
+    };
+    // `x` keeps its value from op `from` up to op `to`
+    let unchanged = |x: crate::ssa::VarId, from: usize, to: usize| {
+        let xd = &func.varnodes[x as usize].data;
+        !func.ops[from + 1..to].iter().any(|o| !o.dead && o.output.is_some_and(|w| overlaps(xd, &func.varnodes[w as usize].data)))
+    };
+    let mut folded_by: rustc_hash::FxHashMap<usize, Vec<usize>> = rustc_hash::FxHashMap::default();
+    let mut named: Vec<crate::ssa::VarId> = Vec::new();
     for (s, op) in func.ops.iter().enumerate() {
         if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
             continue;
         }
         let c = op.inputs[0];
-        let Some(d) = func.varnodes[c as usize].def_op else { continue };
-        let cmp = &func.ops[d];
-        let comparison = matches!(
-            cmp.opcode,
-            OpCode::IntEqual
-                | OpCode::IntNotEqual
-                | OpCode::IntLess
-                | OpCode::IntLessEqual
-                | OpCode::IntSLess
-                | OpCode::IntSLessEqual
-                | OpCode::FloatEqual
-                | OpCode::FloatNotEqual
-                | OpCode::FloatLess
-                | OpCode::FloatLessEqual
-        );
-        if cmp.dead || !comparison || cmp.block != op.block || d >= s || folded.contains(&d) || readers.of(func, c) != [s] {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut leaves = Vec::new();
+        if !fold_chain(func, c, s, op.block, &temp, &unchanged, &mut chain, &mut leaves, 0) {
             continue;
         }
-        let operand_overwritten = func.ops[d + 1..s].iter().any(|o| {
-            !o.dead
-                && o.output.is_some_and(|w| {
-                    let w = &func.varnodes[w as usize].data;
-                    cmp.inputs.iter().any(|&x| {
-                        let x = &func.varnodes[x as usize].data;
-                        x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
-                    })
-                })
-        });
-        if operand_overwritten {
-            continue;
-        }
-        let Some(out_v) = cmp.output else { continue };
-        let prefix = format!("{} = ", varnode_name(&func.varnodes[out_v as usize]));
-        if let Some(rhs) = emit(cmp).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
-            out.push((d, rhs));
+        chain.sort_unstable();
+        let name = |v: crate::ssa::VarId| varnode_name(&func.varnodes[v as usize]);
+        if let Some(f) = inliner.fold_value(func, &chain, c, &name, emit)
+            && f.text != name(c)
+        {
+            texts.insert(s, f.text);
+            folded_by.insert(s, chain);
+            named.extend(leaves);
         }
     }
-    out
+    // an op is not printed when every live reader of it folds it (and no folded text names
+    // its value)
+    let mut hidden: rustc_hash::FxHashSet<usize> = folded_by.values().flatten().copied().collect();
+    for v in named {
+        if let Some(d) = func.varnodes[v as usize].def_op {
+            hidden.remove(&d);
+        }
+    }
+    loop {
+        let keep: Vec<usize> = hidden
+            .iter()
+            .copied()
+            .filter(|&d| {
+                let Some(v) = func.ops[d].output else { return true };
+                func.varnodes[v as usize].uses.iter().any(|&u| {
+                    let r = &func.ops[u];
+                    !r.dead
+                        && r.inputs.contains(&v)
+                        && !hidden.contains(&u)
+                        && !folded_by.get(&u).is_some_and(|ch| ch.contains(&d))
+                })
+            })
+            .collect();
+        if keep.is_empty() {
+            break;
+        }
+        for d in keep {
+            hidden.remove(&d);
+        }
+    }
+    (texts, hidden.into_iter().collect())
 }
 
 /// A `case` value: decimal, hex from 0x100 on.
