@@ -751,13 +751,13 @@ fn fits_i32_f64(a: u64, _: u64, _: u64) -> bool {
     x.is_finite() && x > -2147483648.0 && x < 2147483647.0
 }
 
-/// `comis…`/`ucomis…` of an `N`-byte float in a and b: OF/SF cleared; CF and ZF are the
-/// ordered comparison. (Unordered sets CF = ZF = PF = 1 on the CPU; the lifter keeps CF/ZF as
-/// the plain `<` / `==` there, which agrees with every jcc/setcc combination compilers emit
-/// together with the PF test, so CF/ZF are only compared for ordered inputs.)
+/// `comis…`/`ucomis…` of an `N`-byte float in a and b: OF/SF cleared, CF = below or
+/// unordered. (Unordered also sets ZF = 1 on the CPU; the lifter keeps ZF as the plain `==`,
+/// which only `je`/`jne`/`sete`… read, and compilers pair those with the PF test, so ZF is only
+/// compared for ordered inputs.)
 fn d_fcmp<const N: u32>(a: u64, b: u64, _: u64) -> (u64, u8) {
     let nan = |x: u64| if N == 4 { f32::from_bits(x as u32).is_nan() } else { f64::from_bits(x).is_nan() };
-    (if nan(a) || nan(b) { OF | SF } else { ARITH }, RAX)
+    (if nan(a) || nan(b) { CF | OF | SF } else { ARITH }, RAX)
 }
 
 #[test]
@@ -787,6 +787,22 @@ fn scalar_float_matches_the_cpu() {
         case!("movq xmm0, rax
  movq xmm1, rcx
  comisd xmm0, xmm1", d_fcmp::<8>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ seta al", d_fcmp::<4>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomisd xmm0, xmm1
+ setae al", d_fcmp::<8>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ setb al", d_fcmp::<4>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomisd xmm0, xmm1
+ setbe al", d_fcmp::<8>, Inputs::Floats),
         case!("cvtsi2ss xmm0, ecx
  movd eax, xmm0", d_arith, Inputs::Values),
         case!("cvtsi2sd xmm0, rcx

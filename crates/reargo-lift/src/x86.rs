@@ -1226,11 +1226,22 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[a, b]),
                 });
                 sb += 1;
+                // CF = "below or unordered" = !(b <= a) (WS84: `a < b` was false for a NaN,
+                // so `ucomiss; ja` read as taken). ZF stays the plain `a == b`: it differs
+                // only for unordered inputs, which compilers test together with PF.
+                let ge = unique(0x54c, 1);
                 ops.push(PcodeOp {
-                    opcode: OpCode::FloatLess,
+                    opcode: OpCode::FloatLessEqual,
+                    seq: seq(sb),
+                    output: Some(ge),
+                    inputs: SmallVec::from_slice(&[b, a]),
+                });
+                sb += 1;
+                ops.push(PcodeOp {
+                    opcode: OpCode::BoolNegate,
                     seq: seq(sb),
                     output: Some(reg(CF_OFFSET, 1)),
-                    inputs: SmallVec::from_slice(&[a, b]),
+                    inputs: SmallVec::from_slice(&[ge]),
                 });
                 sb += 1;
                 // PF = unordered = isnan(a) || isnan(b). Lets `jp`/`jnp` after a
@@ -2422,7 +2433,10 @@ mod tests {
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
         assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatEqual
             && o.output.unwrap().offset == ZF_OFFSET));
-        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatLess
+        // CF = !(xmm1 <= xmm0): below or unordered (WS84)
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatLessEqual
+            && o.inputs[0].offset == XMM_BASE + 0x10 && o.inputs[1].offset == XMM_BASE));
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::BoolNegate
             && o.output.unwrap().offset == CF_OFFSET));
     }
 

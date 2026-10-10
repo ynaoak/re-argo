@@ -2488,6 +2488,26 @@ mod tests {
         assert!(c.contains("(xmm0_d < xmm2_d) ? xmm0_d : xmm2_d"), "{c}");
     }
 
+    /// `ucomiss a, b; ja` is `a > b` — false for a NaN, like the CPU (WS84: printed
+    /// `!(a <= b)`, true for a NaN) — and `jbe` its NaN-true complement `!(b < a)`.
+    #[test]
+    fn float_compare_above_is_ordered() {
+        let lifter = X86Lifter::new_64();
+        for (jcc, want) in [(0x77u8, "xmm1_d < xmm0_d"), (0x76, "!(xmm1_d < xmm0_d)"), (0x73, "xmm1_d <= xmm0_d")] {
+            let code = [
+                0x0f, 0x2e, 0xc1, // ucomiss xmm0, xmm1
+                jcc, 0x03, // ja / jbe / jae L
+                0x31, 0xc0, // xor eax, eax
+                0xc3, // ret
+                0xb8, 0x01, 0x00, 0x00, 0x00, // L: mov eax, 1
+                0xc3, // ret
+            ];
+            let mem = make_memory(&code, 0x1000);
+            let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+            assert!(c.contains(want), "{jcc:#x} {want}: {c}");
+        }
+    }
+
     /// `cmovl` prints as a select, not the lifter's branch-free mask (WS83).
     #[test]
     fn cmov_is_a_select() {
