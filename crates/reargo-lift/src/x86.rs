@@ -1234,16 +1234,16 @@ impl X86Lifter {
             Comisd | Comiss | Ucomisd | Ucomiss => {
                 let a = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 let b = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                let eq = unique(0x54e, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::FloatEqual,
                     seq: seq(sb),
-                    output: Some(reg(ZF_OFFSET, 1)),
+                    output: Some(eq),
                     inputs: SmallVec::from_slice(&[a, b]),
                 });
                 sb += 1;
                 // CF = "below or unordered" = !(b <= a) (WS84: `a < b` was false for a NaN,
-                // so `ucomiss; ja` read as taken). ZF stays the plain `a == b`: it differs
-                // only for unordered inputs, which compilers test together with PF.
+                // so `ucomiss; ja` read as taken).
                 let ge = unique(0x54c, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::FloatLessEqual,
@@ -1272,6 +1272,11 @@ impl X86Lifter {
                 sb += 1;
                 ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(PF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[na, nb]) });
+                sb += 1;
+                // ZF = equal or unordered (WS85: it was the plain `a == b`, 0 for a NaN, so a
+                // `je` / `sete` alone read the opposite of the CPU for a NaN)
+                ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(ZF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[eq, reg(PF_OFFSET, 1)]) });
                 sb += 1;
                 // OF and SF are cleared (WS84: they kept an earlier integer op's value)
                 self.emit_clear_of_sf(&mut ops, &mut sb, address);
@@ -2574,8 +2579,10 @@ mod tests {
         let lifter = X86Lifter::new_64();
         let mem = make_memory(&[0x66, 0x0f, 0x2e, 0xc1], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatEqual
-            && o.output.unwrap().offset == ZF_OFFSET));
+        // ZF = (xmm0 == xmm1) || PF: equal or unordered (WS85)
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatEqual));
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::BoolOr
+            && o.output.unwrap().offset == ZF_OFFSET && o.inputs[1].offset == PF_OFFSET));
         // CF = !(xmm1 <= xmm0): below or unordered (WS84)
         assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatLessEqual
             && o.inputs[0].offset == XMM_BASE + 0x10 && o.inputs[1].offset == XMM_BASE));

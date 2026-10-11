@@ -837,12 +837,10 @@ fn fits_i32_f64(a: u64, _: u64, _: u64) -> bool {
     x.is_finite() && x > -2147483648.0 && x < 2147483647.0
 }
 
-/// `comis…`/`ucomis…` of an `N`-byte float: OF/SF cleared, PF = unordered, CF = below or
-/// unordered. (Unordered also sets ZF = 1 on the CPU; the lifter keeps ZF as the plain `==`,
-/// so ZF is only compared for ordered inputs.)
-fn d_fcmp<const N: u32>(a: u64, b: u64, _: u64) -> (u64, u8) {
-    let nan = |x: u64| if N == 4 { f32::from_bits(x as u32).is_nan() } else { f64::from_bits(x).is_nan() };
-    (if nan(a) || nan(b) { ARITH & !ZF } else { ARITH }, RAX)
+/// `comis…`/`ucomis…` of an `N`-byte float: OF/SF cleared, ZF = equal or unordered, PF =
+/// unordered, CF = below or unordered (WS85: ZF was the plain `==`, 0 for a NaN).
+fn d_fcmp<const N: u32>(_: u64, _: u64, _: u64) -> (u64, u8) {
+    (ARITH, RAX)
 }
 
 #[test]
@@ -888,6 +886,10 @@ fn scalar_float_matches_the_cpu() {
  movq xmm1, rcx
  ucomisd xmm0, xmm1
  setbe al", d_fcmp::<8>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ sete al", d_fcmp::<4>, Inputs::Floats),
         case!("movq xmm0, rax
  movq xmm1, rcx
  ucomisd xmm0, xmm1

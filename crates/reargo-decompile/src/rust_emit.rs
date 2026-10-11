@@ -592,6 +592,11 @@ impl<'a> RustEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = {}.abs();", dst, a))
             }
+            OpCode::FloatNan => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = {}.is_nan();", dst, a))
+            }
             OpCode::FloatSqrt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);

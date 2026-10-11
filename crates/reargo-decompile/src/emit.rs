@@ -667,6 +667,11 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = fabs({});", dst, a))
             }
+            OpCode::FloatNan => {
+                let dst = out_name?;
+                let a = self.input_expr(func, op, 0);
+                Some(format!("{} = isnan({});", dst, a))
+            }
             OpCode::FloatSqrt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);

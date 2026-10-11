@@ -56,6 +56,7 @@ pub fn decompile_with_symbols(
     }
     crate::noreturn::mark_noreturn_calls(&mut lifted, &crate::noreturn::NoReturn::new(lifter, memory, None));
     let switches = crate::switch::recover_jump_tables(&mut lifted, memory);
+    crate::fparity::fold_parity_checks(&mut lifted, switches.iter().flat_map(|s| s.targets.iter().copied().chain(s.default)));
 
     let mut trimmed = trim_to_return(lifted);
     rewrite_tail_calls(&mut trimmed);
@@ -373,6 +374,11 @@ fn decompile_function_inner(
     crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
     // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
     let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);
+    // WS85: `ucomiss; jne T; jp T` is one `a != b`, `jbe` after it `!(b < a)`
+    crate::fparity::fold_parity_checks(
+        &mut lifted,
+        switches.iter().flat_map(|s| s.targets.iter().copied().chain(s.default)),
+    );
 
     let terminated = if func.is_some() {
         trim_to_function_body(lifted, func_entry, func)
@@ -2442,6 +2448,43 @@ mod tests {
 
     /// `popcnt` / `lzcnt` / `tzcnt` / `bswap` keep their dataflow and print by name (WS84: they
     /// were `__unmodeled_insn()` and the result register was never written).
+    #[test]
+    fn float_inequality_with_its_parity_check_is_one_comparison() {
+        let lifter = X86Lifter::new_64();
+        let tail = [0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]; // mov eax, 1; ret; L: xor eax, eax; ret
+        // ucomiss xmm0, xmm1; jne L; jp L  /  jp L; jne L
+        for jumps in [[0x75, 0x08, 0x7a, 0x06], [0x7a, 0x08, 0x75, 0x06]] {
+            let code: Vec<u8> = [0x0f, 0x2e, 0xc1].iter().chain(&jumps).chain(&tail).copied().collect();
+            let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+            assert!(c.contains("if (xmm0_d != xmm1_d)") || c.contains("if (xmm0_d == xmm1_d)"), "{c}");
+            assert!(!c.contains("isnan"), "{c}");
+        }
+        // jp L; je M: past the parity check ZF is `==`
+        let code = [0x0f, 0x2e, 0xc1, 0x7a, 0x08, 0x74, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("xmm0_d == xmm1_d") || c.contains("xmm0_d != xmm1_d"), "{c}");
+        assert!(c.contains("isnan(xmm0_d)"), "the parity jump itself stays: {c}");
+        // je alone: equal or unordered, as the CPU
+        let code = [0x0f, 0x2e, 0xc1, 0x74, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("isnan(xmm0_d)") && c.contains("xmm0_d == xmm1_d"), "{c}");
+    }
+
+    #[test]
+    fn cmovne_cmovp_pair_selects_on_float_inequality() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x0f, 0x2e, 0xc1, // ucomiss xmm0, xmm1
+            0x89, 0xf8, // mov eax, edi
+            0x0f, 0x45, 0xc6, // cmovne eax, esi
+            0x0f, 0x4a, 0xc6, // cmovp eax, esi
+            0xc3,
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("eax = (xmm0_d != xmm1_d) ? esi : eax;"), "{c}");
+        assert!(!c.contains("isnan"), "{c}");
+    }
+
     #[test]
     fn packed_integer_ops_print_by_name() {
         let lifter = X86Lifter::new_64();
