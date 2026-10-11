@@ -2586,6 +2586,22 @@ mod tests {
         }
     }
 
+    /// `jbe` after a compare with 0: the constant on the right, `<=` only when the other side
+    /// can not be a NaN (WS85).
+    #[test]
+    fn float_below_or_equal_reads_with_the_constant_right() {
+        let lifter = X86Lifter::new_64();
+        let tail = [0x76, 0x03, 0x31, 0xc0, 0xc3, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]; // jbe L; xor; ret; L: mov eax, 1; ret
+        // xorps xmm1, xmm1; ucomiss xmm0, xmm1
+        let code: Vec<u8> = [0x0f, 0x57, 0xc9, 0x0f, 0x2e, 0xc1].iter().chain(&tail).copied().collect();
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("!(xmm0_d > 0.0f)"), "{c}");
+        // cvtsi2ss xmm0, edi first: never a NaN
+        let code: Vec<u8> = [0xf3, 0x0f, 0x2a, 0xc7, 0x0f, 0x57, 0xc9, 0x0f, 0x2e, 0xc1].iter().chain(&tail).copied().collect();
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("xmm0_d <= 0.0f") && !c.contains("!(xmm0_d"), "{c}");
+    }
+
     /// A write to a register's low byte prints as that write (WS84: it printed the lifter's
     /// rebuild `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`).
     #[test]
