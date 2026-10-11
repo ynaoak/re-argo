@@ -1,7 +1,7 @@
 //! What the callers of a function do with its result (WS80): the return type of a function
 //! whose own code does not show it (`return g();` with `g` unknown).
 //!
-//! The direct call sites are found by a byte scan of the executable blocks for `E8 rel32`
+//! The direct call sites are found by a byte scan (SIMD `memchr`) of the executable blocks for `E8 rel32`
 //! landing on the function (no analysis; a random `E8` hit that is not a real call is
 //! improbable for one 32-bit target). After each call, a few instructions are lifted until
 //! the caller first reads the return registers, overwrites them or leaves the straight line.
@@ -41,7 +41,7 @@ pub fn direct_call_sites(memory: &Memory, target: u64, cap: usize) -> Vec<u64> {
         }
         // rel32 = target - (site + 5): only sites within ±2 GiB can reach it
         let start = block.start;
-        for i in memchr_iter(0xe8, &data[..data.len() - 4]) {
+        for i in memchr::memchr_iter(0xe8, &data[..data.len() - 4]) {
             let rel = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
             let site = start + i as u64;
             if (site as i64).wrapping_add(5).wrapping_add(rel as i64) as u64 == target {
@@ -53,22 +53,6 @@ pub fn direct_call_sites(memory: &Memory, target: u64, cap: usize) -> Vec<u64> {
         }
     }
     out
-}
-
-/// Positions of `needle` in `hay`, 8 bytes at a time (a word with no such byte is skipped
-/// with one test).
-fn memchr_iter(needle: u8, hay: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let pat = LO * needle as u64;
-    let words = hay.len() / 8;
-    (0..words)
-        .filter(move |&w| {
-            let x = u64::from_le_bytes(hay[w * 8..w * 8 + 8].try_into().unwrap()) ^ pat;
-            x.wrapping_sub(LO) & !x & HI != 0
-        })
-        .flat_map(move |w| (w * 8..w * 8 + 8).filter(move |&i| hay[i] == needle))
-        .chain((words * 8..hay.len()).filter(move |&i| hay[i] == needle))
 }
 
 /// The verdict of one call site.

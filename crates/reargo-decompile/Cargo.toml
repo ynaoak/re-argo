@@ -14,3 +14,4 @@ smallvec = { workspace = true }
 thiserror = { workspace = true }
 rustc-hash = { workspace = true }
 rayon = { workspace = true }
+memchr = "2"

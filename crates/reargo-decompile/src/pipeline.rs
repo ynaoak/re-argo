@@ -695,6 +695,9 @@ struct RetEvidence {
     size: u32,
     /// The value is a call's result (its return `INDIRECT`, not a clobber).
     call_result: bool,
+    /// The function also stores the value it leaves in the register (WS85): weak evidence
+    /// that it is returned (`obj->x = v` with `v` left over in `xmm0` of a void function).
+    stored: bool,
 }
 
 /// The value `v` holds at a `ret`, looking through the lifter's view syncs (`xmm0 =
@@ -736,7 +739,13 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
             let e = return_evidence(ssa, op.inputs[0], seen);
             RetEvidence { addr: e.addr.max(op.address), ..e }
         }
-        _ => RetEvidence { written: true, addr: op.address, size: vn.data.size, call_result: false },
+        _ => RetEvidence {
+            written: true,
+            addr: op.address,
+            size: vn.data.size,
+            call_result: false,
+            stored: vn.uses.iter().any(|&u| ssa.ops[u].opcode == OpCode::Store && ssa.ops[u].inputs.get(2) == Some(&v)),
+        },
     }
 }
 
@@ -764,6 +773,7 @@ fn choose_return_register(
     }
     let (mut float_votes, mut int_votes, mut size) = (0, 0, 0u32);
     let mut passes_call_result = false;
+    let mut weak = true;
     for &r in &rets {
         let (iv, fv) = (ssa.ops[r].inputs[1], ssa.ops[r].inputs[2]);
         let i = return_evidence(ssa, iv, &mut Vec::new());
@@ -772,13 +782,35 @@ fn choose_return_register(
         if f_scalar && (!i.written || f.addr > i.addr) {
             float_votes += 1;
             size = size.max(f.size);
+            // (both registers computed: which was written last is a guess)
+            weak &= f.stored || i.written;
         } else if i.written {
             int_votes += 1;
+            weak &= i.stored || f_scalar;
         } else if f.call_result && !i.call_result {
             // `call g; ret` with `g` known to return a float (its `rax` is only clobbered)
             float_votes += 1;
+            weak = false;
         } else if i.call_result {
             passes_call_result = true;
+        }
+    }
+    // WS85: every `ret` leaves a value the function also stored, or values it computed in
+    // both `rax` and `xmm0` (0x4bcfb30: `rax` until its `maxss` was lifted, then `xmm0`) —
+    // the last write decides little: the callers decide when they agree
+    if weak && float_votes + int_votes > 0 {
+        match callers() {
+            Some(crate::callers::ReturnHint::Void) => {
+                for &r in &rets {
+                    for v in ssa.ops[r].inputs.drain(1..).collect::<Vec<_>>() {
+                        unuse(ssa, v, r);
+                    }
+                }
+                return None;
+            }
+            Some(crate::callers::ReturnHint::Float(s)) => (float_votes, int_votes, size) = (1, 0, size.max(s)),
+            Some(crate::callers::ReturnHint::Int) => (float_votes, int_votes) = (0, 1),
+            None => {}
         }
     }
     // WS80: `return g();` with `g`'s return register unknown: ask what the callers read
@@ -2151,6 +2183,24 @@ mod tests {
         assert!(tested.contains("uint64_t f("), "{tested}");
     }
 
+
+    /// A value the function stores and leaves in `xmm0` is returned only when callers read
+    /// it (WS85: what was written last flipped the type of a void function).
+    #[test]
+    fn stored_leftover_is_returned_only_when_callers_read_it() {
+        let lifter = X86Lifter::new_64();
+        let f = |after: &[u8]| {
+            let callee: &[u8] = &[0xf3, 0x0f, 0x59, 0xc1, 0xf3, 0x0f, 0x11, 0x07, 0xc3]; // mulss xmm0, xmm1; movss [rdi], xmm0; ret
+            let mut caller = vec![0xe8, 0xeb, 0xff, 0xff, 0xff]; // 1010: call 0x1000
+            caller.extend_from_slice(after);
+            let mem = make_memory_parts(&[(0x1000, callee), (0x1010, &caller)]);
+            decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code
+        };
+        let ignored = f(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]); // mov eax, 1; ret
+        assert!(ignored.contains("void f("), "{ignored}");
+        let used = f(&[0xf3, 0x0f, 0x58, 0xc8, 0xc3]); // addss xmm1, xmm0; ret
+        assert!(used.contains("float f("), "{used}");
+    }
 
     /// A folded `jne` test reads `a != b`, not `!(a == b)` (WS80).
     #[test]

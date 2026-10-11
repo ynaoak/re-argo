@@ -532,6 +532,7 @@ dependencies = [
 name = "reargo-decompile"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "rayon",
  "reargo-core",
  "reargo-lift",
