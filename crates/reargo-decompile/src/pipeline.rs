@@ -2720,6 +2720,26 @@ mod tests {
         assert!(!c.contains("__unmodeled_insn"), "{c}");
     }
 
+    /// WS86: shuffles, the dword add of every lane, shifts and the word extract print by name.
+    #[test]
+    fn shuffles_print_by_name() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x66, 0x0f, 0x70, 0xc1, 0x4e, // pshufd xmm0, xmm1, 0x4e
+            0x66, 0x0f, 0xfe, 0xc2, // paddd xmm0, xmm2
+            0x66, 0x0f, 0x62, 0xc3, // punpckldq xmm0, xmm3
+            0x66, 0x0f, 0x72, 0xd0, 0x03, // psrld xmm0, 3
+            0x66, 0x0f, 0xc5, 0xc0, 0x03, // pextrw eax, xmm0, 3
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        for f in ["pshufd(xmm1, 0x4e)", "paddd(xmm0, xmm2)", "punpckldq(xmm0, xmm3)", "psrld(xmm0, 3)", "pextrw(xmm0, 3)"] {
+            assert!(c.contains(f), "{f}: {c}");
+        }
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+    }
+
     #[test]
     fn bit_count_instructions_print_by_name() {
         let lifter = X86Lifter::new_64();

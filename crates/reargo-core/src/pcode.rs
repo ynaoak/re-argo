@@ -557,7 +557,8 @@ pub mod intrinsic {
     pub const NORETURN: u64 = 0xff;
 
     /// Packed integer SIMD on whole 16-byte registers (WS85): `dst = op(dst, src)` lane by
-    /// lane, named after the instruction (`xmm0 = paddb(xmm0, xmm1)`). The tag is
+    /// lane, named after the instruction (`xmm0 = paddb(xmm0, xmm1)`); shuffles take their
+    /// immediate as a last constant input (WS86, `xmm0 = pshufd(xmm1, 0x4e)`). The tag is
     /// `PACKED_BASE + index` into [`PACKED`].
     pub const PACKED_BASE: u64 = 0x140;
     pub const PACKED: &[&str] = &[
@@ -567,6 +568,21 @@ pub mod intrinsic {
         "pcmpeqq", "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq", "pavgb", "pavgw", "pmullw",
         "pmulhw", "pmulhuw", "pmulld", "pmaddwd", "psadbw", "packsswb", "packuswb", "packssdw",
         "packusdw",
+        // WS86: every lane of the dword / qword add and sub (they were the low lane's `+` / `-`)
+        "paddd", "psubd", "paddq", "psubq",
+        // WS86: unpacks and shuffles (they were a copy of the source): `dst = op(dst, src)` ...
+        "punpcklbw", "punpcklwd", "punpckldq", "punpcklqdq", "punpckhbw", "punpckhwd", "punpckhdq",
+        "punpckhqdq", "unpcklps", "unpckhps", "unpcklpd", "unpckhpd", "pshufb", "movhlps", "movlhps",
+        // ... `dst = op(src, imm)` ...
+        "pshufd", "pshuflw", "pshufhw",
+        // ... `dst = op(dst, src, imm)` (`pinsrw`: the low word of `src` into word `imm`) ...
+        "shufps", "shufpd", "pinsrw",
+        // ... and `r32 = pextrw(src, imm)`: word `imm`, zero-extended
+        "pextrw",
+        // WS86: shifts of every lane by an immediate or the low quadword of a register
+        // (`xmm0 = psrld(xmm0, 3)`), the byte shifts of the whole register, `pmuludq`
+        "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "pslldq", "psrldq",
+        "pmuludq",
     ];
 
     /// The tag of a packed integer instruction by its mnemonic (`"paddb"`).

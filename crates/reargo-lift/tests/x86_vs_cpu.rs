@@ -944,6 +944,44 @@ macro_rules! packed {
     };
 }
 
+/// Like `packed!`, any instructions between loading xmm0 = (rax, rcx), xmm1 = (rcx, rdx) and
+/// reading xmm0 back into rax / rdx (WS86: shuffles with an immediate, `pinsrw`).
+macro_rules! packed_raw {
+    ($body:literal) => {
+        packed_raw!($body, None)
+    };
+    ($body:literal, $needs:expr) => {
+        Case {
+            asm: $body,
+            f: cpu!(
+                "lea rsp, [rsp-32]
+ mov [rsp], rax
+ mov [rsp+8], rcx
+ mov [rsp+16], rcx
+ mov [rsp+24], rdx
+",
+                " movdqu xmm0, [rsp]
+ movdqu xmm1, [rsp+16]
+ ",
+                $body,
+                "
+ movdqu [rsp], xmm0
+ mov rax, [rsp]
+ mov rdx, [rsp+8]
+ lea rsp, [rsp+32]"
+            ),
+            defined: d_packed,
+            inputs: Inputs::Values,
+            needs: $needs,
+            valid: None,
+        }
+    };
+}
+
+fn ssse3() -> bool {
+    std::is_x86_feature_detected!("ssse3")
+}
+
 fn d_packed(_: u64, _: u64, _: u64) -> (u64, u8) {
     (ARITH, RAX | RDX)
 }
@@ -1002,6 +1040,64 @@ fn packed_integer_ops_match_the_cpu() {
         packed!("packuswb"),
         packed!("packssdw"),
         packed!("packusdw", Some(sse41)),
+        // WS86: every lane of the dword / qword add and sub, the unpacks
+        packed!("paddd"),
+        packed!("psubd"),
+        packed!("paddq"),
+        packed!("psubq"),
+        packed!("punpcklbw"),
+        packed!("punpcklwd"),
+        packed!("punpckldq"),
+        packed!("punpcklqdq"),
+        packed!("punpckhbw"),
+        packed!("punpckhwd"),
+        packed!("punpckhdq"),
+        packed!("punpckhqdq"),
+        packed!("unpcklps"),
+        packed!("unpckhps"),
+        packed!("unpcklpd"),
+        packed!("unpckhpd"),
+        packed!("pshufb", Some(ssse3)),
+        packed!("movhlps"),
+        packed!("movlhps"),
+    ];
+    check(&cases);
+}
+
+/// WS86: shuffles with an immediate and the word insert / extract, on whole registers.
+#[test]
+fn shuffles_match_the_cpu() {
+    let cases = vec![
+        packed_raw!("pshufd xmm0, xmm1, 0x1b"),
+        packed_raw!("pshufd xmm0, xmm1, 0x4e"),
+        packed_raw!("pshufd xmm0, xmm0, 0xb1"),
+        packed_raw!("pshuflw xmm0, xmm1, 0x1b"),
+        packed_raw!("pshufhw xmm0, xmm1, 0x93"),
+        packed_raw!("shufps xmm0, xmm1, 0x44"),
+        packed_raw!("shufps xmm0, xmm1, 0xe1"),
+        packed_raw!("shufpd xmm0, xmm1, 1"),
+        packed_raw!("shufpd xmm0, xmm1, 2"),
+        packed_raw!("pinsrw xmm0, ecx, 5"),
+        packed_raw!("pinsrw xmm0, edx, 0"),
+        // (the extracted word in rax: xmm0 is reloaded from rax / rcx after it)
+        packed_raw!("pextrw eax, xmm1, 6
+ mov [rsp], rax
+ movdqu xmm0, [rsp]"),
+        // shifts of every lane: by an immediate, by xmm1's low quadword (= rcx), past the width
+        packed_raw!("psllw xmm0, 3"),
+        packed_raw!("pslld xmm0, 31"),
+        packed_raw!("psllq xmm0, 13"),
+        packed_raw!("psrlw xmm0, 15"),
+        packed_raw!("psrld xmm0, 3"),
+        packed_raw!("psrlq xmm0, 40"),
+        packed_raw!("psraw xmm0, 20"),
+        packed_raw!("psrad xmm0, 7"),
+        packed_raw!("pslld xmm0, xmm1"),
+        packed_raw!("psrlq xmm0, xmm1"),
+        packed_raw!("psrad xmm0, xmm1"),
+        packed_raw!("pslldq xmm0, 3"),
+        packed_raw!("psrldq xmm0, 9"),
+        packed!("pmuludq"),
     ];
     check(&cases);
 }

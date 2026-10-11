@@ -272,9 +272,9 @@ impl Emulator {
             // the lifter's named intrinsics with a defined value (WS84); others are opaque
             OpCode::CallOther => {
                 use reargo_core::pcode::intrinsic;
-                if let (Some(out), Some(tag), Some(src)) = (op.output.as_ref(), op.input(0), op.input(1))
+                if let (Some(out), Some(tag)) = (op.output.as_ref(), op.input(0))
                     && tag.space == SpaceId::CONST
-                    && let Some(v) = self.packed(tag.offset, src, op.input(2))
+                    && let Some(v) = self.packed(tag.offset, &op.inputs[1..])
                 {
                     self.state.write_wide(out, v);
                 } else if let (Some(out), Some(tag), Some(src)) = (op.output.as_ref(), op.input(0), op.input(1))
@@ -631,16 +631,21 @@ impl Emulator {
     }
 
     /// The value of a lane-precise SIMD intrinsic (`pcmpeqb`, `pmovmskb`, the packed integer
-    /// ops of [`reargo_core::pcode::intrinsic::PACKED`]), or None for another tag.
-    fn packed(&self, tag: u64, a: &reargo_core::pcode::VarnodeData, b: Option<&reargo_core::pcode::VarnodeData>) -> Option<u128> {
+    /// ops of [`reargo_core::pcode::intrinsic::PACKED`]), or None for another tag. `args` are the
+    /// op's inputs after the tag; a constant last one is the immediate of a shuffle.
+    fn packed(&self, tag: u64, args: &[reargo_core::pcode::VarnodeData]) -> Option<u128> {
         use reargo_core::pcode::intrinsic;
-        let x = self.state.read_wide(a);
+        let x = self.state.read_wide(args.first()?);
         if tag == intrinsic::PMOVMSKB {
             return Some((0..16).fold(0u128, |m, i| m | ((x >> (i * 8 + 7)) & 1) << i));
         }
         let name = if tag == intrinsic::PCMPEQB { "pcmpeqb" } else { intrinsic::name(tag).filter(|_| tag >= intrinsic::PACKED_BASE)? };
-        let y = self.state.read_wide(b?);
-        Some(packed_op(name, x, y))
+        let (imm, rest) = match args.split_last() {
+            Some((last, rest)) if last.space == SpaceId::CONST && args.len() > 1 => (last.offset, rest),
+            _ => (0, args),
+        };
+        let y = rest.get(1).map_or(0, |v| self.state.read_wide(v));
+        Some(packed_op(name, x, y, imm))
     }
 
     fn read_input(&self, op: &PcodeOp, index: usize) -> Result<u64, EmulatorError> {
@@ -652,8 +657,67 @@ impl Emulator {
     }
 }
 
-/// `name(x, y)` on 16-byte vectors, lane by lane as the SSE instruction does.
-fn packed_op(name: &str, x: u128, y: u128) -> u128 {
+/// `name(x, y)` on 16-byte vectors, lane by lane as the SSE instruction does (`imm`: a
+/// shuffle's immediate).
+fn packed_op(name: &str, x: u128, y: u128, imm: u64) -> u128 {
+    // element `i` of `n` bytes
+    let el = |v: u128, n: u32, i: u32| -> u128 { (v >> (i * n * 8)) & (u128::MAX >> (128 - n * 8)) };
+    let from = |n: u32, f: &dyn Fn(u32) -> u128| -> u128 { (0..16 / n).fold(0u128, |acc, i| acc | f(i) << (i * n * 8)) };
+    let unpack = |n: u32, high: bool| -> u128 {
+        let base = if high { 8 / n } else { 0 };
+        from(n, &|i| if i % 2 == 0 { el(x, n, base + i / 2) } else { el(y, n, base + i / 2) })
+    };
+    let imm = imm as u32;
+    match name {
+        "punpcklbw" => return unpack(1, false),
+        "punpcklwd" => return unpack(2, false),
+        "punpckldq" | "unpcklps" => return unpack(4, false),
+        "punpcklqdq" | "unpcklpd" => return unpack(8, false),
+        "punpckhbw" => return unpack(1, true),
+        "punpckhwd" => return unpack(2, true),
+        "punpckhdq" | "unpckhps" => return unpack(4, true),
+        "punpckhqdq" | "unpckhpd" => return unpack(8, true),
+        "pshufb" => return from(1, &|i| if el(y, 1, i) & 0x80 != 0 { 0 } else { el(x, 1, (el(y, 1, i) & 0x0f) as u32) }),
+        "movhlps" => return el(y, 8, 1) | el(x, 8, 1) << 64,
+        "movlhps" => return el(x, 8, 0) | el(y, 8, 0) << 64,
+        "pshufd" => return from(4, &|i| el(x, 4, (imm >> (2 * i)) & 3)),
+        "pshuflw" => return from(2, &|i| if i < 4 { el(x, 2, (imm >> (2 * i)) & 3) } else { el(x, 2, i) }),
+        "pshufhw" => return from(2, &|i| if i < 4 { el(x, 2, i) } else { el(x, 2, 4 + ((imm >> (2 * (i - 4))) & 3)) }),
+        "shufps" => return from(4, &|i| if i < 2 { el(x, 4, (imm >> (2 * i)) & 3) } else { el(y, 4, (imm >> (2 * i)) & 3) }),
+        "shufpd" => return el(x, 8, imm & 1) | el(y, 8, (imm >> 1) & 1) << 64,
+        "pinsrw" => {
+            let k = (imm & 7) * 16;
+            return (x & !(0xffffu128 << k)) | (y & 0xffff) << k;
+        }
+        "pextrw" => return el(x, 2, imm & 7),
+        // the count: the immediate, or the low quadword of the second register
+        "psllw" | "pslld" | "psllq" | "psrlw" | "psrld" | "psrlq" | "psraw" | "psrad" => {
+            let n = match name.as_bytes()[4] {
+                b'w' => 2,
+                b'd' => 4,
+                _ => 8,
+            };
+            let count = if imm != 0 { u64::from(imm) } else { y as u64 };
+            let bits = u64::from(n * 8);
+            return from(n, &|i| {
+                let v = el(x, n, i);
+                let r = match &name[..4] {
+                    "psll" if count < bits => v << count,
+                    "psrl" if count < bits => v >> count,
+                    "psra" => {
+                        let k = 128 - bits as u32;
+                        (((v << k) as i128) >> (k + count.min(bits - 1) as u32)) as u128
+                    }
+                    _ => 0,
+                };
+                r & (u128::MAX >> (128 - n * 8))
+            });
+        }
+        "pslldq" => return if imm < 16 { x << (imm * 8) } else { 0 },
+        "psrldq" => return if imm < 16 { x >> (imm * 8) } else { 0 },
+        "pmuludq" => return from(8, &|i| el(x, 4, 2 * i) * el(y, 4, 2 * i)),
+        _ => {}
+    }
     // lanes of `n` bytes: f(a, b) on each, the operands zero-extended
     fn lanes(x: u128, y: u128, n: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
         let bits = n * 8;
@@ -681,8 +745,8 @@ fn packed_op(name: &str, x: u128, y: u128) -> u128 {
         _ => 8,
     };
     match name {
-        "paddb" | "paddw" => lanes(x, y, n, |a, b| a.wrapping_add(b)),
-        "psubb" | "psubw" => lanes(x, y, n, |a, b| a.wrapping_sub(b)),
+        "paddb" | "paddw" | "paddd" | "paddq" => lanes(x, y, n, |a, b| a.wrapping_add(b)),
+        "psubb" | "psubw" | "psubd" | "psubq" => lanes(x, y, n, |a, b| a.wrapping_sub(b)),
         "paddusb" | "paddusw" => lanes(x, y, n, |a, b| (a + b).min(all(n))),
         "psubusb" | "psubusw" => lanes(x, y, n, |a, b| a.saturating_sub(b)),
         "paddsb" | "paddsw" => lanes(x, y, n, |a, b| sat_s(sx(a, n) + sx(b, n), n)),
