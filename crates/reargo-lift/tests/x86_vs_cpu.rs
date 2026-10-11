@@ -4,8 +4,7 @@
 //! `popfq`, out via `pushfq`), takes the very bytes it executed, lifts them, runs the p-code in
 //! the p-code emulator from the same registers and flags, and compares the result registers and
 //! every flag the Intel SDM defines for that instruction and input (flags it leaves unaffected
-//! count as defined: they must keep their input value). PF is not modelled for integer ops and
-//! is never compared.
+//! count as defined: they must keep their input value).
 //!
 //! Registers: `a` = rax, `b` = rcx (also the `cl` count), `c` = rdx.
 #![cfg(target_arch = "x86_64")]
@@ -22,7 +21,8 @@ const CF: u64 = 0x1;
 const ZF: u64 = 0x40;
 const SF: u64 = 0x80;
 const OF: u64 = 0x800;
-const ARITH: u64 = CF | ZF | SF | OF;
+const PF: u64 = 0x4;
+const ARITH: u64 = CF | PF | ZF | SF | OF;
 /// (EFLAGS bit, register offset of the lifter's 1-byte flag).
 const FLAGS: [(u64, u64); 5] = [(CF, 0x201), (0x4, 0x202), (ZF, 0x206), (SF, 0x207), (OF, 0x20b)];
 
@@ -140,6 +140,8 @@ enum Inputs {
     /// a, b = f64 bit patterns (an f32 in the low half for `…ss`): zeros, infinities, NaN,
     /// denormals, and random values
     Floats,
+    /// a, c from edge values, b = a bit offset -130..=130
+    BitOffsets,
 }
 
 const EDGE: [u64; 20] = [
@@ -189,8 +191,8 @@ impl Rng {
 
 /// The flag inputs to try: none set, all set, and a random mix.
 fn flag_inputs(rng: &mut Rng) -> [u64; 3] {
-    let mix = rng.next() & (ARITH | 0x4);
-    [0x2, 0x2 | ARITH | 0x4, 0x2 | mix]
+    let mix = rng.next() & ARITH;
+    [0x2, 0x2 | ARITH, 0x2 | mix]
 }
 
 fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
@@ -242,6 +244,14 @@ fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
                         (u64::from((x as f32).to_bits()), u64::from((y as f32).to_bits()))
                     };
                     v.push((a, b, rng.value(), flag_inputs(rng)[(rng.next() % 3) as usize]));
+                }
+            }
+        }
+        Inputs::BitOffsets => {
+            for (i, &a) in EDGE.iter().enumerate() {
+                for b in -130i64..=130 {
+                    let c = EDGE[(i * 7 + b.unsigned_abs() as usize) % EDGE.len()];
+                    v.push((a, b as u64, c, flag_inputs(rng)[b.unsigned_abs() as usize % 3]));
                 }
             }
         }
@@ -308,7 +318,7 @@ fn emulate(ops: &[PcodeOp], a: u64, b: u64, c: u64, fl: u64) -> (Out, bool) {
 }
 
 fn flag_names(mask: u64) -> String {
-    [(CF, "CF"), (ZF, "ZF"), (SF, "SF"), (OF, "OF")]
+    [(CF, "CF"), (PF, "PF"), (ZF, "ZF"), (SF, "SF"), (OF, "OF")]
         .iter()
         .filter(|(b, _)| mask & b != 0)
         .map(|(_, n)| *n)
@@ -410,12 +420,20 @@ fn d_shift<const W: u32, const IMM: i64, const K: u8>(_: u64, b: u64, _: u64) ->
     }
     let of = if n == 1 { OF } else { 0 };
     match K {
-        // rotates leave SF/ZF unaffected
-        ROL | ROR => (CF | ZF | SF | of, RAX),
+        // rotates leave SF/ZF/PF unaffected
+        ROL | ROR => (CF | PF | ZF | SF | of, RAX),
         // CF is undefined for SHL/SHR by >= the operand width
-        SHL | SHR if n >= u64::from(W) => (ZF | SF | of, RAX),
-        _ => (CF | ZF | SF | of, RAX),
+        SHL | SHR if n >= u64::from(W) => (PF | ZF | SF | of, RAX),
+        _ => (CF | PF | ZF | SF | of, RAX),
     }
+}
+
+/// `rcl`/`rcr` of a `W`-bit operand by `cl` (`IMM < 0`) or `IMM`: CF (and OF for a count of
+/// 1) change, the other flags are unaffected; nothing changes for a zero count.
+fn d_rc<const W: u32, const IMM: i64>(_: u64, b: u64, _: u64) -> (u64, u8) {
+    let raw = if IMM < 0 { b & 0xff } else { IMM as u64 };
+    let n = raw & if W == 64 { 63 } else { 31 };
+    (if n == 1 || n == 0 { ARITH } else { ARITH & !OF }, RAX)
 }
 
 /// `shld`/`shrd` of a `W`-bit operand by `cl` (`IMM < 0`) or `IMM`.
@@ -428,7 +446,7 @@ fn d_dshift<const W: u32, const IMM: i64>(_: u64, b: u64, _: u64) -> (u64, u8) {
     if n > u64::from(W) {
         return (0, 0); // result and flags undefined
     }
-    (CF | ZF | SF | if n == 1 { OF } else { 0 }, RAX)
+    (CF | PF | ZF | SF | if n == 1 { OF } else { 0 }, RAX)
 }
 
 /// `bt`/`bts`/`btr`/`btc`: CF = the bit, ZF unaffected, OF/SF undefined.
@@ -541,8 +559,7 @@ fn conditions_match_the_cpu() {
             )+]
         };
     }
-    // (parity conditions are not modelled: PF is not tracked for integer ops)
-    let mut cases = cc!("o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "l", "ge", "le", "g");
+    let mut cases = cc!("o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "l", "ge", "le", "g", "p", "np");
     cases.extend([
         case!("clc", d_arith, Inputs::Flags),
         case!("stc", d_arith, Inputs::Flags),
@@ -624,6 +641,33 @@ fn rotates_match_the_cpu() {
     check(&cases);
 }
 
+/// A rotate through carry at every width, by `cl`, by 1 and by a constant.
+macro_rules! rotates_through_carry {
+    ($op:literal) => {
+        [
+            case!(concat!($op, " al, cl"), d_rc::<8, -1>, Inputs::Counts),
+            case!(concat!($op, " ax, cl"), d_rc::<16, -1>, Inputs::Counts),
+            case!(concat!($op, " eax, cl"), d_rc::<32, -1>, Inputs::Counts),
+            case!(concat!($op, " rax, cl"), d_rc::<64, -1>, Inputs::Counts),
+            case!(concat!($op, " al, 1"), d_rc::<8, 1>, Inputs::Values),
+            case!(concat!($op, " eax, 1"), d_rc::<32, 1>, Inputs::Values),
+            case!(concat!($op, " rax, 1"), d_rc::<64, 1>, Inputs::Values),
+            case!(concat!($op, " al, 9"), d_rc::<8, 9>, Inputs::Values),
+            case!(concat!($op, " al, 5"), d_rc::<8, 5>, Inputs::Values),
+            case!(concat!($op, " ax, 16"), d_rc::<16, 16>, Inputs::Values),
+            case!(concat!($op, " eax, 31"), d_rc::<32, 31>, Inputs::Values),
+            case!(concat!($op, " rax, 0x22"), d_rc::<64, 0x22>, Inputs::Values),
+        ]
+    };
+}
+
+#[test]
+fn rotates_through_carry_match_the_cpu() {
+    let cases: Vec<Case> =
+        [rotates_through_carry!("rcl"), rotates_through_carry!("rcr")].into_iter().flatten().collect();
+    check(&cases);
+}
+
 #[test]
 fn double_shifts_match_the_cpu() {
     let cases = vec![
@@ -671,6 +715,47 @@ fn bit_ops_match_the_cpu() {
         case!("popcnt ax, cx", d_arith, Inputs::Values, popcnt),
         case!("bswap eax", d_arith, Inputs::Values),
         case!("bswap rax", d_arith, Inputs::Values),
+    ];
+    check(&cases);
+}
+
+/// `bt`… on memory with a register bit offset (the bit string: the offset may leave the
+/// operand). rax and rdx are the 16 bytes at `[rsp]`; the case's address leaves room for the
+/// offsets it accepts.
+fn d_bt_mem(_: u64, _: u64, _: u64) -> (u64, u8) {
+    (CF | ZF, RAX | RDX)
+}
+
+macro_rules! bt_mem {
+    ($asm:expr, $valid:expr) => {
+        Case {
+            asm: $asm,
+            f: cpu!("push rdx
+ push rax
+ ", $asm, "
+ pop rax
+ pop rdx"),
+            defined: d_bt_mem,
+            inputs: Inputs::BitOffsets,
+            needs: None,
+            valid: Some($valid),
+        }
+    };
+}
+
+#[test]
+fn bit_string_ops_match_the_cpu() {
+    let low = |_: u64, b: u64, _: u64| (0..128).contains(&(b as i64));
+    let mid = |_: u64, b: u64, _: u64| (-64..64).contains(&(b as i64));
+    let cases = vec![
+        bt_mem!("bt qword ptr [rsp], rcx", low),
+        bt_mem!("bt qword ptr [rsp+8], rcx", mid),
+        bt_mem!("bt dword ptr [rsp+8], ecx", mid),
+        bt_mem!("bt word ptr [rsp+8], cx", mid),
+        bt_mem!("bts qword ptr [rsp+8], rcx", mid),
+        bt_mem!("btr dword ptr [rsp], ecx", low),
+        bt_mem!("btc word ptr [rsp+8], cx", mid),
+        bt_mem!("bts dword ptr [rsp], 37", low),
     ];
     check(&cases);
 }
@@ -752,13 +837,10 @@ fn fits_i32_f64(a: u64, _: u64, _: u64) -> bool {
     x.is_finite() && x > -2147483648.0 && x < 2147483647.0
 }
 
-/// `comis…`/`ucomis…` of an `N`-byte float in a and b: OF/SF cleared, CF = below or
-/// unordered. (Unordered also sets ZF = 1 on the CPU; the lifter keeps ZF as the plain `==`,
-/// which only `je`/`jne`/`sete`… read, and compilers pair those with the PF test, so ZF is only
-/// compared for ordered inputs.)
-fn d_fcmp<const N: u32>(a: u64, b: u64, _: u64) -> (u64, u8) {
-    let nan = |x: u64| if N == 4 { f32::from_bits(x as u32).is_nan() } else { f64::from_bits(x).is_nan() };
-    (if nan(a) || nan(b) { CF | OF | SF } else { ARITH }, RAX)
+/// `comis…`/`ucomis…` of an `N`-byte float: OF/SF cleared, ZF = equal or unordered, PF =
+/// unordered, CF = below or unordered (WS85: ZF was the plain `==`, 0 for a NaN).
+fn d_fcmp<const N: u32>(_: u64, _: u64, _: u64) -> (u64, u8) {
+    (ARITH, RAX)
 }
 
 #[test]
@@ -804,6 +886,27 @@ fn scalar_float_matches_the_cpu() {
  movq xmm1, rcx
  ucomisd xmm0, xmm1
  setbe al", d_fcmp::<8>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ sete al", d_fcmp::<4>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomisd xmm0, xmm1
+ setnp al
+ sete cl
+ and al, cl", d_fcmp::<8>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ setp al
+ setne cl
+ or al, cl", d_fcmp::<4>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ cmovne eax, edx
+ cmovp eax, edx", d_fcmp::<4>, Inputs::Floats),
         case!("cvtsi2ss xmm0, ecx
  movd eax, xmm0", d_arith, Inputs::Values),
         case!("cvtsi2sd xmm0, rcx
@@ -815,5 +918,90 @@ fn scalar_float_matches_the_cpu() {
  cvttss2si eax, xmm0", d_arith, Inputs::Floats) });
     cases.push(Case { valid: Some(fits_i32_f64), ..case!("movq xmm0, rax
  cvttsd2si eax, xmm0", d_arith, Inputs::Floats) });
+    check(&cases);
+}
+
+/// A packed integer op on whole registers: xmm0 = (rax, rcx) and xmm1 = (rcx, rdx) through the
+/// stack, the result back in rax (low half) and rdx (high half).
+macro_rules! packed {
+    ($op:literal) => {
+        packed!($op, None)
+    };
+    ($op:literal, $needs:expr) => {
+        Case {
+            asm: $op,
+            f: cpu!(
+                "lea rsp, [rsp-32]\n mov [rsp], rax\n mov [rsp+8], rcx\n mov [rsp+16], rcx\n mov [rsp+24], rdx\n",
+                " movdqu xmm0, [rsp]\n movdqu xmm1, [rsp+16]\n ",
+                $op,
+                " xmm0, xmm1\n movdqu [rsp], xmm0\n mov rax, [rsp]\n mov rdx, [rsp+8]\n lea rsp, [rsp+32]"
+            ),
+            defined: d_packed,
+            inputs: Inputs::Values,
+            needs: $needs,
+            valid: None,
+        }
+    };
+}
+
+fn d_packed(_: u64, _: u64, _: u64) -> (u64, u8) {
+    (ARITH, RAX | RDX)
+}
+
+fn sse41() -> bool {
+    std::is_x86_feature_detected!("sse4.1")
+}
+fn sse42() -> bool {
+    std::is_x86_feature_detected!("sse4.2")
+}
+
+#[test]
+fn packed_integer_ops_match_the_cpu() {
+    let cases = vec![
+        packed!("paddb"),
+        packed!("paddw"),
+        packed!("psubb"),
+        packed!("psubw"),
+        packed!("paddusb"),
+        packed!("paddusw"),
+        packed!("psubusb"),
+        packed!("psubusw"),
+        packed!("paddsb"),
+        packed!("paddsw"),
+        packed!("psubsb"),
+        packed!("psubsw"),
+        packed!("pminub"),
+        packed!("pmaxub"),
+        packed!("pminsw"),
+        packed!("pmaxsw"),
+        packed!("pminsb", Some(sse41)),
+        packed!("pmaxsb", Some(sse41)),
+        packed!("pminuw", Some(sse41)),
+        packed!("pmaxuw", Some(sse41)),
+        packed!("pminsd", Some(sse41)),
+        packed!("pmaxsd", Some(sse41)),
+        packed!("pminud", Some(sse41)),
+        packed!("pmaxud", Some(sse41)),
+        packed!("pcmpeqb"),
+        packed!("pcmpeqw"),
+        packed!("pcmpeqd"),
+        packed!("pcmpeqq", Some(sse41)),
+        packed!("pcmpgtb"),
+        packed!("pcmpgtw"),
+        packed!("pcmpgtd"),
+        packed!("pcmpgtq", Some(sse42)),
+        packed!("pavgb"),
+        packed!("pavgw"),
+        packed!("pmullw"),
+        packed!("pmulhw"),
+        packed!("pmulhuw"),
+        packed!("pmulld", Some(sse41)),
+        packed!("pmaddwd"),
+        packed!("psadbw"),
+        packed!("packsswb"),
+        packed!("packuswb"),
+        packed!("packssdw"),
+        packed!("packusdw", Some(sse41)),
+    ];
     check(&cases);
 }

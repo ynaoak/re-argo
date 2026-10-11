@@ -18,11 +18,13 @@ struct Emit<'a> {
     seq: &'a mut u32,
     at: Address,
     next: u64,
+    /// compute PF (`X86Lifter::parity`)
+    parity: bool,
 }
 
 impl<'a> Emit<'a> {
-    fn new(ops: &'a mut Vec<PcodeOp>, seq: &'a mut u32, address: u64) -> Self {
-        Emit { ops, seq, at: Address::new(RAM_SPACE, address), next: TMP_BASE }
+    fn new(ops: &'a mut Vec<PcodeOp>, seq: &'a mut u32, address: u64, parity: bool) -> Self {
+        Emit { ops, seq, at: Address::new(RAM_SPACE, address), next: TMP_BASE, parity }
     }
 
     fn put(&mut self, opcode: OpCode, output: Option<VarnodeData>, inputs: &[VarnodeData]) {
@@ -78,6 +80,18 @@ impl<'a> Emit<'a> {
         let z = self.tmp(OpCode::IntEqual, 1, &[r, constant(0, r.size)]);
         let s = self.msb(r);
         (z, s)
+    }
+
+    /// PF of a result (the low byte has even parity), when the lift computes it.
+    fn pf(&mut self, r: VarnodeData) -> Option<VarnodeData> {
+        self.parity.then(|| parity_of(r, self.ops, self.seq, self.at.offset))
+    }
+
+    /// `flag(PF, …)` when the lift computes PF.
+    fn pf_flag(&mut self, pf: Option<VarnodeData>, changed: Option<VarnodeData>) {
+        if let Some(pf) = pf {
+            self.flag(PF_OFFSET, pf, changed);
+        }
     }
 
     /// Write `flag = value`, or `flag = changed ? value : flag` when `changed` is given.
@@ -192,6 +206,7 @@ impl X86Lifter {
         let lifted = match insn.mnemonic() {
             Shl | Sal | Shr | Sar => self.lift_shift(insn, address),
             Rol | Ror => self.lift_rotate(insn, address),
+            Rcl | Rcr => self.lift_rotate_carry(insn, address),
             Shld | Shrd => self.lift_double_shift(insn, address),
             Adc | Sbb => self.lift_carry_chain(insn, address),
             Bt | Bts | Btr | Btc => self.lift_bit_test(insn, address),
@@ -203,7 +218,7 @@ impl X86Lifter {
                 // CF = 0 / 1 / !CF (they fell to __unmodeled_insn and left CF stale)
                 let mut ops = Vec::new();
                 let mut sb = 0u32;
-                let mut e = Emit::new(&mut ops, &mut sb, address);
+                let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
                 let cf = reg(CF_OFFSET, 1);
                 match insn.mnemonic() {
                     Clc => e.set(OpCode::Copy, cf, &[constant(0, 1)]),
@@ -213,7 +228,7 @@ impl X86Lifter {
                 Ok(ops)
             }
             Cmova | Cmovae | Cmovb | Cmovbe | Cmove | Cmovne | Cmovg | Cmovge | Cmovl | Cmovle
-            | Cmovo | Cmovno | Cmovs | Cmovns => self.lift_cmov(insn, address),
+            | Cmovo | Cmovno | Cmovs | Cmovns | Cmovp | Cmovnp => self.lift_cmov(insn, address),
             _ => return None,
         };
         Some(lifted.map(|mut ops| {
@@ -233,7 +248,7 @@ impl X86Lifter {
         let (sz, w) = (dst.size, dst.size as u64 * 8);
         let mnem = insn.mnemonic();
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let n = mask_count(&mut e, cnt, sz);
             if let Count::Const(0) = n {
                 return Ok(ops); // a zero count changes nothing (not even the flags)
@@ -265,6 +280,7 @@ impl X86Lifter {
             };
             e.set(opcode, dst, &[dst, nv]);
             let (zf, sf) = e.zf_sf(dst);
+            let pf = e.pf(dst);
             // OF (defined for a 1-bit shift only): SHL = MSB(result) ^ CF, SHR = the old MSB,
             // SAR = 0
             let of = match mnem {
@@ -276,6 +292,7 @@ impl X86Lifter {
             e.flag(CF_OFFSET, cf, ch);
             e.flag(ZF_OFFSET, zf, ch);
             e.flag(SF_OFFSET, sf, ch);
+            e.pf_flag(pf, ch);
             match n {
                 Count::Const(1) | Count::Var(_) => e.flag(OF_OFFSET, of.unwrap(), ch),
                 Count::Const(_) => {} // undefined: left as it was
@@ -294,7 +311,7 @@ impl X86Lifter {
         let (sz, w) = (dst.size, dst.size as u64 * 8);
         let is_ror = insn.mnemonic() == iced_x86::Mnemonic::Ror;
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let n = mask_count(&mut e, cnt, sz);
             if let Count::Const(0) = n {
                 return Ok(ops);
@@ -302,6 +319,8 @@ impl X86Lifter {
             // the rotation is by `count mod width` (`rol al, 8` rotates by 0 but sets CF)
             let r = match &n {
                 Count::Const(k) => constant(k & (w - 1), sz),
+                // (the count mask already is `w - 1` for 32 / 64 bits)
+                Count::Var(v) if w >= 32 => *v,
                 Count::Var(v) => e.tmp(OpCode::IntAnd, v.size, &[*v, constant(w - 1, v.size)]),
             };
             let comp = e.tmp(OpCode::IntSub, r.size, &[constant(w, r.size), r]);
@@ -334,6 +353,82 @@ impl X86Lifter {
         Ok(ops)
     }
 
+    /// `rcl`/`rcr`: rotate the `w + 1` bits CF:dst by `c` = the masked count (mod 9 / 17 for a
+    /// byte / word). With `c` in 1..=w, `rcl` = `dst << c | CF << (c - 1) | dst >> (w + 1 - c)`
+    /// and CF = bit `w - c` of dst; `rcr` = `dst >> c | CF << (w - c) | dst << (w + 1 - c)` and
+    /// CF = bit `c - 1` (a shift by the width or more is 0 in p-code, so `c = 1` / `c = w`
+    /// need no special case). OF for a count of 1: `rcl` MSB(result) ^ CF, `rcr` the MSB
+    /// before ^ the CF before. SF/ZF/PF are unaffected.
+    fn lift_rotate_carry(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
+        let mut ops = Vec::new();
+        let mut sb = 0u32;
+        let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
+        let cnt = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
+        let (sz, w) = (dst.size, dst.size as u64 * 8);
+        let left = insn.mnemonic() == iced_x86::Mnemonic::Rcl;
+        {
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
+            let n = mask_count(&mut e, cnt, sz);
+            // the rotation count: mod w + 1 for the narrow operands
+            let c = match &n {
+                Count::Const(0) => return Ok(ops),
+                Count::Const(k) if w < 32 && k % (w + 1) == 0 => return Ok(ops),
+                Count::Const(k) => Count::Const(if w < 32 { k % (w + 1) } else { *k }),
+                Count::Var(v) if w < 32 => Count::Var(e.tmp(OpCode::IntRem, v.size, &[*v, constant(w + 1, v.size)])),
+                Count::Var(v) => Count::Var(*v),
+            };
+            let cv = c.value(sz);
+            let csz = cv.size;
+            let cf_old = reg(CF_OFFSET, 1);
+            let cf_wide = e.tmp(OpCode::IntZExt, sz, &[cf_old]);
+            let c_minus_1 = e.tmp(OpCode::IntSub, csz, &[cv, constant(1, csz)]);
+            let w_minus_c = e.tmp(OpCode::IntSub, csz, &[constant(w, csz), cv]);
+            let w1_minus_c = e.tmp(OpCode::IntSub, csz, &[constant(w + 1, csz), cv]);
+            let old_msb = e.msb(dst);
+            let (cf, main, carry, spill) = if left {
+                let cf = e.bit(dst, w_minus_c);
+                let main = e.tmp(OpCode::IntLeft, sz, &[dst, cv]);
+                let carry = e.tmp(OpCode::IntLeft, sz, &[cf_wide, c_minus_1]);
+                let spill = e.tmp(OpCode::IntRight, sz, &[dst, w1_minus_c]);
+                (cf, main, carry, spill)
+            } else {
+                let cf = e.bit(dst, c_minus_1);
+                let main = e.tmp(OpCode::IntRight, sz, &[dst, cv]);
+                let carry = e.tmp(OpCode::IntLeft, sz, &[cf_wide, w_minus_c]);
+                let spill = e.tmp(OpCode::IntLeft, sz, &[dst, w1_minus_c]);
+                (cf, main, carry, spill)
+            };
+            let t = e.tmp(OpCode::IntOr, sz, &[main, carry]);
+            let rotated = e.tmp(OpCode::IntOr, sz, &[t, spill]);
+            let of = if left {
+                let m = e.msb(rotated);
+                e.tmp(OpCode::BoolXor, 1, &[m, cf])
+            } else {
+                e.tmp(OpCode::BoolXor, 1, &[old_msb, cf_old])
+            };
+            // a register count of 0 (or a multiple of w + 1) rotates nothing: keep dst and CF
+            let rotates = match &c {
+                Count::Const(_) => None,
+                Count::Var(v) => Some(e.tmp(OpCode::IntNotEqual, 1, &[*v, constant(0, v.size)])),
+            };
+            match rotates {
+                None => e.set(OpCode::Copy, dst, &[rotated]),
+                Some(r) => e.set(OpCode::Select, dst, &[r, rotated, dst]),
+            }
+            e.flag(CF_OFFSET, cf, rotates);
+            match n {
+                Count::Const(1) => e.flag(OF_OFFSET, of, None),
+                Count::Var(_) => {
+                    let ch = changed(&mut e, &n);
+                    e.flag(OF_OFFSET, of, ch);
+                }
+                Count::Const(_) => {}
+            }
+        }
+        self.write_back_if_memory(insn, 0, dst, &mut ops, &mut sb, address)?;
+        Ok(ops)
+    }
+
     /// `shld dst, src, n` = `(dst << n) | (src >> (w - n))`, `shrd` the mirror image. CF = the
     /// last bit shifted out of `dst`, OF for a 1-bit shift (sign change), SF/ZF from the result.
     fn lift_double_shift(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
@@ -345,7 +440,7 @@ impl X86Lifter {
         let (sz, w) = (dst.size, dst.size as u64 * 8);
         let left = insn.mnemonic() == iced_x86::Mnemonic::Shld;
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let n = mask_count(&mut e, cnt, sz);
             if let Count::Const(0) = n {
                 return Ok(ops);
@@ -369,11 +464,13 @@ impl X86Lifter {
             let b = e.tmp(second, sz, &[src, comp]);
             e.set(OpCode::IntOr, dst, &[a, b]);
             let (zf, sf) = e.zf_sf(dst);
+            let pf = e.pf(dst);
             let of = e.tmp(OpCode::BoolXor, 1, &[sf, old_msb]);
             let ch = changed(&mut e, &n);
             e.flag(CF_OFFSET, cf, ch);
             e.flag(ZF_OFFSET, zf, ch);
             e.flag(SF_OFFSET, sf, ch);
+            e.pf_flag(pf, ch);
             match n {
                 Count::Const(1) | Count::Var(_) => e.flag(OF_OFFSET, of, ch),
                 Count::Const(_) => {}
@@ -398,7 +495,7 @@ impl X86Lifter {
             (OpCode::IntAdd, OpCode::IntCarry, OpCode::IntSCarry)
         };
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let cf_in = e.tmp(OpCode::IntZExt, sz, &[reg(CF_OFFSET, 1)]);
             let c1 = e.tmp(carry, 1, &[dst, src]);
             let o1 = e.tmp(overflow, 1, &[dst, src]);
@@ -409,18 +506,23 @@ impl X86Lifter {
             e.set(OpCode::BoolOr, reg(CF_OFFSET, 1), &[c1, c2]);
             e.set(OpCode::BoolXor, reg(OF_OFFSET, 1), &[o1, o2]);
             let (zf, sf) = e.zf_sf(dst);
+            let pf = e.pf(dst);
             e.flag(ZF_OFFSET, zf, None);
             e.flag(SF_OFFSET, sf, None);
+            e.pf_flag(pf, None);
         }
         self.write_back_if_memory(insn, 0, dst, &mut ops, &mut sb, address)?;
         Ok(ops)
     }
 
     /// `bt`/`bts`/`btr`/`btc`: CF = the bit (offset mod the operand width), then set / clear /
-    /// complement it. ZF is unaffected. (The bit-string form, a memory operand with a register
-    /// offset beyond the operand, is not modelled.)
+    /// complement it. ZF is unaffected. A memory operand with a register offset is a bit
+    /// string: the signed offset picks the operand-sized word `offset >> log2(w)` words away.
     fn lift_bit_test(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
         use iced_x86::Mnemonic::*;
+        if insn.op_kind(0) == iced_x86::OpKind::Memory && insn.op_kind(1) == iced_x86::OpKind::Register {
+            return self.lift_bit_string(insn, address);
+        }
         let mut ops = Vec::new();
         let mut sb = 0u32;
         let val = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
@@ -428,7 +530,7 @@ impl X86Lifter {
         let sz = val.size;
         let mnem = insn.mnemonic();
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let b = e.resize(bit, sz);
             let k = if b.space == CONST_SPACE {
                 constant(b.offset & (sz as u64 * 8 - 1), sz)
@@ -455,6 +557,42 @@ impl X86Lifter {
         Ok(ops)
     }
 
+    /// The bit-string form of [`Self::lift_bit_test`]: `bt [m], r`.
+    fn lift_bit_string(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
+        use iced_x86::Mnemonic::*;
+        let mut ops = Vec::new();
+        let mut sb = 0u32;
+        let base = self.compute_memory_address(insn, &mut ops, &mut sb, address)?;
+        let off = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
+        let sz = off.size;
+        let ps = base.size;
+        let (w, log_w) = (sz as u64 * 8, (sz as u64 * 8).trailing_zeros() as u64);
+        let mnem = insn.mnemonic();
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
+        // the word: base + (offset >> log2(w)) * (w / 8), the offset signed
+        let wide = if sz == ps { off } else { e.tmp(OpCode::IntSExt, ps, &[off]) };
+        let words = e.tmp(OpCode::IntSRight, ps, &[wide, constant(log_w, ps)]);
+        let bytes = e.tmp(OpCode::IntMult, ps, &[words, constant(w / 8, ps)]);
+        let at = e.tmp(OpCode::IntAdd, ps, &[base, bytes]);
+        let val = e.tmp(OpCode::Load, sz, &[constant(RAM_SPACE.0 as u64, 4), at]);
+        let k = e.tmp(OpCode::IntAnd, sz, &[off, constant(w - 1, sz)]);
+        let cf = e.bit(val, k);
+        e.flag(CF_OFFSET, cf, None);
+        if mnem != Bt {
+            let m = e.tmp(OpCode::IntLeft, sz, &[constant(1, sz), k]);
+            let new = match mnem {
+                Bts => e.tmp(OpCode::IntOr, sz, &[val, m]),
+                Btr => {
+                    let nm = e.tmp(OpCode::IntNegate, sz, &[m]);
+                    e.tmp(OpCode::IntAnd, sz, &[val, nm])
+                }
+                _ => e.tmp(OpCode::IntXor, sz, &[val, m]),
+            };
+            e.put(OpCode::Store, None, &[constant(RAM_SPACE.0 as u64, 4), at, new]);
+        }
+        Ok(ops)
+    }
+
     /// `imul` (1/2/3 operands) and `mul`. CF = OF = "the product does not fit the low half"
     /// (unsigned: the high half is not 0; signed: it is not the sign of the low half). SF/ZF
     /// are undefined and left as they were.
@@ -475,7 +613,7 @@ impl X86Lifter {
                 (dst, self.lift_operand(insn, 1, &mut ops, &mut sb, address)?)
             };
             let sz = dst.size;
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let b = e.resize(b, sz);
             let wa = e.tmp(OpCode::IntSExt, sz * 2, &[a]);
             let wb = e.tmp(OpCode::IntSExt, sz * 2, &[b]);
@@ -491,7 +629,7 @@ impl X86Lifter {
         // one operand: {D:A} = A * src, the full product (the RNG multiply)
         let src = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
         let s = src.size;
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         if s == 1 {
             // AX = AL * src
             let al = reg(0, 1);
@@ -546,13 +684,15 @@ impl X86Lifter {
         let acc = reg(0, sz);
         let newdst;
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let d = e.tmp(OpCode::IntSub, sz, &[acc, old]);
             e.set(OpCode::IntLess, reg(CF_OFFSET, 1), &[acc, old]);
             e.set(OpCode::IntSBorrow, reg(OF_OFFSET, 1), &[acc, old]);
             let (zf, sf) = e.zf_sf(d);
+            let pf = e.pf(d);
             e.flag(ZF_OFFSET, zf, None);
             e.flag(SF_OFFSET, sf, None);
+            e.pf_flag(pf, None);
             let zf = reg(ZF_OFFSET, 1);
             newdst = e.tmp(OpCode::Select, sz, &[zf, src, old]);
             // the accumulator is written only when not equal (`eax` then zero-extends into
@@ -589,7 +729,7 @@ impl X86Lifter {
         let mut sb = 0u32;
         let dst = self.lift_operand_no_load(insn, 0, &mut ops, &mut sb, address)?;
         let src = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         let zero = e.tmp(OpCode::IntEqual, 1, &[src, constant(0, src.size)]);
         match insn.mnemonic() {
             m @ (Bsf | Bsr | Tzcnt) => {
@@ -616,7 +756,8 @@ impl X86Lifter {
             _ => {
                 e.set(OpCode::PopCount, dst, &[src]);
                 e.flag(ZF_OFFSET, zero, None);
-                for f in [CF_OFFSET, OF_OFFSET, SF_OFFSET] {
+                let cleared: &[u64] = if self.parity { &[CF_OFFSET, OF_OFFSET, SF_OFFSET, PF_OFFSET] } else { &[CF_OFFSET, OF_OFFSET, SF_OFFSET] };
+                for &f in cleared {
                     e.flag(f, constant(0, 1), None);
                 }
             }
@@ -629,7 +770,7 @@ impl X86Lifter {
         let mut ops = Vec::new();
         let mut sb = 0u32;
         let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         e.set(OpCode::CallOther, dst, &[constant(reargo_core::pcode::intrinsic::BSWAP, 8), dst]);
         Ok(ops)
     }
@@ -644,10 +785,9 @@ impl X86Lifter {
         let src = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
         let (cc, negated) = positive_cc(insn.condition_code());
         let Some(c) = self.cc_condition(cc, &mut ops, &mut sb, address) else {
-            // parity (PF is not modelled for integer ops): leave dst as it was
             return Ok(ops);
         };
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         let (t, f) = if negated { (dst, src) } else { (src, dst) };
         e.set(OpCode::Select, dst, &[c, t, f]);
         Ok(ops)

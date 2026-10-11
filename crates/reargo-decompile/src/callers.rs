@@ -39,36 +39,46 @@ pub fn direct_call_sites(memory: &Memory, target: u64, cap: usize) -> Vec<u64> {
         if data.len() < 5 {
             continue;
         }
-        // rel32 = target - (site + 5): only sites within ±2 GiB can reach it
+        // rel32 = target - (site + 5): only sites within ±2 GiB can reach it. Its upper 16
+        // bits are the same for every site in a run of up to 64 KiB, so each run is searched
+        // for those two bytes (at the site + 3) with `memmem` — a rarer pattern than the `E8`
+        // byte (WS85: ~50 -> ~10 ms on the 230 MB BDS)
         let start = block.start;
-        for i in memchr_iter(0xe8, &data[..data.len() - 4]) {
-            let rel = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
+        let last = data.len() - 4; // sites i < last
+        let mut i = 0usize;
+        while i < last {
             let site = start + i as u64;
-            if (site as i64).wrapping_add(5).wrapping_add(rel as i64) as u64 == target {
-                out.push(site);
-                if out.len() >= cap {
-                    return out;
+            let rel = (target as i64).wrapping_sub(site as i64 + 5);
+            let low = (rel & 0xffff) as usize;
+            // sites i..i + run have the same `rel >> 16` (rel falls as the site rises)
+            let run = (low + 1).min(last - i);
+            if i32::try_from(rel).is_ok() && i32::try_from(rel - run as i64 + 1).is_ok() {
+                let needle = [(rel >> 16) as u8, (rel >> 24) as u8];
+                let finder = memchr::memmem::Finder::new(&needle);
+                let hay = &data[i + 3..i + 3 + run + 1];
+                // (overlapping matches: `00 00 00` holds the pattern `00 00` twice)
+                let mut from = 0;
+                while let Some(q) = finder.find(&hay[from..]) {
+                    let p = from + q;
+                    from = p + 1;
+                    let k = i + p;
+                    if k >= i + run || data[k] != 0xe8 {
+                        continue;
+                    }
+                    let r = i32::from_le_bytes([data[k + 1], data[k + 2], data[k + 3], data[k + 4]]);
+                    let at = start + k as u64;
+                    if (at as i64).wrapping_add(5).wrapping_add(r as i64) as u64 == target {
+                        out.push(at);
+                        if out.len() >= cap {
+                            return out;
+                        }
+                    }
                 }
             }
+            i += run;
         }
     }
     out
-}
-
-/// Positions of `needle` in `hay`, 8 bytes at a time (a word with no such byte is skipped
-/// with one test).
-fn memchr_iter(needle: u8, hay: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let pat = LO * needle as u64;
-    let words = hay.len() / 8;
-    (0..words)
-        .filter(move |&w| {
-            let x = u64::from_le_bytes(hay[w * 8..w * 8 + 8].try_into().unwrap()) ^ pat;
-            x.wrapping_sub(LO) & !x & HI != 0
-        })
-        .flat_map(move |w| (w * 8..w * 8 + 8).filter(move |&i| hay[i] == needle))
-        .chain((words * 8..hay.len()).filter(move |&i| hay[i] == needle))
 }
 
 /// The verdict of one call site.

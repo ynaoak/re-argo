@@ -474,6 +474,54 @@ fn earlier_sub(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
     Some(Rel::Sub(a, b))
 }
 
+/// A float value that is never a NaN: a constant that is not one, or an integer converted.
+fn not_nan(func: &SsaFunction, v: VarId, depth: u32) -> bool {
+    let d = &func.varnodes[v as usize].data;
+    if d.space == reargo_core::address::SpaceId::CONST {
+        return match d.size {
+            4 => !f32::from_bits(d.offset as u32).is_nan(),
+            8 => !f64::from_bits(d.offset).is_nan(),
+            _ => false,
+        };
+    }
+    let Some(o) = func.varnodes[v as usize].def_op.map(|o| &func.ops[o]) else { return false };
+    match o.opcode {
+        OpCode::FloatInt2Float => true,
+        OpCode::Copy | OpCode::FloatFloat2Float if depth < 4 => o.inputs.first().is_some_and(|&i| not_nan(func, i, depth + 1)),
+        _ => false,
+    }
+}
+
+fn is_const(func: &SsaFunction, v: VarId) -> bool {
+    func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST
+}
+
+/// The text of a negated float comparison `!(a OP b)` (`rhs` = `a OP b`, `swapped` = `b OP a`)
+/// (WS85): equality negates exactly (`a != b`); an order comparison negates exactly only for
+/// operands that are never NaN (`!(a < b)` = `a >= b`), else it stays negated, with a constant
+/// operand put on the right: `!(0.0f < x)` reads `!(x > 0.0f)`.
+fn negated_float_compare(func: &SsaFunction, cmp: OpCode, a: VarId, b: VarId, rhs: &str, swapped: Option<String>) -> String {
+    let ordered = not_nan(func, a, 0) && not_nan(func, b, 0);
+    let mirror = |s: &str, from: &str, to: &str| s.rsplit_once(from).map(|(l, r)| format!("{l}{to}{r}"));
+    let text = match cmp {
+        OpCode::FloatEqual => mirror(rhs, " == ", " != "),
+        OpCode::FloatNotEqual => mirror(rhs, " != ", " == "),
+        // !(a < b): `a >= b` when ordered (`b <= a` with a constant `a`)
+        OpCode::FloatLess | OpCode::FloatLessEqual => {
+            let (op, rev, ord, ord_rev) = if cmp == OpCode::FloatLess { (" < ", " > ", " >= ", " <= ") } else { (" <= ", " >= ", " > ", " < ") };
+            let constant_left = is_const(func, a) && !is_const(func, b);
+            match (ordered, constant_left) {
+                (true, false) => mirror(rhs, op, ord),
+                (true, true) => swapped.as_deref().and_then(|s| mirror(s, op, ord_rev)),
+                (false, true) => swapped.as_deref().and_then(|s| mirror(s, op, rev)).map(|t| format!("!({t})")),
+                (false, false) => None,
+            }
+        }
+        _ => None,
+    };
+    text.unwrap_or_else(|| format!("!({rhs})"))
+}
+
 /// A condition folded into one expression.
 #[derive(Debug, Clone)]
 pub struct Folded {
@@ -593,12 +641,16 @@ impl Inliner {
                         dead: false,
                     };
                     let prefix = format!("{} = ", name(out));
-                    if let Some(rhs) = emit(&fake).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)) {
+                    let rhs_of = |x: VarId, y: VarId| {
+                        let f = crate::ssa::SsaOp { inputs: smallvec::smallvec![x, y], ..fake.clone() };
+                        emit(&f).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string))
+                    };
+                    if let Some(rhs) = rhs_of(a, b) {
                         // (`!(a < b)` is not `a >= b` for a NaN)
                         let text = match (negated, int) {
                             (false, _) => Some(rhs),
                             (true, true) => crate::emit::flip_comparison(&rhs),
-                            (true, false) => Some(format!("!({rhs})")),
+                            (true, false) => Some(negated_float_compare(func, cmp, a, b, &rhs, rhs_of(b, a))),
                         };
                         if let Some(text) = text {
                             self.exprs.borrow_mut().insert(key, text);

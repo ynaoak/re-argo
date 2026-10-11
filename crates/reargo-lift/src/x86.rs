@@ -150,15 +150,18 @@ fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
 
 pub struct X86Lifter {
     is_64: bool,
+    /// Compute PF for integer instructions (WS85). On by default; [`PcodeLift::lift_range`]
+    /// lifts without it first and again with it only when some PF reader needs it.
+    parity: bool,
 }
 
 impl X86Lifter {
     pub fn new_64() -> Self {
-        Self { is_64: true }
+        Self { is_64: true, parity: true }
     }
 
     pub fn new_32() -> Self {
-        Self { is_64: false }
+        Self { is_64: false, parity: true }
     }
 
     fn ptr_size(&self) -> u32 {
@@ -562,6 +565,9 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
                 });
                 seq_base += 1;
+                if self.parity {
+                    emit_pf(tmp, &mut ops, &mut seq_base, address);
+                }
                 let cf = reg(CF_OFFSET, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::IntLess,
@@ -607,6 +613,9 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
                 });
                 seq_base += 1;
+                if self.parity {
+                    emit_pf(tmp, &mut ops, &mut seq_base, address);
+                }
                 // TEST clears CF and OF (x86 manual). Without this a `jg` / `jle` after
                 // `test` read the OF of an earlier `dec` / `sub` (WS82).
                 self.emit_clear_cf_of(&mut ops, &mut seq_base, address);
@@ -992,7 +1001,7 @@ impl X86Lifter {
             // Reuses the shared cc_condition flag formulas. Parity codes (no PF)
             // fall back to writing 0.
             Seta | Setae | Setb | Setbe | Sete | Setne | Setg | Setge | Setl | Setle
-            | Seto | Setno | Sets | Setns => {
+            | Seto | Setno | Sets | Setns | Setp | Setnp => {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let cond = self
                     .cc_condition(insn.condition_code(), &mut ops, &mut seq_base, address)
@@ -1108,6 +1117,19 @@ impl X86Lifter {
             return Ok(ops);
         }
 
+        // packed integer ops lane by lane (WS85): `xmm0 = paddb(xmm0, xmm1)` on the whole register
+        if let Some(tag) = packed_int_name(m).and_then(reargo_core::pcode::intrinsic::packed_tag) {
+            let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+            let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+            ops.push(PcodeOp {
+                opcode: OpCode::CallOther,
+                seq: seq(sb),
+                output: Some(dst),
+                inputs: SmallVec::from_slice(&[constant(tag, 8), dst, src]),
+            });
+            return Ok(ops);
+        }
+
         match m {
             // sqrt: dst (xmm) = sqrt(src)
             Sqrtsd | Sqrtss => {
@@ -1219,16 +1241,16 @@ impl X86Lifter {
             Comisd | Comiss | Ucomisd | Ucomiss => {
                 let a = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 let b = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
+                let eq = unique(0x54e, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::FloatEqual,
                     seq: seq(sb),
-                    output: Some(reg(ZF_OFFSET, 1)),
+                    output: Some(eq),
                     inputs: SmallVec::from_slice(&[a, b]),
                 });
                 sb += 1;
                 // CF = "below or unordered" = !(b <= a) (WS84: `a < b` was false for a NaN,
-                // so `ucomiss; ja` read as taken). ZF stays the plain `a == b`: it differs
-                // only for unordered inputs, which compilers test together with PF.
+                // so `ucomiss; ja` read as taken).
                 let ge = unique(0x54c, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::FloatLessEqual,
@@ -1257,6 +1279,11 @@ impl X86Lifter {
                 sb += 1;
                 ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(PF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[na, nb]) });
+                sb += 1;
+                // ZF = equal or unordered (WS85: it was the plain `a == b`, 0 for a NaN, so a
+                // `je` / `sete` alone read the opposite of the CPU for a NaN)
+                ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(ZF_OFFSET, 1)),
+                    inputs: SmallVec::from_slice(&[eq, reg(PF_OFFSET, 1)]) });
                 sb += 1;
                 // OF and SF are cleared (WS84: they kept an earlier integer op's value)
                 self.emit_clear_of_sf(&mut ops, &mut sb, address);
@@ -1406,15 +1433,14 @@ impl X86Lifter {
             // carry), so the low-lane element op is exact for lane 0 and keeps
             // the dataflow — these drive vectorized coordinate/PRNG math in
             // structure placement.
-            Paddd | Psubd | Paddq | Psubq | Paddw | Psubw => {
+            Paddd | Psubd | Paddq | Psubq => {
                 let el = match m {
                     Paddq | Psubq => 8,
-                    Paddw | Psubw => 2,
                     _ => 4,
                 };
                 let dst = self.sse_operand(insn, 0, el, &mut ops, &mut sb, address)?;
                 let src = self.sse_operand(insn, 1, el, &mut ops, &mut sb, address)?;
-                let opcode = if matches!(m, Psubd | Psubq | Psubw) {
+                let opcode = if matches!(m, Psubd | Psubq) {
                     OpCode::IntSub
                 } else {
                     OpCode::IntAdd
@@ -1564,6 +1590,9 @@ impl X86Lifter {
             inputs: SmallVec::from_slice(&[result, zero]),
         });
         *seq_base += 1;
+        if self.parity {
+            emit_pf(result, ops, seq_base, address);
+        }
     }
 
     /// AND/OR/XOR clear CF and OF unconditionally.
@@ -1733,7 +1762,9 @@ impl X86Lifter {
                 let t = bool_or(zf, x, 0x4a4, ops, seq_base);
                 self.emit_not(t, 0x4a6, ops, seq_base, address)
             }
-            _ => return None, // p / np (PF unmodelled) and None
+            C::p => reg(PF_OFFSET, 1),
+            C::np => self.emit_not(reg(PF_OFFSET, 1), 0x4a8, ops, seq_base, address),
+            _ => return None,
         })
     }
 
@@ -1960,6 +1991,27 @@ impl X86Lifter {
 }
 
 impl PcodeLift for X86Lifter {
+    /// The trait's contiguous lift without the integer PF; again with it when a PF reader
+    /// in the range reads a PF no float compare set ([`needs_integer_parity`]).
+    fn lift_range(&self, memory: &Memory, start: u64, count: usize) -> Result<Vec<LiftedInstruction>, LiftError> {
+        let lift = |lifter: &X86Lifter| {
+            let mut results = Vec::with_capacity(count);
+            let mut addr = start;
+            for _ in 0..count {
+                match lifter.lift_instruction(memory, addr) {
+                    Ok(lifted) => {
+                        addr += lifted.length as u64;
+                        results.push(lifted);
+                    }
+                    Err(_) => break,
+                }
+            }
+            results
+        };
+        let fast = lift(&X86Lifter { is_64: self.is_64, parity: false });
+        Ok(if self.parity && needs_integer_parity(&fast) { lift(self) } else { fast })
+    }
+
     /// System V AMD64 (64-bit only): rdi rsi rdx rcx r8 r9, xmm0-7; returns in rax / xmm0.
     fn call_convention(&self) -> Option<crate::lift::CallConvention> {
         if !self.is_64 {
@@ -2055,6 +2107,134 @@ impl PcodeLift for X86Lifter {
 /// `ah`/`ch`/`dh`/`bh` are never kept as views: a read is preceded by
 /// `ah = SUBPIECE(rax, 1)`, and a write rebuilds `ax = PIECE(ah, al)` and then
 /// rax from ax as a 16-bit write would (WS84).
+/// The packed integer instructions lifted as [`reargo_core::pcode::intrinsic::PACKED`].
+fn packed_int_name(m: iced_x86::Mnemonic) -> Option<&'static str> {
+    use iced_x86::Mnemonic::*;
+    Some(match m {
+        Paddb => "paddb",
+        Paddw => "paddw",
+        Psubb => "psubb",
+        Psubw => "psubw",
+        Paddusb => "paddusb",
+        Paddusw => "paddusw",
+        Psubusb => "psubusb",
+        Psubusw => "psubusw",
+        Paddsb => "paddsb",
+        Paddsw => "paddsw",
+        Psubsb => "psubsb",
+        Psubsw => "psubsw",
+        Pminub => "pminub",
+        Pmaxub => "pmaxub",
+        Pminsw => "pminsw",
+        Pmaxsw => "pmaxsw",
+        Pminsb => "pminsb",
+        Pmaxsb => "pmaxsb",
+        Pminuw => "pminuw",
+        Pmaxuw => "pmaxuw",
+        Pminsd => "pminsd",
+        Pmaxsd => "pmaxsd",
+        Pminud => "pminud",
+        Pmaxud => "pmaxud",
+        Pcmpeqw => "pcmpeqw",
+        Pcmpeqd => "pcmpeqd",
+        Pcmpeqq => "pcmpeqq",
+        Pcmpgtb => "pcmpgtb",
+        Pcmpgtw => "pcmpgtw",
+        Pcmpgtd => "pcmpgtd",
+        Pcmpgtq => "pcmpgtq",
+        Pavgb => "pavgb",
+        Pavgw => "pavgw",
+        Pmullw => "pmullw",
+        Pmulhw => "pmulhw",
+        Pmulhuw => "pmulhuw",
+        Pmulld => "pmulld",
+        Pmaddwd => "pmaddwd",
+        Psadbw => "psadbw",
+        Packsswb => "packsswb",
+        Packuswb => "packuswb",
+        Packssdw => "packssdw",
+        Packusdw => "packusdw",
+        _ => return None,
+    })
+}
+
+/// Temporaries of the parity computation.
+const PARITY_TMP: std::ops::Range<u64> = 0x2e00..0x2f00;
+
+/// PF of a result (WS85): the low byte has an even number of set bits,
+/// `(popcount((uint8_t)r) & 1) == 0`. Returns the boolean (a temporary).
+fn parity_of(result: VarnodeData, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, address: u64) -> VarnodeData {
+    let mut put = |opcode: OpCode, out: VarnodeData, inputs: &[VarnodeData], ops: &mut Vec<PcodeOp>| {
+        ops.push(PcodeOp {
+            opcode,
+            seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
+            output: Some(out),
+            inputs: SmallVec::from_slice(inputs),
+        });
+        *seq_base += 1;
+    };
+    let low = if result.size == 1 && result.space != CONST_SPACE {
+        result
+    } else if result.space == CONST_SPACE {
+        constant(result.offset & 0xff, 1)
+    } else {
+        let t = unique(PARITY_TMP.start, 1);
+        put(OpCode::Subpiece, t, &[result, constant(0, 4)], ops);
+        t
+    };
+    let n = unique(PARITY_TMP.start + 0x10, 1);
+    put(OpCode::PopCount, n, &[low], ops);
+    let odd = unique(PARITY_TMP.start + 0x20, 1);
+    put(OpCode::IntAnd, odd, &[n, constant(1, 1)], ops);
+    let even = unique(PARITY_TMP.start + 0x30, 1);
+    put(OpCode::IntEqual, even, &[odd, constant(0, 1)], ops);
+    even
+}
+
+/// `PF = parity_of(result)`, the last op writing the flag.
+fn emit_pf(result: VarnodeData, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, address: u64) {
+    parity_of(result, ops, seq_base, address);
+    if let Some(last) = ops.last_mut() {
+        last.output = Some(reg(PF_OFFSET, 1));
+    }
+}
+
+/// Does a PF reader in `lifted` (lifted without the integer PF) read a PF that an integer
+/// instruction sets (WS85)? Walking back from it along the straight line (conditional jumps
+/// fall through): a float compare's PF write satisfies it; another flag write, the start of the
+/// range or other control flow does not.
+pub fn needs_integer_parity(lifted: &[LiftedInstruction]) -> bool {
+    let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
+    let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
+    for (i, insn) in lifted.iter().enumerate() {
+        let Some(read) = insn.ops.iter().position(|o| o.inputs.iter().any(pf)) else { continue };
+        if insn.ops[..read].iter().any(|o| o.output.as_ref().is_some_and(pf)) {
+            continue;
+        }
+        let mut satisfied = false;
+        for j in (0..i).rev() {
+            let (p, next) = (&lifted[j], &lifted[j + 1]);
+            if p.address + u64::from(p.length) != next.address {
+                break;
+            }
+            if p.ops.iter().any(|o| o.output.as_ref().is_some_and(pf)) {
+                satisfied = true;
+                break;
+            }
+            let control = p.ops.iter().any(|o| {
+                matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Call | OpCode::CallInd | OpCode::Return)
+            });
+            if control || p.ops.iter().any(|o| o.output.as_ref().is_some_and(flag)) {
+                break;
+            }
+        }
+        if !satisfied {
+            return true;
+        }
+    }
+    false
+}
+
 fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
     let gpr = |v: &VarnodeData| {
         (v.space == REG_SPACE && v.offset < 0xC0 && v.offset.is_multiple_of(8) && matches!(v.size, 1 | 2 | 4 | 8))
@@ -2431,8 +2611,10 @@ mod tests {
         let lifter = X86Lifter::new_64();
         let mem = make_memory(&[0x66, 0x0f, 0x2e, 0xc1], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatEqual
-            && o.output.unwrap().offset == ZF_OFFSET));
+        // ZF = (xmm0 == xmm1) || PF: equal or unordered (WS85)
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatEqual));
+        assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::BoolOr
+            && o.output.unwrap().offset == ZF_OFFSET && o.inputs[1].offset == PF_OFFSET));
         // CF = !(xmm1 <= xmm0): below or unordered (WS84)
         assert!(lifted.ops.iter().any(|o| o.opcode == OpCode::FloatLessEqual
             && o.inputs[0].offset == XMM_BASE + 0x10 && o.inputs[1].offset == XMM_BASE));
@@ -3100,21 +3282,40 @@ mod tests {
     }
 
     #[test]
+    fn integer_parity_only_when_read() {
+        let lifter = X86Lifter::new_64();
+        // cmp eax, 0; je / jp: the range has PF only for the jp
+        for (jcc, kept) in [(0x74u8, false), (0x7a, true)] {
+            let mem = make_memory(&[0x83, 0xf8, 0x00, jcc, 0x00], 0x1000);
+            let r = lifter.lift_range(&mem, 0x1000, 2).unwrap();
+            let pf = r[0].ops.iter().any(|o| o.output.is_some_and(|v| v.space == REG_SPACE && v.offset == PF_OFFSET));
+            assert_eq!(pf, kept, "jcc {jcc:#x}");
+        }
+        // ucomiss xmm0, xmm1; jne +2; jp +0: the float compare sets the PF the jp reads
+        let mem = make_memory(&[0x0f, 0x2e, 0xc1, 0x75, 0x02, 0x7a, 0x00], 0x1000);
+        assert!(!needs_integer_parity(&X86Lifter { is_64: true, parity: false }.lift_range(&mem, 0x1000, 3).unwrap()));
+        // lift_instruction alone always has it
+        let one = lifter.lift_instruction(&make_memory(&[0x83, 0xf8, 0x00], 0x1000), 0x1000).unwrap();
+        assert!(one.ops.iter().any(|o| o.opcode == OpCode::PopCount));
+    }
+
+    #[test]
     fn lift_cmp() {
         let lifter = X86Lifter::new_64();
         // cmp eax, 0 = 83 f8 00
         let mem = make_memory(&[0x83, 0xf8, 0x00], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        // Cmp produces IntSub (to a unique), then ZF/SF/CF/OF.
+        // Cmp produces IntSub (to a unique), then ZF/SF/PF/CF/OF.
         // Without OF (added in this round), JL/JGE silently
         // flipped on signed overflow of (left - right).
-        assert_eq!(lifted.ops.len(), 5);
-        assert_eq!(lifted.ops[0].opcode, OpCode::IntSub);
-        assert_eq!(lifted.ops[1].opcode, OpCode::IntEqual);
-        assert_eq!(lifted.ops[2].opcode, OpCode::IntSLess);
-        assert_eq!(lifted.ops[3].opcode, OpCode::IntLess);
-        assert_eq!(lifted.ops[4].opcode, OpCode::IntSBorrow);
-        assert_eq!(lifted.ops[4].output.unwrap().offset, OF_OFFSET);
+        let codes: Vec<OpCode> = lifted.ops.iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            codes,
+            [OpCode::IntSub, OpCode::IntEqual, OpCode::IntSLess, OpCode::Subpiece, OpCode::PopCount,
+             OpCode::IntAnd, OpCode::IntEqual, OpCode::IntLess, OpCode::IntSBorrow]
+        );
+        assert_eq!(lifted.ops[6].output.unwrap().offset, PF_OFFSET);
+        assert_eq!(lifted.ops[8].output.unwrap().offset, OF_OFFSET);
     }
 
     #[test]
