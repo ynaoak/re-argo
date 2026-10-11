@@ -2591,6 +2591,25 @@ mod tests {
         assert!(!c.contains("tmp_600") || c.contains("tmp_600 = rsi + 0x18;"), "{c}");
     }
 
+    /// WS86: … also in a loop, where the liveness walk through phis follows the store's input
+    /// to its definition (`0x417e0a0`).
+    #[test]
+    fn address_shared_by_a_dead_load_and_a_store_in_a_loop_is_kept() {
+        let code = [
+            0x48, 0x39, 0xfe, // 0x1000 cmp rsi, rdi
+            0x0f, 0x94, 0x46, 0x18, // 0x1003 sete [rsi+0x18]
+            0x75, 0x01, // 0x1007 jne 0x100a
+            0xc3, // 0x1009 ret
+            0x48, 0x8b, 0x36, // 0x100a L: mov rsi, [rsi]
+            0x48, 0x85, 0xf6, // 0x100d test rsi, rsi
+            0x75, 0xf8, // 0x1010 jne L
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("rsi + 0x18"), "{c}");
+        assert!(!c.contains("tmp_600") || c.contains("tmp_600 = rsi + 0x18;"), "{c}");
+    }
+
     #[test]
     fn rotates_print_as_rotl_rotr() {
         let lifter = X86Lifter::new_64();

@@ -674,9 +674,11 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
             if let Some(&d) = defined.get(&key)
                 && d as usize != i
-                && !vn.uses.is_empty()
             {
-                let extra = vn.uses.clone();
+                // (and the definition is the kept op: the liveness walk through phis follows
+                // `def_op` from the readers' inputs)
+                func.varnodes[i].def_op = func.varnodes[d as usize].def_op;
+                let extra = func.varnodes[i].uses.clone();
                 let uses = &mut func.varnodes[d as usize].uses;
                 for u in extra {
                     if !uses.contains(&u) {
