@@ -18,11 +18,13 @@ struct Emit<'a> {
     seq: &'a mut u32,
     at: Address,
     next: u64,
+    /// compute PF (`X86Lifter::parity`)
+    parity: bool,
 }
 
 impl<'a> Emit<'a> {
-    fn new(ops: &'a mut Vec<PcodeOp>, seq: &'a mut u32, address: u64) -> Self {
-        Emit { ops, seq, at: Address::new(RAM_SPACE, address), next: TMP_BASE }
+    fn new(ops: &'a mut Vec<PcodeOp>, seq: &'a mut u32, address: u64, parity: bool) -> Self {
+        Emit { ops, seq, at: Address::new(RAM_SPACE, address), next: TMP_BASE, parity }
     }
 
     fn put(&mut self, opcode: OpCode, output: Option<VarnodeData>, inputs: &[VarnodeData]) {
@@ -80,9 +82,16 @@ impl<'a> Emit<'a> {
         (z, s)
     }
 
-    /// PF of a result (the low byte has even parity).
-    fn pf(&mut self, r: VarnodeData) -> VarnodeData {
-        parity_of(r, self.ops, self.seq, self.at.offset)
+    /// PF of a result (the low byte has even parity), when the lift computes it.
+    fn pf(&mut self, r: VarnodeData) -> Option<VarnodeData> {
+        self.parity.then(|| parity_of(r, self.ops, self.seq, self.at.offset))
+    }
+
+    /// `flag(PF, …)` when the lift computes PF.
+    fn pf_flag(&mut self, pf: Option<VarnodeData>, changed: Option<VarnodeData>) {
+        if let Some(pf) = pf {
+            self.flag(PF_OFFSET, pf, changed);
+        }
     }
 
     /// Write `flag = value`, or `flag = changed ? value : flag` when `changed` is given.
@@ -209,7 +218,7 @@ impl X86Lifter {
                 // CF = 0 / 1 / !CF (they fell to __unmodeled_insn and left CF stale)
                 let mut ops = Vec::new();
                 let mut sb = 0u32;
-                let mut e = Emit::new(&mut ops, &mut sb, address);
+                let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
                 let cf = reg(CF_OFFSET, 1);
                 match insn.mnemonic() {
                     Clc => e.set(OpCode::Copy, cf, &[constant(0, 1)]),
@@ -239,7 +248,7 @@ impl X86Lifter {
         let (sz, w) = (dst.size, dst.size as u64 * 8);
         let mnem = insn.mnemonic();
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let n = mask_count(&mut e, cnt, sz);
             if let Count::Const(0) = n {
                 return Ok(ops); // a zero count changes nothing (not even the flags)
@@ -283,7 +292,7 @@ impl X86Lifter {
             e.flag(CF_OFFSET, cf, ch);
             e.flag(ZF_OFFSET, zf, ch);
             e.flag(SF_OFFSET, sf, ch);
-            e.flag(PF_OFFSET, pf, ch);
+            e.pf_flag(pf, ch);
             match n {
                 Count::Const(1) | Count::Var(_) => e.flag(OF_OFFSET, of.unwrap(), ch),
                 Count::Const(_) => {} // undefined: left as it was
@@ -302,7 +311,7 @@ impl X86Lifter {
         let (sz, w) = (dst.size, dst.size as u64 * 8);
         let is_ror = insn.mnemonic() == iced_x86::Mnemonic::Ror;
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let n = mask_count(&mut e, cnt, sz);
             if let Count::Const(0) = n {
                 return Ok(ops);
@@ -358,7 +367,7 @@ impl X86Lifter {
         let (sz, w) = (dst.size, dst.size as u64 * 8);
         let left = insn.mnemonic() == iced_x86::Mnemonic::Rcl;
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let n = mask_count(&mut e, cnt, sz);
             // the rotation count: mod w + 1 for the narrow operands
             let c = match &n {
@@ -431,7 +440,7 @@ impl X86Lifter {
         let (sz, w) = (dst.size, dst.size as u64 * 8);
         let left = insn.mnemonic() == iced_x86::Mnemonic::Shld;
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let n = mask_count(&mut e, cnt, sz);
             if let Count::Const(0) = n {
                 return Ok(ops);
@@ -461,7 +470,7 @@ impl X86Lifter {
             e.flag(CF_OFFSET, cf, ch);
             e.flag(ZF_OFFSET, zf, ch);
             e.flag(SF_OFFSET, sf, ch);
-            e.flag(PF_OFFSET, pf, ch);
+            e.pf_flag(pf, ch);
             match n {
                 Count::Const(1) | Count::Var(_) => e.flag(OF_OFFSET, of, ch),
                 Count::Const(_) => {}
@@ -486,7 +495,7 @@ impl X86Lifter {
             (OpCode::IntAdd, OpCode::IntCarry, OpCode::IntSCarry)
         };
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let cf_in = e.tmp(OpCode::IntZExt, sz, &[reg(CF_OFFSET, 1)]);
             let c1 = e.tmp(carry, 1, &[dst, src]);
             let o1 = e.tmp(overflow, 1, &[dst, src]);
@@ -500,7 +509,7 @@ impl X86Lifter {
             let pf = e.pf(dst);
             e.flag(ZF_OFFSET, zf, None);
             e.flag(SF_OFFSET, sf, None);
-            e.flag(PF_OFFSET, pf, None);
+            e.pf_flag(pf, None);
         }
         self.write_back_if_memory(insn, 0, dst, &mut ops, &mut sb, address)?;
         Ok(ops)
@@ -521,7 +530,7 @@ impl X86Lifter {
         let sz = val.size;
         let mnem = insn.mnemonic();
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let b = e.resize(bit, sz);
             let k = if b.space == CONST_SPACE {
                 constant(b.offset & (sz as u64 * 8 - 1), sz)
@@ -559,7 +568,7 @@ impl X86Lifter {
         let ps = base.size;
         let (w, log_w) = (sz as u64 * 8, (sz as u64 * 8).trailing_zeros() as u64);
         let mnem = insn.mnemonic();
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         // the word: base + (offset >> log2(w)) * (w / 8), the offset signed
         let wide = if sz == ps { off } else { e.tmp(OpCode::IntSExt, ps, &[off]) };
         let words = e.tmp(OpCode::IntSRight, ps, &[wide, constant(log_w, ps)]);
@@ -604,7 +613,7 @@ impl X86Lifter {
                 (dst, self.lift_operand(insn, 1, &mut ops, &mut sb, address)?)
             };
             let sz = dst.size;
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let b = e.resize(b, sz);
             let wa = e.tmp(OpCode::IntSExt, sz * 2, &[a]);
             let wb = e.tmp(OpCode::IntSExt, sz * 2, &[b]);
@@ -620,7 +629,7 @@ impl X86Lifter {
         // one operand: {D:A} = A * src, the full product (the RNG multiply)
         let src = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
         let s = src.size;
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         if s == 1 {
             // AX = AL * src
             let al = reg(0, 1);
@@ -675,7 +684,7 @@ impl X86Lifter {
         let acc = reg(0, sz);
         let newdst;
         {
-            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
             let d = e.tmp(OpCode::IntSub, sz, &[acc, old]);
             e.set(OpCode::IntLess, reg(CF_OFFSET, 1), &[acc, old]);
             e.set(OpCode::IntSBorrow, reg(OF_OFFSET, 1), &[acc, old]);
@@ -683,7 +692,7 @@ impl X86Lifter {
             let pf = e.pf(d);
             e.flag(ZF_OFFSET, zf, None);
             e.flag(SF_OFFSET, sf, None);
-            e.flag(PF_OFFSET, pf, None);
+            e.pf_flag(pf, None);
             let zf = reg(ZF_OFFSET, 1);
             newdst = e.tmp(OpCode::Select, sz, &[zf, src, old]);
             // the accumulator is written only when not equal (`eax` then zero-extends into
@@ -720,7 +729,7 @@ impl X86Lifter {
         let mut sb = 0u32;
         let dst = self.lift_operand_no_load(insn, 0, &mut ops, &mut sb, address)?;
         let src = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         let zero = e.tmp(OpCode::IntEqual, 1, &[src, constant(0, src.size)]);
         match insn.mnemonic() {
             m @ (Bsf | Bsr | Tzcnt) => {
@@ -747,7 +756,8 @@ impl X86Lifter {
             _ => {
                 e.set(OpCode::PopCount, dst, &[src]);
                 e.flag(ZF_OFFSET, zero, None);
-                for f in [CF_OFFSET, OF_OFFSET, SF_OFFSET, PF_OFFSET] {
+                let cleared: &[u64] = if self.parity { &[CF_OFFSET, OF_OFFSET, SF_OFFSET, PF_OFFSET] } else { &[CF_OFFSET, OF_OFFSET, SF_OFFSET] };
+                for &f in cleared {
                     e.flag(f, constant(0, 1), None);
                 }
             }
@@ -760,7 +770,7 @@ impl X86Lifter {
         let mut ops = Vec::new();
         let mut sb = 0u32;
         let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         e.set(OpCode::CallOther, dst, &[constant(reargo_core::pcode::intrinsic::BSWAP, 8), dst]);
         Ok(ops)
     }
@@ -777,7 +787,7 @@ impl X86Lifter {
         let Some(c) = self.cc_condition(cc, &mut ops, &mut sb, address) else {
             return Ok(ops);
         };
-        let mut e = Emit::new(&mut ops, &mut sb, address);
+        let mut e = Emit::new(&mut ops, &mut sb, address, self.parity);
         let (t, f) = if negated { (dst, src) } else { (src, dst) };
         e.set(OpCode::Select, dst, &[c, t, f]);
         Ok(ops)
