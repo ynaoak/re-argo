@@ -73,6 +73,14 @@ impl Emulator {
 
             OpCode::IntMult => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_MULT".into()))?;
+                // a 128-bit product (WS86: the 64-bit `mul` / `imul` widen to 16 bytes)
+                if out.size > 8 {
+                    let (a, b) = (op.input(0), op.input(1));
+                    let (Some(a), Some(b)) = (a, b) else { return Err(EmulatorError::MissingInput { op: "INT_MULT".into(), index: 1 }) };
+                    let v = self.state.read_wide(a).wrapping_mul(self.state.read_wide(b));
+                    self.state.write_wide(out, v);
+                    return Ok(());
+                }
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
                 self.state.write_varnode(out, a.wrapping_mul(b));
@@ -199,7 +207,8 @@ impl Emulator {
             OpCode::IntZExt => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_ZEXT".into()))?;
                 let a = self.read_input(op, 0)?;
-                self.state.write_varnode(out, a);
+                // (to 16 bytes: the upper half is zero)
+                self.state.write_wide(out, u128::from(a));
             }
 
             OpCode::IntSExt => {
@@ -212,7 +221,8 @@ impl Emulator {
                     4 => a as u32 as i32 as i64 as u64,
                     _ => a,
                 };
-                self.state.write_varnode(out, sign_extended);
+                // (to 16 bytes: the upper half is the sign)
+                self.state.write_wide(out, sign_extended as i64 as i128 as u128);
             }
 
             OpCode::Load => {
@@ -312,11 +322,12 @@ impl Emulator {
 
             OpCode::Subpiece => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SUBPIECE".into()))?;
-                let a = self.read_input(op, 0)?;
+                let in_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "SUBPIECE".into(), index: 0 })?;
+                let a = self.state.read_wide(in_vn);
                 let truncate = self.read_input(op, 1)?;
                 let shift = truncate.saturating_mul(8);
-                let result = if shift >= 64 { 0 } else { a >> shift };
-                self.state.write_varnode(out, result);
+                let result = if shift >= 128 { 0 } else { a >> shift };
+                self.state.write_wide(out, result);
             }
 
             OpCode::PopCount => {

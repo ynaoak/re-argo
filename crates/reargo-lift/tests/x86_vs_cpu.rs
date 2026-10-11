@@ -400,10 +400,6 @@ fn d_arith_all_regs(_: u64, _: u64, _: u64) -> (u64, u8) {
 fn d_mul(_: u64, _: u64, _: u64) -> (u64, u8) {
     (CF | OF, RAX | RDX)
 }
-/// A 64-bit `imul`: its CF/OF come from a 128-bit product, beyond the u64 emulator.
-fn d_mul64(_: u64, _: u64, _: u64) -> (u64, u8) {
-    (0, RAX | RDX)
-}
 
 const SHL: u8 = 0;
 const SHR: u8 = 1;
@@ -588,14 +584,13 @@ fn carry_chains_match_the_cpu() {
 
 #[test]
 fn multiplies_match_the_cpu() {
-    // (one-operand 64-bit `mul`/`imul` need a 128-bit product, beyond the u64 emulator)
     let cases = vec![
         case!("imul ax, cx", d_mul, Inputs::Values),
         case!("imul eax, ecx", d_mul, Inputs::Values),
-        case!("imul rax, rcx", d_mul64, Inputs::Values),
+        case!("imul rax, rcx", d_mul, Inputs::Values),
         case!("imul eax, ecx, 0x6c078965", d_mul, Inputs::Values),
         case!("imul eax, ecx, -3", d_mul, Inputs::Values),
-        case!("imul rax, rcx, 0x7fffffff", d_mul64, Inputs::Values),
+        case!("imul rax, rcx, 0x7fffffff", d_mul, Inputs::Values),
         case!("imul ax, cx, 300", d_mul, Inputs::Values),
         case!("mul cl", d_mul, Inputs::Values),
         case!("mul cx", d_mul, Inputs::Values),
@@ -603,6 +598,9 @@ fn multiplies_match_the_cpu() {
         case!("imul cl", d_mul, Inputs::Values),
         case!("imul cx", d_mul, Inputs::Values),
         case!("imul ecx", d_mul, Inputs::Values),
+        // WS86: the 128-bit product of the 64-bit forms (rdx:rax, CF = OF = the high half used)
+        case!("mul rcx", d_mul, Inputs::Values),
+        case!("imul rcx", d_mul, Inputs::Values),
     ];
     check(&cases);
 }
