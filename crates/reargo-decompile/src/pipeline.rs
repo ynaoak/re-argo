@@ -2610,6 +2610,63 @@ mod tests {
         assert!(!c.contains("tmp_600") || c.contains("tmp_600 = rsi + 0x18;"), "{c}");
     }
 
+    /// WS86: an address / loaded value computed into a temporary prints inside its reader.
+    #[test]
+    fn address_temporaries_print_inside_the_access() {
+        let code = [
+            0x48, 0x89, 0xb4, 0x24, 0xa0, 0x00, 0x00, 0x00, // mov [rsp+0xa0], rsi
+            0x8b, 0x83, 0x00, 0x02, 0x00, 0x00, // mov eax, [rbx+0x200]
+            0x03, 0x83, 0x50, 0x03, 0x00, 0x00, // add eax, [rbx+0x350]
+            0x89, 0x47, 0x08, // mov [rdi+8], eax
+            0x83, 0x46, 0x10, 0x01, // add dword [rsi+0x10], 1
+            0xc3,
+        ];
+        let c = c_of(&code);
+        for s in [
+            "*(uint64_t*)(rsp + 0xa0) = rsi;",
+            "eax = *(uint32_t*)(rbx + 0x200);",
+            "+ *(uint32_t*)(rbx + 0x350)",
+            "*(uint32_t*)(rdi + 8) = eax;",
+            "*(uint32_t*)(rsi + 0x10) = *(uint32_t*)(rsi + 0x10) + 1;",
+        ] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+        assert!(!c.contains("tmp_"), "{c}");
+    }
+
+    /// WS86: an inlined temporary reading a register the condition folds (`r9 = zext(r9d)` read
+    /// only by the compare) prints that register's folded expression, not its bare name.
+    #[test]
+    fn inlined_temporary_in_a_condition_reads_the_folded_register() {
+        let code = [
+            0x44, 0x0f, 0xb7, 0x48, 0xfe, // movzx r9d, word [rax-2]
+            0x4e, 0x8d, 0x14, 0x8b, // lea r10, [rbx+r9*4]
+            0x49, 0x39, 0xf2, // cmp r10, rsi
+            0x75, 0x01, // jne +1
+            0xc3, // ret
+            0x44, 0x89, 0xc8, // mov eax, r9d
+            0xc3,
+        ];
+        let c = c_of(&code);
+        let defines = |r: &str| c.lines().any(|l| l.trim().starts_with(&format!("{r} = ")));
+        assert!(!c.contains("(r9 << 2)") || defines("r9"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+    }
+
+    /// WS86: a temporary whose register changes before its reader keeps its line.
+    #[test]
+    fn address_temporary_with_a_changed_register_is_kept() {
+        let code = [
+            0x48, 0x8d, 0x47, 0x08, // lea rax, [rdi+8]
+            0x48, 0x89, 0xc1, // mov rcx, rax
+            0x48, 0x83, 0xc7, 0x10, // add rdi, 0x10
+            0x48, 0x89, 0x39, // mov [rcx], rdi
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("*(uint64_t*)rcx = rdi;"), "{c}");
+    }
+
     #[test]
     fn rotates_print_as_rotl_rotr() {
         let lifter = X86Lifter::new_64();

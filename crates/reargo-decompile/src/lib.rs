@@ -12,6 +12,7 @@ pub mod emit;
 pub mod exception;
 pub mod flags;
 pub mod fparity;
+pub mod inline;
 pub mod rust_emit;
 pub mod noreturn;
 pub mod optimize;

@@ -73,6 +73,10 @@ pub struct CEmitter<'a> {
     /// a select's folded condition, by the select op (WS84: by op, not by value — two selects
     /// on one flag can see its operands in different states)
     select_conds: rustc_hash::FxHashMap<usize, String>,
+    /// Temporaries printed inside their readers' expressions (WS86, `inline::candidates`): the
+    /// defining op by value, rendered where it is read (so a condition folding the values it
+    /// reads folds them there too). Their definitions are in `folded`.
+    inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
 }
 
 impl Default for CEmitter<'static> {
@@ -93,6 +97,7 @@ impl CEmitter<'static> {
             conds: None,
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
+            inlined: Default::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
@@ -129,6 +134,7 @@ impl<'a> CEmitter<'a> {
             conds: None,
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
+            inlined: Default::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
@@ -175,6 +181,8 @@ impl<'a> CEmitter<'a> {
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
+        // WS86: first, as the conditions and selects fold the expressions printed inline
+        let inlined = self.inline_temporaries(func);
         self.folded = (0..func.cfg.blocks.len())
             .filter_map(|b| self.own_condition(func, b))
             .flat_map(|(ops, _)| ops)
@@ -182,6 +190,7 @@ impl<'a> CEmitter<'a> {
         self.select_conds.clear();
         let (conds, hidden) = select_conditions(func, &self.inliner, &|op| self.emit_op(func, op));
         self.folded.extend(hidden);
+        self.folded.extend(inlined);
         self.select_conds = conds;
         let sig = infer_signature(func);
         self.line(&sig.to_c_declaration(&func.name));
@@ -1021,9 +1030,44 @@ impl<'a> CEmitter<'a> {
         None
     }
 
+    /// Fill `inlined` (see [`crate::inline`]); returns the definitions not to print.
+    fn inline_temporaries(&self, func: &SsaFunction) -> Vec<usize> {
+        self.inlined.borrow_mut().clear();
+        let prints = |u: usize| !self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some();
+        let mut hidden = Vec::new();
+        for (d, readers) in crate::inline::candidates(func, &|d| self.noise.contains(&d)) {
+            let op = &func.ops[d];
+            let v = op.output.expect("candidate has an output");
+            if !readers.iter().all(|&u| prints(u)) {
+                continue;
+            }
+            let Some(text) = self.inline_text(func, d) else { continue };
+            if text.len() > MAX_INLINE_LEN || text.contains("//") {
+                continue;
+            }
+            self.inlined.borrow_mut().insert(crate::condition::value_key(func, v), d);
+            hidden.push(d);
+        }
+        hidden
+    }
+
+    /// The right-hand side of inlined op `d` as it prints now.
+    fn inline_text(&self, func: &SsaFunction, d: usize) -> Option<String> {
+        let op = &func.ops[d];
+        let line = self.emit_op(func, op)?;
+        let prefix = format!("{} = ", varnode_name(&func.varnodes[op.output? as usize]));
+        line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)
+    }
+
     fn input_expr(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, idx: usize) -> String {
         if idx >= op.inputs.len() {
             return "???".into();
+        }
+        let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
+        if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
+            // a whole right-hand side needs no parentheses
+            let whole = (op.opcode == OpCode::Store && idx == 2) || op.opcode == OpCode::Copy;
+            return if whole || crate::condition::is_atomic(&rhs) || is_deref(&rhs) { rhs } else { format!("({rhs})") };
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
@@ -1807,6 +1851,17 @@ pub(crate) fn select_conditions(
         }
     }
     (texts, hidden.into_iter().collect())
+}
+
+/// Longest expression printed inside its reader (WS86).
+const MAX_INLINE_LEN: usize = 100;
+
+/// `*(T*)x` with `x` atomic: a unary expression, no parentheses needed around it.
+fn is_deref(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("*(") else { return false };
+    let Some(close) = rest.find(")") else { return false };
+    let ty = &rest[..close];
+    ty.ends_with('*') && ty[..ty.len() - 1].chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && crate::condition::is_atomic(&rest[close + 1..])
 }
 
 /// A `case` value: decimal, hex from 0x100 on.
