@@ -280,8 +280,29 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     }
     let addrs: rustc_hash::FxHashSet<u64> = insns.iter().map(|i| i.address).collect();
     let (bases, loose, loaded) = constant_registers(insns);
-    for k in 0..insns.len() {
-        let Some(found) = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory) else { continue };
+    // first without value ranges; then (WS86), for a dispatch with no bounds check right before
+    // it (none found, or the table read as far as its entries go), the index's range on every
+    // path — with the cases of the tables found as edges
+    let no_range = |_: usize, _: &VarnodeData| None;
+    let mut found: Vec<(usize, Option<Recovered>)> = (0..insns.len())
+        .filter(|&k| has(&insns[k], OpCode::BranchInd))
+        .map(|k| (k, recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &no_range)))
+        .collect();
+    if found.iter().any(|(_, f)| f.as_ref().is_none_or(|f| f.2.default.is_none())) {
+        let cases: FxHashMap<u64, Vec<u64>> =
+            found.iter().filter_map(|(k, f)| Some((insns[*k].address, f.as_ref()?.2.targets.clone()))).collect();
+        if let Some(ranges) = crate::ranges::Ranges::new(insns, &cases) {
+            for (k, f) in found.iter_mut() {
+                if f.as_ref().is_none_or(|f| f.2.default.is_none()) {
+                    let k = *k;
+                    let range = |at: usize, r: &VarnodeData| ranges.at_dispatch(insns, at, k, r);
+                    *f = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &range);
+                }
+            }
+        }
+    }
+    for (k, found) in found {
+        let Some(found) = found else { continue };
         let (index, start, table) = found;
         // the index as the window starts, when the window reuses its register (WS84: `movsxd
         // rax, [rcx+rax*4]`; the BRANCHIND reads at the window's end)
@@ -316,6 +337,9 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     out
 }
 
+/// A dispatch recovered: its index register, the window's first instruction, the table.
+type Recovered = (VarnodeData, usize, JumpTable);
+
 /// The number of cases a bounds check `cmp r, N` lets through.
 type CaseCount = fn(u64) -> Option<u64>;
 
@@ -347,7 +371,9 @@ fn recover_one(
     (bases, loose): (&FxHashMap<u64, u64>, &FxHashMap<u64, u64>),
     loaded: &rustc_hash::FxHashSet<u64>,
     memory: &Memory,
-) -> Option<(VarnodeData, usize, JumpTable)> {
+    // the index's interval on every path to the dispatch, given the window's start (WS86)
+    range: &dyn Fn(usize, &VarnodeData) -> Option<crate::ranges::Interval>,
+) -> Option<Recovered> {
     let jmp = &insns[k];
     let target_vn = *jmp.ops.iter().find(|o| o.opcode == OpCode::BranchInd)?.inputs.first()?;
     // the straight-line run before the `jmp`: from the bounds check's fall-through, or from
@@ -417,7 +443,29 @@ fn recover_one(
             memory.read_u64(table + 8 * slot).ok()?
         })
     };
+    // WS86: the index's range on every path to the window (a bounds check blocks before it)
+    let by_range = || -> Option<Recovered> {
+        if level1.is_some() {
+            return None;
+        }
+        let (lo, hi) = range(start, &r)?;
+        if !(1..MAX_ENTRIES).contains(&hi) || lo > hi {
+            return None;
+        }
+        let mut targets = Vec::with_capacity(hi as usize + 1);
+        for i in 0..=hi {
+            let t = read(i)?;
+            if !addrs.contains(&t) {
+                return None;
+            }
+            targets.push(t);
+        }
+        Some((r, start, JumpTable { jmp: jmp.address, targets, default: None }))
+    };
     let Some(j) = falls.or_else(jumps) else {
+        if let Some(found) = by_range() {
+            return Some(found);
+        }
         // no bounds check: a switch over an enum the compiler knows the range of (`default:
         // __builtin_unreachable()`). The table runs while its entries are instructions of the
         // function, up to the next table the function loads (WS84).
@@ -458,15 +506,17 @@ fn recover_one(
                     .then(|| (c, o.inputs[0], o.inputs[1]))
             })
         });
-        let (c, x, n) = cmp?;
+        // (another register compared, or the index changed after the compare: its range on the
+        // paths to the window decides, WS86)
+        let Some((c, x, n)) = cmp else { return by_range() };
         if n.space != SpaceId::CONST || x.space != r.space || x.offset != r.offset {
-            return None;
+            return by_range();
         }
         // the compared register keeps its value up to the window, whose evaluation reads it
         // (the window itself may reuse it: `movsxd rsi, [rdi+rsi*4]`)
         let written = insns[c + 1..=j].iter().flat_map(|i| i.ops.iter()).any(|o| o.output.is_some_and(|w| overlaps(&r, &w)));
         if written {
-            return None;
+            return by_range();
         }
         count(n.offset)?
     };

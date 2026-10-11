@@ -1130,6 +1130,66 @@ impl X86Lifter {
             return Ok(ops);
         }
 
+        // shuffles with an immediate and the word insert / extract, lane-exact (WS86):
+        // `xmm0 = pshufd(xmm1, 0x4e)`, `xmm0 = shufps(xmm0, xmm1, 0x44)`, `eax = pextrw(xmm0, 3)`
+        let imm_form = match m {
+            Pshufd => Some(("pshufd", false)),
+            Pshuflw => Some(("pshuflw", false)),
+            Pshufhw => Some(("pshufhw", false)),
+            Shufps => Some(("shufps", true)),
+            Shufpd => Some(("shufpd", true)),
+            Pinsrw => Some(("pinsrw", true)),
+            Pextrw if insn.op_kind(0) == iced_x86::OpKind::Register => Some(("pextrw", false)),
+            _ => None,
+        };
+        // shifts of every lane (WS86): `xmm0 = psrld(xmm0, 3)` / `psrld(xmm0, xmm1)` (count: the
+        // second register's low quadword)
+        let shift = match m {
+            Psllw => Some("psllw"),
+            Pslld => Some("pslld"),
+            Psllq => Some("psllq"),
+            Psrlw => Some("psrlw"),
+            Psrld => Some("psrld"),
+            Psrlq => Some("psrlq"),
+            Psraw => Some("psraw"),
+            Psrad => Some("psrad"),
+            Pslldq => Some("pslldq"),
+            Psrldq => Some("psrldq"),
+            _ => None,
+        };
+        if let Some(tag) = shift.and_then(reargo_core::pcode::intrinsic::packed_tag) {
+            let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+            let cnt = if insn.op_kind(1) == iced_x86::OpKind::Immediate8 {
+                constant(u64::from(insn.immediate8()), 1)
+            } else {
+                self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?
+            };
+            ops.push(PcodeOp {
+                opcode: OpCode::CallOther,
+                seq: seq(sb),
+                output: Some(dst),
+                inputs: SmallVec::from_slice(&[constant(tag, 8), dst, cnt]),
+            });
+            return Ok(ops);
+        }
+
+        if let Some((name, reads_dst)) = imm_form
+            && let Some(tag) = reargo_core::pcode::intrinsic::packed_tag(name)
+        {
+            let imm = constant(u64::from(insn.immediate8()), 1);
+            // (`pinsrw xmm, r32/m16`: a register is read as is, memory as its 2 bytes)
+            let src_size = if m == Pinsrw { 2 } else { 16 };
+            let src = self.sse_operand(insn, 1, src_size, &mut ops, &mut sb, address)?;
+            let dst = self.sse_operand(insn, 0, if m == Pextrw { 4 } else { 16 }, &mut ops, &mut sb, address)?;
+            let inputs: SmallVec<[VarnodeData; 3]> = if reads_dst {
+                SmallVec::from_slice(&[constant(tag, 8), dst, src, imm])
+            } else {
+                SmallVec::from_slice(&[constant(tag, 8), src, imm])
+            };
+            ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: Some(dst), inputs });
+            return Ok(ops);
+        }
+
         match m {
             // sqrt: dst (xmm) = sqrt(src)
             Sqrtsd | Sqrtss => {
@@ -1330,10 +1390,7 @@ impl X86Lifter {
             // can't express the permute in scalar p-code, so we model the
             // result as a Copy of the source — lossy, but it keeps the
             // dataflow edge alive instead of emitting an opaque trap.
-            Shufps | Shufpd | Unpcklps | Unpckhps | Unpcklpd | Unpckhpd | Movhlps
-            | Movlhps | Pshufd | Pshuflw | Pshufhw | Pshufb | Punpckldq | Punpckhdq
-            | Punpcklqdq | Punpckhqdq | Punpcklbw | Punpcklwd | Movlps | Movlpd
-            | Movhps | Movhpd => {
+            Movlps | Movlpd | Movhps | Movhpd => {
                 let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
                 let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 ops.push(PcodeOp {
@@ -1426,62 +1483,6 @@ impl X86Lifter {
                     ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: None,
                         inputs: SmallVec::from_slice(&[constant(0, 4)]) });
                 }
-            }
-
-            // Packed integer add/sub on the low lane (paddd/psubd/paddq/psubq/
-            // paddw/psubw). Integer SIMD lanes are independent (no cross-lane
-            // carry), so the low-lane element op is exact for lane 0 and keeps
-            // the dataflow — these drive vectorized coordinate/PRNG math in
-            // structure placement.
-            Paddd | Psubd | Paddq | Psubq => {
-                let el = match m {
-                    Paddq | Psubq => 8,
-                    _ => 4,
-                };
-                let dst = self.sse_operand(insn, 0, el, &mut ops, &mut sb, address)?;
-                let src = self.sse_operand(insn, 1, el, &mut ops, &mut sb, address)?;
-                let opcode = if matches!(m, Psubd | Psubq) {
-                    OpCode::IntSub
-                } else {
-                    OpCode::IntAdd
-                };
-                ops.push(PcodeOp { opcode, seq: seq(sb), output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, src]) });
-            }
-            // PMULUDQ: low 32 bits of each 64-bit lane, unsigned, → 64-bit
-            // product. This is the multiply in vectorized LCG PRNGs. Low-lane:
-            // result(64) = zext(dst[31:0]) * zext(src[31:0]).
-            Pmuludq => {
-                let dlo = self.sse_operand(insn, 0, 4, &mut ops, &mut sb, address)?;
-                let slo = self.sse_operand(insn, 1, 4, &mut ops, &mut sb, address)?;
-                let dz = unique(0x960, 8);
-                ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(sb), output: Some(dz),
-                    inputs: SmallVec::from_slice(&[dlo]) });
-                sb += 1;
-                let sz2 = unique(0x968, 8);
-                ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(sb), output: Some(sz2),
-                    inputs: SmallVec::from_slice(&[slo]) });
-                sb += 1;
-                let dst64 = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp { opcode: OpCode::IntMult, seq: seq(sb), output: Some(dst64),
-                    inputs: SmallVec::from_slice(&[dz, sz2]) });
-            }
-            // Packed dword shifts on the low lane (psrad=arith, psrld=logical,
-            // pslld=left). Count is imm8 or the low 64 bits of an xmm.
-            Psrad | Psrld | Pslld => {
-                let dst = self.sse_operand(insn, 0, 4, &mut ops, &mut sb, address)?;
-                let cnt = if insn.op_kind(1) == iced_x86::OpKind::Immediate8 {
-                    constant(insn.immediate8() as u64, 4)
-                } else {
-                    self.sse_operand(insn, 1, 4, &mut ops, &mut sb, address)?
-                };
-                let opcode = match m {
-                    Psrad => OpCode::IntSRight,
-                    Psrld => OpCode::IntRight,
-                    _ => OpCode::IntLeft,
-                };
-                ops.push(PcodeOp { opcode, seq: seq(sb), output: Some(dst),
-                    inputs: SmallVec::from_slice(&[dst, cnt]) });
             }
 
             // Lane-precise byte SIMD (the SSE memchr/strlen idiom). A scalar
@@ -2154,6 +2155,27 @@ fn packed_int_name(m: iced_x86::Mnemonic) -> Option<&'static str> {
         Packuswb => "packuswb",
         Packssdw => "packssdw",
         Packusdw => "packusdw",
+        // WS86: every lane (were the low lane's `+` / `-`) and the unpacks (were a copy)
+        Paddd => "paddd",
+        Psubd => "psubd",
+        Paddq => "paddq",
+        Psubq => "psubq",
+        Punpcklbw => "punpcklbw",
+        Punpcklwd => "punpcklwd",
+        Punpckldq => "punpckldq",
+        Punpcklqdq => "punpcklqdq",
+        Punpckhbw => "punpckhbw",
+        Punpckhwd => "punpckhwd",
+        Punpckhdq => "punpckhdq",
+        Punpckhqdq => "punpckhqdq",
+        Unpcklps => "unpcklps",
+        Unpckhps => "unpckhps",
+        Unpcklpd => "unpcklpd",
+        Unpckhpd => "unpckhpd",
+        Pshufb => "pshufb",
+        Movhlps => "movhlps",
+        Movlhps => "movlhps",
+        Pmuludq => "pmuludq",
         _ => return None,
     })
 }
@@ -2811,12 +2833,13 @@ mod tests {
     }
 
     #[test]
-    fn lift_pshuflw_is_copy_not_trap() {
-        // pshuflw xmm0, xmm1, 0x1b = f2 0f 70 c1 1b
+    fn lift_pshuflw_is_a_named_shuffle() {
+        // pshuflw xmm0, xmm1, 0x1b = f2 0f 70 c1 1b -> xmm0 = pshuflw(xmm1, 0x1b) (WS86: was a copy)
         let lifter = X86Lifter::new_64();
         let l = lifter.lift_instruction(&make_memory(&[0xf2, 0x0f, 0x70, 0xc1, 0x1b], 0x1000), 0x1000).unwrap();
-        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
-        assert!(l.ops.iter().any(|o| o.opcode == OpCode::Copy));
+        let op = l.ops.iter().find(|o| o.opcode == OpCode::CallOther).expect("intrinsic");
+        assert_eq!(reargo_core::pcode::intrinsic::name(op.inputs[0].offset), Some("pshuflw"));
+        assert_eq!((op.inputs.len(), op.inputs[2].offset, op.output.unwrap().size), (3, 0x1b, 16));
     }
 
     #[test]
@@ -2993,28 +3016,27 @@ mod tests {
     #[test]
     fn lift_packed_int_arith() {
         let lifter = X86Lifter::new_64();
-        // paddd xmm0, xmm1 = 66 0f fe c1 -> low-lane IntAdd (4 bytes)
-        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0xfe, 0xc1], 0x1000), 0x1000).unwrap();
-        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
-        let add = l.ops.iter().find(|o| o.opcode == OpCode::IntAdd).expect("paddd -> IntAdd");
-        assert_eq!(add.output.unwrap().size, 4, "dword lane");
-        // psubd xmm0, xmm1 = 66 0f fa c1 -> IntSub
-        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0xfa, 0xc1], 0x1000), 0x1000).unwrap();
-        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntSub));
-        // psrad xmm0, 3 = 66 0f 72 e0 03 -> IntSRight
-        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0x72, 0xe0, 0x03], 0x1000), 0x1000).unwrap();
-        assert!(l.ops.iter().any(|o| o.opcode == OpCode::IntSRight));
+        // every lane as a named op on the whole register (WS86: was the low lane's IntAdd / …)
+        let named = |code: &[u8]| {
+            let l = lifter.lift_instruction(&make_memory(code, 0x1000), 0x1000).unwrap();
+            let op = l.ops.iter().find(|o| o.opcode == OpCode::CallOther).expect("intrinsic").clone();
+            (reargo_core::pcode::intrinsic::name(op.inputs[0].offset), op.output.unwrap().size)
+        };
+        // paddd xmm0, xmm1 = 66 0f fe c1
+        assert_eq!(named(&[0x66, 0x0f, 0xfe, 0xc1]), (Some("paddd"), 16));
+        // psubd xmm0, xmm1 = 66 0f fa c1
+        assert_eq!(named(&[0x66, 0x0f, 0xfa, 0xc1]), (Some("psubd"), 16));
+        // psrad xmm0, 3 = 66 0f 72 e0 03
+        assert_eq!(named(&[0x66, 0x0f, 0x72, 0xe0, 0x03]), (Some("psrad"), 16));
     }
 
     #[test]
-    fn lift_pmuludq_is_32x32_to_64_unsigned() {
-        // pmuludq xmm0, xmm1 = 66 0f f4 c1 -> zext(lo32)*zext(lo32) = 64-bit
+    fn lift_pmuludq_is_a_named_op() {
+        // pmuludq xmm0, xmm1 = 66 0f f4 c1 -> both quadword lanes (WS86: was the low lane)
         let lifter = X86Lifter::new_64();
         let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0xf4, 0xc1], 0x1000), 0x1000).unwrap();
-        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
-        assert_eq!(l.ops.iter().filter(|o| o.opcode == OpCode::IntZExt).count(), 2, "both operands zero-extended");
-        let mul = l.ops.iter().find(|o| o.opcode == OpCode::IntMult).expect("IntMult");
-        assert_eq!(mul.output.unwrap().size, 8, "64-bit product");
+        let op = l.ops.iter().find(|o| o.opcode == OpCode::CallOther).expect("intrinsic");
+        assert_eq!(reargo_core::pcode::intrinsic::name(op.inputs[0].offset), Some("pmuludq"));
     }
 
     #[test]

@@ -13,7 +13,10 @@
 //!   `a == b`;
 //! * `cmovne r, s; cmovp r, s` (either order): one select on `a != b`;
 //! * `jbe` / `ja` / `setbe` / `cmova` …: `CF || ZF` is `CF || a == b` (CF, "below or
-//!   unordered", already holds for a NaN), which the condition folding prints as `!(b < a)`.
+//!   unordered", already holds for a NaN), which the condition folding prints as `!(b < a)`;
+//! * `ucomisd x, x`: PF is `isnan(x)` (WS86);
+//! * `setnp r1; sete r2; and r2, r1` (either order of the sets / of the `and`'s operands): the
+//!   `and` writes `a == b` (WS86); `setp r1; setne r2; or r2, r1` writes `a != b`.
 //!
 //! Only flags read in the straight line after the compare count: every instruction between
 //! the compare and the reader writes no flag and neither operand, and none is the target of a
@@ -105,6 +108,80 @@ fn not_equal(insn: &LiftedInstruction, a: VarnodeData, b: VarnodeData) -> (Pcode
     (op, t)
 }
 
+/// `(register, reads ZF (else PF), negated)` of a `setcc` of ZF / PF into a byte register.
+fn flag_set(insn: &LiftedInstruction) -> Option<(VarnodeData, bool, bool)> {
+    let m = insn.mnemonic.split_whitespace().next()?;
+    let (zf, neg) = match m {
+        "sete" | "setz" => (true, false),
+        "setne" | "setnz" => (true, true),
+        "setp" | "setpe" => (false, false),
+        "setnp" | "setpo" => (false, true),
+        _ => return None,
+    };
+    let w = insn.ops.iter().find(|o| o.opcode == OpCode::Copy && o.output.is_some_and(|v| v.space == SpaceId::REGISTER && v.size == 1))?;
+    Some((w.output?, zf, neg))
+}
+
+/// `setnp; sete; and` / `setp; setne; or` among `readers` (see the module documentation): the
+/// `and` / `or` writes `a == b` / `a != b`. Returns whether it rewrote one.
+fn fold_set_pair(lifted: &mut [LiftedInstruction], readers: &[usize], a: VarnodeData, b: VarnodeData, eq: VarnodeData) -> bool {
+    let Some(&z) = readers.last() else { return false };
+    let combine = lifted[z].ops.iter().position(|o| {
+        matches!(o.opcode, OpCode::IntAnd | OpCode::IntOr)
+            && o.inputs.len() == 2
+            && o.output.is_some_and(|v| v.space == SpaceId::REGISTER && v.size == 1)
+    });
+    let Some(c) = combine else { return false };
+    let (op, ins) = (lifted[z].ops[c].opcode, lifted[z].ops[c].inputs.clone());
+    // the two sets, each the last write of its register before the combination
+    let sets: Vec<(usize, VarnodeData, bool, bool)> =
+        readers[..readers.len() - 1].iter().filter_map(|&k| flag_set(&lifted[k]).map(|(r, zf, neg)| (k, r, zf, neg))).collect();
+    let find = |r: &VarnodeData| sets.iter().rev().find(|s| s.1 == *r).copied();
+    let (Some(s1), Some(s2)) = (find(&ins[0]), find(&ins[1])) else { return false };
+    if s1.1 == s2.1 {
+        return false;
+    }
+    let (zs, ps) = if s1.2 { (s1, s2) } else { (s2, s1) };
+    if !zs.2 || ps.2 {
+        return false;
+    }
+    // and: ZF && !PF (sete, setnp) = a == b; or: !ZF || PF (setne, setp) = a != b
+    let want = match op {
+        OpCode::IntAnd => !zs.3 && ps.3,
+        _ => zs.3 && !ps.3,
+    };
+    if !want {
+        return false;
+    }
+    // nothing after a set writes its register before the combination; the one the combination
+    // writes is not read in between either (it now holds the comparison from its set on)
+    let dst = lifted[z].ops[c].output.expect("checked");
+    let (ds, os) = if dst == zs.1 { (zs, ps) } else { (ps, zs) };
+    if dst != ds.1 || ds.0 >= z || os.0 >= z {
+        return false;
+    }
+    let between = |from: usize| lifted[from + 1..z].iter().flat_map(|i| i.ops.iter());
+    if between(os.0).any(|o| o.output.is_some_and(|w| overlaps(&os.1, &w)))
+        || between(ds.0).any(|o| o.output.is_some_and(|w| overlaps(&ds.1, &w)) || o.inputs.iter().any(|i| overlaps(&ds.1, i)))
+    {
+        return false;
+    }
+    // the set of the destination writes the comparison; the combination goes
+    let k = ds.0;
+    let w = lifted[k].ops.iter().position(|o| o.opcode == OpCode::Copy && o.output == Some(dst)).expect("flag_set found it");
+    if op == OpCode::IntAnd {
+        lifted[k].ops[w].inputs = SmallVec::from_slice(&[eq]);
+    } else {
+        let (ne, t) = not_equal(&lifted[k], a, b);
+        lifted[k].ops[w].inputs = SmallVec::from_slice(&[t]);
+        lifted[k].ops.insert(w, ne);
+    }
+    renumber(&mut lifted[k]);
+    lifted[z].ops.remove(c);
+    renumber(&mut lifted[z]);
+    true
+}
+
 /// Rewrite the parity checks after float compares (see the module documentation). `targets`
 /// are jump targets not visible as branch ops (jump-table cases). Returns the rewrites made.
 pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIterator<Item = u64>) -> usize {
@@ -123,6 +200,14 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
     let mut done = 0;
     for i in 0..lifted.len() {
         let Some((a, b, eq)) = float_compare(&lifted[i]) else { continue };
+        // `ucomisd x, x` (a NaN test): PF is `isnan(x)`, not `isnan(x) || isnan(x)` (WS86)
+        if a == b
+            && let Some(or) = lifted[i].ops.iter_mut().find(|o| o.opcode == OpCode::BoolOr && o.output.is_some_and(|v| is_reg(&v, PF)))
+        {
+            or.opcode = OpCode::Copy;
+            or.inputs.truncate(1);
+            done += 1;
+        }
         // the instructions after the compare that still see its flags and operands
         let mut readers = Vec::new();
         let mut k = i + 1;
@@ -146,6 +231,9 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
                 break;
             }
             k += 1;
+        }
+        if fold_set_pair(lifted, &readers, a, b, eq) {
+            done += 1;
         }
         let mut r = 0;
         while r < readers.len() {
@@ -266,6 +354,33 @@ mod tests {
         // the jp is also reached from elsewhere: nothing changes
         let mut l = lift(&[0x0f, 0x2e, 0xc1, 0x75, 0x03, 0x7a, 0x01, 0xc3, 0xc3]);
         assert_eq!(fold_parity_checks(&mut l, [0x1005]), 0);
+    }
+
+    #[test]
+    fn setnp_sete_and_is_equal() {
+        // ucomiss xmm1, xmm0; setnp dl; sete al; and al, dl; ret
+        let mut l = lift(&[0x0f, 0x2e, 0xc8, 0x0f, 0x9b, 0xc2, 0x0f, 0x94, 0xc0, 0x20, 0xd0, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 1);
+        assert_eq!(l[2].ops[0].opcode, OpCode::Copy);
+        assert_eq!(l[2].ops[0].inputs[0].offset, EQ_TMP);
+        assert!(!l[3].ops.iter().any(|o| o.opcode == OpCode::IntAnd));
+        // setp; setne; or: not equal
+        let mut l = lift(&[0x0f, 0x2e, 0xc8, 0x0f, 0x9a, 0xc2, 0x0f, 0x95, 0xc0, 0x08, 0xd0, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 1);
+        assert!(l[2].ops.iter().any(|o| o.opcode == OpCode::FloatNotEqual));
+        assert!(!l[3].ops.iter().any(|o| o.opcode == OpCode::IntOr));
+        // setp; sete; and is no comparison of its own: unchanged
+        let mut l = lift(&[0x0f, 0x2e, 0xc8, 0x0f, 0x9a, 0xc2, 0x0f, 0x94, 0xc0, 0x20, 0xd0, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 0);
+    }
+
+    #[test]
+    fn nan_test_of_one_register_is_one_isnan() {
+        // ucomisd xmm0, xmm0; jp +0; ret
+        let mut l = lift(&[0x66, 0x0f, 0x2e, 0xc0, 0x7a, 0x00, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 1);
+        let pf = l[0].ops.iter().find(|o| o.output.is_some_and(|v| is_reg(&v, PF))).unwrap();
+        assert_eq!((pf.opcode, pf.inputs.len()), (OpCode::Copy, 1));
     }
 
     #[test]

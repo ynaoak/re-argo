@@ -655,6 +655,38 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
                 vn.version = to.3;
             }
         }
+        // WS86: the kept definition's output gains the removed one's readers — else dead code
+        // elimination sees no reader of it once its own die (`sete [rsi+0x18]` loads and stores
+        // through two copies of the address: the load died, so did the address the store read)
+        let targets: rustc_hash::FxHashSet<ValueKey> = redirects.values().map(|&k| resolve_redirect(&redirects, k)).collect();
+        let mut defined: rustc_hash::FxHashMap<ValueKey, u32> = Default::default();
+        for vn in &func.varnodes {
+            // (the removed duplicate's output now carries the kept key too: not that one)
+            if vn.def_op.is_some_and(|d| !func.ops[d].dead && func.ops[d].output == Some(vn.id)) {
+                let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+                if targets.contains(&key) {
+                    defined.insert(key, vn.id);
+                }
+            }
+        }
+        for i in 0..func.varnodes.len() {
+            let vn = &func.varnodes[i];
+            let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            if let Some(&d) = defined.get(&key)
+                && d as usize != i
+            {
+                // (and the definition is the kept op: the liveness walk through phis follows
+                // `def_op` from the readers' inputs)
+                func.varnodes[i].def_op = func.varnodes[d as usize].def_op;
+                let extra = func.varnodes[i].uses.clone();
+                let uses = &mut func.varnodes[d as usize].uses;
+                for u in extra {
+                    if !uses.contains(&u) {
+                        uses.push(u);
+                    }
+                }
+            }
+        }
     }
 
     eliminated
