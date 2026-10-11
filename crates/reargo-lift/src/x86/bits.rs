@@ -197,6 +197,7 @@ impl X86Lifter {
         let lifted = match insn.mnemonic() {
             Shl | Sal | Shr | Sar => self.lift_shift(insn, address),
             Rol | Ror => self.lift_rotate(insn, address),
+            Rcl | Rcr => self.lift_rotate_carry(insn, address),
             Shld | Shrd => self.lift_double_shift(insn, address),
             Adc | Sbb => self.lift_carry_chain(insn, address),
             Bt | Bts | Btr | Btc => self.lift_bit_test(insn, address),
@@ -341,6 +342,82 @@ impl X86Lifter {
         Ok(ops)
     }
 
+    /// `rcl`/`rcr`: rotate the `w + 1` bits CF:dst by `c` = the masked count (mod 9 / 17 for a
+    /// byte / word). With `c` in 1..=w, `rcl` = `dst << c | CF << (c - 1) | dst >> (w + 1 - c)`
+    /// and CF = bit `w - c` of dst; `rcr` = `dst >> c | CF << (w - c) | dst << (w + 1 - c)` and
+    /// CF = bit `c - 1` (a shift by the width or more is 0 in p-code, so `c = 1` / `c = w`
+    /// need no special case). OF for a count of 1: `rcl` MSB(result) ^ CF, `rcr` the MSB
+    /// before ^ the CF before. SF/ZF/PF are unaffected.
+    fn lift_rotate_carry(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
+        let mut ops = Vec::new();
+        let mut sb = 0u32;
+        let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
+        let cnt = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
+        let (sz, w) = (dst.size, dst.size as u64 * 8);
+        let left = insn.mnemonic() == iced_x86::Mnemonic::Rcl;
+        {
+            let mut e = Emit::new(&mut ops, &mut sb, address);
+            let n = mask_count(&mut e, cnt, sz);
+            // the rotation count: mod w + 1 for the narrow operands
+            let c = match &n {
+                Count::Const(0) => return Ok(ops),
+                Count::Const(k) if w < 32 && k % (w + 1) == 0 => return Ok(ops),
+                Count::Const(k) => Count::Const(if w < 32 { k % (w + 1) } else { *k }),
+                Count::Var(v) if w < 32 => Count::Var(e.tmp(OpCode::IntRem, v.size, &[*v, constant(w + 1, v.size)])),
+                Count::Var(v) => Count::Var(*v),
+            };
+            let cv = c.value(sz);
+            let csz = cv.size;
+            let cf_old = reg(CF_OFFSET, 1);
+            let cf_wide = e.tmp(OpCode::IntZExt, sz, &[cf_old]);
+            let c_minus_1 = e.tmp(OpCode::IntSub, csz, &[cv, constant(1, csz)]);
+            let w_minus_c = e.tmp(OpCode::IntSub, csz, &[constant(w, csz), cv]);
+            let w1_minus_c = e.tmp(OpCode::IntSub, csz, &[constant(w + 1, csz), cv]);
+            let old_msb = e.msb(dst);
+            let (cf, main, carry, spill) = if left {
+                let cf = e.bit(dst, w_minus_c);
+                let main = e.tmp(OpCode::IntLeft, sz, &[dst, cv]);
+                let carry = e.tmp(OpCode::IntLeft, sz, &[cf_wide, c_minus_1]);
+                let spill = e.tmp(OpCode::IntRight, sz, &[dst, w1_minus_c]);
+                (cf, main, carry, spill)
+            } else {
+                let cf = e.bit(dst, c_minus_1);
+                let main = e.tmp(OpCode::IntRight, sz, &[dst, cv]);
+                let carry = e.tmp(OpCode::IntLeft, sz, &[cf_wide, w_minus_c]);
+                let spill = e.tmp(OpCode::IntLeft, sz, &[dst, w1_minus_c]);
+                (cf, main, carry, spill)
+            };
+            let t = e.tmp(OpCode::IntOr, sz, &[main, carry]);
+            let rotated = e.tmp(OpCode::IntOr, sz, &[t, spill]);
+            let of = if left {
+                let m = e.msb(rotated);
+                e.tmp(OpCode::BoolXor, 1, &[m, cf])
+            } else {
+                e.tmp(OpCode::BoolXor, 1, &[old_msb, cf_old])
+            };
+            // a register count of 0 (or a multiple of w + 1) rotates nothing: keep dst and CF
+            let rotates = match &c {
+                Count::Const(_) => None,
+                Count::Var(v) => Some(e.tmp(OpCode::IntNotEqual, 1, &[*v, constant(0, v.size)])),
+            };
+            match rotates {
+                None => e.set(OpCode::Copy, dst, &[rotated]),
+                Some(r) => e.set(OpCode::Select, dst, &[r, rotated, dst]),
+            }
+            e.flag(CF_OFFSET, cf, rotates);
+            match n {
+                Count::Const(1) => e.flag(OF_OFFSET, of, None),
+                Count::Var(_) => {
+                    let ch = changed(&mut e, &n);
+                    e.flag(OF_OFFSET, of, ch);
+                }
+                Count::Const(_) => {}
+            }
+        }
+        self.write_back_if_memory(insn, 0, dst, &mut ops, &mut sb, address)?;
+        Ok(ops)
+    }
+
     /// `shld dst, src, n` = `(dst << n) | (src >> (w - n))`, `shrd` the mirror image. CF = the
     /// last bit shifted out of `dst`, OF for a 1-bit shift (sign change), SF/ZF from the result.
     fn lift_double_shift(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
@@ -428,10 +505,13 @@ impl X86Lifter {
     }
 
     /// `bt`/`bts`/`btr`/`btc`: CF = the bit (offset mod the operand width), then set / clear /
-    /// complement it. ZF is unaffected. (The bit-string form, a memory operand with a register
-    /// offset beyond the operand, is not modelled.)
+    /// complement it. ZF is unaffected. A memory operand with a register offset is a bit
+    /// string: the signed offset picks the operand-sized word `offset >> log2(w)` words away.
     fn lift_bit_test(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
         use iced_x86::Mnemonic::*;
+        if insn.op_kind(0) == iced_x86::OpKind::Memory && insn.op_kind(1) == iced_x86::OpKind::Register {
+            return self.lift_bit_string(insn, address);
+        }
         let mut ops = Vec::new();
         let mut sb = 0u32;
         let val = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
@@ -462,6 +542,42 @@ impl X86Lifter {
         }
         if mnem != Bt {
             self.write_back_if_memory(insn, 0, val, &mut ops, &mut sb, address)?;
+        }
+        Ok(ops)
+    }
+
+    /// The bit-string form of [`Self::lift_bit_test`]: `bt [m], r`.
+    fn lift_bit_string(&self, insn: &iced_x86::Instruction, address: u64) -> Result<Vec<PcodeOp>, LiftError> {
+        use iced_x86::Mnemonic::*;
+        let mut ops = Vec::new();
+        let mut sb = 0u32;
+        let base = self.compute_memory_address(insn, &mut ops, &mut sb, address)?;
+        let off = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
+        let sz = off.size;
+        let ps = base.size;
+        let (w, log_w) = (sz as u64 * 8, (sz as u64 * 8).trailing_zeros() as u64);
+        let mnem = insn.mnemonic();
+        let mut e = Emit::new(&mut ops, &mut sb, address);
+        // the word: base + (offset >> log2(w)) * (w / 8), the offset signed
+        let wide = if sz == ps { off } else { e.tmp(OpCode::IntSExt, ps, &[off]) };
+        let words = e.tmp(OpCode::IntSRight, ps, &[wide, constant(log_w, ps)]);
+        let bytes = e.tmp(OpCode::IntMult, ps, &[words, constant(w / 8, ps)]);
+        let at = e.tmp(OpCode::IntAdd, ps, &[base, bytes]);
+        let val = e.tmp(OpCode::Load, sz, &[constant(RAM_SPACE.0 as u64, 4), at]);
+        let k = e.tmp(OpCode::IntAnd, sz, &[off, constant(w - 1, sz)]);
+        let cf = e.bit(val, k);
+        e.flag(CF_OFFSET, cf, None);
+        if mnem != Bt {
+            let m = e.tmp(OpCode::IntLeft, sz, &[constant(1, sz), k]);
+            let new = match mnem {
+                Bts => e.tmp(OpCode::IntOr, sz, &[val, m]),
+                Btr => {
+                    let nm = e.tmp(OpCode::IntNegate, sz, &[m]);
+                    e.tmp(OpCode::IntAnd, sz, &[val, nm])
+                }
+                _ => e.tmp(OpCode::IntXor, sz, &[val, m]),
+            };
+            e.put(OpCode::Store, None, &[constant(RAM_SPACE.0 as u64, 4), at, new]);
         }
         Ok(ops)
     }

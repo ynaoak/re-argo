@@ -140,6 +140,8 @@ enum Inputs {
     /// a, b = f64 bit patterns (an f32 in the low half for `…ss`): zeros, infinities, NaN,
     /// denormals, and random values
     Floats,
+    /// a, c from edge values, b = a bit offset -130..=130
+    BitOffsets,
 }
 
 const EDGE: [u64; 20] = [
@@ -242,6 +244,14 @@ fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
                         (u64::from((x as f32).to_bits()), u64::from((y as f32).to_bits()))
                     };
                     v.push((a, b, rng.value(), flag_inputs(rng)[(rng.next() % 3) as usize]));
+                }
+            }
+        }
+        Inputs::BitOffsets => {
+            for (i, &a) in EDGE.iter().enumerate() {
+                for b in -130i64..=130 {
+                    let c = EDGE[(i * 7 + b.unsigned_abs() as usize) % EDGE.len()];
+                    v.push((a, b as u64, c, flag_inputs(rng)[b.unsigned_abs() as usize % 3]));
                 }
             }
         }
@@ -416,6 +426,14 @@ fn d_shift<const W: u32, const IMM: i64, const K: u8>(_: u64, b: u64, _: u64) ->
         SHL | SHR if n >= u64::from(W) => (PF | ZF | SF | of, RAX),
         _ => (CF | PF | ZF | SF | of, RAX),
     }
+}
+
+/// `rcl`/`rcr` of a `W`-bit operand by `cl` (`IMM < 0`) or `IMM`: CF (and OF for a count of
+/// 1) change, the other flags are unaffected; nothing changes for a zero count.
+fn d_rc<const W: u32, const IMM: i64>(_: u64, b: u64, _: u64) -> (u64, u8) {
+    let raw = if IMM < 0 { b & 0xff } else { IMM as u64 };
+    let n = raw & if W == 64 { 63 } else { 31 };
+    (if n == 1 || n == 0 { ARITH } else { ARITH & !OF }, RAX)
 }
 
 /// `shld`/`shrd` of a `W`-bit operand by `cl` (`IMM < 0`) or `IMM`.
@@ -623,6 +641,33 @@ fn rotates_match_the_cpu() {
     check(&cases);
 }
 
+/// A rotate through carry at every width, by `cl`, by 1 and by a constant.
+macro_rules! rotates_through_carry {
+    ($op:literal) => {
+        [
+            case!(concat!($op, " al, cl"), d_rc::<8, -1>, Inputs::Counts),
+            case!(concat!($op, " ax, cl"), d_rc::<16, -1>, Inputs::Counts),
+            case!(concat!($op, " eax, cl"), d_rc::<32, -1>, Inputs::Counts),
+            case!(concat!($op, " rax, cl"), d_rc::<64, -1>, Inputs::Counts),
+            case!(concat!($op, " al, 1"), d_rc::<8, 1>, Inputs::Values),
+            case!(concat!($op, " eax, 1"), d_rc::<32, 1>, Inputs::Values),
+            case!(concat!($op, " rax, 1"), d_rc::<64, 1>, Inputs::Values),
+            case!(concat!($op, " al, 9"), d_rc::<8, 9>, Inputs::Values),
+            case!(concat!($op, " al, 5"), d_rc::<8, 5>, Inputs::Values),
+            case!(concat!($op, " ax, 16"), d_rc::<16, 16>, Inputs::Values),
+            case!(concat!($op, " eax, 31"), d_rc::<32, 31>, Inputs::Values),
+            case!(concat!($op, " rax, 0x22"), d_rc::<64, 0x22>, Inputs::Values),
+        ]
+    };
+}
+
+#[test]
+fn rotates_through_carry_match_the_cpu() {
+    let cases: Vec<Case> =
+        [rotates_through_carry!("rcl"), rotates_through_carry!("rcr")].into_iter().flatten().collect();
+    check(&cases);
+}
+
 #[test]
 fn double_shifts_match_the_cpu() {
     let cases = vec![
@@ -670,6 +715,47 @@ fn bit_ops_match_the_cpu() {
         case!("popcnt ax, cx", d_arith, Inputs::Values, popcnt),
         case!("bswap eax", d_arith, Inputs::Values),
         case!("bswap rax", d_arith, Inputs::Values),
+    ];
+    check(&cases);
+}
+
+/// `bt`… on memory with a register bit offset (the bit string: the offset may leave the
+/// operand). rax and rdx are the 16 bytes at `[rsp]`; the case's address leaves room for the
+/// offsets it accepts.
+fn d_bt_mem(_: u64, _: u64, _: u64) -> (u64, u8) {
+    (CF | ZF, RAX | RDX)
+}
+
+macro_rules! bt_mem {
+    ($asm:expr, $valid:expr) => {
+        Case {
+            asm: $asm,
+            f: cpu!("push rdx
+ push rax
+ ", $asm, "
+ pop rax
+ pop rdx"),
+            defined: d_bt_mem,
+            inputs: Inputs::BitOffsets,
+            needs: None,
+            valid: Some($valid),
+        }
+    };
+}
+
+#[test]
+fn bit_string_ops_match_the_cpu() {
+    let low = |_: u64, b: u64, _: u64| (0..128).contains(&(b as i64));
+    let mid = |_: u64, b: u64, _: u64| (-64..64).contains(&(b as i64));
+    let cases = vec![
+        bt_mem!("bt qword ptr [rsp], rcx", low),
+        bt_mem!("bt qword ptr [rsp+8], rcx", mid),
+        bt_mem!("bt dword ptr [rsp+8], ecx", mid),
+        bt_mem!("bt word ptr [rsp+8], cx", mid),
+        bt_mem!("bts qword ptr [rsp+8], rcx", mid),
+        bt_mem!("btr dword ptr [rsp], ecx", low),
+        bt_mem!("btc word ptr [rsp+8], cx", mid),
+        bt_mem!("bts dword ptr [rsp], 37", low),
     ];
     check(&cases);
 }
