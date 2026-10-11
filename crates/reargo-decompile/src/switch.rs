@@ -280,15 +280,29 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     }
     let addrs: rustc_hash::FxHashSet<u64> = insns.iter().map(|i| i.address).collect();
     let (bases, loose, loaded) = constant_registers(insns);
-    // (computed once, when a dispatch needs it, on the instructions as lifted)
-    let ranges: std::cell::OnceCell<Option<crate::ranges::Ranges>> = std::cell::OnceCell::new();
-    let snapshot: std::cell::OnceCell<Vec<LiftedInstruction>> = std::cell::OnceCell::new();
-    for k in 0..insns.len() {
-        let range = |at: usize, r: &VarnodeData| -> Option<crate::ranges::Interval> {
-            let insns = snapshot.get_or_init(|| insns.to_vec());
-            ranges.get_or_init(|| crate::ranges::Ranges::new(insns)).as_ref()?.at_dispatch(insns, at, k, r)
-        };
-        let Some(found) = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &range) else { continue };
+    // first without value ranges; then (WS86), for a dispatch with no bounds check right before
+    // it (none found, or the table read as far as its entries go), the index's range on every
+    // path — with the cases of the tables found as edges
+    let no_range = |_: usize, _: &VarnodeData| None;
+    let mut found: Vec<(usize, Option<Recovered>)> = (0..insns.len())
+        .filter(|&k| has(&insns[k], OpCode::BranchInd))
+        .map(|k| (k, recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &no_range)))
+        .collect();
+    if found.iter().any(|(_, f)| f.as_ref().is_none_or(|f| f.2.default.is_none())) {
+        let cases: FxHashMap<u64, Vec<u64>> =
+            found.iter().filter_map(|(k, f)| Some((insns[*k].address, f.as_ref()?.2.targets.clone()))).collect();
+        if let Some(ranges) = crate::ranges::Ranges::new(insns, &cases) {
+            for (k, f) in found.iter_mut() {
+                if f.as_ref().is_none_or(|f| f.2.default.is_none()) {
+                    let k = *k;
+                    let range = |at: usize, r: &VarnodeData| ranges.at_dispatch(insns, at, k, r);
+                    *f = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &range);
+                }
+            }
+        }
+    }
+    for (k, found) in found {
+        let Some(found) = found else { continue };
         let (index, start, table) = found;
         // the index as the window starts, when the window reuses its register (WS84: `movsxd
         // rax, [rcx+rax*4]`; the BRANCHIND reads at the window's end)
@@ -323,6 +337,9 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     out
 }
 
+/// A dispatch recovered: its index register, the window's first instruction, the table.
+type Recovered = (VarnodeData, usize, JumpTable);
+
 /// The number of cases a bounds check `cmp r, N` lets through.
 type CaseCount = fn(u64) -> Option<u64>;
 
@@ -356,7 +373,7 @@ fn recover_one(
     memory: &Memory,
     // the index's interval on every path to the dispatch, given the window's start (WS86)
     range: &dyn Fn(usize, &VarnodeData) -> Option<crate::ranges::Interval>,
-) -> Option<(VarnodeData, usize, JumpTable)> {
+) -> Option<Recovered> {
     let jmp = &insns[k];
     let target_vn = *jmp.ops.iter().find(|o| o.opcode == OpCode::BranchInd)?.inputs.first()?;
     // the straight-line run before the `jmp`: from the bounds check's fall-through, or from
@@ -427,7 +444,7 @@ fn recover_one(
         })
     };
     // WS86: the index's range on every path to the window (a bounds check blocks before it)
-    let by_range = || -> Option<(VarnodeData, usize, JumpTable)> {
+    let by_range = || -> Option<Recovered> {
         if level1.is_some() {
             return None;
         }

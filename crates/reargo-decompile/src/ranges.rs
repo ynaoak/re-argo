@@ -51,6 +51,13 @@ fn joined(b: usize, v: View) -> Id {
     3 << 62 | (b as u64) << 8 | slot(v)
 }
 
+/// The value view `v` still holds when the instruction (or join) that made id `old` makes a new
+/// one: around a loop, the same instruction writes a new value under the same id, and a view
+/// copied from the old one must not pass for the new.
+fn stale(old: Id, v: View) -> Id {
+    old ^ 1 << 59 ^ slot(v) << 48
+}
+
 /// Registers a call may change (System V caller-saved): rax, rcx, rdx, rsi, rdi, r8–r11.
 const CALLER_SAVED: [u64; 9] = [0x00, 0x08, 0x10, 0x30, 0x38, 0x80, 0x88, 0x90, 0x98];
 
@@ -88,7 +95,8 @@ pub struct Ranges {
 }
 
 impl Ranges {
-    pub fn new(insns: &[LiftedInstruction]) -> Option<Self> {
+    /// `cases`: the case targets of jump tables, by the `jmp`'s address (edges out of it).
+    pub fn new(insns: &[LiftedInstruction], cases: &FxHashMap<u64, Vec<u64>>) -> Option<Self> {
         let n = insns.len();
         if n == 0 {
             return None;
@@ -97,15 +105,28 @@ impl Ranges {
         // block leaders
         let mut leader = vec![false; n];
         leader[0] = true;
+        // an instruction some modelled edge reaches (a jump, a fall-through, a recovered table)
+        let mut reached = vec![false; n];
+        reached[0] = true;
         for (i, insn) in insns.iter().enumerate() {
             let ends = insn.ops.iter().any(|o| matches!(o.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd | OpCode::Return));
             for o in &insn.ops {
-                if matches!(o.opcode, OpCode::Branch | OpCode::CBranch)
-                    && let Some(t) = o.inputs.first().filter(|t| t.space == SpaceId::RAM)
-                    && let Some(&j) = index.get(&t.offset)
-                {
-                    leader[j] = true;
+                // the target of a jump; a jump table's cases
+                let targets: Vec<u64> = match o.opcode {
+                    OpCode::Branch | OpCode::CBranch => o.inputs.iter().take(1).filter(|t| t.space == SpaceId::RAM).map(|t| t.offset).collect(),
+                    OpCode::BranchInd => cases.get(&insn.address).cloned().unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                for t in targets {
+                    if let Some(&j) = index.get(&t) {
+                        leader[j] = true;
+                        reached[j] = true;
+                    }
                 }
+            }
+            let falls = !insn.ops.iter().any(|o| matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Return));
+            if i + 1 < n && insns[i + 1].address == insn.address + u64::from(insn.length) && falls {
+                reached[i + 1] = true;
             }
             if i + 1 < n && (ends || insns[i + 1].address != insn.address + u64::from(insn.length)) {
                 leader[i + 1] = true;
@@ -122,7 +143,13 @@ impl Ranges {
         let this = Ranges { entry: FxHashMap::default(), block_of };
         let starts: Vec<usize> = (0..n).filter(|&i| leader[i]).collect();
         let mut entry: FxHashMap<usize, State> = FxHashMap::default();
-        entry.insert(0, State::default());
+        // the entry, and every block no modelled edge reaches (a case of a table not recovered
+        // yet, a landing pad): nothing known there
+        for &b in &starts {
+            if !reached[b] || b == 0 {
+                entry.insert(b, State::default());
+            }
+        }
         // per block: the incoming edge states, by predecessor
         let mut incoming: FxHashMap<usize, FxHashMap<usize, State>> = FxHashMap::default();
         let mut changed = true;
@@ -139,7 +166,7 @@ impl Ranges {
                 for k in s..end {
                     if k + 1 == end {
                         // the edges out of the block
-                        for (t, edge) in this.successors(insns, &index, k, &st, end) {
+                        for (t, edge) in this.successors(insns, &index, k, &st, end, cases) {
                             let inc = incoming.entry(t).or_default();
                             if inc.get(&k) != Some(&edge) {
                                 inc.insert(k, edge);
@@ -199,7 +226,9 @@ impl Ranges {
         let first = &inc[preds[0]];
         let mut out = State::default();
         for (&view, &id) in &first.views {
-            let same = preds.iter().all(|p| inc[*p].views.get(&view) == Some(&id));
+            // (an id this block's join made, around a loop: a value of an earlier pass)
+            let made_here = id >> 62 == 3 && (id >> 8) & ((1 << 54) - 1) == block as u64;
+            let same = !made_here && preds.iter().all(|p| inc[*p].views.get(&view) == Some(&id));
             let r = preds.iter().map(|p| inc[*p].get(view)).fold(None, |acc: Option<Interval>, x| {
                 Some(acc.map_or(x, |a| (a.0.min(x.0), a.1.max(x.1))))
             });
@@ -223,6 +252,7 @@ impl Ranges {
         k: usize,
         before: &State,
         end: usize,
+        cases: &FxHashMap<u64, Vec<u64>>,
     ) -> Vec<(usize, State)> {
         let insn = &insns[k];
         let mut after = before.clone();
@@ -232,6 +262,13 @@ impl Ranges {
         let br = insn.ops.iter().find(|o| matches!(o.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd | OpCode::Return));
         match br.map(|o| o.opcode) {
             None => out.extend(fall.map(|f| (f, after))),
+            Some(OpCode::BranchInd) => {
+                for t in cases.get(&insn.address).map_or(&[][..], Vec::as_slice) {
+                    if let Some(&j) = index.get(t) {
+                        out.push((j, after.clone()));
+                    }
+                }
+            }
             Some(OpCode::Branch) => {
                 if let Some(&t) = br.and_then(|o| o.inputs.first()).filter(|t| t.space == SpaceId::RAM).and_then(|t| index.get(&t.offset)) {
                     out.push((t, after));
@@ -332,7 +369,8 @@ impl Ranges {
                 return tmp.get(&(v.offset, v.size)).copied().unwrap_or(((0, mask(v.size)), None));
             }
             if is_gpr(v) {
-                let id = st.views.get(&(v.offset, v.size)).copied();
+                // (a view never written holds its entry value: a copy of it shares that)
+                let id = Some(st.views.get(&(v.offset, v.size)).copied().unwrap_or_else(|| entry_value((v.offset, v.size))));
                 return (st.get((v.offset, v.size)), id);
             }
             ((0, mask(v.size)), None)
@@ -363,6 +401,16 @@ impl Ranges {
                     Some(id) => id,
                     None => {
                         let nid = written(k, view);
+                        // the views still holding the value this instruction made last time
+                        let old: Vec<View> = st.views.iter().filter(|&(w, &i)| i == nid && *w != view).map(|(w, _)| *w).collect();
+                        for w in old {
+                            let sid = stale(nid, w);
+                            match st.ranges.get(&nid).copied() {
+                                Some(r) => st.ranges.insert(sid, r),
+                                None => st.ranges.remove(&sid),
+                            };
+                            st.views.insert(w, sid);
+                        }
                         if r == FULL {
                             st.ranges.remove(&nid);
                         } else {
@@ -420,7 +468,7 @@ mod tests {
             0xc3, // 0x100d ret
             0xc3, // 0x100e ret
         ]);
-        let r = Ranges::new(&l).expect("converges");
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
         let edi = VarnodeData::new(SpaceId::REGISTER, 0x38, 4);
         let eax = VarnodeData::new(SpaceId::REGISTER, 0x00, 4);
         let rax = VarnodeData::new(SpaceId::REGISTER, 0x00, 8);
@@ -431,5 +479,32 @@ mod tests {
         assert_eq!(r.at(&l, 6, &edi), None);
         // past the `je`: rsi == 0 is not a range
         assert_eq!(r.at(&l, 7, &edi), Some((0, 3)));
+    }
+
+    /// A block no modelled edge reaches (after an indirect jump; in BDS 0x3e87ee0 a case of a
+    /// table not recovered yet) may hold anything: `rsi` reloaded there stays unknown where its
+    /// path joins one that copies the compared register into it.
+    #[test]
+    fn unreached_block_is_unknown() {
+        let l = lift(&[
+            0x44, 0x89, 0xe6, // 0 mov esi, r12d
+            0x41, 0xf6, 0xc7, 0x01, // 1 test r15b, 1
+            0x74, 0x07, // 2 je 5
+            0xff, 0xe0, // 3 jmp rax
+            0x48, 0x8b, 0x74, 0x24, 0x28, // 4 mov rsi, [rsp+0x28]
+            0x41, 0x83, 0xfc, 0x03, // 5 cmp r12d, 3
+            0x77, 0x01, // 6 ja 8
+            0x90, // 7 nop
+            0xc3, // 8 ret
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        let rsi = VarnodeData::new(SpaceId::REGISTER, 0x30, 8);
+        let r12d = VarnodeData::new(SpaceId::REGISTER, 0xa0, 4);
+        assert_eq!(r.at(&l, 7, &r12d), Some((0, 3)));
+        assert_eq!(r.at(&l, 7, &rsi), None);
+        // the table's cases as edges: the block is reached, from a dispatch nothing bounds
+        let jmp = l[3].address;
+        let r = Ranges::new(&l, &[(jmp, vec![l[4].address])].into_iter().collect()).expect("converges");
+        assert_eq!(r.at(&l, 7, &rsi), None);
     }
 }
