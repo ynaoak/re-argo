@@ -504,7 +504,25 @@ fn jump_table_dispatch(instructions: &[LiftedInstruction], k: usize) -> bool {
     if insn.mnemonic.contains('[') {
         return false;
     }
-    instructions[..k].iter().rev().take(6).any(|i| scaled(&i.mnemonic))
+    // the straight line before the `jmp` (WS85: `mov rdi, [rcx+rax*8]; …; jge L; mov rax,
+    // [rdi]; mov rax, [rax]; jmp rax` is a virtual tail call, the scaled load is before a branch)
+    instructions[..k]
+        .iter()
+        .rev()
+        .take(6)
+        .take_while(|i| {
+            !i.ops.iter().any(|o| {
+                matches!(
+                    o.opcode,
+                    reargo_core::pcode::OpCode::CBranch
+                        | reargo_core::pcode::OpCode::Branch
+                        | reargo_core::pcode::OpCode::Call
+                        | reargo_core::pcode::OpCode::CallInd
+                        | reargo_core::pcode::OpCode::Return
+                )
+            })
+        })
+        .any(|i| scaled(&i.mnemonic))
 }
 
 /// Second input of a call's `INDIRECT` that marks a clobbered (not returned) register.
@@ -2922,6 +2940,77 @@ mod tests {
     /// A jump table with no bounds check (a switch over an enum, `default:` unreachable) runs
     /// while its entries are the function's instructions, up to the next table the function
     /// loads; a table base set once before a loop is that constant (WS84).
+    #[test]
+    fn jump_table_index_from_a_shift_with_a_popped_base() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let mut code: Vec<u8> = vec![
+            0x41, 0x54, // 0x1000 push r12
+            0x4c, 0x8d, 0x25, 0xf7, 0x00, 0x00, 0x00, // 0x1002 lea r12, [0x1100]
+            0x8b, 0x07, // 0x1009 mov eax, [rdi]
+            0xc1, 0xe8, 0x1e, // 0x100b shr eax, 30
+            0x49, 0x63, 0x04, 0x84, // 0x100e movsxd rax, [r12+rax*4]
+            0x4c, 0x01, 0xe0, // 0x1012 add rax, r12
+            0xff, 0xe0, // 0x1015 jmp rax
+        ];
+        for v in [10u8, 20, 30] {
+            code.extend([0xb8, v, 0, 0, 0, 0x41, 0x5c, 0xc3]); // mov eax, v; pop r12; ret
+        }
+        let table: Vec<u8> = [0x1017u64, 0x101f, 0x1027, 0x101f, 0x1017, 0x1017].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, &code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 3:") && !c.contains("case 4:"), "`shr eax, 30` leaves 4 values: {c}");
+    }
+
+    /// Two tables through one base register: the dispatch takes the constant written last
+    /// before it (WS85).
+    #[test]
+    fn jump_tables_sharing_a_base_register() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64, base: i64| ((t as i64 - base) as i32).to_le_bytes();
+        let mut code: Vec<u8> = vec![
+            0x4c, 0x8d, 0x25, 0xf9, 0x00, 0x00, 0x00, // 0x1000 lea r12, [0x1100]
+            0x85, 0xf6, // 0x1007 test esi, esi
+            0x75, 0x0e, // 0x1009 jne 0x1019
+            0x8b, 0x07, 0x83, 0xe0, 0x01, // 0x100b mov eax, [rdi]; and eax, 1
+            0x49, 0x63, 0x04, 0x84, 0x4c, 0x01, 0xe0, 0xff, 0xe0, // movsxd rax, [r12+rax*4]; add rax, r12; jmp rax
+            0x4c, 0x8d, 0x25, 0xf0, 0x00, 0x00, 0x00, // 0x1019 lea r12, [0x1110]
+            0x8b, 0x07, 0x83, 0xe0, 0x01, // 0x1020 mov eax, [rdi]; and eax, 1
+            0x49, 0x63, 0x04, 0x84, 0x4c, 0x01, 0xe0, 0xff, 0xe0, // 0x1025 … 0x102c jmp rax
+        ];
+        for v in 1u8..=4 {
+            code.extend([0xb8, v, 0, 0, 0, 0xc3]); // 0x102e + 6k: mov eax, v; ret
+        }
+        let mut tables: Vec<u8> = [0x102eu64, 0x1034].iter().flat_map(|&t| rel(t, 0x1100)).collect();
+        tables.resize(0x10, 0xcc);
+        tables.extend([0x103au64, 0x1040].iter().flat_map(|&t| rel(t, 0x1110)));
+        let mem = make_memory_parts(&[(0x1000, &code), (0x1100, &tables)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("goto *") && c.matches("switch (").count() == 2, "{c}");
+        for r in ["return 1;", "return 2;", "return 3;", "return 4;"] {
+            assert!(c.contains(r), "{r}: {c}");
+        }
+    }
+
+    #[test]
+    fn virtual_tail_call_after_a_branch_is_no_jump_table() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x4f, 0x10, // mov rcx, [rdi+0x10]
+            0x48, 0x8b, 0x3c, 0xc1, // mov rdi, [rcx+rax*8]
+            0x3c, 0xc0, // cmp al, 0xc0
+            0x7d, 0x08, // jge L
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0x48, 0x8b, 0x00, // mov rax, [rax]
+            0xff, 0xe0, // jmp rax
+            0x31, 0xc0, 0xc3, // L: xor eax, eax; ret
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("goto *"), "{c}");
+        assert!(c.contains("(*"), "{c}");
+    }
+
     #[test]
     fn jump_table_without_bounds_check() {
         let lifter = X86Lifter::new_64();
