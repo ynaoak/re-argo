@@ -702,7 +702,7 @@ fn settle_unknown_returns(ssa: &mut SsaFunction) {
 }
 
 /// What the function last wrote into a return register before a `ret` (WS79).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct RetEvidence {
     /// The function itself computed the value (not the entry value, a call's result or a
     /// call's clobber).
@@ -716,7 +716,12 @@ struct RetEvidence {
     /// The function also stores the value it leaves in the register (WS85): weak evidence
     /// that it is returned (`obj->x = v` with `v` left over in `xmm0` of a void function).
     stored: bool,
+    /// The direct callees whose results it is (WS86).
+    callees: Vec<u64>,
 }
+
+/// Most callees whose callers [`choose_return_register`] asks about one function's result.
+const MAX_TAIL_CALLEES: usize = 4;
 
 /// The value `v` holds at a `ret`, looking through the lifter's view syncs (`xmm0 =
 /// PIECE(hi, xmm0_q)`), register copies (`movaps xmm0, xmm1`) and φ-nodes.
@@ -731,18 +736,31 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
     let op = &ssa.ops[d];
     let reg = |x: crate::ssa::VarId| ssa.varnodes[x as usize].data.space == reargo_core::address::SpaceId::REGISTER;
     match op.opcode {
-        OpCode::Indirect => RetEvidence {
-            call_result: !is_call_clobber(&op.opcode, &op.inputs.iter().map(|&i| ssa.varnodes[i as usize].data).collect::<Vec<_>>()),
-            ..RetEvidence::default()
-        },
+        OpCode::Indirect => {
+            let call_result = !is_call_clobber(&op.opcode, &op.inputs.iter().map(|&i| ssa.varnodes[i as usize].data).collect::<Vec<_>>());
+            // (the call's target: an address for a direct call)
+            let target = op.inputs.first().map(|&t| ssa.varnodes[t as usize].data);
+            let callees = target
+                .filter(|t| call_result && matches!(t.space, reargo_core::address::SpaceId::RAM | reargo_core::address::SpaceId::CONST) && t.offset != 0)
+                .map(|t| vec![t.offset])
+                .unwrap_or_default();
+            RetEvidence { call_result, callees, ..RetEvidence::default() }
+        }
         OpCode::MultiEqual => {
             let mut best = RetEvidence::default();
             for &i in &op.inputs {
                 let e = return_evidence(ssa, i, seen);
+                let callees = e.callees.clone();
+                let call_result = e.call_result;
                 if e.written && (!best.written || e.addr > best.addr) {
                     best = e;
                 }
-                best.call_result |= e.call_result;
+                best.call_result |= call_result;
+                for c in callees {
+                    if !best.callees.contains(&c) {
+                        best.callees.push(c);
+                    }
+                }
             }
             best
         }
@@ -763,6 +781,7 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
             size: vn.data.size,
             call_result: false,
             stored: vn.uses.iter().any(|&u| ssa.ops[u].opcode == OpCode::Store && ssa.ops[u].inputs.get(2) == Some(&v)),
+            callees: Vec::new(),
         },
     }
 }
@@ -777,8 +796,10 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
 /// size when `xmm0` won.
 fn choose_return_register(
     ssa: &mut SsaFunction,
-    callers: &mut dyn FnMut() -> Option<crate::callers::ReturnHint>,
+    entry: u64,
+    callers_of: &mut dyn FnMut(u64) -> Option<crate::callers::ReturnHint>,
 ) -> Option<u32> {
+    let mut callers = || callers_of(entry);
     use reargo_core::pcode::OpCode;
     let rets: Vec<usize> = ssa
         .ops
@@ -791,11 +812,18 @@ fn choose_return_register(
     }
     let (mut float_votes, mut int_votes, mut size) = (0, 0, 0u32);
     let mut passes_call_result = false;
+    // the callees whose results the `ret`s pass on (WS86)
+    let mut callees: Vec<u64> = Vec::new();
     let mut weak = true;
     for &r in &rets {
         let (iv, fv) = (ssa.ops[r].inputs[1], ssa.ops[r].inputs[2]);
         let i = return_evidence(ssa, iv, &mut Vec::new());
         let f = return_evidence(ssa, fv, &mut Vec::new());
+        for c in i.callees.iter().chain(&f.callees) {
+            if !callees.contains(c) {
+                callees.push(*c);
+            }
+        }
         let f_scalar = f.written && (f.size == 4 || f.size == 8);
         if f_scalar && (!i.written || f.addr > i.addr) {
             float_votes += 1;
@@ -831,10 +859,20 @@ fn choose_return_register(
             None => {}
         }
     }
-    // WS80: `return g();` with `g`'s return register unknown: ask what the callers read
+    // WS80: `return g();` with `g`'s return register unknown: ask what the callers read —
+    // and when none decides (a virtual method has no direct caller), what the callers of `g`
+    // read, as the function returns what `g` does (WS86)
     let mut float = float_votes > 0 && int_votes == 0;
     if float_votes == 0 && int_votes == 0 && passes_call_result {
-        match callers() {
+        let of_callees = |callers_of: &mut dyn FnMut(u64) -> Option<crate::callers::ReturnHint>| {
+            if callees.is_empty() || callees.len() > MAX_TAIL_CALLEES || callees.contains(&entry) {
+                return None;
+            }
+            let hints: Vec<_> = callees.iter().map(|&g| callers_of(g)).collect();
+            hints.windows(2).all(|w| w[0] == w[1]).then(|| hints[0]).flatten()
+        };
+        let hint = callers().or_else(|| of_callees(callers_of));
+        match hint {
             Some(crate::callers::ReturnHint::Float(s)) => {
                 float = true;
                 size = s;
@@ -1073,8 +1111,8 @@ fn build_decompile_result(
             .iter()
             .any(|o| matches!(o.opcode, reargo_core::pcode::OpCode::Call | reargo_core::pcode::OpCode::CallInd) && o.inputs.len() > 1);
 
-    let mut hint = || caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, entry));
-    ssa.return_float = choose_return_register(&mut ssa, &mut hint);
+    let mut hint = |f: u64| caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, f));
+    ssa.return_float = choose_return_register(&mut ssa, entry, &mut hint);
     settle_unknown_returns(&mut ssa);
     let mut opt_stats = run_optimization_passes(&mut ssa);
     // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
@@ -2201,6 +2239,29 @@ mod tests {
         assert!(tested.contains("uint64_t f("), "{tested}");
     }
 
+
+    /// WS86: `return g();` with no direct caller of its own (a virtual method): the callers of
+    /// `g` decide, as the function returns what `g` does.
+    #[test]
+    fn return_type_from_what_the_callers_of_the_tail_callee_read() {
+        let lifter = X86Lifter::new_64();
+        let f = |after: &[u8]| {
+            let mut code = vec![
+                0xe8, 0x1b, 0x00, 0x00, 0x00, // 1000: f: call 0x1020
+                0xc3, // 1005: ret
+                0xe8, 0x15, 0x00, 0x00, 0x00, // 1006: a caller of g: call 0x1020
+            ];
+            code.extend_from_slice(after);
+            code.resize(0x20, 0x90);
+            code.extend_from_slice(&[0xff, 0x25, 0x00, 0x10, 0x00, 0x00]); // 1020: g: jmp [rip+0x1000]
+            let mem = make_memory(&code, 0x1000);
+            decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code
+        };
+        let ignored = f(&[0x31, 0xc0, 0xc3]); // xor eax, eax ; ret
+        assert!(ignored.contains("void f("), "{ignored}");
+        let tested = f(&[0x85, 0xc0, 0xc3]); // test eax, eax ; ret
+        assert!(tested.contains("uint64_t f("), "{tested}");
+    }
 
     /// A value the function stores and leaves in `xmm0` is returned only when callers read
     /// it (WS85: what was written last flipped the type of a void function).
