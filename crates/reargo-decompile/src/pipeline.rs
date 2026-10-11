@@ -2542,6 +2542,21 @@ mod tests {
         assert!(c.contains("isnan(xmm0_d)") && c.contains("xmm0_d == xmm1_d"), "{c}");
     }
 
+    /// WS86: `setnp dl; sete al; and al, dl` is `al = a == b` in one line.
+    #[test]
+    fn setnp_sete_and_is_one_float_equality() {
+        let code = [
+            0x0f, 0x2e, 0xc8, // ucomiss xmm1, xmm0
+            0x0f, 0x9b, 0xc2, // setnp dl
+            0x0f, 0x94, 0xc0, // sete al
+            0x20, 0xd0, // and al, dl
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("al = xmm1_d == xmm0_d;"), "{c}");
+        assert!(!c.contains("isnan"), "{c}");
+    }
+
     #[test]
     fn cmovne_cmovp_pair_selects_on_float_inequality() {
         let lifter = X86Lifter::new_64();
