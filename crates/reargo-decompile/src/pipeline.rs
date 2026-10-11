@@ -3134,6 +3134,66 @@ mod tests {
         assert!(!c.contains("case 3:") && !c.contains("default:"), "the table ends at the next one: {c}");
     }
 
+    /// WS86: the bounds check blocks before the dispatch (`cmp edi, 3; ja default`, then another
+    /// test, then the index copied): the table has 4 cases, though the entry after them is an
+    /// instruction of the function too.
+    #[test]
+    fn jump_table_bounded_blocks_before() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x83, 0xff, 0x03, // 0x1000 cmp edi, 3
+            0x77, 0x2f, // 0x1003 ja 0x1034
+            0x48, 0x85, 0xf6, // 0x1005 test rsi, rsi
+            0x74, 0x2d, // 0x1008 je 0x1037
+            0x89, 0xf8, // 0x100a mov eax, edi
+            0x48, 0x8d, 0x0d, 0xed, 0x00, 0x00, 0x00, // 0x100c lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x1013 movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1017 add rax, rcx
+            0xff, 0xe0, // 0x101a jmp rax
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, // 0x101c case 0
+            0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3, // 0x1022 case 1
+            0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3, // 0x1028 case 2
+            0xb8, 0x04, 0x00, 0x00, 0x00, 0xc3, // 0x102e case 3
+            0x31, 0xc0, 0xc3, // 0x1034 default: xor eax, eax; ret
+            0xb8, 0x09, 0x00, 0x00, 0x00, 0xc3, // 0x1037 other: mov eax, 9; ret
+        ];
+        let table: Vec<u8> = [0x101cu64, 0x1022, 0x1028, 0x102e, 0x1037].iter().flat_map(|&t| rel(t)).chain([0xff; 4]).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 3:") && !c.contains("case 4:"), "{c}");
+    }
+
+    /// WS86: … but a path joining inside the window with a larger index (`ja X` … `X: jmp D`,
+    /// the window starting before `D`) keeps the table as long as it reads.
+    #[test]
+    fn jump_table_with_a_path_joining_the_window_is_not_bounded() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let mut code: Vec<u8> = vec![
+            0x0f, 0xb6, 0x3a, // 0x1000 movzx edi, byte [rdx]
+            0x83, 0xff, 0x03, // 0x1003 cmp edi, 3
+            0x77, 0x19, // 0x1006 ja 0x1021
+            0x48, 0x85, 0xf6, // 0x1008 test rsi, rsi
+            0x74, 0x01, // 0x100b je 0x100e
+            0xc3, // 0x100d ret
+            0x45, 0x31, 0xe4, // 0x100e xor r12d, r12d
+            0x48, 0x8d, 0x0d, 0xe8, 0x00, 0x00, 0x00, // 0x1011 D: lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0xb9, // 0x1018 movsxd rax, [rcx+rdi*4]
+            0x48, 0x01, 0xc8, // 0x101c add rax, rcx
+            0xff, 0xe0, // 0x101f jmp rax
+            0xeb, 0xee, // 0x1021 jmp D
+        ];
+        for i in 0..6u8 {
+            code.extend([0xb8, i, 0x00, 0x00, 0x00, 0xc3]); // 0x1023 + 6i: mov eax, i; ret
+        }
+        let table: Vec<u8> = (0..6u64).map(|i| 0x1023 + 6 * i).flat_map(rel).chain([0xff; 4]).collect();
+        let mem = make_memory_parts(&[(0x1000, &code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && c.contains("case 5:"), "{c}");
+    }
+
     /// `needle` occurs after `marker` in `c`.
     fn at_least(c: &str, marker: &str, needle: &str) -> bool {
         c.find(marker).is_some_and(|m| c[m..].contains(needle))

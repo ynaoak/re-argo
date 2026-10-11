@@ -17,6 +17,7 @@ pub mod rust_emit;
 pub mod noreturn;
 pub mod optimize;
 pub mod pipeline;
+pub mod ranges;
 pub mod rotate;
 pub mod prototypes;
 pub mod printer;
