@@ -162,6 +162,24 @@ impl EmulatorState {
         self.get_space_mut(vn.space).write(vn.offset, vn.size, value & mask);
     }
 
+    /// A value of up to 16 bytes (an XMM register, a 16-byte load): the two 8-byte halves.
+    pub fn read_wide(&self, vn: &VarnodeData) -> u128 {
+        if vn.size <= 8 || vn.space == SpaceId::CONST {
+            return u128::from(self.read_varnode(vn));
+        }
+        let hi = VarnodeData::new(vn.space, vn.offset.wrapping_add(8), vn.size.min(16) - 8);
+        u128::from(self.read_varnode(&VarnodeData::new(vn.space, vn.offset, 8))) | u128::from(self.read_varnode(&hi)) << 64
+    }
+
+    pub fn write_wide(&mut self, vn: &VarnodeData, value: u128) {
+        if vn.size <= 8 {
+            return self.write_varnode(vn, value as u64);
+        }
+        self.write_varnode(&VarnodeData::new(vn.space, vn.offset, 8), value as u64);
+        let hi = VarnodeData::new(vn.space, vn.offset.wrapping_add(8), vn.size.min(16) - 8);
+        self.write_varnode(&hi, (value >> 64) as u64);
+    }
+
     pub fn read_register(&self, offset: u64, size: u32) -> u64 {
         self.read_varnode(&VarnodeData::new(SpaceId::REGISTER, offset, size))
     }

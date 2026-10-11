@@ -47,8 +47,14 @@ impl Emulator {
         match op.opcode {
             OpCode::Copy => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("COPY".into()))?;
-                let src = self.read_input(op, 0)?;
-                self.state.write_varnode(out, src);
+                let in_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "COPY".into(), index: 0 })?;
+                if out.size > 8 {
+                    let v = self.state.read_wide(in_vn);
+                    self.state.write_wide(out, v);
+                } else {
+                    let src = self.read_input(op, 0)?;
+                    self.state.write_varnode(out, src);
+                }
             }
 
             OpCode::IntAdd => {
@@ -213,8 +219,13 @@ impl Emulator {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("LOAD".into()))?;
                 let _space_id = self.read_input(op, 0)?;
                 let addr = self.read_input(op, 1)?;
-                let val = self.state.read_memory(addr, out.size);
-                self.state.write_varnode(out, val);
+                if out.size > 8 {
+                    let v = self.state.read_wide(&reargo_core::pcode::VarnodeData::new(SpaceId::RAM, addr, out.size));
+                    self.state.write_wide(out, v);
+                } else {
+                    let val = self.state.read_memory(addr, out.size);
+                    self.state.write_varnode(out, val);
+                }
             }
 
             OpCode::Store => {
@@ -222,7 +233,10 @@ impl Emulator {
                 let addr = self.read_input(op, 1)?;
                 let in_vn = op.input(2).ok_or_else(|| EmulatorError::MissingInput { op: "STORE".into(), index: 2 })?;
                 let val = self.state.read_varnode(in_vn);
-                if space_id == 1 {
+                if in_vn.size > 8 {
+                    let v = self.state.read_wide(in_vn);
+                    self.state.write_wide(&reargo_core::pcode::VarnodeData::new(SpaceId(space_id as u32), addr, in_vn.size), v);
+                } else if space_id == 1 {
                     self.state.write_memory(addr, in_vn.size, val);
                 } else {
                     self.state.write_varnode(
@@ -259,6 +273,11 @@ impl Emulator {
             OpCode::CallOther => {
                 use reargo_core::pcode::intrinsic;
                 if let (Some(out), Some(tag), Some(src)) = (op.output.as_ref(), op.input(0), op.input(1))
+                    && tag.space == SpaceId::CONST
+                    && let Some(v) = self.packed(tag.offset, src, op.input(2))
+                {
+                    self.state.write_wide(out, v);
+                } else if let (Some(out), Some(tag), Some(src)) = (op.output.as_ref(), op.input(0), op.input(1))
                     && tag.space == SpaceId::CONST
                 {
                     let bits = src.size.min(8) * 8;
@@ -611,12 +630,99 @@ impl Emulator {
         self.state.write_varnode(out, bits);
     }
 
+    /// The value of a lane-precise SIMD intrinsic (`pcmpeqb`, `pmovmskb`, the packed integer
+    /// ops of [`reargo_core::pcode::intrinsic::PACKED`]), or None for another tag.
+    fn packed(&self, tag: u64, a: &reargo_core::pcode::VarnodeData, b: Option<&reargo_core::pcode::VarnodeData>) -> Option<u128> {
+        use reargo_core::pcode::intrinsic;
+        let x = self.state.read_wide(a);
+        if tag == intrinsic::PMOVMSKB {
+            return Some((0..16).fold(0u128, |m, i| m | ((x >> (i * 8 + 7)) & 1) << i));
+        }
+        let name = if tag == intrinsic::PCMPEQB { "pcmpeqb" } else { intrinsic::name(tag).filter(|_| tag >= intrinsic::PACKED_BASE)? };
+        let y = self.state.read_wide(b?);
+        Some(packed_op(name, x, y))
+    }
+
     fn read_input(&self, op: &PcodeOp, index: usize) -> Result<u64, EmulatorError> {
         let vn = op.input(index).ok_or_else(|| EmulatorError::MissingInput {
             op: op.opcode.name().into(),
             index,
         })?;
         Ok(self.state.read_varnode(vn))
+    }
+}
+
+/// `name(x, y)` on 16-byte vectors, lane by lane as the SSE instruction does.
+fn packed_op(name: &str, x: u128, y: u128) -> u128 {
+    // lanes of `n` bytes: f(a, b) on each, the operands zero-extended
+    fn lanes(x: u128, y: u128, n: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
+        let bits = n * 8;
+        let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        (0..16 / n).fold(0u128, |acc, i| {
+            let s = i * bits;
+            let (a, b) = ((x >> s) as u64 & mask, (y >> s) as u64 & mask);
+            acc | u128::from(f(a, b) & mask) << s
+        })
+    }
+    let sx = |v: u64, n: u32| -> i64 {
+        let k = 64 - n * 8;
+        ((v << k) as i64) >> k
+    };
+    let all = |n: u32| if n == 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
+    let sat_s = |v: i64, n: u32| -> u64 {
+        let k = n * 8 - 1;
+        v.clamp(-(1i64 << k), (1i64 << k) - 1) as u64
+    };
+    let sat_u = |v: i64, n: u32| -> u64 { v.clamp(0, (1i64 << (n * 8)) - 1) as u64 };
+    let n: u32 = match name.as_bytes()[name.len() - 1] {
+        b'b' => 1,
+        b'w' => 2,
+        b'd' => 4,
+        _ => 8,
+    };
+    match name {
+        "paddb" | "paddw" => lanes(x, y, n, |a, b| a.wrapping_add(b)),
+        "psubb" | "psubw" => lanes(x, y, n, |a, b| a.wrapping_sub(b)),
+        "paddusb" | "paddusw" => lanes(x, y, n, |a, b| (a + b).min(all(n))),
+        "psubusb" | "psubusw" => lanes(x, y, n, |a, b| a.saturating_sub(b)),
+        "paddsb" | "paddsw" => lanes(x, y, n, |a, b| sat_s(sx(a, n) + sx(b, n), n)),
+        "psubsb" | "psubsw" => lanes(x, y, n, |a, b| sat_s(sx(a, n) - sx(b, n), n)),
+        "pminub" | "pminuw" | "pminud" => lanes(x, y, n, |a, b| a.min(b)),
+        "pmaxub" | "pmaxuw" | "pmaxud" => lanes(x, y, n, |a, b| a.max(b)),
+        "pminsb" | "pminsw" | "pminsd" => lanes(x, y, n, |a, b| if sx(a, n) < sx(b, n) { a } else { b }),
+        "pmaxsb" | "pmaxsw" | "pmaxsd" => lanes(x, y, n, |a, b| if sx(a, n) > sx(b, n) { a } else { b }),
+        "pcmpeqb" | "pcmpeqw" | "pcmpeqd" | "pcmpeqq" => lanes(x, y, n, |a, b| if a == b { u64::MAX } else { 0 }),
+        "pcmpgtb" | "pcmpgtw" | "pcmpgtd" | "pcmpgtq" => lanes(x, y, n, |a, b| if sx(a, n) > sx(b, n) { u64::MAX } else { 0 }),
+        "pavgb" | "pavgw" => lanes(x, y, n, |a, b| (a + b + 1) >> 1),
+        "pmullw" | "pmulld" => lanes(x, y, n, |a, b| a.wrapping_mul(b)),
+        "pmulhw" => lanes(x, y, 2, |a, b| ((sx(a, 2) * sx(b, 2)) >> 16) as u64),
+        "pmulhuw" => lanes(x, y, 2, |a, b| (a * b) >> 16),
+        "pmaddwd" => lanes(x, y, 4, |a, b| {
+            let p = |s: u32| sx((a >> s) & 0xffff, 2) * sx((b >> s) & 0xffff, 2);
+            (p(0) + p(16)) as u64
+        }),
+        "psadbw" => lanes(x, y, 8, |a, b| (0..8).map(|i| u64::from(((a >> (i * 8)) as u8).abs_diff((b >> (i * 8)) as u8))).sum()),
+        // narrow both operands' lanes with saturation: x's into the low half, y's into the high
+        "packsswb" | "packuswb" | "packssdw" | "packusdw" => {
+            let (from, signed) = match name {
+                "packsswb" => (2, true),
+                "packuswb" => (2, false),
+                "packssdw" => (4, true),
+                _ => (4, false),
+            };
+            let to = from / 2;
+            let per = 16 / from;
+            let mut out = 0u128;
+            for (k, v) in [x, y].into_iter().enumerate() {
+                for i in 0..per {
+                    let lane = sx((v >> (i * from * 8)) as u64 & all(from), from);
+                    let r = if signed { sat_s(lane, to) } else { sat_u(lane, to) } & all(to);
+                    out |= u128::from(r) << ((k as u32 * per + i) * to * 8);
+                }
+            }
+            out
+        }
+        _ => x,
     }
 }
 

@@ -1110,6 +1110,19 @@ impl X86Lifter {
             return Ok(ops);
         }
 
+        // packed integer ops lane by lane (WS85): `xmm0 = paddb(xmm0, xmm1)` on the whole register
+        if let Some(tag) = packed_int_name(m).and_then(reargo_core::pcode::intrinsic::packed_tag) {
+            let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+            let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+            ops.push(PcodeOp {
+                opcode: OpCode::CallOther,
+                seq: seq(sb),
+                output: Some(dst),
+                inputs: SmallVec::from_slice(&[constant(tag, 8), dst, src]),
+            });
+            return Ok(ops);
+        }
+
         match m {
             // sqrt: dst (xmm) = sqrt(src)
             Sqrtsd | Sqrtss => {
@@ -1408,15 +1421,14 @@ impl X86Lifter {
             // carry), so the low-lane element op is exact for lane 0 and keeps
             // the dataflow — these drive vectorized coordinate/PRNG math in
             // structure placement.
-            Paddd | Psubd | Paddq | Psubq | Paddw | Psubw => {
+            Paddd | Psubd | Paddq | Psubq => {
                 let el = match m {
                     Paddq | Psubq => 8,
-                    Paddw | Psubw => 2,
                     _ => 4,
                 };
                 let dst = self.sse_operand(insn, 0, el, &mut ops, &mut sb, address)?;
                 let src = self.sse_operand(insn, 1, el, &mut ops, &mut sb, address)?;
-                let opcode = if matches!(m, Psubd | Psubq | Psubw) {
+                let opcode = if matches!(m, Psubd | Psubq) {
                     OpCode::IntSub
                 } else {
                     OpCode::IntAdd
@@ -2077,6 +2089,57 @@ impl PcodeLift for X86Lifter {
 /// `ah`/`ch`/`dh`/`bh` are never kept as views: a read is preceded by
 /// `ah = SUBPIECE(rax, 1)`, and a write rebuilds `ax = PIECE(ah, al)` and then
 /// rax from ax as a 16-bit write would (WS84).
+/// The packed integer instructions lifted as [`reargo_core::pcode::intrinsic::PACKED`].
+fn packed_int_name(m: iced_x86::Mnemonic) -> Option<&'static str> {
+    use iced_x86::Mnemonic::*;
+    Some(match m {
+        Paddb => "paddb",
+        Paddw => "paddw",
+        Psubb => "psubb",
+        Psubw => "psubw",
+        Paddusb => "paddusb",
+        Paddusw => "paddusw",
+        Psubusb => "psubusb",
+        Psubusw => "psubusw",
+        Paddsb => "paddsb",
+        Paddsw => "paddsw",
+        Psubsb => "psubsb",
+        Psubsw => "psubsw",
+        Pminub => "pminub",
+        Pmaxub => "pmaxub",
+        Pminsw => "pminsw",
+        Pmaxsw => "pmaxsw",
+        Pminsb => "pminsb",
+        Pmaxsb => "pmaxsb",
+        Pminuw => "pminuw",
+        Pmaxuw => "pmaxuw",
+        Pminsd => "pminsd",
+        Pmaxsd => "pmaxsd",
+        Pminud => "pminud",
+        Pmaxud => "pmaxud",
+        Pcmpeqw => "pcmpeqw",
+        Pcmpeqd => "pcmpeqd",
+        Pcmpeqq => "pcmpeqq",
+        Pcmpgtb => "pcmpgtb",
+        Pcmpgtw => "pcmpgtw",
+        Pcmpgtd => "pcmpgtd",
+        Pcmpgtq => "pcmpgtq",
+        Pavgb => "pavgb",
+        Pavgw => "pavgw",
+        Pmullw => "pmullw",
+        Pmulhw => "pmulhw",
+        Pmulhuw => "pmulhuw",
+        Pmulld => "pmulld",
+        Pmaddwd => "pmaddwd",
+        Psadbw => "psadbw",
+        Packsswb => "packsswb",
+        Packuswb => "packuswb",
+        Packssdw => "packssdw",
+        Packusdw => "packusdw",
+        _ => return None,
+    })
+}
+
 /// Temporaries of the parity computation: one range, so a function whose code never reads PF
 /// can drop them (`strip_unread_parity`).
 pub const PARITY_TMP: std::ops::Range<u64> = 0x2e00..0x2f00;

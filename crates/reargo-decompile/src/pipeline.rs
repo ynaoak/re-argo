@@ -2443,6 +2443,25 @@ mod tests {
     /// `popcnt` / `lzcnt` / `tzcnt` / `bswap` keep their dataflow and print by name (WS84: they
     /// were `__unmodeled_insn()` and the result register was never written).
     #[test]
+    fn packed_integer_ops_print_by_name() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x66, 0x0f, 0xfc, 0xc1, // paddb xmm0, xmm1
+            0x66, 0x0f, 0xda, 0xc2, // pminub xmm0, xmm2
+            0x66, 0x0f, 0xde, 0xc3, // pmaxub xmm0, xmm3
+            0x66, 0x0f, 0x76, 0xc1, // pcmpeqd xmm0, xmm1
+            0x66, 0x48, 0x0f, 0x7e, 0xc0, // movq rax, xmm0
+            0xc3, // ret
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        for f in ["paddb(xmm0, xmm1)", "pminub(xmm0, xmm2)", "pmaxub(xmm0, xmm3)", "pcmpeqd(xmm0, xmm1)"] {
+            assert!(c.contains(f), "{f}: {c}");
+        }
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+    }
+
+    #[test]
     fn bit_count_instructions_print_by_name() {
         let lifter = X86Lifter::new_64();
         let code = [

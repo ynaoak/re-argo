@@ -552,6 +552,24 @@ pub mod intrinsic {
     /// (`reargo_decompile::noreturn`). Prints nothing; control does not fall through it.
     pub const NORETURN: u64 = 0xff;
 
+    /// Packed integer SIMD on whole 16-byte registers (WS85): `dst = op(dst, src)` lane by
+    /// lane, named after the instruction (`xmm0 = paddb(xmm0, xmm1)`). The tag is
+    /// `PACKED_BASE + index` into [`PACKED`].
+    pub const PACKED_BASE: u64 = 0x140;
+    pub const PACKED: &[&str] = &[
+        "paddb", "paddw", "psubb", "psubw", "paddusb", "paddusw", "psubusb", "psubusw", "paddsb",
+        "paddsw", "psubsb", "psubsw", "pminub", "pmaxub", "pminsw", "pmaxsw", "pminsb", "pmaxsb",
+        "pminuw", "pmaxuw", "pminsd", "pmaxsd", "pminud", "pmaxud", "pcmpeqw", "pcmpeqd",
+        "pcmpeqq", "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq", "pavgb", "pavgw", "pmullw",
+        "pmulhw", "pmulhuw", "pmulld", "pmaddwd", "psadbw", "packsswb", "packuswb", "packssdw",
+        "packusdw",
+    ];
+
+    /// The tag of a packed integer instruction by its mnemonic (`"paddb"`).
+    pub fn packed_tag(mnemonic: &str) -> Option<u64> {
+        PACKED.iter().position(|&m| m == mnemonic).map(|i| PACKED_BASE + i as u64)
+    }
+
     /// Map an intrinsic tag to its rendered name, or None if `tag` is not a
     /// named intrinsic (e.g. 0 generic / 3 int3).
     pub fn name(tag: u64) -> Option<&'static str> {
@@ -562,6 +580,7 @@ pub mod intrinsic {
             PCMPEQB => "pcmpeqb",
             TZCNT => "tzcnt",
             BSWAP => "bswap",
+            t if (PACKED_BASE..PACKED_BASE + PACKED.len() as u64).contains(&t) => PACKED[(t - PACKED_BASE) as usize],
             _ => return None,
         })
     }

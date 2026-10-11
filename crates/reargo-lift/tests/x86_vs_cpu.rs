@@ -918,3 +918,88 @@ fn scalar_float_matches_the_cpu() {
  cvttsd2si eax, xmm0", d_arith, Inputs::Floats) });
     check(&cases);
 }
+
+/// A packed integer op on whole registers: xmm0 = (rax, rcx) and xmm1 = (rcx, rdx) through the
+/// stack, the result back in rax (low half) and rdx (high half).
+macro_rules! packed {
+    ($op:literal) => {
+        packed!($op, None)
+    };
+    ($op:literal, $needs:expr) => {
+        Case {
+            asm: $op,
+            f: cpu!(
+                "lea rsp, [rsp-32]\n mov [rsp], rax\n mov [rsp+8], rcx\n mov [rsp+16], rcx\n mov [rsp+24], rdx\n",
+                " movdqu xmm0, [rsp]\n movdqu xmm1, [rsp+16]\n ",
+                $op,
+                " xmm0, xmm1\n movdqu [rsp], xmm0\n mov rax, [rsp]\n mov rdx, [rsp+8]\n lea rsp, [rsp+32]"
+            ),
+            defined: d_packed,
+            inputs: Inputs::Values,
+            needs: $needs,
+            valid: None,
+        }
+    };
+}
+
+fn d_packed(_: u64, _: u64, _: u64) -> (u64, u8) {
+    (ARITH, RAX | RDX)
+}
+
+fn sse41() -> bool {
+    std::is_x86_feature_detected!("sse4.1")
+}
+fn sse42() -> bool {
+    std::is_x86_feature_detected!("sse4.2")
+}
+
+#[test]
+fn packed_integer_ops_match_the_cpu() {
+    let cases = vec![
+        packed!("paddb"),
+        packed!("paddw"),
+        packed!("psubb"),
+        packed!("psubw"),
+        packed!("paddusb"),
+        packed!("paddusw"),
+        packed!("psubusb"),
+        packed!("psubusw"),
+        packed!("paddsb"),
+        packed!("paddsw"),
+        packed!("psubsb"),
+        packed!("psubsw"),
+        packed!("pminub"),
+        packed!("pmaxub"),
+        packed!("pminsw"),
+        packed!("pmaxsw"),
+        packed!("pminsb", Some(sse41)),
+        packed!("pmaxsb", Some(sse41)),
+        packed!("pminuw", Some(sse41)),
+        packed!("pmaxuw", Some(sse41)),
+        packed!("pminsd", Some(sse41)),
+        packed!("pmaxsd", Some(sse41)),
+        packed!("pminud", Some(sse41)),
+        packed!("pmaxud", Some(sse41)),
+        packed!("pcmpeqb"),
+        packed!("pcmpeqw"),
+        packed!("pcmpeqd"),
+        packed!("pcmpeqq", Some(sse41)),
+        packed!("pcmpgtb"),
+        packed!("pcmpgtw"),
+        packed!("pcmpgtd"),
+        packed!("pcmpgtq", Some(sse42)),
+        packed!("pavgb"),
+        packed!("pavgw"),
+        packed!("pmullw"),
+        packed!("pmulhw"),
+        packed!("pmulhuw"),
+        packed!("pmulld", Some(sse41)),
+        packed!("pmaddwd"),
+        packed!("psadbw"),
+        packed!("packsswb"),
+        packed!("packuswb"),
+        packed!("packssdw"),
+        packed!("packusdw", Some(sse41)),
+    ];
+    check(&cases);
+}
