@@ -2576,6 +2576,21 @@ mod tests {
         assert_eq!(swap, ["tmp_560 = rsi;", "rsi = rdi;", "rdi = tmp_560;"].iter().filter(|l| l.contains("tmp_560")).copied().collect::<Vec<_>>(), "{c}");
     }
 
+    /// WS86: `sete [rsi+0x18]` loads and stores through two copies of one address; common
+    /// subexpression elimination kept the first, whose only reader (the load) died — the address
+    /// went with it and the store named a temporary nothing set.
+    #[test]
+    fn address_shared_by_a_dead_load_and_a_store_is_kept() {
+        let code = [
+            0x48, 0x39, 0xfe, // cmp rsi, rdi
+            0x0f, 0x94, 0x46, 0x18, // sete [rsi+0x18]
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("rsi + 0x18"), "{c}");
+        assert!(!c.contains("tmp_600") || c.contains("tmp_600 = rsi + 0x18;"), "{c}");
+    }
+
     #[test]
     fn rotates_print_as_rotl_rotr() {
         let lifter = X86Lifter::new_64();
