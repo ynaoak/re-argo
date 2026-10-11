@@ -548,6 +548,10 @@ pub mod intrinsic {
     pub const TZCNT: u64 = 0x104;
     /// `bswap`: the bytes in reverse order
     pub const BSWAP: u64 = 0x105;
+    /// `rotl(x, n)` / `rotr(x, n)`: not lifted (p-code has shifts), the decompiler's name for
+    /// `x << n | x >> (w - n)` (WS85, `reargo_decompile::rotate`)
+    pub const ROTL: u64 = 0x106;
+    pub const ROTR: u64 = 0x107;
     /// Not an instruction: the decompiler's marker after a call that never returns
     /// (`reargo_decompile::noreturn`). Prints nothing; control does not fall through it.
     pub const NORETURN: u64 = 0xff;
@@ -580,6 +584,8 @@ pub mod intrinsic {
             PCMPEQB => "pcmpeqb",
             TZCNT => "tzcnt",
             BSWAP => "bswap",
+            ROTL => "rotl",
+            ROTR => "rotr",
             t if (PACKED_BASE..PACKED_BASE + PACKED.len() as u64).contains(&t) => PACKED[(t - PACKED_BASE) as usize],
             _ => return None,
         })

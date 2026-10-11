@@ -1034,6 +1034,8 @@ fn build_decompile_result(
     if crate::select::recover_selects(&mut ssa) + flags > 0 {
         opt_stats.dead_ops_removed += crate::optimize::dead_code_elimination(&mut ssa);
     }
+    // WS85: `x << n | x >> (w - n)` is `rotl(x, n)`
+    crate::rotate::recover_rotates(&mut ssa);
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
         ssa.signature_params = Some(signature_params(&ssa, info, &args));
@@ -2483,6 +2485,25 @@ mod tests {
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("eax = (xmm0_d != xmm1_d) ? esi : eax;"), "{c}");
         assert!(!c.contains("isnan"), "{c}");
+    }
+
+    #[test]
+    fn rotates_print_as_rotl_rotr() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0xc1, 0xc7, 0x11, // rol rdi, 0x11
+            0x48, 0xc1, 0xce, 0x05, // ror rsi, 5
+            0xd3, 0xc2, // rol edx, cl
+            0x48, 0x89, 0xf8, // mov rax, rdi
+            0x48, 0x31, 0xf0, // xor rax, rsi
+            0x48, 0x31, 0xd0, // xor rax, rdx
+            0xc3,
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        for f in ["rotl(rdi, 0x11)", "rotr(rsi, 5)", "rotl(edx, tmp_2000)"] {
+            assert!(c.contains(f), "{f}: {c}");
+        }
+        assert!(!c.contains("<<"), "{c}");
     }
 
     #[test]

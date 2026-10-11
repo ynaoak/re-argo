@@ -310,6 +310,8 @@ impl X86Lifter {
             // the rotation is by `count mod width` (`rol al, 8` rotates by 0 but sets CF)
             let r = match &n {
                 Count::Const(k) => constant(k & (w - 1), sz),
+                // (the count mask already is `w - 1` for 32 / 64 bits)
+                Count::Var(v) if w >= 32 => *v,
                 Count::Var(v) => e.tmp(OpCode::IntAnd, v.size, &[*v, constant(w - 1, v.size)]),
             };
             let comp = e.tmp(OpCode::IntSub, r.size, &[constant(w, r.size), r]);
