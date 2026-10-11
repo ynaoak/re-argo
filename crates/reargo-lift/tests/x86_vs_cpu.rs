@@ -4,8 +4,7 @@
 //! `popfq`, out via `pushfq`), takes the very bytes it executed, lifts them, runs the p-code in
 //! the p-code emulator from the same registers and flags, and compares the result registers and
 //! every flag the Intel SDM defines for that instruction and input (flags it leaves unaffected
-//! count as defined: they must keep their input value). PF is not modelled for integer ops and
-//! is never compared.
+//! count as defined: they must keep their input value).
 //!
 //! Registers: `a` = rax, `b` = rcx (also the `cl` count), `c` = rdx.
 #![cfg(target_arch = "x86_64")]
@@ -22,7 +21,8 @@ const CF: u64 = 0x1;
 const ZF: u64 = 0x40;
 const SF: u64 = 0x80;
 const OF: u64 = 0x800;
-const ARITH: u64 = CF | ZF | SF | OF;
+const PF: u64 = 0x4;
+const ARITH: u64 = CF | PF | ZF | SF | OF;
 /// (EFLAGS bit, register offset of the lifter's 1-byte flag).
 const FLAGS: [(u64, u64); 5] = [(CF, 0x201), (0x4, 0x202), (ZF, 0x206), (SF, 0x207), (OF, 0x20b)];
 
@@ -189,8 +189,8 @@ impl Rng {
 
 /// The flag inputs to try: none set, all set, and a random mix.
 fn flag_inputs(rng: &mut Rng) -> [u64; 3] {
-    let mix = rng.next() & (ARITH | 0x4);
-    [0x2, 0x2 | ARITH | 0x4, 0x2 | mix]
+    let mix = rng.next() & ARITH;
+    [0x2, 0x2 | ARITH, 0x2 | mix]
 }
 
 fn inputs(kind: Inputs, rng: &mut Rng) -> Vec<(u64, u64, u64, u64)> {
@@ -308,7 +308,7 @@ fn emulate(ops: &[PcodeOp], a: u64, b: u64, c: u64, fl: u64) -> (Out, bool) {
 }
 
 fn flag_names(mask: u64) -> String {
-    [(CF, "CF"), (ZF, "ZF"), (SF, "SF"), (OF, "OF")]
+    [(CF, "CF"), (PF, "PF"), (ZF, "ZF"), (SF, "SF"), (OF, "OF")]
         .iter()
         .filter(|(b, _)| mask & b != 0)
         .map(|(_, n)| *n)
@@ -410,11 +410,11 @@ fn d_shift<const W: u32, const IMM: i64, const K: u8>(_: u64, b: u64, _: u64) ->
     }
     let of = if n == 1 { OF } else { 0 };
     match K {
-        // rotates leave SF/ZF unaffected
-        ROL | ROR => (CF | ZF | SF | of, RAX),
+        // rotates leave SF/ZF/PF unaffected
+        ROL | ROR => (CF | PF | ZF | SF | of, RAX),
         // CF is undefined for SHL/SHR by >= the operand width
-        SHL | SHR if n >= u64::from(W) => (ZF | SF | of, RAX),
-        _ => (CF | ZF | SF | of, RAX),
+        SHL | SHR if n >= u64::from(W) => (PF | ZF | SF | of, RAX),
+        _ => (CF | PF | ZF | SF | of, RAX),
     }
 }
 
@@ -428,7 +428,7 @@ fn d_dshift<const W: u32, const IMM: i64>(_: u64, b: u64, _: u64) -> (u64, u8) {
     if n > u64::from(W) {
         return (0, 0); // result and flags undefined
     }
-    (CF | ZF | SF | if n == 1 { OF } else { 0 }, RAX)
+    (CF | PF | ZF | SF | if n == 1 { OF } else { 0 }, RAX)
 }
 
 /// `bt`/`bts`/`btr`/`btc`: CF = the bit, ZF unaffected, OF/SF undefined.
@@ -541,8 +541,7 @@ fn conditions_match_the_cpu() {
             )+]
         };
     }
-    // (parity conditions are not modelled: PF is not tracked for integer ops)
-    let mut cases = cc!("o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "l", "ge", "le", "g");
+    let mut cases = cc!("o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "l", "ge", "le", "g", "p", "np");
     cases.extend([
         case!("clc", d_arith, Inputs::Flags),
         case!("stc", d_arith, Inputs::Flags),
@@ -752,13 +751,12 @@ fn fits_i32_f64(a: u64, _: u64, _: u64) -> bool {
     x.is_finite() && x > -2147483648.0 && x < 2147483647.0
 }
 
-/// `comis…`/`ucomis…` of an `N`-byte float in a and b: OF/SF cleared, CF = below or
+/// `comis…`/`ucomis…` of an `N`-byte float: OF/SF cleared, PF = unordered, CF = below or
 /// unordered. (Unordered also sets ZF = 1 on the CPU; the lifter keeps ZF as the plain `==`,
-/// which only `je`/`jne`/`sete`… read, and compilers pair those with the PF test, so ZF is only
-/// compared for ordered inputs.)
+/// so ZF is only compared for ordered inputs.)
 fn d_fcmp<const N: u32>(a: u64, b: u64, _: u64) -> (u64, u8) {
     let nan = |x: u64| if N == 4 { f32::from_bits(x as u32).is_nan() } else { f64::from_bits(x).is_nan() };
-    (if nan(a) || nan(b) { CF | OF | SF } else { ARITH }, RAX)
+    (if nan(a) || nan(b) { ARITH & !ZF } else { ARITH }, RAX)
 }
 
 #[test]
@@ -804,6 +802,23 @@ fn scalar_float_matches_the_cpu() {
  movq xmm1, rcx
  ucomisd xmm0, xmm1
  setbe al", d_fcmp::<8>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomisd xmm0, xmm1
+ setnp al
+ sete cl
+ and al, cl", d_fcmp::<8>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ setp al
+ setne cl
+ or al, cl", d_fcmp::<4>, Inputs::Floats),
+        case!("movq xmm0, rax
+ movq xmm1, rcx
+ ucomiss xmm0, xmm1
+ cmovne eax, edx
+ cmovp eax, edx", d_fcmp::<4>, Inputs::Floats),
         case!("cvtsi2ss xmm0, ecx
  movd eax, xmm0", d_arith, Inputs::Values),
         case!("cvtsi2sd xmm0, rcx

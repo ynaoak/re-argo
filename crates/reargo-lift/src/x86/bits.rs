@@ -80,6 +80,11 @@ impl<'a> Emit<'a> {
         (z, s)
     }
 
+    /// PF of a result (the low byte has even parity).
+    fn pf(&mut self, r: VarnodeData) -> VarnodeData {
+        parity_of(r, self.ops, self.seq, self.at.offset)
+    }
+
     /// Write `flag = value`, or `flag = changed ? value : flag` when `changed` is given.
     fn flag(&mut self, off: u64, value: VarnodeData, changed: Option<VarnodeData>) {
         match changed {
@@ -213,7 +218,7 @@ impl X86Lifter {
                 Ok(ops)
             }
             Cmova | Cmovae | Cmovb | Cmovbe | Cmove | Cmovne | Cmovg | Cmovge | Cmovl | Cmovle
-            | Cmovo | Cmovno | Cmovs | Cmovns => self.lift_cmov(insn, address),
+            | Cmovo | Cmovno | Cmovs | Cmovns | Cmovp | Cmovnp => self.lift_cmov(insn, address),
             _ => return None,
         };
         Some(lifted.map(|mut ops| {
@@ -265,6 +270,7 @@ impl X86Lifter {
             };
             e.set(opcode, dst, &[dst, nv]);
             let (zf, sf) = e.zf_sf(dst);
+            let pf = e.pf(dst);
             // OF (defined for a 1-bit shift only): SHL = MSB(result) ^ CF, SHR = the old MSB,
             // SAR = 0
             let of = match mnem {
@@ -276,6 +282,7 @@ impl X86Lifter {
             e.flag(CF_OFFSET, cf, ch);
             e.flag(ZF_OFFSET, zf, ch);
             e.flag(SF_OFFSET, sf, ch);
+            e.flag(PF_OFFSET, pf, ch);
             match n {
                 Count::Const(1) | Count::Var(_) => e.flag(OF_OFFSET, of.unwrap(), ch),
                 Count::Const(_) => {} // undefined: left as it was
@@ -369,11 +376,13 @@ impl X86Lifter {
             let b = e.tmp(second, sz, &[src, comp]);
             e.set(OpCode::IntOr, dst, &[a, b]);
             let (zf, sf) = e.zf_sf(dst);
+            let pf = e.pf(dst);
             let of = e.tmp(OpCode::BoolXor, 1, &[sf, old_msb]);
             let ch = changed(&mut e, &n);
             e.flag(CF_OFFSET, cf, ch);
             e.flag(ZF_OFFSET, zf, ch);
             e.flag(SF_OFFSET, sf, ch);
+            e.flag(PF_OFFSET, pf, ch);
             match n {
                 Count::Const(1) | Count::Var(_) => e.flag(OF_OFFSET, of, ch),
                 Count::Const(_) => {}
@@ -409,8 +418,10 @@ impl X86Lifter {
             e.set(OpCode::BoolOr, reg(CF_OFFSET, 1), &[c1, c2]);
             e.set(OpCode::BoolXor, reg(OF_OFFSET, 1), &[o1, o2]);
             let (zf, sf) = e.zf_sf(dst);
+            let pf = e.pf(dst);
             e.flag(ZF_OFFSET, zf, None);
             e.flag(SF_OFFSET, sf, None);
+            e.flag(PF_OFFSET, pf, None);
         }
         self.write_back_if_memory(insn, 0, dst, &mut ops, &mut sb, address)?;
         Ok(ops)
@@ -551,8 +562,10 @@ impl X86Lifter {
             e.set(OpCode::IntLess, reg(CF_OFFSET, 1), &[acc, old]);
             e.set(OpCode::IntSBorrow, reg(OF_OFFSET, 1), &[acc, old]);
             let (zf, sf) = e.zf_sf(d);
+            let pf = e.pf(d);
             e.flag(ZF_OFFSET, zf, None);
             e.flag(SF_OFFSET, sf, None);
+            e.flag(PF_OFFSET, pf, None);
             let zf = reg(ZF_OFFSET, 1);
             newdst = e.tmp(OpCode::Select, sz, &[zf, src, old]);
             // the accumulator is written only when not equal (`eax` then zero-extends into
@@ -616,7 +629,7 @@ impl X86Lifter {
             _ => {
                 e.set(OpCode::PopCount, dst, &[src]);
                 e.flag(ZF_OFFSET, zero, None);
-                for f in [CF_OFFSET, OF_OFFSET, SF_OFFSET] {
+                for f in [CF_OFFSET, OF_OFFSET, SF_OFFSET, PF_OFFSET] {
                     e.flag(f, constant(0, 1), None);
                 }
             }
@@ -644,7 +657,6 @@ impl X86Lifter {
         let src = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
         let (cc, negated) = positive_cc(insn.condition_code());
         let Some(c) = self.cc_condition(cc, &mut ops, &mut sb, address) else {
-            // parity (PF is not modelled for integer ops): leave dst as it was
             return Ok(ops);
         };
         let mut e = Emit::new(&mut ops, &mut sb, address);

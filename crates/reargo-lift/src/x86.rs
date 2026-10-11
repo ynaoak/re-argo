@@ -562,6 +562,7 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
                 });
                 seq_base += 1;
+                emit_pf(tmp, &mut ops, &mut seq_base, address);
                 let cf = reg(CF_OFFSET, 1);
                 ops.push(PcodeOp {
                     opcode: OpCode::IntLess,
@@ -607,6 +608,7 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[tmp, constant(0, tmp.size)]),
                 });
                 seq_base += 1;
+                emit_pf(tmp, &mut ops, &mut seq_base, address);
                 // TEST clears CF and OF (x86 manual). Without this a `jg` / `jle` after
                 // `test` read the OF of an earlier `dec` / `sub` (WS82).
                 self.emit_clear_cf_of(&mut ops, &mut seq_base, address);
@@ -992,7 +994,7 @@ impl X86Lifter {
             // Reuses the shared cc_condition flag formulas. Parity codes (no PF)
             // fall back to writing 0.
             Seta | Setae | Setb | Setbe | Sete | Setne | Setg | Setge | Setl | Setle
-            | Seto | Setno | Sets | Setns => {
+            | Seto | Setno | Sets | Setns | Setp | Setnp => {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let cond = self
                     .cc_condition(insn.condition_code(), &mut ops, &mut seq_base, address)
@@ -1564,6 +1566,7 @@ impl X86Lifter {
             inputs: SmallVec::from_slice(&[result, zero]),
         });
         *seq_base += 1;
+        emit_pf(result, ops, seq_base, address);
     }
 
     /// AND/OR/XOR clear CF and OF unconditionally.
@@ -1733,7 +1736,9 @@ impl X86Lifter {
                 let t = bool_or(zf, x, 0x4a4, ops, seq_base);
                 self.emit_not(t, 0x4a6, ops, seq_base, address)
             }
-            _ => return None, // p / np (PF unmodelled) and None
+            C::p => reg(PF_OFFSET, 1),
+            C::np => self.emit_not(reg(PF_OFFSET, 1), 0x4a8, ops, seq_base, address),
+            _ => return None,
         })
     }
 
@@ -1960,6 +1965,23 @@ impl X86Lifter {
 }
 
 impl PcodeLift for X86Lifter {
+    /// The trait's contiguous lift, then [`strip_unread_parity`] over the range.
+    fn lift_range(&self, memory: &Memory, start: u64, count: usize) -> Result<Vec<LiftedInstruction>, LiftError> {
+        let mut results = Vec::with_capacity(count);
+        let mut addr = start;
+        for _ in 0..count {
+            match self.lift_instruction(memory, addr) {
+                Ok(lifted) => {
+                    addr += lifted.length as u64;
+                    results.push(lifted);
+                }
+                Err(_) => break,
+            }
+        }
+        strip_unread_parity(&mut results);
+        Ok(results)
+    }
+
     /// System V AMD64 (64-bit only): rdi rsi rdx rcx r8 r9, xmm0-7; returns in rax / xmm0.
     fn call_convention(&self) -> Option<crate::lift::CallConvention> {
         if !self.is_64 {
@@ -2055,6 +2077,64 @@ impl PcodeLift for X86Lifter {
 /// `ah`/`ch`/`dh`/`bh` are never kept as views: a read is preceded by
 /// `ah = SUBPIECE(rax, 1)`, and a write rebuilds `ax = PIECE(ah, al)` and then
 /// rax from ax as a 16-bit write would (WS84).
+/// Temporaries of the parity computation: one range, so a function whose code never reads PF
+/// can drop them (`strip_unread_parity`).
+pub const PARITY_TMP: std::ops::Range<u64> = 0x2e00..0x2f00;
+
+/// PF of a result (WS85): the low byte has an even number of set bits,
+/// `(popcount((uint8_t)r) & 1) == 0`. Returns the boolean (a temporary).
+fn parity_of(result: VarnodeData, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, address: u64) -> VarnodeData {
+    let mut put = |opcode: OpCode, out: VarnodeData, inputs: &[VarnodeData], ops: &mut Vec<PcodeOp>| {
+        ops.push(PcodeOp {
+            opcode,
+            seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
+            output: Some(out),
+            inputs: SmallVec::from_slice(inputs),
+        });
+        *seq_base += 1;
+    };
+    let low = if result.size == 1 && result.space != CONST_SPACE {
+        result
+    } else if result.space == CONST_SPACE {
+        constant(result.offset & 0xff, 1)
+    } else {
+        let t = unique(PARITY_TMP.start, 1);
+        put(OpCode::Subpiece, t, &[result, constant(0, 4)], ops);
+        t
+    };
+    let n = unique(PARITY_TMP.start + 0x10, 1);
+    put(OpCode::PopCount, n, &[low], ops);
+    let odd = unique(PARITY_TMP.start + 0x20, 1);
+    put(OpCode::IntAnd, odd, &[n, constant(1, 1)], ops);
+    let even = unique(PARITY_TMP.start + 0x30, 1);
+    put(OpCode::IntEqual, even, &[odd, constant(0, 1)], ops);
+    even
+}
+
+/// `PF = parity_of(result)`, the last op writing the flag.
+fn emit_pf(result: VarnodeData, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, address: u64) {
+    parity_of(result, ops, seq_base, address);
+    if let Some(last) = ops.last_mut() {
+        last.output = Some(reg(PF_OFFSET, 1));
+    }
+}
+
+/// Drop the PF computations of integer instructions when nothing in `lifted` reads PF (WS85:
+/// PF is only read after float compares in practice; the four ops per arithmetic instruction
+/// would otherwise go through SSA and dead-code elimination for nothing).
+pub fn strip_unread_parity(lifted: &mut [LiftedInstruction]) {
+    let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
+    if lifted.iter().any(|i| i.ops.iter().any(|o| o.inputs.iter().any(pf))) {
+        return;
+    }
+    let tmp = |v: &VarnodeData| v.space == UNIQUE_SPACE && PARITY_TMP.contains(&v.offset);
+    for i in lifted.iter_mut() {
+        if i.ops.iter().any(|o| o.output.as_ref().is_some_and(tmp)) {
+            i.ops.retain(|o| !o.output.as_ref().is_some_and(|v| tmp(v) || pf(v) && o.inputs.iter().any(tmp)));
+        }
+    }
+}
+
 fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
     let gpr = |v: &VarnodeData| {
         (v.space == REG_SPACE && v.offset < 0xC0 && v.offset.is_multiple_of(8) && matches!(v.size, 1 | 2 | 4 | 8))
@@ -3100,21 +3180,35 @@ mod tests {
     }
 
     #[test]
+    fn unread_parity_is_dropped_from_a_range() {
+        let lifter = X86Lifter::new_64();
+        // cmp eax, 0; je +0 / the same with jp
+        for (jcc, kept) in [(0x74u8, false), (0x7a, true)] {
+            let mem = make_memory(&[0x83, 0xf8, 0x00, jcc, 0x00], 0x1000);
+            let r = lifter.lift_range(&mem, 0x1000, 2).unwrap();
+            let pf = r[0].ops.iter().any(|o| o.output.is_some_and(|v| v.space == REG_SPACE && v.offset == PF_OFFSET));
+            let popcount = r[0].ops.iter().any(|o| o.opcode == OpCode::PopCount);
+            assert_eq!((pf, popcount), (kept, kept), "jcc {jcc:#x}");
+        }
+    }
+
+    #[test]
     fn lift_cmp() {
         let lifter = X86Lifter::new_64();
         // cmp eax, 0 = 83 f8 00
         let mem = make_memory(&[0x83, 0xf8, 0x00], 0x1000);
         let lifted = lifter.lift_instruction(&mem, 0x1000).unwrap();
-        // Cmp produces IntSub (to a unique), then ZF/SF/CF/OF.
+        // Cmp produces IntSub (to a unique), then ZF/SF/PF/CF/OF.
         // Without OF (added in this round), JL/JGE silently
         // flipped on signed overflow of (left - right).
-        assert_eq!(lifted.ops.len(), 5);
-        assert_eq!(lifted.ops[0].opcode, OpCode::IntSub);
-        assert_eq!(lifted.ops[1].opcode, OpCode::IntEqual);
-        assert_eq!(lifted.ops[2].opcode, OpCode::IntSLess);
-        assert_eq!(lifted.ops[3].opcode, OpCode::IntLess);
-        assert_eq!(lifted.ops[4].opcode, OpCode::IntSBorrow);
-        assert_eq!(lifted.ops[4].output.unwrap().offset, OF_OFFSET);
+        let codes: Vec<OpCode> = lifted.ops.iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            codes,
+            [OpCode::IntSub, OpCode::IntEqual, OpCode::IntSLess, OpCode::Subpiece, OpCode::PopCount,
+             OpCode::IntAnd, OpCode::IntEqual, OpCode::IntLess, OpCode::IntSBorrow]
+        );
+        assert_eq!(lifted.ops[6].output.unwrap().offset, PF_OFFSET);
+        assert_eq!(lifted.ops[8].output.unwrap().offset, OF_OFFSET);
     }
 
     #[test]
