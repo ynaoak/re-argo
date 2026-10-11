@@ -4,6 +4,7 @@ pub mod callers;
 pub mod cast;
 pub mod cfg;
 pub mod condition;
+pub mod copyprop;
 pub mod comments_gen;
 pub mod dataflow;
 pub mod dominator;

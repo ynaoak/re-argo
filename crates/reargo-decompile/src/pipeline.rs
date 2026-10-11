@@ -1036,6 +1036,8 @@ fn build_decompile_result(
     }
     // WS85: `x << n | x >> (w - n)` is `rotl(x, n)`
     crate::rotate::recover_rotates(&mut ssa);
+    // WS85: `tmp_500 = *(…); rdi = tmp_500;` is `rdi = *(…);`
+    crate::copyprop::propagate_register_copies(&mut ssa);
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
         ssa.signature_params = Some(signature_params(&ssa, info, &args));
@@ -2485,6 +2487,25 @@ mod tests {
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("eax = (xmm0_d != xmm1_d) ? esi : eax;"), "{c}");
         assert!(!c.contains("isnan"), "{c}");
+    }
+
+    #[test]
+    fn loaded_temporary_copied_to_a_register_is_one_statement() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x8b, 0x3b, // mov rdi, [rbx]
+            0x48, 0x8d, 0x74, 0x24, 0x30, // lea rsi, [rsp+0x30]
+            0x48, 0x87, 0xfe, // xchg rsi, rdi
+            0x48, 0x89, 0xf8, // mov rax, rdi
+            0x48, 0x29, 0xf0, // sub rax, rsi
+            0xc3,
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("rdi = *(uint64_t*)rbx;"), "{c}");
+        assert!(c.contains("rsi = rsp + 0x30;"), "{c}");
+        // the swap reads the old value of the register it writes: it keeps its temporary
+        let swap: Vec<&str> = c.lines().map(str::trim).filter(|l| l.contains("tmp_560")).collect();
+        assert_eq!(swap, ["tmp_560 = rsi;", "rsi = rdi;", "rdi = tmp_560;"].iter().filter(|l| l.contains("tmp_560")).copied().collect::<Vec<_>>(), "{c}");
     }
 
     #[test]
