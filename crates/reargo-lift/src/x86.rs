@@ -1373,9 +1373,10 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[c, dst, src]) });
             }
 
-            // xorps/pxor self-zero idiom -> 0; otherwise low-lane xor.
+            // xorps/pxor self-zero idiom -> 0; otherwise the xor of the whole register (WS88:
+            // was the low 8 bytes)
             Xorps | Xorpd | Pxor => {
-                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
                 if insn.op_kind(1) == iced_x86::OpKind::Register
                     && insn.op_register(0) == insn.op_register(1)
                 {
@@ -1383,10 +1384,10 @@ impl X86Lifter {
                         opcode: OpCode::Copy,
                         seq: seq(sb),
                         output: Some(dst),
-                        inputs: SmallVec::from_slice(&[constant(0, 8)]),
+                        inputs: SmallVec::from_slice(&[constant(0, 16)]),
                     });
                 } else {
-                    let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                    let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
                     ops.push(PcodeOp {
                         opcode: OpCode::IntXor,
                         seq: seq(sb),
@@ -1435,12 +1436,11 @@ impl X86Lifter {
                 }
             }
 
-            // Bitwise and/or — exact (bitwise ops don't cross lanes), modeled on
-            // the low lane like the masks the BDS uses for sign/abs. Pand/Por
-            // are the integer-SIMD spellings of the same operation.
+            // Bitwise and/or of the whole register (WS88: was the low 8 bytes, which left the
+            // upper lanes of a packed mask stale). Pand/Por are the integer-SIMD spellings.
             Andps | Andpd | Orps | Orpd | Pand | Por => {
-                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
-                let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
                 let opcode = if matches!(m, Andps | Andpd | Pand) {
                     OpCode::IntAnd
                 } else {
@@ -1456,9 +1456,9 @@ impl X86Lifter {
 
             // and-not: dst = (~dst) & src  (ANDNPS/ANDNPD/PANDN). Exact bitwise.
             Andnps | Andnpd | Pandn => {
-                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
-                let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
-                let ndst = unique(0x780, 8);
+                let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+                let ndst = unique(0x780, 16);
                 ops.push(PcodeOp {
                     opcode: OpCode::IntNegate,
                     seq: seq(sb),

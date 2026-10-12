@@ -1142,6 +1142,29 @@ fn packed_float_ops_match_the_cpu() {
     check(&cases);
 }
 
+/// WS88: the bitwise ops act on the whole register (they were the low 8 bytes).
+#[test]
+fn bitwise_ops_match_the_cpu() {
+    let cases = vec![
+        packed!("andps"),
+        packed!("andpd"),
+        packed!("pand"),
+        packed!("orps"),
+        packed!("orpd"),
+        packed!("por"),
+        packed!("xorps"),
+        packed!("xorpd"),
+        packed!("pxor"),
+        packed!("andnps"),
+        packed!("andnpd"),
+        packed!("pandn"),
+        packed_raw!("xorps xmm0, xmm0"),
+        packed_raw!("pxor xmm1, xmm1
+ por xmm0, xmm1"),
+    ];
+    check(&cases);
+}
+
 /// WS87: the half-register moves (`movhps` was a copy into the low half, a store was lost).
 #[test]
 fn half_register_moves_match_the_cpu() {

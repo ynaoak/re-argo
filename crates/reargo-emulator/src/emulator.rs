@@ -89,6 +89,14 @@ impl Emulator {
 
             OpCode::IntAnd => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_AND".into()))?;
+                // a whole XMM register (WS88: `andps` / `orps` / `xorps`)
+                if out.size > 8
+                    && let (Some(a), Some(b)) = (op.input(0), op.input(1))
+                {
+                    let v = self.state.read_wide(a) & self.state.read_wide(b);
+                    self.state.write_wide(out, v);
+                    return Ok(());
+                }
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
                 self.state.write_varnode(out, a & b);
@@ -96,6 +104,14 @@ impl Emulator {
 
             OpCode::IntOr => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_OR".into()))?;
+                // a whole XMM register (WS88: `andps` / `orps` / `xorps`)
+                if out.size > 8
+                    && let (Some(a), Some(b)) = (op.input(0), op.input(1))
+                {
+                    let v = self.state.read_wide(a) | self.state.read_wide(b);
+                    self.state.write_wide(out, v);
+                    return Ok(());
+                }
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
                 self.state.write_varnode(out, a | b);
@@ -103,6 +119,14 @@ impl Emulator {
 
             OpCode::IntXor => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_XOR".into()))?;
+                // a whole XMM register (WS88: `andps` / `orps` / `xorps`)
+                if out.size > 8
+                    && let (Some(a), Some(b)) = (op.input(0), op.input(1))
+                {
+                    let v = self.state.read_wide(a) ^ self.state.read_wide(b);
+                    self.state.write_wide(out, v);
+                    return Ok(());
+                }
                 let a = self.read_input(op, 0)?;
                 let b = self.read_input(op, 1)?;
                 self.state.write_varnode(out, a ^ b);
@@ -110,6 +134,13 @@ impl Emulator {
 
             OpCode::IntNegate => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("INT_NEGATE".into()))?;
+                if out.size > 8
+                    && let Some(a) = op.input(0)
+                {
+                    let v = !self.state.read_wide(a);
+                    self.state.write_wide(out, v);
+                    return Ok(());
+                }
                 let a = self.read_input(op, 0)?;
                 self.state.write_varnode(out, !a);
             }
