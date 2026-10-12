@@ -2676,10 +2676,12 @@ mod tests {
         ];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("rdi = *(uint64_t*)rbx;"), "{c}");
-        assert!(c.contains("rsi = rsp + 0x30;"), "{c}");
-        // the swap reads the old value of the register it writes: it keeps its temporary
-        let swap: Vec<&str> = c.lines().map(str::trim).filter(|l| l.contains("tmp_560")).collect();
-        assert_eq!(swap, ["tmp_560 = rsi;", "rsi = rdi;", "rdi = tmp_560;"].iter().filter(|l| l.contains("tmp_560")).copied().collect::<Vec<_>>(), "{c}");
+        // (`rsp + 0x30` is a stack argument's address, WS88)
+        assert!(c.contains("rsi = arg_30;"), "{c}");
+        // the swap reads the old value of the register it writes: `rdi` gets the address after
+        let body: Vec<&str> = c.lines().map(str::trim).collect();
+        let (x, y) = (body.iter().position(|l| *l == "rsi = rdi;"), body.iter().position(|l| *l == "rdi = arg_30;"));
+        assert!(x.is_some() && y > x, "{c}");
     }
 
     /// WS86: `sete [rsi+0x18]` loads and stores through two copies of one address; common
@@ -2730,7 +2732,7 @@ mod tests {
         ];
         let c = c_of(&code);
         for s in [
-            "*(uint64_t*)(rsp + 0xa0) = rsi;",
+            "arg_a0 = rsi;",
             "eax = *(uint32_t*)(rbx + 0x200);",
             "+ *(uint32_t*)(rbx + 0x350)",
             "*(uint32_t*)(rdi + 8) = eax;",
@@ -2792,14 +2794,14 @@ mod tests {
             0x48, 0x89, 0x37, // mov [rdi], rsi
             0xc3,
         ]);
-        assert!(c.contains(": *(uint64_t*)(rsp + 0x18);") || c.contains("? *(uint64_t*)(rsp + 0x18) :"), "{c}");
+        assert!(c.contains(": arg_18;") || c.contains("? arg_18 :"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
         let c = c_of(&[
             0xf3, 0x0f, 0x5b, 0x4c, 0x24, 0x30, // cvttps2dq xmm1, [rsp+0x30]
             0x0f, 0x11, 0x0f, // movups [rdi], xmm1
             0xc3,
         ]);
-        assert!(c.contains("xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));"), "{c}");
+        assert!(c.contains("xmm1 = cvttps2dq(arg_30);"), "{c}");
     }
 
     /// WS87: a `setcc` folds its condition like a branch: `ucomiss xmm1, xmm0; seta al` is
@@ -2846,6 +2848,139 @@ mod tests {
             assert!(c.contains(s), "{s}: {c}");
         }
         assert!(!c.contains("rsp"), "{c}");
+    }
+
+    /// WS88: the stack arguments above the return address are `arg_<k>` (the first at `entry
+    /// rsp + 8`), named the same across pushes, and parameters after the register ones; an
+    /// address only taken there is an argument array of unknown length.
+    #[test]
+    fn stack_arguments_are_named_parameters() {
+        let code = [
+            0x53, // push rbx
+            0x48, 0x8b, 0x44, 0x24, 0x10, // mov rax, [rsp+0x10]   (arg_8)
+            0x8b, 0x4c, 0x24, 0x18, // mov ecx, [rsp+0x18]         (arg_10)
+            0x48, 0x8d, 0x54, 0x24, 0x28, // lea rdx, [rsp+0x28]   (&arg_20)
+            0x48, 0x01, 0xc8, // add rax, rcx
+            0x48, 0x89, 0x07, // mov [rdi], rax
+            0x48, 0x89, 0x16, // mov [rsi], rdx
+            0x5b, // pop rbx
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("uint64_t arg_8, uint32_t arg_10, uint8_t arg_20[])"), "{c}");
+        assert!(c.contains("arg_8 + arg_10") || c.contains("rax = arg_8;"), "{c}");
+        assert!(c.contains("= arg_20;"), "{c}");
+        assert!(!c.contains("rsp"), "{c}");
+        let lifter = X86Lifter::new_64();
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("arg_8: u64, arg_10: u32, arg_20: *mut u8)"), "{rs}");
+        assert!(!rs.contains("rsp"), "{rs}");
+    }
+
+    /// WS88: a landing pad starts with the stack pointer of the call that threw, not the
+    /// entry's (the SSA names both the incoming `rsp`): its slots are the body's, not stack
+    /// arguments.
+    #[test]
+    fn landing_pad_slots_are_the_bodys() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x83, 0xec, 0x18, // sub rsp, 0x18
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0x48, 0x83, 0xc4, 0x18, // add rsp, 0x18
+            0xc3, // ret
+            // the landing pad (0x1013)
+            0x48, 0x8b, 0x7c, 0x24, 0x08, // mov rdi, [rsp+8]
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let lifted = lifter.lift_range(&mem, 0x1000, 100).unwrap();
+        let terminated = apply_call_convention(lifted, &lifter, &rustc_hash::FxHashMap::default());
+        let empty = std::collections::BTreeMap::new();
+        let handlers = [(0x1013, "cleanup".to_string())];
+        let r = build_decompile_result(
+            terminated,
+            "f",
+            0x1000,
+            &empty,
+            &empty,
+            None,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+            &handlers,
+            &[],
+        )
+        .unwrap();
+        let c = r.c_code;
+        let pad = &c[c.find("landing pad").unwrap_or_else(|| panic!("{c}"))..];
+        assert!(c.contains("local_10 = rdi;"), "{c}");
+        assert!(pad.contains("rdi = local_10;"), "{c}");
+        assert!(!c.contains("arg_"), "{c}");
+    }
+
+    /// WS88: the Rust output folds the conditions of `setcc` and `cmovcc` like the C output.
+    #[test]
+    fn rust_output_folds_setcc_and_select_conditions() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x0f, 0x2e, 0xc8, // ucomiss xmm1, xmm0
+            0x0f, 0x97, 0xc0, // seta al
+            0x0f, 0x97, 0x07, // seta [rdi]
+            0x48, 0x39, 0xf2, // cmp rdx, rsi
+            0x48, 0x0f, 0x42, 0xd6, // cmovb rdx, rsi
+            0x48, 0x89, 0x57, 0x08, // mov [rdi+8], rdx
+            0xc3,
+        ];
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("al = (xmm0_d < xmm1_d) as u8;"), "{rs}");
+        assert!(rs.contains("unsafe { *(rdi as *mut u8) = (xmm0_d < xmm1_d) as u8; }"), "{rs}");
+        assert!(rs.contains("if rdx < rsi { rsi } else { rdx }"), "{rs}");
+        assert!(!rs.contains("var_2") && !rs.contains("tmp_"), "{rs}");
+        // a float op's constant is a float literal
+        let code = [
+            0x0f, 0x57, 0xd2, // xorps xmm2, xmm2
+            0x0f, 0x2e, 0xc2, // ucomiss xmm0, xmm2
+            0x0f, 0x97, 0x07, // seta [rdi]
+            0xc3,
+        ];
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("= (0.0f32 < xmm0_d) as u8;"), "{rs}");
+    }
+
+    /// WS88: the Rust output names the stack slots like the C output.
+    #[test]
+    fn rust_output_names_stack_slots() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x53, // push rbx
+            0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0xc7, 0x44, 0x24, 0x0c, 0x01, 0x00, 0x00, 0x00, // mov dword [rsp+0xc], 1
+            0x48, 0x8d, 0x44, 0x24, 0x10, // lea rax, [rsp+0x10]
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0x8b, 0x44, 0x24, 0x08, // mov eax, [rsp+8]
+            0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+            0x5b, // pop rbx
+            0xc3,
+        ];
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        for s in [
+            "let mut local_20: u64;",
+            "let mut local_18: [u8; 0x10];",
+            "local_8 = rbx;",
+            "local_20 = rdi;",
+            "unsafe { *((&raw mut local_20 as *mut u8).add(0x4) as *mut u32) = 1; }",
+            "local_18.as_mut_ptr()",
+            "eax = local_20 as u32;",
+        ] {
+            assert!(rs.contains(s), "{s}: {rs}");
+        }
+        assert!(!rs.contains("rsp"), "{rs}");
     }
 
     /// WS87: the Rust output prints temporaries inline like the C output.

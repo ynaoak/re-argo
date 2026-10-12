@@ -200,7 +200,12 @@ impl<'a> CEmitter<'a> {
         self.folded.extend(hidden);
         self.folded.extend(inlined);
         self.select_conds = conds;
-        let sig = infer_signature(func);
+        let mut sig = infer_signature(func);
+        // the stack arguments (WS88) after the register parameters
+        sig.params.extend(self.frame.slots().filter(|s| s.is_arg()).map(|s| match s.c_declaration().rsplit_once(' ') {
+            Some((ty, name)) => (ty.to_string(), name.to_string()),
+            None => (String::new(), s.c_declaration()),
+        }));
         self.line(&sig.to_c_declaration(&func.name));
         self.line("{");
         self.indent += 1;
@@ -231,13 +236,9 @@ impl<'a> CEmitter<'a> {
             }
         }
         // the stack slots (WS87)
-        let slots: Vec<crate::frame::Slot> = self.frame.slots().copied().collect();
+        let slots: Vec<crate::frame::Slot> = self.frame.slots().filter(|s| !s.is_arg()).copied().collect();
         for s in &slots {
-            if s.array {
-                linef!(self, "uint8_t {}[0x{:x}];", s.name(), s.size);
-            } else {
-                linef!(self, "{} {};", size_to_type(s.size), s.name());
-            }
+            linef!(self, "{};", s.c_declaration());
         }
         if !declared.is_empty() || !slots.is_empty() {
             self.output.push('\n');
@@ -515,9 +516,9 @@ impl<'a> CEmitter<'a> {
                 if op.output.is_some_and(|o| {
                     let d = &func.varnodes[o as usize].data;
                     !(d.space == SpaceId::REGISTER && d.offset == 0x20)
-                }) && op.output.and_then(|o| self.frame.address(func, o)).is_some() =>
+                }) && op.output.and_then(|o| self.frame.address(func, o, false)).is_some() =>
             {
-                Some(format!("{} = {};", out_name?, self.frame.address(func, op.output?)?))
+                Some(format!("{} = {};", out_name?, self.frame.address(func, op.output?, false)?))
             }
             OpCode::Copy => {
                 let dst = out_name?;
@@ -894,7 +895,7 @@ impl<'a> CEmitter<'a> {
                 let dst = out_name?;
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
                 // a stack slot by name (WS87)
-                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, a, out_size, false)) {
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, out_size, false, false)) {
                     return Some(format!("{dst} = {slot};"));
                 }
                 let addr = self.input_expr(func, op, 1);
@@ -907,7 +908,7 @@ impl<'a> CEmitter<'a> {
                 } else {
                     8
                 };
-                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, a, size, true)) {
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, size, true, false)) {
                     return Some(format!("{slot} = {val};"));
                 }
                 let addr = self.input_expr(func, op, 1);
@@ -1262,7 +1263,7 @@ fn is_switch_index_copy(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
 }
 
 /// How a `PIECE` that rebuilds a register after a write to its low view prints (WS84).
-enum ViewMerge {
+pub(crate) enum ViewMerge {
     /// `R = PIECE(SUBPIECE(R, n), lo)`: the upper bytes are kept, it is the write `view = lo`
     Keep { view: String },
     /// `R = PIECE(c, lo)` with the upper bytes a known constant
@@ -1273,7 +1274,7 @@ enum ViewMerge {
 /// `rax = PIECE(SUBPIECE(rax, 1), al)`) and an XMM register after a scalar write. Printed as
 /// is that was `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`; it is the write of
 /// the view, which the register names already alias.
-fn view_merge(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<ViewMerge> {
+pub(crate) fn view_merge(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<ViewMerge> {
     let out = func.varnodes[op.output? as usize].data;
     let (hi, lo) = (*op.inputs.first()?, *op.inputs.get(1)?);
     let (hi_d, lo_d) = (func.varnodes[hi as usize].data, func.varnodes[lo as usize].data);
@@ -1301,7 +1302,7 @@ fn is_kept_upper(func: &SsaFunction, hi: crate::ssa::VarId, out: reargo_core::pc
 }
 
 /// Is `op` (a SUBPIECE) the kept upper bytes of view writes only, so it needs no statement?
-fn kept_upper_only(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
+pub(crate) fn kept_upper_only(func: &SsaFunction, op: &crate::ssa::SsaOp) -> bool {
     let Some(v) = op.output else { return false };
     let readers: Vec<&crate::ssa::SsaOp> = func.varnodes[v as usize]
         .uses
@@ -1401,7 +1402,7 @@ pub(crate) fn negate_condition(cond: String, negated: bool) -> String {
 }
 
 /// `(x)` -> `x` when the parentheses enclose the whole expression.
-fn strip_outer_parens(s: &str) -> &str {
+pub(crate) fn strip_outer_parens(s: &str) -> &str {
     if s.starts_with('(') && crate::condition::is_atomic(s) { &s[1..s.len() - 1] } else { s }
 }
 
@@ -1969,7 +1970,7 @@ pub(crate) fn case_label(v: u64) -> String {
 
 /// An op whose operands are floats (arithmetic and comparisons, not conversions from an
 /// integer).
-fn is_float_op(op: OpCode) -> bool {
+pub(crate) fn is_float_op(op: OpCode) -> bool {
     matches!(
         op,
         OpCode::FloatEqual
