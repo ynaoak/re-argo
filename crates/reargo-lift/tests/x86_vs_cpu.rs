@@ -1099,3 +1099,66 @@ fn shuffles_match_the_cpu() {
     ];
     check(&cases);
 }
+
+/// WS87: packed float arithmetic, min / max, square roots, conversions and compares, lane by
+/// lane (they were one float op on the whole register).
+#[test]
+fn packed_float_ops_match_the_cpu() {
+    let cases = vec![
+        packed!("addps"),
+        packed!("subps"),
+        packed!("mulps"),
+        packed!("divps"),
+        packed!("minps"),
+        packed!("maxps"),
+        packed!("addpd"),
+        packed!("subpd"),
+        packed!("mulpd"),
+        packed!("divpd"),
+        packed!("minpd"),
+        packed!("maxpd"),
+        packed!("sqrtps"),
+        packed!("sqrtpd"),
+        packed!("cvtdq2ps"),
+        packed!("cvttps2dq"),
+        packed!("cvtps2dq"),
+        packed!("cvtps2pd"),
+        packed!("cvtpd2ps"),
+        packed!("cvttpd2dq"),
+        packed!("cvtpd2dq"),
+        packed!("cvtdq2pd"),
+        packed_raw!("cmpps xmm0, xmm1, 0"),
+        packed_raw!("cmpps xmm0, xmm1, 1"),
+        packed_raw!("cmpps xmm0, xmm1, 2"),
+        packed_raw!("cmpps xmm0, xmm1, 3"),
+        packed_raw!("cmpps xmm0, xmm1, 4"),
+        packed_raw!("cmpps xmm0, xmm1, 5"),
+        packed_raw!("cmpps xmm0, xmm1, 6"),
+        packed_raw!("cmpps xmm0, xmm1, 7"),
+        packed_raw!("cmppd xmm0, xmm1, 1"),
+        packed_raw!("cmppd xmm0, xmm1, 4"),
+        packed_raw!("cmppd xmm0, xmm1, 7"),
+    ];
+    check(&cases);
+}
+
+/// WS87: the half-register moves (`movhps` was a copy into the low half, a store was lost).
+#[test]
+fn half_register_moves_match_the_cpu() {
+    // memory: [rsp] = rax, [rsp+8] = rcx, [rsp+16] = rcx, [rsp+24] = rdx
+    let cases = vec![
+        packed_raw!("movlps xmm0, [rsp+24]"),
+        packed_raw!("movhps xmm0, [rsp+24]"),
+        packed_raw!("movlpd xmm0, [rsp+24]"),
+        packed_raw!("movhpd xmm0, [rsp+24]"),
+        packed_raw!("movhps [rsp], xmm1
+ movdqu xmm0, [rsp]"),
+        packed_raw!("movlps [rsp+8], xmm1
+ movdqu xmm0, [rsp]"),
+        packed_raw!("movhpd [rsp+8], xmm1
+ movdqu xmm0, [rsp]"),
+        packed_raw!("movlpd [rsp], xmm1
+ movdqu xmm0, [rsp]"),
+    ];
+    check(&cases);
+}
