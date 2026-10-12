@@ -366,7 +366,7 @@ fn decompile_function_inner(
     // function was followed into that function's code (0x39f04e0 printed 0x39f0520's loop);
     // dropped, the `jmp` leaves the code and becomes a tail call
     if let Some((start, len)) = fde_bounds(&program.info.memory, &program.info.sections, func_entry) {
-        lifted.retain(|i| i.address >= start && i.address < start + len);
+        lifted = keep_fde_body(lifted, start, start + len);
     }
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
@@ -413,6 +413,27 @@ fn decompile_function_inner(
         &handlers,
         &switches,
     )
+}
+
+/// The instructions in `[start, end)` and the `int3`s right after `end` (WS87): the padding
+/// to the next function is where a switch over an enum sends its impossible values (BDS
+/// 0x3b13ff0, the fmt argument type: `case 1: __builtin_trap();`). Only a jump table's case
+/// reaches them; the trim drops them otherwise.
+fn keep_fde_body(lifted: Vec<LiftedInstruction>, start: u64, end: u64) -> Vec<LiftedInstruction> {
+    let mut next = end;
+    lifted
+        .into_iter()
+        .filter(|i| {
+            if i.address >= start && i.address < end {
+                return true;
+            }
+            if i.address == next && i.mnemonic.trim() == "int3" {
+                next += u64::from(i.length);
+                return true;
+            }
+            false
+        })
+        .collect()
 }
 
 /// `[start, start + len)` of the function covering `entry`, from the `.eh_frame_hdr` table.
@@ -3196,6 +3217,18 @@ mod tests {
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("goto *"), "{c}");
         assert!(c.contains("(*"), "{c}");
+    }
+
+    /// WS87: the `int3`s right after the FDE's end stay (a switch over an enum sends its
+    /// impossible values there), the rest past it does not.
+    #[test]
+    fn padding_after_the_fde_is_kept() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[0x31, 0xc0, 0xc3, 0xcc, 0xcc, 0x90, 0xcc, 0x55];
+        let mem = make_memory(code, 0x1000);
+        let l = lifter.lift_range(&mem, 0x1000, 20).unwrap();
+        let kept: Vec<u64> = keep_fde_body(l, 0x1000, 0x1003).iter().map(|i| i.address).collect();
+        assert_eq!(kept, vec![0x1000, 0x1002, 0x1003, 0x1004]);
     }
 
     #[test]
