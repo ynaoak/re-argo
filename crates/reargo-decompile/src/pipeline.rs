@@ -3010,6 +3010,33 @@ mod tests {
         assert!(!cond.contains("*(uint32_t*)rsi"), "{c}");
     }
 
+    /// WS88: a reference count's `lock xadd [m], -1` loads once into the register it returns
+    /// in: `rax = *(m); *(m) = rax - 1;` (was `tmp_510 = *(m); rax = tmp_510; *(m) = tmp_510 - 1;`).
+    /// With a register addend the store reads the register's old value: the temporary stays.
+    #[test]
+    fn refcount_xadd_loads_into_its_register() {
+        let code = [
+            0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov rax, -1
+            0xf0, 0x48, 0x0f, 0xc1, 0x47, 0x10, // lock xadd [rdi+0x10], rax
+            0x48, 0x83, 0xf8, 0x01, // cmp rax, 1
+            0x75, 0x01, // jne +1
+            0xc3,
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("rax = *(uint64_t*)(rdi + 0x10);"), "{c}");
+        assert!(c.contains("*(uint64_t*)(rdi + 0x10) = rax - 1;"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        let lifter = X86Lifter::new_64();
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("rax = unsafe { *(rdi.wrapping_add(0x10) as *const u64) };"), "{rs}");
+        assert!(!rs.contains("tmp_"), "{rs}");
+        // mov rax, [rdi+8]; lock xadd [rdi+8], rax: the store adds the old rax
+        let c = c_of(&[0x48, 0x8b, 0x47, 0x08, 0xf0, 0x48, 0x0f, 0xc1, 0x47, 0x08, 0x48, 0x89, 0x06, 0xc3]);
+        let store = c.lines().map(str::trim).find(|l| l.starts_with("*(uint64_t*)") && l.contains(" = ")).unwrap_or_else(|| panic!("{c}"));
+        assert!(store.ends_with("= tmp_510 + rax;"), "{c}");
+    }
+
     /// WS88: the Rust output folds the conditions of `setcc` and `cmovcc` like the C output.
     #[test]
     fn rust_output_folds_setcc_and_select_conditions() {

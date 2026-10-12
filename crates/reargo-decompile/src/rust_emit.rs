@@ -58,6 +58,8 @@ pub struct RustEmitter<'a> {
     select_conds: rustc_hash::FxHashMap<usize, String>,
     /// The stack slots by name (WS88, `frame`, as in C).
     frame: crate::frame::Frame,
+    /// Temporaries printed as the register they are copied to (WS88, as in C).
+    coalesced: crate::emit::Coalesced,
 }
 
 impl Default for RustEmitter<'static> {
@@ -83,6 +85,7 @@ impl RustEmitter<'static> {
             inlined: Default::default(),
             select_conds: Default::default(),
             frame: Default::default(),
+            coalesced: Default::default(),
         }
     }
 }
@@ -108,6 +111,7 @@ impl<'a> RustEmitter<'a> {
             inlined: Default::default(),
             select_conds: Default::default(),
             frame: Default::default(),
+            coalesced: Default::default(),
         }
     }
 
@@ -150,6 +154,7 @@ impl<'a> RustEmitter<'a> {
         self.noise.extend(frame_noise);
         // WS87: first, as the conditions fold the expressions printed inline (as in C)
         let inlined = self.inline_temporaries(func);
+        self.coalesced = crate::emit::Coalesced::new(func, &self.noise, &inlined);
         self.folded = (0..func.cfg.blocks.len())
             .filter_map(|b| self.own_condition(func, b))
             .flat_map(|(ops, _)| ops)
@@ -447,7 +452,10 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn emit_op(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {
-        let out_name = op.output.map(|id| varnode_name(&func.varnodes[id as usize]));
+        if self.coalesced.copies.contains(&op.index) {
+            return None;
+        }
+        let out_name = self.coalesced.defs.get(&op.index).cloned().or_else(|| op.output.map(|id| varnode_name(&func.varnodes[id as usize])));
 
         match op.opcode {
             // phi: same name on every incoming edge, nothing to print
@@ -971,6 +979,9 @@ impl<'a> RustEmitter<'a> {
             && let Some(e) = self.select_conds.get(&op.index)
         {
             return format!("({}) as u8", crate::emit::strip_outer_parens(e));
+        }
+        if let Some(r) = self.coalesced.values.get(&crate::condition::value_key(func, op.inputs[idx])) {
+            return r.clone();
         }
         let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
         if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {

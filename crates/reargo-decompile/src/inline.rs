@@ -217,3 +217,78 @@ pub(crate) fn candidates(
     }
     out
 }
+
+/// Temporaries copied to a register and read again by stores (WS88): `lock xadd` / a reference
+/// count's `tmp_510 = *(m); rax = tmp_510; *(m) = tmp_510 - 1;`. The definition prints as the
+/// copy's register (`rax = *(m); *(m) = rax - 1;`) and the copy prints nothing. Returns
+/// `(definition, copy)`; `inlined` says which definitions print inside their readers.
+///
+/// The register takes the value at the definition instead of at the copy, so between the two
+/// nothing reads or writes it; up to the last store reading the value (directly, or through a
+/// pure op printed inside the store) nothing but the copy writes it.
+pub(crate) fn coalesced(func: &SsaFunction, skip: &dyn Fn(OpIdx) -> bool, inlined: &dyn Fn(OpIdx) -> bool) -> Vec<(OpIdx, OpIdx)> {
+    let readers = crate::condition::Readers::new(func);
+    let live = |v: crate::ssa::VarId| -> smallvec::SmallVec<[OpIdx; 2]> {
+        readers.of(func, v).iter().copied().filter(|&u| func.ops[u].opcode != OpCode::Indirect).collect()
+    };
+    let mut out = Vec::new();
+    for (d, op) in func.ops.iter().enumerate() {
+        if op.dead || skip(d) || inlined(d) || !(op.opcode == OpCode::Load || pure(op.opcode)) {
+            continue;
+        }
+        let Some(v) = op.output else { continue };
+        let vd = func.varnodes[v as usize].data;
+        if vd.space != SpaceId::UNIQUE {
+            continue;
+        }
+        let rs = live(v);
+        let same = |u: OpIdx| u > d && func.ops[u].block == op.block;
+        let copies: Vec<OpIdx> = rs
+            .iter()
+            .copied()
+            .filter(|&u| {
+                let r = &func.ops[u];
+                r.opcode == OpCode::Copy
+                    && same(u)
+                    && r.output.is_some_and(|w| {
+                        let wd = func.varnodes[w as usize].data;
+                        wd.space == SpaceId::REGISTER && wd.size == vd.size
+                    })
+            })
+            .collect();
+        let [c] = copies.as_slice() else { continue };
+        let c = *c;
+        let reg = func.varnodes[func.ops[c].output.expect("filtered") as usize].data;
+        // the other readers: stores, or pure ops printed inside stores
+        let mut ends = Vec::new();
+        let ok = rs.iter().filter(|&&u| u != c).all(|&u| {
+            let r = &func.ops[u];
+            if !same(u) {
+                return false;
+            }
+            if r.opcode == OpCode::Store {
+                ends.push(u);
+                return true;
+            }
+            let Some(w) = r.output.filter(|&w| func.varnodes[w as usize].data.space == SpaceId::UNIQUE) else { return false };
+            let ws = live(w);
+            let stores = pure(r.opcode) && inlined(u) && !ws.is_empty() && ws.iter().all(|&s| same(s) && func.ops[s].opcode == OpCode::Store);
+            ends.extend(ws.iter().copied());
+            stores
+        });
+        if !ok || ends.is_empty() {
+            continue;
+        }
+        let last = ends.iter().copied().max().expect("non-empty").max(c);
+        let touches = |o: &crate::ssa::SsaOp, reads: bool| {
+            o.output.is_some_and(|w| overlaps(&reg, &func.varnodes[w as usize].data))
+                || (reads && o.inputs.iter().any(|&i| overlaps(&reg, &func.varnodes[i as usize].data)))
+        };
+        let clear = func.ops[d + 1..c].iter().all(|o| o.dead || !touches(o, true))
+            && func.ops[c + 1..=last].iter().all(|o| o.dead || !touches(o, false));
+        if clear {
+            out.push((d, c));
+        }
+    }
+    out
+}

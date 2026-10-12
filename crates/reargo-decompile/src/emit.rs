@@ -79,6 +79,33 @@ pub struct CEmitter<'a> {
     inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
     /// The stack slots by name (WS87, `frame`).
     frame: crate::frame::Frame,
+    /// A temporary printed as the register it is copied to (WS88, `inline::coalesced`).
+    coalesced: Coalesced,
+}
+
+/// Temporaries printed as the register they are copied to (WS88, `inline::coalesced`): the
+/// definition by op, the value by key, and the copies printing nothing.
+#[derive(Default)]
+pub(crate) struct Coalesced {
+    pub defs: rustc_hash::FxHashMap<usize, String>,
+    pub values: rustc_hash::FxHashMap<crate::condition::ValueKey, String>,
+    pub copies: rustc_hash::FxHashSet<usize>,
+}
+
+impl Coalesced {
+    /// Fill from `inline::coalesced` (definitions in `inlined` print inside their readers).
+    pub(crate) fn new(func: &SsaFunction, noise: &rustc_hash::FxHashSet<usize>, inlined: &[usize]) -> Self {
+        let inl: rustc_hash::FxHashSet<usize> = inlined.iter().copied().collect();
+        let mut c = Coalesced::default();
+        for (d, copy) in crate::inline::coalesced(func, &|d| noise.contains(&d), &|d| inl.contains(&d)) {
+            let reg = varnode_name(&func.varnodes[func.ops[copy].output.expect("a copy") as usize]);
+            let v = func.ops[d].output.expect("a definition");
+            c.values.insert(crate::condition::value_key(func, v), reg.clone());
+            c.defs.insert(d, reg);
+            c.copies.insert(copy);
+        }
+        c
+    }
 }
 
 impl Default for CEmitter<'static> {
@@ -105,6 +132,7 @@ impl CEmitter<'static> {
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            coalesced: Default::default(),
         }
     }
 }
@@ -143,6 +171,7 @@ impl<'a> CEmitter<'a> {
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            coalesced: Default::default(),
         }
     }
 
@@ -191,6 +220,8 @@ impl<'a> CEmitter<'a> {
         self.noise.extend(frame_noise);
         // WS86: first, as the conditions and selects fold the expressions printed inline
         let inlined = self.inline_temporaries(func);
+        // WS88: a temporary copied to a register and read again by stores prints as that register
+        self.coalesced = Coalesced::new(func, &self.noise, &inlined);
         self.folded = (0..func.cfg.blocks.len())
             .filter_map(|b| self.own_condition(func, b))
             .flat_map(|(ops, _)| ops)
@@ -505,7 +536,10 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_op(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {
-        let out_name = op.output.map(|id| varnode_name(&func.varnodes[id as usize]));
+        if self.coalesced.copies.contains(&op.index) {
+            return None;
+        }
+        let out_name = self.coalesced.defs.get(&op.index).cloned().or_else(|| op.output.map(|id| varnode_name(&func.varnodes[id as usize])));
 
         match op.opcode {
             // A phi joins versions of one register / slot, which the C output
@@ -1113,6 +1147,9 @@ impl<'a> CEmitter<'a> {
             && let Some(e) = self.select_conds.get(&op.index)
         {
             return strip_outer_parens(e).to_string();
+        }
+        if let Some(r) = self.coalesced.values.get(&crate::condition::value_key(func, op.inputs[idx])) {
+            return r.clone();
         }
         let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
         if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
