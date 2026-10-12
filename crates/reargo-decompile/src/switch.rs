@@ -289,8 +289,15 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
         .map(|k| (k, recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &no_range)))
         .collect();
     if found.iter().any(|(_, f)| f.as_ref().is_none_or(|f| f.2.default.is_none())) {
-        let cases: FxHashMap<u64, Vec<u64>> =
-            found.iter().filter_map(|(k, f)| Some((insns[*k].address, f.as_ref()?.2.targets.clone()))).collect();
+        // (the index register as the dispatch reads it: its case edges bound it, WS87)
+        let cases: crate::ranges::Cases = found
+            .iter()
+            .filter_map(|(k, f)| {
+                let (r, start, table) = f.as_ref()?;
+                let reused = insns[*start..=*k].iter().flat_map(|i| i.ops.iter()).any(|o| o.output.is_some_and(|w| overlaps(r, &w)));
+                Some((insns[*k].address, ((!reused).then_some(*r), table.targets.clone())))
+            })
+            .collect();
         if let Some(ranges) = crate::ranges::Ranges::new(insns, &cases) {
             for (k, f) in found.iter_mut() {
                 if f.as_ref().is_none_or(|f| f.2.default.is_none()) {

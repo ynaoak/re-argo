@@ -16,6 +16,19 @@
 //! * where paths join, a view keeps its value when every path agrees on it (the interval is
 //!   the union), else it gets a fresh unknown one.
 //!
+//! WS87 widened it:
+//!
+//! * a stack slot (`mov [rsp+0x28], rsi` … `mov rsi, [rsp+0x28]`) holds a value like a register
+//!   view does, keyed by the value of `rsp` and the offset, when no address of the frame at or
+//!   below it is taken (`lea rdi, [rsp+0x40]` leaves the slots below 0x40 to the function; an
+//!   indexed store `[rsp+rax+0x40]` is taken for an array above its constant part);
+//! * signed bounds: `cmp r, N; jg / jge / jl / jle` and `test r, r; js / jns` (a value known
+//!   non-negative, `movzx`, then `jg 5` falling through is `0..=5`);
+//! * `r + c` / `r - c` move the interval when they do not wrap (`lea eax, [rdi-1]`);
+//! * a jump table's case edges bound its index (the cases taken to that target: an enum
+//!   switch's index is below its case count on each, so a dispatch reading it again later has
+//!   the same cases).
+//!
 //! [`Ranges::at`] answers the interval of a register view as an instruction starts.
 
 use reargo_core::address::SpaceId;
@@ -64,12 +77,51 @@ const CALLER_SAVED: [u64; 9] = [0x00, 0x08, 0x10, 0x30, 0x38, 0x80, 0x88, 0x90, 
 /// Passes over the blocks before giving up (a loop that keeps widening).
 const MAX_PASSES: usize = 24;
 
+/// Changes of a block's entry state before the intervals still changing there are dropped.
+const WIDEN_AFTER: usize = 4;
+
+/// `next` with every interval that differs from `prev`'s for the same view / slot unknown.
+fn widen(prev: &State, next: &mut State) {
+    let mut drop: Vec<Id> = Vec::new();
+    for (&view, &id) in &next.views {
+        if prev.get(view) != next.get(view) {
+            drop.push(id);
+        }
+    }
+    for (slot, &id) in &next.slots {
+        let old = prev.slots.get(slot).and_then(|i| prev.ranges.get(i));
+        if old != next.ranges.get(&id) {
+            drop.push(id);
+        }
+    }
+    for id in drop {
+        next.ranges.remove(&id);
+    }
+}
+
+/// A stack slot: the value id of `rsp`, the offset added to it, the size.
+type Slot = (Id, u64, u32);
+
 #[derive(Clone, Default, PartialEq, Debug)]
 struct State {
     /// view -> value id
     views: FxHashMap<View, Id>,
     /// value id -> interval (absent = unknown)
     ranges: FxHashMap<Id, Interval>,
+    /// stack slot -> value id (WS87)
+    slots: FxHashMap<Slot, Id>,
+}
+
+/// The view a fresh value stored to a stack slot is made under (no register's).
+const STORED: View = (0xF8, 8);
+
+/// What a conditional jump says of a register on one edge (WS87: signed bounds).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bound {
+    /// within the interval
+    In(Interval),
+    /// signed `<= n` (n >= 0): `0..=n` when the value is known non-negative
+    SignedLe(u64),
 }
 
 impl State {
@@ -92,11 +144,50 @@ pub struct Ranges {
     entry: FxHashMap<usize, State>,
     /// block start (instruction index) of each instruction
     block_of: Vec<usize>,
+    /// the lowest `rsp` offset whose address the function takes (slots reaching it may change
+    /// behind its back: they are not tracked)
+    escaped: u64,
+}
+
+/// A jump table for [`Ranges::new`]: the index register as the dispatch reads it (`None` when
+/// the window overwrites it) and the case targets (case `i` = `targets[i]`).
+pub type Cases = FxHashMap<u64, (Option<VarnodeData>, Vec<u64>)>;
+
+const RSP: u64 = 0x20;
+
+/// The lowest constant offset `c` of an `rsp + c` the function uses other than as a load's or
+/// a store's address (`lea rdi, [rsp+0x40]`, `mov rdi, rsp`); `rsp + reg + c` (an array) is
+/// not counted.
+fn escaped_offset(insns: &[LiftedInstruction]) -> u64 {
+    let is_rsp = |v: &VarnodeData| v.space == SpaceId::REGISTER && v.offset == RSP && v.size == 8;
+    let mut low = u64::MAX;
+    for insn in insns {
+        for (i, op) in insn.ops.iter().enumerate() {
+            let Some(out) = op.output else { continue };
+            if is_rsp(&out) {
+                continue;
+            }
+            let c = match (op.opcode, op.inputs.first(), op.inputs.get(1)) {
+                (OpCode::IntAdd, Some(a), Some(b)) if is_rsp(a) && b.space == SpaceId::CONST => b.offset,
+                (OpCode::Copy, Some(a), _) if is_rsp(a) => 0,
+                _ => continue,
+            };
+            // (an address only loads / stores read)
+            let as_address = out.space == SpaceId::UNIQUE
+                && insn.ops[i + 1..].iter().all(|o| {
+                    o.inputs.iter().enumerate().all(|(j, v)| *v != out || (j == 1 && matches!(o.opcode, OpCode::Load | OpCode::Store)))
+                });
+            if !as_address {
+                low = low.min(c);
+            }
+        }
+    }
+    low
 }
 
 impl Ranges {
     /// `cases`: the case targets of jump tables, by the `jmp`'s address (edges out of it).
-    pub fn new(insns: &[LiftedInstruction], cases: &FxHashMap<u64, Vec<u64>>) -> Option<Self> {
+    pub fn new(insns: &[LiftedInstruction], cases: &Cases) -> Option<Self> {
         let n = insns.len();
         if n == 0 {
             return None;
@@ -114,7 +205,7 @@ impl Ranges {
                 // the target of a jump; a jump table's cases
                 let targets: Vec<u64> = match o.opcode {
                     OpCode::Branch | OpCode::CBranch => o.inputs.iter().take(1).filter(|t| t.space == SpaceId::RAM).map(|t| t.offset).collect(),
-                    OpCode::BranchInd => cases.get(&insn.address).cloned().unwrap_or_default(),
+                    OpCode::BranchInd => cases.get(&insn.address).map(|c| c.1.clone()).unwrap_or_default(),
                     _ => Vec::new(),
                 };
                 for t in targets {
@@ -140,7 +231,7 @@ impl Ranges {
             }
             block_of[i] = cur;
         }
-        let this = Ranges { entry: FxHashMap::default(), block_of };
+        let this = Ranges { entry: FxHashMap::default(), block_of, escaped: escaped_offset(insns) };
         let starts: Vec<usize> = (0..n).filter(|&i| leader[i]).collect();
         let mut entry: FxHashMap<usize, State> = FxHashMap::default();
         // the entry, and every block no modelled edge reaches (a case of a table not recovered
@@ -152,6 +243,7 @@ impl Ranges {
         }
         // per block: the incoming edge states, by predecessor
         let mut incoming: FxHashMap<usize, FxHashMap<usize, State>> = FxHashMap::default();
+        let mut updates: FxHashMap<usize, usize> = FxHashMap::default();
         let mut changed = true;
         let mut passes = 0;
         while changed {
@@ -170,8 +262,17 @@ impl Ranges {
                             let inc = incoming.entry(t).or_default();
                             if inc.get(&k) != Some(&edge) {
                                 inc.insert(k, edge);
-                                let joined = this.join(t, inc);
+                                let mut joined = this.join(t, inc);
                                 if entry.get(&t) != Some(&joined) {
+                                    // (a value that keeps changing around a loop, `inc r9d`:
+                                    // unknown after a few rounds, WS87)
+                                    let n = updates.entry(t).or_insert(0usize);
+                                    *n += 1;
+                                    if *n > WIDEN_AFTER
+                                        && let Some(prev) = entry.get(&t)
+                                    {
+                                        widen(prev, &mut joined);
+                                    }
                                     entry.insert(t, joined);
                                     changed = true;
                                 }
@@ -240,6 +341,22 @@ impl Ranges {
                 out.ranges.insert(nid, r);
             }
         }
+        // the stack slots every path agrees on (WS87)
+        for (&slot, &id) in &first.slots {
+            if !preds.iter().all(|p| inc[*p].slots.get(&slot) == Some(&id)) {
+                continue;
+            }
+            out.slots.insert(slot, id);
+            if out.ranges.contains_key(&id) || out.views.values().any(|&v| v == id) {
+                continue;
+            }
+            let r = preds.iter().map(|p| inc[*p].ranges.get(&id).copied().unwrap_or(FULL)).fold(None, |acc: Option<Interval>, x| {
+                Some(acc.map_or(x, |a| (a.0.min(x.0), a.1.max(x.1))))
+            });
+            if let Some(r) = r.filter(|&r| r != FULL) {
+                out.ranges.insert(id, r);
+            }
+        }
         // views sharing a merged id must agree on their interval: keep the union
         out
     }
@@ -252,7 +369,7 @@ impl Ranges {
         k: usize,
         before: &State,
         end: usize,
-        cases: &FxHashMap<u64, Vec<u64>>,
+        cases: &Cases,
     ) -> Vec<(usize, State)> {
         let insn = &insns[k];
         let mut after = before.clone();
@@ -263,10 +380,22 @@ impl Ranges {
         match br.map(|o| o.opcode) {
             None => out.extend(fall.map(|f| (f, after))),
             Some(OpCode::BranchInd) => {
-                for t in cases.get(&insn.address).map_or(&[][..], Vec::as_slice) {
-                    if let Some(&j) = index.get(t) {
-                        out.push((j, after.clone()));
+                let Some((ix, targets)) = cases.get(&insn.address) else { return out };
+                let mut seen: Vec<u64> = Vec::new();
+                for &t in targets {
+                    if seen.contains(&t) {
+                        continue;
                     }
+                    seen.push(t);
+                    let Some(&j) = index.get(&t) else { continue };
+                    let mut s = after.clone();
+                    // (the cases going there bound the index, WS87)
+                    if let Some(ix) = ix.filter(is_gpr) {
+                        let lo = targets.iter().position(|&x| x == t).unwrap_or(0) as u64;
+                        let hi = targets.iter().rposition(|&x| x == t).unwrap_or(0) as u64;
+                        Self::refine(&mut s, k, (ix.offset, ix.size), Bound::In((lo, hi)));
+                    }
+                    out.push((j, s));
                 }
             }
             Some(OpCode::Branch) => {
@@ -279,8 +408,8 @@ impl Ranges {
                 let bound = self.bound(insns, k);
                 let refine = |taken: bool| {
                     let mut s = after.clone();
-                    if let Some((view, t_range, f_range)) = bound {
-                        Self::refine(&mut s, k, view, if taken { t_range } else { f_range });
+                    if let Some((view, t_bound, f_bound)) = bound {
+                        Self::refine(&mut s, k, view, if taken { t_bound } else { f_bound });
                     }
                     s
                 };
@@ -298,15 +427,21 @@ impl Ranges {
 
     /// `cmp r, N` right before the conditional jump `k` (nothing in between writes `r` or the
     /// flags): `(r's view, interval when taken, interval when falling through)`.
-    fn bound(&self, insns: &[LiftedInstruction], k: usize) -> Option<(View, Interval, Interval)> {
+    fn bound(&self, insns: &[LiftedInstruction], k: usize) -> Option<(View, Bound, Bound)> {
         let jcc = insns[k].mnemonic.split_whitespace().next()?;
         let s = self.block_of[k];
         let c = (s..k).rev().find(|&c| insns[c].ops.iter().any(|o| o.output.is_some_and(|w| w.space == SpaceId::REGISTER && (0x200..0x210).contains(&w.offset))))?;
-        if !insns[c].mnemonic.starts_with("cmp") {
+        let test = insns[c].mnemonic.starts_with("test");
+        let (x, n) = if insns[c].mnemonic.starts_with("cmp") {
+            let less = insns[c].ops.iter().find(|o| o.opcode == OpCode::IntLess && o.output.is_some_and(|w| w.space == SpaceId::REGISTER && w.offset == 0x201))?;
+            (less.inputs[0], less.inputs[1])
+        } else if test {
+            // `test r, r`: the sign of `r` (WS87)
+            let and = insns[c].ops.iter().find(|o| o.opcode == OpCode::IntAnd && o.inputs.len() == 2 && o.inputs[0] == o.inputs[1])?;
+            (and.inputs[0], VarnodeData::new(SpaceId::CONST, 0, and.inputs[0].size))
+        } else {
             return None;
-        }
-        let less = insns[c].ops.iter().find(|o| o.opcode == OpCode::IntLess && o.output.is_some_and(|w| w.space == SpaceId::REGISTER && w.offset == 0x201))?;
-        let (x, n) = (less.inputs[0], less.inputs[1]);
+        };
         if !is_gpr(&x) || n.space != SpaceId::CONST {
             return None;
         }
@@ -316,24 +451,37 @@ impl Ranges {
         }
         let n = n.offset & mask(x.size);
         let m = mask(x.size);
-        let le = (0, n);
-        let gt = (n.checked_add(1)?, m);
-        let lt = (0, n.checked_sub(1)?);
-        let ge = (n, m);
+        // the largest non-negative value of the view
+        let top = m >> 1;
         let (t, f) = match jcc {
-            "ja" | "jnbe" => (gt, le),
-            "jae" | "jnb" | "jnc" => (ge, lt),
-            "jb" | "jnae" | "jc" => (lt, ge),
-            "jbe" | "jna" => (le, gt),
+            "js" if test => (Bound::In((top + 1, m)), Bound::In((0, top))),
+            "jns" if test => (Bound::In((0, top)), Bound::In((top + 1, m))),
+            _ if test => return None,
+            "ja" | "jnbe" => (Bound::In((n.checked_add(1)?, m)), Bound::In((0, n))),
+            "jae" | "jnb" | "jnc" => (Bound::In((n, m)), Bound::In((0, n.checked_sub(1)?))),
+            "jb" | "jnae" | "jc" => (Bound::In((0, n.checked_sub(1)?)), Bound::In((n, m))),
+            "jbe" | "jna" => (Bound::In((0, n)), Bound::In((n.checked_add(1)?, m))),
+            // signed, against a non-negative constant (WS87)
+            _ if n >= top => return None,
+            "jg" | "jnle" => (Bound::In((n + 1, top)), Bound::SignedLe(n)),
+            "jge" | "jnl" => (Bound::In((n, top)), Bound::SignedLe(n.checked_sub(1)?)),
+            "jl" | "jnge" => (Bound::SignedLe(n.checked_sub(1)?), Bound::In((n, top))),
+            "jle" | "jng" => (Bound::SignedLe(n), Bound::In((n + 1, top))),
             _ => return None,
         };
         Some(((x.offset, x.size), t, f))
     }
 
     /// Narrow the value of `view` (and every view sharing it) to `r`.
-    fn refine(st: &mut State, k: usize, view: View, r: Interval) {
+    fn refine(st: &mut State, k: usize, view: View, b: Bound) {
         let id = *st.views.entry(view).or_insert_with(|| entry_value(view));
         let cur = st.ranges.get(&id).copied().unwrap_or(FULL);
+        let r = match b {
+            Bound::In(r) => r,
+            // (known non-negative: below the sign bit of the view)
+            Bound::SignedLe(n) if cur.1 <= mask(view.1) >> 1 => (0, n),
+            Bound::SignedLe(_) => return,
+        };
         let lo = cur.0.max(r.0);
         let hi = cur.1.min(r.1);
         if lo > hi {
@@ -358,59 +506,104 @@ impl Ranges {
 
     /// Run one instruction: the views it writes get their new values.
     fn step(&self, k: usize, insn: &LiftedInstruction, st: &mut State) {
-        // the instruction's temporaries: interval and (for a plain copy of a view) its value id
-        let mut tmp: FxHashMap<(u64, u32), (Interval, Option<Id>)> = FxHashMap::default();
-        let val = |st: &State, tmp: &FxHashMap<(u64, u32), (Interval, Option<Id>)>, v: &VarnodeData| -> (Interval, Option<Id>) {
+        // the instruction's temporaries: interval, (for a plain copy of a view) its value id and
+        // (for `rsp + c`, WS87) the stack address
+        let mut tmp: FxHashMap<(u64, u32), Val> = FxHashMap::default();
+        let val = |st: &State, tmp: &FxHashMap<(u64, u32), Val>, v: &VarnodeData| -> Val {
             if v.space == SpaceId::CONST {
                 let c = v.offset & mask(v.size);
-                return ((c, c), None);
+                return ((c, c), None, None);
             }
             if v.space == SpaceId::UNIQUE {
-                return tmp.get(&(v.offset, v.size)).copied().unwrap_or(((0, mask(v.size)), None));
+                return tmp.get(&(v.offset, v.size)).copied().unwrap_or(((0, mask(v.size)), None, None));
             }
             if is_gpr(v) {
                 // (a view never written holds its entry value: a copy of it shares that)
-                let id = Some(st.views.get(&(v.offset, v.size)).copied().unwrap_or_else(|| entry_value((v.offset, v.size))));
-                return (st.get((v.offset, v.size)), id);
+                let id = st.views.get(&(v.offset, v.size)).copied().unwrap_or_else(|| entry_value((v.offset, v.size)));
+                let addr = (v.offset == RSP && v.size == 8).then_some((id, 0));
+                return (st.get((v.offset, v.size)), Some(id), addr);
             }
-            ((0, mask(v.size)), None)
+            ((0, mask(v.size)), None, None)
         };
+        // a stack slot the function keeps to itself (WS87)
+        let tracked = |a: Option<(Id, u64)>, size: u32| a.filter(|&(_, c)| c.checked_add(u64::from(size)).is_some_and(|e| e <= self.escaped));
         for op in &insn.ops {
+            if op.opcode == OpCode::Store {
+                let (Some(a), Some(v)) = (op.inputs.get(1), op.inputs.get(2)) else { continue };
+                let addr = val(st, &tmp, a).2;
+                let Some((base, c)) = addr else { continue };
+                // the slots it overlaps change
+                let end = c.saturating_add(u64::from(v.size));
+                st.slots.retain(|&(b, o, sz), _| b != base || o.saturating_add(u64::from(sz)) <= c || o >= end);
+                if (v.size == 4 || v.size == 8) && tracked(addr, v.size).is_some() {
+                    let (r, id, _) = val(st, &tmp, v);
+                    let id = match id {
+                        Some(id) => id,
+                        None => {
+                            let nid = written(k, STORED);
+                            Self::renew(st, nid, None);
+                            if r != FULL {
+                                st.ranges.insert(nid, r);
+                            }
+                            nid
+                        }
+                    };
+                    st.slots.insert((base, c, v.size), id);
+                }
+                continue;
+            }
             let Some(out) = op.output else { continue };
             let i0 = op.inputs.first().map(|v| val(st, &tmp, v));
             let c1 = op.inputs.get(1).filter(|v| v.space == SpaceId::CONST).map(|v| v.offset);
             let full = (0, mask(out.size));
-            let (r, id) = match (op.opcode, i0, c1) {
-                (OpCode::Copy, Some((r, id)), _) => (r, id),
+            let m = mask(out.size);
+            let (r, id, addr) = match (op.opcode, i0, c1) {
+                (OpCode::Copy, Some(x), _) => x,
                 // (a zero extension is the same number: the views share the value, so a bound on
                 // `edi` holds for `rdi = zext(edi)`)
-                (OpCode::IntZExt, Some((r, id)), _) => (r, id),
-                (OpCode::IntAnd, Some((r, _)), Some(c)) => ((0, r.1.min(c & mask(out.size))), None),
-                (OpCode::IntRight, Some((r, _)), Some(s)) if s < 64 => ((r.0 >> s, r.1 >> s), None),
+                (OpCode::IntZExt, Some((r, id, _)), _) => (r, id, None),
+                (OpCode::IntAnd, Some((r, _, _)), Some(c)) => ((0, r.1.min(c & m)), None, None),
+                (OpCode::IntRight, Some((r, _, _)), Some(s)) if s < 64 => ((r.0 >> s, r.1 >> s), None, None),
                 // the low bytes (the lifter derives `eax` from `rax` after a write)
-                (OpCode::Subpiece, Some((r, id)), Some(0)) if r.1 <= mask(out.size) => (r, id),
-                (OpCode::Load, _, _) => (full, None),
-                _ => (full, None),
+                (OpCode::Subpiece, Some((r, id, _)), Some(0)) if r.1 <= m => (r, id, None),
+                // `rsp + c`: a stack address (WS87)
+                (OpCode::IntAdd, Some((_, _, Some((base, 0)))), Some(c)) => (full, None, Some((base, c & m))),
+                // `r + c` / `r - c` that does not wrap moves the interval (WS87)
+                (OpCode::IntAdd | OpCode::IntSub, Some((r, _, _)), Some(c)) if r != FULL && r.1 <= m => {
+                    let c = c & m;
+                    // (an added constant above the sign bit subtracts)
+                    let (add, n) = match (op.opcode, c > m >> 1) {
+                        (OpCode::IntAdd, false) => (true, c),
+                        (OpCode::IntAdd, true) => (false, m - c + 1),
+                        (_, false) => (false, c),
+                        (_, true) => (true, m - c + 1),
+                    };
+                    let moved = if add {
+                        r.1.checked_add(n).filter(|&h| h <= m).map(|h| (r.0 + n, h))
+                    } else {
+                        r.0.checked_sub(n).map(|l| (l, r.1 - n))
+                    };
+                    (moved.unwrap_or(full), None, None)
+                }
+                (OpCode::Load, _, _) => {
+                    let a = op.inputs.get(1).map(|v| val(st, &tmp, v).2);
+                    match tracked(a.flatten(), out.size).and_then(|(b, c)| st.slots.get(&(b, c, out.size))) {
+                        Some(&id) => (st.ranges.get(&id).copied().unwrap_or(full), Some(id), None),
+                        None => (full, None, None),
+                    }
+                }
+                _ => (full, None, None),
             };
             let r = (r.0.min(full.1), r.1.min(full.1));
             if out.space == SpaceId::UNIQUE {
-                tmp.insert((out.offset, out.size), (r, id));
+                tmp.insert((out.offset, out.size), (r, id, addr));
             } else if is_gpr(&out) {
                 let view = (out.offset, out.size);
                 let nid = match id {
                     Some(id) => id,
                     None => {
                         let nid = written(k, view);
-                        // the views still holding the value this instruction made last time
-                        let old: Vec<View> = st.views.iter().filter(|&(w, &i)| i == nid && *w != view).map(|(w, _)| *w).collect();
-                        for w in old {
-                            let sid = stale(nid, w);
-                            match st.ranges.get(&nid).copied() {
-                                Some(r) => st.ranges.insert(sid, r),
-                                None => st.ranges.remove(&sid),
-                            };
-                            st.views.insert(w, sid);
-                        }
+                        Self::renew(st, nid, Some(view));
                         if r == FULL {
                             st.ranges.remove(&nid);
                         } else {
@@ -434,7 +627,25 @@ impl Ranges {
             }
         }
     }
+
+    /// Instruction `k` makes value `nid` anew (around a loop, the same id as last time): the
+    /// views still holding the old value get a stale id of their own, the slots forget it.
+    fn renew(st: &mut State, nid: Id, view: Option<View>) {
+        let old: Vec<View> = st.views.iter().filter(|&(w, &i)| i == nid && Some(*w) != view).map(|(w, _)| *w).collect();
+        for w in old {
+            let sid = stale(nid, w);
+            match st.ranges.get(&nid).copied() {
+                Some(r) => st.ranges.insert(sid, r),
+                None => st.ranges.remove(&sid),
+            };
+            st.views.insert(w, sid);
+        }
+        st.slots.retain(|_, i| *i != nid);
+    }
 }
+
+/// A temporary's value in [`Ranges::step`]: interval, value id, stack address.
+type Val = (Interval, Option<Id>, Option<(Id, u64)>);
 
 #[cfg(test)]
 mod tests {
@@ -504,7 +715,127 @@ mod tests {
         assert_eq!(r.at(&l, 7, &rsi), None);
         // the table's cases as edges: the block is reached, from a dispatch nothing bounds
         let jmp = l[3].address;
-        let r = Ranges::new(&l, &[(jmp, vec![l[4].address])].into_iter().collect()).expect("converges");
+        let r = Ranges::new(&l, &[(jmp, (None, vec![l[4].address]))].into_iter().collect()).expect("converges");
         assert_eq!(r.at(&l, 7, &rsi), None);
+    }
+    /// WS87: an index spilled to the stack and reloaded (BDS 0x3e87ee0: `mov [rsp+0x28], rsi`
+    /// … `mov rsi, [rsp+0x28]`) is the value stored, so the compared copy bounds it.
+    #[test]
+    fn spilled_index_keeps_its_value() {
+        let code = [
+            0x44, 0x89, 0xe6, // 0 mov esi, r12d
+            0x48, 0x89, 0x74, 0x24, 0x28, // 1 mov [rsp+0x28], rsi
+            0xe8, 0x00, 0x00, 0x00, 0x00, // 2 call (next)
+            0x48, 0x8b, 0x74, 0x24, 0x28, // 3 mov rsi, [rsp+0x28]
+            0x41, 0x83, 0xfc, 0x03, // 4 cmp r12d, 3
+            0x77, 0x01, // 5 ja 7
+            0x90, // 6 nop
+            0xc3, // 7 ret
+        ];
+        let l = lift(&code);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        let rsi = VarnodeData::new(SpaceId::REGISTER, 0x30, 8);
+        assert_eq!(r.at(&l, 6, &rsi), Some((0, 3)));
+        // the slot's address passed on (`lea rdi, [rsp+0x20]` before the call): not tracked
+        let mut esc = code[..8].to_vec();
+        esc.extend([0x48, 0x8d, 0x7c, 0x24, 0x20]); // lea rdi, [rsp+0x20]
+        esc.extend(&code[8..]);
+        let l = lift(&esc);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        assert_eq!(r.at(&l, 7, &rsi), None);
+    }
+
+    /// WS87: a signed bound on a value known non-negative (`movzx`), and the sign test.
+    #[test]
+    fn signed_bounds() {
+        let l = lift(&[
+            0x0f, 0xb6, 0x07, // 0 movzx eax, byte [rdi]
+            0x83, 0xf8, 0x05, // 1 cmp eax, 5
+            0x7f, 0x01, // 2 jg 4
+            0x90, // 3 nop
+            0xc3, // 4 ret
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        let eax = VarnodeData::new(SpaceId::REGISTER, 0x00, 4);
+        assert_eq!(r.at(&l, 3, &eax), Some((0, 5)));
+        // not known non-negative: no bound
+        let l = lift(&[
+            0x8b, 0x07, // 0 mov eax, [rdi]
+            0x83, 0xf8, 0x05, // 1 cmp eax, 5
+            0x7f, 0x01, // 2 jg 4
+            0x90, // 3 nop
+            0xc3, // 4 ret
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        assert_eq!(r.at(&l, 3, &eax), None);
+        // ... unless a sign test says so first
+        let l = lift(&[
+            0x8b, 0x07, // 0 mov eax, [rdi]
+            0x85, 0xc0, // 1 test eax, eax
+            0x78, 0x06, // 2 js 6
+            0x83, 0xf8, 0x05, // 3 cmp eax, 5
+            0x7f, 0x01, // 4 jg 6
+            0x90, // 5 nop
+            0xc3, // 6 ret
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        assert_eq!(r.at(&l, 5, &eax), Some((0, 5)));
+    }
+
+    /// WS87: a constant added or subtracted moves the interval, when it does not wrap.
+    #[test]
+    fn added_constant_moves_the_interval() {
+        let l = lift(&[
+            0x83, 0xff, 0x04, // 0 cmp edi, 4
+            0x77, 0x06, // 1 ja 5
+            0x89, 0xf8, // 2 mov eax, edi
+            0x83, 0xc0, 0x02, // 3 add eax, 2
+            0x90, // 4 nop
+            0xc3, // 5 ret
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        let eax = VarnodeData::new(SpaceId::REGISTER, 0x00, 4);
+        assert_eq!(r.at(&l, 4, &eax), Some((2, 6)));
+        let l = lift(&[
+            0x83, 0xff, 0x04, // 0 cmp edi, 4
+            0x77, 0x06, // 1 ja 5
+            0x89, 0xf8, // 2 mov eax, edi
+            0x83, 0xe8, 0x01, // 3 sub eax, 1 (0 wraps)
+            0x90, // 4 nop
+            0xc3, // 5 ret
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        assert_eq!(r.at(&l, 4, &eax), None);
+    }
+
+    /// WS87: the case edges of a table bound its index (an enum switch read again later).
+    #[test]
+    fn case_edges_bound_the_index() {
+        let l = lift(&[
+            0xff, 0xe0, // 0 jmp rax (cases 0, 2 -> 1; case 1 -> 3)
+            0x90, // 1 nop
+            0xc3, // 2 ret
+            0x90, // 3 nop
+            0xc3, // 4 ret
+        ]);
+        let eax = VarnodeData::new(SpaceId::REGISTER, 0x00, 4);
+        let t = |i: usize| l[i].address;
+        let cases: Cases = [(l[0].address, (Some(eax), vec![t(1), t(3), t(1)]))].into_iter().collect();
+        let r = Ranges::new(&l, &cases).expect("converges");
+        assert_eq!(r.at(&l, 1, &eax), Some((0, 2)));
+        assert_eq!(r.at(&l, 3, &eax), Some((1, 1)));
+    }
+
+    /// WS87: a loop counter does not keep the iteration going (`inc` around a loop).
+    #[test]
+    fn loop_counter_settles() {
+        let l = lift(&[
+            0x31, 0xc0, // 0 xor eax, eax
+            0xff, 0xc0, // 1 inc eax
+            0x39, 0xf8, // 2 cmp eax, edi
+            0x75, 0xfa, // 3 jne 1
+            0xc3, // 4 ret
+        ]);
+        assert!(Ranges::new(&l, &FxHashMap::default()).is_some());
     }
 }
