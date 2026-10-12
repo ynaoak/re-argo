@@ -77,6 +77,8 @@ pub struct CEmitter<'a> {
     /// defining op by value, rendered where it is read (so a condition folding the values it
     /// reads folds them there too). Their definitions are in `folded`.
     inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
+    /// The stack slots by name (WS87, `frame`).
+    frame: crate::frame::Frame,
 }
 
 impl Default for CEmitter<'static> {
@@ -102,6 +104,7 @@ impl CEmitter<'static> {
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
+            frame: Default::default(),
         }
     }
 }
@@ -139,6 +142,7 @@ impl<'a> CEmitter<'a> {
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
+            frame: Default::default(),
         }
     }
 
@@ -181,6 +185,10 @@ impl<'a> CEmitter<'a> {
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
+        // WS87: the stack slots by name; the stack pointer updates only they read go
+        self.frame = crate::frame::Frame::new(func, &|_| true);
+        let frame_noise = self.frame.hidden(func, &self.noise);
+        self.noise.extend(frame_noise);
         // WS86: first, as the conditions and selects fold the expressions printed inline
         let inlined = self.inline_temporaries(func);
         self.folded = (0..func.cfg.blocks.len())
@@ -209,7 +217,9 @@ impl<'a> CEmitter<'a> {
         for vn in &func.varnodes {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
             // view syncs nobody reads) is not printed, so declaring it is noise
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d)) {
+            if vn.data.space == SpaceId::REGISTER
+                && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d))
+            {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
@@ -220,7 +230,16 @@ impl<'a> CEmitter<'a> {
                 }
             }
         }
-        if !declared.is_empty() {
+        // the stack slots (WS87)
+        let slots: Vec<crate::frame::Slot> = self.frame.slots().copied().collect();
+        for s in &slots {
+            if s.array {
+                linef!(self, "uint8_t {}[0x{:x}];", s.name(), s.size);
+            } else {
+                linef!(self, "{} {};", size_to_type(s.size), s.name());
+            }
+        }
+        if !declared.is_empty() || !slots.is_empty() {
             self.output.push('\n');
         }
     }
@@ -491,6 +510,15 @@ impl<'a> CEmitter<'a> {
             // A phi joins versions of one register / slot, which the C output
             // names identically — nothing to print.
             OpCode::MultiEqual => None,
+            // a stack address by its slot (WS87): `rdi = &local_48;`
+            OpCode::Copy | OpCode::IntAdd | OpCode::IntSub
+                if op.output.is_some_and(|o| {
+                    let d = &func.varnodes[o as usize].data;
+                    !(d.space == SpaceId::REGISTER && d.offset == 0x20)
+                }) && op.output.and_then(|o| self.frame.address(func, o)).is_some() =>
+            {
+                Some(format!("{} = {};", out_name?, self.frame.address(func, op.output?)?))
+            }
             OpCode::Copy => {
                 let dst = out_name?;
                 // the copy of a jump table's index the `switch` prints by its register (WS84)
@@ -766,6 +794,10 @@ impl<'a> CEmitter<'a> {
             }
             OpCode::BoolNegate => {
                 let dst = out_name?;
+                // a `setcc` whose condition folded (WS87): the negation is the text
+                if let Some(e) = self.select_conds.get(&op.index) {
+                    return Some(format!("{dst} = {};", strip_outer_parens(e)));
+                }
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = !{};", dst, a))
             }
@@ -860,18 +892,25 @@ impl<'a> CEmitter<'a> {
             }
             OpCode::Load => {
                 let dst = out_name?;
-                let addr = self.input_expr(func, op, 1);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                // a stack slot by name (WS87)
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, a, out_size, false)) {
+                    return Some(format!("{dst} = {slot};"));
+                }
+                let addr = self.input_expr(func, op, 1);
                 Some(format!("{} = *({}*){};", dst, size_to_type(out_size), addr))
             }
             OpCode::Store => {
-                let addr = self.input_expr(func, op, 1);
                 let val = self.input_expr(func, op, 2);
                 let size = if op.inputs.len() > 2 {
                     func.varnodes[op.inputs[2] as usize].data.size
                 } else {
                     8
                 };
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, a, size, true)) {
+                    return Some(format!("{slot} = {val};"));
+                }
+                let addr = self.input_expr(func, op, 1);
                 Some(format!("*({}*){} = {};", size_to_type(size), addr, val))
             }
             OpCode::Call => {
@@ -1035,7 +1074,12 @@ impl<'a> CEmitter<'a> {
         self.inlined.borrow_mut().clear();
         let prints = |u: usize| !self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some();
         let mut hidden = Vec::new();
-        for (d, readers) in crate::inline::candidates(func, &|d| self.noise.contains(&d)) {
+        // (a call printed from a rendering of its site does not print its operands)
+        let prints_operands = |u: usize| {
+            let op = &func.ops[u];
+            op.opcode == OpCode::CallInd || !self.call_renderings.is_some_and(|r| r.contains_key(&op.address))
+        };
+        for (d, readers) in crate::inline::candidates(func, &|d| self.noise.contains(&d), &prints_operands) {
             let op = &func.ops[d];
             let v = op.output.expect("candidate has an output");
             if !readers.iter().all(|&u| prints(u)) {
@@ -1063,10 +1107,20 @@ impl<'a> CEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
+        // a `setcc`'s folded condition (WS87), a whole right-hand side
+        if ((idx == 0 && op.opcode == OpCode::Copy) || (idx == 2 && op.opcode == OpCode::Store))
+            && let Some(e) = self.select_conds.get(&op.index)
+        {
+            return strip_outer_parens(e).to_string();
+        }
         let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
         if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
             // a whole right-hand side needs no parentheses
-            let whole = (op.opcode == OpCode::Store && idx == 2) || op.opcode == OpCode::Copy;
+            // (an argument of a call or intrinsic is separated by commas: WS87)
+            let whole = (op.opcode == OpCode::Store && idx == 2)
+                || op.opcode == OpCode::Copy
+                || (matches!(op.opcode, OpCode::Call | OpCode::CallOther) && idx > 0)
+                || (op.opcode == OpCode::CallInd && idx > 0);
             return if whole || crate::condition::is_atomic(&rhs) || is_deref(&rhs) { rhs } else { format!("({rhs})") };
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
@@ -1699,7 +1753,7 @@ fn reg_name(offset: u64, size: u32) -> String {
     }
 }
 
-fn size_to_type(size: u32) -> &'static str {
+pub(crate) fn size_to_type(size: u32) -> &'static str {
     match size {
         1 => "uint8_t",
         2 => "uint16_t",
@@ -1777,19 +1831,66 @@ fn fold_chain(
 /// defining the condition (not loads, calls or other registers), and folds only when none of
 /// the registers it reads is written between its op and the select. Returns each select's text
 /// and the ops no longer printed: those every live reader of which folds them.
+///
+/// WS87: a `setcc` folds its condition the same way — a byte register or a byte stored taking
+/// a flag / temporary (`sil = !tmp_49a;` after `ucomiss; seta sil` -> `sil = tmp_700 <
+/// xmm1_d;`): the text of a `!` site is its negation, the whole right-hand side.
 pub(crate) fn select_conditions(
     func: &SsaFunction,
     inliner: &crate::condition::Inliner,
     emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
 ) -> (rustc_hash::FxHashMap<usize, String>, Vec<usize>) {
     let mut texts = rustc_hash::FxHashMap::default();
-    if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
-        return (texts, Vec::new());
-    }
     let temp = |v: crate::ssa::VarId| {
         let d = &func.varnodes[v as usize].data;
         d.space == SpaceId::UNIQUE || (d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset) && d.size == 1)
     };
+    // the value a site folds (its input), and whether its text is the negation
+    let site = |op: &crate::ssa::SsaOp| -> Option<(crate::ssa::VarId, bool)> {
+        if op.dead {
+            return None;
+        }
+        let byte_reg = op.output.is_some_and(|w| {
+            let d = &func.varnodes[w as usize].data;
+            d.space == SpaceId::REGISTER && d.size == 1 && !(0x200..0x210).contains(&d.offset)
+        });
+        let c = match op.opcode {
+            OpCode::Select if op.inputs.len() == 3 => return Some((op.inputs[0], false)),
+            OpCode::Copy | OpCode::BoolNegate if byte_reg => op.inputs[0],
+            OpCode::Store if op.inputs.len() == 3 && func.varnodes[op.inputs[2] as usize].data.size == 1 => op.inputs[2],
+            _ => return None,
+        };
+        // (a flag / temporary computed by a comparison or a boolean op, through copies)
+        let mut v = c;
+        while let Some(d) = func.varnodes[v as usize].def_op.filter(|&d| func.ops[d].opcode == OpCode::Copy && temp(func.ops[d].inputs[0])) {
+            v = func.ops[d].inputs[0];
+        }
+        let def = func.varnodes[v as usize].def_op.map(|d| func.ops[d].opcode);
+        let boolean = def.is_some_and(|o| {
+            matches!(
+                o,
+                OpCode::BoolNegate
+                    | OpCode::BoolOr
+                    | OpCode::BoolAnd
+                    | OpCode::BoolXor
+                    | OpCode::IntEqual
+                    | OpCode::IntNotEqual
+                    | OpCode::IntLess
+                    | OpCode::IntSLess
+                    | OpCode::IntLessEqual
+                    | OpCode::IntSLessEqual
+                    | OpCode::FloatEqual
+                    | OpCode::FloatNotEqual
+                    | OpCode::FloatLess
+                    | OpCode::FloatLessEqual
+                    | OpCode::FloatNan
+            )
+        });
+        (temp(c) && boolean).then_some((c, op.opcode == OpCode::BoolNegate))
+    };
+    if !func.ops.iter().any(|o| site(o).is_some()) {
+        return (texts, Vec::new());
+    }
     let overlaps = |x: &reargo_core::pcode::VarnodeData, w: &reargo_core::pcode::VarnodeData| {
         x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
     };
@@ -1801,10 +1902,7 @@ pub(crate) fn select_conditions(
     let mut folded_by: rustc_hash::FxHashMap<usize, Vec<usize>> = rustc_hash::FxHashMap::default();
     let mut named: Vec<crate::ssa::VarId> = Vec::new();
     for (s, op) in func.ops.iter().enumerate() {
-        if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
-            continue;
-        }
-        let c = op.inputs[0];
+        let Some((c, negated)) = site(op) else { continue };
         let mut chain: Vec<usize> = Vec::new();
         let mut leaves = Vec::new();
         if !fold_chain(func, c, s, op.block, &temp, &unchanged, &mut chain, &mut leaves, 0) {
@@ -1815,7 +1913,7 @@ pub(crate) fn select_conditions(
         if let Some(f) = inliner.fold_value(func, &chain, c, &name, emit)
             && f.text != name(c)
         {
-            texts.insert(s, f.text);
+            texts.insert(s, f.render(negated));
             folded_by.insert(s, chain);
             named.extend(leaves);
         }
@@ -1854,7 +1952,7 @@ pub(crate) fn select_conditions(
 }
 
 /// Longest expression printed inside its reader (WS86).
-const MAX_INLINE_LEN: usize = 100;
+pub(crate) const MAX_INLINE_LEN: usize = 100;
 
 /// `*(T*)x` with `x` atomic: a unary expression, no parentheses needed around it.
 fn is_deref(s: &str) -> bool {

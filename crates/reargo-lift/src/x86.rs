@@ -1099,12 +1099,54 @@ impl X86Lifter {
         // (sd/ss) and packed (ps) forms; packed runs at sz=16 (whole-register
         // approximation — see the sz note above).
         let float_bin = match m {
-            Addsd | Addss | Addps | Addpd => Some(OpCode::FloatAdd),
-            Subsd | Subss | Subps | Subpd => Some(OpCode::FloatSub),
-            Mulsd | Mulss | Mulps | Mulpd => Some(OpCode::FloatMult),
-            Divsd | Divss | Divps | Divpd => Some(OpCode::FloatDiv),
+            Addsd | Addss => Some(OpCode::FloatAdd),
+            Subsd | Subss => Some(OpCode::FloatSub),
+            Mulsd | Mulss => Some(OpCode::FloatMult),
+            Divsd | Divss => Some(OpCode::FloatDiv),
             _ => None,
         };
+        // packed float ops lane by lane (WS87; they were one float op on the whole register):
+        // `xmm0 = mulps(xmm0, xmm1)`, `xmm0 = sqrtps(xmm1)`, `xmm0 = cvtps2pd(xmm1)`
+        let packed_float = match m {
+            Addps => Some(("addps", true)),
+            Subps => Some(("subps", true)),
+            Mulps => Some(("mulps", true)),
+            Divps => Some(("divps", true)),
+            Minps => Some(("minps", true)),
+            Maxps => Some(("maxps", true)),
+            Addpd => Some(("addpd", true)),
+            Subpd => Some(("subpd", true)),
+            Mulpd => Some(("mulpd", true)),
+            Divpd => Some(("divpd", true)),
+            Minpd => Some(("minpd", true)),
+            Maxpd => Some(("maxpd", true)),
+            Sqrtps => Some(("sqrtps", false)),
+            Sqrtpd => Some(("sqrtpd", false)),
+            Cvtdq2ps => Some(("cvtdq2ps", false)),
+            Cvttps2dq => Some(("cvttps2dq", false)),
+            Cvtps2dq => Some(("cvtps2dq", false)),
+            Cvtps2pd => Some(("cvtps2pd", false)),
+            Cvtpd2ps => Some(("cvtpd2ps", false)),
+            Cvttpd2dq => Some(("cvttpd2dq", false)),
+            Cvtpd2dq => Some(("cvtpd2dq", false)),
+            Cvtdq2pd => Some(("cvtdq2pd", false)),
+            _ => None,
+        };
+        if let Some((name, reads_dst)) = packed_float
+            && let Some(tag) = reargo_core::pcode::intrinsic::packed_tag(name)
+        {
+            // (`cvtps2pd` / `cvtdq2pd` read 8 bytes of memory)
+            let src_size = if matches!(m, Cvtps2pd | Cvtdq2pd) && insn.op_kind(1) == iced_x86::OpKind::Memory { 8 } else { 16 };
+            let src = self.sse_operand(insn, 1, src_size, &mut ops, &mut sb, address)?;
+            let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+            let inputs: SmallVec<[VarnodeData; 3]> = if reads_dst {
+                SmallVec::from_slice(&[constant(tag, 8), dst, src])
+            } else {
+                SmallVec::from_slice(&[constant(tag, 8), src])
+            };
+            ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: Some(dst), inputs });
+            return Ok(ops);
+        }
         if let Some(opcode) = float_bin {
             let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
             let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
@@ -1140,6 +1182,9 @@ impl X86Lifter {
             Shufpd => Some(("shufpd", true)),
             Pinsrw => Some(("pinsrw", true)),
             Pextrw if insn.op_kind(0) == iced_x86::OpKind::Register => Some(("pextrw", false)),
+            // every lane compared to a mask (WS87; was the low lane only)
+            Cmpps => Some(("cmpps", true)),
+            Cmppd => Some(("cmppd", true)),
             _ => None,
         };
         // shifts of every lane (WS86): `xmm0 = psrld(xmm0, 3)` / `psrld(xmm0, xmm1)` (count: the
@@ -1234,30 +1279,6 @@ impl X86Lifter {
                 });
             }
 
-            // packed int32 -> float32 / float32 -> int32 (cvtdq2ps, cvttps2dq,
-            // cvtps2dq). Modeled as a single whole-register FLOAT op, like the
-            // other packed (…ps) ops — not per-lane. Was unhandled → CallOther.
-            Cvtdq2ps => {
-                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
-                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::FloatInt2Float,
-                    seq: seq(sb),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[src]),
-                });
-            }
-            Cvttps2dq | Cvtps2dq => {
-                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
-                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::FloatTrunc,
-                    seq: seq(sb),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[src]),
-                });
-            }
-
             // float -> int (truncating cvtt*, and rounding cvt* approximated as trunc)
             Cvttsd2si | Cvttss2si | Cvtsd2si | Cvtss2si => {
                 let in_sz = if matches!(m, Cvttsd2si | Cvtsd2si) { 8 } else { 4 };
@@ -1277,17 +1298,6 @@ impl X86Lifter {
                 let out_sz = if m == Cvtsd2ss { 4 } else { 8 };
                 let src = self.sse_operand(insn, 1, in_sz, &mut ops, &mut sb, address)?;
                 let dst = self.sse_operand(insn, 0, out_sz, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::FloatFloat2Float,
-                    seq: seq(sb),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[src]),
-                });
-            }
-            // packed double<->single (whole-register approximation).
-            Cvtpd2ps | Cvtps2pd => {
-                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
-                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 ops.push(PcodeOp {
                     opcode: OpCode::FloatFloat2Float,
                     seq: seq(sb),
@@ -1386,19 +1396,43 @@ impl X86Lifter {
                 }
             }
 
-            // Shuffles / unpacks rearrange lanes between two registers. We
-            // can't express the permute in scalar p-code, so we model the
-            // result as a Copy of the source — lossy, but it keeps the
-            // dataflow edge alive instead of emitting an opaque trap.
+            // The half-register moves (WS87; were a copy into the low half, a store lost): a load
+            // into the low half is a write of its low 8 bytes (`xmm0_q = *(uint64_t*)m`), into the
+            // high half `xmm0 = movhps(xmm0, *(uint64_t*)m)`; a store writes the low quadword or
+            // the high one (`*(uint64_t*)m = (uint64_t)(xmm0 >> 64)`).
             Movlps | Movlpd | Movhps | Movhpd => {
-                let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
-                let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
-                    opcode: OpCode::Copy,
-                    seq: seq(sb),
-                    output: Some(dst),
-                    inputs: SmallVec::from_slice(&[src]),
-                });
+                let high = matches!(m, Movhps | Movhpd);
+                if insn.op_kind(0) == iced_x86::OpKind::Memory {
+                    let val = if high {
+                        let x = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+                        let h = unique(0x7a0, 8);
+                        ops.push(PcodeOp {
+                            opcode: OpCode::Subpiece,
+                            seq: seq(sb),
+                            output: Some(h),
+                            inputs: SmallVec::from_slice(&[x, constant(8, 4)]),
+                        });
+                        sb += 1;
+                        h
+                    } else {
+                        self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?
+                    };
+                    self.write_back_if_memory(insn, 0, val, &mut ops, &mut sb, address)?;
+                } else if high {
+                    let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                    let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+                    let tag = reargo_core::pcode::intrinsic::packed_tag("movhps").expect("named");
+                    ops.push(PcodeOp {
+                        opcode: OpCode::CallOther,
+                        seq: seq(sb),
+                        output: Some(dst),
+                        inputs: SmallVec::from_slice(&[constant(tag, 8), dst, src]),
+                    });
+                } else {
+                    let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                    let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
+                    ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(sb), output: Some(dst), inputs: SmallVec::from_slice(&[src]) });
+                }
             }
 
             // Bitwise and/or — exact (bitwise ops don't cross lanes), modeled on
@@ -1445,8 +1479,8 @@ impl X86Lifter {
             // set the destination lane to all-ones if the float predicate
             // holds, else 0. Faithful in the low lane for the ordered
             // predicates (eq/lt/le/neq/nlt/nle); unord/ord (3/7) fall through.
-            Cmpss | Cmpsd | Cmpps | Cmppd => {
-                let lane = if matches!(m, Cmpsd | Cmppd) { 8 } else { 4 };
+            Cmpss | Cmpsd => {
+                let lane = if m == Cmpsd { 8 } else { 4 };
                 let pred = insn.immediate8() & 0x7;
                 let cmp_def = match pred {
                     0 => Some((OpCode::FloatEqual, false)),
@@ -3079,16 +3113,20 @@ mod tests {
             "bt writes CF: {:?}", l.ops);
     }
 
+    /// WS87: packed float ops are lane-exact named intrinsics (`addpd(xmm0, xmm1)`), not one
+    /// float op on the whole register.
     #[test]
     fn lift_packed_double_arith() {
         let lifter = X86Lifter::new_64();
-        // addpd xmm0, xmm1 = 66 0f 58 c1
-        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0x58, 0xc1], 0x1000), 0x1000).unwrap();
-        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
-        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatAdd));
-        // cvtpd2ps xmm0, xmm1 = 66 0f 5a c1
-        let l = lifter.lift_instruction(&make_memory(&[0x66, 0x0f, 0x5a, 0xc1], 0x1000), 0x1000).unwrap();
-        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatFloat2Float));
+        let name = |code: &[u8]| {
+            let l = lifter.lift_instruction(&make_memory(code, 0x1000), 0x1000).unwrap();
+            let op = l.ops.iter().find(|o| o.opcode == OpCode::CallOther).expect("intrinsic").clone();
+            (reargo_core::pcode::intrinsic::name(op.inputs[0].offset), op.inputs.len(), op.output.unwrap().size)
+        };
+        // addpd xmm0, xmm1 = 66 0f 58 c1: reads both
+        assert_eq!(name(&[0x66, 0x0f, 0x58, 0xc1]), (Some("addpd"), 3, 16));
+        // cvtpd2ps xmm0, xmm1 = 66 0f 5a c1: reads the source only
+        assert_eq!(name(&[0x66, 0x0f, 0x5a, 0xc1]), (Some("cvtpd2ps"), 2, 16));
     }
 
     #[test]
@@ -3096,8 +3134,8 @@ mod tests {
         // cvtdq2ps xmm0, xmm1 = 0f 5b c1
         let lifter = X86Lifter::new_64();
         let l = lifter.lift_instruction(&make_memory(&[0x0f, 0x5b, 0xc1], 0x1000), 0x1000).unwrap();
-        assert!(!l.ops.iter().any(|o| o.opcode == OpCode::CallOther));
-        assert!(l.ops.iter().any(|o| o.opcode == OpCode::FloatInt2Float));
+        let op = l.ops.iter().find(|o| o.opcode == OpCode::CallOther).expect("intrinsic");
+        assert_eq!(reargo_core::pcode::intrinsic::name(op.inputs[0].offset), Some("cvtdq2ps"));
     }
 
     #[test]

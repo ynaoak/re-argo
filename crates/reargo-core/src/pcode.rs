@@ -583,6 +583,15 @@ pub mod intrinsic {
         // (`xmm0 = psrld(xmm0, 3)`), the byte shifts of the whole register, `pmuludq`
         "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "pslldq", "psrldq",
         "pmuludq",
+        // WS87: packed float lane by lane (they were one float op on the whole register) ...
+        "addps", "subps", "mulps", "divps", "minps", "maxps", "addpd", "subpd", "mulpd", "divpd",
+        "minpd", "maxpd",
+        // ... `dst = op(src)` ...
+        "sqrtps", "sqrtpd", "cvtdq2ps", "cvttps2dq", "cvtps2dq", "cvtps2pd", "cvtpd2ps", "cvttpd2dq",
+        "cvtpd2dq", "cvtdq2pd",
+        // ... `dst = cmpps(dst, src, imm)` (a mask per lane), and `movhps(dst, m64)`: the high
+        // quadword loaded
+        "cmpps", "cmppd", "movhps",
     ];
 
     /// The tag of a packed integer instruction by its mnemonic (`"paddb"`).

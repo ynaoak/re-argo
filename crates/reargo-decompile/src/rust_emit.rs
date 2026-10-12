@@ -50,6 +50,9 @@ pub struct RustEmitter<'a> {
     /// Per-address emit-once dedup, so multi-op instructions don't
     /// replay the same comment.
     emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    /// Temporaries printed inside their readers' expressions, as the C emitter does (WS87;
+    /// `inline::candidates`): the defining op by value. Their definitions are in `folded`.
+    inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
 }
 
 impl Default for RustEmitter<'static> {
@@ -72,6 +75,7 @@ impl RustEmitter<'static> {
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            inlined: Default::default(),
         }
     }
 }
@@ -94,6 +98,7 @@ impl<'a> RustEmitter<'a> {
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            inlined: Default::default(),
         }
     }
 
@@ -130,10 +135,13 @@ impl<'a> RustEmitter<'a> {
     ) -> String {
         self.output.clear();
         self.noise = crate::emit::epilogue_noise(func);
+        // WS87: first, as the conditions fold the expressions printed inline (as in C)
+        let inlined = self.inline_temporaries(func);
         self.folded = (0..func.cfg.blocks.len())
             .filter_map(|b| self.own_condition(func, b))
             .flat_map(|(ops, _)| ops)
             .collect();
+        self.folded.extend(inlined);
         let sig = infer_signature(func);
         self.line(&sig.to_rust_declaration(&func.name));
         self.line("{");
@@ -844,9 +852,51 @@ impl<'a> RustEmitter<'a> {
         }
     }
 
+    /// Fill `inlined` (see [`crate::inline`]); returns the definitions not to print.
+    fn inline_temporaries(&self, func: &SsaFunction) -> Vec<usize> {
+        self.inlined.borrow_mut().clear();
+        let prints = |u: usize| !self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some();
+        let prints_operands = |u: usize| {
+            let op = &func.ops[u];
+            op.opcode == OpCode::CallInd || !self.call_renderings.is_some_and(|r| r.contains_key(&op.address))
+        };
+        let mut hidden = Vec::new();
+        for (d, readers) in crate::inline::candidates(func, &|d| self.noise.contains(&d), &prints_operands) {
+            let v = func.ops[d].output.expect("candidate has an output");
+            if !readers.iter().all(|&u| prints(u)) {
+                continue;
+            }
+            let Some(text) = self.inline_text(func, d) else { continue };
+            if text.len() > crate::emit::MAX_INLINE_LEN || text.contains("//") {
+                continue;
+            }
+            self.inlined.borrow_mut().insert(crate::condition::value_key(func, v), d);
+            hidden.push(d);
+        }
+        hidden
+    }
+
+    /// The right-hand side of inlined op `d` as it prints now.
+    fn inline_text(&self, func: &SsaFunction, d: usize) -> Option<String> {
+        let op = &func.ops[d];
+        let line = self.emit_op(func, op)?;
+        let prefix = format!("{} = ", varnode_name(&func.varnodes[op.output? as usize]));
+        line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)
+    }
+
     fn input_expr(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, idx: usize) -> String {
         if idx >= op.inputs.len() {
             return "???".into();
+        }
+        let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
+        if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
+            // a whole right-hand side or an argument needs no parentheses; a method call or an
+            // `unsafe { … }` block is one operand already
+            let whole = (op.opcode == OpCode::Store && idx == 2)
+                || op.opcode == OpCode::Copy
+                || (matches!(op.opcode, OpCode::Call | OpCode::CallOther | OpCode::CallInd) && idx > 0);
+            let block = rhs.starts_with("unsafe {") && rhs.ends_with('}') && !rhs[1..rhs.len() - 1].contains('}');
+            return if whole || block || method_call(&rhs) || crate::condition::is_atomic(&rhs) { rhs } else { format!("({rhs})") };
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
@@ -1077,6 +1127,30 @@ fn reg_name(offset: u64, size: u32) -> String {
         }
         _ => format!("var_{:x}", offset),
     }
+}
+
+/// `x.wrapping_add(y)`: a method call on a name, one operand (WS87).
+fn method_call(s: &str) -> bool {
+    let Some(open) = s.find('(') else { return false };
+    let head = &s[..open];
+    if !head.contains('.') || !head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') || !s.ends_with(')') {
+        return false;
+    }
+    // the parenthesis after the method closes at the end
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == s.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn size_to_rust_type(size: u32) -> &'static str {

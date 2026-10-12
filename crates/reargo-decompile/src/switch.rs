@@ -289,8 +289,15 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
         .map(|k| (k, recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &no_range)))
         .collect();
     if found.iter().any(|(_, f)| f.as_ref().is_none_or(|f| f.2.default.is_none())) {
-        let cases: FxHashMap<u64, Vec<u64>> =
-            found.iter().filter_map(|(k, f)| Some((insns[*k].address, f.as_ref()?.2.targets.clone()))).collect();
+        // (the index register as the dispatch reads it: its case edges bound it, WS87)
+        let cases: crate::ranges::Cases = found
+            .iter()
+            .filter_map(|(k, f)| {
+                let (r, start, table) = f.as_ref()?;
+                let reused = insns[*start..=*k].iter().flat_map(|i| i.ops.iter()).any(|o| o.output.is_some_and(|w| overlaps(r, &w)));
+                Some((insns[*k].address, ((!reused).then_some(*r), table.targets.clone())))
+            })
+            .collect();
         if let Some(ranges) = crate::ranges::Ranges::new(insns, &cases) {
             for (k, f) in found.iter_mut() {
                 if f.as_ref().is_none_or(|f| f.2.default.is_none()) {
@@ -408,7 +415,9 @@ fn recover_one(
             _ => with_loose_bases(&target, &nearest_constants(insns, st)),
         };
         let (table, relative, index) = dispatch(&target)?;
-        let (index, level1) = match index_table(index) {
+        // (a byte loaded from a struct field, `movzx eax, byte [rsi+8]`, is no slot table: the
+        // window then starts after the load, WS87)
+        let (index, level1) = match index_table(index).filter(|&(t1, _, _)| memory.find_block(t1).is_some()) {
             Some((t1, sz, i)) => (i, Some((t1, sz))),
             None => (index, None),
         };
@@ -476,6 +485,14 @@ fn recover_one(
         // the index's range when the code shows it: a shift / mask computing it right before
         // (`shr edi, 30`: 4 cases, WS85)
         let limit = index_range(insns, window_start, k, &r).filter(|&n| n >= 2).unwrap_or(MAX_ENTRIES);
+        // (and its range on the paths to the window: a byte loaded, `and ecx, 6`, WS87)
+        let limit = match range(start, &r) {
+            Some((_, hi)) if hi >= 1 => limit.min(hi + 1),
+            _ => limit,
+        };
+        // (an impossible value may also go to the next function, right after this one's code:
+        // a tail call there, WS87 — 0x3b14da0)
+        let end = insns.iter().map(|i| i.address + u64::from(i.length)).max().unwrap_or(0);
         let mut targets = Vec::new();
         for i in 0..limit.min(MAX_ENTRIES) {
             if i > 0 && loaded.contains(&(table + width * i)) {
@@ -483,8 +500,12 @@ fn recover_one(
             }
             match read(i) {
                 Some(t) if addrs.contains(&t) => targets.push(t),
+                Some(t) if t == end && i > 0 => targets.push(crate::pipeline::TAIL_STUB_BASE + t),
                 _ => break,
             }
+        }
+        while targets.last().is_some_and(|&t| t >= crate::pipeline::TAIL_STUB_BASE) {
+            targets.pop();
         }
         if targets.len() < 2 {
             return None;
@@ -573,7 +594,8 @@ fn index_range(insns: &[LiftedInstruction], from: usize, k: usize, r: &VarnodeDa
         let c = op.inputs.get(1).filter(|v| v.space == SpaceId::CONST).map(|v| v.offset);
         range = match (op.opcode, c) {
             (OpCode::IntRight, Some(s)) if s > 0 && s < u64::from(out.size) * 8 => Some(1u64 << (u64::from(out.size) * 8 - s).min(63)),
-            (OpCode::IntAnd, Some(m)) if m < MAX_ENTRIES && (m + 1).is_power_of_two() => Some(m + 1),
+            // (any low mask: `and ecx, 6` leaves 0..=6, WS87)
+            (OpCode::IntAnd, Some(m)) if m < MAX_ENTRIES => Some(m + 1),
             // the wider view of the value just computed
             (OpCode::IntZExt, _) if op.inputs.first().is_some_and(|i| i.space == r.space && i.offset == r.offset) => range,
             // a narrower view the lifter derives from the register

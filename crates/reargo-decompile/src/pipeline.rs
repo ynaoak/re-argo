@@ -366,7 +366,7 @@ fn decompile_function_inner(
     // function was followed into that function's code (0x39f04e0 printed 0x39f0520's loop);
     // dropped, the `jmp` leaves the code and becomes a tail call
     if let Some((start, len)) = fde_bounds(&program.info.memory, &program.info.sections, func_entry) {
-        lifted.retain(|i| i.address >= start && i.address < start + len);
+        lifted = keep_fde_body(lifted, start, start + len);
     }
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
@@ -413,6 +413,27 @@ fn decompile_function_inner(
         &handlers,
         &switches,
     )
+}
+
+/// The instructions in `[start, end)` and the `int3`s right after `end` (WS87): the padding
+/// to the next function is where a switch over an enum sends its impossible values (BDS
+/// 0x3b13ff0, the fmt argument type: `case 1: __builtin_trap();`). Only a jump table's case
+/// reaches them; the trim drops them otherwise.
+fn keep_fde_body(lifted: Vec<LiftedInstruction>, start: u64, end: u64) -> Vec<LiftedInstruction> {
+    let mut next = end;
+    lifted
+        .into_iter()
+        .filter(|i| {
+            if i.address >= start && i.address < end {
+                return true;
+            }
+            if i.address == next && i.mnemonic.trim() == "int3" {
+                next += u64::from(i.length);
+                return true;
+            }
+            false
+        })
+        .collect()
 }
 
 /// `[start, start + len)` of the function covering `entry`, from the `.eh_frame_hdr` table.
@@ -490,12 +511,16 @@ pub(crate) fn rewrite_tail_calls(instructions: &mut Vec<LiftedInstruction>) {
 
 /// Is the indirect `jmp` of `instructions[k]` a jump-table dispatch (`jmp [table + i*8]`, or
 /// `movsxd rax, [rcx + rax*4]; add rax, rcx; jmp rax`) rather than a tail call? A scaled
-/// index in the `jmp` or in the instructions right before it marks a table.
+/// index in the `jmp` or in the straight-line instructions right before it marks a table; a
+/// dispatch whose table was recovered (its cases are inputs) is one.
 fn jump_table_dispatch(instructions: &[LiftedInstruction], k: usize) -> bool {
     let scaled = |m: &str| m.contains("*2]") || m.contains("*4]") || m.contains("*8]") || m.contains("*2+") || m.contains("*4+") || m.contains("*8+");
     let insn = &instructions[k];
-    if !insn.ops.iter().any(|o| o.opcode == reargo_core::pcode::OpCode::BranchInd) {
+    let Some(ind) = insn.ops.iter().find(|o| o.opcode == reargo_core::pcode::OpCode::BranchInd) else {
         return false;
+    };
+    if ind.inputs.len() > 1 {
+        return true;
     }
     if scaled(&insn.mnemonic) {
         return true;
@@ -519,6 +544,9 @@ fn jump_table_dispatch(instructions: &[LiftedInstruction], k: usize) -> bool {
                         | reargo_core::pcode::OpCode::Call
                         | reargo_core::pcode::OpCode::CallInd
                         | reargo_core::pcode::OpCode::Return
+                        // (WS87: another dispatch — a case right after a table's `jmp rax`
+                        // reached it: `mov rax, [rdi]; mov rax, [rax+0xe0]; jmp rax`)
+                        | reargo_core::pcode::OpCode::BranchInd
                 )
             })
         })
@@ -1444,7 +1472,8 @@ mod tests {
         ];
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
-        let call_line = c.lines().find(|l| l.contains("(*tmp_500)")).unwrap_or_else(|| panic!("{c}"));
+        // (WS87: the loaded target prints in the call)
+        let call_line = c.lines().find(|l| l.contains("(**(uint64_t*)rdi)")).unwrap_or_else(|| panic!("{c}"));
         assert!(call_line.trim_start().starts_with("rax = "), "{c}");
     }
 
@@ -2191,7 +2220,8 @@ mod tests {
         assert!(!c.contains("rsp = rsp + 8"), "{c}");
         assert!(!c.contains("= *(uint64_t*)rsp;"), "{c}");
         assert!(c.contains("return rax;"), "{c}");
-        assert!(c.contains("rsp = rsp - 8"), "the prologue is kept: {c}");
+        // (WS87: the push stores into its stack slot; the stack pointer update is not printed)
+        assert!(c.contains("local_8 = rbx;") && !c.contains("rsp"), "the prologue is kept: {c}");
     }
 
 
@@ -2692,7 +2722,8 @@ mod tests {
         let code = [
             0x48, 0x89, 0xb4, 0x24, 0xa0, 0x00, 0x00, 0x00, // mov [rsp+0xa0], rsi
             0x8b, 0x83, 0x00, 0x02, 0x00, 0x00, // mov eax, [rbx+0x200]
-            0x03, 0x83, 0x50, 0x03, 0x00, 0x00, // add eax, [rbx+0x350]
+            0x03, 0xb3, 0x50, 0x03, 0x00, 0x00, // add esi, [rbx+0x350]
+            0x89, 0x77, 0x08, // mov [rdi+8], esi
             0x89, 0x47, 0x08, // mov [rdi+8], eax
             0x83, 0x46, 0x10, 0x01, // add dword [rsi+0x10], 1
             0xc3,
@@ -2743,6 +2774,99 @@ mod tests {
         assert!(c.contains("*(uint64_t*)rcx = rdi;"), "{c}");
     }
 
+    /// WS87: a loaded call target, a cmov's memory arm and an intrinsic's memory operand print
+    /// in place: `(**(uint64_t*)(rax + 0x30))(rdi);`, `rsi = c ? rsi : *(uint64_t*)(rsp + 0x18);`,
+    /// `xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));`.
+    #[test]
+    fn temporaries_in_calls_selects_and_intrinsics_print_inline() {
+        let c = c_of(&[
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x30, // call [rax+0x30]
+            0xc3,
+        ]);
+        assert!(c.contains("(**(uint64_t*)(rax + 0x30))(rdi);"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        let c = c_of(&[
+            0x84, 0xc0, // test al, al
+            0x48, 0x0f, 0x45, 0x74, 0x24, 0x18, // cmovne rsi, [rsp+0x18]
+            0x48, 0x89, 0x37, // mov [rdi], rsi
+            0xc3,
+        ]);
+        assert!(c.contains(": *(uint64_t*)(rsp + 0x18);") || c.contains("? *(uint64_t*)(rsp + 0x18) :"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        let c = c_of(&[
+            0xf3, 0x0f, 0x5b, 0x4c, 0x24, 0x30, // cvttps2dq xmm1, [rsp+0x30]
+            0x0f, 0x11, 0x0f, // movups [rdi], xmm1
+            0xc3,
+        ]);
+        assert!(c.contains("xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));"), "{c}");
+    }
+
+    /// WS87: a `setcc` folds its condition like a branch: `ucomiss xmm1, xmm0; seta al` is
+    /// `al = xmm0_d < xmm1_d;`, `seta [rdi]` stores it.
+    #[test]
+    fn setcc_folds_its_condition() {
+        let c = c_of(&[
+            0x0f, 0x2e, 0xc8, // ucomiss xmm1, xmm0
+            0x0f, 0x97, 0xc0, // seta al
+            0x0f, 0x97, 0x07, // seta [rdi]
+            0xc3,
+        ]);
+        assert!(c.contains("al = xmm0_d < xmm1_d;"), "{c}");
+        assert!(c.contains("*(uint8_t*)rdi = xmm0_d < xmm1_d;"), "{c}");
+        assert!(!c.contains("var_2") && !c.contains("tmp_"), "{c}");
+    }
+
+    /// WS87: stack slots by name, the same across pushes; a narrower access at a slot's start
+    /// casts it, one further in goes through its address; an address only taken is an array.
+    #[test]
+    fn stack_slots_are_named() {
+        let c = c_of(&[
+            0x53, // push rbx
+            0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0xc7, 0x44, 0x24, 0x0c, 0x01, 0x00, 0x00, 0x00, // mov dword [rsp+0xc], 1
+            0x48, 0x8d, 0x44, 0x24, 0x10, // lea rax, [rsp+0x10]
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0x8b, 0x44, 0x24, 0x08, // mov eax, [rsp+8]
+            0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+            0x5b, // pop rbx
+            0xc3,
+        ]);
+        for s in [
+            "uint64_t local_20;",
+            "uint8_t local_18[0x10];",
+            "local_8 = rbx;",
+            "local_20 = rdi;",
+            "*(uint32_t*)((uint8_t*)&local_20 + 0x4) = 1;",
+            "rax = local_18;",
+            "eax = (uint32_t)local_20;",
+        ] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+        assert!(!c.contains("rsp"), "{c}");
+    }
+
+    /// WS87: the Rust output prints temporaries inline like the C output.
+    #[test]
+    fn rust_output_inlines_temporaries() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x89, 0xb7, 0xa0, 0x00, 0x00, 0x00, // mov [rdi+0xa0], rsi
+            0x03, 0xb3, 0x50, 0x03, 0x00, 0x00, // add esi, [rbx+0x350]
+            0x89, 0x77, 0x08, // mov [rdi+8], esi
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x30, // call [rax+0x30]
+            0xc3,
+        ];
+        let r = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap();
+        let rs = &r.rust_code;
+        assert!(!rs.contains("tmp_"), "{rs}");
+        assert!(rs.contains("unsafe { *(rdi.wrapping_add(0xa0) as *mut u64) = rsi; }"), "{rs}");
+        assert!(rs.contains("esi.wrapping_add(unsafe { *(rbx.wrapping_add(0x350) as *const u32) })"), "{rs}");
+    }
+
     #[test]
     fn rotates_print_as_rotl_rotr() {
         let lifter = X86Lifter::new_64();
@@ -2756,7 +2880,8 @@ mod tests {
             0xc3,
         ];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        for f in ["rotl(rdi, 0x11)", "rotr(rsi, 5)", "rotl(edx, tmp_2000)"] {
+        // (WS87: the count's mask printed in the intrinsic's operand)
+        for f in ["rotl(rdi, 0x11)", "rotr(rsi, 5)", "rotl(edx, cl & 0x1f)"] {
             assert!(c.contains(f), "{f}: {c}");
         }
         assert!(!c.contains("<<"), "{c}");
@@ -3196,6 +3321,109 @@ mod tests {
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("goto *"), "{c}");
         assert!(c.contains("(*"), "{c}");
+    }
+
+    /// WS87: a case right after the dispatch that is a virtual tail call (`mov rax, [rsi]; mov
+    /// rax, [rax+0x18]; jmp rax`) is a tail call: the scaled load before it belongs to the
+    /// table's `jmp rax` (BDS 0xa4de390 printed `goto *rax;  // vfn[28]`).
+    #[test]
+    fn virtual_tail_call_in_a_case_is_a_call() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x83, 0xff, 0x01, // 0x1000 cmp edi, 1
+            0x77, 0x1b, // 0x1003 ja 0x1020
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x00, 0x00, 0x00, // 0x1007 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100e movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1012 add rax, rcx
+            0xff, 0xe0, // 0x1015 jmp rax
+            0x48, 0x8b, 0x06, // 0x1017 case 0: mov rax, [rsi]
+            0x48, 0x8b, 0x40, 0x18, // 0x101a mov rax, [rax+0x18]
+            0xff, 0xe0, // 0x101e jmp rax
+            0x31, 0xc0, 0xc3, // 0x1020 xor eax, eax; ret
+        ];
+        let table: Vec<u8> = [0x1017u64, 0x1020].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (edi)"), "{c}");
+        assert!(!c.contains("goto *"), "{c}");
+        assert!(c.contains("vfn[3]"), "{c}");
+    }
+
+    /// WS87: an enum switch over a byte field (`movzx eax, byte [rsi+8]`) is no two-level
+    /// table (the field's offset 8 is no slot table's address); a mask computing the index
+    /// (`and eax, 6`) bounds it.
+    #[test]
+    fn jump_table_over_a_byte_field() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x0f, 0xb6, 0x46, 0x08, // 0x1000 movzx eax, byte [rsi+8]
+            0x48, 0x8d, 0x0d, 0xf5, 0x00, 0x00, 0x00, // 0x1004 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100b movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x100f add rax, rcx
+            0xff, 0xe0, // 0x1012 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1014 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101a mov eax, 20; ret
+        ];
+        let table: Vec<u8> = [0x1014u64, 0x101a, 0x1014].iter().flat_map(|&t| rel(t)).chain([0xff; 4]).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 2:") && !c.contains("case 3:"), "{c}");
+        // `and eax, 6`: cases 0..=6, the entry after them an instruction too
+        let code: &[u8] = &[
+            0x8b, 0x06, // 0x1000 mov eax, [rsi]
+            0x83, 0xe0, 0x06, // 0x1002 and eax, 6
+            0x48, 0x8d, 0x0d, 0xf4, 0x00, 0x00, 0x00, // 0x1005 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100c movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1010 add rax, rcx
+            0xff, 0xe0, // 0x1013 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1015 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101b mov eax, 20; ret
+        ];
+        let table: Vec<u8> = [0x1015u64, 0x101b, 0x1015, 0x101b, 0x1015, 0x101b, 0x1015, 0x101b].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("case 6:") && !c.contains("case 7:"), "{c}");
+    }
+
+    /// WS87: an enum table's impossible value may go to the next function, right after this
+    /// one's code (BDS 0x3b14da0): a tail call there, and the table goes on past it.
+    #[test]
+    fn jump_table_case_into_the_next_function() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x0f, 0xb6, 0x07, // 0x1000 movzx eax, byte [rdi]
+            0x48, 0x8d, 0x0d, 0xf6, 0x00, 0x00, 0x00, // 0x1003 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100a movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x100e add rax, rcx
+            0xff, 0xe0, // 0x1011 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1013 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x1019 mov eax, 20; ret
+        ];
+        let table: Vec<u8> = [0x1013u64, 0x101f, 0x1019, 0x101f].iter().flat_map(|&t| rel(t)).chain([0xff; 4]).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        // (the 9 instructions: the code ends at 0x101f)
+        let c = decompile(&lifter, &mem, 0x1000, "f", 9).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 2:") && c.contains("0x101f("), "{c}");
+        // (the run ends with the last entry that is code of the function)
+        assert!(!c.contains("case 3:"), "{c}");
+    }
+
+    /// WS87: the `int3`s right after the FDE's end stay (a switch over an enum sends its
+    /// impossible values there), the rest past it does not.
+    #[test]
+    fn padding_after_the_fde_is_kept() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[0x31, 0xc0, 0xc3, 0xcc, 0xcc, 0x90, 0xcc, 0x55];
+        let mem = make_memory(code, 0x1000);
+        let l = lifter.lift_range(&mem, 0x1000, 20).unwrap();
+        let kept: Vec<u64> = keep_fde_body(l, 0x1000, 0x1003).iter().map(|i| i.address).collect();
+        assert_eq!(kept, vec![0x1000, 0x1002, 0x1003, 0x1004]);
     }
 
     #[test]

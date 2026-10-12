@@ -727,7 +727,11 @@ fn packed_op(name: &str, x: u128, y: u128, imm: u64) -> u128 {
         "pslldq" => return if imm < 16 { x << (imm * 8) } else { 0 },
         "psrldq" => return if imm < 16 { x >> (imm * 8) } else { 0 },
         "pmuludq" => return from(8, &|i| el(x, 4, 2 * i) * el(y, 4, 2 * i)),
+        "movhps" => return el(x, 8, 0) | el(y, 8, 0) << 64,
         _ => {}
+    }
+    if let Some(v) = packed_float(name, x, y, imm) {
+        return v;
     }
     // lanes of `n` bytes: f(a, b) on each, the operands zero-extended
     fn lanes(x: u128, y: u128, n: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
@@ -799,6 +803,93 @@ fn packed_op(name: &str, x: u128, y: u128, imm: u64) -> u128 {
         }
         _ => x,
     }
+}
+
+/// The packed float ops (WS87), lane by lane as SSE computes them: a NaN operand gives the
+/// first NaN operand quieted, `min`/`max` the second operand when unordered or both zero, a
+/// conversion out of range (or of a NaN) the integer `0x80000000`.
+fn packed_float(name: &str, x: u128, y: u128, imm: u32) -> Option<u128> {
+    let el = |v: u128, n: u32, i: u32| -> u64 { ((v >> (i * n * 8)) & (u128::MAX >> (128 - n * 8))) as u64 };
+    let from = |n: u32, f: &dyn Fn(u32) -> u64| -> u128 {
+        let mask = if n == 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
+        (0..16 / n).fold(0u128, |acc, i| acc | u128::from(f(i) & mask) << (i * n * 8))
+    };
+    let s = |v: u64| f32::from_bits(v as u32);
+    let d = f64::from_bits;
+    // (arithmetic: the first NaN operand, quieted; else the CPU's own result)
+    let arith_s = |a: f32, b: f32, op: fn(f32, f32) -> f32| -> u64 {
+        u64::from(if a.is_nan() { a.to_bits() | 0x40_0000 } else if b.is_nan() { b.to_bits() | 0x40_0000 } else { op(a, b).to_bits() })
+    };
+    let arith_d = |a: f64, b: f64, op: fn(f64, f64) -> f64| -> u64 {
+        if a.is_nan() { a.to_bits() | 1 << 51 } else if b.is_nan() { b.to_bits() | 1 << 51 } else { op(a, b).to_bits() }
+    };
+    let cmp = |a: f64, b: f64| -> bool {
+        match imm & 7 {
+            0 => a == b,
+            1 => a < b,
+            2 => a <= b,
+            3 => a.is_nan() || b.is_nan(),
+            4 => a != b,
+            // (not less / not less-or-equal: true when unordered)
+            5 => a >= b || a.is_nan() || b.is_nan(),
+            6 => a > b || a.is_nan() || b.is_nan(),
+            _ => !(a.is_nan() || b.is_nan()),
+        }
+    };
+    let to_i32 = |v: f64, round: bool| -> u64 {
+        let v = if round { v.round_ties_even() } else { v.trunc() };
+        u64::from(if !(-2147483648.0..=2147483647.0).contains(&v) { 0x8000_0000 } else { v as i32 as u32 })
+    };
+    let quiet_s = |a: f32| if a.is_nan() { a.to_bits() | 0x40_0000 } else { a.sqrt().to_bits() };
+    Some(match name {
+        "addps" => from(4, &|i| arith_s(s(el(x, 4, i)), s(el(y, 4, i)), |a, b| a + b)),
+        "subps" => from(4, &|i| arith_s(s(el(x, 4, i)), s(el(y, 4, i)), |a, b| a - b)),
+        "mulps" => from(4, &|i| arith_s(s(el(x, 4, i)), s(el(y, 4, i)), |a, b| a * b)),
+        "divps" => from(4, &|i| arith_s(s(el(x, 4, i)), s(el(y, 4, i)), |a, b| a / b)),
+        "minps" => from(4, &|i| if s(el(x, 4, i)) < s(el(y, 4, i)) { el(x, 4, i) } else { el(y, 4, i) }),
+        "maxps" => from(4, &|i| if s(el(x, 4, i)) > s(el(y, 4, i)) { el(x, 4, i) } else { el(y, 4, i) }),
+        "addpd" => from(8, &|i| arith_d(d(el(x, 8, i)), d(el(y, 8, i)), |a, b| a + b)),
+        "subpd" => from(8, &|i| arith_d(d(el(x, 8, i)), d(el(y, 8, i)), |a, b| a - b)),
+        "mulpd" => from(8, &|i| arith_d(d(el(x, 8, i)), d(el(y, 8, i)), |a, b| a * b)),
+        "divpd" => from(8, &|i| arith_d(d(el(x, 8, i)), d(el(y, 8, i)), |a, b| a / b)),
+        "minpd" => from(8, &|i| if d(el(x, 8, i)) < d(el(y, 8, i)) { el(x, 8, i) } else { el(y, 8, i) }),
+        "maxpd" => from(8, &|i| if d(el(x, 8, i)) > d(el(y, 8, i)) { el(x, 8, i) } else { el(y, 8, i) }),
+        "sqrtps" => from(4, &|i| u64::from(quiet_s(s(el(x, 4, i))))),
+        "sqrtpd" => from(8, &|i| {
+            let a = d(el(x, 8, i));
+            if a.is_nan() { a.to_bits() | 1 << 51 } else { a.sqrt().to_bits() }
+        }),
+        "cvtdq2ps" => from(4, &|i| u64::from((el(x, 4, i) as u32 as i32 as f32).to_bits())),
+        "cvttps2dq" => from(4, &|i| to_i32(f64::from(s(el(x, 4, i))), false)),
+        "cvtps2dq" => from(4, &|i| to_i32(f64::from(s(el(x, 4, i))), true)),
+        "cvtps2pd" => from(8, &|i| {
+            let a = s(el(x, 4, i));
+            if a.is_nan() {
+                // (the payload moves to the top of the wider fraction, quieted)
+                let b = a.to_bits();
+                (u64::from(b >> 31) << 63) | 0x7ff8_0000_0000_0000 | (u64::from(b & 0x3f_ffff) << 29)
+            } else {
+                f64::from(a).to_bits()
+            }
+        }),
+        "cvtpd2ps" => from(4, &|i| {
+            if i >= 2 {
+                return 0;
+            }
+            let a = d(el(x, 8, i));
+            u64::from(if a.is_nan() {
+                let b = a.to_bits();
+                ((b >> 63) as u32) << 31 | 0x7fc0_0000 | ((b >> 29) as u32 & 0x3f_ffff)
+            } else {
+                (a as f32).to_bits()
+            })
+        }),
+        "cvttpd2dq" | "cvtpd2dq" => from(4, &|i| if i >= 2 { 0 } else { to_i32(d(el(x, 8, i)), name == "cvtpd2dq") }),
+        "cvtdq2pd" => from(8, &|i| (el(x, 4, i) as u32 as i32 as f64).to_bits()),
+        "cmpps" => from(4, &|i| if cmp(f64::from(s(el(x, 4, i))), f64::from(s(el(y, 4, i)))) { u64::MAX } else { 0 }),
+        "cmppd" => from(8, &|i| if cmp(d(el(x, 8, i)), d(el(y, 8, i))) { u64::MAX } else { 0 }),
+        _ => return None,
+    })
 }
 
 impl Default for Emulator {
