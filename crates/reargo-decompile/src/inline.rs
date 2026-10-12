@@ -69,9 +69,26 @@ fn pure(op: OpCode) -> bool {
 }
 
 /// An op that may print a temporary's expression in place of its name (WS88: also a
-/// division, `eax = eax / ebx;`).
+/// division, `eax = eax / ebx;`, and a comparison, see [`comparison`]).
 fn reader_ok(op: OpCode) -> bool {
-    op == OpCode::Load || op == OpCode::Store || pure(op) || matches!(op, OpCode::IntDiv | OpCode::IntSDiv | OpCode::IntRem | OpCode::IntSRem)
+    op == OpCode::Load
+        || op == OpCode::Store
+        || pure(op)
+        || comparison(op)
+        || matches!(op, OpCode::IntDiv | OpCode::IntSDiv | OpCode::IntRem | OpCode::IntSRem)
+}
+
+/// A comparison or boolean op (WS88): a flag kept as a statement prints its operands
+/// (`var_206 = rcx == *(uint64_t*)0xdfbea80;`); one folded into its block's branch or a select
+/// prints them there, later in the block — so the value must hold to the block's end when the
+/// comparison is read later in its block.
+fn comparison(op: OpCode) -> bool {
+    use OpCode::*;
+    matches!(
+        op,
+        IntEqual | IntNotEqual | IntLess | IntSLess | IntLessEqual | IntSLessEqual | BoolNegate | BoolAnd | BoolOr | BoolXor | FloatEqual
+            | FloatNotEqual | FloatLess | FloatLessEqual | FloatNan
+    )
 }
 
 /// A named intrinsic (`pmovmskb(x)`, `mulps(a, b)`): prints its operands as `name(…)`.
@@ -108,6 +125,11 @@ pub(crate) fn candidates(
     prints_operands: &dyn Fn(OpIdx) -> bool,
 ) -> Vec<(OpIdx, Vec<OpIdx>)> {
     let readers = crate::condition::Readers::new(func);
+    // the last op of each block (a comparison's value is printed up to there)
+    let mut block_end: FxHashMap<usize, OpIdx> = FxHashMap::default();
+    for o in &func.ops {
+        block_end.insert(o.block, o.index);
+    }
     let mut deps: FxHashMap<ValueKey, Deps> = FxHashMap::default();
     let mut out = Vec::new();
     for (d, op) in func.ops.iter().enumerate() {
@@ -144,12 +166,31 @@ pub(crate) fn candidates(
                 regs += 1;
             }
         }
-        // (a load's first input is its address space)
-        dep.simple = matches!(op.opcode, OpCode::IntAdd | OpCode::IntSub | OpCode::Copy) && regs == 1 && consts <= 1;
+        // (a load's first input is its address space; WS88: an indexed address, `rax + (rcx << 2)`,
+        // is cheap too)
+        let scaled = |x: crate::ssa::VarId| {
+            func.varnodes[x as usize].def_op.is_some_and(|i| {
+                let o = &func.ops[i];
+                o.opcode == OpCode::IntLeft
+                    && deps.get(&value_key(func, x)).is_some_and(|dx| dx.simple)
+                    && o.inputs.get(1).is_some_and(|&c| func.varnodes[c as usize].data.space == SpaceId::CONST)
+            })
+        };
+        dep.simple = (matches!(op.opcode, OpCode::IntAdd | OpCode::IntSub | OpCode::Copy) && regs == 1 && consts <= 1)
+            || (op.opcode == OpCode::IntLeft && regs == 1 && consts == 1)
+            || (op.opcode == OpCode::IntAdd && consts == 0 && op.inputs.iter().all(|&x| !deps.contains_key(&value_key(func, x)) || scaled(x)));
         if rs.len() > 1 && !dep.simple {
             continue;
         }
-        let last = *rs.iter().max().expect("non-empty");
+        let mut last = *rs.iter().max().expect("non-empty");
+        // (a comparison read later in its block may fold into a condition printed there; one
+        // read elsewhere only is a statement of its own)
+        let folds_later = |u: OpIdx| {
+            func.ops[u].output.is_some_and(|w| readers.of(func, w).iter().any(|&r| r > u && func.ops[r].block == func.ops[u].block))
+        };
+        if rs.iter().any(|&u| comparison(func.ops[u].opcode) && folds_later(u)) {
+            last = last.max(block_end.get(&op.block).map_or(last, |&e| e + 1));
+        }
         let key = value_key(func, v);
         let ok = rs.iter().all(|&u| {
             let r = &func.ops[u];

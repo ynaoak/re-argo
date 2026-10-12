@@ -2980,6 +2980,36 @@ mod tests {
         assert!(!c.contains("var_20") && !c.contains("tmp_"), "{c}");
     }
 
+    /// WS88: a loaded value a flag kept as a statement compares prints inside it, and an
+    /// indexed address read twice prints in both readers; a load a branch compares after a store
+    /// keeps its value.
+    #[test]
+    fn loads_and_indexed_addresses_print_inline() {
+        let c = c_of(&[
+            0x48, 0x3b, 0x0d, 0x00, 0x01, 0x00, 0x00, // cmp rcx, [rip+0x100]
+            0x74, 0x05, // je +5
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x74, 0x01, // je +1 (the same flag, another block)
+            0xc3,
+            0xc3,
+        ]);
+        assert!(c.contains("var_206 = rcx == *(uint64_t*)0x1107;"), "{c}");
+        let c = c_of(&[
+            0x44, 0x8b, 0x0c, 0x8a, // mov r9d, [rdx+rcx*4]
+            0x48, 0x8d, 0x4c, 0x8a, 0x04, // lea rcx, [rdx+rcx*4+4]
+            0x48, 0x89, 0x0f, // mov [rdi], rcx
+            0x44, 0x89, 0x4f, 0x08, // mov [rdi+8], r9d
+            0xc3,
+        ]);
+        assert!(c.contains("r9d = *(uint32_t*)(rdx + (rcx << 2));"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        // cmp edi, [rsi]; mov dword [rsi], 0; jg +1; ret; ret: the compared value is read before
+        // the store
+        let c = c_of(&[0x3b, 0x3e, 0xc7, 0x06, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x01, 0xc3, 0xc3]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(!cond.contains("*(uint32_t*)rsi"), "{c}");
+    }
+
     /// WS88: the Rust output folds the conditions of `setcc` and `cmovcc` like the C output.
     #[test]
     fn rust_output_folds_setcc_and_select_conditions() {
