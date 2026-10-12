@@ -25,8 +25,10 @@
 //!   `and` writes `a == b` (WS86); `setp r1; setne r2; or r2, r1` writes `a != b`.
 //!
 //! Only flags read in the straight line after the compare count: every instruction between
-//! the compare and the reader writes no flag and neither operand, and none is the target of a
-//! jump (where the flags could come from elsewhere).
+//! the compare and the reader writes no flag, and none is the target of a jump (where the
+//! flags could come from elsewhere). A rewrite that compares the operands again at the reader
+//! also needs them unchanged up to it; one that reads the compare's own `a == b` (`CF || ZF`,
+//! ZF past the parity jump) does not (WS88: `ucomiss xmm1, xmm0; …; andps xmm1, xmm2; …; jbe`).
 
 use reargo_core::address::{Address, SpaceId};
 use reargo_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
@@ -44,7 +46,7 @@ const NE_TMP: u64 = 0x2f80;
 /// The `a < b`, `b < a` and their `||` it adds for an ordered `!=` (WS88).
 const LT_TMP: u64 = 0x2f90;
 /// Instructions looked at after the compare.
-const MAX_READERS: usize = 6;
+const MAX_READERS: usize = 12;
 
 fn is_reg(v: &VarnodeData, off: u64) -> bool {
     v.space == SpaceId::REGISTER && v.offset == off && v.size == 1
@@ -264,8 +266,10 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
             or.inputs.truncate(1);
             done += 1;
         }
-        // the instructions after the compare that still see its flags and operands
+        // the instructions after the compare that still see its flags; the first `intact` of
+        // them also see its operands
         let mut readers = Vec::new();
+        let mut intact = usize::MAX;
         let mut k = i + 1;
         while k < lifted.len() && readers.len() < MAX_READERS {
             let (prev, insn) = (&lifted[k - 1], &lifted[k]);
@@ -273,12 +277,7 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
                 break;
             }
             readers.push(k);
-            let writes = |v: &VarnodeData| {
-                (v.space == SpaceId::REGISTER && (0x200..0x210).contains(&v.offset))
-                    || overlaps(&a, v)
-                    || overlaps(&b, v)
-                    || *v == eq
-            };
+            let writes = |v: &VarnodeData| (v.space == SpaceId::REGISTER && (0x200..0x210).contains(&v.offset)) || *v == eq;
             let ends = insn.ops.iter().any(|o| {
                 o.output.as_ref().is_some_and(writes)
                     || matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Call | OpCode::CallInd | OpCode::Return | OpCode::CallOther)
@@ -286,9 +285,12 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
             if ends {
                 break;
             }
+            if intact == usize::MAX && insn.ops.iter().any(|o| o.output.as_ref().is_some_and(|v| overlaps(&a, v) || overlaps(&b, v))) {
+                intact = readers.len() - 1;
+            }
             k += 1;
         }
-        if fold_set_pair(lifted, &readers, a, b, eq) {
+        if fold_set_pair(lifted, &readers[..intact.min(readers.len())], a, b, eq) {
             done += 1;
         }
         let mut r = 0;
@@ -300,7 +302,7 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
                 && let Some((j2, t2)) = flag_jump(&lifted[y])
             {
                 match (j1, j2) {
-                    (Jump::Ne, Jump::P) | (Jump::P, Jump::Ne) if t1 == t2 => {
+                    (Jump::Ne, Jump::P) | (Jump::P, Jump::Ne) if t1 == t2 && r + 1 < intact => {
                         let (ne, t) = not_equal(&lifted[x], a, b);
                         let br = PcodeOp {
                             opcode: OpCode::CBranch,
@@ -356,7 +358,7 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
                 match (j1, j2) {
                     // jne T; …; jp / jnp: the jne on `a < b || b < a`, the parity jump on the
                     // operands' NaN test
-                    (Jump::Ne, Jump::P | Jump::Np) => {
+                    (Jump::Ne, Jump::P | Jump::Np) if readers.iter().position(|&k| k == y).is_some_and(|q| q < intact) => {
                         lifted[x].ops = ordered_not_equal_jump(&lifted[x], a, b, t1);
                         renumber(&mut lifted[x]);
                         lifted[y].ops = unordered_jump(&lifted[y], a, b, t2, j2 == Jump::Np);
@@ -381,6 +383,7 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
             }
             // cmovne r, s; cmovp r, s (either order)
             if let (Some((m1, o1)), Some(y)) = (cmov(&lifted[x]), next)
+                && r + 1 < intact
                 && let Some((m2, o2)) = cmov(&lifted[y])
                 && m1 != m2
                 && o1 == o2
@@ -513,6 +516,21 @@ mod tests {
         // a compare between: no pair
         let mut l = lift(&[0x0f, 0x2e, 0xc1, 0x75, 0x05, 0x39, 0xf8, 0x7a, 0x01, 0xc3, 0xc3]);
         assert_eq!(fold_parity_checks(&mut l, []), 0);
+    }
+
+    /// WS88: `jbe` after an operand is written still reads the compare's `a == b`; a `jne; jp`
+    /// pair there is left alone (it would compare the new value).
+    #[test]
+    fn jbe_after_an_operand_write_reads_equal() {
+        // ucomiss xmm1, xmm0; andps xmm1, xmm2; jbe +0; ret
+        let mut l = lift(&[0x0f, 0x2e, 0xc8, 0x0f, 0x54, 0xca, 0x76, 0x00, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 1);
+        let or = l[2].ops.iter().find(|o| o.opcode == OpCode::BoolOr).unwrap();
+        assert_eq!(or.inputs[1].offset, EQ_TMP);
+        // ucomiss xmm0, xmm1; movaps xmm0, xmm2; jne +2; jp +0; ret; ret
+        let mut l = lift(&[0x0f, 0x2e, 0xc1, 0x0f, 0x28, 0xc2, 0x75, 0x03, 0x7a, 0x01, 0xc3, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 0);
+        assert!(!l[2].ops.iter().any(|o| o.opcode == OpCode::FloatNotEqual));
     }
 
     #[test]
