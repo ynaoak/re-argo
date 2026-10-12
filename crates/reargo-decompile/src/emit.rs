@@ -77,6 +77,8 @@ pub struct CEmitter<'a> {
     /// defining op by value, rendered where it is read (so a condition folding the values it
     /// reads folds them there too). Their definitions are in `folded`.
     inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
+    /// The stack slots by name (WS87, `frame`).
+    frame: crate::frame::Frame,
 }
 
 impl Default for CEmitter<'static> {
@@ -102,6 +104,7 @@ impl CEmitter<'static> {
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
+            frame: Default::default(),
         }
     }
 }
@@ -139,6 +142,7 @@ impl<'a> CEmitter<'a> {
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
+            frame: Default::default(),
         }
     }
 
@@ -181,6 +185,10 @@ impl<'a> CEmitter<'a> {
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
+        // WS87: the stack slots by name; the stack pointer updates only they read go
+        self.frame = crate::frame::Frame::new(func, &|_| true);
+        let frame_noise = self.frame.hidden(func, &self.noise);
+        self.noise.extend(frame_noise);
         // WS86: first, as the conditions and selects fold the expressions printed inline
         let inlined = self.inline_temporaries(func);
         self.folded = (0..func.cfg.blocks.len())
@@ -209,7 +217,9 @@ impl<'a> CEmitter<'a> {
         for vn in &func.varnodes {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
             // view syncs nobody reads) is not printed, so declaring it is noise
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d)) {
+            if vn.data.space == SpaceId::REGISTER
+                && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d))
+            {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_type(vn.data.size);
@@ -220,7 +230,16 @@ impl<'a> CEmitter<'a> {
                 }
             }
         }
-        if !declared.is_empty() {
+        // the stack slots (WS87)
+        let slots: Vec<crate::frame::Slot> = self.frame.slots().copied().collect();
+        for s in &slots {
+            if s.array {
+                linef!(self, "uint8_t {}[0x{:x}];", s.name(), s.size);
+            } else {
+                linef!(self, "{} {};", size_to_type(s.size), s.name());
+            }
+        }
+        if !declared.is_empty() || !slots.is_empty() {
             self.output.push('\n');
         }
     }
@@ -491,6 +510,15 @@ impl<'a> CEmitter<'a> {
             // A phi joins versions of one register / slot, which the C output
             // names identically — nothing to print.
             OpCode::MultiEqual => None,
+            // a stack address by its slot (WS87): `rdi = &local_48;`
+            OpCode::Copy | OpCode::IntAdd | OpCode::IntSub
+                if op.output.is_some_and(|o| {
+                    let d = &func.varnodes[o as usize].data;
+                    !(d.space == SpaceId::REGISTER && d.offset == 0x20)
+                }) && op.output.and_then(|o| self.frame.address(func, o)).is_some() =>
+            {
+                Some(format!("{} = {};", out_name?, self.frame.address(func, op.output?)?))
+            }
             OpCode::Copy => {
                 let dst = out_name?;
                 // the copy of a jump table's index the `switch` prints by its register (WS84)
@@ -864,18 +892,25 @@ impl<'a> CEmitter<'a> {
             }
             OpCode::Load => {
                 let dst = out_name?;
-                let addr = self.input_expr(func, op, 1);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
+                // a stack slot by name (WS87)
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, a, out_size, false)) {
+                    return Some(format!("{dst} = {slot};"));
+                }
+                let addr = self.input_expr(func, op, 1);
                 Some(format!("{} = *({}*){};", dst, size_to_type(out_size), addr))
             }
             OpCode::Store => {
-                let addr = self.input_expr(func, op, 1);
                 let val = self.input_expr(func, op, 2);
                 let size = if op.inputs.len() > 2 {
                     func.varnodes[op.inputs[2] as usize].data.size
                 } else {
                     8
                 };
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, a, size, true)) {
+                    return Some(format!("{slot} = {val};"));
+                }
+                let addr = self.input_expr(func, op, 1);
                 Some(format!("*({}*){} = {};", size_to_type(size), addr, val))
             }
             OpCode::Call => {
@@ -1718,7 +1753,7 @@ fn reg_name(offset: u64, size: u32) -> String {
     }
 }
 
-fn size_to_type(size: u32) -> &'static str {
+pub(crate) fn size_to_type(size: u32) -> &'static str {
     match size {
         1 => "uint8_t",
         2 => "uint16_t",

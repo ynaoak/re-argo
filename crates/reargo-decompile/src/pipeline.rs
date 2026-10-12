@@ -2220,7 +2220,8 @@ mod tests {
         assert!(!c.contains("rsp = rsp + 8"), "{c}");
         assert!(!c.contains("= *(uint64_t*)rsp;"), "{c}");
         assert!(c.contains("return rax;"), "{c}");
-        assert!(c.contains("rsp = rsp - 8"), "the prologue is kept: {c}");
+        // (WS87: the push stores into its stack slot; the stack pointer update is not printed)
+        assert!(c.contains("local_8 = rbx;") && !c.contains("rsp"), "the prologue is kept: {c}");
     }
 
 
@@ -2813,6 +2814,37 @@ mod tests {
         assert!(c.contains("al = xmm0_d < xmm1_d;"), "{c}");
         assert!(c.contains("*(uint8_t*)rdi = xmm0_d < xmm1_d;"), "{c}");
         assert!(!c.contains("var_2") && !c.contains("tmp_"), "{c}");
+    }
+
+    /// WS87: stack slots by name, the same across pushes; a narrower access at a slot's start
+    /// casts it, one further in goes through its address; an address only taken is an array.
+    #[test]
+    fn stack_slots_are_named() {
+        let c = c_of(&[
+            0x53, // push rbx
+            0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0xc7, 0x44, 0x24, 0x0c, 0x01, 0x00, 0x00, 0x00, // mov dword [rsp+0xc], 1
+            0x48, 0x8d, 0x44, 0x24, 0x10, // lea rax, [rsp+0x10]
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0x8b, 0x44, 0x24, 0x08, // mov eax, [rsp+8]
+            0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+            0x5b, // pop rbx
+            0xc3,
+        ]);
+        for s in [
+            "uint64_t local_20;",
+            "uint8_t local_18[0x10];",
+            "local_8 = rbx;",
+            "local_20 = rdi;",
+            "*(uint32_t*)((uint8_t*)&local_20 + 0x4) = 1;",
+            "rax = local_18;",
+            "eax = (uint32_t)local_20;",
+        ] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+        assert!(!c.contains("rsp"), "{c}");
     }
 
     #[test]
