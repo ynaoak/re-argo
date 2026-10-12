@@ -3292,6 +3292,31 @@ mod tests {
         assert!(c.contains("case 6:") && !c.contains("case 7:"), "{c}");
     }
 
+    /// WS87: an enum table's impossible value may go to the next function, right after this
+    /// one's code (BDS 0x3b14da0): a tail call there, and the table goes on past it.
+    #[test]
+    fn jump_table_case_into_the_next_function() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x0f, 0xb6, 0x07, // 0x1000 movzx eax, byte [rdi]
+            0x48, 0x8d, 0x0d, 0xf6, 0x00, 0x00, 0x00, // 0x1003 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100a movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x100e add rax, rcx
+            0xff, 0xe0, // 0x1011 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1013 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x1019 mov eax, 20; ret
+        ];
+        let table: Vec<u8> = [0x1013u64, 0x101f, 0x1019, 0x101f].iter().flat_map(|&t| rel(t)).chain([0xff; 4]).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        // (the 9 instructions: the code ends at 0x101f)
+        let c = decompile(&lifter, &mem, 0x1000, "f", 9).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 2:") && c.contains("0x101f("), "{c}");
+        // (the run ends with the last entry that is code of the function)
+        assert!(!c.contains("case 3:"), "{c}");
+    }
+
     /// WS87: the `int3`s right after the FDE's end stay (a switch over an enum sends its
     /// impossible values there), the rest past it does not.
     #[test]

@@ -490,6 +490,9 @@ fn recover_one(
             Some((_, hi)) if hi >= 1 => limit.min(hi + 1),
             _ => limit,
         };
+        // (an impossible value may also go to the next function, right after this one's code:
+        // a tail call there, WS87 — 0x3b14da0)
+        let end = insns.iter().map(|i| i.address + u64::from(i.length)).max().unwrap_or(0);
         let mut targets = Vec::new();
         for i in 0..limit.min(MAX_ENTRIES) {
             if i > 0 && loaded.contains(&(table + width * i)) {
@@ -497,8 +500,12 @@ fn recover_one(
             }
             match read(i) {
                 Some(t) if addrs.contains(&t) => targets.push(t),
+                Some(t) if t == end && i > 0 => targets.push(crate::pipeline::TAIL_STUB_BASE + t),
                 _ => break,
             }
+        }
+        while targets.last().is_some_and(|&t| t >= crate::pipeline::TAIL_STUB_BASE) {
+            targets.pop();
         }
         if targets.len() < 2 {
             return None;
