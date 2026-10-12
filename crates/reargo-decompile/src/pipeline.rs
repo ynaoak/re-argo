@@ -1472,7 +1472,8 @@ mod tests {
         ];
         let mem = make_memory(&code, 0x1000);
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
-        let call_line = c.lines().find(|l| l.contains("(*tmp_500)")).unwrap_or_else(|| panic!("{c}"));
+        // (WS87: the loaded target prints in the call)
+        let call_line = c.lines().find(|l| l.contains("(**(uint64_t*)rdi)")).unwrap_or_else(|| panic!("{c}"));
         assert!(call_line.trim_start().starts_with("rax = "), "{c}");
     }
 
@@ -2771,6 +2772,34 @@ mod tests {
         assert!(c.contains("*(uint64_t*)rcx = rdi;"), "{c}");
     }
 
+    /// WS87: a loaded call target, a cmov's memory arm and an intrinsic's memory operand print
+    /// in place: `(**(uint64_t*)(rax + 0x30))(rdi);`, `rsi = c ? rsi : *(uint64_t*)(rsp + 0x18);`,
+    /// `xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));`.
+    #[test]
+    fn temporaries_in_calls_selects_and_intrinsics_print_inline() {
+        let c = c_of(&[
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x30, // call [rax+0x30]
+            0xc3,
+        ]);
+        assert!(c.contains("(**(uint64_t*)(rax + 0x30))(rdi);"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        let c = c_of(&[
+            0x84, 0xc0, // test al, al
+            0x48, 0x0f, 0x45, 0x74, 0x24, 0x18, // cmovne rsi, [rsp+0x18]
+            0x48, 0x89, 0x37, // mov [rdi], rsi
+            0xc3,
+        ]);
+        assert!(c.contains(": *(uint64_t*)(rsp + 0x18);") || c.contains("? *(uint64_t*)(rsp + 0x18) :"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        let c = c_of(&[
+            0xf3, 0x0f, 0x5b, 0x4c, 0x24, 0x30, // cvttps2dq xmm1, [rsp+0x30]
+            0x0f, 0x11, 0x0f, // movups [rdi], xmm1
+            0xc3,
+        ]);
+        assert!(c.contains("xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));"), "{c}");
+    }
+
     #[test]
     fn rotates_print_as_rotl_rotr() {
         let lifter = X86Lifter::new_64();
@@ -2784,7 +2813,8 @@ mod tests {
             0xc3,
         ];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        for f in ["rotl(rdi, 0x11)", "rotr(rsi, 5)", "rotl(edx, tmp_2000)"] {
+        // (WS87: the count's mask printed in the intrinsic's operand)
+        for f in ["rotl(rdi, 0x11)", "rotr(rsi, 5)", "rotl(edx, cl & 0x1f)"] {
             assert!(c.contains(f), "{f}: {c}");
         }
         assert!(!c.contains("<<"), "{c}");

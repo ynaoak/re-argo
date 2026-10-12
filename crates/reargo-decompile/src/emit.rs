@@ -1035,7 +1035,12 @@ impl<'a> CEmitter<'a> {
         self.inlined.borrow_mut().clear();
         let prints = |u: usize| !self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some();
         let mut hidden = Vec::new();
-        for (d, readers) in crate::inline::candidates(func, &|d| self.noise.contains(&d)) {
+        // (a call printed from a rendering of its site does not print its operands)
+        let prints_operands = |u: usize| {
+            let op = &func.ops[u];
+            op.opcode == OpCode::CallInd || !self.call_renderings.is_some_and(|r| r.contains_key(&op.address))
+        };
+        for (d, readers) in crate::inline::candidates(func, &|d| self.noise.contains(&d), &prints_operands) {
             let op = &func.ops[d];
             let v = op.output.expect("candidate has an output");
             if !readers.iter().all(|&u| prints(u)) {
@@ -1066,7 +1071,11 @@ impl<'a> CEmitter<'a> {
         let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
         if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
             // a whole right-hand side needs no parentheses
-            let whole = (op.opcode == OpCode::Store && idx == 2) || op.opcode == OpCode::Copy;
+            // (an argument of a call or intrinsic is separated by commas: WS87)
+            let whole = (op.opcode == OpCode::Store && idx == 2)
+                || op.opcode == OpCode::Copy
+                || (matches!(op.opcode, OpCode::Call | OpCode::CallOther) && idx > 0)
+                || (op.opcode == OpCode::CallInd && idx > 0);
             return if whole || crate::condition::is_atomic(&rhs) || is_deref(&rhs) { rhs } else { format!("({rhs})") };
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
