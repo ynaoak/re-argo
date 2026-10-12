@@ -3254,6 +3254,44 @@ mod tests {
         assert!(c.contains("vfn[3]"), "{c}");
     }
 
+    /// WS87: an enum switch over a byte field (`movzx eax, byte [rsi+8]`) is no two-level
+    /// table (the field's offset 8 is no slot table's address); a mask computing the index
+    /// (`and eax, 6`) bounds it.
+    #[test]
+    fn jump_table_over_a_byte_field() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x0f, 0xb6, 0x46, 0x08, // 0x1000 movzx eax, byte [rsi+8]
+            0x48, 0x8d, 0x0d, 0xf5, 0x00, 0x00, 0x00, // 0x1004 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100b movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x100f add rax, rcx
+            0xff, 0xe0, // 0x1012 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1014 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101a mov eax, 20; ret
+        ];
+        let table: Vec<u8> = [0x1014u64, 0x101a, 0x1014].iter().flat_map(|&t| rel(t)).chain([0xff; 4]).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 2:") && !c.contains("case 3:"), "{c}");
+        // `and eax, 6`: cases 0..=6, the entry after them an instruction too
+        let code: &[u8] = &[
+            0x8b, 0x06, // 0x1000 mov eax, [rsi]
+            0x83, 0xe0, 0x06, // 0x1002 and eax, 6
+            0x48, 0x8d, 0x0d, 0xf4, 0x00, 0x00, 0x00, // 0x1005 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100c movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1010 add rax, rcx
+            0xff, 0xe0, // 0x1013 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1015 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101b mov eax, 20; ret
+        ];
+        let table: Vec<u8> = [0x1015u64, 0x101b, 0x1015, 0x101b, 0x1015, 0x101b, 0x1015, 0x101b].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("case 6:") && !c.contains("case 7:"), "{c}");
+    }
+
     /// WS87: the `int3`s right after the FDE's end stay (a switch over an enum sends its
     /// impossible values there), the rest past it does not.
     #[test]

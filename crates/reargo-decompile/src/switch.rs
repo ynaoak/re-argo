@@ -408,7 +408,9 @@ fn recover_one(
             _ => with_loose_bases(&target, &nearest_constants(insns, st)),
         };
         let (table, relative, index) = dispatch(&target)?;
-        let (index, level1) = match index_table(index) {
+        // (a byte loaded from a struct field, `movzx eax, byte [rsi+8]`, is no slot table: the
+        // window then starts after the load, WS87)
+        let (index, level1) = match index_table(index).filter(|&(t1, _, _)| memory.find_block(t1).is_some()) {
             Some((t1, sz, i)) => (i, Some((t1, sz))),
             None => (index, None),
         };
@@ -476,6 +478,11 @@ fn recover_one(
         // the index's range when the code shows it: a shift / mask computing it right before
         // (`shr edi, 30`: 4 cases, WS85)
         let limit = index_range(insns, window_start, k, &r).filter(|&n| n >= 2).unwrap_or(MAX_ENTRIES);
+        // (and its range on the paths to the window: a byte loaded, `and ecx, 6`, WS87)
+        let limit = match range(start, &r) {
+            Some((_, hi)) if hi >= 1 => limit.min(hi + 1),
+            _ => limit,
+        };
         let mut targets = Vec::new();
         for i in 0..limit.min(MAX_ENTRIES) {
             if i > 0 && loaded.contains(&(table + width * i)) {
@@ -573,7 +580,8 @@ fn index_range(insns: &[LiftedInstruction], from: usize, k: usize, r: &VarnodeDa
         let c = op.inputs.get(1).filter(|v| v.space == SpaceId::CONST).map(|v| v.offset);
         range = match (op.opcode, c) {
             (OpCode::IntRight, Some(s)) if s > 0 && s < u64::from(out.size) * 8 => Some(1u64 << (u64::from(out.size) * 8 - s).min(63)),
-            (OpCode::IntAnd, Some(m)) if m < MAX_ENTRIES && (m + 1).is_power_of_two() => Some(m + 1),
+            // (any low mask: `and ecx, 6` leaves 0..=6, WS87)
+            (OpCode::IntAnd, Some(m)) if m < MAX_ENTRIES => Some(m + 1),
             // the wider view of the value just computed
             (OpCode::IntZExt, _) if op.inputs.first().is_some_and(|i| i.space == r.space && i.offset == r.offset) => range,
             // a narrower view the lifter derives from the register
