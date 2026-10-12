@@ -3064,6 +3064,10 @@ mod tests {
         ];
         let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
         assert!(rs.contains("= (0.0f32 < xmm0_d) as u8;"), "{rs}");
+        // an added negative constant is a subtraction
+        let code = [0x48, 0x83, 0xc7, 0xfa, 0x48, 0x89, 0x3e, 0xc3]; // add rdi, -6; mov [rsi], rdi; ret
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("rdi.wrapping_sub(6)"), "{rs}");
     }
 
     /// WS88: the Rust output names the stack slots like the C output.

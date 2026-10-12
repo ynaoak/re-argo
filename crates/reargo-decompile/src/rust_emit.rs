@@ -477,6 +477,10 @@ impl<'a> RustEmitter<'a> {
             OpCode::IntAdd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
+                // `x + 0xfffffffffffffffa` is `x - 6` (WS88, as in C)
+                if let Some(k) = op.inputs.get(1).and_then(|&v| crate::emit::negative_constant(&func.varnodes[v as usize].data)) {
+                    return Some(format!("{} = {}.wrapping_sub({});", dst, a, crate::emit::small_hex(k)));
+                }
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {}.wrapping_add({});", dst, a, b))
             }

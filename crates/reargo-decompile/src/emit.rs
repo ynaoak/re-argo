@@ -2051,7 +2051,7 @@ pub(crate) fn float_literal(bits: u64, size: u32) -> Option<String> {
 
 /// `k` when `v` is the constant `-k` of its width, `k` small (below 2^31): an addition of it
 /// reads as a subtraction.
-fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u64> {
+pub(crate) fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u64> {
     if v.space != SpaceId::CONST || v.size == 0 || v.size > 8 {
         return None;
     }
@@ -2065,7 +2065,7 @@ fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u64> {
 }
 
 /// A constant as the C output prints it: decimal below 10, else hex.
-fn small_hex(k: u64) -> String {
+pub(crate) fn small_hex(k: u64) -> String {
     if k < 10 { k.to_string() } else { format!("0x{k:x}") }
 }
 
