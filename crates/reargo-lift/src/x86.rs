@@ -469,21 +469,21 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[acc]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
-                    opcode: div_op,
-                    seq: seq(seq_base),
-                    output: Some(acc),
-                    inputs: SmallVec::from_slice(&[old, src]),
-                });
-                seq_base += 1;
-                // Remainder to the D register.
-                ops.push(PcodeOp {
-                    opcode: rem_op,
-                    seq: seq(seq_base),
-                    output: Some(hi),
-                    inputs: SmallVec::from_slice(&[old, src]),
-                });
-                seq_base += 1;
+                let quotient = PcodeOp { opcode: div_op, seq: seq(seq_base), output: Some(acc), inputs: SmallVec::from_slice(&[old, src]) };
+                let remainder = PcodeOp { opcode: rem_op, seq: seq(seq_base + 1), output: Some(hi), inputs: SmallVec::from_slice(&[old, src]) };
+                // the remainder first unless the divisor is the D register (WS88): then both
+                // read the accumulator itself, and the decompiler prints `edx = eax % ebx;
+                // eax = eax / ebx;` rather than through a copy of the dividend
+                let divisor_in_d = src.space == REG_SPACE && src.offset < hi.offset + u64::from(hi.size) && hi.offset < src.offset + u64::from(src.size);
+                if divisor_in_d {
+                    ops.extend([quotient, remainder]);
+                } else {
+                    ops.extend([remainder, quotient]);
+                }
+                for (k, op) in ops.iter_mut().rev().take(2).rev().enumerate() {
+                    op.seq = seq(seq_base + k as u32);
+                }
+                seq_base += 2;
             }
 
             Not => {

@@ -2942,6 +2942,25 @@ mod tests {
         assert!(!c.contains("__unmodeled_insn"), "{c}");
     }
 
+    /// WS88: a division reads the dividend's register, not a copy of it: the remainder is
+    /// computed first (unless the divisor is the D register), the quotient prints inline.
+    #[test]
+    fn division_reads_the_dividend_register() {
+        let c = c_of(&[
+            0x89, 0xf8, // mov eax, edi
+            0x31, 0xd2, // xor edx, edx
+            0xf7, 0xf6, // div esi
+            0x89, 0x07, // mov [rdi], eax
+            0x89, 0x56, 0x04, // mov [rsi+4], edx
+            0xc3,
+        ]);
+        assert!(c.contains("edx = eax % esi;") && c.contains("eax = eax / esi;"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        // the divisor in edx: the quotient first, through the copy
+        let c = c_of(&[0x89, 0xf8, 0xf7, 0xf2, 0x89, 0x07, 0x89, 0x56, 0x04, 0xc3]);
+        assert!(c.contains("/ edx;") && c.contains("% edx;"), "{c}");
+    }
+
     /// WS88: the Rust output folds the conditions of `setcc` and `cmovcc` like the C output.
     #[test]
     fn rust_output_folds_setcc_and_select_conditions() {

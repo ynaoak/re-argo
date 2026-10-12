@@ -68,9 +68,10 @@ fn pure(op: OpCode) -> bool {
     )
 }
 
-/// An op that may print a temporary's expression in place of its name.
+/// An op that may print a temporary's expression in place of its name (WS88: also a
+/// division, `eax = eax / ebx;`).
 fn reader_ok(op: OpCode) -> bool {
-    op == OpCode::Load || op == OpCode::Store || pure(op)
+    op == OpCode::Load || op == OpCode::Store || pure(op) || matches!(op, OpCode::IntDiv | OpCode::IntSDiv | OpCode::IntRem | OpCode::IntSRem)
 }
 
 /// A named intrinsic (`pmovmskb(x)`, `mulps(a, b)`): prints its operands as `name(…)`.
