@@ -1952,7 +1952,7 @@ pub(crate) fn select_conditions(
 }
 
 /// Longest expression printed inside its reader (WS86).
-const MAX_INLINE_LEN: usize = 100;
+pub(crate) const MAX_INLINE_LEN: usize = 100;
 
 /// `*(T*)x` with `x` atomic: a unary expression, no parentheses needed around it.
 fn is_deref(s: &str) -> bool {

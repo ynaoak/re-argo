@@ -2722,7 +2722,8 @@ mod tests {
         let code = [
             0x48, 0x89, 0xb4, 0x24, 0xa0, 0x00, 0x00, 0x00, // mov [rsp+0xa0], rsi
             0x8b, 0x83, 0x00, 0x02, 0x00, 0x00, // mov eax, [rbx+0x200]
-            0x03, 0x83, 0x50, 0x03, 0x00, 0x00, // add eax, [rbx+0x350]
+            0x03, 0xb3, 0x50, 0x03, 0x00, 0x00, // add esi, [rbx+0x350]
+            0x89, 0x77, 0x08, // mov [rdi+8], esi
             0x89, 0x47, 0x08, // mov [rdi+8], eax
             0x83, 0x46, 0x10, 0x01, // add dword [rsi+0x10], 1
             0xc3,
@@ -2845,6 +2846,25 @@ mod tests {
             assert!(c.contains(s), "{s}: {c}");
         }
         assert!(!c.contains("rsp"), "{c}");
+    }
+
+    /// WS87: the Rust output prints temporaries inline like the C output.
+    #[test]
+    fn rust_output_inlines_temporaries() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x89, 0xb7, 0xa0, 0x00, 0x00, 0x00, // mov [rdi+0xa0], rsi
+            0x03, 0xb3, 0x50, 0x03, 0x00, 0x00, // add esi, [rbx+0x350]
+            0x89, 0x77, 0x08, // mov [rdi+8], esi
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x30, // call [rax+0x30]
+            0xc3,
+        ];
+        let r = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap();
+        let rs = &r.rust_code;
+        assert!(!rs.contains("tmp_"), "{rs}");
+        assert!(rs.contains("unsafe { *(rdi.wrapping_add(0xa0) as *mut u64) = rsi; }"), "{rs}");
+        assert!(rs.contains("esi.wrapping_add(unsafe { *(rbx.wrapping_add(0x350) as *const u32) })"), "{rs}");
     }
 
     #[test]
