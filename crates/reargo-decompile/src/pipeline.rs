@@ -2800,6 +2800,21 @@ mod tests {
         assert!(c.contains("xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));"), "{c}");
     }
 
+    /// WS87: a `setcc` folds its condition like a branch: `ucomiss xmm1, xmm0; seta al` is
+    /// `al = xmm0_d < xmm1_d;`, `seta [rdi]` stores it.
+    #[test]
+    fn setcc_folds_its_condition() {
+        let c = c_of(&[
+            0x0f, 0x2e, 0xc8, // ucomiss xmm1, xmm0
+            0x0f, 0x97, 0xc0, // seta al
+            0x0f, 0x97, 0x07, // seta [rdi]
+            0xc3,
+        ]);
+        assert!(c.contains("al = xmm0_d < xmm1_d;"), "{c}");
+        assert!(c.contains("*(uint8_t*)rdi = xmm0_d < xmm1_d;"), "{c}");
+        assert!(!c.contains("var_2") && !c.contains("tmp_"), "{c}");
+    }
+
     #[test]
     fn rotates_print_as_rotl_rotr() {
         let lifter = X86Lifter::new_64();

@@ -766,6 +766,10 @@ impl<'a> CEmitter<'a> {
             }
             OpCode::BoolNegate => {
                 let dst = out_name?;
+                // a `setcc` whose condition folded (WS87): the negation is the text
+                if let Some(e) = self.select_conds.get(&op.index) {
+                    return Some(format!("{dst} = {};", strip_outer_parens(e)));
+                }
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = !{};", dst, a))
             }
@@ -1067,6 +1071,12 @@ impl<'a> CEmitter<'a> {
     fn input_expr(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, idx: usize) -> String {
         if idx >= op.inputs.len() {
             return "???".into();
+        }
+        // a `setcc`'s folded condition (WS87), a whole right-hand side
+        if ((idx == 0 && op.opcode == OpCode::Copy) || (idx == 2 && op.opcode == OpCode::Store))
+            && let Some(e) = self.select_conds.get(&op.index)
+        {
+            return strip_outer_parens(e).to_string();
         }
         let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
         if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
@@ -1786,19 +1796,66 @@ fn fold_chain(
 /// defining the condition (not loads, calls or other registers), and folds only when none of
 /// the registers it reads is written between its op and the select. Returns each select's text
 /// and the ops no longer printed: those every live reader of which folds them.
+///
+/// WS87: a `setcc` folds its condition the same way — a byte register or a byte stored taking
+/// a flag / temporary (`sil = !tmp_49a;` after `ucomiss; seta sil` -> `sil = tmp_700 <
+/// xmm1_d;`): the text of a `!` site is its negation, the whole right-hand side.
 pub(crate) fn select_conditions(
     func: &SsaFunction,
     inliner: &crate::condition::Inliner,
     emit: &dyn Fn(&crate::ssa::SsaOp) -> Option<String>,
 ) -> (rustc_hash::FxHashMap<usize, String>, Vec<usize>) {
     let mut texts = rustc_hash::FxHashMap::default();
-    if !func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::Select) {
-        return (texts, Vec::new());
-    }
     let temp = |v: crate::ssa::VarId| {
         let d = &func.varnodes[v as usize].data;
         d.space == SpaceId::UNIQUE || (d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset) && d.size == 1)
     };
+    // the value a site folds (its input), and whether its text is the negation
+    let site = |op: &crate::ssa::SsaOp| -> Option<(crate::ssa::VarId, bool)> {
+        if op.dead {
+            return None;
+        }
+        let byte_reg = op.output.is_some_and(|w| {
+            let d = &func.varnodes[w as usize].data;
+            d.space == SpaceId::REGISTER && d.size == 1 && !(0x200..0x210).contains(&d.offset)
+        });
+        let c = match op.opcode {
+            OpCode::Select if op.inputs.len() == 3 => return Some((op.inputs[0], false)),
+            OpCode::Copy | OpCode::BoolNegate if byte_reg => op.inputs[0],
+            OpCode::Store if op.inputs.len() == 3 && func.varnodes[op.inputs[2] as usize].data.size == 1 => op.inputs[2],
+            _ => return None,
+        };
+        // (a flag / temporary computed by a comparison or a boolean op, through copies)
+        let mut v = c;
+        while let Some(d) = func.varnodes[v as usize].def_op.filter(|&d| func.ops[d].opcode == OpCode::Copy && temp(func.ops[d].inputs[0])) {
+            v = func.ops[d].inputs[0];
+        }
+        let def = func.varnodes[v as usize].def_op.map(|d| func.ops[d].opcode);
+        let boolean = def.is_some_and(|o| {
+            matches!(
+                o,
+                OpCode::BoolNegate
+                    | OpCode::BoolOr
+                    | OpCode::BoolAnd
+                    | OpCode::BoolXor
+                    | OpCode::IntEqual
+                    | OpCode::IntNotEqual
+                    | OpCode::IntLess
+                    | OpCode::IntSLess
+                    | OpCode::IntLessEqual
+                    | OpCode::IntSLessEqual
+                    | OpCode::FloatEqual
+                    | OpCode::FloatNotEqual
+                    | OpCode::FloatLess
+                    | OpCode::FloatLessEqual
+                    | OpCode::FloatNan
+            )
+        });
+        (temp(c) && boolean).then_some((c, op.opcode == OpCode::BoolNegate))
+    };
+    if !func.ops.iter().any(|o| site(o).is_some()) {
+        return (texts, Vec::new());
+    }
     let overlaps = |x: &reargo_core::pcode::VarnodeData, w: &reargo_core::pcode::VarnodeData| {
         x.space != SpaceId::CONST && x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
     };
@@ -1810,10 +1867,7 @@ pub(crate) fn select_conditions(
     let mut folded_by: rustc_hash::FxHashMap<usize, Vec<usize>> = rustc_hash::FxHashMap::default();
     let mut named: Vec<crate::ssa::VarId> = Vec::new();
     for (s, op) in func.ops.iter().enumerate() {
-        if op.dead || op.opcode != OpCode::Select || op.inputs.len() != 3 {
-            continue;
-        }
-        let c = op.inputs[0];
+        let Some((c, negated)) = site(op) else { continue };
         let mut chain: Vec<usize> = Vec::new();
         let mut leaves = Vec::new();
         if !fold_chain(func, c, s, op.block, &temp, &unchanged, &mut chain, &mut leaves, 0) {
@@ -1824,7 +1878,7 @@ pub(crate) fn select_conditions(
         if let Some(f) = inliner.fold_value(func, &chain, c, &name, emit)
             && f.text != name(c)
         {
-            texts.insert(s, f.text);
+            texts.insert(s, f.render(negated));
             folded_by.insert(s, chain);
             named.extend(leaves);
         }
