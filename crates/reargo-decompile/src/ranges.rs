@@ -77,7 +77,8 @@ const CALLER_SAVED: [u64; 9] = [0x00, 0x08, 0x10, 0x30, 0x38, 0x80, 0x88, 0x90, 
 /// Passes over the blocks before giving up (a loop that keeps widening).
 const MAX_PASSES: usize = 24;
 
-/// Changes of a block's entry state before the intervals still changing there are dropped.
+/// Changes of a block's entry state through a back edge before the intervals still changing
+/// there are dropped.
 const WIDEN_AFTER: usize = 4;
 
 /// `next` with every interval that differs from `prev`'s for the same view / slot unknown.
@@ -265,9 +266,12 @@ impl Ranges {
                                 let mut joined = this.join(t, inc);
                                 if entry.get(&t) != Some(&joined) {
                                     // (a value that keeps changing around a loop, `inc r9d`:
-                                    // unknown after a few rounds, WS87)
+                                    // unknown after a few rounds through a back edge, WS87 —
+                                    // not where many forward paths join one by one)
                                     let n = updates.entry(t).or_insert(0usize);
-                                    *n += 1;
+                                    if k >= t {
+                                        *n += 1;
+                                    }
                                     if *n > WIDEN_AFTER
                                         && let Some(prev) = entry.get(&t)
                                     {
@@ -837,5 +841,27 @@ mod tests {
             0xc3, // 4 ret
         ]);
         assert!(Ranges::new(&l, &FxHashMap::default()).is_some());
+    }
+    /// WS87: many forward paths joining one by one are no loop: the join keeps the union.
+    #[test]
+    fn forward_joins_are_not_widened() {
+        let l = lift(&[
+            0xb8, 0x00, 0x00, 0x00, 0x00, // 0 mov eax, 0
+            0x85, 0xff, 0x74, 0x2a, // 1 test edi, edi; 2 je J
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 3 mov eax, 1
+            0x85, 0xf6, 0x74, 0x21, // 4, 5
+            0xb8, 0x02, 0x00, 0x00, 0x00, // 6
+            0x85, 0xd2, 0x74, 0x18, // 7, 8
+            0xb8, 0x03, 0x00, 0x00, 0x00, // 9
+            0x85, 0xc9, 0x74, 0x0f, // 10, 11
+            0xb8, 0x04, 0x00, 0x00, 0x00, // 12
+            0x45, 0x85, 0xc0, 0x74, 0x05, // 13, 14
+            0xb8, 0x05, 0x00, 0x00, 0x00, // 15
+            0x90, // 16 J: nop
+            0xc3, // 17
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        let eax = VarnodeData::new(SpaceId::REGISTER, 0x00, 4);
+        assert_eq!(r.at(&l, 16, &eax), Some((0, 5)));
     }
 }
