@@ -511,12 +511,16 @@ pub(crate) fn rewrite_tail_calls(instructions: &mut Vec<LiftedInstruction>) {
 
 /// Is the indirect `jmp` of `instructions[k]` a jump-table dispatch (`jmp [table + i*8]`, or
 /// `movsxd rax, [rcx + rax*4]; add rax, rcx; jmp rax`) rather than a tail call? A scaled
-/// index in the `jmp` or in the instructions right before it marks a table.
+/// index in the `jmp` or in the straight-line instructions right before it marks a table; a
+/// dispatch whose table was recovered (its cases are inputs) is one.
 fn jump_table_dispatch(instructions: &[LiftedInstruction], k: usize) -> bool {
     let scaled = |m: &str| m.contains("*2]") || m.contains("*4]") || m.contains("*8]") || m.contains("*2+") || m.contains("*4+") || m.contains("*8+");
     let insn = &instructions[k];
-    if !insn.ops.iter().any(|o| o.opcode == reargo_core::pcode::OpCode::BranchInd) {
+    let Some(ind) = insn.ops.iter().find(|o| o.opcode == reargo_core::pcode::OpCode::BranchInd) else {
         return false;
+    };
+    if ind.inputs.len() > 1 {
+        return true;
     }
     if scaled(&insn.mnemonic) {
         return true;
@@ -540,6 +544,9 @@ fn jump_table_dispatch(instructions: &[LiftedInstruction], k: usize) -> bool {
                         | reargo_core::pcode::OpCode::Call
                         | reargo_core::pcode::OpCode::CallInd
                         | reargo_core::pcode::OpCode::Return
+                        // (WS87: another dispatch — a case right after a table's `jmp rax`
+                        // reached it: `mov rax, [rdi]; mov rax, [rax+0xe0]; jmp rax`)
+                        | reargo_core::pcode::OpCode::BranchInd
                 )
             })
         })
@@ -3217,6 +3224,34 @@ mod tests {
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("goto *"), "{c}");
         assert!(c.contains("(*"), "{c}");
+    }
+
+    /// WS87: a case right after the dispatch that is a virtual tail call (`mov rax, [rsi]; mov
+    /// rax, [rax+0x18]; jmp rax`) is a tail call: the scaled load before it belongs to the
+    /// table's `jmp rax` (BDS 0xa4de390 printed `goto *rax;  // vfn[28]`).
+    #[test]
+    fn virtual_tail_call_in_a_case_is_a_call() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x83, 0xff, 0x01, // 0x1000 cmp edi, 1
+            0x77, 0x1b, // 0x1003 ja 0x1020
+            0x89, 0xf8, // 0x1005 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf2, 0x00, 0x00, 0x00, // 0x1007 lea rcx, [0x1100]
+            0x48, 0x63, 0x04, 0x81, // 0x100e movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x1012 add rax, rcx
+            0xff, 0xe0, // 0x1015 jmp rax
+            0x48, 0x8b, 0x06, // 0x1017 case 0: mov rax, [rsi]
+            0x48, 0x8b, 0x40, 0x18, // 0x101a mov rax, [rax+0x18]
+            0xff, 0xe0, // 0x101e jmp rax
+            0x31, 0xc0, 0xc3, // 0x1020 xor eax, eax; ret
+        ];
+        let table: Vec<u8> = [0x1017u64, 0x1020].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (edi)"), "{c}");
+        assert!(!c.contains("goto *"), "{c}");
+        assert!(c.contains("vfn[3]"), "{c}");
     }
 
     /// WS87: the `int3`s right after the FDE's end stay (a switch over an enum sends its
