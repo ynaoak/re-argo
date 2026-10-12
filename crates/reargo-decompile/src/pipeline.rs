@@ -2922,6 +2922,26 @@ mod tests {
         assert!(!c.contains("arg_"), "{c}");
     }
 
+    /// WS88: `crc32`, `movmskps` and the SSE3 / SSE4.1 ops are named intrinsics (they were
+    /// `__unmodeled_insn()`).
+    #[test]
+    fn sse42_and_sse41_ops_are_intrinsics() {
+        let c = c_of(&[
+            0xf2, 0x0f, 0x38, 0xf0, 0xc1, // crc32 eax, cl
+            0x0f, 0x50, 0xd1, // movmskps edx, xmm1
+            0x66, 0x0f, 0x3a, 0x08, 0xc1, 0x01, // roundps xmm0, xmm1, 1
+            0x0f, 0x53, 0xd0, // rcpps xmm2, xmm0
+            0xf2, 0x0f, 0x7c, 0xd2, // haddps xmm2, xmm2
+            0x0f, 0x11, 0x17, // movups [rdi], xmm2
+            0x01, 0xd0, // add eax, edx
+            0xc3,
+        ]);
+        for s in ["crc32(eax, cl)", "movmskps(xmm1)", "roundps(xmm1, 1)", "rcpps(", "haddps("] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+    }
+
     /// WS88: the Rust output folds the conditions of `setcc` and `cmovcc` like the C output.
     #[test]
     fn rust_output_folds_setcc_and_select_conditions() {

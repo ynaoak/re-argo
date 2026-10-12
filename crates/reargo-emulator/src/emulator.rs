@@ -687,6 +687,11 @@ impl Emulator {
             _ => (0, args),
         };
         let y = rest.get(1).map_or(0, |v| self.state.read_wide(v));
+        // CRC-32C of the source's bytes (WS88)
+        if name == "crc32" {
+            let n = rest.get(1)?.size.min(8);
+            return Some(u128::from(crc32c(x as u32, y as u64, n)));
+        }
         Some(packed_op(name, x, y, imm))
     }
 
@@ -761,6 +766,9 @@ fn packed_op(name: &str, x: u128, y: u128, imm: u64) -> u128 {
         "movhps" => return el(x, 8, 0) | el(y, 8, 0) << 64,
         _ => {}
     }
+    if let Some(v) = sse_more(name, x, y, imm) {
+        return v;
+    }
     if let Some(v) = packed_float(name, x, y, imm) {
         return v;
     }
@@ -834,6 +842,220 @@ fn packed_op(name: &str, x: u128, y: u128, imm: u64) -> u128 {
         }
         _ => x,
     }
+}
+
+/// CRC-32C (the Castagnoli polynomial, reflected) of the low `n` bytes of `data`, continuing
+/// from `crc`, as the SSE4.2 `crc32` instruction computes it (no pre / post inversion).
+fn crc32c(crc: u32, data: u64, n: u32) -> u32 {
+    let mut c = crc;
+    for i in 0..n {
+        c ^= (data >> (8 * i)) as u8 as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0x82f6_3b78 } else { c >> 1 };
+        }
+    }
+    c
+}
+
+/// The approximate reciprocal (`rcpps`) or reciprocal square root (`rsqrtps`) of each float
+/// lane. The precision is implementation-specific (relative error at most 1.5 * 2^-12, and Intel
+/// and AMD differ), so on x86-64 the emulator runs the instruction itself: the result is the
+/// host CPU's. Elsewhere it is the exact value rounded to `f32` (within the same bound).
+fn approx_recip(x: u128, sqrt: bool) -> u128 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::{_mm_castps_si128, _mm_castsi128_ps, _mm_loadu_si128, _mm_rcp_ps, _mm_rsqrt_ps, _mm_storeu_si128};
+        let mut out = 0u128;
+        // SAFETY: SSE is part of the x86-64 baseline; the loads / stores are unaligned ones
+        // of 16-byte locals.
+        unsafe {
+            let v = _mm_castsi128_ps(_mm_loadu_si128((&raw const x).cast()));
+            let r = if sqrt { _mm_rsqrt_ps(v) } else { _mm_rcp_ps(v) };
+            _mm_storeu_si128((&raw mut out).cast(), _mm_castps_si128(r));
+        }
+        out
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (0..4).fold(0u128, |acc, i| {
+            let a = f32::from_bits((x >> (32 * i)) as u32);
+            let r = if sqrt { 1.0 / a.sqrt() } else { 1.0 / a };
+            acc | u128::from(r.to_bits()) << (32 * i)
+        })
+    }
+}
+
+/// The SSE3 / SSSE3 / SSE4.1 ops and `movmskps` (WS88), lane by lane as the CPU computes them
+/// (`x` = the destination / only source, `y` = the second source, `imm` = the immediate).
+fn sse_more(name: &str, x: u128, y: u128, imm: u32) -> Option<u128> {
+    let el = |v: u128, n: u32, i: u32| -> u64 { ((v >> (i * n * 8)) & (u128::MAX >> (128 - n * 8))) as u64 };
+    let from = |n: u32, f: &dyn Fn(u32) -> u64| -> u128 {
+        let mask = if n == 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
+        (0..16 / n).fold(0u128, |acc, i| acc | u128::from(f(i) & mask) << (i * n * 8))
+    };
+    let sx = |v: u64, n: u32| -> i64 {
+        let k = 64 - n * 8;
+        ((v << k) as i64) >> k
+    };
+    let s = |v: u64| f32::from_bits(v as u32);
+    let d = f64::from_bits;
+    // (a NaN operand: the first one, quieted; else the IEEE result)
+    let fs = |a: f32, b: f32, op: fn(f32, f32) -> f32| -> f32 {
+        if a.is_nan() {
+            f32::from_bits(a.to_bits() | 0x40_0000)
+        } else if b.is_nan() {
+            f32::from_bits(b.to_bits() | 0x40_0000)
+        } else {
+            op(a, b)
+        }
+    };
+    let fd = |a: f64, b: f64, op: fn(f64, f64) -> f64| -> f64 {
+        if a.is_nan() {
+            f64::from_bits(a.to_bits() | 1 << 51)
+        } else if b.is_nan() {
+            f64::from_bits(b.to_bits() | 1 << 51)
+        } else {
+            op(a, b)
+        }
+    };
+    let add_s = |a: u64, b: u64| u64::from(fs(s(a), s(b), |p, q| p + q).to_bits());
+    let sub_s = |a: u64, b: u64| u64::from(fs(s(a), s(b), |p, q| p - q).to_bits());
+    let add_d = |a: u64, b: u64| fd(d(a), d(b), |p, q| p + q).to_bits();
+    let sub_d = |a: u64, b: u64| fd(d(a), d(b), |p, q| p - q).to_bits();
+    // rounding (`roundps`): imm bit 2 = the MXCSR's mode (round to nearest even, the default),
+    // else bits 1:0; a NaN is quieted
+    let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
+    let round_s = |v: u64| -> u64 {
+        let a = s(v);
+        let r = match mode {
+            _ if a.is_nan() => f32::from_bits(a.to_bits() | 0x40_0000),
+            0 => a.round_ties_even(),
+            1 => a.floor(),
+            2 => a.ceil(),
+            _ => a.trunc(),
+        };
+        u64::from(r.to_bits())
+    };
+    let round_d = |v: u64| -> u64 {
+        let a = d(v);
+        let r = match mode {
+            _ if a.is_nan() => f64::from_bits(a.to_bits() | 1 << 51),
+            0 => a.round_ties_even(),
+            1 => a.floor(),
+            2 => a.ceil(),
+            _ => a.trunc(),
+        };
+        r.to_bits()
+    };
+    let low = |n: u32| u128::MAX >> (128 - n * 8);
+    let pairs = |n: u32, f: &dyn Fn(u64, u64) -> u64| -> u128 {
+        // horizontal: x's pairs into the low half, y's into the high one
+        let half = 8 / n;
+        from(n, &|i| {
+            let (v, j) = if i < half { (x, i) } else { (y, i - half) };
+            f(el(v, n, 2 * j), el(v, n, 2 * j + 1))
+        })
+    };
+    let widen = |from_n: u32, to_n: u32, signed: bool| -> u128 {
+        from(to_n, &|i| {
+            let v = el(x, from_n, i);
+            if signed { sx(v, from_n) as u64 } else { v }
+        })
+    };
+    Some(match name {
+        "rcpps" => approx_recip(x, false),
+        "rsqrtps" => approx_recip(x, true),
+        "rcpss" => (x & !low(4)) | (approx_recip(y, false) & low(4)),
+        "rsqrtss" => (x & !low(4)) | (approx_recip(y, true) & low(4)),
+        "movddup" => from(8, &|_| el(x, 8, 0)),
+        "movshdup" => from(4, &|i| el(x, 4, i | 1)),
+        "movsldup" => from(4, &|i| el(x, 4, i & !1)),
+        "pabsb" | "pabsw" | "pabsd" => {
+            let n = match name.as_bytes()[4] {
+                b'b' => 1,
+                b'w' => 2,
+                _ => 4,
+            };
+            from(n, &|i| sx(el(x, n, i), n).unsigned_abs())
+        }
+        "pmovzxbw" => widen(1, 2, false),
+        "pmovzxbd" => widen(1, 4, false),
+        "pmovzxbq" => widen(1, 8, false),
+        "pmovzxwd" => widen(2, 4, false),
+        "pmovzxwq" => widen(2, 8, false),
+        "pmovzxdq" => widen(4, 8, false),
+        "pmovsxbw" => widen(1, 2, true),
+        "pmovsxbd" => widen(1, 4, true),
+        "pmovsxbq" => widen(1, 8, true),
+        "pmovsxwd" => widen(2, 4, true),
+        "pmovsxwq" => widen(2, 8, true),
+        "pmovsxdq" => widen(4, 8, true),
+        "haddps" => pairs(4, &add_s),
+        "hsubps" => pairs(4, &sub_s),
+        "haddpd" => pairs(8, &add_d),
+        "hsubpd" => pairs(8, &sub_d),
+        "addsubps" => from(4, &|i| if i % 2 == 0 { sub_s(el(x, 4, i), el(y, 4, i)) } else { add_s(el(x, 4, i), el(y, 4, i)) }),
+        "addsubpd" => from(8, &|i| if i == 0 { sub_d(el(x, 8, 0), el(y, 8, 0)) } else { add_d(el(x, 8, 1), el(y, 8, 1)) }),
+        "phaddw" => pairs(2, &|a, b| a.wrapping_add(b)),
+        "phaddd" => pairs(4, &|a, b| a.wrapping_add(b)),
+        "phsubw" => pairs(2, &|a, b| a.wrapping_sub(b)),
+        "phsubd" => pairs(4, &|a, b| a.wrapping_sub(b)),
+        "psignb" | "psignw" | "psignd" => {
+            let n = match name.as_bytes()[5] {
+                b'b' => 1,
+                b'w' => 2,
+                _ => 4,
+            };
+            from(n, &|i| match sx(el(y, n, i), n) {
+                0 => 0,
+                k if k < 0 => sx(el(x, n, i), n).wrapping_neg() as u64,
+                _ => el(x, n, i),
+            })
+        }
+        "pmaddubsw" => from(2, &|i| {
+            let p = |j: u32| el(x, 1, j) as i64 * sx(el(y, 1, j), 1);
+            (p(2 * i) + p(2 * i + 1)).clamp(-0x8000, 0x7fff) as u64
+        }),
+        "pmulhrsw" => from(2, &|i| ((((sx(el(x, 2, i), 2) * sx(el(y, 2, i), 2)) >> 14) + 1) >> 1) as u64),
+        "pmuldq" => from(8, &|i| (sx(el(x, 4, 2 * i), 4) * sx(el(y, 4, 2 * i), 4)) as u64),
+        "blendps" => from(4, &|i| if imm >> i & 1 != 0 { el(y, 4, i) } else { el(x, 4, i) }),
+        "blendpd" => from(8, &|i| if imm >> i & 1 != 0 { el(y, 8, i) } else { el(x, 8, i) }),
+        "pblendw" => from(2, &|i| if imm >> i & 1 != 0 { el(y, 2, i) } else { el(x, 2, i) }),
+        // (the products of the lanes imm[7:4] picks, summed in pairs, into the lanes imm[3:0]
+        // picks; which NaN comes out of NaN inputs is the implementation's — Intel picks a
+        // different one per destination lane — here the first, as for `addps`)
+        "dpps" => {
+            let mul = |a: f32, b: f32| fs(a, b, |p, q| p * q);
+            let t: Vec<f32> = (0..4).map(|i| if imm >> (4 + i) & 1 != 0 { mul(s(el(x, 4, i)), s(el(y, 4, i))) } else { 0.0 }).collect();
+            let add = |a: f32, b: f32| fs(a, b, |p, q| p + q);
+            let sum = add(add(t[0], t[1]), add(t[2], t[3]));
+            from(4, &|i| if imm >> i & 1 != 0 { u64::from(sum.to_bits()) } else { 0 })
+        }
+        "dppd" => {
+            let mul = |a: f64, b: f64| fd(a, b, |p, q| p * q);
+            let t: Vec<f64> = (0..2).map(|i| if imm >> (4 + i) & 1 != 0 { mul(d(el(x, 8, i)), d(el(y, 8, i))) } else { 0.0 }).collect();
+            let sum = fd(t[0], t[1], |p, q| p + q);
+            from(8, &|i| if imm >> i & 1 != 0 { sum.to_bits() } else { 0 })
+        }
+        // (dst:src shifted right by imm bytes)
+        "palignr" => match imm {
+            0..16 => (y >> (imm * 8)) | if imm == 0 { 0 } else { x << ((16 - imm) * 8) },
+            16..32 => x >> ((imm - 16) * 8),
+            _ => 0,
+        },
+        "insertps" => {
+            let v = el(y, 4, (imm >> 6) & 3);
+            let at = (imm >> 4) & 3;
+            from(4, &|i| if imm >> i & 1 != 0 { 0 } else if i == at { v } else { el(x, 4, i) })
+        }
+        "roundss" => (x & !low(4)) | u128::from(round_s(el(y, 4, 0))),
+        "roundsd" => (x & !low(8)) | u128::from(round_d(el(y, 8, 0))),
+        "roundps" => from(4, &|i| round_s(el(x, 4, i))),
+        "roundpd" => from(8, &|i| round_d(el(x, 8, i))),
+        "movmskps" => (0..4).fold(0u128, |m, i| m | ((x >> (32 * i + 31)) & 1) << i),
+        "movmskpd" => ((x >> 63) & 1) | ((x >> 127) & 1) << 1,
+        _ => return None,
+    })
 }
 
 /// The packed float ops (WS87), lane by lane as SSE computes them: a NaN operand gives the

@@ -1165,6 +1165,137 @@ fn bitwise_ops_match_the_cpu() {
     check(&cases);
 }
 
+fn sse3() -> bool {
+    std::is_x86_feature_detected!("sse3")
+}
+
+/// On float inputs (zeros, infinities, NaN, denormals, fractions) rather than bit patterns.
+macro_rules! on_floats {
+    ($case:expr) => {
+        Case { inputs: Inputs::Floats, ..$case }
+    };
+}
+
+/// No NaN among the float lanes of xmm0 = (a, b), xmm1 = (b, c): which NaN a dot product returns
+/// is the implementation's (Intel picks a different one per destination lane), so `dpps` /
+/// `dppd` are compared on numbers only.
+fn no_nan_ps(a: u64, b: u64, c: u64) -> bool {
+    [a, b, c].iter().all(|&v| !f32::from_bits(v as u32).is_nan() && !f32::from_bits((v >> 32) as u32).is_nan())
+}
+fn no_nan_pd(a: u64, b: u64, c: u64) -> bool {
+    [a, b, c].iter().all(|&v| !f64::from_bits(v).is_nan())
+}
+
+/// WS88: SSE3 / SSSE3 / SSE4.1 lane ops. `rcpps` / `rsqrtps` are approximations whose bits are
+/// the CPU's own (the emulator runs the instruction): compared exactly.
+#[test]
+fn sse3_to_sse41_ops_match_the_cpu() {
+    let mut cases = vec![
+        packed!("rcpps"),
+        packed!("rsqrtps"),
+        packed!("rcpss"),
+        packed!("rsqrtss"),
+        on_floats!(packed!("rcpps")),
+        on_floats!(packed!("rsqrtps")),
+        packed_raw!("rcpss xmm0, [rsp+24]"),
+        packed!("haddps", Some(sse3)),
+        packed!("hsubps", Some(sse3)),
+        packed!("haddpd", Some(sse3)),
+        packed!("hsubpd", Some(sse3)),
+        packed!("addsubps", Some(sse3)),
+        packed!("addsubpd", Some(sse3)),
+        on_floats!(packed!("haddps", Some(sse3))),
+        on_floats!(packed!("hsubpd", Some(sse3))),
+        on_floats!(packed!("addsubps", Some(sse3))),
+        packed!("movddup", Some(sse3)),
+        packed!("movshdup", Some(sse3)),
+        packed!("movsldup", Some(sse3)),
+        packed_raw!("movddup xmm0, [rsp+24]", Some(sse3)),
+        packed!("pabsb", Some(ssse3)),
+        packed!("pabsw", Some(ssse3)),
+        packed!("pabsd", Some(ssse3)),
+        packed!("phaddw", Some(ssse3)),
+        packed!("phaddd", Some(ssse3)),
+        packed!("phsubw", Some(ssse3)),
+        packed!("phsubd", Some(ssse3)),
+        packed!("psignb", Some(ssse3)),
+        packed!("psignw", Some(ssse3)),
+        packed!("psignd", Some(ssse3)),
+        packed!("pmaddubsw", Some(ssse3)),
+        packed!("pmulhrsw", Some(ssse3)),
+        packed_raw!("palignr xmm0, xmm1, 0", Some(ssse3)),
+        packed_raw!("palignr xmm0, xmm1, 5", Some(ssse3)),
+        packed_raw!("palignr xmm0, xmm1, 16", Some(ssse3)),
+        packed_raw!("palignr xmm0, xmm1, 21", Some(ssse3)),
+        packed_raw!("palignr xmm0, xmm1, 40", Some(ssse3)),
+        packed!("pmuldq", Some(sse41)),
+        packed!("pmovzxbw", Some(sse41)),
+        packed!("pmovzxbd", Some(sse41)),
+        packed!("pmovzxbq", Some(sse41)),
+        packed!("pmovzxwd", Some(sse41)),
+        packed!("pmovzxwq", Some(sse41)),
+        packed!("pmovzxdq", Some(sse41)),
+        packed!("pmovsxbw", Some(sse41)),
+        packed!("pmovsxbd", Some(sse41)),
+        packed!("pmovsxbq", Some(sse41)),
+        packed!("pmovsxwd", Some(sse41)),
+        packed!("pmovsxwq", Some(sse41)),
+        packed!("pmovsxdq", Some(sse41)),
+        packed_raw!("pmovzxbd xmm0, [rsp+24]", Some(sse41)),
+        packed_raw!("pmovsxbq xmm0, [rsp+24]", Some(sse41)),
+        packed_raw!("pmovsxwd xmm0, [rsp+24]", Some(sse41)),
+        packed_raw!("blendps xmm0, xmm1, 0x5", Some(sse41)),
+        packed_raw!("blendpd xmm0, xmm1, 0x2", Some(sse41)),
+        packed_raw!("pblendw xmm0, xmm1, 0xa6", Some(sse41)),
+        packed_raw!("insertps xmm0, xmm1, 0x9c", Some(sse41)),
+        packed_raw!("insertps xmm0, xmm1, 0x61", Some(sse41)),
+        packed_raw!("insertps xmm0, [rsp+24], 0xd0", Some(sse41)),
+        on_floats!(packed_raw!("roundps xmm0, xmm1, 0", Some(sse41))),
+        on_floats!(packed_raw!("roundps xmm0, xmm1, 1", Some(sse41))),
+        on_floats!(packed_raw!("roundps xmm0, xmm1, 2", Some(sse41))),
+        on_floats!(packed_raw!("roundps xmm0, xmm1, 3", Some(sse41))),
+        on_floats!(packed_raw!("roundps xmm0, xmm1, 4", Some(sse41))),
+        on_floats!(packed_raw!("roundpd xmm0, xmm1, 9", Some(sse41))),
+        on_floats!(packed_raw!("roundpd xmm0, xmm1, 2", Some(sse41))),
+        on_floats!(packed_raw!("roundss xmm0, xmm1, 1", Some(sse41))),
+        on_floats!(packed_raw!("roundsd xmm0, xmm1, 3", Some(sse41))),
+        on_floats!(packed_raw!("roundss xmm0, [rsp+24], 2", Some(sse41))),
+        packed_raw!("roundps xmm0, xmm1, 3", Some(sse41)),
+        // the sign bits into a general register, zero-extended (back in xmm0 through rax)
+        packed_raw!("movmskps eax, xmm1
+ movq xmm0, rax"),
+        packed_raw!("movmskpd eax, xmm1
+ movq xmm0, rax"),
+        on_floats!(packed_raw!("movmskps rax, xmm0
+ movq xmm0, rax")),
+    ];
+    let ps = |c: Case| Case { valid: Some(no_nan_ps), ..c };
+    let pd = |c: Case| Case { valid: Some(no_nan_pd), ..c };
+    cases.extend([
+        ps(packed_raw!("dpps xmm0, xmm1, 0xf1", Some(sse41))),
+        ps(packed_raw!("dpps xmm0, xmm1, 0x7f", Some(sse41))),
+        ps(packed_raw!("dpps xmm0, xmm1, 0xa6", Some(sse41))),
+        pd(packed_raw!("dppd xmm0, xmm1, 0x31", Some(sse41))),
+        pd(packed_raw!("dppd xmm0, xmm1, 0x12", Some(sse41))),
+        ps(on_floats!(packed_raw!("dpps xmm0, xmm1, 0xff", Some(sse41)))),
+        pd(on_floats!(packed_raw!("dppd xmm0, xmm1, 0x33", Some(sse41)))),
+    ]);
+    check(&cases);
+}
+
+/// WS88: SSE4.2 `crc32` (CRC-32C), the accumulator zero-extended, the flags untouched.
+#[test]
+fn crc32_matches_the_cpu() {
+    let cases = vec![
+        case!("crc32 eax, cl", d_arith, Inputs::Values, sse42),
+        case!("crc32 eax, cx", d_arith, Inputs::Values, sse42),
+        case!("crc32 eax, ecx", d_arith, Inputs::Values, sse42),
+        case!("crc32 rax, rcx", d_arith, Inputs::Values, sse42),
+        case!("crc32 rax, cl", d_arith, Inputs::Values, sse42),
+    ];
+    check(&cases);
+}
+
 /// WS87: the half-register moves (`movhps` was a copy into the low half, a store was lost).
 #[test]
 fn half_register_moves_match_the_cpu() {
