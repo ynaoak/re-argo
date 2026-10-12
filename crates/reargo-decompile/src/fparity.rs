@@ -11,6 +11,8 @@
 //!   NaN: the NaN case went to `T` through the parity jump anyway), the second jumps nowhere;
 //! * `jp F; je T` / `jp F; jne T`: past the parity jump the operands are ordered, so ZF is
 //!   `a == b`;
+//! * `jne F; jnp T` with `F` right after the `jnp` (WS87, jt 0x414c4d0): `T` exactly when
+//!   `a == b` — the first jumps there on FLOAT_EQUAL (false for a NaN), the second goes;
 //! * `cmovne r, s; cmovp r, s` (either order): one select on `a != b`;
 //! * `jbe` / `ja` / `setbe` / `cmova` …: `CF || ZF` is `CF || a == b` (CF, "below or
 //!   unordered", already holds for a NaN), which the condition folding prints as `!(b < a)`;
@@ -65,6 +67,8 @@ enum Jump {
     E,
     /// `jne`
     Ne,
+    /// `jnp` (WS87)
+    Np,
 }
 
 /// A `jp` / `je` / `jne` and its target.
@@ -79,6 +83,9 @@ fn flag_jump(insn: &LiftedInstruction) -> Option<(Jump, u64)> {
         [_] if is_reg(&cond, ZF) => Some((Jump::E, target)),
         [neg, _] if neg.opcode == OpCode::BoolNegate && neg.output == Some(cond) && is_reg(&neg.inputs[0], ZF) => {
             Some((Jump::Ne, target))
+        }
+        [neg, _] if neg.opcode == OpCode::BoolNegate && neg.output == Some(cond) && is_reg(&neg.inputs[0], PF) => {
+            Some((Jump::Np, target))
         }
         _ => None,
     }
@@ -259,6 +266,21 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
                         r += 2;
                         continue;
                     }
+                    // jne F; jnp T, F right after the jnp: to T exactly on `a == b` (WS87)
+                    (Jump::Ne, Jump::Np) if t1 == lifted[y].address + u64::from(lifted[y].length) => {
+                        let br = PcodeOp {
+                            opcode: OpCode::CBranch,
+                            seq: SeqNum::new(Address::new(SpaceId::RAM, lifted[x].address), 0),
+                            output: None,
+                            inputs: SmallVec::from_slice(&[VarnodeData::new(SpaceId::RAM, t2, 8), eq]),
+                        };
+                        lifted[x].ops = vec![br];
+                        renumber(&mut lifted[x]);
+                        lifted[y].ops.clear();
+                        done += 1;
+                        r += 2;
+                        continue;
+                    }
                     // jp F; je T / jp F; jne T: ordered past the parity jump
                     (Jump::P, Jump::E | Jump::Ne) => {
                         for op in lifted[y].ops.iter_mut() {
@@ -371,6 +393,21 @@ mod tests {
         assert!(!l[3].ops.iter().any(|o| o.opcode == OpCode::IntOr));
         // setp; sete; and is no comparison of its own: unchanged
         let mut l = lift(&[0x0f, 0x2e, 0xc8, 0x0f, 0x9a, 0xc2, 0x0f, 0x94, 0xc0, 0x20, 0xd0, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 0);
+    }
+
+    /// WS87: `jne F; jnp T` with `F` right after it is one jump to `T` on `a == b`.
+    #[test]
+    fn jne_past_a_jnp_is_one_equal_jump() {
+        // ucomisd xmm0, xmm1; jne +2 (past the jnp); jnp +1; ret; ret
+        let mut l = lift(&[0x66, 0x0f, 0x2e, 0xc1, 0x75, 0x02, 0x7b, 0x01, 0xc3, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 1);
+        assert_eq!(l[1].ops.len(), 1);
+        let br = &l[1].ops[0];
+        assert_eq!((br.opcode, br.inputs[0].offset, br.inputs[1].offset), (OpCode::CBranch, 0x1009, EQ_TMP));
+        assert!(l[2].ops.is_empty());
+        // the jne elsewhere: unchanged
+        let mut l = lift(&[0x66, 0x0f, 0x2e, 0xc1, 0x75, 0x03, 0x7b, 0x01, 0xc3, 0xc3, 0xc3]);
         assert_eq!(fold_parity_checks(&mut l, []), 0);
     }
 
