@@ -3708,6 +3708,65 @@ mod tests {
         assert!(!c.contains("case 3:") && !c.contains("default:"), "the table ends at the next one: {c}");
     }
 
+    /// WS88 (0x4c6d3d0): a loop's test (`cmp [rsi], edx; jg`) falls into an enum's dispatch;
+    /// it is no bounds check of the index, and the table runs as an enum's does.
+    #[test]
+    fn jump_table_after_a_loop_test() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let mut code: Vec<u8> = vec![
+            0x4c, 0x8d, 0x0d, 0xf9, 0x00, 0x00, 0x00, // 0x1000 lea r9, [0x1100]
+            0x8b, 0x07, // 0x1007 mov eax, [rdi]
+            0x39, 0x16, // 0x1009 cmp [rsi], edx
+            0x7f, 0xfc, // 0x100b jg 0x1009
+            0x49, 0x63, 0x04, 0x81, // 0x100d movsxd rax, [r9+rax*4]
+            0x4c, 0x01, 0xc8, // 0x1011 add rax, r9
+            0xff, 0xe0, // 0x1014 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1016 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101c mov eax, 20; ret
+            0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00, // 0x1022 lea rax, [0x110c] (another table)
+            0xc3,
+        ];
+        code[0x22 + 3..0x22 + 7].copy_from_slice(&((0x110c - 0x1029i32).to_le_bytes()));
+        let mut table: Vec<u8> = [0x1016u64, 0x101c, 0x1016].iter().flat_map(|&t| rel(t)).collect();
+        table.extend([0x101cu64, 0x1016].iter().flat_map(|&t| rel(t)));
+        let mem = make_memory_parts(&[(0x1000, &code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 2:") && !c.contains("case 3:"), "{c}");
+    }
+
+    /// WS88 (0x3e11d80): the table base is in a register the function also sets to other values
+    /// (`lea r13, [T]` before a loop, `movabs r13, …` / `mov r13, rsi` elsewhere); with the
+    /// table's own case edges (the loop goes back through one) the register holds `T` on every
+    /// path to the dispatch.
+    #[test]
+    fn jump_table_base_in_a_reused_register() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x4c, 0x8d, 0x2d, 0xf9, 0x00, 0x00, 0x00, // 0x1000 lea r13, [0x1100]
+            0xeb, 0x16, // 0x1007 jmp 0x101f
+            0x49, 0xbd, 0, 0, 0, 0, 0, 0, 0, 0x40, // 0x1009 case 2: movabs r13, 1 << 62
+            0x49, 0x89, 0xf5, // 0x1013 mov r13, rsi
+            0x31, 0xc0, 0xc3, // 0x1016 xor eax, eax; ret
+            0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3, // 0x1019 case 3: mov eax, 3; ret
+            0x8b, 0x07, // 0x101f mov eax, [rdi]
+            0xc1, 0xe8, 0x1e, // 0x1021 shr eax, 30
+            0x49, 0x63, 0x44, 0x85, 0x00, // 0x1024 movsxd rax, [r13+rax*4]
+            0x4c, 0x01, 0xe8, // 0x1029 add rax, r13
+            0xff, 0xe0, // 0x102c jmp rax
+            0x48, 0x83, 0xc7, 0x04, // 0x102e case 0: add rdi, 4
+            0xeb, 0xeb, // 0x1032 jmp 0x101f
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, // 0x1034 case 1: mov eax, 1; ret
+        ];
+        let table: Vec<u8> = [0x102eu64, 0x1034, 0x1009, 0x1019].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 3:") && c.contains("return 3;"), "{c}");
+    }
+
     /// WS86: the bounds check blocks before the dispatch (`cmp edi, 3; ja default`, then another
     /// test, then the index copied): the table has 4 cases, though the entry after them is an
     /// instruction of the function too.

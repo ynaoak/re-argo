@@ -224,6 +224,23 @@ fn constant_registers(insns: &[LiftedInstruction]) -> Constants {
     (once, loose, loaded)
 }
 
+/// Each constant address (in the binary's memory) a general register is set to, by register
+/// (WS88: the table bases to try for a register that also holds other values).
+fn address_constants(insns: &[LiftedInstruction], memory: &Memory) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for op in insns.iter().filter(|i| !i.mnemonic.starts_with("pop ")).flat_map(|i| i.ops.iter()) {
+        let Some(o) = op.output else { continue };
+        if op.opcode != OpCode::Copy || o.space != SpaceId::REGISTER || o.offset >= 0xC0 || o.size != 8 {
+            continue;
+        }
+        let Some(c) = op.inputs.first().filter(|v| v.space == SpaceId::CONST).map(|v| v.offset) else { continue };
+        if memory.find_block(c).is_some() && !out.contains(&(o.offset, c)) {
+            out.push((o.offset, c));
+        }
+    }
+    out
+}
+
 /// `(T, I)` when `addr` is `T + I * scale` (`T + I` for a byte table).
 fn table_slot(addr: &E, scale: u64) -> Option<(u64, &E)> {
     let E::Add(a, b) = addr else { return None };
@@ -288,16 +305,19 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
         .filter(|&k| has(&insns[k], OpCode::BranchInd))
         .map(|k| (k, recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &no_range)))
         .collect();
-    if found.iter().any(|(_, f)| f.as_ref().is_none_or(|f| f.2.default.is_none())) {
-        // (the index register as the dispatch reads it: its case edges bound it, WS87)
-        let cases: crate::ranges::Cases = found
+    // (the index register as the dispatch reads it: its case edges bound it, WS87)
+    let cases_of = |found: &[(usize, Option<Recovered>)]| -> crate::ranges::Cases {
+        found
             .iter()
             .filter_map(|(k, f)| {
                 let (r, start, table) = f.as_ref()?;
                 let reused = insns[*start..=*k].iter().flat_map(|i| i.ops.iter()).any(|o| o.output.is_some_and(|w| overlaps(r, &w)));
                 Some((insns[*k].address, ((!reused).then_some(*r), table.targets.clone())))
             })
-            .collect();
+            .collect()
+    };
+    if found.iter().any(|(_, f)| f.as_ref().is_none_or(|f| f.2.default.is_none())) {
+        let cases = cases_of(&found);
         if let Some(ranges) = crate::ranges::Ranges::new(insns, &cases) {
             for (k, f) in found.iter_mut() {
                 if f.as_ref().is_none_or(|f| f.2.default.is_none()) {
@@ -305,6 +325,34 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
                     let range = |at: usize, r: &VarnodeData| ranges.at_dispatch(insns, at, k, r);
                     *f = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &range);
                 }
+            }
+        }
+    }
+    // WS88: a table base in a register the function also uses for other values (0x3e11d80's
+    // r13: `lea r13, [T]` before a loop, other values elsewhere). Each constant address the
+    // register gets is tried as the base, and kept when — with the table's own cases as edges,
+    // which the paths back to the dispatch of a loop need — the register holds it on every path
+    // to the dispatch.
+    if found.iter().any(|(_, f)| f.is_none()) {
+        let candidates = address_constants(insns, memory);
+        for at in 0..found.len() {
+            if found[at].1.is_some() {
+                continue;
+            }
+            let k = found[at].0;
+            let no_range = |_: usize, _: &VarnodeData| None;
+            let verified = candidates.iter().find_map(|&(reg, c)| {
+                let mut b = bases.clone();
+                b.insert(reg, c);
+                let got = recover_one(insns, k, &addrs, (&b, &FxHashMap::default()), &loaded, memory, &no_range)?;
+                let mut trial = found.clone();
+                trial[at].1 = Some(got.clone());
+                let ranges = crate::ranges::Ranges::new(insns, &cases_of(&trial))?;
+                let base = VarnodeData::new(SpaceId::REGISTER, reg, 8);
+                (ranges.at(insns, k, &base) == Some((c, c))).then_some(got)
+            });
+            if verified.is_some() {
+                found[at].1 = verified;
             }
         }
     }
@@ -471,13 +519,10 @@ fn recover_one(
         }
         Some((r, start, JumpTable { jmp: jmp.address, targets, default: None }))
     };
-    let Some(j) = falls.or_else(jumps) else {
-        if let Some(found) = by_range() {
-            return Some(found);
-        }
-        // no bounds check: a switch over an enum the compiler knows the range of (`default:
-        // __builtin_unreachable()`). The table runs while its entries are instructions of the
-        // function, up to the next table the function loads (WS84).
+    // no bounds check: a switch over an enum the compiler knows the range of (`default:
+    // __builtin_unreachable()`). The table runs while its entries are instructions of the
+    // function, up to the next table the function loads (WS84).
+    let by_scan = || -> Option<Recovered> {
         if level1.is_some() || insns[start..k].iter().any(|i| has(i, OpCode::CBranch)) {
             return None;
         }
@@ -510,7 +555,10 @@ fn recover_one(
         if targets.len() < 2 {
             return None;
         }
-        return Some((r, start, JumpTable { jmp: jmp.address, targets, default: None }));
+        Some((r, start, JumpTable { jmp: jmp.address, targets, default: None }))
+    };
+    let Some(j) = falls.or_else(jumps) else {
+        return by_range().or_else(by_scan);
     };
     let jcc = &insns[j];
     let (count, to_dispatch) = bounds_kind(&jcc.mnemonic)?;
@@ -528,9 +576,14 @@ fn recover_one(
             })
         });
         // (another register compared, or the index changed after the compare: its range on the
-        // paths to the window decides, WS86)
-        let Some((c, x, n)) = cmp else { return by_range() };
-        if n.space != SpaceId::CONST || x.space != r.space || x.offset != r.offset {
+        // paths to the window decides, WS86; WS88: else the conditional jump is no bounds check
+        // of the index — a loop's test falling into an enum's dispatch, 0x4c6d3d0 — and the
+        // table runs as an enum's does)
+        let Some((c, x, n)) = cmp else { return by_range().or_else(by_scan) };
+        if x.space != r.space || x.offset != r.offset {
+            return by_range().or_else(by_scan);
+        }
+        if n.space != SpaceId::CONST {
             return by_range();
         }
         // the compared register keeps its value up to the window, whose evaluation reads it

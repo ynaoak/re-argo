@@ -236,9 +236,14 @@ impl Ranges {
         let starts: Vec<usize> = (0..n).filter(|&i| leader[i]).collect();
         let mut entry: FxHashMap<usize, State> = FxHashMap::default();
         // the entry, and every block no modelled edge reaches (a case of a table not recovered
-        // yet, a landing pad): nothing known there
+        // yet, a landing pad): nothing known there — but alignment padding after a jump / return
+        // (`nop`s falling into a loop head, WS88) is never run
+        let padding = |b: usize| {
+            insns[b..].iter().take_while(|i| i.mnemonic.starts_with("nop") || i.mnemonic.starts_with("int3")).count() > 0
+                && insns[b..].iter().position(|i| !(i.mnemonic.starts_with("nop") || i.mnemonic.starts_with("int3"))).is_some_and(|p| leader[b + p] || reached[b + p])
+        };
         for &b in &starts {
-            if !reached[b] || b == 0 {
+            if b == 0 || (!reached[b] && !padding(b)) {
                 entry.insert(b, State::default());
             }
         }
@@ -669,6 +674,22 @@ mod tests {
             data: Some(Arc::from(code)),
         });
         X86Lifter::new_64().lift_range(&mem, 0x1000, 64).unwrap()
+    }
+
+    /// WS88: `nop` padding after a jump falls into a loop head but never runs: the values
+    /// reaching the head by the jump stay known.
+    #[test]
+    fn padding_is_not_a_path() {
+        let l = lift(&[
+            0xb9, 0x05, 0x00, 0x00, 0x00, // 0x1000 mov ecx, 5
+            0xeb, 0x01, // 0x1005 jmp 0x1008
+            0x90, // 0x1007 nop (padding)
+            0x89, 0xc8, // 0x1008 mov eax, ecx
+            0xc3, // 0x100a ret
+        ]);
+        let r = Ranges::new(&l, &FxHashMap::default()).expect("converges");
+        let ecx = VarnodeData::new(SpaceId::REGISTER, 0x08, 4);
+        assert_eq!(r.at(&l, 3, &ecx), Some((5, 5)));
     }
 
     #[test]
