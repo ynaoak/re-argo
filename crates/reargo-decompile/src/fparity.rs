@@ -13,6 +13,10 @@
 //!   `a == b`;
 //! * `jne F; jnp T` with `F` right after the `jnp` (WS87, jt 0x414c4d0): `T` exactly when
 //!   `a == b` — the first jumps there on FLOAT_EQUAL (false for a NaN), the second goes;
+//! * WS88: the pair with instructions between the jumps (they run only when the first does
+//!   not jump, so the two cannot become one): `jne T; …; jp T'` — the `jne` jumps on "ordered
+//!   and not equal", `a < b || b < a`, the `jp` on `isnan(a) || isnan(b)`; `jp F; …; je T` /
+//!   `jne T` — past the parity jump ZF is `a == b`;
 //! * `cmovne r, s; cmovp r, s` (either order): one select on `a != b`;
 //! * `jbe` / `ja` / `setbe` / `cmova` …: `CF || ZF` is `CF || a == b` (CF, "below or
 //!   unordered", already holds for a NaN), which the condition folding prints as `!(b < a)`;
@@ -37,6 +41,8 @@ const ZF: u64 = 0x206;
 const EQ_TMP: u64 = 0x54e;
 /// The `a != b` this pass adds.
 const NE_TMP: u64 = 0x2f80;
+/// The `a < b`, `b < a` and their `||` it adds for an ordered `!=` (WS88).
+const LT_TMP: u64 = 0x2f90;
 /// Instructions looked at after the compare.
 const MAX_READERS: usize = 6;
 
@@ -113,6 +119,49 @@ fn not_equal(insn: &LiftedInstruction, a: VarnodeData, b: VarnodeData) -> (Pcode
         inputs: SmallVec::from_slice(&[a, b]),
     };
     (op, t)
+}
+
+/// The ops of a jump to `target` on "ordered and not equal" (`a < b || b < a`, false for a
+/// NaN) at `insn` (WS88).
+fn ordered_not_equal_jump(insn: &LiftedInstruction, a: VarnodeData, b: VarnodeData, target: u64) -> Vec<PcodeOp> {
+    let t = |k: u64| VarnodeData::new(SpaceId::UNIQUE, LT_TMP + k, 1);
+    let op = |opcode: OpCode, output: Option<VarnodeData>, inputs: &[VarnodeData]| PcodeOp {
+        opcode,
+        seq: SeqNum::new(Address::new(SpaceId::RAM, insn.address), 0),
+        output,
+        inputs: SmallVec::from_slice(inputs),
+    };
+    vec![
+        op(OpCode::FloatLess, Some(t(0)), &[a, b]),
+        op(OpCode::FloatLess, Some(t(1)), &[b, a]),
+        op(OpCode::BoolOr, Some(t(2)), &[t(0), t(1)]),
+        op(OpCode::CBranch, None, &[VarnodeData::new(SpaceId::RAM, target, 8), t(2)]),
+    ]
+}
+
+/// The ops of a jump to `target` on `isnan(a) || isnan(b)` (`negated`: on neither) computed at
+/// `insn` (WS88): a parity jump away from its compare reads the operands, not the flag.
+fn unordered_jump(insn: &LiftedInstruction, a: VarnodeData, b: VarnodeData, target: u64, negated: bool) -> Vec<PcodeOp> {
+    let t = |k: u64| VarnodeData::new(SpaceId::UNIQUE, LT_TMP + k, 1);
+    let op = |opcode: OpCode, output: Option<VarnodeData>, inputs: &[VarnodeData]| PcodeOp {
+        opcode,
+        seq: SeqNum::new(Address::new(SpaceId::RAM, insn.address), 0),
+        output,
+        inputs: SmallVec::from_slice(inputs),
+    };
+    let mut ops = vec![op(OpCode::FloatNan, Some(t(3)), &[a])];
+    let mut c = t(3);
+    if a != b {
+        ops.push(op(OpCode::FloatNan, Some(t(4)), &[b]));
+        ops.push(op(OpCode::BoolOr, Some(t(5)), &[t(3), t(4)]));
+        c = t(5);
+    }
+    if negated {
+        ops.push(op(OpCode::BoolNegate, Some(t(6)), &[c]));
+        c = t(6);
+    }
+    ops.push(op(OpCode::CBranch, None, &[VarnodeData::new(SpaceId::RAM, target, 8), c]));
+    ops
 }
 
 /// `(register, reads ZF (else PF), negated)` of a `setcc` of ZF / PF into a byte register.
@@ -297,6 +346,39 @@ pub fn fold_parity_checks(lifted: &mut [LiftedInstruction], targets: impl IntoIt
                     _ => {}
                 }
             }
+            // the pair with instructions between the jumps (WS88): the next jump of the readers,
+            // with nothing but straight-line code before it
+            if let Some((j1, t1)) = flag_jump(&lifted[x])
+                && let Some(&y) = readers[r + 1..].iter().find(|&&k| lifted[k].ops.iter().any(|o| o.opcode == OpCode::CBranch))
+                && Some(y) != next
+                && let Some((j2, t2)) = flag_jump(&lifted[y])
+            {
+                match (j1, j2) {
+                    // jne T; …; jp / jnp: the jne on `a < b || b < a`, the parity jump on the
+                    // operands' NaN test
+                    (Jump::Ne, Jump::P | Jump::Np) => {
+                        lifted[x].ops = ordered_not_equal_jump(&lifted[x], a, b, t1);
+                        renumber(&mut lifted[x]);
+                        lifted[y].ops = unordered_jump(&lifted[y], a, b, t2, j2 == Jump::Np);
+                        renumber(&mut lifted[y]);
+                        done += 1;
+                    }
+                    // jp F; …; je / jne: ordered past the parity jump
+                    (Jump::P, Jump::E | Jump::Ne) => {
+                        for op in lifted[y].ops.iter_mut() {
+                            for v in op.inputs.iter_mut() {
+                                if is_reg(v, ZF) {
+                                    *v = eq;
+                                }
+                            }
+                        }
+                        done += 1;
+                    }
+                    _ => {}
+                }
+                r += 1;
+                continue;
+            }
             // cmovne r, s; cmovp r, s (either order)
             if let (Some((m1, o1)), Some(y)) = (cmov(&lifted[x]), next)
                 && let Some((m2, o2)) = cmov(&lifted[y])
@@ -408,6 +490,28 @@ mod tests {
         assert!(l[2].ops.is_empty());
         // the jne elsewhere: unchanged
         let mut l = lift(&[0x66, 0x0f, 0x2e, 0xc1, 0x75, 0x03, 0x7b, 0x01, 0xc3, 0xc3, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 0);
+    }
+
+    /// WS88: `jne T; mov; jp T`: the `mov` runs only when the jne does not jump, so the jne
+    /// jumps on "ordered and not equal" and the jp stays; `jp F; mov; jne T`: the jne reads
+    /// `a == b`.
+    #[test]
+    fn parity_pair_with_an_instruction_between() {
+        // ucomiss xmm0, xmm1; jne +5; mov eax, edi; jp +0; ret; ret
+        let mut l = lift(&[0x0f, 0x2e, 0xc1, 0x75, 0x05, 0x89, 0xf8, 0x7a, 0x01, 0xc3, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 1);
+        let ops: Vec<OpCode> = l[1].ops.iter().map(|o| o.opcode).collect();
+        assert_eq!(ops, [OpCode::FloatLess, OpCode::FloatLess, OpCode::BoolOr, OpCode::CBranch]);
+        assert_eq!(l[1].ops[3].inputs[0].offset, 0x100a);
+        let ops: Vec<OpCode> = l[3].ops.iter().map(|o| o.opcode).collect();
+        assert_eq!(ops, [OpCode::FloatNan, OpCode::FloatNan, OpCode::BoolOr, OpCode::CBranch]);
+        // ucomiss xmm0, xmm1; jp +5; mov eax, edi; jne +0; ret; ret
+        let mut l = lift(&[0x0f, 0x2e, 0xc1, 0x7a, 0x05, 0x89, 0xf8, 0x75, 0x01, 0xc3, 0xc3]);
+        assert_eq!(fold_parity_checks(&mut l, []), 1);
+        assert!(l[3].ops.iter().any(|o| o.inputs.iter().any(|v| v.offset == EQ_TMP)), "{:?}", l[3].ops);
+        // a compare between: no pair
+        let mut l = lift(&[0x0f, 0x2e, 0xc1, 0x75, 0x05, 0x39, 0xf8, 0x7a, 0x01, 0xc3, 0xc3]);
         assert_eq!(fold_parity_checks(&mut l, []), 0);
     }
 

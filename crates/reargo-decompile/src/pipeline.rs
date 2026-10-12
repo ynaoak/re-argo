@@ -2961,6 +2961,25 @@ mod tests {
         assert!(c.contains("/ edx;") && c.contains("% edx;"), "{c}");
     }
 
+    /// WS88: `jne T; mov; jp T` after a float compare: the jne on "ordered and not equal", the
+    /// jp on a NaN — no flag variables.
+    #[test]
+    fn float_parity_pair_with_an_instruction_between() {
+        let c = c_of(&[
+            0x0f, 0x2e, 0xc1, // ucomiss xmm0, xmm1
+            0x75, 0x07, // jne T
+            0x89, 0xf8, // mov eax, edi
+            0x7a, 0x03, // jp T
+            0x89, 0x06, // mov [rsi], eax
+            0xc3,
+            0x89, 0x3e, // T: mov [rsi], edi
+            0xc3,
+        ]);
+        assert!(c.contains("if ((xmm0_d < xmm1_d) || (xmm1_d < xmm0_d))"), "{c}");
+        assert!(c.contains("isnan(xmm0_d)") || c.contains("isnan(xmm1_d)"), "{c}");
+        assert!(!c.contains("var_20") && !c.contains("tmp_"), "{c}");
+    }
+
     /// WS88: the Rust output folds the conditions of `setcc` and `cmovcc` like the C output.
     #[test]
     fn rust_output_folds_setcc_and_select_conditions() {
