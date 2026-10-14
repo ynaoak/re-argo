@@ -219,7 +219,7 @@ pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> V
             let mut leaves = Vec::new();
             let mut loads = op.opcode == OpCode::Load;
             for &i in &op.inputs {
-                collect_leaves(func, i, op.block, 0, &mut leaves, &mut loads);
+                collect_leaves(func, readers, i, op.block, 0, &mut leaves, &mut loads);
             }
             let reads_changed = leaves.iter().any(|d| written.iter().any(|w| w.overlaps(d)));
             !(reads_changed || (loads && memory_written))
@@ -246,20 +246,37 @@ pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> V
 }
 
 /// The storage `v` reads, and — through its pure definition in `block` — what that reads (up
-/// to a depth); `loads` when a load is among them.
-fn collect_leaves(func: &SsaFunction, v: VarId, block: BlockId, depth: u32, out: &mut Vec<reargo_core::pcode::VarnodeData>, loads: &mut bool) {
+/// to a depth); `loads` when a load is among them. A temporary copied to a register may print
+/// as that register (`emit::Coalesced`): the register counts too.
+fn collect_leaves(
+    func: &SsaFunction,
+    readers: &Readers,
+    v: VarId,
+    block: BlockId,
+    depth: u32,
+    out: &mut Vec<reargo_core::pcode::VarnodeData>,
+    loads: &mut bool,
+) {
     let d = func.varnodes[v as usize].data;
     if d.space == reargo_core::address::SpaceId::CONST {
         return;
     }
     out.push(d);
+    if d.space == reargo_core::address::SpaceId::UNIQUE {
+        for &r in readers.of(func, v) {
+            let op = &func.ops[r];
+            if op.opcode == OpCode::Copy && let Some(o) = op.output {
+                out.push(func.varnodes[o as usize].data);
+            }
+        }
+    }
     let Some(def) = func.varnodes[v as usize].def_op.map(|o| &func.ops[o]) else { return };
     if def.dead || def.block != block || !is_pure(def.opcode) || depth >= 6 {
         return;
     }
     *loads |= def.opcode == OpCode::Load;
     for &i in &def.inputs {
-        collect_leaves(func, i, block, depth + 1, out, loads);
+        collect_leaves(func, readers, i, block, depth + 1, out, loads);
     }
 }
 
