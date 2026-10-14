@@ -3342,6 +3342,18 @@ mod tests {
         assert!(c.contains("var_201 = rdi < rsi;"), "{c}");
     }
 
+    /// WS89: what a register's own statement computed from does not count as read by a
+    /// condition naming the register: the load's address temporary of `rdi = *(rbx + 0x20)`
+    /// shares its storage with the next load's and kept `var_206 = rdi == 0;`.
+    #[test]
+    fn a_flag_folds_past_a_load_reusing_a_temporary() {
+        let lifter = X86Lifter::new_64();
+        // mov rdi, [rbx+0x20]; test rdi, rdi; mov r15, [rsp+0x28]; je L; mov [rsi], r15; L: ret
+        let code = [0x48, 0x8b, 0x7b, 0x20, 0x48, 0x85, 0xff, 0x4c, 0x8b, 0x7c, 0x24, 0x28, 0x74, 0x03, 0x4c, 0x89, 0x3e, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("if (rdi != 0)") && !c.contains("var_206"), "{c}");
+    }
+
     /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
     /// condition (it was `tmp_510 = *m; var_206 = rax == tmp_510; tmp_2030 = … ? rcx : tmp_510;
     /// rax = … ? rax : tmp_510; *m = tmp_2030;`).
