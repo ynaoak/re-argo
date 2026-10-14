@@ -44,6 +44,13 @@ impl Emulator {
     pub fn execute_op(&mut self, op: &PcodeOp) -> Result<(), EmulatorError> {
         self.step_count += 1;
 
+        // WS89: 80-bit x87 floats (`long double`)
+        if is_float_opcode(op.opcode)
+            && (op.output.is_some_and(|o| o.size == 10) || op.inputs.iter().any(|i| i.size == 10))
+        {
+            return self.float80(op);
+        }
+
         match op.opcode {
             OpCode::Copy => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("COPY".into()))?;
@@ -313,6 +320,16 @@ impl Emulator {
             // the lifter's named intrinsics with a defined value (WS84); others are opaque
             OpCode::CallOther => {
                 use reargo_core::pcode::intrinsic;
+                // `fist(x, fpucw)`: the x87 `fistp` rounding as the control word says (WS89)
+                if let (Some(out), Some(tag), Some(x), Some(cw)) = (op.output.as_ref(), op.input(0), op.input(1), op.input(2))
+                    && tag.space == SpaceId::CONST
+                    && tag.offset == intrinsic::FIST
+                {
+                    let rc = (self.state.read_varnode(cw) >> 10) as u8 & 3;
+                    let v = crate::x87::to_int(self.state.read_wide(x), out.size.min(8), rc);
+                    self.state.write_varnode(out, v);
+                    return Ok(());
+                }
                 if let (Some(out), Some(tag)) = (op.output.as_ref(), op.input(0))
                     && tag.space == SpaceId::CONST
                     && let Some(v) = self.packed(tag.offset, &op.inputs[1..])
@@ -611,8 +628,11 @@ impl Emulator {
             OpCode::Select => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SELECT".into()))?;
                 let c = self.read_input(op, 0)?;
-                let v = if c != 0 { self.read_input(op, 1)? } else { self.read_input(op, 2)? };
-                self.state.write_varnode(out, v);
+                // (wide: an x87 `fcmov` selects 10 bytes, WS89)
+                let i = if c != 0 { 1 } else { 2 };
+                let pick = op.input(i).ok_or_else(|| EmulatorError::MissingInput { op: "SELECT".into(), index: i })?;
+                let v = self.state.read_wide(pick);
+                self.state.write_wide(out, v);
             }
             OpCode::SPull => {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("SPULL".into()))?;
@@ -652,6 +672,90 @@ impl Emulator {
     pub fn execute_ops(&mut self, ops: &[PcodeOp]) -> Result<(), EmulatorError> {
         for op in ops {
             self.execute_op(op)?;
+        }
+        Ok(())
+    }
+
+    /// A FLOAT_* op on an 80-bit x87 value (an input or the output of 10 bytes, WS89), computed
+    /// as the x87 does ([`crate::x87`]).
+    fn float80(&mut self, op: &PcodeOp) -> Result<(), EmulatorError> {
+        use crate::x87::{self, Bin, Cmp, Un};
+        let name = || op.opcode.name().to_string();
+        let input = |i: usize| op.input(i).copied().ok_or_else(|| EmulatorError::MissingInput { op: name(), index: i });
+        // an input as an 80-bit value (a `float` / `double` one converted exactly)
+        let ext = |s: &Self, i: usize| -> Result<u128, EmulatorError> {
+            let v = input(i)?;
+            Ok(match v.size {
+                10 => s.state.read_wide(&v),
+                4 | 8 => x87::from_float(s.state.read_varnode(&v), v.size),
+                _ => return Err(EmulatorError::Unsupported(format!("{} of {} bytes", name(), v.size))),
+            })
+        };
+        let out = op.output.ok_or_else(|| EmulatorError::MissingOutput(name()))?;
+        match op.opcode {
+            OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMult | OpCode::FloatDiv => {
+                let k = match op.opcode {
+                    OpCode::FloatAdd => Bin::Add,
+                    OpCode::FloatSub => Bin::Sub,
+                    OpCode::FloatMult => Bin::Mul,
+                    _ => Bin::Div,
+                };
+                let v = x87::bin(k, ext(self, 0)?, ext(self, 1)?);
+                self.state.write_wide(&out, v);
+            }
+            OpCode::FloatNeg | OpCode::FloatAbs | OpCode::FloatSqrt => {
+                let k = match op.opcode {
+                    OpCode::FloatNeg => Un::Neg,
+                    OpCode::FloatAbs => Un::Abs,
+                    _ => Un::Sqrt,
+                };
+                let v = x87::un(k, ext(self, 0)?);
+                self.state.write_wide(&out, v);
+            }
+            OpCode::FloatEqual | OpCode::FloatNotEqual | OpCode::FloatLess | OpCode::FloatLessEqual => {
+                let c = x87::cmp(ext(self, 0)?, ext(self, 1)?);
+                let b = match op.opcode {
+                    OpCode::FloatEqual => c == Cmp::Equal,
+                    OpCode::FloatNotEqual => c != Cmp::Equal,
+                    OpCode::FloatLess => c == Cmp::Less,
+                    _ => matches!(c, Cmp::Less | Cmp::Equal),
+                };
+                self.state.write_varnode(&out, u64::from(b));
+            }
+            OpCode::FloatNan => {
+                let a = ext(self, 0)?;
+                self.state.write_varnode(&out, u64::from(x87::cmp(a, a) == Cmp::Unordered));
+            }
+            OpCode::FloatInt2Float => {
+                let v = input(0)?;
+                let size = v.size.min(8);
+                let extend = 64 - size * 8;
+                let a = ((self.state.read_varnode(&v) << extend) as i64) >> extend;
+                match out.size {
+                    10 => self.state.write_wide(&out, x87::from_int(a)),
+                    _ => return Err(EmulatorError::Unsupported(format!("{} to {} bytes", name(), out.size))),
+                }
+            }
+            OpCode::FloatFloat2Float => {
+                let a = ext(self, 0)?;
+                match out.size {
+                    10 => self.state.write_wide(&out, a),
+                    4 | 8 => self.state.write_varnode(&out, x87::to_float(a, out.size)),
+                    _ => return Err(EmulatorError::Unsupported(format!("{} to {} bytes", name(), out.size))),
+                }
+            }
+            // to an integer (this emulator's FLOAT_TRUNC / FLOOR / CEIL / ROUND results)
+            OpCode::FloatTrunc | OpCode::FloatFloor | OpCode::FloatCeil | OpCode::FloatRound => {
+                let rc = match op.opcode {
+                    OpCode::FloatTrunc => 3,
+                    OpCode::FloatFloor => 1,
+                    OpCode::FloatCeil => 2,
+                    _ => 0,
+                };
+                let v = x87::to_int(ext(self, 0)?, out.size.min(8), rc);
+                self.state.write_varnode(&out, v);
+            }
+            _ => return Err(EmulatorError::Unsupported(name())),
         }
         Ok(())
     }
@@ -855,6 +959,30 @@ fn crc32c(crc: u32, data: u64, n: u32) -> u32 {
         }
     }
     c
+}
+
+fn is_float_opcode(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::FloatAdd
+            | OpCode::FloatSub
+            | OpCode::FloatMult
+            | OpCode::FloatDiv
+            | OpCode::FloatNeg
+            | OpCode::FloatAbs
+            | OpCode::FloatSqrt
+            | OpCode::FloatEqual
+            | OpCode::FloatNotEqual
+            | OpCode::FloatLess
+            | OpCode::FloatLessEqual
+            | OpCode::FloatNan
+            | OpCode::FloatInt2Float
+            | OpCode::FloatFloat2Float
+            | OpCode::FloatTrunc
+            | OpCode::FloatCeil
+            | OpCode::FloatFloor
+            | OpCode::FloatRound
+    )
 }
 
 /// The approximate reciprocal (`rcpps`) or reciprocal square root (`rsqrtps`) of each float
@@ -1616,5 +1744,39 @@ mod tests {
         let conv = PcodeOp { opcode: OpCode::FloatInt2Float, seq: seq(), output: Some(f(0x1220)), inputs: SmallVec::from_slice(&[VarnodeData::new(REG, 0x00, 4)]) };
         emu.execute_op(&conv).unwrap();
         assert_eq!(emu.state.read_register(0x1220, 4), u64::from((-3.0f32).to_bits()));
+    }
+    /// WS89: 80-bit (10-byte) float ops run as the x87 computes them, `fist(x, fpucw)` rounds
+    /// as the control word says, and a SELECT moves all 10 bytes (`fcmov`).
+    #[test]
+    fn emu_float80_ops() {
+        use reargo_core::pcode::intrinsic;
+        let mut emu = Emulator::new();
+        let st = |k: u64| VarnodeData::new(REG, 0x1100 + 0x10 * k, 10);
+        let op = |opcode, output, inputs: &[VarnodeData]| PcodeOp { opcode, seq: seq(), output: Some(output), inputs: SmallVec::from_slice(inputs) };
+        // st0 = (long double)7; st1 = (long double)2.5; st2 = st0 / st1
+        emu.execute_op(&op(OpCode::FloatInt2Float, st(0), &[VarnodeData::new(CNST, 7, 4)])).unwrap();
+        emu.state.write_register(0x1200, 8, 2.5f64.to_bits());
+        emu.execute_op(&op(OpCode::FloatFloat2Float, st(1), &[VarnodeData::new(REG, 0x1200, 8)])).unwrap();
+        emu.execute_op(&op(OpCode::FloatDiv, st(2), &[st(0), st(1)])).unwrap();
+        // 2.8 is not a double: rounded to one, it is the double nearest 2.8
+        emu.execute_op(&op(OpCode::FloatFloat2Float, VarnodeData::new(REG, 0x1210, 8), &[st(2)])).unwrap();
+        assert_eq!(emu.state.read_register(0x1210, 8), 2.8f64.to_bits());
+        let less = VarnodeData::new(REG, 0x300, 1);
+        emu.execute_op(&op(OpCode::FloatLess, less, &[st(1), st(2)])).unwrap();
+        assert_eq!(emu.state.read_register(0x300, 1), 1);
+        // fist: 2.8 → 3 (nearest, cw 0x37f) / 2 (toward zero, cw 0xf7f)
+        let cw = VarnodeData::new(REG, 0x10a0, 2);
+        let out = VarnodeData::new(REG, 0x00, 4);
+        for (w, want) in [(0x37fu64, 3u64), (0xf7f, 2)] {
+            emu.state.write_varnode(&cw, w);
+            emu.execute_op(&op(OpCode::CallOther, out, &[VarnodeData::new(CNST, intrinsic::FIST, 8), st(2), cw])).unwrap();
+            assert_eq!(emu.state.read_register(0x00, 4), want, "cw {w:#x}");
+        }
+        emu.execute_op(&op(OpCode::FloatTrunc, out, &[st(2)])).unwrap();
+        assert_eq!(emu.state.read_register(0x00, 4), 2);
+        // SELECT of 10 bytes
+        emu.state.write_register(0x301, 1, 1);
+        emu.execute_op(&op(OpCode::Select, st(3), &[VarnodeData::new(REG, 0x301, 1), st(2), st(0)])).unwrap();
+        assert_eq!(emu.state.read_wide(&st(3)), emu.state.read_wide(&st(2)));
     }
 }

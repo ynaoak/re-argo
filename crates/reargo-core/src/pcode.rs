@@ -552,6 +552,11 @@ pub mod intrinsic {
     /// `x << n | x >> (w - n)` (WS85, `reargo_decompile::rotate`)
     pub const ROTL: u64 = 0x106;
     pub const ROTR: u64 = 0x107;
+    /// x87 `fist` / `fistp` when the rounding the control word selects is not known (WS89):
+    /// `fist(x, fpucw)` is the 80-bit `x` as a signed integer of the output's width, rounded by
+    /// the control word's bits 10-11, the "integer indefinite" (the lowest value) for a NaN or
+    /// a value out of range.
+    pub const FIST: u64 = 0x108;
     /// Not an instruction: the decompiler's marker after a call that never returns
     /// (`reargo_decompile::noreturn`). Prints nothing; control does not fall through it.
     pub const NORETURN: u64 = 0xff;
@@ -627,6 +632,7 @@ pub mod intrinsic {
             BSWAP => "bswap",
             ROTL => "rotl",
             ROTR => "rotr",
+            FIST => "fist",
             t if (PACKED_BASE..PACKED_BASE + PACKED.len() as u64).contains(&t) => PACKED[(t - PACKED_BASE) as usize],
             _ => return None,
         })
