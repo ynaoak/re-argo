@@ -79,7 +79,8 @@ pub(crate) fn find(func: &SsaFunction, noise: &FxHashSet<OpIdx>) -> (FxHashMap<O
         }
         // rax = ZF ? rax : t  (32-bit: ZF ? rax : (uint64_t)t)
         let mut group = vec![store.index, sel.index, load.index, eq.index];
-        let update = func.ops.iter().find(|o| {
+        // (the ops of the one instruction, between the load and the store)
+        let update = func.ops[load.index.min(store.index)..store.index].iter().find(|o| {
             !o.dead
                 && o.address == store.address
                 && o.opcode == OpCode::Select
@@ -155,30 +156,35 @@ pub(crate) fn fold_into_conditions(text: &str, decl: &dyn Fn(&str) -> String, fo
     if !text.contains(FOLDABLE) {
         return text.to_string();
     }
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let src: Vec<&str> = text.lines().collect();
+    let mut lines: Vec<String> = Vec::with_capacity(src.len());
     let mut folded_names: Vec<String> = Vec::new();
     let mut i = 0;
-    while i < lines.len() {
-        let Some(line) = lines[i].strip_suffix(FOLDABLE).map(str::to_string) else {
+    while i < src.len() {
+        let Some(line) = src[i].strip_suffix(FOLDABLE) else {
+            lines.push(src[i].to_string());
             i += 1;
             continue;
         };
-        lines[i] = line.clone();
-        let parsed = line.trim_start().split_once(" = ").map(|(n, c)| (n.to_string(), c.trim_end_matches(';').to_string()));
-        let folded = parsed.as_ref().zip(lines.get(i + 1)).and_then(|((name, call), next)| {
+        let parsed = line.trim_start().split_once(" = ").map(|(n, c)| (n, c.trim_end_matches(';')));
+        let folded = parsed.zip(src.get(i + 1)).and_then(|((name, call), next)| {
             forms
                 .iter()
-                .map(|(from, to)| (from.replace('X', name), to.replace('X', call)))
-                .find(|(from, _)| next.trim_start() == from)
-                .map(|(_, to)| format!("{}{to}", &next[..next.len() - next.trim_start().len()]))
+                .find(|(from, _)| next.trim_start() == from.replace('X', name))
+                .map(|(_, to)| format!("{}{}", &next[..next.len() - next.trim_start().len()], to.replace('X', call)))
         });
         match (folded, parsed) {
             (Some(to), Some((name, _))) => {
-                lines[i + 1] = to;
-                lines.remove(i);
-                folded_names.push(name);
+                lines.push(to);
+                if !folded_names.iter().any(|n| n == name) {
+                    folded_names.push(name.to_string());
+                }
+                i += 2;
             }
-            _ => i += 1,
+            _ => {
+                lines.push(line.to_string());
+                i += 1;
+            }
         }
     }
     for name in folded_names {
