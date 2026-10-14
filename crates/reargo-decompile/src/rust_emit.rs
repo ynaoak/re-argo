@@ -686,7 +686,11 @@ impl<'a> RustEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
-                let ty = if out_size == 4 { "f32" } else { "f64" };
+                let ty = match out_size {
+                    4 => "f32",
+                    10 => "f80",
+                    _ => "f64",
+                };
                 Some(format!("{} = {} as {};", dst, a, ty))
             }
             OpCode::FloatTrunc => {
@@ -1112,6 +1116,7 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
 
     let return_type = match (has_return_value, func.return_float) {
         (false, _) => None,
+        _ if crate::emit::returns_long_double(func) => Some("f80"),
         (true, Some(4)) => Some("f32"),
         (true, Some(_)) => Some("f64"),
         (true, None) => Some("u64"),
@@ -1234,6 +1239,10 @@ fn reg_name(offset: u64, size: u32) -> String {
                 _ => format!("xmm{}_{}", n, sz),
             }
         }
+        // WS89: see `emit::reg_name`
+        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => format!("st{}", (off - 0x1100) / 0x10),
+        (0x10a0, 2) => "fpucw".into(),
+        (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
         _ => format!("var_{:x}", offset),
     }
 }
@@ -1269,6 +1278,8 @@ pub(crate) fn size_to_rust_type(size: u32) -> &'static str {
         4 => "u32",
         8 => "u64",
         16 => "u128",
+        // the x87's 80-bit float (no Rust type: `f80` names it, WS89)
+        10 => "f80",
         _ => "()",
     }
 }
@@ -1361,7 +1372,8 @@ mod tests {
         assert_eq!(size_to_rust_type(4), "u32");
         assert_eq!(size_to_rust_type(8), "u64");
         assert_eq!(size_to_rust_type(16), "u128");
-        assert_eq!(size_to_rust_type(10), "()");
+        assert_eq!(size_to_rust_type(10), "f80");
+        assert_eq!(size_to_rust_type(12), "()");
     }
 
     #[test]

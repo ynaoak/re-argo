@@ -599,6 +599,11 @@ fn apply_call_convention(
             continue;
         };
         let insn_addr = insn.address;
+        // WS89: the lifter found the callee returning a `long double` (the code after the call
+        // pops it): `INDIRECT(target)` of an x87 slot after the call; rax / xmm0 are clobbered
+        let x87_result = insn.ops[pos + 1..].iter().any(|o| {
+            o.opcode == OpCode::Indirect && o.output.is_some_and(|v| v.size == 10 && (0x1100..0x1180).contains(&v.offset))
+        });
         let call = &mut insn.ops[pos];
         let at = call.seq;
         let target = call.inputs.first().copied();
@@ -611,6 +616,7 @@ fn apply_call_convention(
         let clobber_mark = VarnodeData::new(reargo_core::address::SpaceId::CONST, CLOBBER_MARK, 1);
         // WS79: a callee known to return in one register only clobbers the other
         let returned = |i: usize| match call_returns.get(&insn_addr) {
+            _ if x87_result => false,
             Some(crate::callee_params::ReturnKind::Int) => i == 0,
             Some(crate::callee_params::ReturnKind::Float) => i == 1,
             _ => true,
@@ -3276,6 +3282,25 @@ mod tests {
         let code: Vec<u8> = [0xf3, 0x0f, 0x2a, 0xc7, 0x0f, 0x57, 0xc9, 0x0f, 0x2e, 0xc1].iter().chain(&tail).copied().collect();
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("xmm0_d <= 0.0f") && !c.contains("!(xmm0_d"), "{c}");
+    }
+
+    /// WS89: x87 code prints with its stack slots as `long double` variables (`st0` = the
+    /// first value pushed), a function leaving a value on the stack returns `long double`, and
+    /// a callee whose result the caller pops defines `st0` (no `__ret`, no `rax` / `xmm0`).
+    #[test]
+    fn x87_prints_long_double_slots() {
+        let lifter = X86Lifter::new_64();
+        // fld tbyte [rsp+8]; fld tbyte [rsp+0x18]; fmulp st(1), st; ret
+        let code = [0xdb, 0x6c, 0x24, 0x08, 0xdb, 0x6c, 0x24, 0x18, 0xde, 0xc9, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("long double f(") && c.contains("return st0;"), "{c}");
+        assert!(c.contains("st0 * st1") && !c.contains("__unmodeled"), "{c}");
+        // call g; fstp tbyte [rbx]; ret   /   g: fld1; ret
+        let code = [0xe8, 0xfb, 0x0f, 0x00, 0x00, 0xdb, 0x3b, 0xc3];
+        let g = [0xd9, 0xe8, 0xc3];
+        let c = decompile(&lifter, &make_memory_parts(&[(0x1000, &code), (0x2000, &g)]), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("st0 = 0x2000(") && c.contains("*(long double*)rbx = st0;"), "{c}");
+        assert!(!c.contains("__ret") && !c.contains("xmm0"), "{c}");
     }
 
     /// A write to a register's low byte prints as that write (WS84: it printed the lifter's

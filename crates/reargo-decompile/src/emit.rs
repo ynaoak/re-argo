@@ -777,14 +777,14 @@ impl<'a> CEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
-                let ty = if out_size == 4 { "float" } else { "double" };
+                let ty = float_type(out_size);
                 Some(format!("{} = ({}){};", dst, ty, a))
             }
             OpCode::FloatFloat2Float => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
-                let ty = if out_size == 4 { "float" } else { "double" };
+                let ty = float_type(out_size);
                 Some(format!("{} = ({}){};", dst, ty, a))
             }
             OpCode::FloatTrunc => {
@@ -1648,6 +1648,15 @@ pub(crate) fn return_value(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option
     }
 }
 
+/// A function that returns the top of the x87 stack (WS89: its `ret`s have an 80-bit value).
+pub(crate) fn returns_long_double(func: &SsaFunction) -> bool {
+    func.ops.iter().any(|op| {
+        !op.dead
+            && op.opcode == OpCode::Return
+            && return_value(func, op).is_some_and(|i| func.varnodes[op.inputs[i] as usize].data.size == 10)
+    })
+}
+
 fn infer_signature(func: &SsaFunction) -> FunctionSignature {
     let has_return_value = func.ops.iter().any(|op| {
         if op.dead || op.opcode != OpCode::Return {
@@ -1658,6 +1667,7 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
 
     let return_type = match (has_return_value, func.return_float) {
         (false, _) => "void",
+        _ if returns_long_double(func) => "long double",
         (true, Some(4)) => "float",
         (true, Some(_)) => "double",
         (true, None) => "uint64_t",
@@ -1787,7 +1797,21 @@ fn reg_name(offset: u64, size: u32) -> String {
                 _ => format!("xmm{}_{}", n, sz),
             }
         }
+        // WS89: the x87 stack slots, named from the bottom of the stack (`st0` = the first value
+        // pushed; see `reargo_lift::x86::x87`), the control word and the condition codes
+        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => format!("st{}", (off - 0x1100) / 0x10),
+        (0x10a0, 2) => "fpucw".into(),
+        (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
         _ => format!("var_{:x}", offset),
+    }
+}
+
+/// The C type of a float of `size` bytes (`long double` = the x87's 80 bits, WS89).
+pub(crate) fn float_type(size: u32) -> &'static str {
+    match size {
+        4 => "float",
+        10 => "long double",
+        _ => "double",
     }
 }
 
@@ -1799,6 +1823,8 @@ pub(crate) fn size_to_type(size: u32) -> &'static str {
         8 => "uint64_t",
         // an XMM register / 128-bit memory access (it printed `void xmm0;`, `*(void*)p = ..`)
         16 => "uint128_t",
+        // only an x87 value is 10 bytes (WS89)
+        10 => "long double",
         _ => "void",
     }
 }
@@ -2198,6 +2224,11 @@ mod tests {
         assert_eq!(reg_name(0x80, 4), "r8d");
         assert_eq!(reg_name(0xB0, 1), "r14b");
         assert_eq!(reg_name(0x1200, 16), "xmm0");
+        assert_eq!(reg_name(0x1100, 10), "st0");
+        assert_eq!(reg_name(0x1170, 10), "st7");
+        assert_eq!(reg_name(0x10a0, 2), "fpucw");
+        assert_eq!(reg_name(0x10ab, 1), "fpu_c3");
+        assert_eq!(size_to_type(10), "long double");
         assert_eq!(reg_name(0x1210, 8), "xmm1_q");
         assert_eq!(reg_name(0x1220, 4), "xmm2_d");
         assert_eq!(reg_name(0x00, 8), "rax");
