@@ -3373,6 +3373,21 @@ mod tests {
         assert!(!c.contains("tmp_"), "{c}");
     }
 
+    /// WS89: `fucomi` folds with its jump like `ucomisd` (`jbe` reads `!(b < a)`; it printed
+    /// `!(st0 <= st1) || ((st1 == st0) || (isnan(st1) || isnan(st0)))`).
+    #[test]
+    fn fucomi_folds_like_ucomisd() {
+        let lifter = X86Lifter::new_64();
+        // fld tbyte [rsp+8]; fld tbyte [rsp+0x18]; fucomi st, st(1); fstp st(0); fstp st(0);
+        // jbe L; mov eax, 1; L: ret
+        let code = [
+            0xdb, 0x6c, 0x24, 0x08, 0xdb, 0x6c, 0x24, 0x18, 0xdb, 0xe9, 0xdd, 0xd8, 0xdd, 0xd8, 0x76, 0x05, 0xb8, 0x01, 0x00,
+            0x00, 0x00, 0xc3,
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("st0 < st1") && !c.contains("isnan"), "{c}");
+    }
+
     /// A write to a register's low byte prints as that write (WS84: it printed the lifter's
     /// rebuild `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`).
     #[test]

@@ -199,7 +199,11 @@ impl E<'_> {
         self.set(OpCode::BoolOr, reg(unord_f, 1), &[na, nb]);
         let ge = self.tmp(OpCode::FloatLessEqual, 1, &[b, a]);
         self.set(OpCode::BoolNegate, reg(less_f, 1), &[ge]);
-        let eq = self.tmp(OpCode::FloatEqual, 1, &[a, b]);
+        // (`fucomi`'s `a == b` in the temporary `ucomisd` uses: the decompiler's parity folding
+        // finds a float compare by it — `jbe` reads `!(b < a)`)
+        let eq = if eq_f == ZF_OFFSET { unique(0x54e, 1) } else { unique(self.next, 1) };
+        self.next += 0x10;
+        self.set(OpCode::FloatEqual, eq, &[a, b]);
         self.set(OpCode::BoolOr, reg(eq_f, 1), &[eq, reg(unord_f, 1)]);
     }
 
