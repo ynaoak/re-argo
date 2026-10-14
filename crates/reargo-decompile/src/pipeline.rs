@@ -3303,6 +3303,23 @@ mod tests {
         assert!(!c.contains("__ret") && !c.contains("xmm0"), "{c}");
     }
 
+    /// WS89: a flag computed above statements that do not change what it compares folds into
+    /// the branch (`var_206 = rax == 0; rcx = *(uint64_t*)rsi; if (!var_206)` was printed);
+    /// one whose operand is overwritten in between stays a flag.
+    #[test]
+    fn a_flag_folds_past_unrelated_statements() {
+        let lifter = X86Lifter::new_64();
+        // test rax, rax; mov rcx, [rsi]; je L; mov [rdi], rcx; ret; L: ret
+        let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x0e, 0x74, 0x04, 0x48, 0x89, 0x0f, 0xc3, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("rcx = *(uint64_t*)rsi;") && c.contains("if (rax == 0)"), "{c}");
+        assert!(!c.contains("var_206"), "{c}");
+        // test rax, rax; mov rax, [rsi]; je L; ...: rax changes before the jump
+        let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x06, 0x74, 0x04, 0x48, 0x89, 0x07, 0xc3, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("var_206 = rax == 0;") && c.contains("var_206"), "{c}");
+    }
+
     /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
     /// condition (it was `tmp_510 = *m; var_206 = rax == tmp_510; tmp_2030 = … ? rcx : tmp_510;
     /// rax = … ? rax : tmp_510; *m = tmp_2030;`).

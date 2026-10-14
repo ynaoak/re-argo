@@ -179,38 +179,66 @@ impl Readers {
 /// sees their results and nothing is lost by not printing them as statements.
 pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> Option<Vec<OpIdx>> {
     let tail = condition_tail(func, ops, readers);
-    (tail.len() + 1 == ops.len()).then(|| tail.to_vec())
+    (tail.len() + 1 == ops.len()).then_some(tail)
 }
 
-/// The trailing ops of `ops` (a block's live ops) that only compute its branch condition
-/// (WS81): the longest run right before the `CBRANCH` of pure ops whose result is read only by
-/// later ops of the run or the branch (by one of them, or — `a - b` / `a & b` of a `cmp` /
-/// `test` — by the flags computed from it). Nothing with a side effect runs between them and
-/// the branch, and nothing else reads their results, so they fold into the condition
-/// expression (`var_201 = edi < 6; if (var_201)` -> `if (edi < 6)`). Empty when the block does
-/// not end in a `CBRANCH`.
-pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx], readers: &Readers) -> &'o [OpIdx] {
-    let Some((&last, body)) = ops.split_last() else { return &[] };
+/// The ops of `ops` (a block's live ops) that only compute its branch condition (WS81), in
+/// order: pure ops whose result is read only by later ops of the set or the branch (by one of
+/// them, or — `a - b` / `a & b` of a `cmp` / `test` — by the flags computed from it). They fold
+/// into the condition expression (`var_201 = edi < 6; if (var_201)` -> `if (edi < 6)`), which
+/// is evaluated at the branch: WS89 — not only the run right before the `CBRANCH` but also an
+/// op further up when the statements between it and the branch write nothing it reads (no
+/// register / temporary of its inputs; no memory, when it loads): `var_206 = rax == 0;
+/// rcx = *(uint64_t*)rsp; if (!var_206)` -> `rcx = *(uint64_t*)rsp; if (rax != 0)`. Empty when
+/// the block does not end in a `CBRANCH`.
+pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> Vec<OpIdx> {
+    let Some((&last, body)) = ops.split_last() else { return Vec::new() };
     let br = &func.ops[last];
     if br.opcode != OpCode::CBranch || br.inputs.len() < 2 {
-        return &[];
+        return Vec::new();
     }
-    let mut start = body.len();
-    while start > 0 {
-        let op = &func.ops[body[start - 1]];
-        let Some(out) = op.output else { break };
-        if !is_pure(op.opcode) {
+    let mut chain: Vec<OpIdx> = vec![last];
+    // what the ops left out (printed between a folded op and the branch) write
+    let mut written: Vec<reargo_core::pcode::VarnodeData> = Vec::new();
+    let mut memory_written = false;
+    for &o in body.iter().rev() {
+        let op = &func.ops[o];
+        let folds = op.output.is_some_and(|out| {
+            if !is_pure(op.opcode) {
+                return false;
+            }
+            // read by several ops only when it is what a compare's flags are computed from
+            let r = readers.of(func, out);
+            let shared_ok = r.len() == 1 || matches!(op.opcode, OpCode::IntSub | OpCode::IntAnd);
+            if r.is_empty() || !shared_ok || !r.iter().all(|u| chain.contains(u)) {
+                return false;
+            }
+            // nothing printed after it changes what it reads
+            let reads_changed = op.inputs.iter().any(|&i| {
+                let d = func.varnodes[i as usize].data;
+                d.space != reargo_core::address::SpaceId::CONST && written.iter().any(|w| w.overlaps(&d))
+            });
+            !(reads_changed || (op.opcode == OpCode::Load && memory_written))
+        });
+        if folds {
+            chain.push(o);
+            continue;
+        }
+        // (a phi is no statement: it is first in the block, nothing folds above it)
+        if op.opcode == OpCode::MultiEqual {
             break;
         }
-        // read by several ops only when it is what a compare's flags are computed from
-        let r = readers.of(func, out);
-        let shared_ok = r.len() == 1 || matches!(op.opcode, OpCode::IntSub | OpCode::IntAnd);
-        if r.is_empty() || !shared_ok || !r.iter().all(|u| ops[start..].contains(u)) {
-            break;
+        if let Some(out) = op.output {
+            written.push(func.varnodes[out as usize].data);
         }
-        start -= 1;
+        if matches!(op.opcode, OpCode::Store | OpCode::Call | OpCode::CallInd | OpCode::CallOther) {
+            memory_written = true;
+        }
+        // (a call also writes the registers its INDIRECTs name, listed as ops of their own)
     }
-    &body[start..]
+    chain.remove(0);
+    chain.reverse();
+    chain
 }
 
 /// The CFG with short-circuit tests merged, and the condition of each merged block.
@@ -598,7 +626,7 @@ impl Inliner {
             None
         } else {
             let cv = func.ops[*ops.last().unwrap()].inputs[1];
-            self.fold_ops(func, tail, cv, name, emit, Some(MAX_FOLDED_LEN)).map(|f| (tail.to_vec(), f))
+            self.fold_ops(func, &tail, cv, name, emit, Some(MAX_FOLDED_LEN)).map(|f| (tail, f))
         };
         self.own.borrow_mut().insert(block, r.clone());
         r
