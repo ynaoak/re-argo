@@ -3325,6 +3325,23 @@ mod tests {
         assert!(c.contains("cl = rax == rbx;") || c.contains("var_206 = rax == rbx;"), "{c}");
     }
 
+    /// WS89: a flag another block computed folds into the branch reading it when its operands
+    /// keep their values (`cmp rdi, rsi; je L; jb M` printed `var_201 = rdi < rsi;` and
+    /// `if (var_201)` in the next block).
+    #[test]
+    fn a_flag_from_another_block_folds() {
+        let lifter = X86Lifter::new_64();
+        // cmp rdi, rsi; je L1; jb L2; xor eax, eax; ret; L1: ret; L2: mov eax, 1; ret
+        let code = [0x48, 0x39, 0xf7, 0x74, 0x05, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("rdi < rsi") && !c.contains("var_201"), "{c}");
+        // mov in between: rdi changes before the `jb`
+        // cmp rdi, rsi; je L1; mov rdi, rdx; jb L2; xor eax, eax; ret; L1: ret; L2: mov rax, rdi; ret
+        let code = [0x48, 0x39, 0xf7, 0x74, 0x08, 0x48, 0x89, 0xd7, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0x48, 0x89, 0xf8, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("var_201 = rdi < rsi;"), "{c}");
+    }
+
     /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
     /// condition (it was `tmp_510 = *m; var_206 = rax == tmp_510; tmp_2030 = … ? rcx : tmp_510;
     /// rax = … ? rax : tmp_510; *m = tmp_2030;`).

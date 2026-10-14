@@ -625,6 +625,8 @@ pub struct Inliner {
     exprs: std::cell::RefCell<FxHashMap<ValueKey, String>>,
     by_block: std::cell::OnceCell<Vec<Vec<OpIdx>>>,
     readers: std::cell::OnceCell<Readers>,
+    /// the first op of each block (`flags::block_starts`)
+    starts: std::cell::OnceCell<Vec<usize>>,
     /// block -> (the ops folded into its own condition, the condition's text)
     own: std::cell::RefCell<FxHashMap<BlockId, Option<OwnCondition>>>,
 }
@@ -644,6 +646,47 @@ impl Inliner {
         (self.by_block.get_or_init(|| ops_by_block(func)), self.readers.get_or_init(|| Readers::new(func)))
     }
 
+    /// WS89: a flag a block's branch reads that another block computed — `cmp r12, r13; je L`
+    /// leaves the `jb` reading `CF` in the next block, which printed `var_201 = r12 < r13;` there
+    /// and `if (!var_201)` here. The comparison (of registers / constants only) folds into this
+    /// condition, before `chain` (the block's own folded ops), when nothing but the condition
+    /// reads it and its operands keep their values on every path from it to here
+    /// (`flags::operands_hold`, which also needs it to dominate this block).
+    fn with_cross_block(&self, func: &SsaFunction, block: BlockId, chain: Vec<OpIdx>) -> Vec<OpIdx> {
+        let (by_block, readers) = self.parts(func);
+        let Some(&br) = by_block[block].last() else { return chain };
+        if func.ops[br].opcode != OpCode::CBranch || func.ops[br].inputs.len() < 2 {
+            return chain;
+        }
+        let starts = self.starts.get_or_init(|| crate::flags::block_starts(func));
+        let mut readers_ok: Vec<OpIdx> = chain.clone();
+        readers_ok.push(br);
+        let mut cross: Vec<OpIdx> = Vec::new();
+        for &r in readers_ok.iter() {
+            for &v in &func.ops[r].inputs {
+                let Some(d) = func.varnodes[v as usize].def_op else { continue };
+                let def = &func.ops[d];
+                let compare = matches!(
+                    def.opcode,
+                    OpCode::IntEqual | OpCode::IntNotEqual | OpCode::IntLess | OpCode::IntLessEqual | OpCode::IntSLess | OpCode::IntSLessEqual
+                );
+                if def.dead || def.block == block || !compare || cross.contains(&d) {
+                    continue;
+                }
+                let plain = def.inputs.iter().all(|&i| {
+                    matches!(func.varnodes[i as usize].data.space, reargo_core::address::SpaceId::REGISTER | reargo_core::address::SpaceId::CONST)
+                });
+                let only_here = def.output.is_some_and(|o| readers.of(func, o).iter().all(|u| readers_ok.contains(u)));
+                if plain && only_here && crate::flags::operands_hold(func, starts, &[d], r, &def.inputs) {
+                    cross.push(d);
+                }
+            }
+        }
+        cross.sort_unstable();
+        cross.extend(chain);
+        cross
+    }
+
     /// A block's own branch condition with its [`condition_tail`] folded in (WS81): the ops
     /// not to print as statements and the condition's text, or `None` when nothing folds (or
     /// an op of the tail does not print as `dst = rhs;`). Cached: the statements and the
@@ -660,7 +703,7 @@ impl Inliner {
         }
         let (by_block, readers) = self.parts(func);
         let ops = &by_block[block];
-        let tail = condition_tail(func, ops, readers);
+        let tail = self.with_cross_block(func, block, condition_tail(func, ops, readers));
         let r = if tail.is_empty() {
             None
         } else {
@@ -787,7 +830,7 @@ impl Inliner {
         let ops = &by_block[block];
         let Some(&br) = ops.last() else { return Folded::plain("cond".into()) };
         let Some(&cv) = func.ops[br].inputs.get(1) else { return Folded::plain("cond".into()) };
-        let body = condition_ops(func, ops, readers).unwrap_or_default();
+        let body = self.with_cross_block(func, block, condition_ops(func, ops, readers).unwrap_or_default());
         if let Some(f) = self.fold_ops(func, &body, cv, name, emit, None) {
             return f;
         }
