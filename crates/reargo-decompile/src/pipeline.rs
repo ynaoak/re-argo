@@ -2676,10 +2676,12 @@ mod tests {
         ];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("rdi = *(uint64_t*)rbx;"), "{c}");
-        assert!(c.contains("rsi = rsp + 0x30;"), "{c}");
-        // the swap reads the old value of the register it writes: it keeps its temporary
-        let swap: Vec<&str> = c.lines().map(str::trim).filter(|l| l.contains("tmp_560")).collect();
-        assert_eq!(swap, ["tmp_560 = rsi;", "rsi = rdi;", "rdi = tmp_560;"].iter().filter(|l| l.contains("tmp_560")).copied().collect::<Vec<_>>(), "{c}");
+        // (`rsp + 0x30` is a stack argument's address, WS88)
+        assert!(c.contains("rsi = arg_30;"), "{c}");
+        // the swap reads the old value of the register it writes: `rdi` gets the address after
+        let body: Vec<&str> = c.lines().map(str::trim).collect();
+        let (x, y) = (body.iter().position(|l| *l == "rsi = rdi;"), body.iter().position(|l| *l == "rdi = arg_30;"));
+        assert!(x.is_some() && y > x, "{c}");
     }
 
     /// WS86: `sete [rsi+0x18]` loads and stores through two copies of one address; common
@@ -2730,7 +2732,7 @@ mod tests {
         ];
         let c = c_of(&code);
         for s in [
-            "*(uint64_t*)(rsp + 0xa0) = rsi;",
+            "arg_a0 = rsi;",
             "eax = *(uint32_t*)(rbx + 0x200);",
             "+ *(uint32_t*)(rbx + 0x350)",
             "*(uint32_t*)(rdi + 8) = eax;",
@@ -2792,14 +2794,14 @@ mod tests {
             0x48, 0x89, 0x37, // mov [rdi], rsi
             0xc3,
         ]);
-        assert!(c.contains(": *(uint64_t*)(rsp + 0x18);") || c.contains("? *(uint64_t*)(rsp + 0x18) :"), "{c}");
+        assert!(c.contains(": arg_18;") || c.contains("? arg_18 :"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
         let c = c_of(&[
             0xf3, 0x0f, 0x5b, 0x4c, 0x24, 0x30, // cvttps2dq xmm1, [rsp+0x30]
             0x0f, 0x11, 0x0f, // movups [rdi], xmm1
             0xc3,
         ]);
-        assert!(c.contains("xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));"), "{c}");
+        assert!(c.contains("xmm1 = cvttps2dq(arg_30);"), "{c}");
     }
 
     /// WS87: a `setcc` folds its condition like a branch: `ucomiss xmm1, xmm0; seta al` is
@@ -2846,6 +2848,258 @@ mod tests {
             assert!(c.contains(s), "{s}: {c}");
         }
         assert!(!c.contains("rsp"), "{c}");
+    }
+
+    /// WS88: the stack arguments above the return address are `arg_<k>` (the first at `entry
+    /// rsp + 8`), named the same across pushes, and parameters after the register ones; an
+    /// address only taken there is an argument array of unknown length.
+    #[test]
+    fn stack_arguments_are_named_parameters() {
+        let code = [
+            0x53, // push rbx
+            0x48, 0x8b, 0x44, 0x24, 0x10, // mov rax, [rsp+0x10]   (arg_8)
+            0x8b, 0x4c, 0x24, 0x18, // mov ecx, [rsp+0x18]         (arg_10)
+            0x48, 0x8d, 0x54, 0x24, 0x28, // lea rdx, [rsp+0x28]   (&arg_20)
+            0x48, 0x01, 0xc8, // add rax, rcx
+            0x48, 0x89, 0x07, // mov [rdi], rax
+            0x48, 0x89, 0x16, // mov [rsi], rdx
+            0x5b, // pop rbx
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("uint64_t arg_8, uint32_t arg_10, uint8_t arg_20[])"), "{c}");
+        assert!(c.contains("arg_8 + arg_10") || c.contains("rax = arg_8;"), "{c}");
+        assert!(c.contains("= arg_20;"), "{c}");
+        assert!(!c.contains("rsp"), "{c}");
+        let lifter = X86Lifter::new_64();
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("arg_8: u64, arg_10: u32, arg_20: *mut u8)"), "{rs}");
+        assert!(!rs.contains("rsp"), "{rs}");
+    }
+
+    /// WS88: a landing pad starts with the stack pointer of the call that threw, not the
+    /// entry's (the SSA names both the incoming `rsp`): its slots are the body's, not stack
+    /// arguments.
+    #[test]
+    fn landing_pad_slots_are_the_bodys() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x48, 0x83, 0xec, 0x18, // sub rsp, 0x18
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0x48, 0x83, 0xc4, 0x18, // add rsp, 0x18
+            0xc3, // ret
+            // the landing pad (0x1013)
+            0x48, 0x8b, 0x7c, 0x24, 0x08, // mov rdi, [rsp+8]
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0xc3,
+        ];
+        let mem = make_memory(&code, 0x1000);
+        let lifted = lifter.lift_range(&mem, 0x1000, 100).unwrap();
+        let terminated = apply_call_convention(lifted, &lifter, &rustc_hash::FxHashMap::default());
+        let empty = std::collections::BTreeMap::new();
+        let handlers = [(0x1013, "cleanup".to_string())];
+        let r = build_decompile_result(
+            terminated,
+            "f",
+            0x1000,
+            &empty,
+            &empty,
+            None,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+            &handlers,
+            &[],
+        )
+        .unwrap();
+        let c = r.c_code;
+        let pad = &c[c.find("landing pad").unwrap_or_else(|| panic!("{c}"))..];
+        assert!(c.contains("local_10 = rdi;"), "{c}");
+        assert!(pad.contains("rdi = local_10;"), "{c}");
+        assert!(!c.contains("arg_"), "{c}");
+    }
+
+    /// WS88: `crc32`, `movmskps` and the SSE3 / SSE4.1 ops are named intrinsics (they were
+    /// `__unmodeled_insn()`).
+    #[test]
+    fn sse42_and_sse41_ops_are_intrinsics() {
+        let c = c_of(&[
+            0xf2, 0x0f, 0x38, 0xf0, 0xc1, // crc32 eax, cl
+            0x0f, 0x50, 0xd1, // movmskps edx, xmm1
+            0x66, 0x0f, 0x3a, 0x08, 0xc1, 0x01, // roundps xmm0, xmm1, 1
+            0x0f, 0x53, 0xd0, // rcpps xmm2, xmm0
+            0xf2, 0x0f, 0x7c, 0xd2, // haddps xmm2, xmm2
+            0x0f, 0x11, 0x17, // movups [rdi], xmm2
+            0x01, 0xd0, // add eax, edx
+            0xc3,
+        ]);
+        for s in ["crc32(eax, cl)", "movmskps(xmm1)", "roundps(xmm1, 1)", "rcpps(", "haddps("] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+        assert!(!c.contains("__unmodeled_insn"), "{c}");
+    }
+
+    /// WS88: a division reads the dividend's register, not a copy of it: the remainder is
+    /// computed first (unless the divisor is the D register), the quotient prints inline.
+    #[test]
+    fn division_reads_the_dividend_register() {
+        let c = c_of(&[
+            0x89, 0xf8, // mov eax, edi
+            0x31, 0xd2, // xor edx, edx
+            0xf7, 0xf6, // div esi
+            0x89, 0x07, // mov [rdi], eax
+            0x89, 0x56, 0x04, // mov [rsi+4], edx
+            0xc3,
+        ]);
+        assert!(c.contains("edx = eax % esi;") && c.contains("eax = eax / esi;"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        // the divisor in edx: the quotient first, through the copy
+        let c = c_of(&[0x89, 0xf8, 0xf7, 0xf2, 0x89, 0x07, 0x89, 0x56, 0x04, 0xc3]);
+        assert!(c.contains("/ edx;") && c.contains("% edx;"), "{c}");
+    }
+
+    /// WS88: `jne T; mov; jp T` after a float compare: the jne on "ordered and not equal", the
+    /// jp on a NaN — no flag variables.
+    #[test]
+    fn float_parity_pair_with_an_instruction_between() {
+        let c = c_of(&[
+            0x0f, 0x2e, 0xc1, // ucomiss xmm0, xmm1
+            0x75, 0x07, // jne T
+            0x89, 0xf8, // mov eax, edi
+            0x7a, 0x03, // jp T
+            0x89, 0x06, // mov [rsi], eax
+            0xc3,
+            0x89, 0x3e, // T: mov [rsi], edi
+            0xc3,
+        ]);
+        assert!(c.contains("if ((xmm0_d < xmm1_d) || (xmm1_d < xmm0_d))"), "{c}");
+        assert!(c.contains("isnan(xmm0_d)") || c.contains("isnan(xmm1_d)"), "{c}");
+        assert!(!c.contains("var_20") && !c.contains("tmp_"), "{c}");
+    }
+
+    /// WS88: a loaded value a flag kept as a statement compares prints inside it, and an
+    /// indexed address read twice prints in both readers; a load a branch compares after a store
+    /// keeps its value.
+    #[test]
+    fn loads_and_indexed_addresses_print_inline() {
+        let c = c_of(&[
+            0x48, 0x3b, 0x0d, 0x00, 0x01, 0x00, 0x00, // cmp rcx, [rip+0x100]
+            0x74, 0x05, // je +5
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x74, 0x01, // je +1 (the same flag, another block)
+            0xc3,
+            0xc3,
+        ]);
+        assert!(c.contains("var_206 = rcx == *(uint64_t*)0x1107;"), "{c}");
+        let c = c_of(&[
+            0x44, 0x8b, 0x0c, 0x8a, // mov r9d, [rdx+rcx*4]
+            0x48, 0x8d, 0x4c, 0x8a, 0x04, // lea rcx, [rdx+rcx*4+4]
+            0x48, 0x89, 0x0f, // mov [rdi], rcx
+            0x44, 0x89, 0x4f, 0x08, // mov [rdi+8], r9d
+            0xc3,
+        ]);
+        assert!(c.contains("r9d = *(uint32_t*)(rdx + (rcx << 2));"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        // cmp edi, [rsi]; mov dword [rsi], 0; jg +1; ret; ret: the compared value is read before
+        // the store
+        let c = c_of(&[0x3b, 0x3e, 0xc7, 0x06, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x01, 0xc3, 0xc3]);
+        let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
+        assert!(!cond.contains("*(uint32_t*)rsi"), "{c}");
+    }
+
+    /// WS88: a reference count's `lock xadd [m], -1` loads once into the register it returns
+    /// in: `rax = *(m); *(m) = rax - 1;` (was `tmp_510 = *(m); rax = tmp_510; *(m) = tmp_510 - 1;`).
+    /// With a register addend the store reads the register's old value: the temporary stays.
+    #[test]
+    fn refcount_xadd_loads_into_its_register() {
+        let code = [
+            0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov rax, -1
+            0xf0, 0x48, 0x0f, 0xc1, 0x47, 0x10, // lock xadd [rdi+0x10], rax
+            0x48, 0x83, 0xf8, 0x01, // cmp rax, 1
+            0x75, 0x01, // jne +1
+            0xc3,
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("rax = *(uint64_t*)(rdi + 0x10);"), "{c}");
+        assert!(c.contains("*(uint64_t*)(rdi + 0x10) = rax - 1;"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+        let lifter = X86Lifter::new_64();
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("rax = unsafe { *(rdi.wrapping_add(0x10) as *const u64) };"), "{rs}");
+        assert!(!rs.contains("tmp_"), "{rs}");
+        // mov rax, [rdi+8]; lock xadd [rdi+8], rax: the store adds the old rax
+        let c = c_of(&[0x48, 0x8b, 0x47, 0x08, 0xf0, 0x48, 0x0f, 0xc1, 0x47, 0x08, 0x48, 0x89, 0x06, 0xc3]);
+        let store = c.lines().map(str::trim).find(|l| l.starts_with("*(uint64_t*)") && l.contains(" = ")).unwrap_or_else(|| panic!("{c}"));
+        assert!(store.ends_with("= tmp_510 + rax;"), "{c}");
+    }
+
+    /// WS88: the Rust output folds the conditions of `setcc` and `cmovcc` like the C output.
+    #[test]
+    fn rust_output_folds_setcc_and_select_conditions() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x0f, 0x2e, 0xc8, // ucomiss xmm1, xmm0
+            0x0f, 0x97, 0xc0, // seta al
+            0x0f, 0x97, 0x07, // seta [rdi]
+            0x48, 0x39, 0xf2, // cmp rdx, rsi
+            0x48, 0x0f, 0x42, 0xd6, // cmovb rdx, rsi
+            0x48, 0x89, 0x57, 0x08, // mov [rdi+8], rdx
+            0xc3,
+        ];
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("al = (xmm0_d < xmm1_d) as u8;"), "{rs}");
+        assert!(rs.contains("unsafe { *(rdi as *mut u8) = (xmm0_d < xmm1_d) as u8; }"), "{rs}");
+        assert!(rs.contains("if rdx < rsi { rsi } else { rdx }"), "{rs}");
+        assert!(!rs.contains("var_2") && !rs.contains("tmp_"), "{rs}");
+        // a float op's constant is a float literal
+        let code = [
+            0x0f, 0x57, 0xd2, // xorps xmm2, xmm2
+            0x0f, 0x2e, 0xc2, // ucomiss xmm0, xmm2
+            0x0f, 0x97, 0x07, // seta [rdi]
+            0xc3,
+        ];
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("= (0.0f32 < xmm0_d) as u8;"), "{rs}");
+        // an added negative constant is a subtraction
+        let code = [0x48, 0x83, 0xc7, 0xfa, 0x48, 0x89, 0x3e, 0xc3]; // add rdi, -6; mov [rsi], rdi; ret
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(rs.contains("rdi.wrapping_sub(6)"), "{rs}");
+    }
+
+    /// WS88: the Rust output names the stack slots like the C output.
+    #[test]
+    fn rust_output_names_stack_slots() {
+        let lifter = X86Lifter::new_64();
+        let code = [
+            0x53, // push rbx
+            0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0xc7, 0x44, 0x24, 0x0c, 0x01, 0x00, 0x00, 0x00, // mov dword [rsp+0xc], 1
+            0x48, 0x8d, 0x44, 0x24, 0x10, // lea rax, [rsp+0x10]
+            0x48, 0x89, 0x02, // mov [rdx], rax
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call (next)
+            0x8b, 0x44, 0x24, 0x08, // mov eax, [rsp+8]
+            0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+            0x5b, // pop rbx
+            0xc3,
+        ];
+        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        for s in [
+            "let mut local_20: u64;",
+            "let mut local_18: [u8; 0x10];",
+            "local_8 = rbx;",
+            "local_20 = rdi;",
+            "unsafe { *((&raw mut local_20 as *mut u8).add(0x4) as *mut u32) = 1; }",
+            "local_18.as_mut_ptr()",
+            "eax = local_20 as u32;",
+        ] {
+            assert!(rs.contains(s), "{s}: {rs}");
+        }
+        assert!(!rs.contains("rsp"), "{rs}");
     }
 
     /// WS87: the Rust output prints temporaries inline like the C output.
@@ -3456,6 +3710,65 @@ mod tests {
         let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s}: {c}"));
         assert!(at("case 0:") < at("case 2:") && at("case 2:") < at("return 0xa;") && at("case 1:") < at("return 0x14;"), "{c}");
         assert!(!c.contains("case 3:") && !c.contains("default:"), "the table ends at the next one: {c}");
+    }
+
+    /// WS88 (0x4c6d3d0): a loop's test (`cmp [rsi], edx; jg`) falls into an enum's dispatch;
+    /// it is no bounds check of the index, and the table runs as an enum's does.
+    #[test]
+    fn jump_table_after_a_loop_test() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let mut code: Vec<u8> = vec![
+            0x4c, 0x8d, 0x0d, 0xf9, 0x00, 0x00, 0x00, // 0x1000 lea r9, [0x1100]
+            0x8b, 0x07, // 0x1007 mov eax, [rdi]
+            0x39, 0x16, // 0x1009 cmp [rsi], edx
+            0x7f, 0xfc, // 0x100b jg 0x1009
+            0x49, 0x63, 0x04, 0x81, // 0x100d movsxd rax, [r9+rax*4]
+            0x4c, 0x01, 0xc8, // 0x1011 add rax, r9
+            0xff, 0xe0, // 0x1014 jmp rax
+            0xb8, 0x0a, 0x00, 0x00, 0x00, 0xc3, // 0x1016 mov eax, 10; ret
+            0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3, // 0x101c mov eax, 20; ret
+            0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00, // 0x1022 lea rax, [0x110c] (another table)
+            0xc3,
+        ];
+        code[0x22 + 3..0x22 + 7].copy_from_slice(&((0x110c - 0x1029i32).to_le_bytes()));
+        let mut table: Vec<u8> = [0x1016u64, 0x101c, 0x1016].iter().flat_map(|&t| rel(t)).collect();
+        table.extend([0x101cu64, 0x1016].iter().flat_map(|&t| rel(t)));
+        let mem = make_memory_parts(&[(0x1000, &code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 2:") && !c.contains("case 3:"), "{c}");
+    }
+
+    /// WS88 (0x3e11d80): the table base is in a register the function also sets to other values
+    /// (`lea r13, [T]` before a loop, `movabs r13, …` / `mov r13, rsi` elsewhere); with the
+    /// table's own case edges (the loop goes back through one) the register holds `T` on every
+    /// path to the dispatch.
+    #[test]
+    fn jump_table_base_in_a_reused_register() {
+        let lifter = X86Lifter::new_64();
+        let rel = |t: u64| ((t as i64 - 0x1100) as i32).to_le_bytes();
+        let code: &[u8] = &[
+            0x4c, 0x8d, 0x2d, 0xf9, 0x00, 0x00, 0x00, // 0x1000 lea r13, [0x1100]
+            0xeb, 0x16, // 0x1007 jmp 0x101f
+            0x49, 0xbd, 0, 0, 0, 0, 0, 0, 0, 0x40, // 0x1009 case 2: movabs r13, 1 << 62
+            0x49, 0x89, 0xf5, // 0x1013 mov r13, rsi
+            0x31, 0xc0, 0xc3, // 0x1016 xor eax, eax; ret
+            0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3, // 0x1019 case 3: mov eax, 3; ret
+            0x8b, 0x07, // 0x101f mov eax, [rdi]
+            0xc1, 0xe8, 0x1e, // 0x1021 shr eax, 30
+            0x49, 0x63, 0x44, 0x85, 0x00, // 0x1024 movsxd rax, [r13+rax*4]
+            0x4c, 0x01, 0xe8, // 0x1029 add rax, r13
+            0xff, 0xe0, // 0x102c jmp rax
+            0x48, 0x83, 0xc7, 0x04, // 0x102e case 0: add rdi, 4
+            0xeb, 0xeb, // 0x1032 jmp 0x101f
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, // 0x1034 case 1: mov eax, 1; ret
+        ];
+        let table: Vec<u8> = [0x102eu64, 0x1034, 0x1009, 0x1019].iter().flat_map(|&t| rel(t)).collect();
+        let mem = make_memory_parts(&[(0x1000, code), (0x1100, &table)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("switch (") && !c.contains("goto *"), "{c}");
+        assert!(c.contains("case 3:") && c.contains("return 3;"), "{c}");
     }
 
     /// WS86: the bounds check blocks before the dispatch (`cmp edi, 3; ja default`, then another

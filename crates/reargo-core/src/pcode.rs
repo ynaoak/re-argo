@@ -592,6 +592,22 @@ pub mod intrinsic {
         // ... `dst = cmpps(dst, src, imm)` (a mask per lane), and `movhps(dst, m64)`: the high
         // quadword loaded
         "cmpps", "cmppd", "movhps",
+        // WS88: `dst = op(src)`: approximate reciprocals (as the CPU computes them), SSE3
+        // duplicating moves, SSSE3 absolute values, SSE4.1 widening moves ...
+        "rcpps", "rsqrtps", "movddup", "movshdup", "movsldup", "pabsb", "pabsw", "pabsd",
+        "pmovzxbw", "pmovzxbd", "pmovzxbq", "pmovzxwd", "pmovzxwq", "pmovzxdq", "pmovsxbw",
+        "pmovsxbd", "pmovsxbq", "pmovsxwd", "pmovsxwq", "pmovsxdq",
+        // ... `dst = op(dst, src)`: the low lane of src, the rest of dst ...
+        "rcpss", "rsqrtss",
+        // ... `dst = op(dst, src)` lane by lane / horizontally ...
+        "haddps", "hsubps", "haddpd", "hsubpd", "addsubps", "addsubpd", "phaddw", "phaddd",
+        "phsubw", "phsubd", "psignb", "psignw", "psignd", "pmaddubsw", "pmulhrsw", "pmuldq",
+        // ... `dst = op(dst, src, imm)` / `dst = op(src, imm)` ...
+        "blendps", "blendpd", "pblendw", "dpps", "dppd", "palignr", "insertps", "roundss",
+        "roundsd", "roundps", "roundpd",
+        // ... `r = movmskps(src)` (the lanes' sign bits) and `r64 = crc32(r32, src)` (CRC-32C
+        // of src's bytes, zero-extended)
+        "movmskps", "movmskpd", "crc32",
     ];
 
     /// The tag of a packed integer instruction by its mnemonic (`"paddb"`).

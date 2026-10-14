@@ -53,6 +53,13 @@ pub struct RustEmitter<'a> {
     /// Temporaries printed inside their readers' expressions, as the C emitter does (WS87;
     /// `inline::candidates`): the defining op by value. Their definitions are in `folded`.
     inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
+    /// The condition of a select / `setcc` folded into it, by the op (WS88, as in C:
+    /// `emit::select_conditions`).
+    select_conds: rustc_hash::FxHashMap<usize, String>,
+    /// The stack slots by name (WS88, `frame`, as in C).
+    frame: crate::frame::Frame,
+    /// Temporaries printed as the register they are copied to (WS88, as in C).
+    coalesced: crate::emit::Coalesced,
 }
 
 impl Default for RustEmitter<'static> {
@@ -76,6 +83,9 @@ impl RustEmitter<'static> {
             folded: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             inlined: Default::default(),
+            select_conds: Default::default(),
+            frame: Default::default(),
+            coalesced: Default::default(),
         }
     }
 }
@@ -99,6 +109,9 @@ impl<'a> RustEmitter<'a> {
             folded: rustc_hash::FxHashSet::default(),
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             inlined: Default::default(),
+            select_conds: Default::default(),
+            frame: Default::default(),
+            coalesced: Default::default(),
         }
     }
 
@@ -135,14 +148,26 @@ impl<'a> RustEmitter<'a> {
     ) -> String {
         self.output.clear();
         self.noise = crate::emit::epilogue_noise(func);
+        // WS88: the stack slots by name; the stack pointer updates only they read go (as in C)
+        self.frame = crate::frame::Frame::new(func, &|_| true);
+        let frame_noise = self.frame.hidden(func, &self.noise);
+        self.noise.extend(frame_noise);
         // WS87: first, as the conditions fold the expressions printed inline (as in C)
         let inlined = self.inline_temporaries(func);
+        self.coalesced = crate::emit::Coalesced::new(func, &self.noise, &inlined);
         self.folded = (0..func.cfg.blocks.len())
             .filter_map(|b| self.own_condition(func, b))
             .flat_map(|(ops, _)| ops)
             .collect();
+        // WS88: the conditions of selects and `setcc`s fold like branches (as in C)
+        self.select_conds.clear();
+        let (conds, hidden) = crate::emit::select_conditions(func, &self.inliner, &|op| self.emit_op(func, op));
+        self.folded.extend(hidden);
         self.folded.extend(inlined);
-        let sig = infer_signature(func);
+        self.select_conds = conds;
+        let mut sig = infer_signature(func);
+        // the stack arguments (WS88) after the register parameters
+        sig.params.extend(self.frame.slots().filter(|s| s.is_arg()).map(|s| (s.name(), s.rust_type())));
         self.line(&sig.to_rust_declaration(&func.name));
         self.line("{");
         self.indent += 1;
@@ -156,7 +181,9 @@ impl<'a> RustEmitter<'a> {
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
-            if vn.data.space == SpaceId::REGISTER && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d)) {
+            if vn.data.space == SpaceId::REGISTER
+                && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d))
+            {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = size_to_rust_type(vn.data.size);
@@ -165,7 +192,12 @@ impl<'a> RustEmitter<'a> {
                 }
             }
         }
-        if !declared.is_empty() {
+        // the stack slots (WS88)
+        let slots: Vec<crate::frame::Slot> = self.frame.slots().filter(|s| !s.is_arg()).copied().collect();
+        for s in &slots {
+            linef!(self, "let mut {}: {};", s.name(), s.rust_type());
+        }
+        if !declared.is_empty() || !slots.is_empty() {
             self.output.push('\n');
         }
     }
@@ -420,11 +452,23 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn emit_op(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {
-        let out_name = op.output.map(|id| varnode_name(&func.varnodes[id as usize]));
+        if self.coalesced.copies.contains(&op.index) {
+            return None;
+        }
+        let out_name = self.coalesced.defs.get(&op.index).cloned().or_else(|| op.output.map(|id| varnode_name(&func.varnodes[id as usize])));
 
         match op.opcode {
             // phi: same name on every incoming edge, nothing to print
             OpCode::MultiEqual => None,
+            // a stack address by its slot (WS88): `rdi = &raw mut local_48;`
+            OpCode::Copy | OpCode::IntAdd | OpCode::IntSub
+                if op.output.is_some_and(|o| {
+                    let d = &func.varnodes[o as usize].data;
+                    !(d.space == SpaceId::REGISTER && d.offset == 0x20)
+                }) && op.output.and_then(|o| self.frame.address(func, o, true)).is_some() =>
+            {
+                Some(format!("{} = {};", out_name?, self.frame.address(func, op.output?, true)?))
+            }
             OpCode::Copy => {
                 let dst = out_name?;
                 let src = self.input_expr(func, op, 0);
@@ -433,6 +477,10 @@ impl<'a> RustEmitter<'a> {
             OpCode::IntAdd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
+                // `x + 0xfffffffffffffffa` is `x - 6` (WS88, as in C)
+                if let Some(k) = op.inputs.get(1).and_then(|&v| crate::emit::negative_constant(&func.varnodes[v as usize].data)) {
+                    return Some(format!("{} = {}.wrapping_sub({});", dst, a, crate::emit::small_hex(k)));
+                }
                 let b = self.input_expr(func, op, 1);
                 Some(format!("{} = {}.wrapping_add({});", dst, a, b))
             }
@@ -683,15 +731,22 @@ impl<'a> RustEmitter<'a> {
             }
             OpCode::BoolNegate => {
                 let dst = out_name?;
+                // a `setcc` whose condition folded (WS88): the negation is the text
+                if let Some(e) = self.select_conds.get(&op.index) {
+                    return Some(format!("{dst} = ({}) as u8;", crate::emit::strip_outer_parens(e)));
+                }
                 let a = self.input_expr(func, op, 0);
                 Some(format!("{} = {} == 0;", dst, a))
             }
-            // `cmovcc` (WS83, `select`)
+            // `cmovcc` (WS83, `select`); its folded condition (WS88) is a `bool` already
             OpCode::Select if op.inputs.len() == 3 => {
                 let dst = out_name?;
-                let c = self.input_expr(func, op, 0);
                 let a = self.input_expr(func, op, 1);
                 let b = self.input_expr(func, op, 2);
+                if let Some(e) = self.select_conds.get(&op.index) {
+                    return Some(format!("{} = if {} {{ {} }} else {{ {} }};", dst, crate::emit::strip_outer_parens(e), a, b));
+                }
+                let c = self.input_expr(func, op, 0);
                 Some(format!("{} = if {} != 0 {{ {} }} else {{ {} }};", dst, c, a, b))
             }
             OpCode::IntZExt => {
@@ -705,6 +760,24 @@ impl<'a> RustEmitter<'a> {
             OpCode::Piece if op.inputs.len() >= 2 => {
                 // PIECE(hi, lo): concatenation with `lo` in the low bytes.
                 let dst = out_name?;
+                // a write to a register's low view (WS88, as in C): `al = x` / `xmm0_d = x`
+                match crate::emit::view_merge(func, op) {
+                    Some(crate::emit::ViewMerge::Keep { view }) => {
+                        let lo = self.input_expr(func, op, 1);
+                        return (lo != view).then(|| format!("{view} = {lo};"));
+                    }
+                    Some(crate::emit::ViewMerge::Const(c)) => {
+                        let lo = self.input_expr(func, op, 1);
+                        let ty = size_to_rust_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                        let shifted = c << (8 * func.varnodes[op.inputs[1] as usize].data.size);
+                        return Some(if c == 0 {
+                            format!("{dst} = {lo} as {ty};")
+                        } else {
+                            format!("{dst} = 0x{shifted:x} | {lo} as {ty};")
+                        });
+                    }
+                    None => {}
+                }
                 let hi = self.input_expr(func, op, 0);
                 let lo = self.input_expr(func, op, 1);
                 let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
@@ -713,6 +786,10 @@ impl<'a> RustEmitter<'a> {
             OpCode::Subpiece if op.inputs.len() >= 2 => {
                 // Truncating extract: low `out_size` bytes of `a >> 8k`.
                 let dst = out_name?;
+                // the kept upper bytes of a view write, read only by the merge (WS88, as in C)
+                if crate::emit::kept_upper_only(func, op) {
+                    return None;
+                }
                 let a = self.input_expr(func, op, 0);
                 let k = &func.varnodes[op.inputs[1] as usize].data;
                 let out_ty = size_to_rust_type(func.varnodes[op.output.unwrap() as usize].data.size);
@@ -738,8 +815,15 @@ impl<'a> RustEmitter<'a> {
             }
             OpCode::Load => {
                 let dst = out_name?;
-                let addr = self.input_expr(func, op, 1);
                 let out_size = func.varnodes[op.output.unwrap() as usize].data.size;
+                // a stack slot by name (WS88)
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, out_size, false, true)) {
+                    return Some(match slot.starts_with('*') {
+                        true => format!("{dst} = unsafe {{ {slot} }};"),
+                        false => format!("{dst} = {};", crate::emit::strip_outer_parens(&slot)),
+                    });
+                }
+                let addr = self.input_expr(func, op, 1);
                 let ty = size_to_rust_type(out_size);
                 Some(format!(
                     "{} = unsafe {{ *({} as *const {}) }};",
@@ -747,13 +831,19 @@ impl<'a> RustEmitter<'a> {
                 ))
             }
             OpCode::Store => {
-                let addr = self.input_expr(func, op, 1);
                 let val = self.input_expr(func, op, 2);
                 let size = if op.inputs.len() > 2 {
                     func.varnodes[op.inputs[2] as usize].data.size
                 } else {
                     8
                 };
+                if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, size, true, true)) {
+                    return Some(match slot.starts_with('*') {
+                        true => format!("unsafe {{ {slot} = {val}; }}"),
+                        false => format!("{slot} = {val};"),
+                    });
+                }
+                let addr = self.input_expr(func, op, 1);
                 let ty = size_to_rust_type(size);
                 Some(format!(
                     "unsafe {{ *({} as *mut {}) = {}; }}",
@@ -888,6 +978,15 @@ impl<'a> RustEmitter<'a> {
         if idx >= op.inputs.len() {
             return "???".into();
         }
+        // a `setcc`'s folded condition (WS88), a whole right-hand side: a `bool` as the byte
+        if ((idx == 0 && op.opcode == OpCode::Copy) || (idx == 2 && op.opcode == OpCode::Store))
+            && let Some(e) = self.select_conds.get(&op.index)
+        {
+            return format!("({}) as u8", crate::emit::strip_outer_parens(e));
+        }
+        if let Some(r) = self.coalesced.values.get(&crate::condition::value_key(func, op.inputs[idx])) {
+            return r.clone();
+        }
         let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
         if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
             // a whole right-hand side or an argument needs no parentheses; a method call or an
@@ -902,6 +1001,16 @@ impl<'a> RustEmitter<'a> {
             return e;
         }
         let vn = &func.varnodes[op.inputs[idx] as usize];
+        // a constant a float op reads is the bits of a float (WS88, as in C): `0.0f32`
+        if vn.data.space == SpaceId::CONST
+            && crate::emit::is_float_op(op.opcode)
+            && let Some(f) = crate::emit::float_literal(vn.data.offset, vn.data.size)
+        {
+            return match f.strip_suffix('f') {
+                Some(t) => format!("{t}f32"),
+                None => f,
+            };
+        }
         if vn.data.space == SpaceId::CONST && vn.data.offset > 0x1000 {
             if let Some(s) = self.string_literals.get(&vn.data.offset) {
                 return format!("\"{}\"", s.escape_default());
@@ -1153,7 +1262,7 @@ fn method_call(s: &str) -> bool {
     false
 }
 
-fn size_to_rust_type(size: u32) -> &'static str {
+pub(crate) fn size_to_rust_type(size: u32) -> &'static str {
     match size {
         1 => "u8",
         2 => "u16",

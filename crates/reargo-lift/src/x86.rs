@@ -197,6 +197,25 @@ impl X86Lifter {
         match insn.mnemonic() {
             Nop | Endbr64 | Endbr32 => {}
 
+            // WS88: SSE4.2 `crc32` (CRC-32C) of 1 / 2 / 4 / 8 bytes into the low 32 bits of the
+            // accumulator: `eax = crc32(eax, cl)`
+            Crc32 => {
+                // (a 32-bit write zero-extends: `zero_extend_gpr32_writes`)
+                let full = iced_reg_to_varnode(insn.op_register(0)).ok_or_else(|| LiftError::Unsupported {
+                    address: insn.ip(),
+                    mnemonic: format!("crc32 to {:?}", insn.op_register(0)),
+                })?;
+                let acc = VarnodeData::new(full.space, full.offset, 4);
+                let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
+                let tag = reargo_core::pcode::intrinsic::packed_tag("crc32").expect("named");
+                ops.push(PcodeOp {
+                    opcode: OpCode::CallOther,
+                    seq: seq(seq_base),
+                    output: Some(full),
+                    inputs: SmallVec::from_slice(&[constant(tag, 8), acc, src]),
+                });
+            }
+
             Mov => {
                 use iced_x86::OpKind;
                 if insn.op_kind(0) == OpKind::Memory {
@@ -450,21 +469,21 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[acc]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
-                    opcode: div_op,
-                    seq: seq(seq_base),
-                    output: Some(acc),
-                    inputs: SmallVec::from_slice(&[old, src]),
-                });
-                seq_base += 1;
-                // Remainder to the D register.
-                ops.push(PcodeOp {
-                    opcode: rem_op,
-                    seq: seq(seq_base),
-                    output: Some(hi),
-                    inputs: SmallVec::from_slice(&[old, src]),
-                });
-                seq_base += 1;
+                let quotient = PcodeOp { opcode: div_op, seq: seq(seq_base), output: Some(acc), inputs: SmallVec::from_slice(&[old, src]) };
+                let remainder = PcodeOp { opcode: rem_op, seq: seq(seq_base + 1), output: Some(hi), inputs: SmallVec::from_slice(&[old, src]) };
+                // the remainder first unless the divisor is the D register (WS88): then both
+                // read the accumulator itself, and the decompiler prints `edx = eax % ebx;
+                // eax = eax / ebx;` rather than through a copy of the dividend
+                let divisor_in_d = src.space == REG_SPACE && src.offset < hi.offset + u64::from(hi.size) && hi.offset < src.offset + u64::from(src.size);
+                if divisor_in_d {
+                    ops.extend([quotient, remainder]);
+                } else {
+                    ops.extend([remainder, quotient]);
+                }
+                for (k, op) in ops.iter_mut().rev().take(2).rev().enumerate() {
+                    op.seq = seq(seq_base + k as u32);
+                }
+                seq_base += 2;
             }
 
             Not => {
@@ -1130,13 +1149,47 @@ impl X86Lifter {
             Cvttpd2dq => Some(("cvttpd2dq", false)),
             Cvtpd2dq => Some(("cvtpd2dq", false)),
             Cvtdq2pd => Some(("cvtdq2pd", false)),
+            // WS88: the approximate reciprocals (the emulator runs the CPU's own instruction),
+            // the SSE3 duplicating moves, the SSSE3 absolute values, the SSE4.1 widening moves
+            // (`xmm0 = pmovzxbw(*(uint64_t*)p)`), and the scalar reciprocals of the low lane
+            Rcpps => Some(("rcpps", false)),
+            Rsqrtps => Some(("rsqrtps", false)),
+            Movddup => Some(("movddup", false)),
+            Movshdup => Some(("movshdup", false)),
+            Movsldup => Some(("movsldup", false)),
+            Pabsb => Some(("pabsb", false)),
+            Pabsw => Some(("pabsw", false)),
+            Pabsd => Some(("pabsd", false)),
+            Pmovzxbw => Some(("pmovzxbw", false)),
+            Pmovzxbd => Some(("pmovzxbd", false)),
+            Pmovzxbq => Some(("pmovzxbq", false)),
+            Pmovzxwd => Some(("pmovzxwd", false)),
+            Pmovzxwq => Some(("pmovzxwq", false)),
+            Pmovzxdq => Some(("pmovzxdq", false)),
+            Pmovsxbw => Some(("pmovsxbw", false)),
+            Pmovsxbd => Some(("pmovsxbd", false)),
+            Pmovsxbq => Some(("pmovsxbq", false)),
+            Pmovsxwd => Some(("pmovsxwd", false)),
+            Pmovsxwq => Some(("pmovsxwq", false)),
+            Pmovsxdq => Some(("pmovsxdq", false)),
+            Rcpss => Some(("rcpss", true)),
+            Rsqrtss => Some(("rsqrtss", true)),
             _ => None,
         };
-        if let Some((name, reads_dst)) = packed_float
+        // (the MMX spellings of the SSSE3 ops are not these)
+        let xmm_dst = insn.op_kind(0) != iced_x86::OpKind::Register || iced_xmm_offset(insn.op_register(0)).is_some();
+        if let Some((name, reads_dst)) = packed_float.filter(|_| xmm_dst)
             && let Some(tag) = reargo_core::pcode::intrinsic::packed_tag(name)
         {
-            // (`cvtps2pd` / `cvtdq2pd` read 8 bytes of memory)
-            let src_size = if matches!(m, Cvtps2pd | Cvtdq2pd) && insn.op_kind(1) == iced_x86::OpKind::Memory { 8 } else { 16 };
+            // (the bytes a memory source is: `cvtps2pd` / `cvtdq2pd` read 8 of them, the
+            // widening moves what they widen, the scalar ops one lane)
+            let mem_size = match m {
+                Cvtps2pd | Cvtdq2pd | Movddup | Pmovzxbw | Pmovzxwd | Pmovzxdq | Pmovsxbw | Pmovsxwd | Pmovsxdq => 8,
+                Pmovzxbd | Pmovzxwq | Pmovsxbd | Pmovsxwq | Rcpss | Rsqrtss => 4,
+                Pmovzxbq | Pmovsxbq => 2,
+                _ => 16,
+            };
+            let src_size = if insn.op_kind(1) == iced_x86::OpKind::Memory { mem_size } else { 16 };
             let src = self.sse_operand(insn, 1, src_size, &mut ops, &mut sb, address)?;
             let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
             let inputs: SmallVec<[VarnodeData; 3]> = if reads_dst {
@@ -1160,7 +1213,7 @@ impl X86Lifter {
         }
 
         // packed integer ops lane by lane (WS85): `xmm0 = paddb(xmm0, xmm1)` on the whole register
-        if let Some(tag) = packed_int_name(m).and_then(reargo_core::pcode::intrinsic::packed_tag) {
+        if let Some(tag) = packed_int_name(m).filter(|_| xmm_dst).and_then(reargo_core::pcode::intrinsic::packed_tag) {
             let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
             let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
             ops.push(PcodeOp {
@@ -1185,6 +1238,18 @@ impl X86Lifter {
             // every lane compared to a mask (WS87; was the low lane only)
             Cmpps => Some(("cmpps", true)),
             Cmppd => Some(("cmppd", true)),
+            // WS88: SSE4.1 blends, dot products, rounding, `insertps`; SSSE3 `palignr`
+            Blendps => Some(("blendps", true)),
+            Blendpd => Some(("blendpd", true)),
+            Pblendw => Some(("pblendw", true)),
+            Dpps => Some(("dpps", true)),
+            Dppd => Some(("dppd", true)),
+            Palignr if xmm_dst => Some(("palignr", true)),
+            Insertps => Some(("insertps", true)),
+            Roundss => Some(("roundss", true)),
+            Roundsd => Some(("roundsd", true)),
+            Roundps => Some(("roundps", false)),
+            Roundpd => Some(("roundpd", false)),
             _ => None,
         };
         // shifts of every lane (WS86): `xmm0 = psrld(xmm0, 3)` / `psrld(xmm0, xmm1)` (count: the
@@ -1221,9 +1286,18 @@ impl X86Lifter {
         if let Some((name, reads_dst)) = imm_form
             && let Some(tag) = reargo_core::pcode::intrinsic::packed_tag(name)
         {
-            let imm = constant(u64::from(insn.immediate8()), 1);
-            // (`pinsrw xmm, r32/m16`: a register is read as is, memory as its 2 bytes)
-            let src_size = if m == Pinsrw { 2 } else { 16 };
+            let memory = insn.op_kind(1) == iced_x86::OpKind::Memory;
+            // (`insertps` from memory inserts the loaded float: no source lane to pick)
+            let imm = u64::from(insn.immediate8()) & if m == Insertps && memory { 0x3f } else { 0xff };
+            let imm = constant(imm, 1);
+            // (`pinsrw xmm, r32/m16`: a register is read as is, memory as its 2 bytes; the
+            // scalar ops read one lane of memory)
+            let src_size = match m {
+                Pinsrw => 2,
+                Insertps | Roundss if memory => 4,
+                Roundsd if memory => 8,
+                _ => 16,
+            };
             let src = self.sse_operand(insn, 1, src_size, &mut ops, &mut sb, address)?;
             let dst = self.sse_operand(insn, 0, if m == Pextrw { 4 } else { 16 }, &mut ops, &mut sb, address)?;
             let inputs: SmallVec<[VarnodeData; 3]> = if reads_dst {
@@ -1373,9 +1447,10 @@ impl X86Lifter {
                     inputs: SmallVec::from_slice(&[c, dst, src]) });
             }
 
-            // xorps/pxor self-zero idiom -> 0; otherwise low-lane xor.
+            // xorps/pxor self-zero idiom -> 0; otherwise the xor of the whole register (WS88:
+            // was the low 8 bytes)
             Xorps | Xorpd | Pxor => {
-                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
                 if insn.op_kind(1) == iced_x86::OpKind::Register
                     && insn.op_register(0) == insn.op_register(1)
                 {
@@ -1383,10 +1458,10 @@ impl X86Lifter {
                         opcode: OpCode::Copy,
                         seq: seq(sb),
                         output: Some(dst),
-                        inputs: SmallVec::from_slice(&[constant(0, 8)]),
+                        inputs: SmallVec::from_slice(&[constant(0, 16)]),
                     });
                 } else {
-                    let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                    let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
                     ops.push(PcodeOp {
                         opcode: OpCode::IntXor,
                         seq: seq(sb),
@@ -1435,12 +1510,11 @@ impl X86Lifter {
                 }
             }
 
-            // Bitwise and/or — exact (bitwise ops don't cross lanes), modeled on
-            // the low lane like the masks the BDS uses for sign/abs. Pand/Por
-            // are the integer-SIMD spellings of the same operation.
+            // Bitwise and/or of the whole register (WS88: was the low 8 bytes, which left the
+            // upper lanes of a packed mask stale). Pand/Por are the integer-SIMD spellings.
             Andps | Andpd | Orps | Orpd | Pand | Por => {
-                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
-                let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
+                let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
                 let opcode = if matches!(m, Andps | Andpd | Pand) {
                     OpCode::IntAnd
                 } else {
@@ -1456,9 +1530,9 @@ impl X86Lifter {
 
             // and-not: dst = (~dst) & src  (ANDNPS/ANDNPD/PANDN). Exact bitwise.
             Andnps | Andnpd | Pandn => {
-                let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
-                let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
-                let ndst = unique(0x780, 8);
+                let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
+                let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+                let ndst = unique(0x780, 16);
                 ops.push(PcodeOp {
                     opcode: OpCode::IntNegate,
                     seq: seq(sb),
@@ -1531,6 +1605,22 @@ impl X86Lifter {
                     seq: seq(sb),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[constant(reargo_core::pcode::intrinsic::PMOVMSKB, 8), src]),
+                });
+            }
+            // WS88: the sign bits of the float lanes (`eax = movmskps(xmm0)`)
+            Movmskps | Movmskpd => {
+                let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
+                let dst = iced_reg_to_varnode(insn.op_register(0)).ok_or_else(|| LiftError::Unsupported {
+                    address: insn.ip(),
+                    mnemonic: format!("{m:?} to {:?}", insn.op_register(0)),
+                })?;
+                let name = if m == Movmskps { "movmskps" } else { "movmskpd" };
+                let tag = reargo_core::pcode::intrinsic::packed_tag(name).expect("named");
+                ops.push(PcodeOp {
+                    opcode: OpCode::CallOther,
+                    seq: seq(sb),
+                    output: Some(dst),
+                    inputs: SmallVec::from_slice(&[constant(tag, 8), src]),
                 });
             }
             Pcmpeqb => {
@@ -2210,6 +2300,24 @@ fn packed_int_name(m: iced_x86::Mnemonic) -> Option<&'static str> {
         Movhlps => "movhlps",
         Movlhps => "movlhps",
         Pmuludq => "pmuludq",
+        // WS88: SSE3 horizontal / alternating float ops, SSSE3 horizontal integer ops, signs,
+        // multiplies, and the SSE4.1 signed `pmuldq`
+        Haddps => "haddps",
+        Hsubps => "hsubps",
+        Haddpd => "haddpd",
+        Hsubpd => "hsubpd",
+        Addsubps => "addsubps",
+        Addsubpd => "addsubpd",
+        Phaddw => "phaddw",
+        Phaddd => "phaddd",
+        Phsubw => "phsubw",
+        Phsubd => "phsubd",
+        Psignb => "psignb",
+        Psignw => "psignw",
+        Psignd => "psignd",
+        Pmaddubsw => "pmaddubsw",
+        Pmulhrsw => "pmulhrsw",
+        Pmuldq => "pmuldq",
         _ => return None,
     })
 }
