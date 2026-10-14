@@ -3303,6 +3303,25 @@ mod tests {
         assert!(!c.contains("__ret") && !c.contains("xmm0"), "{c}");
     }
 
+    /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
+    /// condition (it was `tmp_510 = *m; var_206 = rax == tmp_510; tmp_2030 = … ? rcx : tmp_510;
+    /// rax = … ? rax : tmp_510; *m = tmp_2030;`).
+    #[test]
+    fn cmpxchg_prints_as_compare_exchange() {
+        let lifter = X86Lifter::new_64();
+        // mov rax, [rdi]; L: lock cmpxchg [rdi], rcx; jne L; ret
+        let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x75, 0xf9, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("!__atomic_compare_exchange((uint64_t*)rdi, &rax, rcx)"), "{c}");
+        assert!(!c.contains("tmp_") && !c.contains("var_206"), "{c}");
+        // the flag read later too: a statement
+        // mov rax, [rdi]; lock cmpxchg [rdi], rcx; sete al; ret
+        let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x0f, 0x94, 0xc0, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("var_206 = __atomic_compare_exchange((uint64_t*)rdi, &rax, rcx);"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+    }
+
     /// A write to a register's low byte prints as that write (WS84: it printed the lifter's
     /// rebuild `tmp_7e00 = (void)(rax >> 8); rax = CONCAT(tmp_7e00, al:1);`).
     #[test]

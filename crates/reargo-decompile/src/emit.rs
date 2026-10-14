@@ -81,6 +81,10 @@ pub struct CEmitter<'a> {
     frame: crate::frame::Frame,
     /// A temporary printed as the register it is copied to (WS88, `inline::coalesced`).
     coalesced: Coalesced,
+    /// `lock cmpxchg` printed as one compare-and-swap, by its store (WS89, `cas::find`).
+    cas: rustc_hash::FxHashMap<usize, crate::cas::Cas>,
+    /// the ops a compare-and-swap hides (its load is no reader that has to print)
+    cas_hidden: rustc_hash::FxHashSet<usize>,
 }
 
 /// Temporaries printed as the register they are copied to (WS88, `inline::coalesced`): the
@@ -133,6 +137,8 @@ impl CEmitter<'static> {
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
             coalesced: Default::default(),
+            cas: Default::default(),
+            cas_hidden: Default::default(),
         }
     }
 }
@@ -172,6 +178,8 @@ impl<'a> CEmitter<'a> {
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
             coalesced: Default::default(),
+            cas: Default::default(),
+            cas_hidden: Default::default(),
         }
     }
 
@@ -218,6 +226,11 @@ impl<'a> CEmitter<'a> {
         self.frame = crate::frame::Frame::new(func, &|_| true);
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
+        // WS89: `lock cmpxchg` as one statement at its store
+        let (cas, cas_hidden) = crate::cas::find(func, &self.noise);
+        self.noise.extend(cas_hidden.iter().copied());
+        self.cas = cas;
+        self.cas_hidden = cas_hidden;
         // WS86: first, as the conditions and selects fold the expressions printed inline
         let inlined = self.inline_temporaries(func);
         // WS88: a temporary copied to a register and read again by stores prints as that register
@@ -245,6 +258,10 @@ impl<'a> CEmitter<'a> {
         self.emit_block(func, structured);
         self.indent -= 1;
         self.line("}");
+        // WS89: a compare-and-swap's flag read only by the next condition goes into it
+        if !self.cas.is_empty() {
+            self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("uint8_t {n};"), crate::cas::C_FORMS);
+        }
         self.output.clone()
     }
 
@@ -254,7 +271,10 @@ impl<'a> CEmitter<'a> {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
             // view syncs nobody reads) is not printed, so declaring it is noise
             if vn.data.space == SpaceId::REGISTER
-                && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d))
+                && vn.def_op.is_some_and(|d| {
+                    // (the flag and accumulator of a compare-and-swap print in its statement)
+                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d))
+                })
             {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
@@ -935,6 +955,20 @@ impl<'a> CEmitter<'a> {
                 let addr = self.input_expr(func, op, 1);
                 Some(format!("{} = *({}*){};", dst, size_to_type(out_size), addr))
             }
+            OpCode::Store if self.cas.contains_key(&op.index) => {
+                let c = &self.cas[&op.index];
+                let ptr = match self.frame.access(func, op.block, c.addr, c.size, true, false) {
+                    Some(slot) if !slot.starts_with('*') => format!("&{slot}"),
+                    _ => format!("({}*){}", size_to_type(c.size), self.input_expr(func, op, 1)),
+                };
+                let sel = func.varnodes[op.inputs[2] as usize].def_op?;
+                let call = crate::cas::call_text(&ptr, &varnode_name(&func.varnodes[c.expected as usize]), &self.input_expr(func, &func.ops[sel], 1));
+                Some(match c.flag {
+                    Some(f) if c.branch => format!("{} = {call};{}", varnode_name(&func.varnodes[f as usize]), crate::cas::FOLDABLE),
+                    Some(f) => format!("{} = {call};", varnode_name(&func.varnodes[f as usize])),
+                    None => format!("{call};"),
+                })
+            }
             OpCode::Store => {
                 let val = self.input_expr(func, op, 2);
                 let size = if op.inputs.len() > 2 {
@@ -1107,7 +1141,7 @@ impl<'a> CEmitter<'a> {
     /// Fill `inlined` (see [`crate::inline`]); returns the definitions not to print.
     fn inline_temporaries(&self, func: &SsaFunction) -> Vec<usize> {
         self.inlined.borrow_mut().clear();
-        let prints = |u: usize| !self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some();
+        let prints = |u: usize| self.cas_hidden.contains(&u) || (!self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some());
         let mut hidden = Vec::new();
         // (a call printed from a rendering of its site does not print its operands)
         let prints_operands = |u: usize| {
