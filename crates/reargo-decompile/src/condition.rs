@@ -213,12 +213,16 @@ pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> V
             if r.is_empty() || !shared_ok || !r.iter().all(|u| chain.contains(u)) {
                 return false;
             }
-            // nothing printed after it changes what it reads
-            let reads_changed = op.inputs.iter().any(|&i| {
-                let d = func.varnodes[i as usize].data;
-                d.space != reargo_core::address::SpaceId::CONST && written.iter().any(|w| w.overlaps(&d))
-            });
-            !(reads_changed || (op.opcode == OpCode::Load && memory_written))
+            // nothing printed after it changes what it reads — also through the definitions of
+            // its inputs in the block that may print inside it (a `setcc`'s folded comparison,
+            // an inlined temporary: `cl = rax == rbx; rbx = rax; if (… | cl)` must keep `cl`)
+            let mut leaves = Vec::new();
+            let mut loads = op.opcode == OpCode::Load;
+            for &i in &op.inputs {
+                collect_leaves(func, i, op.block, 0, &mut leaves, &mut loads);
+            }
+            let reads_changed = leaves.iter().any(|d| written.iter().any(|w| w.overlaps(d)));
+            !(reads_changed || (loads && memory_written))
         });
         if folds {
             chain.push(o);
@@ -239,6 +243,24 @@ pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> V
     chain.remove(0);
     chain.reverse();
     chain
+}
+
+/// The storage `v` reads, and — through its pure definition in `block` — what that reads (up
+/// to a depth); `loads` when a load is among them.
+fn collect_leaves(func: &SsaFunction, v: VarId, block: BlockId, depth: u32, out: &mut Vec<reargo_core::pcode::VarnodeData>, loads: &mut bool) {
+    let d = func.varnodes[v as usize].data;
+    if d.space == reargo_core::address::SpaceId::CONST {
+        return;
+    }
+    out.push(d);
+    let Some(def) = func.varnodes[v as usize].def_op.map(|o| &func.ops[o]) else { return };
+    if def.dead || def.block != block || !is_pure(def.opcode) || depth >= 6 {
+        return;
+    }
+    *loads |= def.opcode == OpCode::Load;
+    for &i in &def.inputs {
+        collect_leaves(func, i, block, depth + 1, out, loads);
+    }
 }
 
 /// The CFG with short-circuit tests merged, and the condition of each merged block.

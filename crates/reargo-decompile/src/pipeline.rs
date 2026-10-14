@@ -3318,6 +3318,11 @@ mod tests {
         let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x06, 0x74, 0x04, 0x48, 0x89, 0x07, 0xc3, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("var_206 = rax == 0;") && c.contains("var_206"), "{c}");
+        // cmp rax, rbx; sete cl; mov rbx, rax; test cl, cl; jne L; ...: the `sete` prints its
+        // comparison, which reads rbx before it changes — it stays a statement
+        let code = [0x48, 0x39, 0xd8, 0x0f, 0x94, 0xc1, 0x48, 0x89, 0xc3, 0x84, 0xc9, 0x75, 0x04, 0x48, 0x89, 0x1f, 0xc3, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("cl = rax == rbx;") || c.contains("var_206 = rax == rbx;"), "{c}");
     }
 
     /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
