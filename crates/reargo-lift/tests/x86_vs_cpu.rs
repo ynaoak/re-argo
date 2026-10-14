@@ -1316,3 +1316,394 @@ fn half_register_moves_match_the_cpu() {
     ];
     check(&cases);
 }
+
+// ---- x87 (WS89) ------------------------------------------------------------------------------
+
+/// The x87 buffer: inputs at 0 / 16 / 32 (80-bit values, integers, a control word), results at
+/// 48..96.
+const FBUF: usize = 96;
+/// Where the emulator puts the buffer.
+const FBUF_AT: u64 = 0x10_0000;
+
+/// Run natively: (rax/rcx/rdx and flags after, the buffer after, start / end of the code).
+type FNative = fn(&mut [u8; FBUF], u64, u64, u64) -> (Out, usize, usize);
+
+/// x87 instructions between `2:` and `3:`, `rax` pointing at the buffer, `rcx` / `rdx` = `b` /
+/// `c`, flags in from `fl`. The control word is 0x37F (64-bit precision, round to nearest, the
+/// System V state; Windows starts processes at 53 bits) around them.
+macro_rules! fpu {
+    ($($ins:expr),+ $(,)?) => {{
+        fn run(buf: &mut [u8; FBUF], b: u64, c: u64, fl: u64) -> (Out, usize, usize) {
+            let (mut ra, mut rc, mut rd) = (buf.as_mut_ptr() as u64, b, c);
+            let (s, e, fo): (usize, usize, u64);
+            let cw: u16 = 0x37f;
+            let mut saved: u16 = 0;
+            unsafe {
+                core::arch::asm!(
+                    "fnstcw word ptr [{saved}]",
+                    "fldcw word ptr [{cw}]",
+                    "lea {s}, [rip + 2f]",
+                    "lea {e}, [rip + 3f]",
+                    "push {fi}",
+                    "popfq",
+                    "2:",
+                    concat!($($ins, "\n"),+),
+                    "3:",
+                    "pushfq",
+                    "pop {fo}",
+                    "fnclex",
+                    "fldcw word ptr [{saved}]",
+                    saved = in(reg) &raw mut saved,
+                    cw = in(reg) &raw const cw,
+                    s = out(reg) s,
+                    e = out(reg) e,
+                    fi = in(reg) fl,
+                    fo = lateout(reg) fo,
+                    inout("rax") ra,
+                    inout("rcx") rc,
+                    inout("rdx") rd,
+                    out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+                    out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+                );
+            }
+            (Out { rax: ra, rcx: rc, rdx: rd, flags: fo }, s, e)
+        }
+        run as FNative
+    }};
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FInputs {
+    /// 80-bit values at 0 / 16 / 32: every pair of edge values, random ones
+    Values,
+    /// integers at 0 (and 80-bit values at 16 / 32)
+    Ints,
+    /// as `Values`, every combination of CF/PF/ZF in
+    Flags,
+    /// as `Values`, a control word with each rounding control at 32
+    Rounding,
+}
+
+struct FCase {
+    asm: &'static str,
+    f: FNative,
+    inputs: FInputs,
+    /// the flags compared (EFLAGS bits) and registers (`RAX | RCX | RDX`, rax with `rax_mask`)
+    flags: u64,
+    regs: u8,
+    rax_mask: u64,
+}
+
+macro_rules! fcase {
+    ($inputs:expr, $flags:expr, $regs:expr, $($ins:expr),+ $(,)?) => {
+        FCase { asm: concat!($($ins, "; "),+), f: fpu!($($ins),+), inputs: $inputs, flags: $flags, regs: $regs, rax_mask: u64::MAX }
+    };
+}
+
+/// A value of the 80-bit format: (sign+exponent, significand).
+fn f80(se: u16, m: u64) -> [u8; 10] {
+    let mut b = [0u8; 10];
+    b[..8].copy_from_slice(&m.to_le_bytes());
+    b[8..].copy_from_slice(&se.to_le_bytes());
+    b
+}
+
+/// The double `x` in the 80-bit format (exact; computed by the CPU).
+fn ext(x: f64) -> [u8; 10] {
+    let mut o = [0u8; 10];
+    unsafe {
+        core::arch::asm!(
+            "fld qword ptr [{i}]",
+            "fstp tbyte ptr [{o}]",
+            i = in(reg) &raw const x,
+            o = in(reg) o.as_mut_ptr(),
+            out("st(0)") _, out("st(1)") _, out("st(2)") _, out("st(3)") _,
+            out("st(4)") _, out("st(5)") _, out("st(6)") _, out("st(7)") _,
+        );
+    }
+    o
+}
+
+fn f80_values(rng: &mut Rng) -> Vec<[u8; 10]> {
+    let mut v: Vec<[u8; 10]> = [
+        0.0f64, -0.0, 1.0, -1.0, 0.5, 2.5, -2.5, 3.75, 1e30, -1e-30, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1e-310,
+        2147483647.0, -2147483648.0, 32767.5, -32768.5, 1e19, -9.3e18, 0.49999999999999994,
+    ]
+    .iter()
+    .map(|&x| ext(x))
+    .collect();
+    v.extend([
+        f80(0x7ffe, u64::MAX),                 // the largest finite
+        f80(0x0001, 1 << 63),                  // the smallest normal
+        f80(0x0000, 1),                        // a denormal
+        f80(0x0000, 1 << 63 | 5),              // a pseudo-denormal
+        f80(0x3fff, 0x4000_0000_0000_0000),    // an unnormal (invalid)
+        f80(0x7fff, 0x4000_0000_0000_0001),    // a pseudo-NaN (invalid)
+        f80(0x7fff, 0x8000_0000_0000_0001),    // a signalling NaN
+        f80(0xffff, 0xc000_0000_dead_beef),    // a negative quiet NaN with a payload
+        f80(0x3fff, 1 << 63 | 1),              // 1 + 2^-63
+        f80(0x403e, 0xffff_ffff_ffff_fffe),    // near 2^64
+        f80(0xc03d, 0x8000_0000_0000_0001),    // near -2^62
+    ]);
+    for _ in 0..16 {
+        let se = (0x3fff - 70 + (rng.next() % 140) as u16) | if rng.next().is_multiple_of(2) { 0x8000 } else { 0 };
+        v.push(f80(se, rng.next() | 1 << 63));
+    }
+    v
+}
+
+fn finputs(kind: FInputs, rng: &mut Rng) -> Vec<([u8; FBUF], u64, u64, u64)> {
+    let vals = f80_values(rng);
+    let mut out = Vec::new();
+    let put = |buf: &mut [u8; FBUF], at: usize, v: &[u8]| buf[at..at + v.len()].copy_from_slice(v);
+    match kind {
+        FInputs::Values | FInputs::Flags | FInputs::Rounding => {
+            for (i, a) in vals.iter().enumerate() {
+                for (j, b) in vals.iter().enumerate() {
+                    let mut buf = [0u8; FBUF];
+                    put(&mut buf, 0, a);
+                    put(&mut buf, 16, b);
+                    put(&mut buf, 32, &vals[(i * 7 + j * 3) % vals.len()]);
+                    let fl = match kind {
+                        FInputs::Flags => 0x2 | [0, CF, PF, ZF, CF | ZF, CF | PF | ZF, PF | ZF, CF | PF][(i + j) % 8],
+                        _ => flag_inputs(rng)[(i + j) % 3],
+                    };
+                    if kind == FInputs::Rounding {
+                        put(&mut buf, 32, &(0x37fu16 | ((((i + j) % 4) as u16) << 10)).to_le_bytes());
+                    }
+                    out.push((buf, rng.value(), rng.value(), fl));
+                }
+            }
+        }
+        FInputs::Ints => {
+            for &a in &EDGE {
+                for b in vals.iter().take(12) {
+                    let mut buf = [0u8; FBUF];
+                    put(&mut buf, 0, &a.to_le_bytes());
+                    put(&mut buf, 16, b);
+                    put(&mut buf, 32, &vals[(a % 7) as usize]);
+                    out.push((buf, rng.value(), rng.value(), 0x2));
+                }
+            }
+            for _ in 0..200 {
+                let mut buf = [0u8; FBUF];
+                put(&mut buf, 0, &rng.value().to_le_bytes());
+                put(&mut buf, 16, &vals[(rng.next() % vals.len() as u64) as usize]);
+                out.push((buf, rng.value(), rng.value(), 0x2));
+            }
+        }
+    }
+    out
+}
+
+/// Lift the code between `start` and `end` as a range from a function's entry (the x87 stack
+/// empty), as the decompiler does.
+fn lift_range(start: usize, end: usize) -> (Vec<PcodeOp>, String) {
+    let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) }.to_vec();
+    let mut mem = Memory::new(SpaceId(1), Endian::Little);
+    mem.add_block(MemoryBlock {
+        name: ".text".into(),
+        start: start as u64,
+        size: bytes.len() as u64,
+        flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+        data: Some(Arc::from(bytes.as_slice())),
+    });
+    let lifted = X86Lifter::new_64().lift_range(&mem, start as u64, 64).expect("lift");
+    let last = lifted.last().map(|l| l.address + u64::from(l.length));
+    assert_eq!(last, Some(end as u64), "{bytes:02x?}: instruction boundaries");
+    let text = lifted.iter().map(|l| l.mnemonic.clone()).collect::<Vec<_>>().join("; ");
+    (lifted.into_iter().flat_map(|l| l.ops).collect(), text)
+}
+
+fn femulate(ops: &[PcodeOp], buf: &[u8; FBUF], b: u64, c: u64, fl: u64) -> (Out, [u8; FBUF]) {
+    let mut emu = Emulator::new();
+    emu.state.write_register(0x00, 8, FBUF_AT);
+    emu.state.write_register(0x08, 8, b);
+    emu.state.write_register(0x10, 8, c);
+    // the control word at a function's entry
+    emu.state.write_register(0x10a0, 2, 0x37f);
+    for (bit, off) in FLAGS {
+        emu.state.write_register(off, 1, u64::from(fl & bit != 0));
+    }
+    for (i, chunk) in buf.chunks(8).enumerate() {
+        emu.state.write_memory(FBUF_AT + 8 * i as u64, 8, u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    if let Err(e) = emu.execute_ops(ops) {
+        panic!("emulator: {e:?}");
+    }
+    let mut flags = 0x2;
+    for (bit, off) in FLAGS {
+        if emu.state.read_register(off, 1) != 0 {
+            flags |= bit;
+        }
+    }
+    let mut out = [0u8; FBUF];
+    for i in 0..FBUF / 8 {
+        out[8 * i..8 * i + 8].copy_from_slice(&emu.state.read_memory(FBUF_AT + 8 * i as u64, 8).to_le_bytes());
+    }
+    let r = |off| emu.state.read_register(off, 8);
+    (Out { rax: r(0x00), rcx: r(0x08), rdx: r(0x10), flags }, out)
+}
+
+fn check_fpu(cases: &[FCase]) {
+    let mut failures = Vec::new();
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for case in cases {
+        let mut probe = [0u8; FBUF];
+        let (_, s, e) = (case.f)(&mut probe, 0, 0, 0x2);
+        let (ops, mnemonic) = lift_range(s, e);
+        if ops.iter().any(|o| o.opcode == reargo_core::pcode::OpCode::CallOther && o.output.is_none()) {
+            failures.push(format!("{} [{}]: not lifted", case.asm, mnemonic));
+            continue;
+        }
+        let mut shown = 0;
+        for (input, b, c, fl) in finputs(case.inputs, &mut rng) {
+            let mut native = input;
+            let (cpu, _, _) = (case.f)(&mut native, b, c, fl);
+            let (emu, buf) = femulate(&ops, &input, b, c, fl);
+            let mut bad = Vec::new();
+            if native[48..] != buf[48..] {
+                bad.push(format!("result cpu {:02x?} lifted {:02x?}", &native[48..74], &buf[48..74]));
+            }
+            let diff = (cpu.flags ^ emu.flags) & case.flags;
+            if diff != 0 {
+                bad.push(format!("flags {} cpu {} lifted {}", flag_names(diff), flag_names(cpu.flags & diff), flag_names(emu.flags & diff)));
+            }
+            for (bit, name, x, y, mask) in [
+                (RAX, "rax", cpu.rax, emu.rax, case.rax_mask),
+                (RCX, "rcx", cpu.rcx, emu.rcx, u64::MAX),
+                (RDX, "rdx", cpu.rdx, emu.rdx, u64::MAX),
+            ] {
+                if case.regs & bit != 0 && (x ^ y) & mask != 0 {
+                    bad.push(format!("{name} cpu {x:#x} lifted {y:#x}"));
+                }
+            }
+            if !bad.is_empty() {
+                if shown < 3 {
+                    failures.push(format!(
+                        "{} [{}] in {:02x?} {:02x?} b={b:#x} flags={}: {}",
+                        case.asm,
+                        mnemonic,
+                        &input[..10],
+                        &input[16..26],
+                        flag_names(fl),
+                        bad.join(", ")
+                    ));
+                }
+                shown += 1;
+            }
+        }
+        if shown > 3 {
+            failures.push(format!("{}: {} mismatching inputs in all", case.asm, shown));
+        }
+    }
+    assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+}
+
+const V: FInputs = FInputs::Values;
+
+/// WS89: x87 loads, stores, conversions and arithmetic in every operand form, checked as a
+/// sequence lifted from an empty stack (the stack slots are named from its bottom).
+#[test]
+fn x87_arithmetic_matches_the_cpu() {
+    let cases = vec![
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fst qword ptr [rax+48]", "fstp dword ptr [rax+56]"),
+        fcase!(V, 0, 0, "fld qword ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld dword ptr [rax+16]", "fstp tbyte ptr [rax+48]"),
+        fcase!(FInputs::Ints, 0, 0, "fild word ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(FInputs::Ints, 0, 0, "fild dword ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(FInputs::Ints, 0, 0, "fild qword ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fldz", "fld1", "fldpi", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]", "fstp tbyte ptr [rax+80]"),
+        fcase!(V, 0, 0, "fldl2e", "fldl2t", "fldlg2", "fldln2", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]", "fstp tbyte ptr [rax+80]", "fstp tbyte ptr [rax+80]"),
+        fcase!(V, 0, 0, "fldln2", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "faddp st(1), st", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fsubp st(1), st", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fsubrp st(1), st", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fmulp st(1), st", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fdivp st(1), st", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fdivrp st(1), st", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fsub st, st(1)", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fsub st(1), st", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fsubr st, st(1)", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fsubr st(1), st", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fdiv st, st(1)", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fdivr st(1), st", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fadd qword ptr [rax+16]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fsub dword ptr [rax+16]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fsubr qword ptr [rax+16]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fmul dword ptr [rax+16]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fdivr dword ptr [rax+16]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax+16]", "fiadd dword ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax+16]", "fisubr word ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax+16]", "fidiv dword ptr [rax]", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fchs", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fabs", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fsqrt", "fstp tbyte ptr [rax+48]"),
+        // the stack moves: copies, exchanges, stores into the stack
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fxch st(1)", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax+32]", "fxch st(2)", "fsubp st(1), st", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fld st(1)", "fmul st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(1)", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fst st(1)", "fdivp st(1), st", "fstp tbyte ptr [rax+48]"),
+        fcase!(V, 0, 0, "fldz", "fldz", "fld tbyte ptr [rax]", "fxch st(2)", "fadd qword ptr [rax+16]", "fstp st(1)", "fstp tbyte ptr [rax+48]", "fstp tbyte ptr [rax+64]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax+32]", "faddp st(2), st", "fmulp st(1), st", "fstp tbyte ptr [rax+48]"),
+    ];
+    check_fpu(&cases);
+}
+
+/// WS89: `fist` / `fistp` round as the control word says — the default (to nearest), the
+/// truncation idiom around `fistp` (its rounding followed through memory statically), and a
+/// control word loaded from anywhere (`fist(x, fpucw)`); `fisttp` truncates.
+#[test]
+fn x87_integer_stores_match_the_cpu() {
+    let cases = vec![
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fistp word ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fist dword ptr [rax+48]", "fistp qword ptr [rax+56]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fisttp qword ptr [rax+48]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fisttp word ptr [rax+48]"),
+        fcase!(V, 0, RCX, "fld tbyte ptr [rax]", "fnstcw word ptr [rax+64]", "movzx ecx, word ptr [rax+64]", "or ecx, 0xc00", "mov word ptr [rax+66], cx", "fldcw word ptr [rax+66]", "fistp qword ptr [rax+48]", "fldcw word ptr [rax+64]", "fld tbyte ptr [rax+16]", "fistp qword ptr [rax+56]"),
+        fcase!(V, 0, 0, "fld tbyte ptr [rax]", "fnstcw word ptr [rax+64]", "mov word ptr [rax+66], 0x77f", "fldcw word ptr [rax+66]", "fistp dword ptr [rax+48]", "fldcw word ptr [rax+64]"),
+        fcase!(FInputs::Rounding, 0, 0, "fld tbyte ptr [rax]", "fldcw word ptr [rax+32]", "fist dword ptr [rax+48]", "fistp qword ptr [rax+56]"),
+    ];
+    check_fpu(&cases);
+}
+
+/// WS89: compares — `fucomi` / `fcomi` set ZF / PF / CF (OF, SF cleared), `fcom` / `fucom` /
+/// `ftst` the condition codes that `fnstsw ax` (with TOP) and `sahf` read — and `fcmov`.
+#[test]
+fn x87_compares_match_the_cpu() {
+    let f = FInputs::Flags;
+    let fl = CF | PF | ZF | SF | OF;
+    let mut cases = vec![
+        fcase!(V, fl, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fucomi st, st(1)", "fstp st(0)", "fstp st(0)"),
+        fcase!(V, fl, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcomi st, st(1)", "fstp st(0)", "fstp st(0)"),
+        fcase!(V, fl, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fucomip st, st(1)", "fstp st(0)"),
+        fcase!(V, fl, 0, "fld tbyte ptr [rax]", "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax+32]", "fcomip st, st(2)", "fstp st(0)", "fstp st(0)"),
+        fcase!(V, CF | PF | ZF | SF, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fucompp", "fnstsw ax", "sahf"),
+        fcase!(V, CF | PF | ZF | SF, 0, "fld tbyte ptr [rax]", "fcomp qword ptr [rax+16]", "fnstsw ax", "sahf"),
+        fcase!(V, CF | PF | ZF | SF, 0, "fld tbyte ptr [rax]", "ftst", "fnstsw ax", "fstp st(0)", "sahf"),
+        fcase!(V, CF | PF | ZF | SF, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fucom st(1)", "fnstsw ax", "fstp st(0)", "fstp st(0)", "sahf"),
+        fcase!(V, CF | PF | ZF | SF, 0, "fld tbyte ptr [rax+16]", "fild word ptr [rax]", "ficomp dword ptr [rax+32]", "fnstsw ax", "fstp st(0)", "sahf"),
+    ];
+    // the status word itself: C0 / C1 / C2 / C3 and TOP (not the exception flags)
+    let mut sw = fcase!(V, 0, RAX, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fucom st(1)", "fnstsw ax", "fstp st(0)", "fstp st(0)");
+    sw.rax_mask = 0x7f00;
+    cases.push(sw);
+    // (TOP only: no compare set the condition codes)
+    let mut sw = fcase!(V, 0, RAX, "fld tbyte ptr [rax+16]", "fnstsw ax", "fstp st(0)");
+    sw.rax_mask = 0x3800;
+    cases.push(sw);
+    cases.extend([
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmovb st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmove st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmovbe st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmovu st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmovnb st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmovne st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmovnbe st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        fcase!(f, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fcmovnu st, st(1)", "fstp tbyte ptr [rax+48]", "fstp st(0)"),
+        // as BDS 0x3b1c4a8 does it: compare, then pick 0 or the bound
+        fcase!(V, 0, 0, "fld tbyte ptr [rax+16]", "fld tbyte ptr [rax]", "fucomi st, st(1)", "fldz", "fcmovnb st, st(2)", "fstp st(2)", "fsubp st(1), st", "fstp tbyte ptr [rax+48]"),
+    ]);
+    check_fpu(&cases);
+}

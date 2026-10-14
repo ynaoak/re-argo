@@ -359,6 +359,12 @@ impl Emulator {
                 let out = op.output.as_ref().ok_or_else(|| EmulatorError::MissingOutput("PIECE".into()))?;
                 let hi_vn = op.input(0).ok_or_else(|| EmulatorError::MissingInput { op: "PIECE".into(), index: 0 })?;
                 let lo_vn = op.input(1).ok_or_else(|| EmulatorError::MissingInput { op: "PIECE".into(), index: 1 })?;
+                // (wide: an 80-bit x87 constant is PIECE(sign+exponent, significand), WS89)
+                if out.size > 8 && lo_vn.size < 16 {
+                    let v = self.state.read_wide(hi_vn) << (lo_vn.size * 8) | self.state.read_wide(lo_vn);
+                    self.state.write_wide(out, v);
+                    return Ok(());
+                }
                 let hi = self.state.read_varnode(hi_vn);
                 let lo = self.state.read_varnode(lo_vn);
                 // Shift by 64 would panic in debug; if lo already fills the
