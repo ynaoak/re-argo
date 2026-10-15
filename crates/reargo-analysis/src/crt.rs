@@ -56,19 +56,22 @@ impl Analyzer for CrtAnalyzer {
             });
         }
 
+        let is_lsm = |n: &str| {
+            let n = n.strip_suffix("@plt").unwrap_or(n);
+            n.split('@').next() == Some("__libc_start_main")
+        };
+        // Direct-call targets: PLT stubs / symbols. An import with no stub
+        // sits at address 0, which is no call target.
         let lsm_addrs: std::collections::BTreeSet<u64> = program
             .symbol_table
             .iter()
-            .filter(|s| {
-                let n = s.name.strip_suffix("@plt").unwrap_or(&s.name);
-                n == "__libc_start_main"
-                    || n == "__libc_start_main@GLIBC_2.34"
-                    || n == "__libc_start_main@GLIBC_2.2.5"
-            })
+            .filter(|s| s.address != 0 && is_lsm(&s.name))
             .map(|s| s.address)
             .collect();
+        // Indirect-call slots: GOT entries a dynamic relocation binds to it.
+        let lsm_slots = lsm_got_slots(&program.info.dynamic.got_slots, is_lsm);
 
-        if lsm_addrs.is_empty() {
+        if lsm_addrs.is_empty() && lsm_slots.is_empty() {
             return Ok(AnalysisResult {
                 analyzer_name: self.name().into(),
                 functions_found: 0,
@@ -84,10 +87,15 @@ impl Analyzer for CrtAnalyzer {
         // (arg1=rsi=argc, arg2=rdx=argv come from _start's prologue.)
         let mut recovered = 0usize;
         for site in &sites {
-            let Some(target) = site.call_target else {
-                continue;
+            let is_lsm_call = match site.call_target {
+                Some(target) => lsm_addrs.contains(&target),
+                None => {
+                    !lsm_slots.is_empty()
+                        && indirect_call_slot(program, site.call_site)
+                            .is_some_and(|slot| lsm_slots.contains(&slot))
+                }
             };
-            if !lsm_addrs.contains(&target) {
+            if !is_lsm_call {
                 continue;
             }
             for (i, name) in [(0, "main"), (3, "init"), (4, "fini")] {
@@ -106,6 +114,40 @@ impl Analyzer for CrtAnalyzer {
             references_found: 0,
             instructions_decoded: 0,
         })
+    }
+}
+
+/// The GOT slot addresses bound to `__libc_start_main` (any version suffix).
+fn lsm_got_slots(
+    got_slots: &[(u64, String)],
+    is_lsm: impl Fn(&str) -> bool,
+) -> std::collections::BTreeSet<u64> {
+    got_slots
+        .iter()
+        .filter(|(_, n)| is_lsm(n))
+        .map(|(a, _)| *a)
+        .collect()
+}
+
+/// For the instruction at `addr`, if it is `call qword ptr [rip+disp]` or
+/// `call qword ptr [disp32]`, the memory slot it calls through.
+fn indirect_call_slot(program: &Program, addr: u64) -> Option<u64> {
+    use iced_x86::{Code, Decoder, DecoderOptions, OpKind, Register};
+    let mut buf = [0u8; 15];
+    let n = (1..=15usize)
+        .rev()
+        .find(|&n| program.info.memory.read_bytes(addr, &mut buf[..n]).is_ok())?;
+    let insn = Decoder::with_ip(64, &buf[..n], addr, DecoderOptions::NONE).decode();
+    if insn.code() != Code::Call_rm64 || insn.op0_kind() != OpKind::Memory {
+        return None;
+    }
+    if insn.memory_index() != Register::None {
+        return None;
+    }
+    match insn.memory_base() {
+        // iced resolves rip-relative operands to an absolute address
+        Register::RIP | Register::None => Some(insn.memory_displacement64()),
+        _ => None,
     }
 }
 
@@ -151,6 +193,8 @@ fn rename_or_create(program: &mut Program, addr: u64, name: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::lsm_got_slots;
+
     // CRT recovery depends on a full Program load — covered end-to-end
     // by the test binaries the harness already analyses. The pure
     // helper here is `rename_or_create` whose behaviour collapses to
@@ -165,5 +209,19 @@ mod tests {
         let name = "do_something";
         assert!(!name.starts_with("FUN_"));
         assert_ne!(name, "main");
+    }
+
+    #[test]
+    fn got_slots_resolve_only_libc_start_main() {
+        let relocs = vec![
+            (0x3fc0, "__libc_start_main".to_string()),
+            (0x3fc8, "__libc_start_main@GLIBC_2.34".to_string()),
+            (0x3fd0, "puts".to_string()),
+        ];
+        let is_lsm = |n: &str| n.split('@').next() == Some("__libc_start_main");
+        let slots = lsm_got_slots(&relocs, is_lsm);
+        assert!(slots.contains(&0x3fc0) && slots.contains(&0x3fc8));
+        assert!(!slots.contains(&0x3fd0));
+        assert!(lsm_got_slots(&[(0x10, "puts".into())], is_lsm).is_empty());
     }
 }
