@@ -885,7 +885,13 @@ struct RetEvidence {
     stored: bool,
     /// The direct callees whose results it is (WS86).
     callees: Vec<u64>,
+    /// The value is an argument register's value on entry (WS92): `mov rax, rdi; ret`.
+    param: bool,
 }
+
+/// The integer argument registers of the x86-64 conventions (System V and Microsoft):
+/// `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`.
+const ARG_REGISTERS: [u64; 6] = [0x38, 0x30, 0x10, 0x08, 0x80, 0x88];
 
 /// Most callees whose callers [`choose_return_register`] asks about one function's result.
 const MAX_TAIL_CALLEES: usize = 4;
@@ -899,7 +905,10 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
     }
     seen.push(v);
     let vn = &ssa.varnodes[v as usize];
-    let Some(d) = vn.def_op else { return RetEvidence::default() };
+    let Some(d) = vn.def_op else {
+        let param = vn.data.space == reargo_core::address::SpaceId::REGISTER && vn.data.size == 8 && ARG_REGISTERS.contains(&vn.data.offset);
+        return RetEvidence { param, ..RetEvidence::default() };
+    };
     let op = &ssa.ops[d];
     let reg = |x: crate::ssa::VarId| ssa.varnodes[x as usize].data.space == reargo_core::address::SpaceId::REGISTER;
     match op.opcode {
@@ -940,6 +949,12 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
             src.size == vn.data.size && src.offset != vn.data.offset
         } => {
             let e = return_evidence(ssa, op.inputs[0], seen);
+            if e.param {
+                // WS92: the function copied an argument into the return register (`mov rax,
+                // rbx` with `rbx = rdi`: a struct returned in memory returns its hidden
+                // pointer, `return this;`, `memcpy`'s `dst`) — it wrote the result itself
+                return RetEvidence { written: true, addr: op.address, size: vn.data.size, ..RetEvidence::default() };
+            }
             RetEvidence { addr: e.addr.max(op.address), ..e }
         }
         _ => RetEvidence {
@@ -949,6 +964,7 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
             call_result: false,
             stored: vn.uses.iter().any(|&u| ssa.ops[u].opcode == OpCode::Store && ssa.ops[u].inputs.get(2) == Some(&v)),
             callees: Vec::new(),
+            param: false,
         },
     }
 }
@@ -2097,6 +2113,30 @@ mod tests {
         ]);
         assert!(c.contains("double f(") || c.contains("float f("), "{c}");
         assert!(c.contains("return xmm0"), "{c}");
+    }
+
+    /// WS92: a function returning a struct in memory returns its hidden pointer (`mov rax,
+    /// rbx` with `rbx = rdi`), even when the last value left in `xmm0` is a float callee's
+    /// result (BDS 0x43fadc0 printed `double …` / `return xmm0;`).
+    #[test]
+    fn struct_returned_in_memory_returns_its_pointer() {
+        let code = [
+            0x53, // 0x1000 push rbx
+            0x48, 0x89, 0xfb, // mov rbx, rdi
+            0x66, 0x0f, 0xef, 0xc0, // pxor xmm0, xmm0
+            0x0f, 0x11, 0x47, 0x08, // movups [rdi+8], xmm0
+            0xe8, 0x0b, 0x00, 0x00, 0x00, // call 0x101c
+            0x48, 0x89, 0xd8, // mov rax, rbx
+            0x5b, // pop rbx
+            0xc3, // ret
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad to 0x101c
+            0xf3, 0x0f, 0x2a, 0xc7, // 0x101c cvtsi2ss xmm0, edi
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("uint64_t f("), "{c}");
+        assert!(c.contains("return rax;") || c.contains("return rbx;") || c.contains("return rdi;"), "{c}");
+        assert!(!c.contains("return xmm0"), "{c}");
     }
 
     /// An integer written after the last float write is the return value.
