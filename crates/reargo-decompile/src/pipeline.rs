@@ -4162,4 +4162,14 @@ mod tests {
         let r = rust_of(&[0x39, 0xf7, 0x19, 0xc0, 0xc3]);
         assert!(r.contains("eax = 0.wrapping_sub((((edi < esi) as u8) as u32));"), "{r}");
     }
+
+    /// WS90: the low byte of a zero-extended byte is the byte (`(uint8_t)((uint32_t)*(uint8_t*)p)`
+    /// printed in a folded condition).
+    #[test]
+    fn low_bytes_of_a_zero_extension_are_the_value() {
+        // dec dword [rdi]; jne L; movzx ecx, byte [rdi+4]; and cl, 0xf0; cmp cl, 0x10; jne L; mov eax, 1; ret; L: xor eax, eax; ret
+        let c = c_of(&[0xff, 0x0f, 0x75, 0x12, 0x0f, 0xb6, 0x4f, 0x04, 0x80, 0xe1, 0xf0, 0x80, 0xf9, 0x10, 0x75, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
+        assert!(c.contains("(*(uint8_t*)(rdi + 4)) & 0xf0") || c.contains("*(uint8_t*)(rdi + 4) & 0xf0"), "{c}");
+        assert!(!c.contains("(uint8_t)((uint32_t)"), "{c}");
+    }
 }

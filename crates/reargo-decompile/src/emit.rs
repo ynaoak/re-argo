@@ -969,8 +969,18 @@ impl<'a> CEmitter<'a> {
                 }
                 let a = self.input_expr(func, op, 0);
                 let k = &func.varnodes[op.inputs[1] as usize].data;
-                let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                let dst_size = func.varnodes[op.output.unwrap() as usize].data.size;
+                let dst_ty = size_to_type(dst_size);
                 if k.space == SpaceId::CONST && k.offset == 0 {
+                    // WS90: the low bytes of a zero extension are what it extended:
+                    // `(uint8_t)((uint32_t)*(uint8_t*)p)` is `*(uint8_t*)p`
+                    if let Some((w, false, y)) = int_cast(strip_outer_parens(&a))
+                        && w >= dst_size
+                        && let Some((k, false)) = text_int_type(y)
+                        && k <= dst_size
+                    {
+                        return Some(if k == dst_size { format!("{dst} = {y};") } else { format!("{dst} = ({dst_ty}){y};") });
+                    }
                     Some(format!("{} = ({}){};", dst, dst_ty, a))
                 } else if k.space == SpaceId::CONST {
                     Some(format!("{} = ({})({} >> {});", dst, dst_ty, a, k.offset * 8))
@@ -1957,6 +1967,12 @@ pub(crate) fn int_cast(s: &str) -> Option<(u32, bool, &str)> {
     (!operand.is_empty() && unary).then_some((w, signed, operand))
 }
 
+/// The integer type of a cast covering the whole text or a dereference (`*(uint8_t*)p`):
+/// `(width, signed)` (WS90).
+fn text_int_type(s: &str) -> Option<(u32, bool)> {
+    int_cast(s).map(|(k, signed, _)| (k, signed)).or_else(|| s.strip_prefix("*(").filter(|_| is_deref(s)).and_then(|r| int_type_name(r.split_once("*)")?.0)))
+}
+
 /// `(uintA_t)(uintB_t)…x` with the casts made minimal (WS90): an unsigned cast whose operand
 /// is an unsigned cast to a type no wider is the identity on its value, so it goes —
 /// `(uint32_t)(uint8_t)x` stays, `(uint32_t)(uint32_t)x` and `(uint32_t)(uint16_t)(uint8_t)x`
@@ -1965,9 +1981,7 @@ pub(crate) fn int_cast(s: &str) -> Option<(u32, bool, &str)> {
 pub(crate) fn drop_widening_casts(s: &str) -> String {
     let Some((w, false, operand)) = int_cast(s) else { return s.to_string() };
     let inner = drop_widening_casts(operand);
-    // the operand's own unsigned type: a cast or a dereference (`*(uint8_t*)p`)
-    let deref = || inner.strip_prefix("*(").filter(|_| is_deref(&inner)).and_then(|r| int_type_name(r.split_once("*)")?.0));
-    match int_cast(&inner).map(|(k, s, _)| (k, s)).or_else(deref) {
+    match text_int_type(&inner) {
         // (uintW)(uintK)y with K <= W: the outer cast changes nothing
         Some((k, false)) if k <= w => inner,
         _ => format!("({}){}", size_to_type(w), inner),
