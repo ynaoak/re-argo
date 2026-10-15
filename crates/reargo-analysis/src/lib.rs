@@ -36,6 +36,7 @@ pub mod filler;
 pub mod fingerprint;
 pub mod floss_lite;
 pub mod format_varargs;
+pub mod func_lift;
 pub mod got_annotate;
 pub mod hot;
 pub mod immstr;

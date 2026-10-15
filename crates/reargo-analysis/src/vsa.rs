@@ -35,6 +35,9 @@ use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
 use reargo_lift::{LiftedInstruction, PcodeLift};
 use reargo_program::Program;
+use rayon::prelude::*;
+
+use crate::func_lift::{function_jobs, lift_function};
 
 /// Set → Range widening threshold. A `Set` join that crosses this
 /// size collapses to a Range envelope to keep the per-block state
@@ -117,26 +120,56 @@ pub type VsaResult = BTreeMap<u64, BTreeMap<u64, AbstractValue>>;
 type State = BTreeMap<(SpaceId, u64), AbstractValue>;
 
 pub fn run_vsa(lifter: &dyn PcodeLift, program: &Program) -> VsaResult {
+    // Lift + propagate each function in parallel (a function's
+    // propagation reads only its own lift), then merge the snapshots
+    // in listing order, exactly as the sequential walk would.
+    let per_func: Vec<Option<CallSnapshots>> = function_jobs(program)
+        .par_iter()
+        .map(|&(entry, max)| {
+            lift_function(lifter, program, entry, max).map(|insns| function_snapshots(&insns))
+        })
+        .collect();
     let mut out = VsaResult::new();
-    for func in program.listing.functions() {
-        let max = func
-            .body
-            .ranges()
-            .map(|r| r.size as usize)
-            .sum::<usize>()
-            .max(500);
-        let Ok(lifted) = lifter.lift_range(&program.info.memory, func.entry_point, max) else {
-            continue;
-        };
-        if lifted.is_empty() {
-            continue;
-        }
-        propagate(&lifted, &mut out);
+    for snaps in per_func.into_iter().flatten() {
+        merge_snapshots(&mut out, snaps);
     }
     out
 }
 
-fn propagate(insns: &[LiftedInstruction], out: &mut VsaResult) {
+/// One function's call snapshots, in the order its worklist records
+/// them (a site may appear once per visit).
+pub type CallSnapshots = Vec<(u64, BTreeMap<u64, AbstractValue>)>;
+
+/// Propagate one function's lifted instructions (empty for an empty
+/// lift). Merge the results of every function, in listing order,
+/// with [`merge_snapshots`] to get [`run_vsa`].
+pub fn function_snapshots(insns: &[LiftedInstruction]) -> CallSnapshots {
+    if insns.is_empty() {
+        return Vec::new();
+    }
+    propagate(insns)
+}
+
+/// Fold one function's call snapshots into the program-wide map.
+pub fn merge_snapshots(out: &mut VsaResult, snaps: CallSnapshots) {
+    for (addr, regs) in snaps {
+        let entry = out.entry(addr).or_default();
+        if entry.is_empty() {
+            *entry = regs;
+        } else {
+            let mut merged: BTreeMap<u64, AbstractValue> = BTreeMap::new();
+            for (k, v) in entry.iter() {
+                if let Some(other) = regs.get(k) {
+                    merged.insert(*k, v.join(other));
+                }
+            }
+            *entry = merged;
+        }
+    }
+}
+
+fn propagate(insns: &[LiftedInstruction]) -> CallSnapshots {
+    let mut snaps: CallSnapshots = Vec::new();
     let mut block_starts: BTreeSet<u64> = BTreeSet::new();
     block_starts.insert(insns[0].address);
     let mut prev_terminator = false;
@@ -164,12 +197,11 @@ fn propagate(insns: &[LiftedInstruction], out: &mut VsaResult) {
     }
     let starts_vec: Vec<u64> = block_starts.iter().copied().collect();
     let block_of = |addr: u64| -> u64 {
-        starts_vec
-            .iter()
-            .rev()
-            .find(|&&s| s <= addr)
-            .copied()
-            .unwrap_or(addr)
+        // Largest start ≤ addr (`starts_vec` is sorted).
+        match starts_vec.partition_point(|&s| s <= addr) {
+            0 => addr,
+            i => starts_vec[i - 1],
+        }
     };
 
     // Build pred map.
@@ -263,8 +295,7 @@ fn propagate(insns: &[LiftedInstruction], out: &mut VsaResult) {
         }
 
         let block_end = starts_vec
-            .iter()
-            .find(|&&s| s > b)
+            .get(starts_vec.partition_point(|&s| s <= b))
             .copied()
             .unwrap_or(u64::MAX);
         let mut st = joined;
@@ -300,20 +331,7 @@ fn propagate(insns: &[LiftedInstruction], out: &mut VsaResult) {
                 }
             }
         }
-        for (addr, regs) in call_snaps {
-            let entry = out.entry(addr).or_default();
-            if entry.is_empty() {
-                *entry = regs;
-            } else {
-                let mut merged: BTreeMap<u64, AbstractValue> = BTreeMap::new();
-                for (k, v) in entry.iter() {
-                    if let Some(other) = regs.get(k) {
-                        merged.insert(*k, v.join(other));
-                    }
-                }
-                *entry = merged;
-            }
-        }
+        snaps.extend(call_snaps);
 
         let out_changed = out_st.get(&b) != Some(&st);
         if out_changed {
@@ -330,6 +348,7 @@ fn propagate(insns: &[LiftedInstruction], out: &mut VsaResult) {
             }
         }
     }
+    snaps
 }
 
 fn apply_copy(st: &mut State, op: &reargo_core::pcode::PcodeOp) {
@@ -415,6 +434,7 @@ fn join_states<'a>(states: impl Iterator<Item = &'a State>) -> State {
     }
     out
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -575,7 +595,7 @@ mod tests {
         };
 
         let mut result = VsaResult::new();
-        propagate(&[block_a, block_b], &mut result);
+        merge_snapshots(&mut result, propagate(&[block_a, block_b]));
 
         let snap = result.get(&0x2000).expect("call snapshot at 0x2000");
         let v = snap.get(&rdi_off).expect("rdi tracked across branch");
@@ -662,7 +682,7 @@ mod tests {
         };
 
         let mut result = VsaResult::new();
-        propagate(&[entry, fallthrough, taken, call_block], &mut result);
+        merge_snapshots(&mut result, propagate(&[entry, fallthrough, taken, call_block]));
 
         let snap = result.get(&0x3000).expect("call snapshot at 0x3000");
         let v = snap.get(&rdi_off).expect("rdi joined into call snapshot");

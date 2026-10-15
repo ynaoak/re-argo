@@ -33,6 +33,9 @@ use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
 use reargo_lift::{LiftedInstruction, PcodeLift};
 use reargo_program::Program;
+use rayon::prelude::*;
+
+use crate::func_lift::{function_jobs, lift_function};
 
 /// Constants observed on entry to each call instruction.
 /// Outer key = instruction address of the Call; inner key = REGISTER
@@ -45,34 +48,58 @@ pub type CallConstants = BTreeMap<u64, BTreeMap<u64, u64>>;
 /// but pathological irreducible CFGs still need a hard fence.
 const MAX_VISITS_PER_BLOCK: usize = 8;
 
+/// One function's call-site register snapshots, in the order its
+/// worklist records them (a site may appear once per visit).
+pub type CallSnapshots = Vec<(u64, BTreeMap<u64, u64>)>;
+
 /// Run multi-block constant propagation across every function the
 /// program knows about. Returns the merged map across functions.
 pub fn build_call_constants(lifter: &dyn PcodeLift, program: &Program) -> CallConstants {
+    // Lift + propagate each function in parallel (a function's
+    // propagation reads only its own lift), then merge the snapshots
+    // in listing order, exactly as the sequential walk would.
+    let per_func: Vec<Option<CallSnapshots>> = function_jobs(program)
+        .par_iter()
+        .map(|&(entry, max)| {
+            lift_function(lifter, program, entry, max).map(|insns| function_snapshots(&insns))
+        })
+        .collect();
     let mut out = CallConstants::new();
-    for func in program.listing.functions() {
-        let max = func
-            .body
-            .ranges()
-            .map(|r| r.size as usize)
-            .sum::<usize>()
-            .max(500);
-        let Ok(lifted) = lifter.lift_range(&program.info.memory, func.entry_point, max) else {
-            continue;
-        };
-        if lifted.is_empty() {
-            continue;
-        }
-        propagate_one(&lifted, &mut out);
+    for snaps in per_func.into_iter().flatten() {
+        merge_snapshots(&mut out, snaps);
     }
     out
+}
+
+/// Propagate one function's lifted instructions (empty for an empty
+/// lift). Merge the results of every function, in listing order,
+/// with [`merge_snapshots`] to get [`build_call_constants`].
+pub fn function_snapshots(insns: &[LiftedInstruction]) -> CallSnapshots {
+    propagate_one(insns)
+}
+
+/// Fold one function's call snapshots into the program-wide map.
+pub fn merge_snapshots(out: &mut CallConstants, snaps: CallSnapshots) {
+    for (addr, regs) in snaps {
+        let entry = out.entry(addr).or_default();
+        // Merge — keep only values that agree with what's already
+        // there (this is the same intersection rule we apply at block
+        // joins).
+        if entry.is_empty() {
+            *entry = regs;
+        } else {
+            entry.retain(|k, v| regs.get(k) == Some(v));
+        }
+    }
 }
 
 /// State at a P-code-op boundary: (space-id, offset) → constant.
 type State = BTreeMap<(SpaceId, u64), u64>;
 
-fn propagate_one(insns: &[LiftedInstruction], out: &mut CallConstants) {
+fn propagate_one(insns: &[LiftedInstruction]) -> CallSnapshots {
+    let mut snaps: CallSnapshots = Vec::new();
     if insns.is_empty() {
-        return;
+        return snaps;
     }
 
     // Build a flat `address -> index` map up front so we can walk
@@ -114,13 +141,11 @@ fn propagate_one(insns: &[LiftedInstruction], out: &mut CallConstants) {
     // The block ends at the next block-start (exclusive).
     let starts_vec: Vec<u64> = block_starts.iter().copied().collect();
     let block_of = |addr: u64| -> u64 {
-        // Largest start ≤ addr
-        starts_vec
-            .iter()
-            .rev()
-            .find(|&&s| s <= addr)
-            .copied()
-            .unwrap_or(addr)
+        // Largest start ≤ addr (`starts_vec` is sorted).
+        match starts_vec.partition_point(|&s| s <= addr) {
+            0 => addr,
+            i => starts_vec[i - 1],
+        }
     };
 
     // Predecessor map: block_start → set of predecessor block_starts.
@@ -215,8 +240,7 @@ fn propagate_one(insns: &[LiftedInstruction], out: &mut CallConstants) {
 
         // Walk the block's instructions to compute out.
         let block_end = starts_vec
-            .iter()
-            .find(|&&s| s > b)
+            .get(starts_vec.partition_point(|&s| s <= b))
             .copied()
             .unwrap_or(u64::MAX);
         let mut st = joined;
@@ -265,18 +289,8 @@ fn propagate_one(insns: &[LiftedInstruction], out: &mut CallConstants) {
                 }
             }
         }
-        // Record this block's call snapshots into the global map.
-        for (addr, regs) in block_call_consts {
-            let entry = out.entry(addr).or_default();
-            // Merge — keep only values that agree with what's
-            // already there (this is the same intersection rule
-            // we apply at block joins).
-            if entry.is_empty() {
-                *entry = regs;
-            } else {
-                entry.retain(|k, v| regs.get(k) == Some(v));
-            }
-        }
+        // Record this block's call snapshots (merged by the caller).
+        snaps.extend(block_call_consts);
 
         let out_changed = out_state.get(&b) != Some(&st);
         if out_changed {
@@ -293,6 +307,7 @@ fn propagate_one(insns: &[LiftedInstruction], out: &mut CallConstants) {
             }
         }
     }
+    snaps
 }
 
 fn apply_copy(st: &mut State, op: &reargo_core::pcode::PcodeOp) {
@@ -331,6 +346,7 @@ fn intersect_all<'a>(states: impl Iterator<Item = &'a State>) -> State {
     }
     out
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -400,7 +416,7 @@ mod tests {
             ],
         };
         let mut result = CallConstants::new();
-        propagate_one(&[block_a, block_b], &mut result);
+        merge_snapshots(&mut result, propagate_one(&[block_a, block_b]));
         let snap = result.get(&0x2000).expect("call snapshot");
         assert_eq!(snap.get(&rdi).copied(), Some(0xaa));
     }
@@ -446,7 +462,7 @@ mod tests {
             ],
         };
         let mut result = CallConstants::new();
-        propagate_one(&[entry, ft, taken, call], &mut result);
+        merge_snapshots(&mut result, propagate_one(&[entry, ft, taken, call]));
         let snap = result.get(&0x3000).expect("call snapshot");
         // Point-tracker drops the key entirely at the disagreement.
         assert!(snap.get(&rdi).is_none(), "got: {:?}", snap);
@@ -484,7 +500,7 @@ mod tests {
             ],
         };
         let mut result = CallConstants::new();
-        propagate_one(&[setup_and_call, second_call], &mut result);
+        merge_snapshots(&mut result, propagate_one(&[setup_and_call, second_call]));
 
         let first = result.get(&0x1000).expect("first call");
         assert_eq!(first.get(&rdi).copied(), Some(0xaa));

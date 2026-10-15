@@ -31,6 +31,9 @@ use reargo_program::Program;
 use rustc_hash::FxHashMap;
 
 use crate::analyzer::AnalysisError;
+use crate::func_lift::{function_jobs, lift_function};
+use rayon::prelude::*;
+use reargo_lift::LiftedInstruction;
 
 /// Calling-convention argument-register offsets for x86_64 SysV in
 /// declaration order: arg0..arg5 → RDI, RSI, RDX, RCX, R8, R9.
@@ -153,70 +156,103 @@ fn resolve_inner(
     if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
         return Ok(Vec::new());
     }
+    // Lift + walk every function in parallel; a walk reads only its
+    // own lift, so its call sites do not depend on the others.
+    let per_func: Vec<Option<Vec<CallSite>>> = function_jobs(program)
+        .par_iter()
+        .map(|&(entry, max)| {
+            let insns = lift_function(lifter, program, entry, max)?;
+            Some(walk_function(program, entry, &insns, summaries))
+        })
+        .collect();
+    Ok(dedup_sites(per_func.iter().flatten().map(Vec::as_slice)))
+}
 
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+/// Keep each call site once, in listing order: the first function to
+/// own a site keeps it.
+fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<CallSite> {
+    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     let mut out: Vec<CallSite> = Vec::new();
-
-    for func in program.listing.functions() {
-        let max_insns = func
-            .body
-            .ranges()
-            .map(|r| r.size as usize)
-            .sum::<usize>()
-            .max(500);
-        let Ok(lifted) = lifter.lift_range(&program.info.memory, func.entry_point, max_insns)
-        else {
-            continue;
-        };
-
-        let mut tracker = Tracker::new();
-        if let Some(summary) = summaries.get(&func.entry_point) {
-            tracker.seed_from_summary(summary);
+    for site in per_func.flatten() {
+        if seen.insert(site.call_site) {
+            out.push(site.clone());
         }
+    }
+    out
+}
 
-        for insn in &lifted {
-            for op in &insn.ops {
-                match op.opcode {
-                    OpCode::Call | OpCode::CallInd => {
-                        // Only record this call site if we're
-                        // actually walking the function that *owns*
-                        // it. Without this gate, an earlier
-                        // function whose lift_range bled past its
-                        // own body would record the call with
-                        // *its* tracker state (e.g. all
-                        // unresolved), and `seen` would block the
-                        // real owner from re-recording it with
-                        // the correct seeded state.
-                        let true_caller = program
-                            .listing
-                            .function_containing(insn.address)
-                            .map(|f| f.entry_point);
-                        let owns_this_call = true_caller == Some(func.entry_point);
-                        if owns_this_call && seen.insert(insn.address) {
-                            let target = direct_call_target(op);
-                            let args = X86_64_SYSV_ARG_REGS
-                                .iter()
-                                .map(|&(offset, name)| ResolvedArg {
-                                    reg_offset: offset,
-                                    reg_name: name,
-                                    value: tracker.const_regs.get(&offset).copied(),
-                                })
-                                .collect();
-                            out.push(CallSite {
-                                call_site: insn.address,
-                                caller_function: func.entry_point,
-                                call_target: target,
-                                args,
-                            });
-                        }
-                        tracker.clear_for_call();
+/// The call sites the function at `entry` owns, from its lifted
+/// instructions, in instruction order. With an empty `summaries` this
+/// is the intra-function (round 0) walk.
+pub fn walk_function(
+    program: &Program,
+    entry: u64,
+    insns: &[LiftedInstruction],
+    summaries: &ParamSummaries,
+) -> Vec<CallSite> {
+    let mut out = Vec::new();
+    let mut tracker = Tracker::new();
+    if let Some(summary) = summaries.get(&entry) {
+        tracker.seed_from_summary(summary);
+    }
+
+    for insn in insns {
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Call | OpCode::CallInd => {
+                    // Only record this call site if we're actually
+                    // walking the function that *owns* it. Without
+                    // this gate, an earlier function whose lift_range
+                    // bled past its own body would record the call
+                    // with *its* tracker state (e.g. all unresolved),
+                    // and the dedup would block the real owner from
+                    // re-recording it with the correct seeded state.
+                    let true_caller = program
+                        .listing
+                        .function_containing(insn.address)
+                        .map(|f| f.entry_point);
+                    if true_caller == Some(entry) {
+                        let target = direct_call_target(op);
+                        let args = X86_64_SYSV_ARG_REGS
+                            .iter()
+                            .map(|&(offset, name)| ResolvedArg {
+                                reg_offset: offset,
+                                reg_name: name,
+                                value: tracker.const_regs.get(&offset).copied(),
+                            })
+                            .collect();
+                        out.push(CallSite {
+                            call_site: insn.address,
+                            caller_function: entry,
+                            call_target: target,
+                            args,
+                        });
                     }
-                    _ => tracker.apply(op),
+                    tracker.clear_for_call();
                 }
+                _ => tracker.apply(op),
             }
         }
     }
-    Ok(out)
+    out
+}
+
+/// Whether `summary` pins any parameter (seeds the tracker). A walk
+/// with no seed is the round-0 walk.
+fn seeds_anything(summary: Option<&Vec<std::collections::HashSet<u64>>>) -> bool {
+    summary.is_some_and(|s| s.iter().any(|set| set.len() == 1))
+}
+
+/// Round-0 result of one function for
+/// [`resolve_call_sites_iterative_from`].
+pub struct FunctionWalk {
+    /// Function entry.
+    pub entry: u64,
+    /// Instruction budget it was lifted with.
+    pub max_insns: usize,
+    /// Its call sites from [`walk_function`] with no summaries, or
+    /// `None` when its lift failed (the function is skipped).
+    pub sites: Option<Vec<CallSite>>,
 }
 
 /// Iterate the propagator to fixpoint (or until `max_iters`). On
@@ -228,11 +264,40 @@ pub fn resolve_call_sites_iterative(
     program: &Program,
     max_iters: usize,
 ) -> Result<Vec<CallSite>, AnalysisError> {
-    let mut sites = resolve_call_sites(lifter, program)?;
+    if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+        return Ok(Vec::new());
+    }
+    let empty = ParamSummaries::default();
+    let round0: Vec<FunctionWalk> = function_jobs(program)
+        .par_iter()
+        .map(|&(entry, max_insns)| FunctionWalk {
+            entry,
+            max_insns,
+            sites: lift_function(lifter, program, entry, max_insns)
+                .map(|insns| walk_function(program, entry, &insns, &empty)),
+        })
+        .collect();
+    resolve_call_sites_iterative_from(lifter, program, &round0, max_iters)
+}
+
+/// [`resolve_call_sites_iterative`] from round-0 walks already done
+/// (one per function, in listing order). A later round re-lifts and
+/// re-walks only the functions its summaries seed; the walk of any
+/// other function is its round-0 walk.
+pub fn resolve_call_sites_iterative_from(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    round0: &[FunctionWalk],
+    max_iters: usize,
+) -> Result<Vec<CallSite>, AnalysisError> {
+    if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+        return Ok(Vec::new());
+    }
+    let mut sites = dedup_sites(round0.iter().filter_map(|w| w.sites.as_deref()));
     let mut prev_total_known = count_known_args(&sites);
     for _ in 0..max_iters {
         let summaries = build_param_summaries(&sites);
-        let next = resolve_call_sites_with_summaries(lifter, program, &summaries)?;
+        let next = rewalk_round(lifter, program, round0, &summaries);
         let next_known = count_known_args(&next);
         sites = next;
         if next_known == prev_total_known {
@@ -241,6 +306,32 @@ pub fn resolve_call_sites_iterative(
         prev_total_known = next_known;
     }
     Ok(sites)
+}
+
+/// [`resolve_call_sites_with_summaries`] from round-0 walks: re-lifts
+/// and re-walks only the functions `summaries` seeds.
+pub fn rewalk_round(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    round0: &[FunctionWalk],
+    summaries: &ParamSummaries,
+) -> Vec<CallSite> {
+    let rewalked: Vec<Option<Vec<CallSite>>> = round0
+        .par_iter()
+        .map(|w| {
+            if w.sites.is_none() || !seeds_anything(summaries.get(&w.entry)) {
+                return None;
+            }
+            let insns = lift_function(lifter, program, w.entry, w.max_insns)?;
+            Some(walk_function(program, w.entry, &insns, summaries))
+        })
+        .collect();
+    dedup_sites(
+        round0
+            .iter()
+            .zip(&rewalked)
+            .filter_map(|(w, r)| r.as_deref().or(w.sites.as_deref())),
+    )
 }
 
 fn count_known_args(sites: &[CallSite]) -> usize {
