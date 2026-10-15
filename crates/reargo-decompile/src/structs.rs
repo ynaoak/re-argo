@@ -1306,6 +1306,21 @@ mod tests {
         code[0x1000..0x1007].copy_from_slice(&[0x48, 0x8b, 0x06, 0x48, 0x03, 0x07, 0xc3]);
         let r = c_of(&code);
         assert!(r.c_code.contains("rdi = &rdi->field_10;"), "{}", r.c_code);
+        // WS92: the Rust output too
+        assert!(r.rust_code.contains("rdi = unsafe { &raw mut (*rdi).field_10 };"), "{}", r.rust_code);
+    }
+
+    /// WS92: a field's address copied from another register prints as one in Rust too.
+    #[test]
+    fn a_members_address_in_another_register_in_rust() {
+        // mov rbx, rdi ; mov dword [rbx+0x98], 0 ; lea rdi, [rbx+0x98] ; call 0x2000 ; ret
+        let mut code = vec![0x48, 0x89, 0xfb, 0xc7, 0x83, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0xbb, 0x98, 0x00, 0x00, 0x00, 0xe8, 0xe7, 0x0f, 0x00, 0x00, 0xc3];
+        code.resize(0x1100, 0xcc);
+        // 0x2000: mov eax, [rdi] ; ret
+        code[0x1000..0x1003].copy_from_slice(&[0x8b, 0x07, 0xc3]);
+        let r = c_of(&code);
+        assert!(r.c_code.contains("rdi = &rbx->field_98;"), "{}", r.c_code);
+        assert!(r.rust_code.contains("rdi = unsafe { &raw mut (*rbx).field_98 };"), "{}", r.rust_code);
     }
 
     #[test]
