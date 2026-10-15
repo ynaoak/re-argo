@@ -4130,4 +4130,17 @@ mod tests {
         assert_eq!(c.matches("((int32_t)esi <= (int32_t)tmp_510) ?").count(), 2, "{c}");
         assert!(!c.contains("||"), "{c}");
     }
+
+    /// WS90: a zero extension of an operand that already has the source type casts once
+    /// (`(uint64_t)(uint32_t)eax` -> `(uint64_t)eax`); a sign extension of an unsigned operand
+    /// keeps its signed cast.
+    #[test]
+    fn extensions_cast_once_when_the_operand_has_the_type() {
+        // movzx eax, byte [rdi]; mov [rsi], rax; mov ecx, edx; add rcx, r8; mov [rsi+8], rcx; movsx r9, word [rdi+2]; mov [rsi+16], r9; ret
+        let code = [0x0f, 0xb6, 0x07, 0x48, 0x89, 0x06, 0x89, 0xd1, 0x4c, 0x01, 0xc1, 0x48, 0x89, 0x4e, 0x08, 0x4c, 0x0f, 0xbf, 0x4f, 0x02, 0x4c, 0x89, 0x4e, 0x10, 0xc3];
+        let c = c_of(&code);
+        for s in ["eax = (uint32_t)*(uint8_t*)rdi;", "rax = (uint64_t)eax;", "rcx = (uint64_t)ecx;", "r9 = (int64_t)(int16_t)*(uint16_t*)(rdi + 2);"] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+    }
 }

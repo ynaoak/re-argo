@@ -890,8 +890,15 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 // Cast through the source's unsigned type so a non-MSB-set
                 // value isn't accidentally sign-extended by C's promotion.
-                let src_ty = size_to_type(func.varnodes[op.inputs[0] as usize].data.size);
+                let src = func.varnodes[op.inputs[0] as usize].data.size;
+                let src_ty = size_to_type(src);
                 let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                // WS90: not when the operand already has that type (`(uint64_t)(uint32_t)eax` is
+                // `(uint64_t)eax`, `(uint32_t)(uint8_t)*(uint8_t*)p` is `(uint32_t)*(uint8_t*)p`)
+                let a = match self.c_int_type(func, op.inputs[0], &a) {
+                    Some((w, false)) if w == src => return Some(format!("{} = ({}){};", dst, dst_ty, drop_widening_casts(&a))),
+                    _ => a,
+                };
                 Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
             }
             OpCode::Piece if op.inputs.len() >= 2 => {
@@ -946,8 +953,13 @@ impl<'a> CEmitter<'a> {
             OpCode::IntSExt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                let src_ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                let src = func.varnodes[op.inputs[0] as usize].data.size;
+                let src_ty = size_to_signed_type(src);
                 let dst_ty = size_to_signed_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                // WS90: not when the operand is already that signed type
+                if self.c_int_type(func, op.inputs[0], &a) == Some((src, true)) {
+                    return Some(format!("{} = ({}){};", dst, dst_ty, a));
+                }
                 Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
             }
             OpCode::Load => {
@@ -1246,6 +1258,24 @@ impl<'a> CEmitter<'a> {
             }
         }
         varnode_name(vn)
+    }
+
+    /// The C integer type of `text` (the printed operand `v`) when it is certain (WS90): `(width
+    /// in bytes, signed)` of a cast covering the whole text (`(uint8_t)x`), a dereference
+    /// (`*(uint16_t*)p`), or a register printed by its own name (declared by its size, unsigned;
+    /// a named flag is a `bool`, 0 or 1).
+    fn c_int_type(&self, func: &SsaFunction, v: crate::ssa::VarId, text: &str) -> Option<(u32, bool)> {
+        if let Some((w, signed, _)) = int_cast(text) {
+            return Some((w, signed));
+        }
+        if let Some(rest) = text.strip_prefix("*(")
+            && is_deref(text)
+        {
+            return int_type_name(rest.split_once("*)")?.0);
+        }
+        let vn = &func.varnodes[v as usize];
+        (vn.data.space == SpaceId::REGISTER && is_identifier(text) && text == varnode_name(vn) && matches!(vn.data.size, 1 | 2 | 4 | 8))
+            .then_some((vn.data.size, false))
     }
 
     /// The block's branch condition with the ops that only compute it folded in (WS81).
@@ -1866,6 +1896,49 @@ fn reg_name(offset: u64, size: u32) -> String {
     }
 }
 
+/// `(width in bytes, signed)` of a C integer type name (`uint32_t`, `int8_t`).
+fn int_type_name(t: &str) -> Option<(u32, bool)> {
+    let (signed, bits) = match t.strip_prefix('u') {
+        Some(r) => (false, r.strip_prefix("int")?.strip_suffix("_t")?),
+        None => (true, t.strip_prefix("int")?.strip_suffix("_t")?),
+    };
+    match bits {
+        "8" => Some((1, signed)),
+        "16" => Some((2, signed)),
+        "32" => Some((4, signed)),
+        "64" => Some((8, signed)),
+        _ => None,
+    }
+}
+
+/// `(T)rest` where the cast to the integer type `T` covers the whole text (WS90): its width,
+/// signedness and operand. `rest` is one operand — a name, a parenthesised whole, a call, a
+/// dereference or another such cast — so `(uint8_t)x + 1` is no cast of the whole.
+pub(crate) fn int_cast(s: &str) -> Option<(u32, bool, &str)> {
+    let rest = s.strip_prefix('(')?;
+    let (ty, operand) = rest.split_once(')')?;
+    let (w, signed) = int_type_name(ty)?;
+    let unary = crate::condition::is_atomic(operand) || is_deref(operand) || int_cast(operand).is_some();
+    (!operand.is_empty() && unary).then_some((w, signed, operand))
+}
+
+/// `(uintA_t)(uintB_t)…x` with the casts made minimal (WS90): an unsigned cast whose operand
+/// is an unsigned cast to a type no wider is the identity on its value, so it goes —
+/// `(uint32_t)(uint8_t)x` stays, `(uint32_t)(uint32_t)x` and `(uint32_t)(uint16_t)(uint8_t)x`
+/// lose the outer / middle cast. Only the outermost cast is kept when everything below it is
+/// such a widening; nothing else is rewritten.
+pub(crate) fn drop_widening_casts(s: &str) -> String {
+    let Some((w, false, operand)) = int_cast(s) else { return s.to_string() };
+    let inner = drop_widening_casts(operand);
+    // the operand's own unsigned type: a cast or a dereference (`*(uint8_t*)p`)
+    let deref = || inner.strip_prefix("*(").filter(|_| is_deref(&inner)).and_then(|r| int_type_name(r.split_once("*)")?.0));
+    match int_cast(&inner).map(|(k, s, _)| (k, s)).or_else(deref) {
+        // (uintW)(uintK)y with K <= W: the outer cast changes nothing
+        Some((k, false)) if k <= w => inner,
+        _ => format!("({}){}", size_to_type(w), inner),
+    }
+}
+
 /// A plain variable name (`eax`, `tmp_510`, `local_30`), not a constant or an expression.
 pub(crate) fn is_identifier(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -2163,6 +2236,28 @@ pub(crate) fn small_hex(k: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WS90: an integer cast covering the whole text, and the widening casts below an unsigned
+    /// one dropped (each dropped cast is the identity on the value it gets).
+    #[test]
+    fn integer_cast_chains() {
+        assert_eq!(int_cast("(uint8_t)x"), Some((1, false, "x")));
+        assert_eq!(int_cast("(int32_t)*(uint32_t*)(rbx + 4)"), Some((4, true, "*(uint32_t*)(rbx + 4)")));
+        assert_eq!(int_cast("(uint32_t)(uint8_t)(al >> 1)"), Some((4, false, "(uint8_t)(al >> 1)")));
+        assert_eq!(int_cast("(uint8_t)x + 1"), None);
+        assert_eq!(int_cast("(uint8_t)x)(y"), None);
+        assert_eq!(int_cast("(float)x"), None);
+        assert_eq!(drop_widening_casts("(uint32_t)(uint8_t)x"), "(uint8_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)(uint32_t)x"), "(uint32_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)(uint16_t)(uint8_t)x"), "(uint8_t)x");
+        // a narrowing cast in between, or a signed one, changes the value: kept
+        assert_eq!(drop_widening_casts("(uint32_t)(uint8_t)(uint16_t)x"), "(uint8_t)(uint16_t)x");
+        assert_eq!(drop_widening_casts("(uint16_t)(uint32_t)x"), "(uint16_t)(uint32_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)(int8_t)x"), "(uint32_t)(int8_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)x + 1"), "(uint32_t)x + 1");
+        assert_eq!(drop_widening_casts("(uint32_t)*(uint8_t*)(rbx + 1)"), "*(uint8_t*)(rbx + 1)");
+        assert_eq!(drop_widening_casts("(uint8_t)*(uint32_t*)rbx"), "(uint8_t)*(uint32_t*)rbx");
+    }
     use crate::cfg::ControlFlowGraph;
     use crate::ssa::SsaFunction;
     use crate::structure::structure_cfg;
