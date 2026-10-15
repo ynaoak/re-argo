@@ -127,6 +127,9 @@ enum Commands {
     Bench {
         /// Path to the binary file
         file: PathBuf,
+        /// Show only the N slowest analyzers (0 = all)
+        #[arg(long, default_value_t = 15)]
+        top: usize,
     },
     /// List analyzer pipeline (BN-style Workflow) and warn on dependency issues
     Workflow {
@@ -887,7 +890,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Metrics { file, sort, top } => cmd_metrics(&file, &sort, top),
         Commands::Summary { file } => cmd_summary(&file),
         Commands::Tags { file, filter, list_types } => cmd_tags(&file, filter.as_deref(), list_types),
-        Commands::Bench { file } => cmd_bench(&file),
+        Commands::Bench { file, top } => cmd_bench(&file, top),
         Commands::Find { file, query, limit } => cmd_find(&file, &query, limit),
         Commands::Signatures { export, library } => cmd_signatures(export.as_deref(), library.as_deref()),
         Commands::Workflow { declared_only } => cmd_workflow(declared_only),
@@ -2082,7 +2085,7 @@ fn cmd_find(
     Ok(())
 }
 
-fn cmd_bench(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_bench(path: &Path, top: usize) -> Result<(), Box<dyn std::error::Error>> {
     // Measure the wall time of three stages independently so we can
     // see which one dominates: load → discovery → full analysis.
     let t0 = std::time::Instant::now();
@@ -2095,8 +2098,9 @@ fn cmd_bench(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let manager = reargo_analysis::AnalysisManager::new();
 
     let t1 = std::time::Instant::now();
-    let results = manager.run_all(&mut program);
-    let analysis_ms = t1.elapsed().as_millis();
+    let timed = manager.run_all_timed(&mut program);
+    let analysis_dur = t1.elapsed();
+    let analysis_ms = analysis_dur.as_millis();
 
     println!("Bench: {}", path.display());
     println!("  Load              {} ms", load_ms);
@@ -2107,13 +2111,36 @@ fn cmd_bench(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let total_insns = program.listing.instruction_count();
     let total_refs = program.references.len();
     let total_comments = program.comments.len();
-    let analyzers_ok = results.iter().filter(|r| r.is_ok()).count();
-    let analyzers_err = results.iter().filter(|r| r.is_err()).count();
+    let analyzers_ok = timed.iter().filter(|(_, _, r)| r.is_ok()).count();
+    let analyzers_err = timed.iter().filter(|(_, _, r)| r.is_err()).count();
     println!("  Analyzers OK / Err {} / {}", analyzers_ok, analyzers_err);
     println!("  Functions          {}", total_funcs);
     println!("  Instructions       {}", total_insns);
     println!("  References         {}", total_refs);
     println!("  Comments           {}", total_comments);
+
+    // Per-analyzer breakdown, slowest first.
+    let mut rows: Vec<_> = timed
+        .iter()
+        .map(|(name, d, r)| (*name, d.as_secs_f64() * 1000.0, r.is_ok()))
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let total_ms = analysis_dur.as_secs_f64() * 1000.0;
+    let shown = if top == 0 { rows.len() } else { top.min(rows.len()) };
+    println!();
+    println!("Per-analyzer time (top {} of {})", shown, rows.len());
+    println!("{}", "-".repeat(72));
+    println!("{:<40} {:>10} {:>9}  status", "Analyzer", "ms", "% total");
+    for (name, ms, ok) in rows.iter().take(shown) {
+        let pct = if total_ms > 0.0 { ms / total_ms * 100.0 } else { 0.0 };
+        println!(
+            "{:<40} {:>10.1} {:>8.1}%  {}",
+            name,
+            ms,
+            pct,
+            if *ok { "ok" } else { "err" }
+        );
+    }
     Ok(())
 }
 

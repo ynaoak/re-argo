@@ -178,9 +178,24 @@ impl AnalysisManager {
     }
 
     pub fn run_all(&self, program: &mut Program) -> Vec<Result<AnalysisResult, AnalysisError>> {
+        self.run_all_timed(program)
+            .into_iter()
+            .map(|(_, _, r)| r)
+            .collect()
+    }
+
+    /// Like [`run_all`](Self::run_all), but also reports each analyzer's
+    /// name and wall-clock time. One entry per analyzer, in run
+    /// (priority) order. Drives the per-analyzer table in `bench`.
+    pub fn run_all_timed(
+        &self,
+        program: &mut Program,
+    ) -> Vec<(&str, std::time::Duration, Result<AnalysisResult, AnalysisError>)> {
         let mut results = Vec::with_capacity(self.analyzers.len());
         for analyzer in &self.analyzers {
-            results.push(analyzer.analyze(program));
+            let t = std::time::Instant::now();
+            let r = analyzer.analyze(program);
+            results.push((analyzer.name(), t.elapsed(), r));
         }
         results
     }

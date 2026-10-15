@@ -39,7 +39,7 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Imports / exports" | `imports <bin>` / `imports <bin> --exports` |
 | "Sections" | `sections <bin>` |
 | "Coverage of analysis (% of executable bytes decoded)" | `coverage <bin> [--annotated]` |
-| "Wall-clock benchmark of analysis" | `bench <bin>` |
+| "Wall-clock benchmark of analysis + slowest analyzers" | `bench <bin> [--top 15]` |
 | "List the analyzer pipeline" | `workflow [--declared-only]` |
 | "Inspect / export the built-in signature DB" | `signatures [--library libc] [--export sigs.json]` |
 | "Emit machine-readable analysis to JSON" | `export <bin> -o out.json` |
@@ -270,9 +270,13 @@ Address            Name                              insns blocks mccabe  fanIn 
 0x0000000000401196 main                                 41      4      3      0      4        8
 ```
 
-#### `bench <FILE>`
+#### `bench <FILE> [--top N]`
 
 Wall-clock + per-stage breakdown of the analysis. Output keys: `Load`, `Analysis (total)`, `Analyzers OK / Err`, `Functions`, `Instructions`, `References`, `Comments`.
+
+Followed by a per-analyzer table (after a 72-char `-` rule), slowest first: `Analyzer  ms  % total  status` (`ms` 1 decimal, `% total` of `Analysis (total)`, `status` ok/err). `--top N` limits it to the N slowest (default 15, 0 = all).
+
+For profiling, `cargo build --profile profiling` builds release-optimised code with line tables (`target/profiling/re-argo`) for `perf` / `cargo flamegraph`.
 
 #### `coverage <FILE> [--annotated]`
 
