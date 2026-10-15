@@ -412,6 +412,8 @@ impl StructView {
         // across calls: what a callee accesses through a pointer passed to it, and the classes
         // whose methods take it as `this`
         let mut this_calls: Vec<(u32, u64)> = Vec::new();
+        // (WS92) pointers a callee stores a vtable into: a constructor's / destructor's object
+        let mut constructed: Vec<(u32, u64)> = Vec::new();
         if let Some(oracle) = ctx.oracle {
             for op in func.ops.iter().filter(|o| !o.dead && o.opcode == OpCode::Call) {
                 let Some(t) = op.inputs.first().map(|&t| func.varnodes[t as usize].data).filter(|t| t.space == SpaceId::RAM).map(|t| t.offset) else { continue };
@@ -425,13 +427,18 @@ impl StructView {
                     let used: Vec<_> = pu.iter().flat_map(|p| p.fields.iter()).filter(|f| f.arg == ai && f.size <= 16).copied().collect();
                     // (`this` is the second argument of a method returning a struct in memory)
                     let this_arg = usize::from(pu.as_ref().is_some_and(|p| p.returns_first));
-                    if used.is_empty() && !(ai == this_arg && nodes.contains_key(&value_key(func, v))) {
+                    let vtables: Vec<u64> = match ctx.memory {
+                        Some(mem) => pu.iter().flat_map(|p| p.vtable_stores.iter()).filter(|&&(a, k)| a == ai && crate::vcall::is_vtable_point(mem, k)).map(|&(_, k)| k).collect(),
+                        None => Vec::new(),
+                    };
+                    if used.is_empty() && vtables.is_empty() && !(ai == this_arg && nodes.contains_key(&value_key(func, v))) {
                         continue;
                     }
                     let n = node(&mut uf, &mut nodes, value_key(func, v));
                     if ai == this_arg {
                         this_calls.push((n, t));
                     }
+                    constructed.extend(vtables.into_iter().map(|k| (n, k)));
                     for f in used {
                         raws.push(Raw { op: usize::MAX, base: n, off: f.off, size: f.size, value: None, float: false, add: None, base_input: 0, vptr: false, vtable_store: None, skip: false, callee: Some(t) });
                     }
@@ -442,17 +449,85 @@ impl StructView {
             return StructView::default();
         }
 
-        // copies and phis hold the same pointer
-        for op in func.ops.iter().filter(|o| !o.dead && matches!(o.opcode, OpCode::Copy | OpCode::MultiEqual)) {
-            let Some(out) = op.output else { continue };
-            if func.varnodes[out as usize].data.size != 8 {
-                continue;
+        let mut targets: Vec<u64> = vec![ctx.entry];
+        targets.extend(this_calls.iter().map(|&(_, t)| t));
+        let listing = ctx.memory.map(|m| crate::vcall::vtables_listing(m, &targets)).unwrap_or_default();
+        let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));
+        let this_class: Option<(String, Option<u64>)> = ctx.name_class.clone().map(|c| (c, None)).or_else(|| class_of(ctx.entry).map(|(c, v)| (c, Some(v))));
+
+        // WS92: what says a value is of a class, before the values are joined: `this`, a pointer
+        // passed as `this` to a method listed in vtables, a vtable stored into an object here or
+        // by a callee (a constructor called on it)
+        let mut evidence: Vec<(u32, (String, u64))> = Vec::new();
+        if let Some(mem) = ctx.memory {
+            for &(n, t) in &this_calls {
+                if let Some(c) = class_of(t) {
+                    evidence.push((n, c));
+                }
             }
-            let o = node(&mut uf, &mut nodes, value_key(func, out));
+            let stored = raws[..local].iter().filter_map(|r| Some((r.base, r.vtable_store?)));
+            for (n, vt) in stored.chain(constructed.iter().copied()) {
+                if let Some(c) = crate::vcall::vtable_class(mem, vt) {
+                    evidence.push((n, (c, vt)));
+                }
+            }
+            let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
+            if let (Some(reg), Some((c, Some(vt)))) = (ctx.arg_regs[usize::from(sret)], &this_class)
+                && let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)
+                && let Some(&n) = nodes.get(&value_key(func, v.id))
+            {
+                evidence.push((n, (c.clone(), *vt)));
+            }
+        }
+        // joining these types would mix two classes neither of which derives from the other
+        let conflict = |uf: &Uf, roots: &[u32]| {
+            let Some(mem) = ctx.memory else { return false };
+            let mut classes: Vec<(String, u64)> = Vec::new();
+            for (n, c) in &evidence {
+                if roots.contains(&uf.find_const(*n)) && !classes.contains(c) {
+                    classes.push(c.clone());
+                }
+            }
+            classes.len() > 1 && crate::vcall::most_derived(mem, &classes).is_none()
+        };
+
+        // copies hold the same pointer; so do the versions a phi joins, unless they are objects
+        // of unrelated classes (a register reused for two objects)
+        // (the nodes first, in the order of the ops: the numbering decides the roots)
+        for op in func.ops.iter().filter(|o| !o.dead && matches!(o.opcode, OpCode::Copy | OpCode::MultiEqual)) {
+            let Some(out) = op.output.filter(|&o| func.varnodes[o as usize].data.size == 8) else { continue };
+            node(&mut uf, &mut nodes, value_key(func, out));
             for &i in &op.inputs {
                 let d = &func.varnodes[i as usize].data;
                 if d.size == 8 && d.space != SpaceId::CONST {
-                    let n = node(&mut uf, &mut nodes, value_key(func, i));
+                    node(&mut uf, &mut nodes, value_key(func, i));
+                }
+            }
+        }
+        for phis in [false, true] {
+            let opcode = if phis { OpCode::MultiEqual } else { OpCode::Copy };
+            for op in func.ops.iter().filter(|o| !o.dead && o.opcode == opcode) {
+                let Some(out) = op.output else { continue };
+                if func.varnodes[out as usize].data.size != 8 {
+                    continue;
+                }
+                let o = node(&mut uf, &mut nodes, value_key(func, out));
+                let ins: Vec<u32> = op
+                    .inputs
+                    .iter()
+                    .filter(|&&i| {
+                        let d = &func.varnodes[i as usize].data;
+                        d.size == 8 && d.space != SpaceId::CONST
+                    })
+                    .map(|&i| node(&mut uf, &mut nodes, value_key(func, i)))
+                    .collect();
+                if phis && !evidence.is_empty() {
+                    let roots: Vec<u32> = ins.iter().chain([&o]).map(|&n| uf.find(n)).collect();
+                    if conflict(&uf, &roots) {
+                        continue;
+                    }
+                }
+                for n in ins {
                     uf.union(o, n);
                 }
             }
@@ -506,7 +581,8 @@ impl StructView {
                 let Some(v) = r.value else { continue };
                 let key = (uf.find(r.base), r.off);
                 match seen.get(&key) {
-                    Some(&w) => changed |= uf.union(v, w),
+                    Some(&w) if evidence.is_empty() || !conflict(&uf, &[uf.find_const(v), uf.find_const(w)]) => changed |= uf.union(v, w),
+                    Some(_) => {}
                     None => {
                         seen.insert(key, v);
                     }
@@ -543,21 +619,34 @@ impl StructView {
 
         // classes: of `this` (its name, or the vtables listing the function), and of a pointer
         // passed as `this` to a method listed in vtables (the most derived of those classes)
-        let mut targets: Vec<u64> = vec![ctx.entry];
-        targets.extend(this_calls.iter().map(|&(_, t)| t));
-        let listing = ctx.memory.map(|m| crate::vcall::vtables_listing(m, &targets)).unwrap_or_default();
-        let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));
-        let this_class: Option<(String, Option<u64>)> = ctx.name_class.clone().map(|c| (c, None)).or_else(|| class_of(ctx.entry).map(|(c, v)| (c, Some(v))));
         let mut root_classes: FxHashMap<u32, Vec<(String, u64)>> = FxHashMap::default();
+        let mut add_class = |root: u32, c: (String, u64)| {
+            let e = root_classes.entry(root).or_default();
+            if !e.contains(&c) {
+                e.push(c);
+            }
+        };
         for &(n, t) in &this_calls {
             if let Some(c) = class_of(t) {
-                let e = root_classes.entry(uf.find(n)).or_default();
-                if !e.contains(&c) {
-                    e.push(c);
+                add_class(uf.find(n), c);
+            }
+        }
+        // WS92: the vtables stored into an object, here or by a callee (a constructor called on
+        // it): of the class it is (with a base class's constructor or an inlined one, the most
+        // derived of them)
+        if let Some(mem) = ctx.memory {
+            let stored = raws[..local].iter().filter(|r| !r.skip).filter_map(|r| Some((r.base, r.vtable_store?)));
+            for (n, vt) in stored.chain(constructed.iter().copied()) {
+                if let Some(c) = crate::vcall::vtable_class(mem, vt) {
+                    add_class(uf.find(n), (c, vt));
                 }
             }
         }
-
+        let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
+        let this_root = ctx.arg_regs[usize::from(sret)].and_then(|reg| {
+            let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
+            nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
+        });
         // the types that are structs: an access past offset 0, or a vtable pointer
         let mut is_base: FxHashSet<u32> = FxHashSet::default();
         let mut struct_roots: Vec<u32> = Vec::new();
@@ -569,11 +658,6 @@ impl StructView {
             }
         }
         // `this` of a known class is a struct too
-        let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
-        let this_root = ctx.arg_regs[usize::from(sret)].and_then(|reg| {
-            let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
-            nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
-        });
         if let (Some(r), Some(_)) = (this_root, &this_class)
             && is_base.contains(&r)
             && !struct_roots.contains(&r)
@@ -669,9 +753,7 @@ impl StructView {
                 && let Some((name, vt)) = crate::vcall::most_derived(mem, classes)
             {
                 defs[d].class = Some(name);
-                if defs[d].vtable.is_none() {
-                    defs[d].vtable = Some(vt);
-                }
+                defs[d].vtable = Some(vt);
             }
         }
         if let Some(mem) = ctx.memory {
@@ -1177,6 +1259,89 @@ mod tests {
         assert!(r.recovered_structs[0].starts_with("struct Shape {"), "{:?}", r.recovered_structs);
         assert!(r.recovered_structs[0].contains("field_8; // +0x8 (used by 0x1100)"), "{:?}", r.recovered_structs);
         assert!(r.c_code.contains("rdi->vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+    }
+
+    /// WS92: an object a callee stores a vtable into (its constructor) is of that class, so a
+    /// virtual call on it names the slot's function.
+    #[test]
+    fn an_object_a_constructor_was_called_on_has_its_class() {
+        // push rbx ; mov rbx, rdi ; mov rdi, rbx ; call 0x1080 (the constructor) ; mov rax, [rbx] ;
+        // mov rdi, rbx ; call [rax+8] ; pop rbx ; ret
+        let mut f = vec![0x53, 0x48, 0x89, 0xfb, 0x48, 0x89, 0xdf, 0xe8, 0x74, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x50, 0x08, 0x5b, 0xc3];
+        f.resize(0x80, 0xcc);
+        // 0x1080: lea rax, [0x2010] ; mov [rdi], rax ; ret
+        f.extend_from_slice(&[0x48, 0x8d, 0x05, 0x89, 0x0f, 0x00, 0x00, 0x48, 0x89, 0x07, 0xc3]);
+        let r = decompile(&X86Lifter::new_64(), &shape(&f, &[0xc3]), 0x1000, "f", 100).unwrap();
+        assert!(r.c_code.contains("rdi->vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.recovered_structs.iter().any(|d| d.starts_with("struct Shape {  // class from RTTI, vtable 0x2010")), "{:?}", r.recovered_structs);
+    }
+
+    /// Two classes: `Shape` (vtable 0x2010: 0x1100, 0x1200; type_info 0x2030 -> `5Shape`) and
+    /// `Holder` (vtable 0x2050: 0x1300, 0x1310; type_info 0x2070 -> `6Holder`). `Holder`'s
+    /// constructor at 0x1000 stores a new object at `this + 8` and calls `Shape`'s constructor
+    /// (0x1080) on it; `Holder::m` (0x1300) makes a virtual call on `this->field_8`.
+    ///
+    /// With more code (`(offset in .text, bytes)`; .text is 0x1000..0x1600).
+    fn holder_with(extra: &[(usize, &[u8])]) -> Memory {
+        let mut t = vec![0xccu8; 0x600];
+        let mut put = |at: usize, b: &[u8]| t[at..at + b.len()].copy_from_slice(b);
+        put(0x000, &[
+            0x53, 0x48, 0x89, 0xfb, // push rbx ; mov rbx, rdi
+            0x48, 0x8d, 0x05, 0x45, 0x10, 0x00, 0x00, // lea rax, [0x2050]
+            0x48, 0x89, 0x03, // mov [rbx], rax
+            0xbf, 0x10, 0x00, 0x00, 0x00, // mov edi, 0x10
+            0xe8, 0xe8, 0x03, 0x00, 0x00, // call 0x1400 (operator new)
+            0x48, 0x89, 0x43, 0x08, // mov [rbx+8], rax
+            0x48, 0x89, 0xc7, // mov rdi, rax
+            0xe8, 0x5c, 0x00, 0x00, 0x00, // call 0x1080 (Shape's constructor)
+            0x5b, 0xc3, // pop rbx ; ret
+        ]);
+        put(0x080, &[0x48, 0x8d, 0x05, 0x89, 0x0f, 0x00, 0x00, 0x48, 0x89, 0x07, 0xc3]);
+        put(0x100, &[0xc3]);
+        put(0x200, &[0x8b, 0x47, 0x04, 0xc3]);
+        // 0x1300: mov rdi, [rdi+8] ; mov rax, [rdi] ; call [rax+8] ; ret
+        put(0x300, &[0x48, 0x8b, 0x7f, 0x08, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x08, 0xc3]);
+        put(0x310, &[0xc3]);
+        put(0x400, &[0x31, 0xc0, 0xc3]);
+        for (at, b) in extra {
+            put(*at, b);
+        }
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        mem.add_block(block(".text", 0x1000, t, MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.add_block(block(".data.rel.ro", 0x2000, vec![0; 0x80], MemoryFlags::READ | MemoryFlags::WRITE));
+        mem.add_block(block(".rodata", 0x3000, [&b"5Shape"[..], &[0; 10], b"6Holder\0"].concat(), MemoryFlags::READ));
+        let rela: Vec<u8> = [
+            (0x2008u64, 8u64, 0x2030u64),
+            (0x2010, 8, 0x1100),
+            (0x2018, 8, 0x1200),
+            (0x2038, 8, 0x3000),
+            (0x2048, 8, 0x2070),
+            (0x2050, 8, 0x1300),
+            (0x2058, 8, 0x1310),
+            (0x2078, 8, 0x3010),
+        ]
+        .iter()
+        .flat_map(|&(o, i, a)| [o.to_le_bytes(), i.to_le_bytes(), a.to_le_bytes()].concat())
+        .collect();
+        mem.set_dynamic_relocations(Arc::from(rela));
+        mem
+    }
+
+    /// WS92: a phi joining objects of two unrelated classes does not merge their types: the
+    /// virtual calls on each before the join keep their class (the one on the joined value is
+    /// unresolved).
+    #[test]
+    fn a_phi_of_two_classes_keeps_each_class_before_the_join() {
+        // 0x1500: push rbx ; test esi, esi ; je L1 ; rbx = new ; Shape::Shape(rbx) ; rbx->vfn_1() ;
+        // jmp L2 ; L1: rbx = new ; Holder::Holder(rbx) ; rbx->vfn_1() ; L2: rbx->vfn_0() ; pop rbx ; ret
+        let f = [
+            0x53, 0x85, 0xf6, 0x74, 0x1b, 0xe8, 0xf6, 0xfe, 0xff, 0xff, 0x48, 0x89, 0xc3, 0x48, 0x89, 0xc7, 0xe8, 0x6b, 0xfb, 0xff, 0xff, 0x48, 0x8b, 0x03,
+            0x48, 0x89, 0xdf, 0xff, 0x50, 0x08, 0xeb, 0x19, 0xe8, 0xdb, 0xfe, 0xff, 0xff, 0x48, 0x89, 0xc3, 0x48, 0x89, 0xc7, 0xe8, 0xd0, 0xfa, 0xff, 0xff,
+            0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x50, 0x08, 0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x10, 0x5b, 0xc3,
+        ];
+        let r = decompile(&X86Lifter::new_64(), &holder_with(&[(0x500, &f)]), 0x1500, "f", 100).unwrap();
+        assert!(r.c_code.contains("= Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.c_code.contains("= Holder::method_at_1310"), "{}", r.c_code);
     }
 
     #[test]

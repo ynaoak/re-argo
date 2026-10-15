@@ -87,6 +87,10 @@ pub struct ParamUse {
     /// Every `ret` returns the first argument's incoming value: a struct returned in memory
     /// (`rdi` is the result's address, so a method's `this` is the second argument).
     pub returns_first: bool,
+    /// Constants it stores at offset 0 of a parameter, 8 bytes (WS92): the vtable a constructor
+    /// or destructor puts into its `this` (`(arg, value)`; whether a value is a vtable is for
+    /// the caller to check).
+    pub vtable_stores: Vec<(usize, u64)>,
 }
 
 /// A memory access a function makes through one of its parameters (WS91): `*(T*)(param + off)`.
@@ -446,15 +450,48 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
     let rpo = crate::dominator::reverse_post_order(cfg);
     let mut found: Vec<ParamAccess> = Vec::new();
     let mut returns: Vec<bool> = Vec::new();
+    let mut vtable_stores: Vec<(usize, u64)> = Vec::new();
     for pass in 0..8 {
         returns.clear();
         let mut changed = false;
         let last = pass == 7;
         for &b in &rpo {
             let Some(mut st) = inn[b].clone() else { continue };
+            // the constants the block wrote into registers (`lea rax, [vtable]`), for the stores
+            let mut consts: FxHashMap<(SpaceId, u64, u32), u64> = FxHashMap::default();
             for insn in &cfg.blocks[b].instructions {
                 for op in &insn.ops {
                     let held = |st: &Held, v: &VarnodeData| st.get(&(v.space, v.offset, v.size)).copied();
+                    if op.opcode == OpCode::Store
+                        && let (Some(a), Some(v)) = (op.inputs.get(1).and_then(|v| held(&st, v)), op.inputs.get(2))
+                        && a.1 == 0
+                        && v.size == 8
+                    {
+                        let k = if v.space == SpaceId::CONST { Some(v.offset) } else { consts.get(&(v.space, v.offset, v.size)).copied() };
+                        if let Some(k) = k
+                            && !vtable_stores.contains(&(a.0, k))
+                        {
+                            vtable_stores.push((a.0, k));
+                        }
+                    }
+                    if let Some(out) = op.output {
+                        let c = match (op.opcode, op.inputs.first()) {
+                            (OpCode::Copy, Some(c)) if out.size == 8 && c.space == SpaceId::CONST => Some(c.offset),
+                            (OpCode::Copy, Some(c)) if out.size == 8 => consts.get(&(c.space, c.offset, c.size)).copied(),
+                            _ => None,
+                        };
+                        // (the lifter's view sync, `eax = SUBPIECE(rax, 0)`, leaves the register it reads)
+                        let view_sync = op.opcode == OpCode::Subpiece && op.inputs.first().is_some_and(|r| r.space == out.space && r.offset == out.offset && r.size > out.size);
+                        if !view_sync {
+                            consts.retain(|r, _| !(r.0 == out.space && r.1 < out.offset + u64::from(out.size) && out.offset < r.1 + u64::from(r.2)));
+                        }
+                        if let Some(c) = c {
+                            consts.insert((out.space, out.offset, out.size), c);
+                        }
+                    }
+                    if matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
+                        consts.clear();
+                    }
                     match op.opcode {
                         OpCode::Load | OpCode::Store => {
                             let size = match op.opcode {
@@ -518,7 +555,7 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
             break;
         }
     }
-    ParamUse { fields: found, returns_first: !returns.is_empty() && returns.iter().all(|&r| r) }
+    ParamUse { fields: found, returns_first: !returns.is_empty() && returns.iter().all(|&r| r), vtable_stores }
 }
 
 /// Group the argument registers into classes (System V: integer, vector) by
