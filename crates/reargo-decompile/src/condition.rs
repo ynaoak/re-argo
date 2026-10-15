@@ -453,7 +453,7 @@ fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKe
     // whose result several flags read) when `a` and `b` still hold their values at the end
     let rel = |i: usize| {
         let v = *op.inputs.get(i)?;
-        rels.get(&value_key(func, v)).copied().or_else(|| earlier_sub(func, v, op.block)).or_else(|| earlier_compare(func, v, op.block))
+        rels.get(&value_key(func, v)).copied().or_else(|| earlier_sub(func, v, op.block))
     };
     let zero = |i: usize| {
         op.inputs.get(i).is_some_and(|&v| {
@@ -511,7 +511,7 @@ fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKe
             Rel::Cmp { op: le, a, b, negated: false }
         }
         // (a signed compare computed once at its `cmp`, WS90: `SF != OF` became a copy of it)
-        Copy => match rel(0)? {
+        Copy => match rel(0).or_else(|| earlier_compare(func, *op.inputs.first()?, op.block))? {
             r @ Rel::Cmp { .. } => r,
             _ => return None,
         },
