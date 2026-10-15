@@ -113,6 +113,7 @@ fn rust_type(c_type: &str) -> String {
         "uint16_t" | "unsigned short" => "u16".into(),
         "float" => "f32".into(),
         "double" => "f64".into(),
+        "long double" => "f80".into(),
         "bool" | "_Bool" => "bool".into(),
         "size_t" => "usize".into(),
         // Strip ONE trailing '*' and recurse so each pointer level

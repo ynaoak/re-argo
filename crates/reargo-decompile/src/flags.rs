@@ -139,7 +139,7 @@ fn overlaps(x: &reargo_core::pcode::VarnodeData, w: &reargo_core::pcode::Varnode
 
 /// Does every path from the anchors (the ops that read `a` and `b`) to `at` leave the storage
 /// of `operands` untouched, so their names still mean the values at `at`?
-fn operands_hold(func: &SsaFunction, block_start: &[usize], anchors: &[OpIdx], at: OpIdx, operands: &[VarId]) -> bool {
+pub(crate) fn operands_hold(func: &SsaFunction, block_start: &[usize], anchors: &[OpIdx], at: OpIdx, operands: &[VarId]) -> bool {
     let mut stores: SmallVec<[&reargo_core::pcode::VarnodeData; 2]> = SmallVec::new();
     for &v in operands {
         let d = &func.varnodes[v as usize].data;
@@ -210,17 +210,7 @@ fn operands_hold(func: &SsaFunction, block_start: &[usize], anchors: &[OpIdx], a
 /// afterwards to drop the flag ops nothing reads any more.
 pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
     use OpCode::*;
-    let n = func.cfg.blocks.len();
-    let mut block_start = vec![func.ops.len(); n + 1];
-    for op in func.ops.iter().rev() {
-        if op.block < n {
-            block_start[op.block] = op.index;
-        }
-    }
-    // a block with no ops starts where the next one does
-    for b in (0..n).rev() {
-        block_start[b] = block_start[b].min(block_start[b + 1]);
-    }
+    let block_start = block_starts(func);
     let mut memo: FxHashMap<ValueKey, Option<Found>> = FxHashMap::default();
     let readers = crate::condition::Readers::new(func);
     let mut saved = 0u64;
@@ -305,6 +295,22 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
         rewritten += 1;
     }
     rewritten
+}
+
+/// The first op of each block (a block with no ops starts where the next one does), and the
+/// end of the ops last.
+pub(crate) fn block_starts(func: &SsaFunction) -> Vec<usize> {
+    let n = func.cfg.blocks.len();
+    let mut block_start = vec![func.ops.len(); n + 1];
+    for op in func.ops.iter().rev() {
+        if op.block < n {
+            block_start[op.block] = op.index;
+        }
+    }
+    for b in (0..n).rev() {
+        block_start[b] = block_start[b].min(block_start[b + 1]);
+    }
+    block_start
 }
 
 /// The value `v` copies (`v = COPY src`), if it is a copy.

@@ -81,6 +81,10 @@ pub struct CEmitter<'a> {
     frame: crate::frame::Frame,
     /// A temporary printed as the register it is copied to (WS88, `inline::coalesced`).
     coalesced: Coalesced,
+    /// `lock cmpxchg` printed as one compare-and-swap, by its store (WS89, `cas::find`).
+    cas: rustc_hash::FxHashMap<usize, crate::cas::Cas>,
+    /// the ops a compare-and-swap hides (its load is no reader that has to print)
+    cas_hidden: rustc_hash::FxHashSet<usize>,
 }
 
 /// Temporaries printed as the register they are copied to (WS88, `inline::coalesced`): the
@@ -133,6 +137,8 @@ impl CEmitter<'static> {
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
             coalesced: Default::default(),
+            cas: Default::default(),
+            cas_hidden: Default::default(),
         }
     }
 }
@@ -172,6 +178,8 @@ impl<'a> CEmitter<'a> {
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
             coalesced: Default::default(),
+            cas: Default::default(),
+            cas_hidden: Default::default(),
         }
     }
 
@@ -218,6 +226,11 @@ impl<'a> CEmitter<'a> {
         self.frame = crate::frame::Frame::new(func, &|_| true);
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
+        // WS89: `lock cmpxchg` as one statement at its store
+        let (cas, cas_hidden) = crate::cas::find(func, &self.noise);
+        self.noise.extend(cas_hidden.iter().copied());
+        self.cas = cas;
+        self.cas_hidden = cas_hidden;
         // WS86: first, as the conditions and selects fold the expressions printed inline
         let inlined = self.inline_temporaries(func);
         // WS88: a temporary copied to a register and read again by stores prints as that register
@@ -245,6 +258,10 @@ impl<'a> CEmitter<'a> {
         self.emit_block(func, structured);
         self.indent -= 1;
         self.line("}");
+        // WS89: a compare-and-swap's flag read only by the next condition goes into it
+        if !self.cas.is_empty() {
+            self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("uint8_t {n};"), crate::cas::C_FORMS);
+        }
         self.output.clone()
     }
 
@@ -254,7 +271,10 @@ impl<'a> CEmitter<'a> {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
             // view syncs nobody reads) is not printed, so declaring it is noise
             if vn.data.space == SpaceId::REGISTER
-                && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d))
+                && vn.def_op.is_some_and(|d| {
+                    // (the flag and accumulator of a compare-and-swap print in its statement)
+                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d))
+                })
             {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
@@ -777,14 +797,14 @@ impl<'a> CEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
-                let ty = if out_size == 4 { "float" } else { "double" };
+                let ty = float_type(out_size);
                 Some(format!("{} = ({}){};", dst, ty, a))
             }
             OpCode::FloatFloat2Float => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
-                let ty = if out_size == 4 { "float" } else { "double" };
+                let ty = float_type(out_size);
                 Some(format!("{} = ({}){};", dst, ty, a))
             }
             OpCode::FloatTrunc => {
@@ -934,6 +954,20 @@ impl<'a> CEmitter<'a> {
                 }
                 let addr = self.input_expr(func, op, 1);
                 Some(format!("{} = *({}*){};", dst, size_to_type(out_size), addr))
+            }
+            OpCode::Store if self.cas.contains_key(&op.index) => {
+                let c = &self.cas[&op.index];
+                let ptr = match self.frame.access(func, op.block, c.addr, c.size, true, false) {
+                    Some(slot) if !slot.starts_with('*') => format!("&{slot}"),
+                    _ => format!("({}*){}", size_to_type(c.size), self.input_expr(func, op, 1)),
+                };
+                let sel = func.varnodes[op.inputs[2] as usize].def_op?;
+                let call = crate::cas::call_text(&ptr, &varnode_name(&func.varnodes[c.expected as usize]), &self.input_expr(func, &func.ops[sel], 1));
+                Some(match c.flag {
+                    Some(f) if c.branch => format!("{} = {call};{}", varnode_name(&func.varnodes[f as usize]), crate::cas::FOLDABLE),
+                    Some(f) => format!("{} = {call};", varnode_name(&func.varnodes[f as usize])),
+                    None => format!("{call};"),
+                })
             }
             OpCode::Store => {
                 let val = self.input_expr(func, op, 2);
@@ -1107,7 +1141,7 @@ impl<'a> CEmitter<'a> {
     /// Fill `inlined` (see [`crate::inline`]); returns the definitions not to print.
     fn inline_temporaries(&self, func: &SsaFunction) -> Vec<usize> {
         self.inlined.borrow_mut().clear();
-        let prints = |u: usize| !self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some();
+        let prints = |u: usize| self.cas_hidden.contains(&u) || (!self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some());
         let mut hidden = Vec::new();
         // (a call printed from a rendering of its site does not print its operands)
         let prints_operands = |u: usize| {
@@ -1648,6 +1682,15 @@ pub(crate) fn return_value(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option
     }
 }
 
+/// A function that returns the top of the x87 stack (WS89: its `ret`s have an 80-bit value).
+pub(crate) fn returns_long_double(func: &SsaFunction) -> bool {
+    func.ops.iter().any(|op| {
+        !op.dead
+            && op.opcode == OpCode::Return
+            && return_value(func, op).is_some_and(|i| func.varnodes[op.inputs[i] as usize].data.size == 10)
+    })
+}
+
 fn infer_signature(func: &SsaFunction) -> FunctionSignature {
     let has_return_value = func.ops.iter().any(|op| {
         if op.dead || op.opcode != OpCode::Return {
@@ -1658,6 +1701,7 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
 
     let return_type = match (has_return_value, func.return_float) {
         (false, _) => "void",
+        _ if returns_long_double(func) => "long double",
         (true, Some(4)) => "float",
         (true, Some(_)) => "double",
         (true, None) => "uint64_t",
@@ -1787,7 +1831,21 @@ fn reg_name(offset: u64, size: u32) -> String {
                 _ => format!("xmm{}_{}", n, sz),
             }
         }
+        // WS89: the x87 stack slots, named from the bottom of the stack (`st0` = the first value
+        // pushed; see `reargo_lift::x86::x87`), the control word and the condition codes
+        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => format!("st{}", (off - 0x1100) / 0x10),
+        (0x10a0, 2) => "fpucw".into(),
+        (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
         _ => format!("var_{:x}", offset),
+    }
+}
+
+/// The C type of a float of `size` bytes (`long double` = the x87's 80 bits, WS89).
+pub(crate) fn float_type(size: u32) -> &'static str {
+    match size {
+        4 => "float",
+        10 => "long double",
+        _ => "double",
     }
 }
 
@@ -1799,6 +1857,8 @@ pub(crate) fn size_to_type(size: u32) -> &'static str {
         8 => "uint64_t",
         // an XMM register / 128-bit memory access (it printed `void xmm0;`, `*(void*)p = ..`)
         16 => "uint128_t",
+        // only an x87 value is 10 bytes (WS89)
+        10 => "long double",
         _ => "void",
     }
 }
@@ -2198,6 +2258,11 @@ mod tests {
         assert_eq!(reg_name(0x80, 4), "r8d");
         assert_eq!(reg_name(0xB0, 1), "r14b");
         assert_eq!(reg_name(0x1200, 16), "xmm0");
+        assert_eq!(reg_name(0x1100, 10), "st0");
+        assert_eq!(reg_name(0x1170, 10), "st7");
+        assert_eq!(reg_name(0x10a0, 2), "fpucw");
+        assert_eq!(reg_name(0x10ab, 1), "fpu_c3");
+        assert_eq!(size_to_type(10), "long double");
         assert_eq!(reg_name(0x1210, 8), "xmm1_q");
         assert_eq!(reg_name(0x1220, 4), "xmm2_d");
         assert_eq!(reg_name(0x00, 8), "rax");

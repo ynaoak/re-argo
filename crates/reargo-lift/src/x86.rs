@@ -7,6 +7,9 @@ use smallvec::SmallVec;
 use crate::lift::{LiftError, LiftedInstruction, PcodeLift};
 
 mod bits;
+mod x87;
+
+pub use x87::X87Ctx;
 
 const CONST_SPACE: SpaceId = SpaceId::CONST;
 const RAM_SPACE: SpaceId = SpaceId::RAM;
@@ -176,8 +179,13 @@ impl X86Lifter {
         &self,
         insn: &iced_x86::Instruction,
         address: u64,
+        x87: Option<X87Ctx>,
     ) -> Result<Vec<PcodeOp>, LiftError> {
         use iced_x86::Mnemonic::*;
+        // WS89: x87, with the stack depth `lift_range` found
+        if let Some(lifted) = self.lift_x87(insn, address, x87) {
+            return lifted;
+        }
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
         let mut ops: Vec<PcodeOp> = Vec::new();
         let mut seq_base: u32 = 0;
@@ -1052,6 +1060,35 @@ impl X86Lifter {
                     output: None,
                     inputs: SmallVec::from_slice(&[ram(target, ps), cond]),
                 });
+            }
+
+            // WS89: `sahf` loads SF / ZF / PF / CF from bits 7 / 6 / 2 / 0 of ah (after `fnstsw ax`,
+            // the x87 condition codes C3 / C2 / C0 become ZF / PF / CF); `lahf` stores them (AF,
+            // not modelled, as 0; bit 1 is always 1)
+            Sahf => {
+                for (flag, bit) in [(SF_OFFSET, 7u64), (ZF_OFFSET, 6), (PF_OFFSET, 2), (CF_OFFSET, 0)] {
+                    let sh = unique(0x5a0 + bit * 0x10, 1);
+                    ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(seq_base), output: Some(sh),
+                        inputs: SmallVec::from_slice(&[reg(0x01, 1), constant(bit, 1)]) });
+                    seq_base += 1;
+                    ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(seq_base), output: Some(reg(flag, 1)),
+                        inputs: SmallVec::from_slice(&[sh, constant(1, 1)]) });
+                    seq_base += 1;
+                }
+            }
+            Lahf => {
+                let mut acc = constant(2, 1);
+                for (k, (flag, bit)) in [(SF_OFFSET, 7u64), (ZF_OFFSET, 6), (PF_OFFSET, 2), (CF_OFFSET, 0)].into_iter().enumerate() {
+                    let sh = unique(0x5a0 + k as u64 * 0x20, 1);
+                    ops.push(PcodeOp { opcode: OpCode::IntLeft, seq: seq(seq_base), output: Some(sh),
+                        inputs: SmallVec::from_slice(&[reg(flag, 1), constant(bit, 1)]) });
+                    seq_base += 1;
+                    let out = if k == 3 { reg(0x01, 1) } else { unique(0x5b0 + k as u64 * 0x20, 1) };
+                    ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(seq_base), output: Some(out),
+                        inputs: SmallVec::from_slice(&[acc, sh]) });
+                    seq_base += 1;
+                    acc = out;
+                }
             }
 
             Int3 => {
@@ -2131,6 +2168,7 @@ impl PcodeLift for X86Lifter {
                     Err(_) => break,
                 }
             }
+            lifter.lift_x87_range(memory, &mut results);
             results
         };
         let fast = lift(&X86Lifter { is_64: self.is_64, parity: false });
@@ -2161,6 +2199,18 @@ impl PcodeLift for X86Lifter {
         memory: &Memory,
         address: u64,
     ) -> Result<LiftedInstruction, LiftError> {
+        self.lift_one(memory, address, None).map(|(l, _)| l)
+    }
+}
+
+impl X86Lifter {
+    /// One instruction (and its decoding), the x87 ones with what [`x87::flow`] found before it.
+    fn lift_one(
+        &self,
+        memory: &Memory,
+        address: u64,
+        x87: Option<X87Ctx>,
+    ) -> Result<(LiftedInstruction, iced_x86::Instruction), LiftError> {
         let mut buf = [0u8; 15];
         let read_len = memory.read_instruction_bytes(address, &mut buf);
         if read_len == 0 {
@@ -2194,18 +2244,70 @@ impl PcodeLift for X86Lifter {
             })
         };
 
-        let mut pcode_ops = self.lift_iced(&insn, address)?;
+        let mut pcode_ops = self.lift_iced(&insn, address, x87)?;
         if self.is_64 {
             pcode_ops = zero_extend_gpr32_writes(pcode_ops);
         }
         pcode_ops = sync_xmm_views(pcode_ops, xmm_write_zeroes_upper(&insn));
 
-        Ok(LiftedInstruction {
-            address,
-            length: insn.len() as u32,
-            mnemonic,
-            ops: pcode_ops,
-        })
+        Ok((
+            LiftedInstruction {
+                address,
+                length: insn.len() as u32,
+                mnemonic,
+                ops: pcode_ops,
+            },
+            insn,
+        ))
+    }
+
+    /// WS89: lift the x87 instructions of a range lifted from a function's entry again with the
+    /// stack depth [`x87::flow`] finds; a call whose callee returns a `long double` defines the
+    /// slot it leaves (`INDIRECT(target)`, like the convention's return registers), and a `ret`
+    /// with a value on the stack returns it (a further input of its RETURN).
+    fn lift_x87_range(&self, memory: &Memory, lifted: &mut [LiftedInstruction]) {
+        if !lifted.iter().any(|l| l.mnemonic.starts_with('f')) {
+            return;
+        }
+        let decoded: Vec<Option<iced_x86::Instruction>> = lifted
+            .iter()
+            .map(|l| {
+                let mut buf = [0u8; 15];
+                let n = memory.read_instruction_bytes(l.address, &mut buf);
+                let mut d = iced_x86::Decoder::with_ip(if self.is_64 { 64 } else { 32 }, &buf[..n], l.address, iced_x86::DecoderOptions::NONE);
+                let insn = d.decode();
+                (!insn.is_invalid()).then_some(insn)
+            })
+            .collect();
+        if !decoded.iter().flatten().any(|d| x87::kind(d) != x87::Kind::NotX87) {
+            return;
+        }
+        let flow = x87::flow(lifted, &decoded);
+        for (i, l) in lifted.iter_mut().enumerate() {
+            let Some(d) = &decoded[i] else { continue };
+            if x87::kind(d) != x87::Kind::NotX87 {
+                if let Ok((again, _)) = self.lift_one(memory, l.address, flow.ctx[i]) {
+                    *l = again;
+                }
+                continue;
+            }
+            if let Some(k) = flow.call_result[i]
+                && let Some(call) = l.ops.iter().find(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd))
+            {
+                let op = PcodeOp {
+                    opcode: OpCode::Indirect,
+                    seq: SeqNum::new(call.seq.addr, l.ops.len() as u32),
+                    output: Some(x87::slot(k)),
+                    inputs: SmallVec::from_slice(&call.inputs[..1]),
+                };
+                l.ops.push(op);
+            }
+            if let Some(c) = flow.ctx[i].filter(|c| c.depth > 0) {
+                for op in l.ops.iter_mut().filter(|o| o.opcode == OpCode::Return && o.inputs.len() == 1) {
+                    op.inputs.push(x87::slot(c.depth - 1));
+                }
+            }
+        }
     }
 }
 

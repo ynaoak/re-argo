@@ -179,38 +179,109 @@ impl Readers {
 /// sees their results and nothing is lost by not printing them as statements.
 pub fn condition_ops(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> Option<Vec<OpIdx>> {
     let tail = condition_tail(func, ops, readers);
-    (tail.len() + 1 == ops.len()).then(|| tail.to_vec())
+    (tail.len() + 1 == ops.len()).then_some(tail)
 }
 
-/// The trailing ops of `ops` (a block's live ops) that only compute its branch condition
-/// (WS81): the longest run right before the `CBRANCH` of pure ops whose result is read only by
-/// later ops of the run or the branch (by one of them, or — `a - b` / `a & b` of a `cmp` /
-/// `test` — by the flags computed from it). Nothing with a side effect runs between them and
-/// the branch, and nothing else reads their results, so they fold into the condition
-/// expression (`var_201 = edi < 6; if (var_201)` -> `if (edi < 6)`). Empty when the block does
-/// not end in a `CBRANCH`.
-pub fn condition_tail<'o>(func: &SsaFunction, ops: &'o [OpIdx], readers: &Readers) -> &'o [OpIdx] {
-    let Some((&last, body)) = ops.split_last() else { return &[] };
+/// The ops of `ops` (a block's live ops) that only compute its branch condition (WS81), in
+/// order: pure ops whose result is read only by later ops of the set or the branch (by one of
+/// them, or — `a - b` / `a & b` of a `cmp` / `test` — by the flags computed from it). They fold
+/// into the condition expression (`var_201 = edi < 6; if (var_201)` -> `if (edi < 6)`), which
+/// is evaluated at the branch: WS89 — not only the run right before the `CBRANCH` but also an
+/// op further up when the statements between it and the branch write nothing it reads (no
+/// register / temporary of its inputs; no memory, when it loads): `var_206 = rax == 0;
+/// rcx = *(uint64_t*)rsp; if (!var_206)` -> `rcx = *(uint64_t*)rsp; if (rax != 0)`. Empty when
+/// the block does not end in a `CBRANCH`.
+pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> Vec<OpIdx> {
+    let Some((&last, body)) = ops.split_last() else { return Vec::new() };
     let br = &func.ops[last];
     if br.opcode != OpCode::CBranch || br.inputs.len() < 2 {
-        return &[];
+        return Vec::new();
     }
-    let mut start = body.len();
-    while start > 0 {
-        let op = &func.ops[body[start - 1]];
-        let Some(out) = op.output else { break };
-        if !is_pure(op.opcode) {
+    let mut chain: Vec<OpIdx> = vec![last];
+    // what the ops left out (printed between a folded op and the branch) write
+    let mut written: Vec<reargo_core::pcode::VarnodeData> = Vec::new();
+    let mut memory_written = false;
+    for &o in body.iter().rev() {
+        let op = &func.ops[o];
+        let folds = op.output.is_some_and(|out| {
+            if !is_pure(op.opcode) {
+                return false;
+            }
+            // read by several ops only when it is what a compare's flags are computed from
+            let r = readers.of(func, out);
+            let shared_ok = r.len() == 1 || matches!(op.opcode, OpCode::IntSub | OpCode::IntAnd);
+            if r.is_empty() || !shared_ok || !r.iter().all(|u| chain.contains(u)) {
+                return false;
+            }
+            // nothing printed after it changes what it reads — also through the definitions of
+            // its inputs in the block that may print inside it (a `setcc`'s folded comparison,
+            // an inlined temporary: `cl = rax == rbx; rbx = rax; if (… | cl)` must keep `cl`)
+            let mut leaves = Vec::new();
+            let mut loads = op.opcode == OpCode::Load;
+            for &i in &op.inputs {
+                collect_leaves(func, readers, i, op.block, 0, &mut leaves, &mut loads);
+            }
+            let reads_changed = leaves.iter().any(|d| written.iter().any(|w| w.overlaps(d)));
+            !(reads_changed || (loads && memory_written))
+        });
+        if folds {
+            chain.push(o);
+            continue;
+        }
+        // (a phi is no statement: it is first in the block, nothing folds above it)
+        if op.opcode == OpCode::MultiEqual {
             break;
         }
-        // read by several ops only when it is what a compare's flags are computed from
-        let r = readers.of(func, out);
-        let shared_ok = r.len() == 1 || matches!(op.opcode, OpCode::IntSub | OpCode::IntAnd);
-        if r.is_empty() || !shared_ok || !r.iter().all(|u| ops[start..].contains(u)) {
-            break;
+        if let Some(out) = op.output {
+            written.push(func.varnodes[out as usize].data);
         }
-        start -= 1;
+        if matches!(op.opcode, OpCode::Store | OpCode::Call | OpCode::CallInd | OpCode::CallOther) {
+            memory_written = true;
+        }
+        // (a call also writes the registers its INDIRECTs name, listed as ops of their own)
     }
-    &body[start..]
+    chain.remove(0);
+    chain.reverse();
+    chain
+}
+
+/// The storage `v` reads, and — through its pure definition in `block` — what that reads (up
+/// to a depth); `loads` when a load is among them. A temporary copied to a register may print
+/// as that register (`emit::Coalesced`): the register counts too.
+fn collect_leaves(
+    func: &SsaFunction,
+    readers: &Readers,
+    v: VarId,
+    block: BlockId,
+    depth: u32,
+    out: &mut Vec<reargo_core::pcode::VarnodeData>,
+    loads: &mut bool,
+) {
+    let d = func.varnodes[v as usize].data;
+    if d.space == reargo_core::address::SpaceId::CONST {
+        return;
+    }
+    out.push(d);
+    if d.space == reargo_core::address::SpaceId::UNIQUE {
+        for &r in readers.of(func, v) {
+            let op = &func.ops[r];
+            if op.opcode == OpCode::Copy && let Some(o) = op.output {
+                out.push(func.varnodes[o as usize].data);
+            }
+        }
+    }
+    let Some(def) = func.varnodes[v as usize].def_op.map(|o| &func.ops[o]) else { return };
+    // (only a temporary or a flag may print inside its reader — an inlined temporary, a `setcc`'s
+    // folded comparison; a register is assigned by a statement and stands for its value)
+    let inlinable = d.space == reargo_core::address::SpaceId::UNIQUE
+        || (d.space == reargo_core::address::SpaceId::REGISTER && (0x200..0x210).contains(&d.offset));
+    if def.dead || def.block != block || !is_pure(def.opcode) || depth >= 6 || !inlinable {
+        return;
+    }
+    *loads |= def.opcode == OpCode::Load;
+    for &i in &def.inputs {
+        collect_leaves(func, readers, i, block, depth + 1, out, loads);
+    }
 }
 
 /// The CFG with short-circuit tests merged, and the condition of each merged block.
@@ -558,6 +629,8 @@ pub struct Inliner {
     exprs: std::cell::RefCell<FxHashMap<ValueKey, String>>,
     by_block: std::cell::OnceCell<Vec<Vec<OpIdx>>>,
     readers: std::cell::OnceCell<Readers>,
+    /// the first op of each block (`flags::block_starts`)
+    starts: std::cell::OnceCell<Vec<usize>>,
     /// block -> (the ops folded into its own condition, the condition's text)
     own: std::cell::RefCell<FxHashMap<BlockId, Option<OwnCondition>>>,
 }
@@ -577,6 +650,47 @@ impl Inliner {
         (self.by_block.get_or_init(|| ops_by_block(func)), self.readers.get_or_init(|| Readers::new(func)))
     }
 
+    /// WS89: a flag a block's branch reads that another block computed — `cmp r12, r13; je L`
+    /// leaves the `jb` reading `CF` in the next block, which printed `var_201 = r12 < r13;` there
+    /// and `if (!var_201)` here. The comparison (of registers / constants only) folds into this
+    /// condition, before `chain` (the block's own folded ops), when nothing but the condition
+    /// reads it and its operands keep their values on every path from it to here
+    /// (`flags::operands_hold`, which also needs it to dominate this block).
+    fn with_cross_block(&self, func: &SsaFunction, block: BlockId, chain: Vec<OpIdx>) -> Vec<OpIdx> {
+        let (by_block, readers) = self.parts(func);
+        let Some(&br) = by_block[block].last() else { return chain };
+        if func.ops[br].opcode != OpCode::CBranch || func.ops[br].inputs.len() < 2 {
+            return chain;
+        }
+        let starts = self.starts.get_or_init(|| crate::flags::block_starts(func));
+        let mut readers_ok: Vec<OpIdx> = chain.clone();
+        readers_ok.push(br);
+        let mut cross: Vec<OpIdx> = Vec::new();
+        for &r in readers_ok.iter() {
+            for &v in &func.ops[r].inputs {
+                let Some(d) = func.varnodes[v as usize].def_op else { continue };
+                let def = &func.ops[d];
+                let compare = matches!(
+                    def.opcode,
+                    OpCode::IntEqual | OpCode::IntNotEqual | OpCode::IntLess | OpCode::IntLessEqual | OpCode::IntSLess | OpCode::IntSLessEqual
+                );
+                if def.dead || def.block == block || !compare || cross.contains(&d) {
+                    continue;
+                }
+                let plain = def.inputs.iter().all(|&i| {
+                    matches!(func.varnodes[i as usize].data.space, reargo_core::address::SpaceId::REGISTER | reargo_core::address::SpaceId::CONST)
+                });
+                let only_here = def.output.is_some_and(|o| readers.of(func, o).iter().all(|u| readers_ok.contains(u)));
+                if plain && only_here && crate::flags::operands_hold(func, starts, &[d], r, &def.inputs) {
+                    cross.push(d);
+                }
+            }
+        }
+        cross.sort_unstable();
+        cross.extend(chain);
+        cross
+    }
+
     /// A block's own branch condition with its [`condition_tail`] folded in (WS81): the ops
     /// not to print as statements and the condition's text, or `None` when nothing folds (or
     /// an op of the tail does not print as `dst = rhs;`). Cached: the statements and the
@@ -593,12 +707,12 @@ impl Inliner {
         }
         let (by_block, readers) = self.parts(func);
         let ops = &by_block[block];
-        let tail = condition_tail(func, ops, readers);
+        let tail = self.with_cross_block(func, block, condition_tail(func, ops, readers));
         let r = if tail.is_empty() {
             None
         } else {
             let cv = func.ops[*ops.last().unwrap()].inputs[1];
-            self.fold_ops(func, tail, cv, name, emit, Some(MAX_FOLDED_LEN)).map(|f| (tail.to_vec(), f))
+            self.fold_ops(func, &tail, cv, name, emit, Some(MAX_FOLDED_LEN)).map(|f| (tail, f))
         };
         self.own.borrow_mut().insert(block, r.clone());
         r
@@ -720,7 +834,7 @@ impl Inliner {
         let ops = &by_block[block];
         let Some(&br) = ops.last() else { return Folded::plain("cond".into()) };
         let Some(&cv) = func.ops[br].inputs.get(1) else { return Folded::plain("cond".into()) };
-        let body = condition_ops(func, ops, readers).unwrap_or_default();
+        let body = self.with_cross_block(func, block, condition_ops(func, ops, readers).unwrap_or_default());
         if let Some(f) = self.fold_ops(func, &body, cv, name, emit, None) {
             return f;
         }
