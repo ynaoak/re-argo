@@ -139,7 +139,44 @@ impl Frame {
     }
 
     /// Follow the offsets through copies, constant adds and phis (a few passes).
+    ///
+    /// WS92: a phi of the entry block (a loop whose header is the entry: a tail call to
+    /// itself after the epilogue, `jmp f`) takes the offset of its known inputs before the
+    /// back edge's is known — the stack pointer at the latch depends on the phi — and keeps
+    /// it when every input then agrees; else the run is redone without it.
     fn propagate(&mut self, func: &SsaFunction) {
+        let mut refuted: FxHashSet<ValueKey> = FxHashSet::default();
+        for _ in 0..4 {
+            self.propagate_with(func, &refuted);
+            let bad: Vec<ValueKey> = func
+                .ops
+                .iter()
+                .filter(|o| !o.dead && o.opcode == OpCode::MultiEqual && o.block == func.cfg.entry_block)
+                .filter_map(|o| {
+                    let key = value_key(func, o.output?);
+                    let k = *self.offsets.get(&key)?;
+                    let at = |i: usize| func.cfg.blocks[o.block].predecessors.get(i).copied().unwrap_or(o.block);
+                    let agree = o.inputs.iter().enumerate().all(|(i, &v)| self.offset_in(func, v, at(i)) == Some(k));
+                    (!agree).then_some(key)
+                })
+                .collect();
+            if bad.is_empty() {
+                return;
+            }
+            refuted.extend(bad);
+            self.offsets.clear();
+        }
+        let all: FxHashSet<ValueKey> = func
+            .ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::MultiEqual && o.block == func.cfg.entry_block)
+            .filter_map(|o| o.output.map(|v| value_key(func, v)))
+            .collect();
+        self.offsets.clear();
+        self.propagate_with(func, &all);
+    }
+
+    fn propagate_with(&mut self, func: &SsaFunction, refuted: &FxHashSet<ValueKey>) {
         let konst = |v: VarId| {
             let d = &func.varnodes[v as usize].data;
             (d.space == SpaceId::CONST).then_some(d.offset as i64)
@@ -170,7 +207,8 @@ impl Frame {
                         let ks: Vec<Option<i64>> = (0..op.inputs.len()).map(off).collect();
                         // (a loop's phi reads itself: the other inputs decide)
                         let known: Vec<i64> = ks.iter().flatten().copied().collect();
-                        let selfish = op.inputs.iter().zip(&ks).all(|(&v, k)| k.is_some() || value_key(func, v) == key);
+                        let optimistic = op.block == func.cfg.entry_block && !refuted.contains(&key);
+                        let selfish = optimistic || op.inputs.iter().zip(&ks).all(|(&v, k)| k.is_some() || value_key(func, v) == key);
                         (selfish && !known.is_empty() && known.iter().all(|&k| k == known[0])).then(|| known[0])
                     }
                     _ => None,
@@ -392,8 +430,10 @@ impl Frame {
             func.ops
                 .iter()
                 .filter(|o| {
+                    // (WS92: and the stack pointer's phi at an entry block that is a loop header)
                     !o.dead
-                        && matches!(o.opcode, OpCode::IntAdd | OpCode::IntSub | OpCode::Copy)
+                        && (matches!(o.opcode, OpCode::IntAdd | OpCode::IntSub | OpCode::Copy)
+                            || (o.opcode == OpCode::MultiEqual && o.block == func.cfg.entry_block))
                         && o.output.is_some_and(|v| {
                             let d = &func.varnodes[v as usize].data;
                             self.offset_of(func, v).is_some() && (is_rsp(func, v) || d.space == SpaceId::UNIQUE)

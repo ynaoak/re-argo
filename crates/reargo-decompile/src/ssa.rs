@@ -192,11 +192,36 @@ impl SsaFunction {
         // 2. phi placement on the iterated dominance frontier
         // WS82: landing pads are roots too, so their values reach the code after them
         let idom = if n > 0 { crate::dominator::compute_idom_forest(&cfg) } else { Vec::new() };
-        let df = if n > 0 {
+        let mut df = if n > 0 {
             crate::dominator::compute_dominance_frontier(&cfg, &idom)
         } else {
             Vec::new()
         };
+        // WS92: a loop whose header is the entry block. The function's entry is an edge into
+        // that block too (from a virtual block before it), so the block is a join: it is in
+        // the frontier of every block on the dominator path from a predecessor up to itself,
+        // and its phis take one input more than it has predecessors — the last, the value on
+        // entry. (Without it, `0x1000: … add rdi, 8; cmp rdi, rsi; jne 0x1000` read the
+        // incoming `rdi` at the top of every iteration.)
+        let entry_is_join = n > 0 && !cfg.blocks[cfg.entry_block].predecessors.is_empty();
+        if entry_is_join {
+            let e = cfg.entry_block;
+            for &p in &cfg.blocks[e].predecessors {
+                if p != e && idom[p].is_none() {
+                    continue; // not reached from the entry
+                }
+                let mut runner = p;
+                loop {
+                    if !df[runner].contains(&e) {
+                        df[runner].push(e);
+                    }
+                    match idom[runner] {
+                        Some(up) if up != runner && runner != e => runner = up,
+                        _ => break,
+                    }
+                }
+            }
+        }
         let mut phis: Vec<Vec<Key>> = vec![Vec::new(); n];
         let mut keys: Vec<Key> = globals.iter().copied().collect();
         keys.sort_unstable(); // deterministic phi order
@@ -232,7 +257,7 @@ impl SsaFunction {
                     index: idx,
                     opcode: OpCode::MultiEqual,
                     output: None,
-                    inputs: smallvec::smallvec![VarId::MAX; block.predecessors.len()],
+                    inputs: smallvec::smallvec![VarId::MAX; block.predecessors.len() + usize::from(entry_is_join && b == cfg.entry_block)],
                     block: b,
                     address: block.start_addr,
                     dead: false,
@@ -292,6 +317,12 @@ impl SsaFunction {
                 let mut idx = block_start[b];
                 for &k in &phis[b] {
                     let vn = VarnodeData::new(SpaceId(k.0), k.1, k.2);
+                    if entry_is_join && b == cfg.entry_block {
+                        // the value on entry (read before any version is pushed)
+                        let incoming = self.get_or_create_var(&vn);
+                        self.varnodes[incoming as usize].uses.push(idx);
+                        *self.ops[idx].inputs.last_mut().expect("the entry input") = incoming;
+                    }
                     let out = self.new_version_var(&vn);
                     self.varnodes[out as usize].def_op = Some(idx);
                     self.ops[idx].output = Some(out);
