@@ -103,6 +103,11 @@ pub struct DynamicInfo {
     /// Entries of the functions the ELF image defines in `.dynsym`
     /// (callable from other images), sorted.
     pub exported_functions: Vec<u64>,
+    /// GOT slots the dynamic loader fills with the address of a named
+    /// symbol: `(slot address, symbol name)` for every `GLOB_DAT` /
+    /// `JUMP_SLOT` / absolute-address relocation against a named dynamic
+    /// symbol. Version suffixes are not part of the name. Sorted by slot.
+    pub got_slots: Vec<(u64, String)>,
 }
 
 
@@ -420,7 +425,21 @@ impl BinaryLoader {
             .collect();
         exported_functions.sort_unstable();
         exported_functions.dedup();
-        let mut dynamic = DynamicInfo { exported_functions, ..DynamicInfo::default() };
+        let mut got_slots: Vec<(u64, String)> = Vec::new();
+        for reloc in elf.dynrelas.iter().chain(elf.pltrelocs.iter()) {
+            if !Self::is_symbol_binding_reloc(elf.header.e_machine, reloc.r_type) || reloc.r_sym == 0 {
+                continue;
+            }
+            if let Some(sym) = elf.dynsyms.get(reloc.r_sym)
+                && let Some(name) = elf.dynstrtab.get_at(sym.st_name)
+                && !name.is_empty()
+            {
+                got_slots.push((reloc.r_offset, name.to_string()));
+            }
+        }
+        got_slots.sort_unstable();
+        got_slots.dedup();
+        let mut dynamic = DynamicInfo { exported_functions, got_slots, ..DynamicInfo::default() };
         if let Some(ref dyns) = elf.dynamic {
             for d in &dyns.dyns {
                 if d.d_tag == goblin::elf::dynamic::DT_NEEDED
@@ -455,6 +474,22 @@ impl BinaryLoader {
             dynamic,
             address_map,
         })
+    }
+
+    /// Relocation types that store a symbol's address in a slot
+    /// (`GLOB_DAT`, `JUMP_SLOT`, absolute) for the machines we resolve
+    /// GOT slots on.
+    fn is_symbol_binding_reloc(machine: u16, r_type: u32) -> bool {
+        use goblin::elf::header::{EM_386, EM_AARCH64, EM_X86_64};
+        match machine {
+            // R_X86_64_64, GLOB_DAT, JUMP_SLOT
+            EM_X86_64 => matches!(r_type, 1 | 6 | 7),
+            // R_386_32, GLOB_DAT, JMP_SLOT
+            EM_386 => matches!(r_type, 1 | 6 | 7),
+            // R_AARCH64_ABS64, GLOB_DAT, JUMP_SLOT
+            EM_AARCH64 => matches!(r_type, 257 | 1025 | 1026),
+            _ => false,
+        }
     }
 
     fn elf_arch(elf: &goblin::elf::Elf) -> Architecture {
