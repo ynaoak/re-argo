@@ -2068,9 +2068,9 @@ mod tests {
         let either = |l: &str, a: &str, b: &str| l.contains(a) || l.contains(b);
         assert!(either(&cond_of(0x76), "edi <= 5", "edi > 5"), "jbe: {}", cond_of(0x76));
         assert!(either(&cond_of(0x77), "edi > 5", "edi <= 5"), "ja: {}", cond_of(0x77));
-        assert!(either(&cond_of(0x7c), "(int32_t)edi < (int32_t)5", "(int32_t)edi >= (int32_t)5"), "jl: {}", cond_of(0x7c));
-        assert!(either(&cond_of(0x7e), "(int32_t)edi <= (int32_t)5", "(int32_t)edi > (int32_t)5"), "jle: {}", cond_of(0x7e));
-        assert!(either(&cond_of(0x7f), "(int32_t)edi > (int32_t)5", "(int32_t)edi <= (int32_t)5"), "jg: {}", cond_of(0x7f));
+        assert!(either(&cond_of(0x7c), "(int32_t)edi < 5", "(int32_t)edi >= 5"), "jl: {}", cond_of(0x7c));
+        assert!(either(&cond_of(0x7e), "(int32_t)edi <= 5", "(int32_t)edi > 5"), "jle: {}", cond_of(0x7e));
+        assert!(either(&cond_of(0x7f), "(int32_t)edi > 5", "(int32_t)edi <= 5"), "jg: {}", cond_of(0x7f));
     }
 
     /// WS81: a `jmp` to another function is a tail call: `return f(…);` with its argument.
@@ -2107,7 +2107,7 @@ mod tests {
             0xc3,
         ]);
         let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
-        assert!(cond.contains("(int32_t)esi > (int32_t)5") || cond.contains("(int32_t)esi <= (int32_t)5"), "{c}");
+        assert!(cond.contains("(int32_t)esi > 5") || cond.contains("(int32_t)esi <= 5"), "{c}");
         assert!(!cond.contains("!("), "{c}");
     }
 
@@ -2511,7 +2511,7 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("SBORROW"), "{c}");
         assert!(c.contains("old_1 = "), "{c}");
-        assert!(c.contains("(int32_t)old_1 <= (int32_t)1") || c.contains("(int32_t)old_1 > (int32_t)1"), "{c}");
+        assert!(c.contains("(int32_t)old_1 <= 1") || c.contains("(int32_t)old_1 > 1"), "{c}");
     }
 
     /// `sub edi, esi; jl; jo`: the overflow flag is read twice, so `edi`'s old value cannot
@@ -2604,7 +2604,7 @@ mod tests {
         assert!(!c.contains("SBORROW") && !c.contains("var_20b"), "{c}");
         // (`ecx` is read only by the test: its load folds into the condition)
         let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
-        assert!(cond.contains(" > (int32_t)0") || cond.contains(" <= (int32_t)0"), "{c}");
+        assert!(cond.contains(" > 0") || cond.contains(" <= 0"), "{c}");
         assert!(!cond.contains("!0") && !cond.contains("||"), "{c}");
     }
 
@@ -3524,7 +3524,7 @@ mod tests {
         assert!(!c.contains("tmp_100"), "{c}");
         assert_eq!(c.matches("((al & 1) == 0) ?").count(), 2, "{c}");
         assert!(c.contains("(rsi == rdx) ?"), "{c}");
-        assert!(c.contains("((int32_t)ecx < (int32_t)0) ?"), "{c}");
+        assert!(c.contains("((int32_t)ecx < 0) ?"), "{c}");
     }
 
     /// Two `cmov`s on one `test` with its register overwritten between them: the second names
@@ -4338,6 +4338,6 @@ mod tests {
         ];
         let c = c_of(&code);
         assert!(!c.contains("overflow_p") && !c.contains("!= !") && !c.contains("var_20"), "{c}");
-        assert!(c.contains("= (int64_t)rsi < (int64_t)rdx;") && c.contains("= (int64_t)rdi < (int64_t)0;"), "{c}");
+        assert!(c.contains("= (int64_t)rsi < (int64_t)rdx;") && c.contains("= (int64_t)rdi < 0;"), "{c}");
     }
 }

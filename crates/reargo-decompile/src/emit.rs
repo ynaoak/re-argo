@@ -2006,6 +2006,11 @@ fn text_int_type(s: &str) -> Option<(u32, bool)> {
 /// — both keep the value modulo 2^W read as two's complement (C's conversion to a signed type
 /// out of its range is implementation-defined; GCC and Clang define it so).
 fn signed_operand(ty: &str, w: u32, text: &str) -> String {
+    // a constant the signed type holds as it is needs no cast (`(int64_t)rdi < 0`)
+    let value = text.strip_prefix("0x").map_or_else(|| text.parse::<u64>().ok(), |h| u64::from_str_radix(h, 16).ok());
+    if value.is_some_and(|v| (1..=8).contains(&w) && v < 1u64 << (8 * w - 1)) {
+        return text.to_string();
+    }
     match int_cast(strip_outer_parens(text)) {
         Some((cw, _, y)) if cw == w => format!("({ty}){y}"),
         _ => format!("({ty}){text}"),
@@ -2355,6 +2360,10 @@ mod tests {
         assert_eq!(signed_operand("int32_t", 4, "((uint32_t)rax)"), "(int32_t)rax");
         assert_eq!(signed_operand("int32_t", 4, "((uint16_t)rax)"), "(int32_t)((uint16_t)rax)");
         assert_eq!(signed_operand("int32_t", 4, "ebp"), "(int32_t)ebp");
+        assert_eq!(signed_operand("int32_t", 4, "0"), "0");
+        assert_eq!(signed_operand("int32_t", 4, "0x7fffffff"), "0x7fffffff");
+        assert_eq!(signed_operand("int32_t", 4, "0xffffffff"), "(int32_t)0xffffffff");
+        assert_eq!(signed_operand("int8_t", 1, "0x80"), "(int8_t)0x80");
         assert_eq!(drop_widening_casts("(uint8_t)*(uint32_t*)rbx"), "(uint8_t)*(uint32_t*)rbx");
     }
     use crate::cfg::ControlFlowGraph;
