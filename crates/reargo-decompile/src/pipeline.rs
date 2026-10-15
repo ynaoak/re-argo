@@ -4158,5 +4158,8 @@ mod tests {
         for c in [&c1, &c2, &c3] {
             assert!(!c.contains("lt_") && !c.contains("var_20"), "{c}");
         }
+        // the Rust output extends to the destination's width
+        let r = rust_of(&[0x39, 0xf7, 0x19, 0xc0, 0xc3]);
+        assert!(r.contains("eax = 0.wrapping_sub((((edi < esi) as u8) as u32));"), "{r}");
     }
 }

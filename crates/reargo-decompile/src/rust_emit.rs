@@ -779,7 +779,9 @@ impl<'a> RustEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let src_ty = size_to_rust_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({} as {}) as u64;", dst, a, src_ty))
+                // (to the destination's own width, WS90: `eax = (x as u8) as u32;`, not `as u64`)
+                let dst_ty = size_to_rust_type(func.varnodes[op.output? as usize].data.size);
+                Some(format!("{} = ({} as {}) as {};", dst, a, src_ty, dst_ty))
             }
             OpCode::Piece if op.inputs.len() >= 2 => {
                 // PIECE(hi, lo): concatenation with `lo` in the low bytes.
