@@ -308,6 +308,17 @@ impl Frame {
         self.offsets.get(&value_key(func, v)).copied()
     }
 
+    /// Whether value `v` read in `block` is a stack address (a known offset from the entry
+    /// `rsp`, WS91).
+    pub fn is_stack(&self, func: &SsaFunction, v: VarId, block: usize) -> bool {
+        self.offset_in(func, v, block).is_some()
+    }
+
+    /// The offset from the entry `rsp` of value `v` read in `block`, when known (WS91).
+    pub fn offset_at(&self, func: &SsaFunction, v: VarId, block: usize) -> Option<i64> {
+        self.offset_in(func, v, block)
+    }
+
     /// The named slots, by start.
     pub fn slots(&self) -> impl Iterator<Item = &Slot> {
         self.slots.values()

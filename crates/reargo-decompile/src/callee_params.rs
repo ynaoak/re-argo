@@ -73,6 +73,29 @@ pub struct CalleeParams<'a> {
     /// The convention's return registers (`rax`, `xmm0`).
     returns: Vec<VarnodeData>,
     ret_memo: Mutex<FxHashMap<(u64, u32), ReturnKind>>,
+    /// Registers a call may change (the convention's returns and clobbers).
+    caller_saved: Vec<VarnodeData>,
+    /// How a callee uses its pointer parameters (WS91), by callee.
+    fields_memo: Mutex<FxHashMap<u64, std::sync::Arc<ParamUse>>>,
+}
+
+/// How a function uses its pointer parameters (WS91).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParamUse {
+    /// The memory it accesses through them.
+    pub fields: Vec<ParamAccess>,
+    /// Every `ret` returns the first argument's incoming value: a struct returned in memory
+    /// (`rdi` is the result's address, so a method's `this` is the second argument).
+    pub returns_first: bool,
+}
+
+/// A memory access a function makes through one of its parameters (WS91): `*(T*)(param + off)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamAccess {
+    /// the parameter (index into the convention's arguments)
+    pub arg: usize,
+    pub off: u64,
+    pub size: u32,
 }
 
 /// Which return register a callee leaves its result in (WS79).
@@ -101,7 +124,18 @@ impl<'a> CalleeParams<'a> {
             memo: Mutex::new(FxHashMap::default()),
             returns: cc.returns.iter().map(|(r, _)| *r).collect(),
             ret_memo: Mutex::new(FxHashMap::default()),
+            caller_saved: cc.returns.iter().chain(cc.clobbers.iter()).map(|(r, _)| *r).collect(),
+            fields_memo: Mutex::new(FxHashMap::default()),
         })
+    }
+
+    /// The memory the function at `target` accesses through its parameters (WS91): every
+    /// load / store whose address is a parameter's incoming value plus a constant (followed
+    /// through copies, constant adds and the registers a call keeps), found while its
+    /// parameters are analysed. `None` when it cannot be lifted.
+    pub fn param_use(&self, target: u64) -> Option<std::sync::Arc<ParamUse>> {
+        self.params(target)?;
+        self.fields_memo.lock().ok()?.get(&target).cloned()
     }
 
     pub fn args(&self) -> &[VarnodeData] {
@@ -223,6 +257,12 @@ impl<'a> CalleeParams<'a> {
         // the body runs past the lift limit (its last lifted instruction is live)
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
         let cfg = ControlFlowGraph::build_owned(insns);
+        if depth_left == MAX_DEPTH {
+            let fields = std::sync::Arc::new(param_accesses(&cfg, &self.args, &self.caller_saved, self.returns.first()));
+            if let Ok(mut m) = self.fields_memo.lock() {
+                m.insert(target, fields);
+            }
+        }
         let kind = self.return_kind_of(&cfg, depth_left);
         if let Ok(mut m) = self.ret_memo.lock() {
             m.insert((target, depth_left), kind);
@@ -380,6 +420,105 @@ impl<'a> CalleeParams<'a> {
 struct Acc {
     reads: u32,
     complete: bool,
+}
+
+/// Field offsets past this are no struct fields.
+const MAX_FIELD: i64 = 0x10_0000;
+
+/// What a storage location holds: an argument's incoming value plus a delta.
+type Held = FxHashMap<(SpaceId, u64, u32), (usize, i64)>;
+
+fn kill(state: &mut Held, out: &VarnodeData) {
+    state.retain(|&(sp, off, sz), _| !(sp == out.space && off < out.offset + u64::from(out.size) && out.offset < off + u64::from(sz)));
+}
+
+/// The loads / stores of a body whose address is an argument's incoming value plus a constant
+/// (WS91): a forward data flow of "holds argument `i` + delta" over copies and constant adds,
+/// meeting at joins where the predecessors agree; a call forgets the registers it may change.
+fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[VarnodeData], ret: Option<&VarnodeData>) -> ParamUse {
+    let n = cfg.blocks.len();
+    let mut inn: Vec<Option<Held>> = vec![None; n];
+    let mut entry = Held::default();
+    for (i, a) in args.iter().enumerate().filter(|(_, a)| a.size == 8) {
+        entry.insert((a.space, a.offset, a.size), (i, 0));
+    }
+    inn[cfg.entry_block] = Some(entry);
+    let rpo = crate::dominator::reverse_post_order(cfg);
+    let mut found: Vec<ParamAccess> = Vec::new();
+    let mut returns: Vec<bool> = Vec::new();
+    for pass in 0..8 {
+        returns.clear();
+        let mut changed = false;
+        let last = pass == 7;
+        for &b in &rpo {
+            let Some(mut st) = inn[b].clone() else { continue };
+            for insn in &cfg.blocks[b].instructions {
+                for op in &insn.ops {
+                    let held = |st: &Held, v: &VarnodeData| st.get(&(v.space, v.offset, v.size)).copied();
+                    match op.opcode {
+                        OpCode::Load | OpCode::Store => {
+                            let size = match op.opcode {
+                                OpCode::Load => op.output.map(|o| o.size),
+                                _ => op.inputs.get(2).map(|v| v.size),
+                            };
+                            if let (Some(a), Some(size)) = (op.inputs.get(1).and_then(|v| held(&st, v)), size)
+                                && (0..MAX_FIELD).contains(&a.1)
+                            {
+                                let acc = ParamAccess { arg: a.0, off: a.1 as u64, size };
+                                if !found.contains(&acc) {
+                                    found.push(acc);
+                                }
+                            }
+                        }
+                        OpCode::Call | OpCode::CallInd => {
+                            for r in caller_saved {
+                                kill(&mut st, r);
+                            }
+                            st.retain(|k, _| k.0 != SpaceId::UNIQUE);
+                            continue;
+                        }
+                        OpCode::Return => {
+                            returns.push(ret.is_some_and(|r| st.get(&(r.space, r.offset, r.size)) == Some(&(0, 0))));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let Some(out) = op.output else { continue };
+                    let konst = |v: &VarnodeData| (v.space == SpaceId::CONST).then_some(v.offset as i64);
+                    let v = match (op.opcode, op.inputs.as_slice()) {
+                        (OpCode::Copy, [a]) => held(&st, a),
+                        (OpCode::IntAdd, [a, b]) => held(&st, a).zip(konst(b)).or_else(|| held(&st, b).zip(konst(a))).map(|((i, d), k)| (i, d.wrapping_add(k))),
+                        (OpCode::IntSub, [a, b]) => held(&st, a).zip(konst(b)).map(|((i, d), k)| (i, d.wrapping_sub(k))),
+                        _ => None,
+                    };
+                    // (the lifter's view sync, `eax = SUBPIECE(rax, 0)`, leaves the register it reads)
+                    let sync = op.opcode == OpCode::Subpiece && op.inputs.first().is_some_and(|r| r.space == out.space && r.offset == out.offset && r.size > out.size);
+                    if sync {
+                        st.remove(&(out.space, out.offset, out.size));
+                    } else {
+                        kill(&mut st, &out);
+                    }
+                    if let Some(v) = v.filter(|_| out.size == 8) {
+                        st.insert((out.space, out.offset, out.size), v);
+                    }
+                }
+            }
+            for &succ in &cfg.blocks[b].successors {
+                let new = match &inn[succ] {
+                    None => st.clone(),
+                    Some(old) => old.iter().filter(|(k, v)| st.get(k) == Some(v)).map(|(k, v)| (*k, *v)).collect(),
+                };
+                if succ != cfg.entry_block && inn[succ].as_ref() != Some(&new) {
+                    inn[succ] = Some(new);
+                    changed = true;
+                }
+            }
+        }
+        if !changed || last {
+            break;
+        }
+    }
+    ParamUse { fields: found, returns_first: !returns.is_empty() && returns.iter().all(|&r| r) }
 }
 
 /// Group the argument registers into classes (System V: integer, vector) by

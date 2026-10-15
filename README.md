@@ -17,7 +17,7 @@ Originally started as a Rust reimplementation of [NSA Ghidra](https://github.com
 - **6 architectures**: x86 / x64, ARM / AArch64, RISC-V, MIPS, PowerPC, SPARC
 - **Full P-code IR**: 74 opcodes with emulation support
 - **68 analyzers** in priority order: function discovery (recursive descent + linear sweep), 312-entry signature DB (libc / POSIX / Win32 / libstdc++), CRT pattern recognition, VSA + multi-block constant tracker, RTTI / VTable recovery, calling-convention inference, anti-debug / crypto / loop / exception / wrapper / no-return propagation, BN-style tag categorisation, hot-function detection, dead-code, callgraph SCC, complexity metrics
-- **Decompiler**: SSA construction, 6 optimisation passes, type inference, C / Rust pseudocode output with **inline analyzer comments + signature-aware call rendering** (`printf("hi %d", 42)` instead of `printf@plt()`)
+- **Decompiler**: SSA construction, 6 optimisation passes, type inference, C / Rust pseudocode output with **inline analyzer comments + signature-aware call rendering** (`printf("hi %d", 42)` instead of `printf@plt()`), **struct field recovery** (`this->field_10`, typed `struct X*` pointers, fields merged across calls) and **member-style virtual calls** named from RTTI (`rdi->vfn_6(rsi);  // = BiomeSource3d::method_at_43fadc0`)
 - **Debug info**: DWARF (functions, types, parameters, line numbers, source-file plates), PDB headers / types
 - **SLEIGH runtime**: packed format reader, decision trees, context database, zlib decompression
 - **Binary formats**: ELF, PE (with `.pdata` / TLS callbacks / IAT / `.rsrc` VS_VERSIONINFO / Rich Header), Mach-O (with ObjC classes / methods / ivars / protocols), COFF, raw binary

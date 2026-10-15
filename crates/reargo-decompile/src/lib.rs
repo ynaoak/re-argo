@@ -29,6 +29,7 @@ pub mod semantic_diff;
 pub mod swap;
 pub mod switch;
 pub mod ssa;
+pub mod structs;
 pub mod structure;
 pub mod taint;
 pub mod token;
@@ -36,7 +37,10 @@ pub mod typeinfer;
 pub mod varrecovery;
 pub mod vcall;
 
-pub use pipeline::{analyze_taint, decompile, decompile_all, decompile_function, DecompileResult, DecompileStats, TaintReport};
+pub use pipeline::{
+    analyze_taint, decompile, decompile_all, decompile_all_with_options, decompile_function, decompile_function_with_options, DecompileOptions, DecompileResult,
+    DecompileStats, TaintReport,
+};
 pub use semantic_diff::{compare_programs, structural_hash, exact_hash, FunctionDiff, FunctionDiffKind};
 pub use taint::{TaintEngine, TaintSink, TaintSinkKind};
 pub use token::{Token, TokenDocument, TokenLine, TokenType};

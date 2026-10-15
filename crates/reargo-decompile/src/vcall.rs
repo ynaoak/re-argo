@@ -168,12 +168,18 @@ const MAX_VTABLES: usize = 8;
 /// the address point is where the run of code pointers before it starts, behind the
 /// type_info pointer and an offset-to-top of 0 or a small negative number.
 pub fn this_vtables(memory: &Memory, entry: u64) -> Vec<u64> {
-    let mut slots = Vec::new();
+    vtables_listing(memory, &[entry]).remove(&entry).unwrap_or_default()
+}
+
+/// [`this_vtables`] of several functions in one pass over the relocations (WS91).
+pub fn vtables_listing(memory: &Memory, targets: &[u64]) -> FxHashMap<u64, Vec<u64>> {
+    let wanted: FxHashSet<u64> = targets.iter().copied().collect();
+    let mut slots: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     if let Some(data) = memory.dynamic_relocations() {
         for e in data.chunks_exact(RELA_SIZE as usize) {
             let word = |i: usize| u64::from_le_bytes(e[i * 8..i * 8 + 8].try_into().unwrap());
-            if word(2) == entry && is_relative(word(1)) {
-                slots.push(word(0));
+            if wanted.contains(&word(2)) && is_relative(word(1)) {
+                slots.entry(word(2)).or_default().push(word(0));
             }
         }
     } else {
@@ -184,14 +190,22 @@ pub fn this_vtables(memory: &Memory, entry: u64) -> Vec<u64> {
             let Some(data) = &b.data else { continue };
             let skip = ((8 - b.start % 8) % 8) as usize;
             for (i, w) in data.get(skip..).unwrap_or(&[]).chunks_exact(8).enumerate() {
-                if u64::from_le_bytes(w.try_into().unwrap()) == entry {
-                    slots.push(b.start + skip as u64 + i as u64 * 8);
+                let v = u64::from_le_bytes(w.try_into().unwrap());
+                if wanted.contains(&v) {
+                    slots.entry(v).or_default().push(b.start + skip as u64 + i as u64 * 8);
                 }
             }
         }
     }
+    slots.into_iter().map(|(f, s)| (f, address_points(memory, &s))).filter(|(_, p)| !p.is_empty()).collect()
+}
+
+/// The vtable address points the slots `slots` belong to: where the run of code pointers
+/// before a slot starts, behind the type_info pointer and an offset-to-top of 0 or a small
+/// negative number (at most [`MAX_VTABLES`]).
+fn address_points(memory: &Memory, slots: &[u64]) -> Vec<u64> {
     let mut points = Vec::new();
-    for s in slots {
+    for &s in slots {
         let mut p = s;
         let mut steps = 0;
         while steps < 4096 && pointer_at(memory, p - 8).is_some_and(|v| is_code(memory, v)) {
@@ -210,6 +224,133 @@ pub fn this_vtables(memory: &Memory, entry: u64) -> Vec<u64> {
         }
     }
     points
+}
+
+/// Whether `p` is a vtable's address point (WS91): a code pointer in slot 0, behind it the
+/// `type_info` pointer (data, not code) and an offset-to-top of 0 or a small negative number.
+pub fn is_vtable_point(memory: &Memory, p: u64) -> bool {
+    p >= 16
+        && pointer_at(memory, p).is_some_and(|f| is_code(memory, f))
+        && pointer_at(memory, p - 8).is_some_and(|t| memory.find_block(t).is_some() && !is_code(memory, t))
+        && memory.read_u64(p - 16).is_ok_and(|o| (-0x10_0000..=0).contains(&(o as i64)))
+}
+
+/// The offset-to-top of the vtable at address point `p` (0 for a class's primary vtable).
+fn offset_to_top(memory: &Memory, p: u64) -> Option<i64> {
+    memory.read_u64(p.checked_sub(16)?).ok().map(|v| v as i64)
+}
+
+/// The mangled name a `type_info` points to (`13BiomeSource3d`).
+fn type_info_name(memory: &Memory, ti: u64) -> Option<String> {
+    let name = pointer_at(memory, ti + 8)?;
+    let mut s = Vec::new();
+    for i in 0..512 {
+        match memory.read_byte(name + i)? {
+            0 => break,
+            c => s.push(c),
+        }
+    }
+    let s = String::from_utf8(s).ok()?;
+    s.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'N' || c == b'S').then_some(s)
+}
+
+/// The C++ name of a mangled type (`17CachedBiomeSourceI13BiomeSource3dE` ->
+/// `CachedBiomeSource<BiomeSource3d>`).
+pub fn demangle_type_name(mangled: &str) -> Option<String> {
+    let full = format!("_ZTS{mangled}");
+    let sym = cpp_demangle::Symbol::new(full.as_bytes()).ok()?;
+    let d = sym.demangle(&cpp_demangle::DemangleOptions::default()).ok()?;
+    Some(d.strip_prefix("typeinfo name for ").unwrap_or(&d).to_string())
+}
+
+/// The class of the vtable at address point `p`, from its RTTI (WS91).
+pub fn vtable_class(memory: &Memory, p: u64) -> Option<String> {
+    let ti = pointer_at(memory, p.checked_sub(8)?)?;
+    let m = type_info_name(memory, ti)?;
+    demangle_type_name(&m).or(Some(m))
+}
+
+/// The function in the slot at byte offset `slot` of the vtable at address point `vt`.
+pub fn slot_target(memory: &Memory, vt: u64, slot: u64) -> Option<u64> {
+    pointer_at(memory, vt + slot).filter(|&f| is_code(memory, f))
+}
+
+/// The direct bases of the class whose `type_info` is at `ti`: `__si_class_type_info` has one
+/// pointer at `ti+16`, `__vmi_class_type_info` a count at `ti+20` and `{base, flags}` pairs
+/// from `ti+24`. A base must be a `type_info` (it names a mangled type).
+fn type_info_bases(memory: &Memory, ti: u64) -> Vec<u64> {
+    let is_ti = |b: u64| type_info_name(memory, b).is_some();
+    if let Some(b) = pointer_at(memory, ti + 16) {
+        return if is_ti(b) { vec![b] } else { Vec::new() };
+    }
+    let Some(n) = memory.read_u32(ti + 20).ok().filter(|n| (1..=64).contains(n)) else { return Vec::new() };
+    (0..u64::from(n)).filter_map(|i| pointer_at(memory, ti + 24 + 16 * i)).filter(|&b| is_ti(b)).collect()
+}
+
+/// The class a method listed in the primary vtables `vtables` belongs to (WS91): the class
+/// every one of them derives from (an inherited method is listed in its subclasses' vtables
+/// too), with its vtable. `None` when no listed class is a base of all the others.
+pub fn method_class(memory: &Memory, vtables: &[u64]) -> Option<(String, u64)> {
+    let primary: Vec<(u64, u64)> = vtables
+        .iter()
+        .filter(|&&p| offset_to_top(memory, p) == Some(0))
+        .filter_map(|&p| Some((p, pointer_at(memory, p - 8)?)))
+        .collect();
+    let ancestors = |ti: u64| {
+        let mut seen: Vec<u64> = vec![ti];
+        let mut work = vec![ti];
+        while let Some(t) = work.pop() {
+            if seen.len() > 64 {
+                break;
+            }
+            for b in type_info_bases(memory, t) {
+                if !seen.contains(&b) {
+                    seen.push(b);
+                    work.push(b);
+                }
+            }
+        }
+        seen
+    };
+    let all: Vec<Vec<u64>> = primary.iter().map(|&(_, ti)| ancestors(ti)).collect();
+    let (p, ti) = *primary.iter().find(|&&(_, ti)| all.iter().all(|a| a.contains(&ti)))?;
+    let name = type_info_name(memory, ti)?;
+    Some((demangle_type_name(&name).unwrap_or(name), p))
+}
+
+/// The most derived of several classes (WS91, `(name, vtable)`): the one deriving from every
+/// other (an object passed to methods of a class and of its base is of the derived class).
+/// `None` when none does.
+pub fn most_derived(memory: &Memory, classes: &[(String, u64)]) -> Option<(String, u64)> {
+    if classes.len() == 1 {
+        return classes.first().cloned();
+    }
+    let ti = |vt: u64| pointer_at(memory, vt.checked_sub(8)?);
+    let ancestors = |t: u64| {
+        let mut seen = vec![t];
+        let mut work = vec![t];
+        while let Some(x) = work.pop() {
+            if seen.len() > 64 {
+                break;
+            }
+            for b in type_info_bases(memory, x) {
+                if !seen.contains(&b) {
+                    seen.push(b);
+                    work.push(b);
+                }
+            }
+        }
+        seen
+    };
+    let tis: Vec<Option<u64>> = classes.iter().map(|c| ti(c.1)).collect();
+    classes
+        .iter()
+        .zip(&tis)
+        .find(|(_, t)| t.is_some_and(|t| {
+            let a = ancestors(t);
+            tis.iter().all(|o| o.is_some_and(|o| a.contains(&o)))
+        }))
+        .map(|(c, _)| c.clone())
 }
 
 /// `v` with register / temporary copies looked through.
@@ -392,8 +533,9 @@ mod tests {
     fn virtual_call_on_this_takes_the_slot_functions_parameters() {
         let mem = class_binary();
         let c = crate::pipeline::decompile(&X86Lifter::new_64(), &mem, 0x1000, "m", 100).unwrap().c_code;
-        let call = c.lines().find(|l| l.contains("(*")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi, rsi)"), "{c}");
+        // (WS91: a member call on `this`, its vtable pointer folded into it)
+        let call = c.lines().find(|l| l.contains("vfn")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("rdi->vfn_1(rsi)"), "{c}");
         assert!(call.contains("e.g. 0x1200"), "{c}");
     }
 
@@ -418,7 +560,7 @@ mod tests {
         ])));
         assert_eq!(this_vtables(&mem, 0x1000), vec![0x2010, 0x2050]);
         let c = crate::pipeline::decompile(&X86Lifter::new_64(), &mem, 0x1000, "m", 100).unwrap().c_code;
-        let call = c.lines().find(|l| l.contains("(*")).unwrap_or_else(|| panic!("{c}"));
-        assert!(call.contains("(rdi, rsi, "), "{c}");
+        let call = c.lines().find(|l| l.contains("vfn")).unwrap_or_else(|| panic!("{c}"));
+        assert!(call.contains("rdi->vfn_1(rsi, "), "{c}");
     }
 }
