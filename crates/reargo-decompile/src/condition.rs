@@ -171,6 +171,11 @@ impl Readers {
     pub fn of(&self, func: &SsaFunction, v: VarId) -> &[OpIdx] {
         self.0.get(&value_key(func, v)).map_or(&[], |r| r.as_slice())
     }
+
+    /// The live ops reading the value `k`.
+    pub fn of_key(&self, k: &ValueKey) -> &[OpIdx] {
+        self.0.get(k).map_or(&[], |r| r.as_slice())
+    }
 }
 
 /// When `block` holds nothing but its test, the ops computing the condition (in order, the
@@ -274,7 +279,7 @@ fn collect_leaves(
     // (only a temporary or a flag may print inside its reader — an inlined temporary, a `setcc`'s
     // folded comparison; a register is assigned by a statement and stands for its value)
     let inlinable = d.space == reargo_core::address::SpaceId::UNIQUE
-        || (d.space == reargo_core::address::SpaceId::REGISTER && (0x200..0x210).contains(&d.offset));
+        || crate::flags::is_flag_storage(&d);
     if def.dead || def.block != block || !is_pure(def.opcode) || depth >= 6 || !inlinable {
         return;
     }
@@ -505,6 +510,11 @@ fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKe
             };
             Rel::Cmp { op: le, a, b, negated: false }
         }
+        // (a signed compare computed once at its `cmp`, WS90: `SF != OF` became a copy of it)
+        Copy => match rel(0).or_else(|| earlier_compare(func, *op.inputs.first()?, op.block))? {
+            r @ Rel::Cmp { .. } => r,
+            _ => return None,
+        },
         BoolNegate => match rel(0)? {
             Rel::Cmp { op, a, b, negated } => Rel::Cmp { op, a, b, negated: !negated },
             _ => return None,
@@ -543,6 +553,35 @@ fn earlier_sub(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
         }
     }
     Some(Rel::Sub(a, b))
+}
+
+/// `Cmp(a, b)` when `v` is an integer comparison computed in `block` (not one of the
+/// condition's ops: one several selects read, WS90) and nothing from it on in the block writes
+/// over `a` or `b`.
+fn earlier_compare(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
+    use OpCode::*;
+    let d = func.varnodes[v as usize].def_op?;
+    let c = &func.ops[d];
+    if c.dead || c.block != block || c.inputs.len() != 2 || !matches!(c.opcode, IntSLess | IntLess | IntEqual) {
+        return None;
+    }
+    let (a, b) = (c.inputs[0], c.inputs[1]);
+    let overlaps = |x: VarId, w: &reargo_core::pcode::VarnodeData| {
+        let x = &func.varnodes[x as usize].data;
+        x.space != reargo_core::address::SpaceId::CONST
+            && x.space == w.space
+            && x.offset < w.offset + w.size as u64
+            && w.offset < x.offset + x.size as u64
+    };
+    for later in func.ops[d + 1..].iter().take_while(|o| o.block == block) {
+        if let Some(out) = later.output
+            && !later.dead
+            && (overlaps(a, &func.varnodes[out as usize].data) || overlaps(b, &func.varnodes[out as usize].data))
+        {
+            return None;
+        }
+    }
+    Some(Rel::Cmp { op: c.opcode, a, b, negated: false })
 }
 
 /// A float value that is never a NaN: a constant that is not one, or an integer converted.
@@ -643,7 +682,9 @@ impl Inliner {
             return None;
         }
         let s = exprs.get(&value_key(func, v))?;
-        Some(if is_atomic(s) { s.clone() } else { format!("({s})") })
+        // (WS90: a dereference or an integer cast is a unary expression too: `(int32_t)*(uint32_t*)rsp`,
+        // `(uint32_t)*(uint8_t*)(rax + 4) ^ 0x47`)
+        Some(if is_atomic(s) || crate::emit::is_unary(s) { s.clone() } else { format!("({s})") })
     }
 
     fn parts(&self, func: &SsaFunction) -> (&Vec<Vec<OpIdx>>, &Readers) {

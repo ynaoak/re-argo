@@ -67,6 +67,8 @@ pub fn decompile_with_symbols(
     let own = own_params(oracle.as_ref(), entry);
     let call_returns = callee_return_map(&trimmed, oracle.as_ref(), &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&trimmed));
+    let mut trimmed = trimmed;
+    long_double_tail_returns(&mut trimmed, &call_returns, &mut || crate::callers::return_hint(lifter, memory, entry));
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
@@ -393,6 +395,8 @@ fn decompile_function_inner(
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle, &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&terminated));
+    let mut terminated = terminated;
+    long_double_tail_returns(&mut terminated, &call_returns, &mut || crate::callers::return_hint(lifter, &program.info.memory, func_entry));
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
     // WS82: the exception landing pads, printed after the body
@@ -570,6 +574,87 @@ pub fn is_call_clobber(op: &reargo_core::pcode::OpCode, inputs: &[reargo_core::p
 /// the result does not read the value from before the call (WS75).
 /// `optimize::prune_call_args` later keeps only the arguments set up for the
 /// call. No-op when the lifter has no convention.
+/// WS90: a function whose every `ret` passes on a call's result (`jmp g`, `call g; pop rbx;
+/// ret`) and whose callers pop a `long double` off the x87 stack after calling it returns that
+/// value. Its own code does not show it (the lifter sees no x87 instruction after the call), so
+/// the callers decide (`callers::return_hint`, asked only for a function without x87 code whose
+/// every `ret` follows such a call to a callee not known to return in `rax` / `xmm0`): each of
+/// those calls defines `st0` and each `ret` returns it — `st0 = g(…); return st0;` in a
+/// `long double f(…)`.
+fn long_double_tail_returns(
+    instructions: &mut [LiftedInstruction],
+    call_returns: &rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind>,
+    hint: &mut dyn FnMut() -> Option<crate::callers::ReturnHint>,
+) {
+    use reargo_core::address::SpaceId;
+    use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
+    let x87 = |v: &VarnodeData| v.space == SpaceId::REGISTER && ((0x1100..0x1180).contains(&v.offset) || (0x10a0..0x10b0).contains(&v.offset));
+    let touches_x87 = |i: &LiftedInstruction| i.ops.iter().any(|o| o.output.as_ref().is_some_and(x87) || o.inputs.iter().any(x87));
+    if instructions.iter().any(touches_x87) {
+        return;
+    }
+    let is_call = |o: &PcodeOp| matches!(o.opcode, OpCode::Call | OpCode::CallInd);
+    // each `ret` and the instruction of the call it passes on
+    let mut sites: Vec<(usize, usize)> = Vec::new();
+    for k in 0..instructions.len() {
+        let Some(ret_pos) = instructions[k].ops.iter().position(|o| o.opcode == OpCode::Return && o.inputs.len() == 1) else { continue };
+        if instructions[k].ops[..ret_pos].iter().any(is_call) {
+            sites.push((k, k));
+            continue;
+        }
+        // straight back over at most 6 instructions that neither branch nor call
+        let mut found = None;
+        for j in (k.saturating_sub(7)..k).rev() {
+            let (a, b) = (&instructions[j], &instructions[j + 1]);
+            if a.address + a.length as u64 != b.address {
+                break;
+            }
+            if a.ops.iter().any(is_call) {
+                found = Some(j);
+                break;
+            }
+            if a.ops.iter().any(|o| matches!(o.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd | OpCode::Return)) {
+                break;
+            }
+        }
+        let Some(j) = found else { return };
+        sites.push((k, j));
+    }
+    if sites.is_empty() {
+        return;
+    }
+    // nothing else jumps between a call and its `ret` (a path that made no call)
+    let mut inside: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+    for &(k, j) in &sites {
+        inside.extend(instructions[j + 1..=k].iter().map(|i| i.address));
+    }
+    let jumps_in = instructions.iter().flat_map(|i| i.ops.iter()).any(|o| {
+        matches!(o.opcode, OpCode::Branch | OpCode::CBranch) && o.inputs.first().is_some_and(|t| t.space == SpaceId::RAM && inside.contains(&t.offset))
+    });
+    // (a callee known to return in `rax` / `xmm0` decides)
+    let known = sites.iter().any(|&(_, j)| {
+        matches!(call_returns.get(&instructions[j].address), Some(crate::callee_params::ReturnKind::Int | crate::callee_params::ReturnKind::Float))
+    });
+    if jumps_in || known || hint() != Some(crate::callers::ReturnHint::LongDouble) {
+        return;
+    }
+    let st0 = VarnodeData::new(SpaceId::REGISTER, 0x1100, 10);
+    for (k, j) in sites {
+        let insn = &mut instructions[j];
+        let pos = insn.ops.iter().position(is_call).expect("a call");
+        let call = &insn.ops[pos];
+        let target = call.inputs.first().copied().unwrap_or(VarnodeData::new(SpaceId::CONST, 0, 8));
+        let def = PcodeOp { opcode: OpCode::Indirect, seq: call.seq, output: Some(st0), inputs: smallvec::smallvec![target] };
+        insn.ops.insert(pos + 1, def);
+        for (i, op) in insn.ops.iter_mut().enumerate() {
+            op.seq.order = i as u32;
+        }
+        if let Some(ret) = instructions[k].ops.iter_mut().find(|o| o.opcode == OpCode::Return && o.inputs.len() == 1) {
+            ret.inputs.push(st0);
+        }
+    }
+}
+
 fn apply_call_convention(
     mut instructions: Vec<LiftedInstruction>,
     lifter: &dyn PcodeLift,
@@ -890,7 +975,7 @@ fn choose_return_register(
             }
             Some(crate::callers::ReturnHint::Float(s)) => (float_votes, int_votes, size) = (1, 0, size.max(s)),
             Some(crate::callers::ReturnHint::Int) => (float_votes, int_votes) = (0, 1),
-            None => {}
+            Some(crate::callers::ReturnHint::LongDouble) | None => {}
         }
     }
     // WS80: `return g();` with `g`'s return register unknown: ask what the callers read —
@@ -1160,6 +1245,8 @@ fn build_decompile_result(
     crate::rotate::recover_rotates(&mut ssa);
     // WS85: `tmp_500 = *(…); rdi = tmp_500;` is `rdi = *(…);`
     crate::copyprop::propagate_register_copies(&mut ssa);
+    // WS90: each flag value a boolean of its own (`lt_0 = a < b;`), not the register every compare writes
+    crate::flags::name_flag_webs(&mut ssa);
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
         ssa.signature_params = Some(signature_params(&ssa, info, &args));
@@ -1981,9 +2068,9 @@ mod tests {
         let either = |l: &str, a: &str, b: &str| l.contains(a) || l.contains(b);
         assert!(either(&cond_of(0x76), "edi <= 5", "edi > 5"), "jbe: {}", cond_of(0x76));
         assert!(either(&cond_of(0x77), "edi > 5", "edi <= 5"), "ja: {}", cond_of(0x77));
-        assert!(either(&cond_of(0x7c), "(int32_t)edi < (int32_t)5", "(int32_t)edi >= (int32_t)5"), "jl: {}", cond_of(0x7c));
-        assert!(either(&cond_of(0x7e), "(int32_t)edi <= (int32_t)5", "(int32_t)edi > (int32_t)5"), "jle: {}", cond_of(0x7e));
-        assert!(either(&cond_of(0x7f), "(int32_t)edi > (int32_t)5", "(int32_t)edi <= (int32_t)5"), "jg: {}", cond_of(0x7f));
+        assert!(either(&cond_of(0x7c), "(int32_t)edi < 5", "(int32_t)edi >= 5"), "jl: {}", cond_of(0x7c));
+        assert!(either(&cond_of(0x7e), "(int32_t)edi <= 5", "(int32_t)edi > 5"), "jle: {}", cond_of(0x7e));
+        assert!(either(&cond_of(0x7f), "(int32_t)edi > 5", "(int32_t)edi <= 5"), "jg: {}", cond_of(0x7f));
     }
 
     /// WS81: a `jmp` to another function is a tail call: `return f(…);` with its argument.
@@ -2020,7 +2107,7 @@ mod tests {
             0xc3,
         ]);
         let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_else(|| panic!("{c}"));
-        assert!(cond.contains("(int32_t)esi > (int32_t)5") || cond.contains("(int32_t)esi <= (int32_t)5"), "{c}");
+        assert!(cond.contains("(int32_t)esi > 5") || cond.contains("(int32_t)esi <= 5"), "{c}");
         assert!(!cond.contains("!("), "{c}");
     }
 
@@ -2424,7 +2511,7 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("SBORROW"), "{c}");
         assert!(c.contains("old_1 = "), "{c}");
-        assert!(c.contains("(int32_t)old_1 <= (int32_t)1") || c.contains("(int32_t)old_1 > (int32_t)1"), "{c}");
+        assert!(c.contains("(int32_t)old_1 <= 1") || c.contains("(int32_t)old_1 > 1"), "{c}");
     }
 
     /// `sub edi, esi; jl; jo`: the overflow flag is read twice, so `edi`'s old value cannot
@@ -2517,7 +2604,7 @@ mod tests {
         assert!(!c.contains("SBORROW") && !c.contains("var_20b"), "{c}");
         // (`ecx` is read only by the test: its load folds into the condition)
         let cond = c.lines().find(|l| l.trim_start().starts_with("if (")).unwrap_or_default();
-        assert!(cond.contains(" > (int32_t)0") || cond.contains(" <= (int32_t)0"), "{c}");
+        assert!(cond.contains(" > 0") || cond.contains(" <= 0"), "{c}");
         assert!(!cond.contains("!0") && !cond.contains("||"), "{c}");
     }
 
@@ -2999,7 +3086,7 @@ mod tests {
             0xc3,
             0xc3,
         ]);
-        assert!(c.contains("var_206 = rcx == *(uint64_t*)0x1107;"), "{c}");
+        assert!(c.contains("eq_0 = rcx == *(uint64_t*)0x1107;"), "{c}");
         let c = c_of(&[
             0x44, 0x8b, 0x0c, 0x8a, // mov r9d, [rdx+rcx*4]
             0x48, 0x8d, 0x4c, 0x8a, 0x04, // lea rcx, [rdx+rcx*4+4]
@@ -3313,16 +3400,16 @@ mod tests {
         let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x0e, 0x74, 0x04, 0x48, 0x89, 0x0f, 0xc3, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("rcx = *(uint64_t*)rsi;") && c.contains("if (rax == 0)"), "{c}");
-        assert!(!c.contains("var_206"), "{c}");
+        assert!(!c.contains("var_206") && !c.contains("eq_0"), "{c}");
         // test rax, rax; mov rax, [rsi]; je L; ...: rax changes before the jump
         let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x06, 0x74, 0x04, 0x48, 0x89, 0x07, 0xc3, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("var_206 = rax == 0;") && c.contains("var_206"), "{c}");
+        assert!(c.contains("eq_0 = rax == 0;") && c.contains("if (eq_0)"), "{c}");
         // cmp rax, rbx; sete cl; mov rbx, rax; test cl, cl; jne L; ...: the `sete` prints its
         // comparison, which reads rbx before it changes — it stays a statement
         let code = [0x48, 0x39, 0xd8, 0x0f, 0x94, 0xc1, 0x48, 0x89, 0xc3, 0x84, 0xc9, 0x75, 0x04, 0x48, 0x89, 0x1f, 0xc3, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("cl = rax == rbx;") || c.contains("var_206 = rax == rbx;"), "{c}");
+        assert!(c.contains("cl = rax == rbx;") || c.contains("eq_0 = rax == rbx;"), "{c}");
     }
 
     /// WS89: a flag another block computed folds into the branch reading it when its operands
@@ -3334,12 +3421,12 @@ mod tests {
         // cmp rdi, rsi; je L1; jb L2; xor eax, eax; ret; L1: ret; L2: mov eax, 1; ret
         let code = [0x48, 0x39, 0xf7, 0x74, 0x05, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("rdi < rsi") && !c.contains("var_201"), "{c}");
+        assert!(c.contains("rdi < rsi") && !c.contains("var_201") && !c.contains("lt_0"), "{c}");
         // mov in between: rdi changes before the `jb`
         // cmp rdi, rsi; je L1; mov rdi, rdx; jb L2; xor eax, eax; ret; L1: ret; L2: mov rax, rdi; ret
         let code = [0x48, 0x39, 0xf7, 0x74, 0x08, 0x48, 0x89, 0xd7, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0x48, 0x89, 0xf8, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("var_201 = rdi < rsi;"), "{c}");
+        assert!(c.contains("lt_0 = rdi < rsi;") && c.contains("if (lt_0)"), "{c}");
     }
 
     /// WS89: what a register's own statement computed from does not count as read by a
@@ -3351,7 +3438,7 @@ mod tests {
         // mov rdi, [rbx+0x20]; test rdi, rdi; mov r15, [rsp+0x28]; je L; mov [rsi], r15; L: ret
         let code = [0x48, 0x8b, 0x7b, 0x20, 0x48, 0x85, 0xff, 0x4c, 0x8b, 0x7c, 0x24, 0x28, 0x74, 0x03, 0x4c, 0x89, 0x3e, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("if (rdi != 0)") && !c.contains("var_206"), "{c}");
+        assert!(c.contains("if (rdi != 0)") && !c.contains("var_206") && !c.contains("eq_0"), "{c}");
     }
 
     /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
@@ -3364,12 +3451,12 @@ mod tests {
         let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x75, 0xf9, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("!__atomic_compare_exchange((uint64_t*)rdi, &rax, rcx)"), "{c}");
-        assert!(!c.contains("tmp_") && !c.contains("var_206"), "{c}");
+        assert!(!c.contains("tmp_") && !c.contains("var_206") && !c.contains("eq_0"), "{c}");
         // the flag read later too: a statement
         // mov rax, [rdi]; lock cmpxchg [rdi], rcx; sete al; ret
         let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x0f, 0x94, 0xc0, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("var_206 = __atomic_compare_exchange((uint64_t*)rdi, &rax, rcx);"), "{c}");
+        assert!(c.contains("eq_0 = __atomic_compare_exchange((uint64_t*)rdi, &rax, rcx);"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
     }
 
@@ -3437,7 +3524,7 @@ mod tests {
         assert!(!c.contains("tmp_100"), "{c}");
         assert_eq!(c.matches("((al & 1) == 0) ?").count(), 2, "{c}");
         assert!(c.contains("(rsi == rdx) ?"), "{c}");
-        assert!(c.contains("((int32_t)ecx < (int32_t)0) ?"), "{c}");
+        assert!(c.contains("((int32_t)ecx < 0) ?"), "{c}");
     }
 
     /// Two `cmov`s on one `test` with its register overwritten between them: the second names
@@ -4016,5 +4103,241 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("rdi = rdi - 6;"), "{c}");
         assert!(!c.contains("0xfffffffffffffffa"), "{c}");
+    }
+
+    fn rust_of(code: &[u8]) -> String {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(code, 0x1000);
+        decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().rust_code
+    }
+
+    /// WS90: the carry / overflow flags print with their operands (they printed `INT_SBORROW(...)`).
+    #[test]
+    fn overflow_flags_print_their_operands() {
+        // add edi, esi ; seto al ; ret
+        let c = c_of(&[0x01, 0xf7, 0x0f, 0x90, 0xc0, 0xc3]);
+        assert!(c.contains("__builtin_add_overflow_p((int32_t)edi, (int32_t)esi, (int32_t)0)"), "{c}");
+        // cmp edi, esi ; seto al ; ret
+        let c = c_of(&[0x39, 0xf7, 0x0f, 0x90, 0xc0, 0xc3]);
+        assert!(c.contains("__builtin_sub_overflow_p((int32_t)edi, (int32_t)esi, (int32_t)0)"), "{c}");
+        // add rdi, rsi ; setc al ; ret
+        let c = c_of(&[0x48, 0x01, 0xf7, 0x0f, 0x92, 0xc0, 0xc3]);
+        assert!(c.contains("__builtin_add_overflow_p(rdi, rsi, (uint64_t)0)"), "{c}");
+        assert!(!c.contains("(...)"), "{c}");
+        let r = rust_of(&[0x39, 0xf7, 0x0f, 0x90, 0xc0, 0xc3]);
+        assert!(r.contains("(edi as i32).overflowing_sub(esi as i32).1"), "{r}");
+        assert!(!r.contains("(...)"), "{r}");
+    }
+
+    /// WS90: `cmp; cmovl; …; cmovge` with an operand changed in between — the comparison is
+    /// computed once at the `cmp` and both selects read it (no `INT_SBORROW`, no `!SF != !OF`).
+    #[test]
+    fn signed_compare_read_after_an_operand_changes_is_computed_at_the_cmp() {
+        let code = [
+            0x39, 0xce, // cmp esi, ecx
+            0x8b, 0x17, // mov edx, [rdi]
+            0x0f, 0x4d, 0xd1, // cmovge edx, ecx
+            0x89, 0x17, // mov [rdi], edx
+            0x8b, 0x4f, 0x04, // mov ecx, [rdi+4]
+            0x0f, 0x4d, 0xce, // cmovge ecx, esi
+            0x89, 0x4f, 0x04, // mov [rdi+4], ecx
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(!c.contains("overflow_p") && !c.contains("INT_SBORROW"), "{c}");
+        assert!(!c.contains("!= !"), "{c}");
+        assert_eq!(c.matches("(int32_t)esi < (int32_t)ecx").count(), 2, "{c}");
+        let named = c.lines().find(|l| l.trim_start().ends_with("= (int32_t)esi < (int32_t)ecx;")).unwrap_or_else(|| panic!("{c}"));
+        let name = named.trim_start().split(' ').next().unwrap();
+        assert!(c.contains(&format!("ecx = {name} ? ecx : esi;")), "{c}");
+    }
+
+    /// WS90: each flag kept as a statement is a boolean of its own, named by what it computes
+    /// (it was the carry-flag register `var_201` for both compares).
+    #[test]
+    fn kept_flags_are_named_booleans() {
+        let code = [
+            0x48, 0x39, 0xf7, // cmp rdi, rsi
+            0x74, 0x12, // je ret
+            0x48, 0x89, 0xd7, // mov rdi, rdx
+            0x72, 0x0e, // jb one
+            0x48, 0x39, 0xca, // cmp rdx, rcx
+            0x74, 0x08, // je ret
+            0x4c, 0x89, 0xc2, // mov rdx, r8
+            0x72, 0x04, // jb one
+            0x31, 0xc0, 0xc3, // xor eax, eax; ret
+            0xc3, // ret
+            0x48, 0x89, 0xf8, 0x48, 0x01, 0xd0, 0xc3, // one: mov rax, rdi; add rax, rdx; ret
+        ];
+        let c = c_of(&code);
+        for s in ["bool lt_0;", "bool lt_1;", "lt_0 = rdi < rsi;", "lt_1 = rdx < rcx;", "if (lt_0)", "if (lt_1)"] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+        assert!(!c.contains("var_20"), "{c}");
+        let r = rust_of(&code);
+        assert!(r.contains("lt_0 = rdi < rsi;") && r.contains("lt_1 = rdx < rcx;") && !r.contains("var_20"), "{r}");
+    }
+
+    /// WS90: a signed compare read at a join of two `cmp`s (`cmp; jne L; cmp; L: jl`) is each
+    /// `cmp`'s `a < b`, joined: no sign / overflow flags (`!neg != !ovf`).
+    #[test]
+    fn signed_compare_at_a_join_is_each_cmps_comparison() {
+        let code = [
+            0x48, 0x39, 0xf7, // cmp rdi, rsi
+            0x75, 0x03, // jne L
+            0x48, 0x39, 0xca, // cmp rdx, rcx
+            0x7c, 0x03, // L: jl M
+            0x31, 0xc0, 0xc3, // xor eax, eax; ret
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, // M: mov eax, 1; ret
+        ];
+        let c = c_of(&code);
+        assert!(!c.contains("overflow_p") && !c.contains("!= !") && !c.contains("var_20"), "{c}");
+        for s in ["lt_0 = (int64_t)rdi < (int64_t)rsi;", "lt_0 = (int64_t)rdx < (int64_t)rcx;", "if (lt_0)"] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+    }
+
+    /// WS90: two `cmovg` of one `cmp` whose operands hold both print `a <= b` (the signed
+    /// compare computed at the `cmp` for them reads as the comparison in each select).
+    #[test]
+    fn two_selects_of_one_signed_compare_read_as_comparisons() {
+        let code = [
+            0x3b, 0x70, 0x14, // cmp esi, [rax+0x14]
+            0x4c, 0x0f, 0x4f, 0xf2, // cmovg r14, rdx
+            0x48, 0x8b, 0x54, 0x24, 0x40, // mov rdx, [rsp+0x40]
+            0x4d, 0x0f, 0x4f, 0xe7, // cmovg r12, r15
+            0x4c, 0x89, 0x27, // mov [rdi], r12
+            0x4c, 0x89, 0x77, 0x08, // mov [rdi+8], r14
+            0x48, 0x89, 0x57, 0x10, // mov [rdi+16], rdx
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert_eq!(c.matches("((int32_t)esi <= (int32_t)tmp_510) ?").count(), 2, "{c}");
+        assert!(!c.contains("||"), "{c}");
+    }
+
+    /// WS90: a zero extension of an operand that already has the source type casts once
+    /// (`(uint64_t)(uint32_t)eax` -> `(uint64_t)eax`); a sign extension of an unsigned operand
+    /// keeps its signed cast.
+    #[test]
+    fn extensions_cast_once_when_the_operand_has_the_type() {
+        // movzx eax, byte [rdi]; mov [rsi], rax; mov ecx, edx; add rcx, r8; mov [rsi+8], rcx; movsx r9, word [rdi+2]; mov [rsi+16], r9; ret
+        let code = [0x0f, 0xb6, 0x07, 0x48, 0x89, 0x06, 0x89, 0xd1, 0x4c, 0x01, 0xc1, 0x48, 0x89, 0x4e, 0x08, 0x4c, 0x0f, 0xbf, 0x4f, 0x02, 0x4c, 0x89, 0x4e, 0x10, 0xc3];
+        let c = c_of(&code);
+        for s in ["eax = (uint32_t)*(uint8_t*)rdi;", "rax = (uint64_t)eax;", "rcx = (uint64_t)ecx;", "r9 = (int64_t)(int16_t)*(uint16_t*)(rdi + 2);"] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+    }
+
+    /// WS90: `sbb` / `adc` after a `cmp` read the comparison as a number (they printed
+    /// `rdx = (rdx - 0xffffffffffffffff) - ((uint64_t)(uint8_t)var_201);` after `var_201 = …;`).
+    #[test]
+    fn carry_arithmetic_reads_the_comparison() {
+        let c1 = c_of(&[0x48, 0x81, 0xff, 0xf4, 0x01, 0x00, 0x00, 0x48, 0x83, 0xda, 0xff, 0x48, 0x89, 0x16, 0xc3]);
+        let c2 = c_of(&[0x39, 0xf7, 0x19, 0xc0, 0xc3]);
+        // cmp rdi, rsi; adc rdx, 0; mov [rcx], rdx; cmp edi, 5; sbb al, 0; mov [rcx], al; ret
+        let c3 = c_of(&[0x48, 0x39, 0xf7, 0x48, 0x83, 0xd2, 0x00, 0x48, 0x89, 0x11, 0x83, 0xff, 0x05, 0x1c, 0x00, 0x88, 0x01, 0xc3]);
+        assert!(c1.contains("rdx = (rdx + 1) - ((uint64_t)(rdi < 0x1f4));"), "{c1}");
+        assert!(c2.contains("eax = -((uint32_t)(edi < esi));"), "{c2}");
+        assert!(c3.contains("rdx = rdx + ((uint64_t)(rdi < rsi));") && c3.contains("al = al - ((uint8_t)(edi < 5));"), "{c3}");
+        for c in [&c1, &c2, &c3] {
+            assert!(!c.contains("lt_") && !c.contains("var_20"), "{c}");
+        }
+        // the Rust output extends to the destination's width
+        let r = rust_of(&[0x39, 0xf7, 0x19, 0xc0, 0xc3]);
+        assert!(r.contains("eax = 0.wrapping_sub((((edi < esi) as u8) as u32));"), "{r}");
+    }
+
+    /// WS90: the low byte of a zero-extended byte is the byte (`(uint8_t)((uint32_t)*(uint8_t*)p)`
+    /// printed in a folded condition).
+    #[test]
+    fn low_bytes_of_a_zero_extension_are_the_value() {
+        // dec dword [rdi]; jne L; movzx ecx, byte [rdi+4]; and cl, 0xf0; cmp cl, 0x10; jne L; mov eax, 1; ret; L: xor eax, eax; ret
+        let c = c_of(&[0xff, 0x0f, 0x75, 0x12, 0x0f, 0xb6, 0x4f, 0x04, 0x80, 0xe1, 0xf0, 0x80, 0xf9, 0x10, 0x75, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
+        assert!(c.contains("(*(uint8_t*)(rdi + 4)) & 0xf0") || c.contains("*(uint8_t*)(rdi + 4) & 0xf0"), "{c}");
+        assert!(!c.contains("(uint8_t)((uint32_t)"), "{c}");
+    }
+
+    /// WS90: `fxch` prints as one swap of the two slots (it was `tmp_3800 = st1; st1 = st0;
+    /// st0 = tmp_3800;`).
+    #[test]
+    fn fxch_prints_as_a_swap() {
+        // fld tbyte [rdi]; fld tbyte [rsi]; fxch st(1); fstp tbyte [rdx]; fstp tbyte [rcx]; ret
+        let code = [0xdb, 0x2f, 0xdb, 0x2e, 0xd9, 0xc9, 0xdb, 0x3a, 0xdb, 0x39, 0xc3];
+        let c = c_of(&code);
+        assert!(c.contains("swap(st1, st0);") || c.contains("swap(st0, st1);"), "{c}");
+        assert!(!c.contains("tmp_") && !c.contains("__unmodeled"), "{c}");
+        // the values: [rdx] gets the first value loaded, [rcx] the second
+        assert!(c.contains("*(long double*)rdx = st1;") && c.contains("*(long double*)rcx = st0;"), "{c}");
+        let r = rust_of(&code);
+        assert!(r.contains("core::mem::swap(&mut st1, &mut st0);") || r.contains("core::mem::swap(&mut st0, &mut st1);"), "{r}");
+    }
+
+    /// WS90: a flag a select folds and a later branch reads again (the second `test` merged into
+    /// the first by common subexpression elimination, so the branch reads it under another
+    /// varnode) stays a statement: the branch printed `if (!var_206)` with nothing assigning it.
+    #[test]
+    fn a_flag_a_select_folds_and_a_branch_reads_is_assigned() {
+        let code = [
+            0x40, 0xf6, 0xc6, 0x01, // test sil, 1
+            0x4c, 0x8b, 0x3a, // mov r15, [rdx]
+            0x4d, 0x0f, 0x45, 0xf7, // cmovne r14, r15
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0x40, 0xf6, 0xc6, 0x01, // test sil, 1
+            0x74, 0x03, // je L
+            0x4c, 0x89, 0x31, // mov [rcx], r14
+            0x48, 0x89, 0x01, // L: mov [rcx], rax
+            0xc3,
+        ];
+        let c = c_of(&code);
+        let flag = c.lines().find_map(|l| l.trim().strip_prefix("if (!").or_else(|| l.trim().strip_prefix("if ("))).map(|l| l.trim_end_matches(") {").to_string());
+        if let Some(f) = flag.filter(|f| crate::emit::is_identifier(f)) {
+            assert!(c.contains(&format!("{f} = ")), "{f} is never assigned: {c}");
+        }
+    }
+
+    /// WS90: a signed comparison of a truncated value casts once, and a dereference / cast
+    /// folded into a condition needs no parentheses (`(int32_t)((uint32_t)(*(uint64_t*)(…)))`).
+    #[test]
+    fn signed_compare_of_a_truncated_load_casts_once() {
+        // cmp esi, [rdi+0x18] (32-bit view of a 64-bit slot read as 32); jl L; mov eax, 1; ret; L: xor eax, eax; ret
+        let c = c_of(&[0x48, 0x8b, 0x47, 0x18, 0x39, 0xc6, 0x7c, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
+        assert!(!c.contains("(int32_t)((uint32_t)") && !c.contains("(int32_t)(uint32_t)"), "{c}");
+        assert!(c.contains("(int32_t)esi < (int32_t)*(uint64_t*)(rdi + 0x18)") || c.contains("(int32_t)esi < (int32_t)(*(uint64_t*)(rdi + 0x18))"), "{c}");
+    }
+
+    /// WS90: a function that passes on a call's result (`jmp g`) returns a `long double` when its
+    /// callers pop one off the x87 stack after calling it (`call f; fstp tbyte [rbx]`).
+    #[test]
+    fn callers_popping_x87_make_a_tail_call_return_long_double() {
+        let lifter = X86Lifter::new_64();
+        let f = [0xe9, 0xfb, 0x0f, 0x00, 0x00]; // jmp 0x2000
+        let g = [0xd9, 0xe8, 0xc3]; // fld1; ret
+        let caller = [0xe8, 0xfb, 0xdf, 0xff, 0xff, 0xdb, 0x3b, 0xc3]; // call 0x1000; fstp tbyte [rbx]; ret
+        let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g), (0x3000, &caller)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("long double f("), "{c}");
+        assert!(c.contains("st0 = 0x2000(") && c.contains("return st0;"), "{c}");
+        // without such a caller it stays as it was
+        let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("long double f(") && !c.contains("st0"), "{c}");
+    }
+
+    /// WS90: a signed compare at a join where one path's flags come from a `test` (OF = 0):
+    /// that path's `SF != OF` is the sign of the tested value, the other's `a < b`.
+    #[test]
+    fn signed_compare_at_a_join_with_a_test() {
+        let code = [
+            0x48, 0x85, 0xff, // test rdi, rdi
+            0x74, 0x03, // je L
+            0x48, 0x39, 0xd6, // cmp rsi, rdx
+            0x7c, 0x03, // L: jl M
+            0x31, 0xc0, 0xc3, // xor eax, eax; ret
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, // M: mov eax, 1; ret
+        ];
+        let c = c_of(&code);
+        assert!(!c.contains("overflow_p") && !c.contains("!= !") && !c.contains("var_20"), "{c}");
+        assert!(c.contains("= (int64_t)rsi < (int64_t)rdx;") && c.contains("= (int64_t)rdi < 0;"), "{c}");
     }
 }

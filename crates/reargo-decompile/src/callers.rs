@@ -21,6 +21,9 @@ pub enum ReturnHint {
     Float(u32),
     /// They overwrite `rax` (or call on) without reading it or `xmm0`: nothing is returned.
     Void,
+    /// They pop a value off the x87 stack the call left there (`call f; fstp tbyte [m]`, WS90):
+    /// a `long double`.
+    LongDouble,
 }
 
 /// Most call sites looked at.
@@ -87,6 +90,7 @@ enum Site {
     Int,
     Float(u32),
     Void,
+    LongDouble,
     Unknown,
 }
 
@@ -100,7 +104,13 @@ fn site_verdict(lifter: &dyn PcodeLift, memory: &Memory, site: u64, rax: &Varnod
     let mut iter = insns.iter();
     // the call itself
     match iter.next() {
-        Some(c) if c.ops.iter().any(|o| o.opcode == OpCode::Call) => {}
+        // (the lifter found the code after the call popping a value below an empty x87 stack:
+        // the call defines that slot, WS89)
+        Some(c) if c.ops.iter().any(|o| o.opcode == OpCode::Call) => {
+            if c.ops.iter().any(|o| o.opcode == OpCode::Indirect && o.output.is_some_and(|v| v.size == 10 && (0x1100..0x1180).contains(&v.offset))) {
+                return Site::LongDouble;
+            }
+        }
         _ => return Site::Unknown,
     }
     // the result is decided by `rax`: read -> `Int`; overwritten, or a call clobbers it,
@@ -156,7 +166,7 @@ pub fn return_hint(lifter: &dyn PcodeLift, memory: &Memory, target: u64) -> Opti
         [(r, _), (x, _), ..] => (*r, *x),
         _ => return None,
     };
-    let (mut int, mut float, mut void, mut size) = (0, 0, 0, 0);
+    let (mut int, mut float, mut void, mut size, mut ld) = (0, 0, 0, 0, 0);
     for site in direct_call_sites(memory, target, MAX_SITES) {
         match site_verdict(lifter, memory, site, &rax, &xmm0) {
             Site::Int => int += 1,
@@ -165,8 +175,12 @@ pub fn return_hint(lifter: &dyn PcodeLift, memory: &Memory, target: u64) -> Opti
                 size = size.max(s);
             }
             Site::Void => void += 1,
+            Site::LongDouble => ld += 1,
             Site::Unknown => {}
         }
+    }
+    if ld > 0 {
+        return (int == 0 && float == 0).then_some(ReturnHint::LongDouble);
     }
     match (int, float, void) {
         (i, 0, _) if i > 0 => Some(ReturnHint::Int),

@@ -85,6 +85,9 @@ pub struct CEmitter<'a> {
     cas: rustc_hash::FxHashMap<usize, crate::cas::Cas>,
     /// the ops a compare-and-swap hides (its load is no reader that has to print)
     cas_hidden: rustc_hash::FxHashSet<usize>,
+    /// `fxch` printed as one swap, at its last copy (WS90, `swap::find`), and the copies hidden.
+    swaps: rustc_hash::FxHashMap<usize, (crate::ssa::VarId, crate::ssa::VarId)>,
+    swap_hidden: rustc_hash::FxHashSet<usize>,
 }
 
 /// Temporaries printed as the register they are copied to (WS88, `inline::coalesced`): the
@@ -139,6 +142,8 @@ impl CEmitter<'static> {
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
+            swaps: Default::default(),
+            swap_hidden: Default::default(),
         }
     }
 }
@@ -180,6 +185,8 @@ impl<'a> CEmitter<'a> {
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
+            swaps: Default::default(),
+            swap_hidden: Default::default(),
         }
     }
 
@@ -231,6 +238,11 @@ impl<'a> CEmitter<'a> {
         self.noise.extend(cas_hidden.iter().copied());
         self.cas = cas;
         self.cas_hidden = cas_hidden;
+        // WS90: `fxch` as one swap
+        let (swaps, swap_hidden) = crate::swap::find(func, &self.noise);
+        self.noise.extend(swap_hidden.iter().copied());
+        self.swaps = swaps;
+        self.swap_hidden = swap_hidden;
         // WS86: first, as the conditions and selects fold the expressions printed inline
         let inlined = self.inline_temporaries(func);
         // WS88: a temporary copied to a register and read again by stores prints as that register
@@ -260,8 +272,13 @@ impl<'a> CEmitter<'a> {
         self.line("}");
         // WS89: a compare-and-swap's flag read only by the next condition goes into it
         if !self.cas.is_empty() {
-            self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("uint8_t {n};"), crate::cas::C_FORMS);
+            self.output = crate::cas::fold_into_conditions(
+                &self.output,
+                &|n| if n.starts_with("var_") { format!("uint8_t {n};") } else { format!("bool {n};") },
+                crate::cas::C_FORMS,
+            );
         }
+        self.output = crate::flags::renumber_named_flags(&self.output, func);
         self.output.clone()
     }
 
@@ -273,12 +290,12 @@ impl<'a> CEmitter<'a> {
             if vn.data.space == SpaceId::REGISTER
                 && vn.def_op.is_some_and(|d| {
                     // (the flag and accumulator of a compare-and-swap print in its statement)
-                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d))
+                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d) || self.swap_hidden.contains(&d))
                 })
             {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
-                    let type_name = size_to_type(vn.data.size);
+                    let type_name = if crate::flags::named_flag(vn.data.offset).is_some() { "bool" } else { size_to_type(vn.data.size) };
                     let var_name = reg_name(vn.data.offset, vn.data.size);
                     if !params.contains(var_name.as_str()) {
                         linef!(self, "{} {};", type_name, var_name);
@@ -565,6 +582,10 @@ impl<'a> CEmitter<'a> {
             // A phi joins versions of one register / slot, which the C output
             // names identically — nothing to print.
             OpCode::MultiEqual => None,
+            OpCode::Copy if self.swaps.contains_key(&op.index) => {
+                let (a, b) = self.swaps[&op.index];
+                Some(format!("swap({}, {});", varnode_name(&func.varnodes[a as usize]), varnode_name(&func.varnodes[b as usize])))
+            }
             // a stack address by its slot (WS87): `rdi = &local_48;`
             OpCode::Copy | OpCode::IntAdd | OpCode::IntSub
                 if op.output.is_some_and(|o| {
@@ -591,12 +612,31 @@ impl<'a> CEmitter<'a> {
                     return Some(format!("{} = {} - {};", dst, a, small_hex(k)));
                 }
                 let b = self.input_expr(func, op, 1);
+                // WS90: `0xffffffffffffffff + x` (`adc rdx, -1` after a `cmp`) is `x - 1` (at 32 / 64
+                // bits, where unsigned arithmetic wraps and nothing is promoted)
+                if let Some(k) = self.wide_negative(func, op, 0)
+                    && func.varnodes[op.inputs[1] as usize].data.space != SpaceId::CONST
+                {
+                    return Some(format!("{} = {} - {};", dst, b, small_hex(k)));
+                }
                 Some(format!("{} = {} + {};", dst, a, b))
             }
             OpCode::IntSub => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
+                let c = |i: usize| func.varnodes[op.inputs[i] as usize].data;
+                // WS90: `x - 0` (`sbb al, 0`) is `x`, `0 - x` (`sbb eax, eax` after it is folded) `-x`,
+                // and `x - 0xffffffffffffffff` (`sbb rdx, -1`) `x + 1` at 32 / 64 bits
+                if c(1).space == SpaceId::CONST && c(1).offset == 0 {
+                    return Some(format!("{} = {};", dst, a));
+                }
+                if c(0).space == SpaceId::CONST && c(0).offset == 0 && c(1).space != SpaceId::CONST {
+                    return Some(format!("{} = -{};", dst, if crate::condition::is_atomic(&b) || is_deref(&b) { b } else { format!("({b})") }));
+                }
+                if let Some(k) = self.wide_negative(func, op, 1) {
+                    return Some(format!("{} = {} + {};", dst, a, small_hex(k)));
+                }
                 Some(format!("{} = {} - {};", dst, a, b))
             }
             OpCode::IntMult => {
@@ -669,14 +709,16 @@ impl<'a> CEmitter<'a> {
                 // implementation-defined width and would silently truncate
                 // 64-bit operands to 32 bits).
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({}){} < ({}){};", dst, ty, a, ty, b))
+                let w = func.varnodes[op.inputs[0] as usize].data.size;
+                Some(format!("{} = {} < {};", dst, signed_operand(ty, w, &a), signed_operand(ty, w, &b)))
             }
             OpCode::IntSLessEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({}){} <= ({}){};", dst, ty, a, ty, b))
+                let w = func.varnodes[op.inputs[0] as usize].data.size;
+                Some(format!("{} = {} <= {};", dst, signed_operand(ty, w, &a), signed_operand(ty, w, &b)))
             }
             OpCode::IntLess => {
                 let dst = out_name?;
@@ -845,6 +887,16 @@ impl<'a> CEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
+                // WS90: `x != false` is `x` (`SF != OF` after a `test`, which clears OF)
+                let zero = |i: usize| op.inputs.get(i).is_some_and(|&v| {
+                    let d = &func.varnodes[v as usize].data;
+                    d.space == SpaceId::CONST && d.offset == 0
+                });
+                match (zero(0), zero(1)) {
+                    (false, true) => return Some(format!("{dst} = {};", strip_outer_parens(&a))),
+                    (true, false) => return Some(format!("{dst} = {};", strip_outer_parens(&b))),
+                    _ => {}
+                }
                 Some(format!("{} = !{} != !{};", dst, a, b))
             }
             OpCode::BoolNegate => {
@@ -885,8 +937,25 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 // Cast through the source's unsigned type so a non-MSB-set
                 // value isn't accidentally sign-extended by C's promotion.
-                let src_ty = size_to_type(func.varnodes[op.inputs[0] as usize].data.size);
+                let src = func.varnodes[op.inputs[0] as usize].data.size;
+                let src_ty = size_to_type(src);
                 let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                // WS90: not when the operand already has that type (`(uint64_t)(uint32_t)eax` is
+                // `(uint64_t)eax`, `(uint32_t)(uint8_t)*(uint8_t*)p` is `(uint32_t)*(uint8_t*)p`)
+                // a comparison's value is 0 or 1: `(uint64_t)(rdi < 0x1f5)`
+                let boolean = func.varnodes[op.inputs[0] as usize].def_op.is_some_and(|d| {
+                    matches!(
+                        func.ops[d].opcode,
+                        OpCode::IntEqual | OpCode::IntNotEqual | OpCode::IntLess | OpCode::IntSLess | OpCode::IntLessEqual | OpCode::IntSLessEqual
+                    )
+                });
+                if boolean && crate::condition::is_atomic(&a) {
+                    return Some(format!("{} = ({}){};", dst, dst_ty, a));
+                }
+                let a = match self.c_int_type(func, op.inputs[0], &a) {
+                    Some((w, false)) if w == src => return Some(format!("{} = ({}){};", dst, dst_ty, drop_widening_casts(&a))),
+                    _ => a,
+                };
                 Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
             }
             OpCode::Piece if op.inputs.len() >= 2 => {
@@ -928,8 +997,18 @@ impl<'a> CEmitter<'a> {
                 }
                 let a = self.input_expr(func, op, 0);
                 let k = &func.varnodes[op.inputs[1] as usize].data;
-                let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                let dst_size = func.varnodes[op.output.unwrap() as usize].data.size;
+                let dst_ty = size_to_type(dst_size);
                 if k.space == SpaceId::CONST && k.offset == 0 {
+                    // WS90: the low bytes of a zero extension are what it extended:
+                    // `(uint8_t)((uint32_t)*(uint8_t*)p)` is `*(uint8_t*)p`
+                    if let Some((w, false, y)) = int_cast(strip_outer_parens(&a))
+                        && w >= dst_size
+                        && let Some((k, false)) = text_int_type(y)
+                        && k <= dst_size
+                    {
+                        return Some(if k == dst_size { format!("{dst} = {y};") } else { format!("{dst} = ({dst_ty}){y};") });
+                    }
                     Some(format!("{} = ({}){};", dst, dst_ty, a))
                 } else if k.space == SpaceId::CONST {
                     Some(format!("{} = ({})({} >> {});", dst, dst_ty, a, k.offset * 8))
@@ -941,8 +1020,13 @@ impl<'a> CEmitter<'a> {
             OpCode::IntSExt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                let src_ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
+                let src = func.varnodes[op.inputs[0] as usize].data.size;
+                let src_ty = size_to_signed_type(src);
                 let dst_ty = size_to_signed_type(func.varnodes[op.output.unwrap() as usize].data.size);
+                // WS90: not when the operand is already that signed type
+                if self.c_int_type(func, op.inputs[0], &a) == Some((src, true)) {
+                    return Some(format!("{} = ({}){};", dst, dst_ty, a));
+                }
                 Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
             }
             OpCode::Load => {
@@ -1100,6 +1184,25 @@ impl<'a> CEmitter<'a> {
                     Some("__unmodeled_insn();  // machine op not yet lifted (dataflow intact)".into())
                 }
             }
+            // the carry / overflow flags of an add or a subtraction, with their operands (WS90; they
+            // printed `INT_SBORROW(...)`): GCC's overflow builtins, exact for any operand values
+            OpCode::IntCarry | OpCode::IntSCarry | OpCode::IntSBorrow if op.inputs.len() == 2 => {
+                let dst = out_name?;
+                let size = func.varnodes[op.inputs[0] as usize].data.size;
+                let (ty, builtin) = match op.opcode {
+                    OpCode::IntCarry => (size_to_type(size), "__builtin_add_overflow_p"),
+                    OpCode::IntSCarry => (size_to_signed_type(size), "__builtin_add_overflow_p"),
+                    _ => (size_to_signed_type(size), "__builtin_sub_overflow_p"),
+                };
+                let unsigned = op.opcode == OpCode::IntCarry;
+                // (an unsigned operand that is a plain variable already has the type; anything
+                // else, and every signed operand, is cast to the operation's width)
+                let arg = |i: usize| {
+                    let e = self.input_expr(func, op, i);
+                    if unsigned && is_identifier(&e) { e } else { format!("({}){}", ty, if crate::condition::is_atomic(&e) { e } else { format!("({e})") }) }
+                };
+                Some(format!("{} = {}({}, {}, ({})0);", dst, builtin, arg(0), arg(1), ty))
+            }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
@@ -1222,6 +1325,30 @@ impl<'a> CEmitter<'a> {
             }
         }
         varnode_name(vn)
+    }
+
+    /// `k` when input `i` of `op` is the constant `-k` of a 32- or 64-bit operation (WS90).
+    fn wide_negative(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, i: usize) -> Option<u64> {
+        let d = func.varnodes[*op.inputs.get(i)? as usize].data;
+        (d.size >= 4).then(|| negative_constant(&d)).flatten()
+    }
+
+    /// The C integer type of `text` (the printed operand `v`) when it is certain (WS90): `(width
+    /// in bytes, signed)` of a cast covering the whole text (`(uint8_t)x`), a dereference
+    /// (`*(uint16_t*)p`), or a register printed by its own name (declared by its size, unsigned;
+    /// a named flag is a `bool`, 0 or 1).
+    fn c_int_type(&self, func: &SsaFunction, v: crate::ssa::VarId, text: &str) -> Option<(u32, bool)> {
+        if let Some((w, signed, _)) = int_cast(text) {
+            return Some((w, signed));
+        }
+        if let Some(rest) = text.strip_prefix("*(")
+            && is_deref(text)
+        {
+            return int_type_name(rest.split_once("*)")?.0);
+        }
+        let vn = &func.varnodes[v as usize];
+        (vn.data.space == SpaceId::REGISTER && is_identifier(text) && text == varnode_name(vn) && matches!(vn.data.size, 1 | 2 | 4 | 8))
+            .then_some((vn.data.size, false))
     }
 
     /// The block's branch condition with the ops that only compute it folded in (WS81).
@@ -1767,6 +1894,8 @@ fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
 
 fn reg_name(offset: u64, size: u32) -> String {
     match (offset, size) {
+        // a flag value named by what it computes (WS90, `flags::name_flag_webs`)
+        (off, 1) if off >= crate::flags::NAMED_FLAG_BASE && crate::flags::named_flag(off).is_some() => crate::flags::named_flag(off).unwrap_or_default(),
         (0x00, 8) => "rax".into(),
         (0x00, 4) => "eax".into(),
         (0x00, 2) => "ax".into(),
@@ -1838,6 +1967,74 @@ fn reg_name(offset: u64, size: u32) -> String {
         (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
         _ => format!("var_{:x}", offset),
     }
+}
+
+/// `(width in bytes, signed)` of a C integer type name (`uint32_t`, `int8_t`).
+fn int_type_name(t: &str) -> Option<(u32, bool)> {
+    let (signed, bits) = match t.strip_prefix('u') {
+        Some(r) => (false, r.strip_prefix("int")?.strip_suffix("_t")?),
+        None => (true, t.strip_prefix("int")?.strip_suffix("_t")?),
+    };
+    match bits {
+        "8" => Some((1, signed)),
+        "16" => Some((2, signed)),
+        "32" => Some((4, signed)),
+        "64" => Some((8, signed)),
+        _ => None,
+    }
+}
+
+/// `(T)rest` where the cast to the integer type `T` covers the whole text (WS90): its width,
+/// signedness and operand. `rest` is one operand — a name, a parenthesised whole, a call, a
+/// dereference or another such cast — so `(uint8_t)x + 1` is no cast of the whole.
+pub(crate) fn int_cast(s: &str) -> Option<(u32, bool, &str)> {
+    let rest = s.strip_prefix('(')?;
+    let (ty, operand) = rest.split_once(')')?;
+    let (w, signed) = int_type_name(ty)?;
+    let unary = crate::condition::is_atomic(operand) || is_deref(operand) || int_cast(operand).is_some();
+    (!operand.is_empty() && unary).then_some((w, signed, operand))
+}
+
+/// The integer type of a cast covering the whole text or a dereference (`*(uint8_t*)p`):
+/// `(width, signed)` (WS90).
+fn text_int_type(s: &str) -> Option<(u32, bool)> {
+    int_cast(s).map(|(k, signed, _)| (k, signed)).or_else(|| s.strip_prefix("*(").filter(|_| is_deref(s)).and_then(|r| int_type_name(r.split_once("*)")?.0)))
+}
+
+/// `(intW_t)text` for a signed comparison's operand (WS90), without a cast of the same width
+/// under it: `(int32_t)((uint32_t)*(uint64_t*)(rsp + 0x18))` is `(int32_t)*(uint64_t*)(rsp + 0x18)`
+/// — both keep the value modulo 2^W read as two's complement (C's conversion to a signed type
+/// out of its range is implementation-defined; GCC and Clang define it so).
+fn signed_operand(ty: &str, w: u32, text: &str) -> String {
+    // a constant the signed type holds as it is needs no cast (`(int64_t)rdi < 0`)
+    let value = text.strip_prefix("0x").map_or_else(|| text.parse::<u64>().ok(), |h| u64::from_str_radix(h, 16).ok());
+    if value.is_some_and(|v| (1..=8).contains(&w) && v < 1u64 << (8 * w - 1)) {
+        return text.to_string();
+    }
+    match int_cast(strip_outer_parens(text)) {
+        Some((cw, _, y)) if cw == w => format!("({ty}){y}"),
+        _ => format!("({ty}){text}"),
+    }
+}
+
+/// `(uintA_t)(uintB_t)…x` with the casts made minimal (WS90): an unsigned cast whose operand
+/// is an unsigned cast to a type no wider is the identity on its value, so it goes —
+/// `(uint32_t)(uint8_t)x` stays, `(uint32_t)(uint32_t)x` and `(uint32_t)(uint16_t)(uint8_t)x`
+/// lose the outer / middle cast. Only the outermost cast is kept when everything below it is
+/// such a widening; nothing else is rewritten.
+pub(crate) fn drop_widening_casts(s: &str) -> String {
+    let Some((w, false, operand)) = int_cast(s) else { return s.to_string() };
+    let inner = drop_widening_casts(operand);
+    match text_int_type(&inner) {
+        // (uintW)(uintK)y with K <= W: the outer cast changes nothing
+        Some((k, false)) if k <= w => inner,
+        _ => format!("({}){}", size_to_type(w), inner),
+    }
+}
+
+/// A plain variable name (`eax`, `tmp_510`, `local_30`), not a constant or an expression.
+pub(crate) fn is_identifier(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The C type of a float of `size` bytes (`long double` = the x87's 80 bits, WS89).
@@ -1941,7 +2138,7 @@ pub(crate) fn select_conditions(
     let mut texts = rustc_hash::FxHashMap::default();
     let temp = |v: crate::ssa::VarId| {
         let d = &func.varnodes[v as usize].data;
-        d.space == SpaceId::UNIQUE || (d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset) && d.size == 1)
+        d.space == SpaceId::UNIQUE || (crate::flags::is_flag_storage(d) && d.size == 1)
     };
     // the value a site folds (its input), and whether its text is the negation
     let site = |op: &crate::ssa::SsaOp| -> Option<(crate::ssa::VarId, bool)> {
@@ -1950,7 +2147,7 @@ pub(crate) fn select_conditions(
         }
         let byte_reg = op.output.is_some_and(|w| {
             let d = &func.varnodes[w as usize].data;
-            d.space == SpaceId::REGISTER && d.size == 1 && !(0x200..0x210).contains(&d.offset)
+            d.space == SpaceId::REGISTER && d.size == 1 && !crate::flags::is_flag_storage(d)
         });
         let c = match op.opcode {
             OpCode::Select if op.inputs.len() == 3 => return Some((op.inputs[0], false)),
@@ -2024,18 +2221,19 @@ pub(crate) fn select_conditions(
             hidden.remove(&d);
         }
     }
+    // (WS90: every reader of the value — common subexpression elimination leaves readers of
+    // one value under several varnodes, each with its own `uses`: a branch reading the flag a
+    // select folded through another name printed `if (var_206)` with no assignment)
+    let readers = crate::condition::Readers::new(func);
     loop {
         let keep: Vec<usize> = hidden
             .iter()
             .copied()
             .filter(|&d| {
                 let Some(v) = func.ops[d].output else { return true };
-                func.varnodes[v as usize].uses.iter().any(|&u| {
+                readers.of(func, v).iter().any(|&u| {
                     let r = &func.ops[u];
-                    !r.dead
-                        && r.inputs.contains(&v)
-                        && !hidden.contains(&u)
-                        && !folded_by.get(&u).is_some_and(|ch| ch.contains(&d))
+                    !r.dead && !hidden.contains(&u) && !folded_by.get(&u).is_some_and(|ch| ch.contains(&d))
                 })
             })
             .collect();
@@ -2051,6 +2249,12 @@ pub(crate) fn select_conditions(
 
 /// Longest expression printed inside its reader (WS86).
 pub(crate) const MAX_INLINE_LEN: usize = 100;
+
+/// A dereference or an integer cast covering the whole text: a unary expression, no
+/// parentheses needed around it as an operand (WS90).
+pub(crate) fn is_unary(s: &str) -> bool {
+    is_deref(s) || int_cast(s).is_some()
+}
 
 /// `*(T*)x` with `x` atomic: a unary expression, no parentheses needed around it.
 fn is_deref(s: &str) -> bool {
@@ -2132,6 +2336,36 @@ pub(crate) fn small_hex(k: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WS90: an integer cast covering the whole text, and the widening casts below an unsigned
+    /// one dropped (each dropped cast is the identity on the value it gets).
+    #[test]
+    fn integer_cast_chains() {
+        assert_eq!(int_cast("(uint8_t)x"), Some((1, false, "x")));
+        assert_eq!(int_cast("(int32_t)*(uint32_t*)(rbx + 4)"), Some((4, true, "*(uint32_t*)(rbx + 4)")));
+        assert_eq!(int_cast("(uint32_t)(uint8_t)(al >> 1)"), Some((4, false, "(uint8_t)(al >> 1)")));
+        assert_eq!(int_cast("(uint8_t)x + 1"), None);
+        assert_eq!(int_cast("(uint8_t)x)(y"), None);
+        assert_eq!(int_cast("(float)x"), None);
+        assert_eq!(drop_widening_casts("(uint32_t)(uint8_t)x"), "(uint8_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)(uint32_t)x"), "(uint32_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)(uint16_t)(uint8_t)x"), "(uint8_t)x");
+        // a narrowing cast in between, or a signed one, changes the value: kept
+        assert_eq!(drop_widening_casts("(uint32_t)(uint8_t)(uint16_t)x"), "(uint8_t)(uint16_t)x");
+        assert_eq!(drop_widening_casts("(uint16_t)(uint32_t)x"), "(uint16_t)(uint32_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)(int8_t)x"), "(uint32_t)(int8_t)x");
+        assert_eq!(drop_widening_casts("(uint32_t)x + 1"), "(uint32_t)x + 1");
+        assert_eq!(drop_widening_casts("(uint32_t)*(uint8_t*)(rbx + 1)"), "*(uint8_t*)(rbx + 1)");
+        assert_eq!(signed_operand("int32_t", 4, "((uint32_t)(*(uint64_t*)(rsp + 0x18)))"), "(int32_t)(*(uint64_t*)(rsp + 0x18))");
+        assert_eq!(signed_operand("int32_t", 4, "((uint32_t)rax)"), "(int32_t)rax");
+        assert_eq!(signed_operand("int32_t", 4, "((uint16_t)rax)"), "(int32_t)((uint16_t)rax)");
+        assert_eq!(signed_operand("int32_t", 4, "ebp"), "(int32_t)ebp");
+        assert_eq!(signed_operand("int32_t", 4, "0"), "0");
+        assert_eq!(signed_operand("int32_t", 4, "0x7fffffff"), "0x7fffffff");
+        assert_eq!(signed_operand("int32_t", 4, "0xffffffff"), "(int32_t)0xffffffff");
+        assert_eq!(signed_operand("int8_t", 1, "0x80"), "(int8_t)0x80");
+        assert_eq!(drop_widening_casts("(uint8_t)*(uint32_t*)rbx"), "(uint8_t)*(uint32_t*)rbx");
+    }
     use crate::cfg::ControlFlowGraph;
     use crate::ssa::SsaFunction;
     use crate::structure::structure_cfg;
