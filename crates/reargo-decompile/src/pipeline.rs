@@ -103,7 +103,7 @@ pub fn decompile_with_options(
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts)
+    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts, oracle.as_ref())
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -463,6 +463,7 @@ fn decompile_function_inner(
         &handlers,
         &switches,
         opts,
+        oracle,
     )
 }
 
@@ -1260,6 +1261,7 @@ fn build_decompile_result(
     handlers: &[crate::exception::Handler],
     switches: &[crate::switch::JumpTable],
     opts: &DecompileOptions,
+    oracle: Option<&CalleeParams<'_>>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -1335,8 +1337,9 @@ fn build_decompile_result(
     // WS91: struct fields, typed pointers and virtual calls
     let view = if opts.structs {
         let memory = caller_hint.map(|(_, m)| m);
-        let this_reg = caller_hint.and_then(|(l, _)| l.call_convention()).and_then(|cc| cc.args.first().copied());
-        let ctx = crate::structs::Context { memory, this_reg, this_class: this_class(func_name, entry, memory) };
+        let cc = caller_hint.and_then(|(l, _)| l.call_convention());
+        let arg_regs = [cc.as_ref().and_then(|c| c.args.first().copied()), cc.as_ref().and_then(|c| c.args.get(1).copied())];
+        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle };
         crate::structs::StructView::new(&ssa, &ctx)
     } else {
         crate::structs::StructView::default()
@@ -1399,18 +1402,6 @@ fn build_decompile_result(
             live_ops_after: live_ops,
         },
     })
-}
-
-/// The class of the function's `this` (WS91): from its (mangled) name (`_ZN5Class6methodEv`),
-/// else the class whose primary vtable lists the function (the base of all such classes), with
-/// that vtable.
-fn this_class(name: &str, entry: u64, memory: Option<&Memory>) -> Option<(String, Option<u64>)> {
-    if let Some(c) = crate::structs::method_class(name) {
-        return Some((c, None));
-    }
-    let memory = memory?;
-    let vtables = crate::vcall::this_vtables(memory, entry);
-    crate::vcall::method_class(memory, &vtables).map(|(c, vt)| (c, Some(vt)))
 }
 
 fn trim_to_function_body(
@@ -3097,6 +3088,7 @@ mod tests {
             &handlers,
             &[],
             &DecompileOptions::default(),
+            None,
         )
         .unwrap();
         let c = r.c_code;

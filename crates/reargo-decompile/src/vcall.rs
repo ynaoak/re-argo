@@ -168,12 +168,18 @@ const MAX_VTABLES: usize = 8;
 /// the address point is where the run of code pointers before it starts, behind the
 /// type_info pointer and an offset-to-top of 0 or a small negative number.
 pub fn this_vtables(memory: &Memory, entry: u64) -> Vec<u64> {
-    let mut slots = Vec::new();
+    vtables_listing(memory, &[entry]).remove(&entry).unwrap_or_default()
+}
+
+/// [`this_vtables`] of several functions in one pass over the relocations (WS91).
+pub fn vtables_listing(memory: &Memory, targets: &[u64]) -> FxHashMap<u64, Vec<u64>> {
+    let wanted: FxHashSet<u64> = targets.iter().copied().collect();
+    let mut slots: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     if let Some(data) = memory.dynamic_relocations() {
         for e in data.chunks_exact(RELA_SIZE as usize) {
             let word = |i: usize| u64::from_le_bytes(e[i * 8..i * 8 + 8].try_into().unwrap());
-            if word(2) == entry && is_relative(word(1)) {
-                slots.push(word(0));
+            if wanted.contains(&word(2)) && is_relative(word(1)) {
+                slots.entry(word(2)).or_default().push(word(0));
             }
         }
     } else {
@@ -184,14 +190,22 @@ pub fn this_vtables(memory: &Memory, entry: u64) -> Vec<u64> {
             let Some(data) = &b.data else { continue };
             let skip = ((8 - b.start % 8) % 8) as usize;
             for (i, w) in data.get(skip..).unwrap_or(&[]).chunks_exact(8).enumerate() {
-                if u64::from_le_bytes(w.try_into().unwrap()) == entry {
-                    slots.push(b.start + skip as u64 + i as u64 * 8);
+                let v = u64::from_le_bytes(w.try_into().unwrap());
+                if wanted.contains(&v) {
+                    slots.entry(v).or_default().push(b.start + skip as u64 + i as u64 * 8);
                 }
             }
         }
     }
+    slots.into_iter().map(|(f, s)| (f, address_points(memory, &s))).filter(|(_, p)| !p.is_empty()).collect()
+}
+
+/// The vtable address points the slots `slots` belong to: where the run of code pointers
+/// before a slot starts, behind the type_info pointer and an offset-to-top of 0 or a small
+/// negative number (at most [`MAX_VTABLES`]).
+fn address_points(memory: &Memory, slots: &[u64]) -> Vec<u64> {
     let mut points = Vec::new();
-    for s in slots {
+    for &s in slots {
         let mut p = s;
         let mut steps = 0;
         while steps < 4096 && pointer_at(memory, p - 8).is_some_and(|v| is_code(memory, v)) {
@@ -302,6 +316,41 @@ pub fn method_class(memory: &Memory, vtables: &[u64]) -> Option<(String, u64)> {
     let (p, ti) = *primary.iter().find(|&&(_, ti)| all.iter().all(|a| a.contains(&ti)))?;
     let name = type_info_name(memory, ti)?;
     Some((demangle_type_name(&name).unwrap_or(name), p))
+}
+
+/// The most derived of several classes (WS91, `(name, vtable)`): the one deriving from every
+/// other (an object passed to methods of a class and of its base is of the derived class).
+/// `None` when none does.
+pub fn most_derived(memory: &Memory, classes: &[(String, u64)]) -> Option<(String, u64)> {
+    if classes.len() == 1 {
+        return classes.first().cloned();
+    }
+    let ti = |vt: u64| pointer_at(memory, vt.checked_sub(8)?);
+    let ancestors = |t: u64| {
+        let mut seen = vec![t];
+        let mut work = vec![t];
+        while let Some(x) = work.pop() {
+            if seen.len() > 64 {
+                break;
+            }
+            for b in type_info_bases(memory, x) {
+                if !seen.contains(&b) {
+                    seen.push(b);
+                    work.push(b);
+                }
+            }
+        }
+        seen
+    };
+    let tis: Vec<Option<u64>> = classes.iter().map(|c| ti(c.1)).collect();
+    classes
+        .iter()
+        .zip(&tis)
+        .find(|(_, t)| t.is_some_and(|t| {
+            let a = ancestors(t);
+            tis.iter().all(|o| o.is_some_and(|o| a.contains(&o)))
+        }))
+        .map(|(c, _)| c.clone())
 }
 
 /// `v` with register / temporary copies looked through.

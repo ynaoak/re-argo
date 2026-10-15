@@ -61,6 +61,13 @@ impl Uf {
         }
         x
     }
+    /// `find` without path compression.
+    fn find_const(&self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            x = self.parent[x as usize];
+        }
+        x
+    }
     fn union(&mut self, a: u32, b: u32) -> bool {
         let (a, b) = (self.find(a), self.find(b));
         if a == b {
@@ -89,6 +96,8 @@ pub struct Field {
     pub off: u64,
     pub size: u32,
     pub kind: FieldKind,
+    /// Only a callee accesses it (through the pointer passed to it): that callee.
+    pub from: Option<u64>,
 }
 
 impl Field {
@@ -141,7 +150,10 @@ impl StructDef {
             if f.off > at {
                 out.push_str(&format!("    uint8_t _gap_{at:x}[0x{:x}];\n", f.off - at));
             }
-            out.push_str(&format!("    {} {}; // +0x{:x}\n", self.field_type(f, defs), f.name(), f.off));
+            match f.from {
+                Some(c) => out.push_str(&format!("    {} {}; // +0x{:x} (used by 0x{c:x})\n", self.field_type(f, defs), f.name(), f.off)),
+                None => out.push_str(&format!("    {} {}; // +0x{:x}\n", self.field_type(f, defs), f.name(), f.off)),
+            }
             at = f.off + u64::from(f.size);
         }
         out.push_str("};");
@@ -271,11 +283,15 @@ pub struct StructView {
 #[derive(Default)]
 pub struct Context<'a> {
     pub memory: Option<&'a Memory>,
-    /// The register holding `this` (the convention's first argument).
-    pub this_reg: Option<VarnodeData>,
-    /// The class of `this` and its vtable (from the vtables listing the function, or its
-    /// mangled name).
-    pub this_class: Option<(String, Option<u64>)>,
+    /// The function's entry (its class is that of the vtables listing it).
+    pub entry: u64,
+    /// The registers of the first two arguments: `this` is the first, or the second when the
+    /// first is the address of a struct the function returns in memory.
+    pub arg_regs: [Option<VarnodeData>; 2],
+    /// The class of `this` from the function's (mangled) name.
+    pub name_class: Option<String>,
+    /// The callees' parameters: the fields a callee accesses through a pointer passed to it.
+    pub oracle: Option<&'a crate::callee_params::CalleeParams<'a>>,
 }
 
 /// A raw access before the layout: op, base node, offset, width, value node (a pointer loaded
@@ -293,6 +309,8 @@ struct Raw {
     vtable_store: Option<u64>,
     /// not a field access after all (a vtable slot, an element past an array stride)
     skip: bool,
+    /// an access a callee makes through the pointer passed to it (no op of this function)
+    callee: Option<u64>,
 }
 
 fn is_xmm(d: &VarnodeData) -> bool {
@@ -381,7 +399,38 @@ impl StructView {
             };
             let b = node(&mut uf, &mut nodes, value_key(func, base));
             let value = value.map(|v| node(&mut uf, &mut nodes, value_key(func, v)));
-            raws.push(Raw { op: op.index, base: b, off, size, value, float, add, base_input, vptr: vtable_store.is_some(), vtable_store, skip: false });
+            raws.push(Raw { op: op.index, base: b, off, size, value, float, add, base_input, vptr: vtable_store.is_some(), vtable_store, skip: false, callee: None });
+        }
+        let local = raws.len();
+
+        // across calls: what a callee accesses through a pointer passed to it, and the classes
+        // whose methods take it as `this`
+        let mut this_calls: Vec<(u32, u64)> = Vec::new();
+        if let Some(oracle) = ctx.oracle {
+            for op in func.ops.iter().filter(|o| !o.dead && o.opcode == OpCode::Call) {
+                let Some(t) = op.inputs.first().map(|&t| func.varnodes[t as usize].data).filter(|t| t.space == SpaceId::RAM).map(|t| t.offset) else { continue };
+                for &v in op.inputs.iter().skip(1) {
+                    let d = func.varnodes[v as usize].data;
+                    if d.space != SpaceId::REGISTER || d.size != 8 || d.offset == RSP || frame.is_stack(func, v, op.block) {
+                        continue;
+                    }
+                    let Some(ai) = oracle.args().iter().position(|a| a.space == d.space && a.offset == d.offset && a.size == d.size) else { continue };
+                    let pu = oracle.param_use(t);
+                    let used: Vec<_> = pu.iter().flat_map(|p| p.fields.iter()).filter(|f| f.arg == ai && f.size <= 16).copied().collect();
+                    // (`this` is the second argument of a method returning a struct in memory)
+                    let this_arg = usize::from(pu.as_ref().is_some_and(|p| p.returns_first));
+                    if used.is_empty() && !(ai == this_arg && nodes.contains_key(&value_key(func, v))) {
+                        continue;
+                    }
+                    let n = node(&mut uf, &mut nodes, value_key(func, v));
+                    if ai == this_arg {
+                        this_calls.push((n, t));
+                    }
+                    for f in used {
+                        raws.push(Raw { op: usize::MAX, base: n, off: f.off, size: f.size, value: None, float: false, add: None, base_input: 0, vptr: false, vtable_store: None, skip: false, callee: Some(t) });
+                    }
+                }
+            }
         }
         if raws.is_empty() {
             return StructView::default();
@@ -404,7 +453,7 @@ impl StructView {
         }
 
         // virtual calls: the slot is read through a vtable pointer loaded from the object
-        let raw_at: FxHashMap<OpIdx, usize> = raws.iter().enumerate().map(|(i, r)| (r.op, i)).collect();
+        let raw_at: FxHashMap<OpIdx, usize> = raws[..local].iter().enumerate().map(|(i, r)| (r.op, i)).collect();
         let mut vcall_raw: Vec<(OpIdx, usize, u64)> = Vec::new();
         let mut vtable_keys: Vec<ValueKey> = Vec::new();
         for op in func.ops.iter().filter(|o| !o.dead && o.opcode == OpCode::CallInd) {
@@ -433,7 +482,7 @@ impl StructView {
         let vtable_nodes: FxHashSet<u32> = vtable_keys
             .iter()
             .filter_map(|k| nodes.get(k).copied())
-            .chain(raws.iter().filter(|r| r.vptr).filter_map(|r| func.ops[r.op].output.and_then(|o| nodes.get(&value_key(func, o)).copied())))
+            .chain(raws[..local].iter().filter(|r| r.vptr).filter_map(|r| func.ops[r.op].output.and_then(|o| nodes.get(&value_key(func, o)).copied())))
             .collect::<Vec<u32>>()
             .into_iter()
             .map(|n| uf.find(n))
@@ -486,6 +535,23 @@ impl StructView {
         }
         vcall_raw.retain(|&(_, ri, _)| !raws[ri].skip);
 
+        // classes: of `this` (its name, or the vtables listing the function), and of a pointer
+        // passed as `this` to a method listed in vtables (the most derived of those classes)
+        let mut targets: Vec<u64> = vec![ctx.entry];
+        targets.extend(this_calls.iter().map(|&(_, t)| t));
+        let listing = ctx.memory.map(|m| crate::vcall::vtables_listing(m, &targets)).unwrap_or_default();
+        let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));
+        let this_class: Option<(String, Option<u64>)> = ctx.name_class.clone().map(|c| (c, None)).or_else(|| class_of(ctx.entry).map(|(c, v)| (c, Some(v))));
+        let mut root_classes: FxHashMap<u32, Vec<(String, u64)>> = FxHashMap::default();
+        for &(n, t) in &this_calls {
+            if let Some(c) = class_of(t) {
+                let e = root_classes.entry(uf.find(n)).or_default();
+                if !e.contains(&c) {
+                    e.push(c);
+                }
+            }
+        }
+
         // the types that are structs: an access past offset 0, or a vtable pointer
         let mut is_base: FxHashSet<u32> = FxHashSet::default();
         let mut struct_roots: Vec<u32> = Vec::new();
@@ -497,16 +563,24 @@ impl StructView {
             }
         }
         // `this` of a known class is a struct too
-        let this_root = ctx.this_reg.and_then(|reg| {
+        let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
+        let this_root = ctx.arg_regs[usize::from(sret)].and_then(|reg| {
             let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
             nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
         });
-        if let (Some(r), Some(_)) = (this_root, &ctx.this_class)
+        if let (Some(r), Some(_)) = (this_root, &this_class)
             && is_base.contains(&r)
             && !struct_roots.contains(&r)
         {
             struct_roots.push(r);
         }
+        // and a pointer a method of a known class takes as `this`
+        for &r in root_classes.keys() {
+            if !struct_roots.contains(&r) {
+                struct_roots.push(r);
+            }
+        }
+        struct_roots.sort_by_key(|&r| first_use(&raws, &uf, r));
         let def_of_root: FxHashMap<u32, usize> = struct_roots.iter().enumerate().map(|(i, &r)| (r, i)).collect();
 
         // the layout of each struct
@@ -522,21 +596,23 @@ impl StructView {
         let mut access: FxHashMap<OpIdx, Access> = FxHashMap::default();
         for (d, list) in by_def.iter().enumerate() {
             // candidates: the widest access (at most 16 bytes) at each start, and how often
-            let mut starts: std::collections::BTreeMap<u64, (u32, usize)> = std::collections::BTreeMap::new();
+            // (the function's own accesses first, then those only a callee makes)
+            let mut starts: std::collections::BTreeMap<u64, (u32, usize, bool)> = std::collections::BTreeMap::new();
             for &i in list {
                 let r = &raws[i];
                 if r.size > 16 {
                     continue;
                 }
-                let e = starts.entry(r.off).or_insert((0, 0));
+                let e = starts.entry(r.off).or_insert((0, 0, true));
                 e.0 = e.0.max(r.size);
                 e.1 += 1;
+                e.2 &= r.callee.is_some();
             }
-            let mut order: Vec<(u64, u32, usize)> = starts.iter().map(|(&o, &(s, n))| (o, s, n)).collect();
+            let mut order: Vec<(u64, u32, usize, bool)> = starts.iter().map(|(&o, &(s, n, c))| (o, s, n, c)).collect();
             // (a 16-byte access is a copy of several fields more often than one: last)
-            order.sort_by_key(|&(o, s, n)| (s > 10, std::cmp::Reverse(n), o));
+            order.sort_by_key(|&(o, s, n, c)| (c, s > 10, std::cmp::Reverse(n), o));
             let mut kept: Vec<(u64, u32)> = Vec::new();
-            for (o, s, _) in order {
+            for (o, s, _, _) in order {
                 let end = o + u64::from(s);
                 if kept.iter().all(|&(ko, ks)| end <= ko || ko + u64::from(ks) <= o) {
                     kept.push((o, s));
@@ -545,19 +621,21 @@ impl StructView {
             kept.sort();
             let mut fields = Vec::new();
             for (o, s) in kept {
-                let at: Vec<&Raw> = list.iter().map(|&i| &raws[i]).filter(|r| r.off == o).collect();
+                let all: Vec<&Raw> = list.iter().map(|&i| &raws[i]).filter(|r| r.off == o).collect();
+                let from = all.iter().all(|r| r.callee.is_some()).then(|| all.iter().find_map(|r| r.callee)).flatten();
+                let at: Vec<&Raw> = all.iter().copied().filter(|r| r.callee.is_none()).collect();
                 let kind = if o == 0 && s == 8 && at.iter().any(|r| r.vptr) {
                     FieldKind::VPtr
                 } else if s == 8 && !at.is_empty() && at.iter().all(|r| r.size == 8 && r.value.is_some_and(|v| is_base.contains(&uf.find(v)))) {
                     FieldKind::Ptr(at.iter().find_map(|r| r.value.and_then(|v| def_of_root.get(&uf.find(v)).copied())))
-                } else if matches!(s, 4 | 8) && at.iter().all(|r| r.size == s && r.float) {
+                } else if matches!(s, 4 | 8) && !at.is_empty() && at.iter().all(|r| r.size == s && r.float) {
                     FieldKind::Float
                 } else {
                     FieldKind::Int
                 };
-                fields.push(Field { off: o, size: s, kind });
+                fields.push(Field { off: o, size: s, kind, from });
             }
-            for &i in list {
+            for &i in list.iter().filter(|&&i| raws[i].callee.is_none()) {
                 let r = &raws[i];
                 if let Some(fi) = fields.iter().position(|f| f.off == r.off && r.size <= f.size) {
                     access.insert(r.op, Access { def: d, field: fi, size: r.size, add: r.add, base_input: r.base_input });
@@ -570,12 +648,23 @@ impl StructView {
         }
 
         // classes: `this`, and the vtables stored into objects
-        if let (Some(r), Some((name, vt))) = (this_root, &ctx.this_class)
+        if let (Some(r), Some((name, vt))) = (this_root, &this_class)
             && let Some(&d) = def_of_root.get(&r)
         {
             defs[d].class = Some(name.clone());
             if defs[d].vtable.is_none() {
                 defs[d].vtable = *vt;
+            }
+        }
+        for (r, classes) in &root_classes {
+            if let (Some(&d), Some(mem)) = (def_of_root.get(r), ctx.memory)
+                && defs[d].class.is_none()
+                && let Some((name, vt)) = crate::vcall::most_derived(mem, classes)
+            {
+                defs[d].class = Some(name);
+                if defs[d].vtable.is_none() {
+                    defs[d].vtable = Some(vt);
+                }
             }
         }
         if let Some(mem) = ctx.memory {
@@ -779,6 +868,12 @@ impl StructView {
             .any(|o| !o.dead && o.block == call.block && matches!(o.opcode, OpCode::Store | OpCode::Call | OpCode::CallInd | OpCode::CallOther));
         (!between).then_some(vc)
     }
+}
+
+/// The first op (index) of a local access through a pointer of type `root` (callee accesses
+/// last): the structs are numbered in the order the body first uses them.
+fn first_use(raws: &[Raw], uf: &Uf, root: u32) -> usize {
+    raws.iter().filter(|r| uf.find_const(r.base) == root).map(|r| if r.callee.is_some() { usize::MAX } else { r.op }).min().unwrap_or(usize::MAX)
 }
 
 /// The name of the slot function `target` of a virtual call on an object of class `class`:
@@ -1016,11 +1111,46 @@ mod tests {
     }
 
     #[test]
+    fn a_method_returning_a_struct_in_memory_has_this_in_the_second_argument() {
+        // 0x1100 (listed in Shape's vtable): mov eax, [rsi+8] ; mov [rdi], eax ; mov [rdi+4], eax ; mov rax, rdi ; ret
+        let m = [0x8b, 0x46, 0x08, 0x89, 0x07, 0x89, 0x47, 0x04, 0x48, 0x89, 0xf8, 0xc3];
+        let r = decompile(&X86Lifter::new_64(), &shape(&[0xc3], &m), 0x1100, "m", 100).unwrap();
+        assert!(r.c_code.contains("struct Shape* rsi"), "{}", r.c_code);
+        assert!(!r.c_code.contains("struct Shape* rdi"), "{}", r.c_code);
+    }
+
+    #[test]
     fn a_mangled_method_name_types_this() {
         // mov eax, [rdi+8] ; ret
         let r = decompile(&X86Lifter::new_64(), &text(&[0x8b, 0x47, 0x08, 0xc3]), 0x1000, "_ZNK5Shape4areaEv", 100).unwrap();
         assert!(r.c_code.contains("(struct Shape* rdi)"), "{}", r.c_code);
         assert!(r.recovered_structs[0].starts_with("struct Shape {"), "{:?}", r.recovered_structs);
+    }
+
+    #[test]
+    fn a_callees_accesses_through_a_passed_pointer_are_fields() {
+        // mov eax, [rdi+8] ; mov [rdi+0xc], eax ; call 0x2000 ; ret
+        // 0x2000: mov rax, [rdi+0x20] ; add eax, [rdi+0x28] ; ret
+        let mut code = vec![0x8b, 0x47, 0x08, 0x89, 0x47, 0x0c, 0xe8, 0xf5, 0x0f, 0x00, 0x00, 0xc3];
+        code.resize(0x1100, 0xcc);
+        code[0x1000..0x1008].copy_from_slice(&[0x48, 0x8b, 0x47, 0x20, 0x03, 0x47, 0x28, 0xc3]);
+        let r = c_of(&code);
+        let d = &r.recovered_structs[0];
+        assert!(d.contains("uint32_t field_8; // +0x8\n"), "{d}");
+        assert!(d.contains("uint64_t field_20; // +0x20 (used by 0x2000)"), "{d}");
+        assert!(d.contains("uint32_t field_28; // +0x28 (used by 0x2000)"), "{d}");
+        assert!(r.c_code.contains("rdi->field_8"), "{}", r.c_code);
+    }
+
+    #[test]
+    fn a_pointer_passed_to_a_method_has_the_methods_class() {
+        // push rbx ; mov rbx, rdi ; call 0x1100 (Shape's method) ; mov rax, [rbx] ; mov rdi, rbx ;
+        // call [rax+8] ; pop rbx ; ret
+        let f = [0x53, 0x48, 0x89, 0xfb, 0xe8, 0xf7, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x50, 0x08, 0x5b, 0xc3];
+        let r = decompile(&X86Lifter::new_64(), &shape(&f, &[0x8b, 0x47, 0x08, 0xc3]), 0x1000, "f", 100).unwrap();
+        assert!(r.recovered_structs[0].starts_with("struct Shape {"), "{:?}", r.recovered_structs);
+        assert!(r.recovered_structs[0].contains("field_8; // +0x8 (used by 0x1100)"), "{:?}", r.recovered_structs);
+        assert!(r.c_code.contains("rdi->vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
     }
 
     #[test]
@@ -1034,14 +1164,14 @@ mod tests {
 
     #[test]
     fn class_structs_merge_over_functions() {
-        let a = vec![StructDef { name: "Shape".into(), class: Some("Shape".into()), vtable: Some(0x2010), stride: None, fields: vec![Field { off: 8, size: 4, kind: FieldKind::Int }] }];
+        let a = vec![StructDef { name: "Shape".into(), class: Some("Shape".into()), vtable: Some(0x2010), stride: None, fields: vec![Field { off: 8, size: 4, kind: FieldKind::Int, from: None }] }];
         let b = vec![
             StructDef {
                 name: "Shape".into(),
                 class: Some("Shape".into()),
                 vtable: None,
                 stride: None,
-                fields: vec![Field { off: 8, size: 8, kind: FieldKind::Int }, Field { off: 0x10, size: 8, kind: FieldKind::Ptr(Some(1)) }],
+                fields: vec![Field { off: 8, size: 8, kind: FieldKind::Int, from: None }, Field { off: 0x10, size: 8, kind: FieldKind::Ptr(Some(1)), from: None }],
             },
             StructDef { name: "struct_1".into(), class: None, vtable: None, stride: None, fields: vec![] },
         ];
@@ -1072,9 +1202,9 @@ mod tests {
                 vtable: None,
                 stride: None,
                 fields: vec![
-                    Field { off: 0, size: 8, kind: FieldKind::VPtr },
-                    Field { off: 0x10, size: 4, kind: FieldKind::Float },
-                    Field { off: 0x18, size: 8, kind: FieldKind::Ptr(Some(0)) },
+                    Field { off: 0, size: 8, kind: FieldKind::VPtr, from: None },
+                    Field { off: 0x10, size: 4, kind: FieldKind::Float, from: None },
+                    Field { off: 0x18, size: 8, kind: FieldKind::Ptr(Some(0)), from: None },
                 ],
             },
         ];
