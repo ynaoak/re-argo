@@ -64,6 +64,9 @@ pub struct RustEmitter<'a> {
     cas: rustc_hash::FxHashMap<usize, crate::cas::Cas>,
     /// the ops a compare-and-swap hides (its load is no reader that has to print)
     cas_hidden: rustc_hash::FxHashSet<usize>,
+    /// `fxch` printed as one swap, at its last copy (WS90, `swap::find`), and the copies hidden.
+    swaps: rustc_hash::FxHashMap<usize, (crate::ssa::VarId, crate::ssa::VarId)>,
+    swap_hidden: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for RustEmitter<'static> {
@@ -92,6 +95,8 @@ impl RustEmitter<'static> {
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
+            swaps: Default::default(),
+            swap_hidden: Default::default(),
         }
     }
 }
@@ -120,6 +125,8 @@ impl<'a> RustEmitter<'a> {
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
+            swaps: Default::default(),
+            swap_hidden: Default::default(),
         }
     }
 
@@ -165,6 +172,11 @@ impl<'a> RustEmitter<'a> {
         self.noise.extend(cas_hidden.iter().copied());
         self.cas = cas;
         self.cas_hidden = cas_hidden;
+        // WS90: `fxch` as one swap
+        let (swaps, swap_hidden) = crate::swap::find(func, &self.noise);
+        self.noise.extend(swap_hidden.iter().copied());
+        self.swaps = swaps;
+        self.swap_hidden = swap_hidden;
         // WS87: first, as the conditions fold the expressions printed inline (as in C)
         let inlined = self.inline_temporaries(func);
         self.coalesced = crate::emit::Coalesced::new(func, &self.noise, &inlined);
@@ -201,7 +213,7 @@ impl<'a> RustEmitter<'a> {
             if vn.data.space == SpaceId::REGISTER
                 && vn.def_op.is_some_and(|d| {
                     // (the flag and accumulator of a compare-and-swap print in its statement)
-                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d))
+                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d) || self.swap_hidden.contains(&d))
                 })
             {
                 let key = (vn.data.offset, vn.data.size);
@@ -480,6 +492,10 @@ impl<'a> RustEmitter<'a> {
         match op.opcode {
             // phi: same name on every incoming edge, nothing to print
             OpCode::MultiEqual => None,
+            OpCode::Copy if self.swaps.contains_key(&op.index) => {
+                let (a, b) = self.swaps[&op.index];
+                Some(format!("core::mem::swap(&mut {}, &mut {});", varnode_name(&func.varnodes[a as usize]), varnode_name(&func.varnodes[b as usize])))
+            }
             // a stack address by its slot (WS88): `rdi = &raw mut local_48;`
             OpCode::Copy | OpCode::IntAdd | OpCode::IntSub
                 if op.output.is_some_and(|o| {

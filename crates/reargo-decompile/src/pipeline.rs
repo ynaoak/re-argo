@@ -4172,4 +4172,19 @@ mod tests {
         assert!(c.contains("(*(uint8_t*)(rdi + 4)) & 0xf0") || c.contains("*(uint8_t*)(rdi + 4) & 0xf0"), "{c}");
         assert!(!c.contains("(uint8_t)((uint32_t)"), "{c}");
     }
+
+    /// WS90: `fxch` prints as one swap of the two slots (it was `tmp_3800 = st1; st1 = st0;
+    /// st0 = tmp_3800;`).
+    #[test]
+    fn fxch_prints_as_a_swap() {
+        // fld tbyte [rdi]; fld tbyte [rsi]; fxch st(1); fstp tbyte [rdx]; fstp tbyte [rcx]; ret
+        let code = [0xdb, 0x2f, 0xdb, 0x2e, 0xd9, 0xc9, 0xdb, 0x3a, 0xdb, 0x39, 0xc3];
+        let c = c_of(&code);
+        assert!(c.contains("swap(st1, st0);") || c.contains("swap(st0, st1);"), "{c}");
+        assert!(!c.contains("tmp_") && !c.contains("__unmodeled"), "{c}");
+        // the values: [rdx] gets the first value loaded, [rcx] the second
+        assert!(c.contains("*(long double*)rdx = st1;") && c.contains("*(long double*)rcx = st0;"), "{c}");
+        let r = rust_of(&code);
+        assert!(r.contains("core::mem::swap(&mut st1, &mut st0);") || r.contains("core::mem::swap(&mut st0, &mut st1);"), "{r}");
+    }
 }
