@@ -75,9 +75,32 @@ impl Cond {
 
 /// An expression that needs no parentheses as an operand: a name / number, a parenthesised
 /// whole, a call-like `f(…)`, or `!` before one of these.
+/// `x->name` with `x` atomic (WS91): a struct member reached through a pointer, a postfix
+/// expression that needs no parentheses (`p->field_8->field_10`, `(*(uint64_t*)q)->field_0`).
+pub fn is_member(s: &str) -> bool {
+    let mut depth = 0i32;
+    let mut last = None;
+    let b = s.as_bytes();
+    for i in 0..b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'-' if depth == 0 && b.get(i + 1) == Some(&b'>') => last = Some(i),
+            _ => {}
+        }
+    }
+    let Some(i) = last else { return false };
+    let name = &s[i + 2..];
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit()) && is_atomic(&s[..i])
+}
+
 pub fn is_atomic(s: &str) -> bool {
     let word = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if word(s) {
+        return true;
+    }
+    // a member access `p->field_8` (WS91) is a postfix expression
+    if is_member(s) {
         return true;
     }
     if let Some(rest) = s.strip_prefix('!') {
