@@ -4187,4 +4187,27 @@ mod tests {
         let r = rust_of(&code);
         assert!(r.contains("core::mem::swap(&mut st1, &mut st0);") || r.contains("core::mem::swap(&mut st0, &mut st1);"), "{r}");
     }
+
+    /// WS90: a flag a select folds and a later branch reads again (the second `test` merged into
+    /// the first by common subexpression elimination, so the branch reads it under another
+    /// varnode) stays a statement: the branch printed `if (!var_206)` with nothing assigning it.
+    #[test]
+    fn a_flag_a_select_folds_and_a_branch_reads_is_assigned() {
+        let code = [
+            0x40, 0xf6, 0xc6, 0x01, // test sil, 1
+            0x4c, 0x8b, 0x3a, // mov r15, [rdx]
+            0x4d, 0x0f, 0x45, 0xf7, // cmovne r14, r15
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0x40, 0xf6, 0xc6, 0x01, // test sil, 1
+            0x74, 0x03, // je L
+            0x4c, 0x89, 0x31, // mov [rcx], r14
+            0x48, 0x89, 0x01, // L: mov [rcx], rax
+            0xc3,
+        ];
+        let c = c_of(&code);
+        let flag = c.lines().find_map(|l| l.trim().strip_prefix("if (!").or_else(|| l.trim().strip_prefix("if ("))).map(|l| l.trim_end_matches(") {").to_string());
+        if let Some(f) = flag.filter(|f| crate::emit::is_identifier(f)) {
+            assert!(c.contains(&format!("{f} = ")), "{f} is never assigned: {c}");
+        }
+    }
 }

@@ -2193,18 +2193,19 @@ pub(crate) fn select_conditions(
             hidden.remove(&d);
         }
     }
+    // (WS90: every reader of the value — common subexpression elimination leaves readers of
+    // one value under several varnodes, each with its own `uses`: a branch reading the flag a
+    // select folded through another name printed `if (var_206)` with no assignment)
+    let readers = crate::condition::Readers::new(func);
     loop {
         let keep: Vec<usize> = hidden
             .iter()
             .copied()
             .filter(|&d| {
                 let Some(v) = func.ops[d].output else { return true };
-                func.varnodes[v as usize].uses.iter().any(|&u| {
+                readers.of(func, v).iter().any(|&u| {
                     let r = &func.ops[u];
-                    !r.dead
-                        && r.inputs.contains(&v)
-                        && !hidden.contains(&u)
-                        && !folded_by.get(&u).is_some_and(|ch| ch.contains(&d))
+                    !r.dead && !hidden.contains(&u) && !folded_by.get(&u).is_some_and(|ch| ch.contains(&d))
                 })
             })
             .collect();
