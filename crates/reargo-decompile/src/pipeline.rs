@@ -4041,4 +4041,27 @@ mod tests {
         assert!(r.contains("(edi as i32).overflowing_sub(esi as i32).1"), "{r}");
         assert!(!r.contains("(...)"), "{r}");
     }
+
+    /// WS90: `cmp; cmovl; …; cmovge` with an operand changed in between — the comparison is
+    /// computed once at the `cmp` and both selects read it (no `INT_SBORROW`, no `!SF != !OF`).
+    #[test]
+    fn signed_compare_read_after_an_operand_changes_is_computed_at_the_cmp() {
+        let code = [
+            0x39, 0xce, // cmp esi, ecx
+            0x8b, 0x17, // mov edx, [rdi]
+            0x0f, 0x4d, 0xd1, // cmovge edx, ecx
+            0x89, 0x17, // mov [rdi], edx
+            0x8b, 0x4f, 0x04, // mov ecx, [rdi+4]
+            0x0f, 0x4d, 0xce, // cmovge ecx, esi
+            0x89, 0x4f, 0x04, // mov [rdi+4], ecx
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(!c.contains("overflow_p") && !c.contains("INT_SBORROW"), "{c}");
+        assert!(!c.contains("!= !"), "{c}");
+        assert_eq!(c.matches("(int32_t)esi < (int32_t)ecx").count(), 2, "{c}");
+        let named = c.lines().find(|l| l.trim_start().ends_with("= (int32_t)esi < (int32_t)ecx;")).unwrap_or_else(|| panic!("{c}"));
+        let name = named.trim_start().split(' ').next().unwrap();
+        assert!(c.contains(&format!("ecx = {name} ? ecx : esi;")), "{c}");
+    }
 }

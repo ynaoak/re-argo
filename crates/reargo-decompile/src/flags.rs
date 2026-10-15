@@ -294,6 +294,60 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
         // what was cached for this value still holds (the same comparison)
         rewritten += 1;
     }
+    rewritten + compare_at_the_cmp(func)
+}
+
+/// WS90: `cmp esi, ecx; cmovl …; mov ecx, [m]; cmovge …` — the second `cmov` reads `SF != OF`
+/// after `ecx` changed, so it cannot print `esi < ecx` where it is (it printed
+/// `(!((int32_t)tmp_100 < (int32_t)0) != !var_20b)` with `var_20b = INT_SBORROW(...)`). When every
+/// reader of an overflow flag left combines it with the sign flag of the same `a - b` into
+/// `a s< b`, the overflow flag's op becomes that comparison — computed once, at the `cmp`,
+/// where `a` and `b` are what it reads — and each `SF != OF` a copy of it.
+fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
+    use OpCode::*;
+    let readers = crate::condition::Readers::new(func);
+    let mut memo: FxHashMap<ValueKey, Option<Found>> = FxHashMap::default();
+    let mut rewritten = 0;
+    for o in 0..func.ops.len() {
+        let op = &func.ops[o];
+        if op.dead || op.opcode != IntSBorrow || op.inputs.len() != 2 {
+            continue;
+        }
+        let Some(of) = op.output else { continue };
+        let (a, b) = (op.inputs[0], op.inputs[1]);
+        let same = |x: VarId, y: VarId| value_key(func, x) == value_key(func, y);
+        let live: SmallVec<[OpIdx; 4]> = readers.of(func, of).iter().copied().filter(|&u| !func.ops[u].dead).collect();
+        if live.is_empty() {
+            continue;
+        }
+        // each reader: `SF != OF` of this `a - b`
+        let all_lt = live.iter().all(|&x| {
+            let xo = &func.ops[x];
+            xo.opcode == BoolXor
+                && xo.inputs.len() == 2
+                && xo.output.is_some_and(|xv| match relation(func, xv, 0, &mut memo) {
+                    Some((Rel::Cmp(IntSLess, c, e), anchors)) => same(a, c) && same(b, e) && anchors.contains(&o),
+                    _ => false,
+                })
+        });
+        if !all_lt {
+            continue;
+        }
+        func.ops[o].opcode = IntSLess;
+        for &x in &live {
+            let inputs = func.ops[x].inputs.clone();
+            let ofk = value_key(func, of);
+            let Some(&ofv) = inputs.iter().find(|&&i| value_key(func, i) == ofk) else { continue };
+            for &i in &inputs {
+                if i != ofv {
+                    func.varnodes[i as usize].uses.retain(|&u| u != x);
+                }
+            }
+            func.ops[x].opcode = Copy;
+            func.ops[x].inputs = smallvec::smallvec![ofv];
+        }
+        rewritten += 1;
+    }
     rewritten
 }
 
