@@ -4323,4 +4323,21 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("long double f(") && !c.contains("st0"), "{c}");
     }
+
+    /// WS90: a signed compare at a join where one path's flags come from a `test` (OF = 0):
+    /// that path's `SF != OF` is the sign of the tested value, the other's `a < b`.
+    #[test]
+    fn signed_compare_at_a_join_with_a_test() {
+        let code = [
+            0x48, 0x85, 0xff, // test rdi, rdi
+            0x74, 0x03, // je L
+            0x48, 0x39, 0xd6, // cmp rsi, rdx
+            0x7c, 0x03, // L: jl M
+            0x31, 0xc0, 0xc3, // xor eax, eax; ret
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, // M: mov eax, 1; ret
+        ];
+        let c = c_of(&code);
+        assert!(!c.contains("overflow_p") && !c.contains("!= !") && !c.contains("var_20"), "{c}");
+        assert!(c.contains("= (int64_t)rsi < (int64_t)rdx;") && c.contains("= (int64_t)rdi < (int64_t)0;"), "{c}");
+    }
 }

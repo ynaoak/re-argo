@@ -338,6 +338,12 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
                 ofs.push(key.1);
                 s.inputs.iter().zip(&o.inputs).all(|(&a, &b)| pairs(func, a, b, depth + 1, seen, ofs))
             }
+            // `test x, x` / `and`: OF is 0, `SF != OF` is the sign of the result (in the same
+            // instruction, where the result is what SF reads)
+            (IntSLess, Copy) if s.inputs.len() == 2 && is_zero(func, s.inputs[1]) && o.inputs.len() == 1 && is_zero(func, o.inputs[0]) && s.address == o.address => {
+                ofs.push(key.1);
+                true
+            }
             (IntSLess, IntSBorrow) if s.inputs.len() == 2 && o.inputs.len() == 2 && is_zero(func, s.inputs[1]) => {
                 let Some(t) = func.varnodes[s.inputs[0] as usize].def_op.map(|t| &func.ops[t]) else { return false };
                 let ok = !t.dead && t.opcode == IntSub && t.inputs.len() == 2 && same(t.inputs[0], o.inputs[0]) && same(t.inputs[1], o.inputs[1]);
@@ -420,9 +426,32 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
     let mut rewritten = 0;
     for o in 0..func.ops.len() {
         let op = &func.ops[o];
-        if !op.dead && op.opcode == IntSBorrow && op.output.is_some_and(|v| set.contains(&value_key(func, v))) {
-            func.ops[o].opcode = IntSLess;
-            rewritten += 1;
+        if op.dead || !op.output.is_some_and(|v| set.contains(&value_key(func, v))) {
+            continue;
+        }
+        match op.opcode {
+            IntSBorrow => {
+                func.ops[o].opcode = IntSLess;
+                rewritten += 1;
+            }
+            // the `OF = 0` of a `test`: its instruction's sign flag, `t < 0`
+            Copy => {
+                let near = &func.ops[o.saturating_sub(16)..(o + 16).min(func.ops.len())];
+                let sign = near.iter().find(|s| {
+                    !s.dead && s.address == op.address && s.block == op.block && s.opcode == IntSLess && s.inputs.len() == 2 && is_zero(func, s.inputs[1])
+                });
+                let Some(inputs) = sign.map(|s| s.inputs.clone()) else { continue };
+                let old = std::mem::replace(&mut func.ops[o].inputs, inputs.clone());
+                for v in old {
+                    func.varnodes[v as usize].uses.retain(|&u| u != o);
+                }
+                for v in inputs {
+                    func.varnodes[v as usize].uses.push(o);
+                }
+                func.ops[o].opcode = IntSLess;
+                rewritten += 1;
+            }
+            _ => {}
         }
     }
     for ((x, of, _), live) in xors.iter().zip(&live_xors) {

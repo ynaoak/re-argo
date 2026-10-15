@@ -767,6 +767,15 @@ impl<'a> RustEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
+                let zero = |i: usize| op.inputs.get(i).is_some_and(|&v| {
+                    let d = &func.varnodes[v as usize].data;
+                    d.space == SpaceId::CONST && d.offset == 0
+                });
+                match (zero(0), zero(1)) {
+                    (false, true) => return Some(format!("{dst} = {a};")),
+                    (true, false) => return Some(format!("{dst} = {b};")),
+                    _ => {}
+                }
                 Some(format!("{} = ({} != 0) != ({} != 0);", dst, a, b))
             }
             OpCode::BoolNegate => {

@@ -887,6 +887,16 @@ impl<'a> CEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
+                // WS90: `x != false` is `x` (`SF != OF` after a `test`, which clears OF)
+                let zero = |i: usize| op.inputs.get(i).is_some_and(|&v| {
+                    let d = &func.varnodes[v as usize].data;
+                    d.space == SpaceId::CONST && d.offset == 0
+                });
+                match (zero(0), zero(1)) {
+                    (false, true) => return Some(format!("{dst} = {};", strip_outer_parens(&a))),
+                    (true, false) => return Some(format!("{dst} = {};", strip_outer_parens(&b))),
+                    _ => {}
+                }
                 Some(format!("{} = !{} != !{};", dst, a, b))
             }
             OpCode::BoolNegate => {
