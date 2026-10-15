@@ -67,6 +67,8 @@ pub fn decompile_with_symbols(
     let own = own_params(oracle.as_ref(), entry);
     let call_returns = callee_return_map(&trimmed, oracle.as_ref(), &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&trimmed));
+    let mut trimmed = trimmed;
+    long_double_tail_returns(&mut trimmed, &call_returns, &mut || crate::callers::return_hint(lifter, memory, entry));
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
@@ -393,6 +395,8 @@ fn decompile_function_inner(
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle, &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&terminated));
+    let mut terminated = terminated;
+    long_double_tail_returns(&mut terminated, &call_returns, &mut || crate::callers::return_hint(lifter, &program.info.memory, func_entry));
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
     // WS82: the exception landing pads, printed after the body
@@ -570,6 +574,87 @@ pub fn is_call_clobber(op: &reargo_core::pcode::OpCode, inputs: &[reargo_core::p
 /// the result does not read the value from before the call (WS75).
 /// `optimize::prune_call_args` later keeps only the arguments set up for the
 /// call. No-op when the lifter has no convention.
+/// WS90: a function whose every `ret` passes on a call's result (`jmp g`, `call g; pop rbx;
+/// ret`) and whose callers pop a `long double` off the x87 stack after calling it returns that
+/// value. Its own code does not show it (the lifter sees no x87 instruction after the call), so
+/// the callers decide (`callers::return_hint`, asked only for a function without x87 code whose
+/// every `ret` follows such a call to a callee not known to return in `rax` / `xmm0`): each of
+/// those calls defines `st0` and each `ret` returns it — `st0 = g(…); return st0;` in a
+/// `long double f(…)`.
+fn long_double_tail_returns(
+    instructions: &mut [LiftedInstruction],
+    call_returns: &rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind>,
+    hint: &mut dyn FnMut() -> Option<crate::callers::ReturnHint>,
+) {
+    use reargo_core::address::SpaceId;
+    use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
+    let x87 = |v: &VarnodeData| v.space == SpaceId::REGISTER && ((0x1100..0x1180).contains(&v.offset) || (0x10a0..0x10b0).contains(&v.offset));
+    let touches_x87 = |i: &LiftedInstruction| i.ops.iter().any(|o| o.output.as_ref().is_some_and(x87) || o.inputs.iter().any(x87));
+    if instructions.iter().any(touches_x87) {
+        return;
+    }
+    let is_call = |o: &PcodeOp| matches!(o.opcode, OpCode::Call | OpCode::CallInd);
+    // each `ret` and the instruction of the call it passes on
+    let mut sites: Vec<(usize, usize)> = Vec::new();
+    for k in 0..instructions.len() {
+        let Some(ret_pos) = instructions[k].ops.iter().position(|o| o.opcode == OpCode::Return && o.inputs.len() == 1) else { continue };
+        if instructions[k].ops[..ret_pos].iter().any(is_call) {
+            sites.push((k, k));
+            continue;
+        }
+        // straight back over at most 6 instructions that neither branch nor call
+        let mut found = None;
+        for j in (k.saturating_sub(7)..k).rev() {
+            let (a, b) = (&instructions[j], &instructions[j + 1]);
+            if a.address + a.length as u64 != b.address {
+                break;
+            }
+            if a.ops.iter().any(is_call) {
+                found = Some(j);
+                break;
+            }
+            if a.ops.iter().any(|o| matches!(o.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd | OpCode::Return)) {
+                break;
+            }
+        }
+        let Some(j) = found else { return };
+        sites.push((k, j));
+    }
+    if sites.is_empty() {
+        return;
+    }
+    // nothing else jumps between a call and its `ret` (a path that made no call)
+    let mut inside: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+    for &(k, j) in &sites {
+        inside.extend(instructions[j + 1..=k].iter().map(|i| i.address));
+    }
+    let jumps_in = instructions.iter().flat_map(|i| i.ops.iter()).any(|o| {
+        matches!(o.opcode, OpCode::Branch | OpCode::CBranch) && o.inputs.first().is_some_and(|t| t.space == SpaceId::RAM && inside.contains(&t.offset))
+    });
+    // (a callee known to return in `rax` / `xmm0` decides)
+    let known = sites.iter().any(|&(_, j)| {
+        matches!(call_returns.get(&instructions[j].address), Some(crate::callee_params::ReturnKind::Int | crate::callee_params::ReturnKind::Float))
+    });
+    if jumps_in || known || hint() != Some(crate::callers::ReturnHint::LongDouble) {
+        return;
+    }
+    let st0 = VarnodeData::new(SpaceId::REGISTER, 0x1100, 10);
+    for (k, j) in sites {
+        let insn = &mut instructions[j];
+        let pos = insn.ops.iter().position(is_call).expect("a call");
+        let call = &insn.ops[pos];
+        let target = call.inputs.first().copied().unwrap_or(VarnodeData::new(SpaceId::CONST, 0, 8));
+        let def = PcodeOp { opcode: OpCode::Indirect, seq: call.seq, output: Some(st0), inputs: smallvec::smallvec![target] };
+        insn.ops.insert(pos + 1, def);
+        for (i, op) in insn.ops.iter_mut().enumerate() {
+            op.seq.order = i as u32;
+        }
+        if let Some(ret) = instructions[k].ops.iter_mut().find(|o| o.opcode == OpCode::Return && o.inputs.len() == 1) {
+            ret.inputs.push(st0);
+        }
+    }
+}
+
 fn apply_call_convention(
     mut instructions: Vec<LiftedInstruction>,
     lifter: &dyn PcodeLift,
@@ -890,7 +975,7 @@ fn choose_return_register(
             }
             Some(crate::callers::ReturnHint::Float(s)) => (float_votes, int_votes, size) = (1, 0, size.max(s)),
             Some(crate::callers::ReturnHint::Int) => (float_votes, int_votes) = (0, 1),
-            None => {}
+            Some(crate::callers::ReturnHint::LongDouble) | None => {}
         }
     }
     // WS80: `return g();` with `g`'s return register unknown: ask what the callers read —
@@ -4219,5 +4304,23 @@ mod tests {
         let c = c_of(&[0x48, 0x8b, 0x47, 0x18, 0x39, 0xc6, 0x7c, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
         assert!(!c.contains("(int32_t)((uint32_t)") && !c.contains("(int32_t)(uint32_t)"), "{c}");
         assert!(c.contains("(int32_t)esi < (int32_t)*(uint64_t*)(rdi + 0x18)") || c.contains("(int32_t)esi < (int32_t)(*(uint64_t*)(rdi + 0x18))"), "{c}");
+    }
+
+    /// WS90: a function that passes on a call's result (`jmp g`) returns a `long double` when its
+    /// callers pop one off the x87 stack after calling it (`call f; fstp tbyte [rbx]`).
+    #[test]
+    fn callers_popping_x87_make_a_tail_call_return_long_double() {
+        let lifter = X86Lifter::new_64();
+        let f = [0xe9, 0xfb, 0x0f, 0x00, 0x00]; // jmp 0x2000
+        let g = [0xd9, 0xe8, 0xc3]; // fld1; ret
+        let caller = [0xe8, 0xfb, 0xdf, 0xff, 0xff, 0xdb, 0x3b, 0xc3]; // call 0x1000; fstp tbyte [rbx]; ret
+        let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g), (0x3000, &caller)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("long double f("), "{c}");
+        assert!(c.contains("st0 = 0x2000(") && c.contains("return st0;"), "{c}");
+        // without such a caller it stays as it was
+        let mem = make_memory_parts(&[(0x1000, &f), (0x2000, &g)]);
+        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        assert!(!c.contains("long double f(") && !c.contains("st0"), "{c}");
     }
 }
