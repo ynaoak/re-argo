@@ -453,7 +453,7 @@ fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKe
     // whose result several flags read) when `a` and `b` still hold their values at the end
     let rel = |i: usize| {
         let v = *op.inputs.get(i)?;
-        rels.get(&value_key(func, v)).copied().or_else(|| earlier_sub(func, v, op.block))
+        rels.get(&value_key(func, v)).copied().or_else(|| earlier_sub(func, v, op.block)).or_else(|| earlier_compare(func, v, op.block))
     };
     let zero = |i: usize| {
         op.inputs.get(i).is_some_and(|&v| {
@@ -510,6 +510,11 @@ fn relation(func: &SsaFunction, op: &crate::ssa::SsaOp, rels: &FxHashMap<ValueKe
             };
             Rel::Cmp { op: le, a, b, negated: false }
         }
+        // (a signed compare computed once at its `cmp`, WS90: `SF != OF` became a copy of it)
+        Copy => match rel(0)? {
+            r @ Rel::Cmp { .. } => r,
+            _ => return None,
+        },
         BoolNegate => match rel(0)? {
             Rel::Cmp { op, a, b, negated } => Rel::Cmp { op, a, b, negated: !negated },
             _ => return None,
@@ -548,6 +553,35 @@ fn earlier_sub(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
         }
     }
     Some(Rel::Sub(a, b))
+}
+
+/// `Cmp(a, b)` when `v` is an integer comparison computed in `block` (not one of the
+/// condition's ops: one several selects read, WS90) and nothing from it on in the block writes
+/// over `a` or `b`.
+fn earlier_compare(func: &SsaFunction, v: VarId, block: BlockId) -> Option<Rel> {
+    use OpCode::*;
+    let d = func.varnodes[v as usize].def_op?;
+    let c = &func.ops[d];
+    if c.dead || c.block != block || c.inputs.len() != 2 || !matches!(c.opcode, IntSLess | IntLess | IntEqual) {
+        return None;
+    }
+    let (a, b) = (c.inputs[0], c.inputs[1]);
+    let overlaps = |x: VarId, w: &reargo_core::pcode::VarnodeData| {
+        let x = &func.varnodes[x as usize].data;
+        x.space != reargo_core::address::SpaceId::CONST
+            && x.space == w.space
+            && x.offset < w.offset + w.size as u64
+            && w.offset < x.offset + x.size as u64
+    };
+    for later in func.ops[d + 1..].iter().take_while(|o| o.block == block) {
+        if let Some(out) = later.output
+            && !later.dead
+            && (overlaps(a, &func.varnodes[out as usize].data) || overlaps(b, &func.varnodes[out as usize].data))
+        {
+            return None;
+        }
+    }
+    Some(Rel::Cmp { op: c.opcode, a, b, negated: false })
 }
 
 /// A float value that is never a NaN: a constant that is not one, or an integer converted.

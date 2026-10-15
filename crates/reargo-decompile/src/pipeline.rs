@@ -4111,4 +4111,23 @@ mod tests {
             assert!(c.contains(s), "{s}: {c}");
         }
     }
+
+    /// WS90: two `cmovg` of one `cmp` whose operands hold both print `a <= b` (the signed
+    /// compare computed at the `cmp` for them reads as the comparison in each select).
+    #[test]
+    fn two_selects_of_one_signed_compare_read_as_comparisons() {
+        let code = [
+            0x3b, 0x70, 0x14, // cmp esi, [rax+0x14]
+            0x4c, 0x0f, 0x4f, 0xf2, // cmovg r14, rdx
+            0x48, 0x8b, 0x54, 0x24, 0x40, // mov rdx, [rsp+0x40]
+            0x4d, 0x0f, 0x4f, 0xe7, // cmovg r12, r15
+            0x4c, 0x89, 0x27, // mov [rdi], r12
+            0x4c, 0x89, 0x77, 0x08, // mov [rdi+8], r14
+            0x48, 0x89, 0x57, 0x10, // mov [rdi+16], rdx
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert_eq!(c.matches("((int32_t)esi <= (int32_t)tmp_510) ?").count(), 2, "{c}");
+        assert!(!c.contains("||"), "{c}");
+    }
 }
