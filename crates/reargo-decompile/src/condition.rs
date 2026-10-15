@@ -171,6 +171,11 @@ impl Readers {
     pub fn of(&self, func: &SsaFunction, v: VarId) -> &[OpIdx] {
         self.0.get(&value_key(func, v)).map_or(&[], |r| r.as_slice())
     }
+
+    /// The live ops reading the value `k`.
+    pub fn of_key(&self, k: &ValueKey) -> &[OpIdx] {
+        self.0.get(k).map_or(&[], |r| r.as_slice())
+    }
 }
 
 /// When `block` holds nothing but its test, the ops computing the condition (in order, the

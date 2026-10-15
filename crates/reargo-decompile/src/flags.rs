@@ -303,49 +303,140 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
 /// reader of an overflow flag left combines it with the sign flag of the same `a - b` into
 /// `a s< b`, the overflow flag's op becomes that comparison — computed once, at the `cmp`,
 /// where `a` and `b` are what it reads — and each `SF != OF` a copy of it.
+///
+/// The same through phis: `cmp a1, b1; jne L; cmp a2, b2; L: jl M` (a lexicographic compare)
+/// reads `SF != OF` of whichever `cmp` ran last. When the sign-flag phi and the overflow-flag
+/// phi join the flags of the same `cmp` on every edge, each `cmp`'s overflow flag becomes its
+/// `a s< b` and the join reads their phi.
 fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
     use OpCode::*;
     let readers = crate::condition::Readers::new(func);
-    let mut memo: FxHashMap<ValueKey, Option<Found>> = FxHashMap::default();
+    let def = |func: &SsaFunction, v: VarId| func.varnodes[v as usize].def_op.filter(|&d| !func.ops[d].dead);
+    // does (`sf`, `of`) hold the sign and overflow flags of one `a - b` (through phis that join
+    // them edge by edge)? Collects the overflow values (leaves and phis) on the way.
+    fn pairs(func: &SsaFunction, sf: VarId, of: VarId, depth: u32, seen: &mut Vec<(ValueKey, ValueKey)>, ofs: &mut Vec<ValueKey>) -> bool {
+        use OpCode::*;
+        let key = (value_key(func, sf), value_key(func, of));
+        if seen.contains(&key) {
+            return true;
+        }
+        if depth > MAX_DEPTH * 2 || seen.len() > 64 {
+            return false;
+        }
+        seen.push(key);
+        let (Some(ds), Some(dof)) = (func.varnodes[sf as usize].def_op, func.varnodes[of as usize].def_op) else { return false };
+        let (s, o) = (&func.ops[ds], &func.ops[dof]);
+        if s.dead || o.dead {
+            return false;
+        }
+        let same = |x: VarId, y: VarId| value_key(func, x) == value_key(func, y);
+        match (s.opcode, o.opcode) {
+            (MultiEqual, MultiEqual) => {
+                if s.block != o.block || s.inputs.len() != o.inputs.len() {
+                    return false;
+                }
+                ofs.push(key.1);
+                s.inputs.iter().zip(&o.inputs).all(|(&a, &b)| pairs(func, a, b, depth + 1, seen, ofs))
+            }
+            (IntSLess, IntSBorrow) if s.inputs.len() == 2 && o.inputs.len() == 2 && is_zero(func, s.inputs[1]) => {
+                let Some(t) = func.varnodes[s.inputs[0] as usize].def_op.map(|t| &func.ops[t]) else { return false };
+                let ok = !t.dead && t.opcode == IntSub && t.inputs.len() == 2 && same(t.inputs[0], o.inputs[0]) && same(t.inputs[1], o.inputs[1]);
+                if ok {
+                    ofs.push(key.1);
+                }
+                ok
+            }
+            _ => false,
+        }
+    }
+    // every `SF != OF` that pairs, with its overflow input and the overflow values it reaches
+    let mut xors: Vec<(OpIdx, VarId, Vec<ValueKey>)> = Vec::new();
+    for x in 0..func.ops.len() {
+        let op = &func.ops[x];
+        if op.dead || op.opcode != BoolXor || op.inputs.len() != 2 {
+            continue;
+        }
+        for (sf, of) in [(op.inputs[0], op.inputs[1]), (op.inputs[1], op.inputs[0])] {
+            let (mut seen, mut ofs) = (Vec::new(), Vec::new());
+            if def(func, of).is_some() && pairs(func, sf, of, 0, &mut seen, &mut ofs) {
+                xors.push((x, of, ofs));
+                break;
+            }
+        }
+    }
+    if xors.is_empty() {
+        return 0;
+    }
+    // the overflow values to turn into comparisons: each read only by phis of the set and by
+    // those `SF != OF` (a value read otherwise — `jo`, a phi with another input — drops out,
+    // and with it every xor and phi reaching it)
+    let mut set: rustc_hash::FxHashSet<ValueKey> = xors.iter().flat_map(|(_, _, o)| o.iter().copied()).collect();
+    let mut live_xors: Vec<bool> = vec![true; xors.len()];
+    let mut def_of: FxHashMap<ValueKey, OpIdx> = FxHashMap::default();
+    for v in 0..func.varnodes.len() {
+        if let Some(d) = func.varnodes[v].def_op {
+            let k = value_key(func, v as VarId);
+            if set.contains(&k) {
+                def_of.entry(k).or_insert(d);
+            }
+        }
+    }
+    loop {
+        let xor_ops: rustc_hash::FxHashSet<OpIdx> = xors.iter().zip(&live_xors).filter(|(_, l)| **l).map(|((x, _, _), _)| *x).collect();
+        let mut drop: Vec<ValueKey> = Vec::new();
+        for &k in &set {
+            let rs = readers.of_key(&k);
+            let ok = rs.iter().all(|&u| {
+                let uo = &func.ops[u];
+                uo.dead
+                    || xor_ops.contains(&u)
+                    || (uo.opcode == MultiEqual && uo.output.is_some_and(|o| set.contains(&value_key(func, o))))
+            });
+            if !ok {
+                drop.push(k);
+            }
+        }
+        // a phi of the set with an input outside it
+        for &k in &set {
+            let Some(&d) = def_of.get(&k) else { continue };
+            if func.ops[d].opcode == MultiEqual && func.ops[d].inputs.iter().any(|&i| !set.contains(&value_key(func, i))) {
+                drop.push(k);
+            }
+        }
+        let mut changed = false;
+        for k in drop {
+            changed |= set.remove(&k);
+        }
+        for (i, (_, _, ofs)) in xors.iter().enumerate() {
+            if live_xors[i] && ofs.iter().any(|k| !set.contains(k)) {
+                live_xors[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut rewritten = 0;
     for o in 0..func.ops.len() {
         let op = &func.ops[o];
-        if op.dead || op.opcode != IntSBorrow || op.inputs.len() != 2 {
+        if !op.dead && op.opcode == IntSBorrow && op.output.is_some_and(|v| set.contains(&value_key(func, v))) {
+            func.ops[o].opcode = IntSLess;
+            rewritten += 1;
+        }
+    }
+    for ((x, of, _), live) in xors.iter().zip(&live_xors) {
+        if !live {
             continue;
         }
-        let Some(of) = op.output else { continue };
-        let (a, b) = (op.inputs[0], op.inputs[1]);
-        let same = |x: VarId, y: VarId| value_key(func, x) == value_key(func, y);
-        let live: SmallVec<[OpIdx; 4]> = readers.of(func, of).iter().copied().filter(|&u| !func.ops[u].dead).collect();
-        if live.is_empty() {
-            continue;
-        }
-        // each reader: `SF != OF` of this `a - b`
-        let all_lt = live.iter().all(|&x| {
-            let xo = &func.ops[x];
-            xo.opcode == BoolXor
-                && xo.inputs.len() == 2
-                && xo.output.is_some_and(|xv| match relation(func, xv, 0, &mut memo) {
-                    Some((Rel::Cmp(IntSLess, c, e), anchors)) => same(a, c) && same(b, e) && anchors.contains(&o),
-                    _ => false,
-                })
-        });
-        if !all_lt {
-            continue;
-        }
-        func.ops[o].opcode = IntSLess;
-        for &x in &live {
-            let inputs = func.ops[x].inputs.clone();
-            let ofk = value_key(func, of);
-            let Some(&ofv) = inputs.iter().find(|&&i| value_key(func, i) == ofk) else { continue };
-            for &i in &inputs {
-                if i != ofv {
-                    func.varnodes[i as usize].uses.retain(|&u| u != x);
-                }
+        let inputs = func.ops[*x].inputs.clone();
+        for &i in &inputs {
+            if i != *of {
+                func.varnodes[i as usize].uses.retain(|&u| u != *x);
             }
-            func.ops[x].opcode = Copy;
-            func.ops[x].inputs = smallvec::smallvec![ofv];
         }
+        func.ops[*x].opcode = Copy;
+        func.ops[*x].inputs = smallvec::smallvec![*of];
         rewritten += 1;
     }
     rewritten

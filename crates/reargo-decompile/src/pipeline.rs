@@ -4092,4 +4092,23 @@ mod tests {
         let r = rust_of(&code);
         assert!(r.contains("lt_0 = rdi < rsi;") && r.contains("lt_1 = rdx < rcx;") && !r.contains("var_20"), "{r}");
     }
+
+    /// WS90: a signed compare read at a join of two `cmp`s (`cmp; jne L; cmp; L: jl`) is each
+    /// `cmp`'s `a < b`, joined: no sign / overflow flags (`!neg != !ovf`).
+    #[test]
+    fn signed_compare_at_a_join_is_each_cmps_comparison() {
+        let code = [
+            0x48, 0x39, 0xf7, // cmp rdi, rsi
+            0x75, 0x03, // jne L
+            0x48, 0x39, 0xca, // cmp rdx, rcx
+            0x7c, 0x03, // L: jl M
+            0x31, 0xc0, 0xc3, // xor eax, eax; ret
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, // M: mov eax, 1; ret
+        ];
+        let c = c_of(&code);
+        assert!(!c.contains("overflow_p") && !c.contains("!= !") && !c.contains("var_20"), "{c}");
+        for s in ["lt_0 = (int64_t)rdi < (int64_t)rsi;", "lt_0 = (int64_t)rdx < (int64_t)rcx;", "if (lt_0)"] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+    }
 }
