@@ -27,26 +27,22 @@
 //! `CallSiteAnnotator` can layer this on top of the existing
 //! resolver to fill in `?` args.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use reargo_core::address::SpaceId;
-use reargo_core::pcode::OpCode;
+use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
 use reargo_lift::{LiftedInstruction, PcodeLift};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::func_lift::{function_jobs, lift_function};
+use crate::blockflow::{self, FlowState};
+use crate::byteconst::{eval, is_unmodeled, is_view_refresh, ByteConst, ByteMem, RegFile};
+use crate::func_lift::{external_entries, function_jobs, in_extent, lift_function, owns};
 
 /// Constants observed on entry to each call instruction.
 /// Outer key = instruction address of the Call; inner key = REGISTER
 /// space offset; value = the proven constant.
 pub type CallConstants = BTreeMap<u64, BTreeMap<u64, u64>>;
-
-/// Per-block visit cap. The previous outer `for _round in 0..8`
-/// loop is gone in favour of a real worklist that re-enqueues only
-/// the successors of a block whose `out` state actually changed,
-/// but pathological irreducible CFGs still need a hard fence.
-const MAX_VISITS_PER_BLOCK: usize = 8;
 
 /// One function's call-site register snapshots, in the order its
 /// worklist records them (a site may appear once per visit).
@@ -61,7 +57,7 @@ pub fn build_call_constants(lifter: &dyn PcodeLift, program: &Program) -> CallCo
     let per_func: Vec<Option<CallSnapshots>> = function_jobs(program)
         .par_iter()
         .map(|&(entry, max)| {
-            lift_function(lifter, program, entry, max).map(|insns| function_snapshots(&insns))
+            lift_function(lifter, program, entry, max).map(|insns| function_snapshots(program, entry, &insns))
         })
         .collect();
     let mut out = CallConstants::new();
@@ -71,11 +67,28 @@ pub fn build_call_constants(lifter: &dyn PcodeLift, program: &Program) -> CallCo
     out
 }
 
-/// Propagate one function's lifted instructions (empty for an empty
-/// lift). Merge the results of every function, in listing order,
-/// with [`merge_snapshots`] to get [`build_call_constants`].
-pub fn function_snapshots(insns: &[LiftedInstruction]) -> CallSnapshots {
-    propagate_one(insns)
+/// Propagate the lifted instructions of the function at `entry`
+/// (empty for an empty lift), keeping the call sites that function
+/// owns. Merge the results of every function, in listing order, with
+/// [`merge_snapshots`] to get [`build_call_constants`].
+pub fn function_snapshots(program: &Program, entry: u64, insns: &[LiftedInstruction]) -> CallSnapshots {
+    function_snapshots_with(program, entry, insns, &external_entries(program, insns))
+}
+
+/// [`function_snapshots`] with the lift's [`external_entries`] already
+/// computed.
+pub(crate) fn function_snapshots_with(
+    program: &Program,
+    entry: u64,
+    insns: &[LiftedInstruction],
+    external: &BTreeSet<u64>,
+) -> CallSnapshots {
+    if insns.is_empty() {
+        return Vec::new();
+    }
+    let mut snaps = propagate_with(insns, external, |a| in_extent(program, entry, a));
+    snaps.retain(|(addr, _)| owns(program, entry, *addr));
+    snaps
 }
 
 /// Fold one function's call snapshots into the program-wide map.
@@ -93,260 +106,94 @@ pub fn merge_snapshots(out: &mut CallConstants, snaps: CallSnapshots) {
     }
 }
 
-/// State at a P-code-op boundary: (space-id, offset) → constant.
-type State = BTreeMap<(SpaceId, u64), u64>;
+/// State at a P-code-op boundary: known register bytes (x86
+/// sub-register semantics, see [`crate::byteconst`]) and known
+/// non-register varnodes (UNIQUE temporaries, …) with their size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct State {
+    regs: RegFile,
+    temps: ByteMem<SpaceId>,
+}
 
-fn propagate_one(insns: &[LiftedInstruction]) -> CallSnapshots {
-    let mut snaps: CallSnapshots = Vec::new();
-    if insns.is_empty() {
-        return snaps;
+impl State {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::default()
     }
 
-    // Build a flat `address -> index` map up front so we can walk
-    // edges in O(1).
-    let mut addr_to_idx: BTreeMap<u64, usize> = BTreeMap::new();
-    for (idx, insn) in insns.iter().enumerate() {
-        addr_to_idx.insert(insn.address, idx);
-    }
-
-    // Determine block starts: function entry + every branch target +
-    // every instruction immediately after a branch / return.
-    let mut block_starts: BTreeSet<u64> = BTreeSet::new();
-    block_starts.insert(insns[0].address);
-    let mut prev_terminator = false;
-    for insn in insns {
-        if prev_terminator {
-            block_starts.insert(insn.address);
-        }
-        prev_terminator = false;
-        for op in &insn.ops {
-            match op.opcode {
-                OpCode::Branch | OpCode::CBranch => {
-                    if let Some(t) = op.inputs.first()
-                        && t.space == SpaceId::RAM
-                    {
-                        block_starts.insert(t.offset);
-                    }
-                    if op.opcode == OpCode::Branch {
-                        prev_terminator = true;
-                    }
-                }
-                OpCode::Return | OpCode::BranchInd => prev_terminator = true,
-                _ => {}
-            }
+    fn read(&self, vn: &VarnodeData) -> ByteConst {
+        match vn.space {
+            SpaceId::CONST => ByteConst::konst(vn.offset, vn.size),
+            SpaceId::REGISTER => self.regs.read(vn.offset, vn.size),
+            s => self.temps.read(s, vn.offset as i64, vn.size),
         }
     }
 
-    // Map every instruction address to its containing block start.
-    // The block ends at the next block-start (exclusive).
-    let starts_vec: Vec<u64> = block_starts.iter().copied().collect();
-    let block_of = |addr: u64| -> u64 {
-        // Largest start ≤ addr (`starts_vec` is sorted).
-        match starts_vec.partition_point(|&s| s <= addr) {
-            0 => addr,
-            i => starts_vec[i - 1],
-        }
-    };
-
-    // Predecessor map: block_start → set of predecessor block_starts.
-    let mut preds: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-    for (i, insn) in insns.iter().enumerate() {
-        let cur_block = block_of(insn.address);
-        let mut terminator = false;
-        for op in &insn.ops {
-            match op.opcode {
-                OpCode::Branch => {
-                    if let Some(t) = op.inputs.first()
-                        && t.space == SpaceId::RAM
-                        && block_starts.contains(&t.offset)
-                    {
-                        preds.entry(t.offset).or_default().insert(cur_block);
-                    }
-                    terminator = true;
-                }
-                OpCode::CBranch => {
-                    if let Some(t) = op.inputs.first()
-                        && t.space == SpaceId::RAM
-                        && block_starts.contains(&t.offset)
-                    {
-                        preds.entry(t.offset).or_default().insert(cur_block);
-                    }
-                }
-                OpCode::Return | OpCode::BranchInd => terminator = true,
-                _ => {}
-            }
-        }
-        // Fall-through edge: if not a terminator op, the next
-        // instruction in stream order — when it sits in a *different*
-        // block — is a successor.
-        if !terminator
-            && let Some(next) = insns.get(i + 1)
-        {
-            let next_block = block_of(next.address);
-            if next_block != cur_block {
-                preds.entry(next_block).or_default().insert(cur_block);
-            }
+    fn write(&mut self, out: &VarnodeData, v: ByteConst) {
+        match out.space {
+            SpaceId::REGISTER => self.regs.write(out.offset, out.size, v),
+            s => self.temps.write(s, out.offset as i64, out.size, v),
         }
     }
 
-    // Per-block in / out states. The previous outer loop re-walked
-    // every block 8 times even when only a leaf had flipped — O(rounds
-    // × blocks × ops). A real worklist re-enqueues only the
-    // successors of a block whose out_state actually changed, which
-    // is O(edges × convergence) and matches the algorithm we already
-    // use in `vsa.rs`.
-    let entry = insns[0].address;
-    let mut in_state: BTreeMap<u64, State> = BTreeMap::new();
-    let mut out_state: BTreeMap<u64, State> = BTreeMap::new();
-    in_state.insert(entry, State::new());
-
-    // Build the successor relation once; reverse of `preds`.
-    let mut succs: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-    for (b, ps) in &preds {
-        for p in ps {
-            succs.entry(*p).or_default().insert(*b);
+    /// Apply one non-call op: view refreshes change nothing, the
+    /// ops [`eval`] models compute their output, anything else
+    /// (loads included) makes it unknown.
+    fn apply(&mut self, op: &PcodeOp) {
+        if is_unmodeled(op) {
+            *self = State::default();
+            return;
         }
-    }
-
-    let mut visits: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut worklist: VecDeque<u64> = VecDeque::from_iter(starts_vec.iter().copied());
-    let mut in_queue: BTreeSet<u64> = starts_vec.iter().copied().collect();
-
-    while let Some(b) = worklist.pop_front() {
-        in_queue.remove(&b);
-        let v = visits.entry(b).or_insert(0);
-        if *v >= MAX_VISITS_PER_BLOCK {
-            continue;
+        let Some(out) = op.output.as_ref() else {
+            return;
+        };
+        if is_view_refresh(op) {
+            return;
         }
-        *v += 1;
-
-        // Join all predecessors' out states.
-        let joined = if let Some(ps) = preds.get(&b) {
-            if ps.is_empty() && b == entry {
-                State::new()
-            } else {
-                intersect_all(ps.iter().filter_map(|p| out_state.get(p)))
-            }
-        } else if b == entry {
-            State::new()
+        let v = if op.opcode == OpCode::Load {
+            // The IndirectCallResolver picks up the (Load of CONST
+            // RAM address → GOT slot → import) chain in its own pass.
+            ByteConst::UNKNOWN
         } else {
-            // Unreachable block — leave alone.
-            continue;
+            eval(op, |vn| self.read(vn)).unwrap_or(ByteConst::UNKNOWN)
         };
-
-        if in_state.get(&b) != Some(&joined) {
-            in_state.insert(b, joined.clone());
-        }
-
-        // Walk the block's instructions to compute out.
-        let block_end = starts_vec
-            .get(starts_vec.partition_point(|&s| s <= b))
-            .copied()
-            .unwrap_or(u64::MAX);
-        let mut st = joined;
-        let mut block_call_consts: Vec<(u64, BTreeMap<u64, u64>)> = Vec::new();
-        let Some(&start_idx) = addr_to_idx.get(&b) else {
-            continue;
-        };
-        for insn in &insns[start_idx..] {
-            if insn.address >= block_end {
-                break;
-            }
-            for op in &insn.ops {
-                match op.opcode {
-                    OpCode::Call | OpCode::CallInd => {
-                        // Snapshot the REGISTER-space subset.
-                        let mut regs: BTreeMap<u64, u64> = BTreeMap::new();
-                        for ((sp, off), val) in &st {
-                            if *sp == SpaceId::REGISTER {
-                                regs.insert(*off, *val);
-                            }
-                        }
-                        block_call_consts.push((insn.address, regs));
-                        // SysV: caller-saved registers clobbered.
-                        st.retain(|(sp, _), _| *sp != SpaceId::REGISTER);
-                    }
-                    OpCode::Copy => {
-                        apply_copy(&mut st, op);
-                    }
-                    OpCode::Load => {
-                        // For our purposes we conservatively drop the
-                        // destination's constness. The IndirectCall-
-                        // Resolver picks up the (Load of CONST RAM
-                        // address → GOT slot → import) chain in its
-                        // own pass; replicating that here would just
-                        // duplicate work.
-                        if let Some(dst) = op.output.as_ref() {
-                            st.remove(&(dst.space, dst.offset));
-                        }
-                    }
-                    _ => {
-                        // Any other write kills constness.
-                        if let Some(dst) = op.output.as_ref() {
-                            st.remove(&(dst.space, dst.offset));
-                        }
-                    }
-                }
-            }
-        }
-        // Record this block's call snapshots (merged by the caller).
-        snaps.extend(block_call_consts);
-
-        let out_changed = out_state.get(&b) != Some(&st);
-        if out_changed {
-            out_state.insert(b, st);
-            // Only the successors of a just-changed block need re-
-            // walking. That's the core of the worklist optimisation
-            // over the previous "scan every block every round" form.
-            if let Some(ss) = succs.get(&b) {
-                for s in ss {
-                    if in_queue.insert(*s) {
-                        worklist.push_back(*s);
-                    }
-                }
-            }
-        }
+        self.write(out, v);
     }
-    snaps
-}
 
-fn apply_copy(st: &mut State, op: &reargo_core::pcode::PcodeOp) {
-    let Some(dst) = op.output.as_ref() else {
-        return;
-    };
-    let Some(src) = op.inputs.first() else {
-        st.remove(&(dst.space, dst.offset));
-        return;
-    };
-    let v = if src.space == SpaceId::CONST {
-        Some(src.offset)
-    } else {
-        st.get(&(src.space, src.offset)).copied()
-    };
-    match v {
-        Some(val) => {
-            st.insert((dst.space, dst.offset), val);
-        }
-        None => {
-            st.remove(&(dst.space, dst.offset));
-        }
+    /// Per-byte intersection (a CFG join).
+    fn intersect(&self, other: &State) -> State {
+        State { regs: self.regs.intersect(&other.regs), temps: self.temps.intersect(&other.temps) }
     }
 }
 
-/// Per-key intersection — a key survives iff every input has it AND
-/// every input maps it to the same value.
-fn intersect_all<'a>(states: impl Iterator<Item = &'a State>) -> State {
-    let collected: Vec<&State> = states.collect();
-    if collected.is_empty() {
-        return State::new();
-    }
-    let mut out = collected[0].clone();
-    for other in &collected[1..] {
-        out.retain(|k, v| other.get(k) == Some(v));
-    }
-    out
+#[cfg(test)]
+fn propagate_one(insns: &[LiftedInstruction]) -> CallSnapshots {
+    propagate_with(insns, &BTreeSet::new(), |_| true)
 }
 
+fn propagate_with(
+    insns: &[LiftedInstruction],
+    external: &BTreeSet<u64>,
+    in_body: impl Fn(u64) -> bool,
+) -> CallSnapshots {
+    blockflow::propagate::<State, _>(insns, external, in_body, |st| st.regs.full_values().collect())
+}
+
+impl FlowState for State {
+    /// Per-byte intersection: a byte survives iff both inputs know it
+    /// with the same value.
+    fn join(&self, other: &Self) -> Self {
+        self.intersect(other)
+    }
+    fn apply(&mut self, op: &PcodeOp) {
+        State::apply(self, op);
+    }
+    /// SysV: caller-saved registers clobbered (conservatively every
+    /// register); temporaries are kept.
+    fn after_call(&mut self) {
+        self.regs.clear();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -355,26 +202,45 @@ mod tests {
     #[test]
     fn intersect_keeps_agreeing_keys() {
         let mut a = State::new();
-        a.insert((SpaceId::REGISTER, 0x38), 0xaa);
-        a.insert((SpaceId::REGISTER, 0x30), 0xbb);
+        a.regs.set64(0x38, 0xaa);
+        a.regs.set64(0x30, 0xbb);
         let mut b = State::new();
-        b.insert((SpaceId::REGISTER, 0x38), 0xaa);
-        b.insert((SpaceId::REGISTER, 0x30), 0xcc); // disagrees
-        let out = intersect_all([&a, &b].into_iter());
-        assert_eq!(out.get(&(SpaceId::REGISTER, 0x38)), Some(&0xaa));
-        assert_eq!(out.get(&(SpaceId::REGISTER, 0x30)), None);
+        b.regs.set64(0x38, 0xaa);
+        b.regs.set64(0x30, 0xcc); // disagrees
+        let out = FlowState::join(&a, &b);
+        assert_eq!(out.regs.get64(0x38), Some(0xaa));
+        assert_eq!(out.regs.get64(0x30), None);
     }
 
+    /// The lifter's sub-register sequences, each followed by a call:
+    /// the snapshot holds the full 8-byte register values.
     #[test]
-    fn intersect_empty_singleton() {
-        let states: Vec<&State> = Vec::new();
-        let out = intersect_all(states.into_iter());
-        assert!(out.is_empty());
+    fn sub_register_sequences_resolve() {
+        use crate::byteconst::testseq::*;
+        let snap = |ops: Vec<PcodeOp>| {
+            let mut ops = ops;
+            ops.push(op(OpCode::Call, None, &[k(0xdead, 8)]));
+            let insn = LiftedInstruction { address: 0x1000, length: 4, mnemonic: "x".into(), ops };
+            let mut result = CallConstants::new();
+            merge_snapshots(&mut result, propagate_one(&[insn]));
+            result.remove(&0x1000).expect("call snapshot")
+        };
+        assert_eq!(snap(mov_esi_imm32()).get(&0x30), Some(&0x2a));
+        let s = snap(lea_rax_mov_rdi());
+        assert_eq!((s.get(&0), s.get(&0x38)), (Some(&0x402004), Some(&0x402004)));
+        assert_eq!(snap(mov_rax_then_al()).get(&0), Some(&0x7fff_1234_5605));
+        let s = snap(ah_write_read());
+        assert_eq!((s.get(&0), s.get(&0x08)), (Some(&0x0734), Some(&7)));
+        let s = snap(movsx_movzx());
+        assert_eq!(s.get(&0x38), Some(&0xffff_ff80));
+        assert_eq!(s.get(&0x30), Some(&0x80));
+        assert_eq!(s.get(&0x80), Some(&0xffff_ffff_ffff_ff80));
+        assert_eq!(s.get(&0x10), None);
     }
 
     // Helpers shared by the propagate tests.
     use reargo_core::address::Address;
-    use reargo_core::pcode::{PcodeOp, SeqNum, VarnodeData};
+    use reargo_core::pcode::SeqNum;
 
     fn vn_reg(off: u64) -> VarnodeData {
         VarnodeData { space: SpaceId::REGISTER, offset: off, size: 8 }
@@ -511,5 +377,55 @@ mod tests {
             "register state must be cleared across the first call; got: {:?}",
             second
         );
+    }
+
+    /// The taken edge of a conditional jump carries the state at the
+    /// jump, not at the end of its block: `je L; mov ecx, 0xe0; jmp M`
+    /// must not reach `L` with `ecx = 0xe0`.
+    #[test]
+    fn conditional_edge_uses_state_at_the_jump() {
+        let rcx = 0x08u64;
+        let insns = [
+            LiftedInstruction {
+                address: 0x1000,
+                length: 4,
+                mnemonic: "je".into(),
+                ops: vec![op(OpCode::CBranch, vec![vn_ram(0x2000), vn_reg(0x206)], None)],
+            },
+            LiftedInstruction {
+                address: 0x1004,
+                length: 4,
+                mnemonic: "mov".into(),
+                ops: vec![op(OpCode::Copy, vec![vn_const(0xe0)], Some(vn_reg(rcx)))],
+            },
+            LiftedInstruction {
+                address: 0x1008,
+                length: 4,
+                mnemonic: "jmp".into(),
+                ops: vec![op(OpCode::Branch, vec![vn_ram(0x3000)], None)],
+            },
+            LiftedInstruction {
+                address: 0x2000,
+                length: 4,
+                mnemonic: "call".into(),
+                ops: vec![
+                    op(OpCode::Call, vec![vn_const(0xdead)], None),
+                    op(OpCode::Return, vec![vn_const(0)], None),
+                ],
+            },
+            LiftedInstruction {
+                address: 0x3000,
+                length: 4,
+                mnemonic: "call".into(),
+                ops: vec![
+                    op(OpCode::Call, vec![vn_const(0xbeef)], None),
+                    op(OpCode::Return, vec![vn_const(0)], None),
+                ],
+            },
+        ];
+        let mut result = CallConstants::new();
+        merge_snapshots(&mut result, propagate_one(&insns));
+        assert_eq!(result.get(&0x2000).expect("taken").get(&rcx), None);
+        assert_eq!(result.get(&0x3000).expect("fall-through").get(&rcx), Some(&0xe0));
     }
 }

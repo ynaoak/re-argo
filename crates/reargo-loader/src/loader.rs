@@ -100,6 +100,9 @@ pub struct DynamicInfo {
     pub needed_libs: Vec<String>,
     pub soname: Option<String>,
     pub rpath: Option<String>,
+    /// Entries of the functions the ELF image defines in `.dynsym`
+    /// (callable from other images), sorted.
+    pub exported_functions: Vec<u64>,
 }
 
 
@@ -402,7 +405,22 @@ impl BinaryLoader {
             }
         }
 
-        let mut dynamic = DynamicInfo::default();
+        let mut exported_functions: Vec<u64> = elf
+            .dynsyms
+            .iter()
+            .filter(|sym| {
+                !sym.is_import()
+                    && sym.st_value != 0
+                    && matches!(
+                        goblin::elf::sym::st_type(sym.st_info),
+                        goblin::elf::sym::STT_FUNC | goblin::elf::sym::STT_GNU_IFUNC
+                    )
+            })
+            .map(|sym| sym.st_value)
+            .collect();
+        exported_functions.sort_unstable();
+        exported_functions.dedup();
+        let mut dynamic = DynamicInfo { exported_functions, ..DynamicInfo::default() };
         if let Some(ref dyns) = elf.dynamic {
             for d in &dyns.dyns {
                 if d.d_tag == goblin::elf::dynamic::DT_NEEDED

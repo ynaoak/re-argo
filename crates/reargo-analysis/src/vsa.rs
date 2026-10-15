@@ -29,15 +29,17 @@
 //! analyzers (switch table v2 sizing, buffer bounds) can consume the
 //! richer info.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use reargo_core::address::SpaceId;
-use reargo_core::pcode::OpCode;
+use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
 use reargo_lift::{LiftedInstruction, PcodeLift};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::func_lift::{function_jobs, lift_function};
+use crate::blockflow::{self, FlowState};
+use crate::byteconst::{bit_mask, eval, is_unmodeled, is_view_refresh, ByteConst};
+use crate::func_lift::{external_entries, function_jobs, in_extent, lift_function, owns};
 
 /// Set → Range widening threshold. A `Set` join that crosses this
 /// size collapses to a Range envelope to keep the per-block state
@@ -116,8 +118,309 @@ impl AbstractValue {
 /// REGISTER-space varnode that was non-Top on entry.
 pub type VsaResult = BTreeMap<u64, BTreeMap<u64, AbstractValue>>;
 
-/// State: (space, offset) → abstract value.
-type State = BTreeMap<(SpaceId, u64), AbstractValue>;
+/// One register (8 bytes at `offset & !7`) or temporary: its known
+/// bytes, or an abstract `Set` / `Range` of its low `size` bytes with
+/// the bytes above unknown. Constants are always `Bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Slot {
+    Bytes(ByteConst),
+    Low(u32, AbstractValue),
+}
+
+impl Slot {
+    /// The known bytes (none for an abstract value).
+    fn bytes(&self) -> ByteConst {
+        match self {
+            Slot::Bytes(b) => *b,
+            Slot::Low(..) => ByteConst::UNKNOWN,
+        }
+    }
+
+    /// The `size` bytes at byte `pos` as an abstract value.
+    fn read(&self, pos: u32, size: u32) -> AbstractValue {
+        match self {
+            Slot::Bytes(b) => b.bytes_at(pos, size).get(size).map_or(AbstractValue::Top, AbstractValue::Const),
+            Slot::Low(ls, v) if pos == 0 && size <= *ls => fit(v.clone(), size),
+            Slot::Low(..) => AbstractValue::Top,
+        }
+    }
+
+    /// The widest low part this slot pins: `(width, value)`.
+    fn view(&self) -> Option<(u32, AbstractValue)> {
+        match self {
+            Slot::Bytes(b) => [8, 4, 2, 1].into_iter().find_map(|w| b.get(w).map(|v| (w, AbstractValue::Const(v)))),
+            Slot::Low(s, v) => Some((*s, v.clone())),
+        }
+    }
+
+    /// CFG join; `None` when nothing survives.
+    fn join(&self, other: &Slot) -> Option<Slot> {
+        if self == other {
+            return Some(self.clone());
+        }
+        if let (Some((wa, va)), Some((wb, vb))) = (self.view(), other.view()) {
+            let w = wa.min(wb);
+            let j = normalize(fit(va, w).join(&fit(vb, w)));
+            if matches!(j, AbstractValue::Set(_) | AbstractValue::Range(..)) {
+                return Some(Slot::Low(w, j));
+            }
+        }
+        let b = self.bytes().intersect(other.bytes());
+        (!b.is_unknown()).then_some(Slot::Bytes(b))
+    }
+}
+
+/// A computed value: known bytes, or an abstract value of the whole
+/// output.
+enum Val {
+    Bytes(ByteConst),
+    Abs(AbstractValue),
+}
+
+/// `Set` of one value / `Range` of one value → `Const`.
+fn normalize(v: AbstractValue) -> AbstractValue {
+    match v {
+        AbstractValue::Set(s) if s.len() == 1 => AbstractValue::Const(*s.iter().next().unwrap()),
+        AbstractValue::Set(s) if s.is_empty() => AbstractValue::Bot,
+        AbstractValue::Range(lo, hi) if lo == hi => AbstractValue::Const(lo),
+        v => v,
+    }
+}
+
+/// `v` as a `size`-byte value (truncated); a range that does not fit
+/// is unknown.
+fn fit(v: AbstractValue, size: u32) -> AbstractValue {
+    let m = bit_mask(size);
+    normalize(match v {
+        AbstractValue::Const(c) => AbstractValue::Const(c & m),
+        AbstractValue::Set(s) => AbstractValue::Set(s.into_iter().map(|x| x & m).collect()),
+        AbstractValue::Range(lo, hi) if hi <= m => AbstractValue::Range(lo, hi),
+        AbstractValue::Range(..) => AbstractValue::Top,
+        v => v,
+    })
+}
+
+/// Sign-extend a `from`-byte value.
+fn sext(v: AbstractValue, from: u32) -> AbstractValue {
+    let ext = |x: u64| -> u64 {
+        let bits = from.min(8) * 8;
+        if bits >= 64 { x } else { (((x << (64 - bits)) as i64) >> (64 - bits)) as u64 }
+    };
+    let sign = |x: u64| from < 8 && x & (1u64 << (from * 8 - 1)) != 0;
+    match v {
+        AbstractValue::Const(c) => AbstractValue::Const(ext(c)),
+        AbstractValue::Set(s) => AbstractValue::Set(s.into_iter().map(ext).collect()),
+        AbstractValue::Range(lo, hi) if sign(lo) == sign(hi) => AbstractValue::Range(ext(lo), ext(hi)),
+        AbstractValue::Range(..) => AbstractValue::Top,
+        v => v,
+    }
+}
+
+/// `a + b` as an `size`-byte value. A range that wraps is unknown.
+fn add(a: AbstractValue, b: AbstractValue, size: u32) -> AbstractValue {
+    use AbstractValue::*;
+    let m = bit_mask(size);
+    let r = match (a, b) {
+        (Bot, _) | (_, Bot) => Bot,
+        (Top, _) | (_, Top) => Top,
+        (Const(x), Const(y)) => Const(x.wrapping_add(y) & m),
+        (Const(x), Range(lo, hi)) | (Range(lo, hi), Const(x)) => {
+            let (l, h) = (lo.wrapping_add(x) & m, hi.wrapping_add(x) & m);
+            if l <= h && h - l == hi - lo { Range(l, h) } else { Top }
+        }
+        (Range(la, ha), Range(lb, hb)) => match (la.checked_add(lb), ha.checked_add(hb)) {
+            (Some(l), Some(h)) if h <= m => Range(l, h),
+            _ => Top,
+        },
+        (Const(x), Set(s)) | (Set(s), Const(x)) => Set(s.into_iter().map(|v| v.wrapping_add(x) & m).collect()),
+        _ => Top,
+    };
+    normalize(r)
+}
+
+/// State: registers by base offset, other varnodes by `(space, offset)`
+/// with their size. A missing entry is Top.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct State {
+    regs: BTreeMap<u64, Slot>,
+    temps: BTreeMap<(SpaceId, i64), (u32, Slot)>,
+}
+
+impl State {
+    /// The known bytes of a varnode.
+    fn read_bytes(&self, vn: &VarnodeData) -> ByteConst {
+        match vn.space {
+            SpaceId::CONST => ByteConst::konst(vn.offset, vn.size),
+            SpaceId::REGISTER => match split(vn.offset, vn.size) {
+                Some((base, pos)) => self.regs.get(&base).map_or(ByteConst::UNKNOWN, |s| s.bytes().bytes_at(pos, vn.size)),
+                None => ByteConst::UNKNOWN,
+            },
+            s => match self.temps.get(&(s, vn.offset as i64)) {
+                Some((sz, slot)) if *sz >= vn.size => slot.bytes().trunc(vn.size),
+                _ => ByteConst::UNKNOWN,
+            },
+        }
+    }
+
+    /// The abstract value of a varnode.
+    fn read(&self, vn: &VarnodeData) -> AbstractValue {
+        match vn.space {
+            SpaceId::CONST => AbstractValue::Const(vn.offset & bit_mask(vn.size)),
+            SpaceId::REGISTER => match split(vn.offset, vn.size) {
+                Some((base, pos)) => self.regs.get(&base).map_or(AbstractValue::Top, |s| s.read(pos, vn.size)),
+                None => AbstractValue::Top,
+            },
+            s => match self.temps.get(&(s, vn.offset as i64)) {
+                Some((sz, slot)) if *sz >= vn.size => slot.read(0, vn.size),
+                _ => AbstractValue::Top,
+            },
+        }
+    }
+
+    fn write(&mut self, out: &VarnodeData, v: Val) {
+        let v = match v {
+            Val::Abs(AbstractValue::Const(c)) => Val::Bytes(ByteConst::konst(c, out.size)),
+            Val::Abs(AbstractValue::Top | AbstractValue::Bot) => Val::Bytes(ByteConst::UNKNOWN),
+            v => v,
+        };
+        if out.space == SpaceId::REGISTER {
+            let Some((base, pos)) = split(out.offset, out.size) else {
+                let end = out.offset.saturating_add(u64::from(out.size.max(1)));
+                let bases: Vec<u64> = self.regs.range(out.offset & !7..end).map(|(b, _)| *b).collect();
+                for b in bases {
+                    self.regs.remove(&b);
+                }
+                return;
+            };
+            let next = match v {
+                Val::Abs(a) if pos == 0 => Slot::Low(out.size, a),
+                Val::Abs(_) => Slot::Bytes(self.regs.get(&base).map_or(ByteConst::UNKNOWN, Slot::bytes).merge(
+                    pos,
+                    out.size,
+                    ByteConst::UNKNOWN,
+                )),
+                Val::Bytes(b) => {
+                    Slot::Bytes(self.regs.get(&base).map_or(ByteConst::UNKNOWN, Slot::bytes).merge(pos, out.size, b))
+                }
+            };
+            if next == Slot::Bytes(ByteConst::UNKNOWN) {
+                self.regs.remove(&base);
+            } else {
+                self.regs.insert(base, next);
+            }
+            return;
+        }
+        let off = out.offset as i64;
+        let end = off.saturating_add(i64::from(out.size.max(1)));
+        let overlapping: smallvec::SmallVec<[(SpaceId, i64); 4]> = self
+            .temps
+            .range((out.space, off.saturating_sub(8))..(out.space, end))
+            .filter(|((_, o), (sz, _))| o.saturating_add(i64::from(*sz)) > off)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in overlapping {
+            self.temps.remove(&k);
+        }
+        if out.size > 8 {
+            return;
+        }
+        let slot = match v {
+            Val::Abs(a) => Slot::Low(out.size, a),
+            Val::Bytes(b) if !b.trunc(out.size).is_unknown() => Slot::Bytes(b.trunc(out.size)),
+            Val::Bytes(_) => return,
+        };
+        self.temps.insert((out.space, off), (out.size, slot));
+    }
+
+    /// The output value of a non-call op.
+    fn eval(&self, op: &PcodeOp) -> Val {
+        let Some(out) = op.output.as_ref() else {
+            return Val::Bytes(ByteConst::UNKNOWN);
+        };
+        if op.opcode == OpCode::Load {
+            return Val::Bytes(ByteConst::UNKNOWN);
+        }
+        let bytes = eval(op, |vn| self.read_bytes(vn));
+        if let Some(b) = bytes
+            && b.get(out.size).is_some()
+        {
+            return Val::Bytes(b);
+        }
+        let input = |i: usize| op.inputs.get(i).map_or(AbstractValue::Top, |vn| self.read(vn));
+        let abs = match op.opcode {
+            OpCode::Copy | OpCode::IntZExt => input(0),
+            OpCode::IntSExt => op.inputs.first().map_or(AbstractValue::Top, |vn| sext(self.read(vn), vn.size)),
+            OpCode::Subpiece => match op.inputs.get(1) {
+                Some(k) if k.space == SpaceId::CONST && k.offset == 0 => input(0),
+                Some(k) if k.space == SpaceId::CONST && k.offset < 8 => match input(0) {
+                    AbstractValue::Set(s) => AbstractValue::Set(s.into_iter().map(|v| v >> (k.offset * 8)).collect()),
+                    _ => AbstractValue::Top,
+                },
+                _ => AbstractValue::Top,
+            },
+            OpCode::IntAdd => add(input(0), input(1), out.size),
+            _ => AbstractValue::Top,
+        };
+        match fit(abs, out.size.min(8)) {
+            a @ (AbstractValue::Set(_) | AbstractValue::Range(..)) if out.size <= 8 => Val::Abs(a),
+            AbstractValue::Const(c) if out.size <= 8 => Val::Bytes(ByteConst::konst(c, out.size)),
+            _ => Val::Bytes(bytes.unwrap_or(ByteConst::UNKNOWN)),
+        }
+    }
+
+    /// Apply one non-call op.
+    fn apply(&mut self, op: &PcodeOp) {
+        if is_unmodeled(op) {
+            *self = State::default();
+            return;
+        }
+        let Some(out) = op.output.as_ref() else {
+            return;
+        };
+        if is_view_refresh(op) {
+            return;
+        }
+        let v = self.eval(op);
+        self.write(out, v);
+    }
+
+    /// Every register whose 8 bytes are pinned, at a call.
+    fn call_snapshot(&self) -> BTreeMap<u64, AbstractValue> {
+        self.regs
+            .iter()
+            .filter_map(|(b, s)| {
+                let v = s.read(0, 8);
+                (!matches!(v, AbstractValue::Top | AbstractValue::Bot)).then_some((*b, v))
+            })
+            .collect()
+    }
+
+    /// CFG join.
+    fn join(&self, other: &State) -> State {
+        let regs = self
+            .regs
+            .iter()
+            .filter_map(|(b, s)| Some((*b, s.join(other.regs.get(b)?)?)))
+            .collect();
+        let temps = self
+            .temps
+            .iter()
+            .filter_map(|(k, (sz, s))| {
+                let (osz, o) = other.temps.get(k)?;
+                (osz == sz).then_some(())?;
+                Some((*k, (*sz, s.join(o)?)))
+            })
+            .collect();
+        State { regs, temps }
+    }
+}
+
+/// `(base, byte position)` of a REGISTER access inside one 8-byte
+/// register.
+fn split(offset: u64, size: u32) -> Option<(u64, u32)> {
+    let pos = (offset & 7) as u32;
+    (size > 0 && pos + size <= 8).then_some((offset & !7, pos))
+}
 
 pub fn run_vsa(lifter: &dyn PcodeLift, program: &Program) -> VsaResult {
     // Lift + propagate each function in parallel (a function's
@@ -126,7 +429,7 @@ pub fn run_vsa(lifter: &dyn PcodeLift, program: &Program) -> VsaResult {
     let per_func: Vec<Option<CallSnapshots>> = function_jobs(program)
         .par_iter()
         .map(|&(entry, max)| {
-            lift_function(lifter, program, entry, max).map(|insns| function_snapshots(&insns))
+            lift_function(lifter, program, entry, max).map(|insns| function_snapshots(program, entry, &insns))
         })
         .collect();
     let mut out = VsaResult::new();
@@ -140,14 +443,31 @@ pub fn run_vsa(lifter: &dyn PcodeLift, program: &Program) -> VsaResult {
 /// them (a site may appear once per visit).
 pub type CallSnapshots = Vec<(u64, BTreeMap<u64, AbstractValue>)>;
 
-/// Propagate one function's lifted instructions (empty for an empty
-/// lift). Merge the results of every function, in listing order,
-/// with [`merge_snapshots`] to get [`run_vsa`].
-pub fn function_snapshots(insns: &[LiftedInstruction]) -> CallSnapshots {
+/// Propagate the lifted instructions of the function at `entry`
+/// (empty for an empty lift), keeping the call sites it owns. Merge
+/// the results of every function, in listing order, with
+/// [`merge_snapshots`] to get [`run_vsa`].
+pub fn function_snapshots(program: &Program, entry: u64, insns: &[LiftedInstruction]) -> CallSnapshots {
     if insns.is_empty() {
         return Vec::new();
     }
-    propagate(insns)
+    function_snapshots_with(program, entry, insns, &external_entries(program, insns))
+}
+
+/// [`function_snapshots`] with the lift's [`external_entries`] already
+/// computed.
+pub(crate) fn function_snapshots_with(
+    program: &Program,
+    entry: u64,
+    insns: &[LiftedInstruction],
+    external: &BTreeSet<u64>,
+) -> CallSnapshots {
+    if insns.is_empty() {
+        return Vec::new();
+    }
+    let mut snaps = propagate_with(insns, external, |a| in_extent(program, entry, a));
+    snaps.retain(|(addr, _)| owns(program, entry, *addr));
+    snaps
 }
 
 /// Fold one function's call snapshots into the program-wide map.
@@ -168,273 +488,32 @@ pub fn merge_snapshots(out: &mut VsaResult, snaps: CallSnapshots) {
     }
 }
 
+#[cfg(test)]
 fn propagate(insns: &[LiftedInstruction]) -> CallSnapshots {
-    let mut snaps: CallSnapshots = Vec::new();
-    let mut block_starts: BTreeSet<u64> = BTreeSet::new();
-    block_starts.insert(insns[0].address);
-    let mut prev_terminator = false;
-    for insn in insns {
-        if prev_terminator {
-            block_starts.insert(insn.address);
-        }
-        prev_terminator = false;
-        for op in &insn.ops {
-            match op.opcode {
-                OpCode::Branch | OpCode::CBranch => {
-                    if let Some(t) = op.inputs.first()
-                        && t.space == SpaceId::RAM
-                    {
-                        block_starts.insert(t.offset);
-                    }
-                    if op.opcode == OpCode::Branch {
-                        prev_terminator = true;
-                    }
-                }
-                OpCode::Return | OpCode::BranchInd => prev_terminator = true,
-                _ => {}
-            }
-        }
-    }
-    let starts_vec: Vec<u64> = block_starts.iter().copied().collect();
-    let block_of = |addr: u64| -> u64 {
-        // Largest start ≤ addr (`starts_vec` is sorted).
-        match starts_vec.partition_point(|&s| s <= addr) {
-            0 => addr,
-            i => starts_vec[i - 1],
-        }
-    };
-
-    // Build pred map.
-    let mut preds: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-    let mut addr_to_idx: BTreeMap<u64, usize> = BTreeMap::new();
-    for (i, insn) in insns.iter().enumerate() {
-        addr_to_idx.insert(insn.address, i);
-        let cur = block_of(insn.address);
-        let mut term = false;
-        for op in &insn.ops {
-            match op.opcode {
-                OpCode::Branch => {
-                    if let Some(t) = op.inputs.first()
-                        && t.space == SpaceId::RAM
-                        && block_starts.contains(&t.offset)
-                    {
-                        preds.entry(t.offset).or_default().insert(cur);
-                    }
-                    term = true;
-                }
-                OpCode::CBranch => {
-                    if let Some(t) = op.inputs.first()
-                        && t.space == SpaceId::RAM
-                        && block_starts.contains(&t.offset)
-                    {
-                        preds.entry(t.offset).or_default().insert(cur);
-                    }
-                }
-                OpCode::Return | OpCode::BranchInd => term = true,
-                _ => {}
-            }
-        }
-        if !term
-            && let Some(next) = insns.get(i + 1)
-        {
-            let nb = block_of(next.address);
-            if nb != cur {
-                preds.entry(nb).or_default().insert(cur);
-            }
-        }
-    }
-
-    let entry = insns[0].address;
-    let mut in_st: BTreeMap<u64, State> = BTreeMap::new();
-    let mut out_st: BTreeMap<u64, State> = BTreeMap::new();
-    in_st.insert(entry, State::new());
-
-    // Build the successor relation once so we can enqueue only the
-    // blocks whose input state might have changed. Before this, the
-    // outer `for _round in 0..8 { for b in all_blocks }` re-walked
-    // every block 8 times even when only a leaf had flipped — O(rounds
-    // × blocks × ops). A real worklist is O(edges × convergence-rounds).
-    let mut succs: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-    for (b, ps) in &preds {
-        for p in ps {
-            succs.entry(*p).or_default().insert(*b);
-        }
-    }
-
-    // Per-block iteration cap so an irreducible / cycle-heavy CFG can't
-    // loop forever. 8 matches the previous outer-round limit; in
-    // practice convergence takes 1-2 rounds for reducible CFGs.
-    const MAX_VISITS_PER_BLOCK: usize = 8;
-    let mut visits: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut worklist: VecDeque<u64> = VecDeque::from_iter(starts_vec.iter().copied());
-    let mut in_queue: BTreeSet<u64> = starts_vec.iter().copied().collect();
-
-    while let Some(b) = worklist.pop_front() {
-        in_queue.remove(&b);
-        let v = visits.entry(b).or_insert(0);
-        if *v >= MAX_VISITS_PER_BLOCK {
-            continue;
-        }
-        *v += 1;
-
-        let joined = if let Some(ps) = preds.get(&b) {
-            if ps.is_empty() && b == entry {
-                State::new()
-            } else {
-                join_states(ps.iter().filter_map(|p| out_st.get(p)))
-            }
-        } else if b == entry {
-            State::new()
-        } else {
-            continue;
-        };
-
-        let in_changed = in_st.get(&b) != Some(&joined);
-        if in_changed {
-            in_st.insert(b, joined.clone());
-        }
-
-        let block_end = starts_vec
-            .get(starts_vec.partition_point(|&s| s <= b))
-            .copied()
-            .unwrap_or(u64::MAX);
-        let mut st = joined;
-        let Some(&start_idx) = addr_to_idx.get(&b) else {
-            continue;
-        };
-        let mut call_snaps: Vec<(u64, BTreeMap<u64, AbstractValue>)> = Vec::new();
-        for insn in &insns[start_idx..] {
-            if insn.address >= block_end {
-                break;
-            }
-            for op in &insn.ops {
-                match op.opcode {
-                    OpCode::Call | OpCode::CallInd => {
-                        let mut regs = BTreeMap::new();
-                        for ((sp, off), val) in &st {
-                            if *sp == SpaceId::REGISTER
-                                && !matches!(val, AbstractValue::Top | AbstractValue::Bot)
-                            {
-                                regs.insert(*off, val.clone());
-                            }
-                        }
-                        call_snaps.push((insn.address, regs));
-                        st.retain(|(sp, _), _| *sp != SpaceId::REGISTER);
-                    }
-                    OpCode::Copy => apply_copy(&mut st, op),
-                    OpCode::IntAdd => apply_intadd(&mut st, op),
-                    _ => {
-                        if let Some(d) = op.output.as_ref() {
-                            st.remove(&(d.space, d.offset));
-                        }
-                    }
-                }
-            }
-        }
-        snaps.extend(call_snaps);
-
-        let out_changed = out_st.get(&b) != Some(&st);
-        if out_changed {
-            out_st.insert(b, st);
-            // Only successors of the just-changed block need re-walking.
-            // That's the central optimisation over the previous "scan
-            // every block every round" form.
-            if let Some(ss) = succs.get(&b) {
-                for s in ss {
-                    if in_queue.insert(*s) {
-                        worklist.push_back(*s);
-                    }
-                }
-            }
-        }
-    }
-    snaps
+    propagate_with(insns, &BTreeSet::new(), |_| true)
 }
 
-fn apply_copy(st: &mut State, op: &reargo_core::pcode::PcodeOp) {
-    let Some(dst) = op.output.as_ref() else {
-        return;
-    };
-    let Some(src) = op.inputs.first() else {
-        st.remove(&(dst.space, dst.offset));
-        return;
-    };
-    let v = if src.space == SpaceId::CONST {
-        AbstractValue::Const(src.offset)
-    } else {
-        st.get(&(src.space, src.offset))
-            .cloned()
-            .unwrap_or(AbstractValue::Top)
-    };
-    if matches!(v, AbstractValue::Top) {
-        st.remove(&(dst.space, dst.offset));
-    } else {
-        st.insert((dst.space, dst.offset), v);
-    }
+fn propagate_with(
+    insns: &[LiftedInstruction],
+    external: &BTreeSet<u64>,
+    in_body: impl Fn(u64) -> bool,
+) -> CallSnapshots {
+    blockflow::propagate::<State, _>(insns, external, in_body, State::call_snapshot)
 }
 
-fn apply_intadd(st: &mut State, op: &reargo_core::pcode::PcodeOp) {
-    let Some(dst) = op.output.as_ref() else {
-        return;
-    };
-    if op.inputs.len() < 2 {
-        st.remove(&(dst.space, dst.offset));
-        return;
+impl FlowState for State {
+    fn join(&self, other: &Self) -> Self {
+        State::join(self, other)
     }
-    let lookup = |vn: &reargo_core::pcode::VarnodeData| -> AbstractValue {
-        if vn.space == SpaceId::CONST {
-            AbstractValue::Const(vn.offset)
-        } else {
-            st.get(&(vn.space, vn.offset))
-                .cloned()
-                .unwrap_or(AbstractValue::Top)
-        }
-    };
-    let a = lookup(&op.inputs[0]);
-    let b = lookup(&op.inputs[1]);
-    use AbstractValue::*;
-    let r = match (a, b) {
-        (Bot, _) | (_, Bot) => Bot,
-        (Top, _) | (_, Top) => Top,
-        (Const(x), Const(y)) => Const(x.wrapping_add(y)),
-        (Const(x), Range(lo, hi)) | (Range(lo, hi), Const(x)) => {
-            Range(lo.wrapping_add(x), hi.wrapping_add(x))
-        }
-        (Range(la, ha), Range(lb, hb)) => Range(la.wrapping_add(lb), ha.wrapping_add(hb)),
-        (Const(x), Set(s)) | (Set(s), Const(x)) => {
-            let s: BTreeSet<u64> = s.into_iter().map(|v| v.wrapping_add(x)).collect();
-            Set(s)
-        }
-        _ => Top,
-    };
-    if matches!(r, Top) {
-        st.remove(&(dst.space, dst.offset));
-    } else {
-        st.insert((dst.space, dst.offset), r);
+    fn apply(&mut self, op: &PcodeOp) {
+        State::apply(self, op);
+    }
+    /// SysV: caller-saved registers clobbered (conservatively every
+    /// register); temporaries are kept.
+    fn after_call(&mut self) {
+        self.regs.clear();
     }
 }
-
-fn join_states<'a>(states: impl Iterator<Item = &'a State>) -> State {
-    let collected: Vec<&State> = states.collect();
-    if collected.is_empty() {
-        return State::new();
-    }
-    let mut out = collected[0].clone();
-    for other in &collected[1..] {
-        let mut new_out = State::new();
-        for (k, v) in &out {
-            if let Some(o) = other.get(k) {
-                let joined = v.join(o);
-                if !matches!(joined, AbstractValue::Top) {
-                    new_out.insert(*k, joined);
-                }
-            }
-        }
-        out = new_out;
-    }
-    out
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -692,5 +771,56 @@ mod tests {
             }
             other => panic!("expected Set, got {:?}", other),
         }
+    }
+
+    /// The lifter's sub-register sequences, each followed by a call.
+    #[test]
+    fn sub_register_sequences_resolve() {
+        use crate::byteconst::testseq::*;
+        let snap = |ops: Vec<PcodeOp>| {
+            let mut ops = ops;
+            ops.push(op(OpCode::Call, None, &[k(0xdead, 8)]));
+            let insn = LiftedInstruction { address: 0x1000, length: 4, mnemonic: "x".into(), ops };
+            let mut result = VsaResult::new();
+            merge_snapshots(&mut result, propagate(&[insn]));
+            let s = result.remove(&0x1000).expect("call snapshot");
+            move |r: u64| s.get(&r).and_then(AbstractValue::as_single)
+        };
+        assert_eq!(snap(mov_esi_imm32())(0x30), Some(0x2a));
+        let s = snap(lea_rax_mov_rdi());
+        assert_eq!((s(0), s(0x38)), (Some(0x402004), Some(0x402004)));
+        assert_eq!(snap(mov_rax_then_al())(0), Some(0x7fff_1234_5605));
+        let s = snap(ah_write_read());
+        assert_eq!((s(0), s(0x08)), (Some(0x0734), Some(7)));
+        let s = snap(movsx_movzx());
+        assert_eq!(s(0x38), Some(0xffff_ff80));
+        assert_eq!(s(0x30), Some(0x80));
+        assert_eq!(s(0x80), Some(0xffff_ffff_ffff_ff80));
+        assert_eq!(s(0x10), None);
+    }
+
+    /// A set flows through a 32-bit move and its view refreshes:
+    /// `mov esi, {1|2}` joined, then `mov edi, esi` keeps the set in rdi.
+    #[test]
+    fn set_survives_32bit_move_and_views() {
+        use crate::byteconst::testseq::*;
+        let ram = |a: u64| VarnodeData { space: SpaceId::RAM, offset: a, size: 8 };
+        let insn = |address: u64, ops: Vec<PcodeOp>| LiftedInstruction { address, length: 4, mnemonic: "x".into(), ops };
+        let mut a = with_views(op(OpCode::Copy, Some(reg(0x30, 4)), &[k(1, 4)]));
+        a.push(op(OpCode::Branch, None, &[ram(0x3000)]));
+        let mut b = with_views(op(OpCode::Copy, Some(reg(0x30, 4)), &[k(2, 4)]));
+        b.push(op(OpCode::Branch, None, &[ram(0x3000)]));
+        let mut c = with_views(op(OpCode::Copy, Some(reg(0x38, 4)), &[reg(0x30, 4)]));
+        c.push(op(OpCode::Call, None, &[k(0xdead, 8)]));
+        let insns = [
+            insn(0x1000, vec![op(OpCode::CBranch, None, &[ram(0x2000), reg(0x206, 1)])]),
+            insn(0x1010, a),
+            insn(0x2000, b),
+            insn(0x3000, c),
+        ];
+        let mut result = VsaResult::new();
+        merge_snapshots(&mut result, propagate(&insns));
+        let snap = result.get(&0x3000).expect("call snapshot");
+        assert_eq!(snap.get(&0x38), Some(&AbstractValue::Set([1u64, 2].into_iter().collect())));
     }
 }

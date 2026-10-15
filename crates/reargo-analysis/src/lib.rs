@@ -9,6 +9,8 @@ pub mod boundary;
 pub mod callingconv;
 pub mod canary;
 pub mod callgraph;
+pub mod blockflow;
+pub mod byteconst;
 pub mod callsite;
 pub mod callsite_annotate;
 pub mod capa;

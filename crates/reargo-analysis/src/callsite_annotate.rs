@@ -28,7 +28,7 @@ use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 use crate::callsite::{
-    resolve_call_sites_iterative_from, walk_function, FunctionWalk, ParamSummaries,
+    resolve_call_sites_iterative_from, walk_function_with, FunctionWalk, ParamSummaries,
 };
 use crate::func_lift::{function_jobs, lift_function};
 use crate::signatures::{FunctionSignature, SignatureDatabase};
@@ -84,11 +84,12 @@ impl Analyzer for CallSiteAnnotator {
                     let walk = FunctionWalk { entry, max_insns, sites: None };
                     return (walk, Vec::new(), Vec::new());
                 };
-                let sites = Some(walk_function(program, entry, &insns, &empty));
+                let external = crate::func_lift::external_entries(program, &insns);
+                let sites = Some(walk_function_with(program, entry, &insns, &empty, &external));
                 (
                     FunctionWalk { entry, max_insns, sites },
-                    crate::cfg_const::function_snapshots(&insns),
-                    crate::vsa::function_snapshots(&insns),
+                    crate::cfg_const::function_snapshots_with(program, entry, &insns, &external),
+                    crate::vsa::function_snapshots_with(program, entry, &insns, &external),
                 )
             })
             .collect();

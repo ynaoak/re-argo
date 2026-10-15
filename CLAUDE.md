@@ -516,7 +516,7 @@ Print every reverse-callgraph path leading INTO `ADDRESS`. Paths sorted shortest
 
 #### `callsites <FILE> [-t ADDR] [-n N] [-i N] [--callbacks]`
 
-Every Call site with statically-resolved argument values.
+Every Call site with statically-resolved argument values: the full 8-byte value of `rdi`/`rsi`/`rdx`/`rcx`/`r8`/`r9` (`mov esi, 0x2a` gives `rsi = 0x2a`, `lea rax, [str]; mov rdi, rax` the address; a write to `al` / `ah` changes only that byte), `?` when not proven. The walk is straight-line: values do not cross a jump target or a call (a stack slot does, unless a stack address escaped); a parameter is seeded from its callers only when every direct call passes the same constant and the function is not exported, address-taken or jumped to. The `CallSiteAnnotator` (decompile's `printf("hello %d\n", 42)`) also fills `?` from a CFG join of the block states.
 
 | Flag | Purpose |
 |---|---|
