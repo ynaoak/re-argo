@@ -62,22 +62,31 @@ const MAX_DEPTH: u32 = 2;
 /// Callee parameter oracle with a memo shared by every lookup (safe to share
 /// across threads, e.g. by `decompile_all`).
 pub struct CalleeParams<'a> {
-    lifter: &'a dyn PcodeLift,
-    memory: &'a Memory,
-    args: Vec<VarnodeData>,
+    pub(crate) lifter: &'a dyn PcodeLift,
+    pub(crate) memory: &'a Memory,
+    pub(crate) args: Vec<VarnodeData>,
     /// Register class of each argument (index into `class_members`).
     class_of: Vec<usize>,
     /// Arguments of each class, in parameter order.
     class_members: Vec<Vec<usize>>,
     memo: Mutex<FxHashMap<(u64, u32), Option<ParamInfo>>>,
     /// The convention's return registers (`rax`, `xmm0`).
-    returns: Vec<VarnodeData>,
+    pub(crate) returns: Vec<VarnodeData>,
     ret_memo: Mutex<FxHashMap<(u64, u32), ReturnKind>>,
     /// Registers a call may change (the convention's returns and clobbers).
-    caller_saved: Vec<VarnodeData>,
+    pub(crate) caller_saved: Vec<VarnodeData>,
     /// How a callee uses its pointer parameters (WS91), by callee.
     fields_memo: Mutex<FxHashMap<u64, std::sync::Arc<ParamUse>>>,
+    /// The address of `.eh_frame_hdr` (the function covering an address), when known (WS92).
+    pub(crate) unwind_table: Option<u64>,
+    /// The classes of the objects a class's constructors store in its fields (WS92,
+    /// `classfields`), by the class's vtable.
+    pub(crate) class_fields_memo: Mutex<FxHashMap<u64, ClassFields>>,
 }
+
+/// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
+/// `classfields`).
+pub type ClassFields = std::sync::Arc<Vec<(u64, u64)>>;
 
 /// How a function uses its pointer parameters (WS91).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -130,7 +139,16 @@ impl<'a> CalleeParams<'a> {
             ret_memo: Mutex::new(FxHashMap::default()),
             caller_saved: cc.returns.iter().chain(cc.clobbers.iter()).map(|(r, _)| *r).collect(),
             fields_memo: Mutex::new(FxHashMap::default()),
+            unwind_table: None,
+            class_fields_memo: Mutex::new(FxHashMap::default()),
         })
+    }
+
+    /// The same oracle, finding the function that covers an address through the
+    /// `.eh_frame_hdr` table at `hdr` (WS92, `classfields`).
+    pub fn with_unwind_table(mut self, hdr: Option<u64>) -> Self {
+        self.unwind_table = hdr;
+        self
     }
 
     /// The memory the function at `target` accesses through its parameters (WS91): every
@@ -248,6 +266,16 @@ impl<'a> CalleeParams<'a> {
             m.insert((target, depth_left), r);
         }
         r
+    }
+
+    /// The body of the function at `target` as a CFG (up to its returns; `None` when it cannot
+    /// be lifted).
+    pub(crate) fn body_cfg(&self, target: u64) -> Option<ControlFlowGraph> {
+        let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
+        if lifted.is_empty() || lifted[0].address != target {
+            return None;
+        }
+        Some(ControlFlowGraph::build_owned(crate::pipeline::trim_to_return(lifted)))
     }
 
     fn analyze(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
@@ -430,9 +458,9 @@ struct Acc {
 const MAX_FIELD: i64 = 0x10_0000;
 
 /// What a storage location holds: an argument's incoming value plus a delta.
-type Held = FxHashMap<(SpaceId, u64, u32), (usize, i64)>;
+pub(crate) type Held = FxHashMap<(SpaceId, u64, u32), (usize, i64)>;
 
-fn kill(state: &mut Held, out: &VarnodeData) {
+pub(crate) fn kill(state: &mut Held, out: &VarnodeData) {
     state.retain(|&(sp, off, sz), _| !(sp == out.space && off < out.offset + u64::from(out.size) && out.offset < off + u64::from(sz)));
 }
 

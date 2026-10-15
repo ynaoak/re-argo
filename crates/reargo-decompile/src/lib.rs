@@ -1,6 +1,7 @@
 pub mod action;
 pub mod callee_params;
 pub mod callers;
+pub mod classfields;
 pub mod cas;
 pub mod cast;
 pub mod cfg;

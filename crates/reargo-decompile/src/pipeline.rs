@@ -286,7 +286,7 @@ pub fn decompile_function_with_options(
 ) -> Result<DecompileResult, String> {
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
-    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
     decompile_function_inner(
         lifter,
         program,
@@ -356,7 +356,7 @@ pub fn decompile_function_with_maps(
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
 ) -> Result<DecompileResult, String> {
-    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
     decompile_function_inner(
         lifter,
         program,
@@ -488,10 +488,14 @@ fn keep_fde_body(lifted: Vec<LiftedInstruction>, start: u64, end: u64) -> Vec<Li
         .collect()
 }
 
+/// The address of the `.eh_frame_hdr` table (the function covering an address).
+fn unwind_table(sections: &[reargo_loader::Section]) -> Option<u64> {
+    sections.iter().find(|s| s.name == ".eh_frame_hdr").map(|s| s.address)
+}
+
 /// `[start, start + len)` of the function covering `entry`, from the `.eh_frame_hdr` table.
 fn fde_bounds(memory: &Memory, sections: &[reargo_loader::Section], entry: u64) -> Option<(u64, u64)> {
-    let hdr = sections.iter().find(|s| s.name == ".eh_frame_hdr")?.address;
-    reargo_loader::fde_function(memory, hdr, entry)
+    reargo_loader::fde_function(memory, unwind_table(sections)?, entry)
 }
 
 /// Address of the stub [`rewrite_tail_calls`] makes for a conditional jump out of the code to
@@ -1187,7 +1191,7 @@ pub fn decompile_all_with_options(
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
     // one callee-parameter memo for the whole batch
-    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
 
     entries
         .par_iter()

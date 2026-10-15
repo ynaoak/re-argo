@@ -647,6 +647,39 @@ impl StructView {
             let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
             nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
         });
+        // WS92: the object a virtual call is made on, loaded from a field of an object of a known
+        // class: of the class the constructors of that class store there (`classfields`)
+        if let (Some(oracle), Some(mem)) = (ctx.oracle, ctx.memory)
+            && !vcall_raw.is_empty()
+        {
+            let objects: FxHashSet<u32> = vcall_raw.iter().map(|&(_, ri, _)| uf.find(raws[ri].base)).collect();
+            for _ in 0..2 {
+                let mut added = false;
+                for r in raws[..local].iter().filter(|r| !r.skip && !r.vptr && r.size == 8 && func.ops[r.op].opcode == OpCode::Load) {
+                    let Some(v) = r.value else { continue };
+                    let obj = uf.find(v);
+                    if !objects.contains(&obj) || root_classes.contains_key(&obj) || Some(obj) == this_root {
+                        continue;
+                    }
+                    let base = uf.find(r.base);
+                    let vt = match (Some(base) == this_root, &this_class) {
+                        (true, Some((_, Some(vt)))) => Some(*vt),
+                        _ => root_classes.get(&base).and_then(|cs| crate::vcall::most_derived(mem, cs)).map(|c| c.1),
+                    };
+                    let Some(vt) = vt else { continue };
+                    if let Some(&(_, ovt)) = oracle.class_fields(vt).iter().find(|f| f.0 == r.off)
+                        && let Some(c) = crate::vcall::vtable_class(mem, ovt)
+                    {
+                        root_classes.entry(obj).or_default().push((c, ovt));
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+        }
+
         // the types that are structs: an access past offset 0, or a vtable pointer
         let mut is_base: FxHashSet<u32> = FxHashSet::default();
         let mut struct_roots: Vec<u32> = Vec::new();
@@ -1280,8 +1313,11 @@ mod tests {
     /// `Holder` (vtable 0x2050: 0x1300, 0x1310; type_info 0x2070 -> `6Holder`). `Holder`'s
     /// constructor at 0x1000 stores a new object at `this + 8` and calls `Shape`'s constructor
     /// (0x1080) on it; `Holder::m` (0x1300) makes a virtual call on `this->field_8`.
-    ///
-    /// With more code (`(offset in .text, bytes)`; .text is 0x1000..0x1600).
+    fn holder() -> Memory {
+        holder_with(&[])
+    }
+
+    /// [`holder`] with more code (`(offset in .text, bytes)`; .text is 0x1000..0x1600).
     fn holder_with(extra: &[(usize, &[u8])]) -> Memory {
         let mut t = vec![0xccu8; 0x600];
         let mut put = |at: usize, b: &[u8]| t[at..at + b.len()].copy_from_slice(b);
@@ -1325,6 +1361,16 @@ mod tests {
         .collect();
         mem.set_dynamic_relocations(Arc::from(rela));
         mem
+    }
+
+    /// WS92: an object loaded from a field of an object of a known class is of the class that
+    /// class's constructor stores there, so a virtual call on it names the slot's function.
+    #[test]
+    fn a_field_object_has_the_class_its_owners_constructor_stores() {
+        let r = decompile(&X86Lifter::new_64(), &holder(), 0x1300, "m", 100).unwrap();
+        assert!(r.c_code.contains("(struct Holder* rdi)"), "{}", r.c_code);
+        assert!(r.c_code.contains("vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.recovered_structs.iter().any(|d| d.contains("struct Shape* field_8; // +0x8")), "{:?}", r.recovered_structs);
     }
 
     /// WS92: a phi joining objects of two unrelated classes does not merge their types: the
