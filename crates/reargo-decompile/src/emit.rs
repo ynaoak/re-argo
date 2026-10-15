@@ -1100,6 +1100,25 @@ impl<'a> CEmitter<'a> {
                     Some("__unmodeled_insn();  // machine op not yet lifted (dataflow intact)".into())
                 }
             }
+            // the carry / overflow flags of an add or a subtraction, with their operands (WS90; they
+            // printed `INT_SBORROW(...)`): GCC's overflow builtins, exact for any operand values
+            OpCode::IntCarry | OpCode::IntSCarry | OpCode::IntSBorrow if op.inputs.len() == 2 => {
+                let dst = out_name?;
+                let size = func.varnodes[op.inputs[0] as usize].data.size;
+                let (ty, builtin) = match op.opcode {
+                    OpCode::IntCarry => (size_to_type(size), "__builtin_add_overflow_p"),
+                    OpCode::IntSCarry => (size_to_signed_type(size), "__builtin_add_overflow_p"),
+                    _ => (size_to_signed_type(size), "__builtin_sub_overflow_p"),
+                };
+                let unsigned = op.opcode == OpCode::IntCarry;
+                // (an unsigned operand that is a plain variable already has the type; anything
+                // else, and every signed operand, is cast to the operation's width)
+                let arg = |i: usize| {
+                    let e = self.input_expr(func, op, i);
+                    if unsigned && is_identifier(&e) { e } else { format!("({}){}", ty, if crate::condition::is_atomic(&e) { e } else { format!("({e})") }) }
+                };
+                Some(format!("{} = {}({}, {}, ({})0);", dst, builtin, arg(0), arg(1), ty))
+            }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
@@ -1838,6 +1857,11 @@ fn reg_name(offset: u64, size: u32) -> String {
         (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
         _ => format!("var_{:x}", offset),
     }
+}
+
+/// A plain variable name (`eax`, `tmp_510`, `local_30`), not a constant or an expression.
+pub(crate) fn is_identifier(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The C type of a float of `size` bytes (`long double` = the x87's 80 bits, WS89).

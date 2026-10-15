@@ -4017,4 +4017,28 @@ mod tests {
         assert!(c.contains("rdi = rdi - 6;"), "{c}");
         assert!(!c.contains("0xfffffffffffffffa"), "{c}");
     }
+
+    fn rust_of(code: &[u8]) -> String {
+        let lifter = X86Lifter::new_64();
+        let mem = make_memory(code, 0x1000);
+        decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().rust_code
+    }
+
+    /// WS90: the carry / overflow flags print with their operands (they printed `INT_SBORROW(...)`).
+    #[test]
+    fn overflow_flags_print_their_operands() {
+        // add edi, esi ; seto al ; ret
+        let c = c_of(&[0x01, 0xf7, 0x0f, 0x90, 0xc0, 0xc3]);
+        assert!(c.contains("__builtin_add_overflow_p((int32_t)edi, (int32_t)esi, (int32_t)0)"), "{c}");
+        // cmp edi, esi ; seto al ; ret
+        let c = c_of(&[0x39, 0xf7, 0x0f, 0x90, 0xc0, 0xc3]);
+        assert!(c.contains("__builtin_sub_overflow_p((int32_t)edi, (int32_t)esi, (int32_t)0)"), "{c}");
+        // add rdi, rsi ; setc al ; ret
+        let c = c_of(&[0x48, 0x01, 0xf7, 0x0f, 0x92, 0xc0, 0xc3]);
+        assert!(c.contains("__builtin_add_overflow_p(rdi, rsi, (uint64_t)0)"), "{c}");
+        assert!(!c.contains("(...)"), "{c}");
+        let r = rust_of(&[0x39, 0xf7, 0x0f, 0x90, 0xc0, 0xc3]);
+        assert!(r.contains("(edi as i32).overflowing_sub(esi as i32).1"), "{r}");
+        assert!(!r.contains("(...)"), "{r}");
+    }
 }

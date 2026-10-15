@@ -973,6 +973,19 @@ impl<'a> RustEmitter<'a> {
                     Some("unmodeled_insn(); // machine op not yet lifted (dataflow intact)".into())
                 }
             }
+            // the carry / overflow flags of an add or a subtraction, with their operands (WS90)
+            OpCode::IntCarry | OpCode::IntSCarry | OpCode::IntSBorrow if op.inputs.len() == 2 => {
+                let dst = out_name?;
+                let size = func.varnodes[op.inputs[0] as usize].data.size;
+                let (ty, method) = match op.opcode {
+                    OpCode::IntCarry => (size_to_rust_type(size), "overflowing_add"),
+                    OpCode::IntSCarry => (size_to_rust_signed_type(size), "overflowing_add"),
+                    _ => (size_to_rust_signed_type(size), "overflowing_sub"),
+                };
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = ({} as {}).{}({} as {}).1;", dst, a, ty, method, b, ty))
+            }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
