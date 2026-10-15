@@ -314,6 +314,11 @@ impl Frame {
         self.offset_in(func, v, block).is_some()
     }
 
+    /// The offset from the entry `rsp` of value `v` read in `block`, when known (WS91).
+    pub fn offset_at(&self, func: &SsaFunction, v: VarId, block: usize) -> Option<i64> {
+        self.offset_in(func, v, block)
+    }
+
     /// The named slots, by start.
     pub fn slots(&self) -> impl Iterator<Item = &Slot> {
         self.slots.values()

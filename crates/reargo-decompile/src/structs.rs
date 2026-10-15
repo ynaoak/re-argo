@@ -119,6 +119,8 @@ pub struct StructDef {
     pub fields: Vec<Field>,
     /// The step of a pointer to it walking an array (an element is no longer).
     pub stride: Option<u64>,
+    /// `class` comes from the function's symbol (a mangled method name), not from RTTI.
+    pub class_from_symbol: bool,
 }
 
 impl StructDef {
@@ -136,8 +138,10 @@ impl StructDef {
     pub fn c_definition(&self, defs: &[StructDef]) -> String {
         let mut out = format!("struct {} {{", self.name);
         match (&self.class, self.vtable) {
-            (Some(_), Some(v)) => out.push_str(&format!("  // class from RTTI, vtable 0x{v:x}")),
-            (Some(_), None) => out.push_str("  // class from RTTI"),
+            (Some(_), Some(v)) if !self.class_from_symbol => out.push_str(&format!("  // class from RTTI, vtable 0x{v:x}")),
+            (Some(_), Some(v)) => out.push_str(&format!("  // class from the symbol, vtable 0x{v:x}")),
+            (Some(_), None) if !self.class_from_symbol => out.push_str("  // class from RTTI"),
+            (Some(_), None) => out.push_str("  // class from the symbol"),
             (None, Some(v)) => out.push_str(&format!("  // vtable 0x{v:x}")),
             (None, None) => {}
         }
@@ -200,7 +204,7 @@ pub fn merge_class_structs<'d>(per_function: impl Iterator<Item = &'d [StructDef
     for defs in per_function {
         for d in defs.iter().filter(|d| d.class.is_some()) {
             let i = *by_name.entry(d.name.clone()).or_insert_with(|| {
-                merged.push(StructDef { name: d.name.clone(), class: d.class.clone(), vtable: d.vtable, fields: Vec::new(), stride: None });
+                merged.push(StructDef { name: d.name.clone(), class: d.class.clone(), vtable: d.vtable, fields: Vec::new(), stride: None, class_from_symbol: d.class_from_symbol });
                 merged.len() - 1
             });
             if merged[i].vtable.is_none() {
@@ -277,6 +281,8 @@ pub struct StructView {
     pub(crate) vcalls: FxHashMap<OpIdx, VCall>,
     /// `INT_ADD`s stepping a register in place (`add r9, 0x18`): no field addresses
     pub(crate) steps: FxHashSet<OpIdx>,
+    /// stores to the function's own stack slots (they change no object's vtable pointer)
+    pub(crate) local_stores: FxHashSet<OpIdx>,
 }
 
 /// What `StructView::new` knows about the program around the function.
@@ -585,7 +591,7 @@ impl StructView {
 
         // the layout of each struct
         let mut defs: Vec<StructDef> = (0..struct_roots.len())
-            .map(|i| StructDef { name: format!("struct_{i}"), class: None, vtable: None, fields: Vec::new(), stride: stride.get(&struct_roots[i]).copied() })
+            .map(|i| StructDef { name: format!("struct_{i}"), class: None, vtable: None, fields: Vec::new(), stride: stride.get(&struct_roots[i]).copied(), class_from_symbol: false })
             .collect();
         let mut by_def: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
         for (i, r) in raws.iter().enumerate().filter(|(_, r)| !r.skip) {
@@ -652,6 +658,7 @@ impl StructView {
             && let Some(&d) = def_of_root.get(&r)
         {
             defs[d].class = Some(name.clone());
+            defs[d].class_from_symbol = ctx.name_class.is_some();
             if defs[d].vtable.is_none() {
                 defs[d].vtable = *vt;
             }
@@ -730,7 +737,14 @@ impl StructView {
             })
             .map(|o| o.index)
             .collect();
-        StructView { defs, value_def, access, vcalls, steps }
+        let local_stores = func
+            .ops
+            .iter()
+            .filter(|o| !o.dead && o.opcode == OpCode::Store)
+            .filter(|o| o.inputs.get(1).and_then(|&a| frame.offset_at(func, a, o.block)).is_some_and(|k| k < 0))
+            .map(|o| o.index)
+            .collect();
+        StructView { defs, value_def, access, vcalls, steps, local_stores }
     }
 
     /// The struct of value `v`, if it is a pointer to one.
@@ -863,9 +877,13 @@ impl StructView {
         if load.block != call.block || load.index > call.index {
             return None;
         }
-        let between = func.ops[load.index + 1..call.index]
-            .iter()
-            .any(|o| !o.dead && o.block == call.block && matches!(o.opcode, OpCode::Store | OpCode::Call | OpCode::CallInd | OpCode::CallOther));
+        // (a store to the function's own stack slot is fine: a spill)
+        let between = func.ops[load.index + 1..call.index].iter().any(|o| {
+            !o.dead
+                && o.block == call.block
+                && matches!(o.opcode, OpCode::Store | OpCode::Call | OpCode::CallInd | OpCode::CallOther)
+                && !self.local_stores.contains(&o.index)
+        });
         (!between).then_some(vc)
     }
 }
@@ -1064,6 +1082,14 @@ mod tests {
     }
 
     #[test]
+    fn a_spill_between_the_vtable_load_and_the_call_keeps_the_member_call() {
+        // sub rsp, 0x18 ; mov rax, [rdi] ; mov [rsp+8], rsi ; call [rax+0x18] ; add rsp, 0x18 ; ret
+        let code = [0x48, 0x83, 0xec, 0x18, 0x48, 0x8b, 0x07, 0x48, 0x89, 0x74, 0x24, 0x08, 0xff, 0x50, 0x18, 0x48, 0x83, 0xc4, 0x18, 0xc3];
+        let r = c_of(&code);
+        assert!(r.c_code.contains("rdi->vfn_3("), "{}", r.c_code);
+    }
+
+    #[test]
     fn a_virtual_call_is_raw_when_this_is_another_object() {
         // mov rax, [rdi] ; mov rdi, rsi ; call [rax+0x18] ; ret
         let r = c_of(&[0x48, 0x8b, 0x07, 0x48, 0x89, 0xf7, 0xff, 0x50, 0x18, 0xc3]);
@@ -1124,7 +1150,7 @@ mod tests {
         // mov eax, [rdi+8] ; ret
         let r = decompile(&X86Lifter::new_64(), &text(&[0x8b, 0x47, 0x08, 0xc3]), 0x1000, "_ZNK5Shape4areaEv", 100).unwrap();
         assert!(r.c_code.contains("(struct Shape* rdi)"), "{}", r.c_code);
-        assert!(r.recovered_structs[0].starts_with("struct Shape {"), "{:?}", r.recovered_structs);
+        assert!(r.recovered_structs[0].starts_with("struct Shape {  // class from the symbol"), "{:?}", r.recovered_structs);
     }
 
     #[test]
@@ -1164,16 +1190,17 @@ mod tests {
 
     #[test]
     fn class_structs_merge_over_functions() {
-        let a = vec![StructDef { name: "Shape".into(), class: Some("Shape".into()), vtable: Some(0x2010), stride: None, fields: vec![Field { off: 8, size: 4, kind: FieldKind::Int, from: None }] }];
+        let a = vec![StructDef { name: "Shape".into(), class: Some("Shape".into()), vtable: Some(0x2010), stride: None, class_from_symbol: false, fields: vec![Field { off: 8, size: 4, kind: FieldKind::Int, from: None }] }];
         let b = vec![
             StructDef {
                 name: "Shape".into(),
                 class: Some("Shape".into()),
                 vtable: None,
                 stride: None,
+                class_from_symbol: false,
                 fields: vec![Field { off: 8, size: 8, kind: FieldKind::Int, from: None }, Field { off: 0x10, size: 8, kind: FieldKind::Ptr(Some(1)), from: None }],
             },
-            StructDef { name: "struct_1".into(), class: None, vtable: None, stride: None, fields: vec![] },
+            StructDef { name: "struct_1".into(), class: None, vtable: None, stride: None, class_from_symbol: false, fields: vec![] },
         ];
         let (c, _) = merge_class_structs([a.as_slice(), b.as_slice()].into_iter());
         assert_eq!(c.len(), 1);
@@ -1201,6 +1228,7 @@ mod tests {
                 class: None,
                 vtable: None,
                 stride: None,
+                class_from_symbol: false,
                 fields: vec![
                     Field { off: 0, size: 8, kind: FieldKind::VPtr, from: None },
                     Field { off: 0x10, size: 4, kind: FieldKind::Float, from: None },
