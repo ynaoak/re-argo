@@ -298,6 +298,10 @@ pub struct Context<'a> {
     pub name_class: Option<String>,
     /// The callees' parameters: the fields a callee accesses through a pointer passed to it.
     pub oracle: Option<&'a crate::callee_params::CalleeParams<'a>>,
+    /// The function's own (mangled) name: its parameter types (WS92).
+    pub name: Option<&'a str>,
+    /// Names by address: the parameter types of the callees with a mangled name (WS92).
+    pub symbols: Option<&'a std::collections::BTreeMap<u64, String>>,
 }
 
 /// A raw access before the layout: op, base node, offset, width, value node (a pointer loaded
@@ -414,6 +418,9 @@ impl StructView {
         let mut this_calls: Vec<(u32, u64)> = Vec::new();
         // (WS92) pointers a callee stores a vtable into: a constructor's / destructor's object
         let mut constructed: Vec<(u32, u64)> = Vec::new();
+        // (WS92) pointers whose class a mangled signature names: a parameter, or a pointer passed
+        // to a callee with such a name
+        let mut declared: Vec<(u32, String)> = Vec::new();
         if let Some(oracle) = ctx.oracle {
             for op in func.ops.iter().filter(|o| !o.dead && o.opcode == OpCode::Call) {
                 let Some(t) = op.inputs.first().map(|&t| func.varnodes[t as usize].data).filter(|t| t.space == SpaceId::RAM).map(|t| t.offset) else { continue };
@@ -431,8 +438,20 @@ impl StructView {
                         Some(mem) => pu.iter().flat_map(|p| p.vtable_stores.iter()).filter(|&&(a, k)| a == ai && crate::vcall::is_vtable_point(mem, k)).map(|&(_, k)| k).collect(),
                         None => Vec::new(),
                     };
-                    if used.is_empty() && vtables.is_empty() && !(ai == this_arg && nodes.contains_key(&value_key(func, v))) {
+                    // the callee's mangled signature: the class its parameter points to
+                    let int_index = oracle.args()[..ai].iter().filter(|a| a.size == d.size).count();
+                    let named = ctx
+                        .symbols
+                        .and_then(|s| s.get(&t))
+                        .and_then(|n| signature_classes(n))
+                        .and_then(|cs| int_index.checked_sub(this_arg).and_then(|i| cs.get(i).cloned()))
+                        .flatten();
+                    if used.is_empty() && vtables.is_empty() && named.is_none() && !(ai == this_arg && nodes.contains_key(&value_key(func, v))) {
                         continue;
+                    }
+                    if let Some(c) = named {
+                        let n = node(&mut uf, &mut nodes, value_key(func, v));
+                        declared.push((n, c));
                     }
                     let n = node(&mut uf, &mut nodes, value_key(func, v));
                     if ai == this_arg {
@@ -454,6 +473,20 @@ impl StructView {
         let listing = ctx.memory.map(|m| crate::vcall::vtables_listing(m, &targets)).unwrap_or_default();
         let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));
         let this_class: Option<(String, Option<u64>)> = ctx.name_class.clone().map(|c| (c, None)).or_else(|| class_of(ctx.entry).map(|(c, v)| (c, Some(v))));
+        // WS92: the parameters a mangled name types (`Scene::add(Circle*, Shape const&)`: `rsi`
+        // is a `Circle*`, `rdx` a `Shape*`; `this` is `name_class`)
+        if let (Some(classes), Some(oracle)) = (ctx.name.and_then(signature_classes), ctx.oracle) {
+            let sret = usize::from(oracle.param_use(ctx.entry).is_some_and(|p| p.returns_first));
+            let ints: Vec<VarnodeData> = oracle.args().iter().filter(|a| a.size == 8).copied().collect();
+            for (i, c) in classes.iter().enumerate().skip(usize::from(ctx.name_class.is_some())) {
+                let (Some(c), Some(reg)) = (c, ints.get(i + sret)) else { continue };
+                if let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)
+                    && let Some(&n) = nodes.get(&value_key(func, v.id))
+                {
+                    declared.push((n, c.clone()));
+                }
+            }
+        }
 
         // WS92: what says a value is of a class, before the values are joined: `this`, a pointer
         // passed as `this` to a method listed in vtables, a vtable stored into an object here or
@@ -697,6 +730,13 @@ impl StructView {
         {
             struct_roots.push(r);
         }
+        // and a pointer a signature names the class of, when it is dereferenced
+        let declared_roots: Vec<(u32, String)> = declared.iter().map(|(n, c)| (uf.find(*n), c.clone())).collect();
+        for (r, _) in &declared_roots {
+            if is_base.contains(r) && !struct_roots.contains(r) {
+                struct_roots.push(*r);
+            }
+        }
         // and a pointer a method of a known class takes as `this`
         for &r in root_classes.keys() {
             if !struct_roots.contains(&r) {
@@ -794,6 +834,14 @@ impl StructView {
                 if let Some(v) = d.vtable {
                     d.class = crate::vcall::vtable_class(mem, v);
                 }
+            }
+        }
+        for (r, c) in &declared_roots {
+            if let Some(&d) = def_of_root.get(r)
+                && defs[d].class.is_none()
+            {
+                defs[d].class = Some(c.clone());
+                defs[d].class_from_symbol = true;
             }
         }
         // names: the class, else `struct_N` by first access; one struct per class name
@@ -1027,6 +1075,91 @@ pub fn demangle_symbol(s: &str) -> Option<String> {
         return None;
     }
     cpp_demangle::Symbol::new(s.as_bytes()).ok()?.demangle(&cpp_demangle::DemangleOptions::default()).ok()
+}
+
+/// The classes the integer / pointer parameters of a function point to, from its mangled name
+/// (WS92), in register order — `this` first for a method (taken to be no static member),
+/// `None` for one that is no class pointer or reference (an `int`, a `char*`, a pointer to a
+/// pointer). `_ZN5Scene3addEP6CircleRK5Shape` (`Scene::add(Circle*, Shape const&)`) ->
+/// `[Scene, Circle, Shape]`. A float parameter takes no integer register; the list ends before
+/// a parameter passed by value that is no scalar (a class or an enum: where it goes is not
+/// known) or `...`. `None` when the name does not demangle.
+pub fn signature_classes(name: &str) -> Option<Vec<Option<String>>> {
+    let demangled = demangle_symbol(name)?;
+    let s = demangled.as_str();
+    // the top-level parameter list
+    let mut depth = 0i32;
+    let mut open = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            '(' if depth == 0 && !s[i..].starts_with("(anonymous namespace)") => {
+                open = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let mut params: Vec<&str> = Vec::new();
+    let (mut depth, mut start, mut close) = (0i32, open + 1, None);
+    for (i, c) in s[open + 1..].char_indices().map(|(i, c)| (i + open + 1, c)) {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            ')' if depth == 0 => {
+                close = Some(i);
+                break;
+            }
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                params.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let last = s[start..close].trim();
+    if !last.is_empty() {
+        params.push(last);
+    }
+    let mut out: Vec<Option<String>> = Vec::new();
+    if let Some(c) = method_class(name) {
+        out.push(Some(c));
+    }
+    const INTS: &[&str] = &[
+        "bool", "char", "signed char", "unsigned char", "short", "unsigned short", "int", "unsigned int", "long", "unsigned long", "long long",
+        "unsigned long long", "wchar_t", "char8_t", "char16_t", "char32_t", "__int128", "unsigned __int128", "std::nullptr_t", "decltype(nullptr)",
+    ];
+    const FLOATS: &[&str] = &["float", "double"];
+    for p in params {
+        let p = p.strip_suffix(" const").unwrap_or(p);
+        if p == "void" || p.is_empty() {
+            continue;
+        }
+        if p == "..." || p == "long double" {
+            break;
+        }
+        if p.contains('(') {
+            out.push(None); // a pointer to a function
+            continue;
+        }
+        let pointee = p.strip_suffix("&&").or_else(|| p.strip_suffix('&')).or_else(|| p.strip_suffix('*'));
+        match pointee {
+            Some(t) => {
+                let t = t.trim_end();
+                let t = t.strip_suffix(" const").unwrap_or(t).trim();
+                let t = t.strip_prefix("const ").unwrap_or(t);
+                let class = !(t.ends_with('*') || t.ends_with('&') || t == "void" || INTS.contains(&t) || FLOATS.contains(&t) || t == "long double");
+                out.push(class.then(|| t.to_string()));
+            }
+            None if INTS.contains(&p) => out.push(None),
+            None if FLOATS.contains(&p) => {}
+            None => break,
+        }
+    }
+    Some(out)
 }
 
 /// The class of a method from its (mangled or demangled) name: `_ZN5Class6methodEv` /
@@ -1388,6 +1521,41 @@ mod tests {
         let r = decompile(&X86Lifter::new_64(), &holder_with(&[(0x500, &f)]), 0x1500, "f", 100).unwrap();
         assert!(r.c_code.contains("= Shape::method_at_1200"), "{}", r.c_code);
         assert!(r.c_code.contains("= Holder::method_at_1310"), "{}", r.c_code);
+    }
+
+    /// WS92: the parameter types of a mangled name.
+    #[test]
+    fn signature_classes_from_mangled_names() {
+        let c = |n: &str| signature_classes(n).unwrap().into_iter().map(|c| c.unwrap_or_default()).collect::<Vec<_>>();
+        assert_eq!(c("_ZN5Scene3addEP6CircleRK5Shape"), ["Scene", "Circle", "Shape"]);
+        // `this`, a `std::vector<int> const&`, a `char**` (no class), a `double` (no integer
+        // register), a `Baz*`
+        assert_eq!(c("_ZNK3Foo3barERKSt6vectorIiSaIiEEPPcdP3Baz"), ["Foo", "std::vector<int, std::allocator<int> >", "", "Baz"]);
+        assert_eq!(c("_Z4drawP6Circle"), ["Circle"]);
+        // a class by value: where it goes is not known, the list ends
+        assert_eq!(c("_Z4fill5ShapeP6Circle"), Vec::<String>::new());
+        assert_eq!(c("_Z1fiP6Circle"), ["", "Circle"]);
+        assert!(signature_classes("FUN_401000").is_none());
+    }
+
+    /// WS92: a mangled function name types its parameters; a pointer passed to a callee with a
+    /// mangled name gets the class of that parameter.
+    #[test]
+    fn mangled_signatures_type_parameters_and_arguments() {
+        // _ZN5Scene3addEP6CircleRK5Shape: mov eax, [rsi+8] ; add eax, [rdx+0x10] ; mov [rdi+4], eax ; ret
+        let code = [0x8b, 0x46, 0x08, 0x03, 0x42, 0x10, 0x89, 0x47, 0x04, 0xc3];
+        let r = crate::pipeline::decompile_with_symbols(&X86Lifter::new_64(), &text(&code), 0x1000, "_ZN5Scene3addEP6CircleRK5Shape", 100, &Default::default()).unwrap();
+        assert!(r.c_code.contains("(struct Scene* rdi, struct Circle* rsi, struct Shape* rdx)"), "{}", r.c_code);
+        assert!(r.recovered_structs.iter().any(|d| d.starts_with("struct Circle {  // class from the symbol")), "{:?}", r.recovered_structs);
+        // f: push rbx ; mov rbx, rsi ; mov eax, [rsi+8] ; mov [rdi+4], eax ; mov rdi, rbx ;
+        // call 0x1100 (_Z4drawP6Circle) ; mov eax, [rbx+0xc] ; pop rbx ; ret
+        let mut f = vec![0x53, 0x48, 0x89, 0xf3, 0x8b, 0x46, 0x08, 0x89, 0x47, 0x04, 0x48, 0x89, 0xdf, 0xe8, 0xee, 0x00, 0x00, 0x00, 0x8b, 0x43, 0x0c, 0x5b, 0xc3];
+        f.resize(0x100, 0xcc);
+        f.extend_from_slice(&[0x8b, 0x47, 0x08, 0xc3]);
+        let symbols = std::collections::BTreeMap::from([(0x1100u64, "_Z4drawP6Circle".to_string())]);
+        let r = crate::pipeline::decompile_with_symbols(&X86Lifter::new_64(), &text(&f), 0x1000, "f", 100, &symbols).unwrap();
+        assert!(r.c_code.contains("struct Circle* rsi"), "{}", r.c_code);
+        assert!(r.c_code.contains("rbx->field_c"), "{}", r.c_code);
     }
 
     #[test]

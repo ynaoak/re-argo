@@ -1359,7 +1359,7 @@ fn build_decompile_result(
         let memory = caller_hint.map(|(_, m)| m);
         let cc = caller_hint.and_then(|(l, _)| l.call_convention());
         let arg_regs = [cc.as_ref().and_then(|c| c.args.first().copied()), cc.as_ref().and_then(|c| c.args.get(1).copied())];
-        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle };
+        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle, name: Some(func_name), symbols: Some(symbols) };
         crate::structs::StructView::new(&ssa, &ctx)
     } else {
         crate::structs::StructView::default()
