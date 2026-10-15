@@ -437,3 +437,211 @@ fn save_value(func: &mut SsaFunction, o: OpIdx, v: VarId, n: u64) -> VarId {
     func.varnodes[v as usize].uses.push(o);
     id
 }
+
+/// Base of the register-space offsets [`name_flag_webs`] gives the flags it names (WS90).
+pub const NAMED_FLAG_BASE: u64 = 0x6f00_0000;
+/// The names' prefixes, by kind: the offset is `NAMED_FLAG_BASE + kind * 0x10000 + n`.
+const FLAG_KINDS: [&str; 8] = ["lt", "le", "eq", "ne", "neg", "carry", "ovf", "cond"];
+
+/// The machine flags (CF..OF) and the flags [`name_flag_webs`] named.
+pub(crate) fn is_flag_storage(d: &reargo_core::pcode::VarnodeData) -> bool {
+    d.space == SpaceId::REGISTER && ((0x200..0x210).contains(&d.offset) || (NAMED_FLAG_BASE..NAMED_FLAG_BASE + 0x0100_0000).contains(&d.offset))
+}
+
+/// The name of a flag [`name_flag_webs`] named (`lt_3`), by its register offset.
+pub(crate) fn named_flag(offset: u64) -> Option<String> {
+    let k = offset.checked_sub(NAMED_FLAG_BASE)?;
+    let kind = FLAG_KINDS.get((k >> 16) as usize)?;
+    Some(format!("{kind}_{}", k & 0xffff))
+}
+
+/// WS90: each flag value the output may name becomes a boolean of its own. A machine flag is
+/// one register written by every compare (`var_201` is the carry flag of whichever `cmp` ran
+/// last), so a flag kept as a statement read like a register, and any later compare counted as
+/// overwriting it. The versions of a flag joined by phis (a web) are one variable; each web whose
+/// every version is computed in the function gets a register of its own, named by what it
+/// computes — `lt_0 = a < b;` (`IntLess` / `IntSLess` / `FloatLess`), `le`, `eq`, `ne`, `neg`
+/// (`x < 0`, the sign flag), `carry`, `ovf`, else `cond`. Every name of a value moves together
+/// (common subexpression elimination leaves several varnodes per value), so the program is the
+/// same; the numbers are made dense later, in the order the output names them
+/// ([`renumber_named_flags`]).
+pub fn name_flag_webs(func: &mut SsaFunction) {
+    use OpCode::*;
+    let machine = |d: &reargo_core::pcode::VarnodeData| d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset);
+    // (a wider access over the flags — none is lifted — would have to move with them)
+    if func.varnodes.iter().any(|v| machine(&v.data) && v.data.size != 1) {
+        return;
+    }
+    let mut index: FxHashMap<ValueKey, usize> = FxHashMap::default();
+    let mut keys: Vec<ValueKey> = Vec::new();
+    for v in 0..func.varnodes.len() {
+        if machine(&func.varnodes[v].data) {
+            let k = value_key(func, v as VarId);
+            index.entry(k).or_insert_with(|| {
+                keys.push(k);
+                keys.len() - 1
+            });
+        }
+    }
+    if keys.is_empty() {
+        return;
+    }
+    let mut parent: Vec<usize> = (0..keys.len()).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    // the web's kind (`usize::MAX` = not yet known), and whether a version has no definition
+    let mut kind = vec![usize::MAX; keys.len()];
+    let mut open = vec![false; keys.len()];
+    let mut first_def = vec![usize::MAX; keys.len()];
+    for op in &func.ops {
+        if op.dead || op.opcode != MultiEqual {
+            continue;
+        }
+        let Some(out) = op.output else { continue };
+        let Some(&o) = index.get(&value_key(func, out)) else { continue };
+        for &i in &op.inputs {
+            match index.get(&value_key(func, i)) {
+                Some(&x) => {
+                    let (a, b) = (find(&mut parent, o), find(&mut parent, x));
+                    parent[a] = b;
+                }
+                None => open[o] = true,
+            }
+        }
+    }
+    let is_zero = |func: &SsaFunction, v: VarId| {
+        let d = &func.varnodes[v as usize].data;
+        d.space == SpaceId::CONST && d.offset == 0
+    };
+    // the definition of each version (any of its varnodes that has one)
+    let mut def_of: Vec<Option<OpIdx>> = vec![None; keys.len()];
+    for v in 0..func.varnodes.len() {
+        if let Some(d) = func.varnodes[v].def_op
+            && let Some(&n) = index.get(&value_key(func, v as VarId))
+        {
+            def_of[n].get_or_insert(d);
+        }
+    }
+    for (n, &def) in def_of.iter().enumerate() {
+        let r = find(&mut parent, n);
+        let Some(d) = def else {
+            open[r] = true;
+            continue;
+        };
+        let op = &func.ops[d];
+        if op.opcode == MultiEqual {
+            continue;
+        }
+        first_def[r] = first_def[r].min(d);
+        let this = match op.opcode {
+            IntSLess if op.inputs.len() == 2 && is_zero(func, op.inputs[1]) => 4,
+            IntLess | IntSLess | FloatLess => 0,
+            IntLessEqual | IntSLessEqual | FloatLessEqual => 1,
+            IntEqual | FloatEqual => 2,
+            IntNotEqual | FloatNotEqual => 3,
+            IntCarry => 5,
+            IntSCarry | IntSBorrow => 6,
+            _ => 7,
+        };
+        kind[r] = if kind[r] == usize::MAX || kind[r] == this { this } else { 7 };
+    }
+    // a web is open when any version in it is
+    for n in 0..keys.len() {
+        if open[n] {
+            let r = find(&mut parent, n);
+            open[r] = true;
+        }
+    }
+    let mut roots: Vec<usize> = (0..keys.len()).filter(|&n| find(&mut parent, n) == n && !open[n] && kind[n] != usize::MAX).collect();
+    roots.sort_by_key(|&r| first_def[r]);
+    let mut count = [0u64; FLAG_KINDS.len()];
+    let mut offset_of: FxHashMap<usize, u64> = FxHashMap::default();
+    for r in roots {
+        let k = kind[r];
+        if count[k] >= 0x10000 {
+            continue;
+        }
+        offset_of.insert(r, NAMED_FLAG_BASE + ((k as u64) << 16) + count[k]);
+        count[k] += 1;
+    }
+    for v in 0..func.varnodes.len() {
+        if !machine(&func.varnodes[v].data) {
+            continue;
+        }
+        let n = index[&value_key(func, v as VarId)];
+        let r = find(&mut parent, n);
+        if let Some(&off) = offset_of.get(&r) {
+            func.varnodes[v].data.offset = off;
+        }
+    }
+}
+
+/// Make the numbers of the named flags dense in `text` (WS90): per kind, in the order the text
+/// first names them (`lt_4`, `lt_9` -> `lt_0`, `lt_1`); a folded flag the output never names
+/// leaves no gap.
+pub(crate) fn renumber_named_flags(text: &str, func: &SsaFunction) -> String {
+    let named: rustc_hash::FxHashSet<u64> = func
+        .varnodes
+        .iter()
+        .filter(|v| v.data.space == SpaceId::REGISTER && v.data.offset >= NAMED_FLAG_BASE && named_flag(v.data.offset).is_some())
+        .map(|v| v.data.offset - NAMED_FLAG_BASE)
+        .collect();
+    if named.is_empty() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut map: FxHashMap<(usize, u64), u64> = FxHashMap::default();
+    let mut next = [0u64; FLAG_KINDS.len()];
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        if ident(bytes[i]) && (i == 0 || !ident(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && ident(bytes[i]) {
+                i += 1;
+            }
+            let word = &text[start..i];
+            if let Some((kind, num)) = word.split_once('_')
+                && let Some(k) = FLAG_KINDS.iter().position(|&p| p == kind)
+                && !num.is_empty()
+                && num.bytes().all(|c| c.is_ascii_digit())
+                && let Ok(n) = num.parse::<u64>()
+                && named.contains(&(((k as u64) << 16) + n))
+            {
+                let m = *map.entry((k, n)).or_insert_with(|| {
+                    next[k] += 1;
+                    next[k] - 1
+                });
+                out.push_str(&text[copied..start]);
+                out.push_str(&format!("{kind}_{m}"));
+                copied = i;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_flags_by_kind() {
+        assert_eq!(named_flag(NAMED_FLAG_BASE + 3).as_deref(), Some("lt_3"));
+        assert_eq!(named_flag(NAMED_FLAG_BASE + (2 << 16)).as_deref(), Some("eq_0"));
+        assert_eq!(named_flag(NAMED_FLAG_BASE + (7 << 16) + 1).as_deref(), Some("cond_1"));
+        assert_eq!(named_flag(0x201), None);
+        let d = |o| reargo_core::pcode::VarnodeData::new(SpaceId::REGISTER, o, 1);
+        assert!(is_flag_storage(&d(0x206)) && is_flag_storage(&d(NAMED_FLAG_BASE + 5)) && !is_flag_storage(&d(0x10)));
+    }
+}

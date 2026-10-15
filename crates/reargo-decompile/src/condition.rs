@@ -274,7 +274,7 @@ fn collect_leaves(
     // (only a temporary or a flag may print inside its reader — an inlined temporary, a `setcc`'s
     // folded comparison; a register is assigned by a statement and stands for its value)
     let inlinable = d.space == reargo_core::address::SpaceId::UNIQUE
-        || (d.space == reargo_core::address::SpaceId::REGISTER && (0x200..0x210).contains(&d.offset));
+        || crate::flags::is_flag_storage(&d);
     if def.dead || def.block != block || !is_pure(def.opcode) || depth >= 6 || !inlinable {
         return;
     }

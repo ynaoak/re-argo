@@ -1160,6 +1160,8 @@ fn build_decompile_result(
     crate::rotate::recover_rotates(&mut ssa);
     // WS85: `tmp_500 = *(…); rdi = tmp_500;` is `rdi = *(…);`
     crate::copyprop::propagate_register_copies(&mut ssa);
+    // WS90: each flag value a boolean of its own (`lt_0 = a < b;`), not the register every compare writes
+    crate::flags::name_flag_webs(&mut ssa);
     let live_ops = ssa.live_op_count();
     if let Some((info, args)) = own_params {
         ssa.signature_params = Some(signature_params(&ssa, info, &args));
@@ -2999,7 +3001,7 @@ mod tests {
             0xc3,
             0xc3,
         ]);
-        assert!(c.contains("var_206 = rcx == *(uint64_t*)0x1107;"), "{c}");
+        assert!(c.contains("eq_0 = rcx == *(uint64_t*)0x1107;"), "{c}");
         let c = c_of(&[
             0x44, 0x8b, 0x0c, 0x8a, // mov r9d, [rdx+rcx*4]
             0x48, 0x8d, 0x4c, 0x8a, 0x04, // lea rcx, [rdx+rcx*4+4]
@@ -3313,16 +3315,16 @@ mod tests {
         let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x0e, 0x74, 0x04, 0x48, 0x89, 0x0f, 0xc3, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("rcx = *(uint64_t*)rsi;") && c.contains("if (rax == 0)"), "{c}");
-        assert!(!c.contains("var_206"), "{c}");
+        assert!(!c.contains("var_206") && !c.contains("eq_0"), "{c}");
         // test rax, rax; mov rax, [rsi]; je L; ...: rax changes before the jump
         let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x06, 0x74, 0x04, 0x48, 0x89, 0x07, 0xc3, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("var_206 = rax == 0;") && c.contains("var_206"), "{c}");
+        assert!(c.contains("eq_0 = rax == 0;") && c.contains("if (eq_0)"), "{c}");
         // cmp rax, rbx; sete cl; mov rbx, rax; test cl, cl; jne L; ...: the `sete` prints its
         // comparison, which reads rbx before it changes — it stays a statement
         let code = [0x48, 0x39, 0xd8, 0x0f, 0x94, 0xc1, 0x48, 0x89, 0xc3, 0x84, 0xc9, 0x75, 0x04, 0x48, 0x89, 0x1f, 0xc3, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("cl = rax == rbx;") || c.contains("var_206 = rax == rbx;"), "{c}");
+        assert!(c.contains("cl = rax == rbx;") || c.contains("eq_0 = rax == rbx;"), "{c}");
     }
 
     /// WS89: a flag another block computed folds into the branch reading it when its operands
@@ -3334,12 +3336,12 @@ mod tests {
         // cmp rdi, rsi; je L1; jb L2; xor eax, eax; ret; L1: ret; L2: mov eax, 1; ret
         let code = [0x48, 0x39, 0xf7, 0x74, 0x05, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("rdi < rsi") && !c.contains("var_201"), "{c}");
+        assert!(c.contains("rdi < rsi") && !c.contains("var_201") && !c.contains("lt_0"), "{c}");
         // mov in between: rdi changes before the `jb`
         // cmp rdi, rsi; je L1; mov rdi, rdx; jb L2; xor eax, eax; ret; L1: ret; L2: mov rax, rdi; ret
         let code = [0x48, 0x39, 0xf7, 0x74, 0x08, 0x48, 0x89, 0xd7, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0x48, 0x89, 0xf8, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("var_201 = rdi < rsi;"), "{c}");
+        assert!(c.contains("lt_0 = rdi < rsi;") && c.contains("if (lt_0)"), "{c}");
     }
 
     /// WS89: what a register's own statement computed from does not count as read by a
@@ -3351,7 +3353,7 @@ mod tests {
         // mov rdi, [rbx+0x20]; test rdi, rdi; mov r15, [rsp+0x28]; je L; mov [rsi], r15; L: ret
         let code = [0x48, 0x8b, 0x7b, 0x20, 0x48, 0x85, 0xff, 0x4c, 0x8b, 0x7c, 0x24, 0x28, 0x74, 0x03, 0x4c, 0x89, 0x3e, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("if (rdi != 0)") && !c.contains("var_206"), "{c}");
+        assert!(c.contains("if (rdi != 0)") && !c.contains("var_206") && !c.contains("eq_0"), "{c}");
     }
 
     /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
@@ -3364,12 +3366,12 @@ mod tests {
         let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x75, 0xf9, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("!__atomic_compare_exchange((uint64_t*)rdi, &rax, rcx)"), "{c}");
-        assert!(!c.contains("tmp_") && !c.contains("var_206"), "{c}");
+        assert!(!c.contains("tmp_") && !c.contains("var_206") && !c.contains("eq_0"), "{c}");
         // the flag read later too: a statement
         // mov rax, [rdi]; lock cmpxchg [rdi], rcx; sete al; ret
         let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x0f, 0x94, 0xc0, 0xc3];
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
-        assert!(c.contains("var_206 = __atomic_compare_exchange((uint64_t*)rdi, &rax, rcx);"), "{c}");
+        assert!(c.contains("eq_0 = __atomic_compare_exchange((uint64_t*)rdi, &rax, rcx);"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
     }
 
@@ -4063,5 +4065,31 @@ mod tests {
         let named = c.lines().find(|l| l.trim_start().ends_with("= (int32_t)esi < (int32_t)ecx;")).unwrap_or_else(|| panic!("{c}"));
         let name = named.trim_start().split(' ').next().unwrap();
         assert!(c.contains(&format!("ecx = {name} ? ecx : esi;")), "{c}");
+    }
+
+    /// WS90: each flag kept as a statement is a boolean of its own, named by what it computes
+    /// (it was the carry-flag register `var_201` for both compares).
+    #[test]
+    fn kept_flags_are_named_booleans() {
+        let code = [
+            0x48, 0x39, 0xf7, // cmp rdi, rsi
+            0x74, 0x12, // je ret
+            0x48, 0x89, 0xd7, // mov rdi, rdx
+            0x72, 0x0e, // jb one
+            0x48, 0x39, 0xca, // cmp rdx, rcx
+            0x74, 0x08, // je ret
+            0x4c, 0x89, 0xc2, // mov rdx, r8
+            0x72, 0x04, // jb one
+            0x31, 0xc0, 0xc3, // xor eax, eax; ret
+            0xc3, // ret
+            0x48, 0x89, 0xf8, 0x48, 0x01, 0xd0, 0xc3, // one: mov rax, rdi; add rax, rdx; ret
+        ];
+        let c = c_of(&code);
+        for s in ["bool lt_0;", "bool lt_1;", "lt_0 = rdi < rsi;", "lt_1 = rdx < rcx;", "if (lt_0)", "if (lt_1)"] {
+            assert!(c.contains(s), "{s}: {c}");
+        }
+        assert!(!c.contains("var_20"), "{c}");
+        let r = rust_of(&code);
+        assert!(r.contains("lt_0 = rdi < rsi;") && r.contains("lt_1 = rdx < rcx;") && !r.contains("var_20"), "{r}");
     }
 }

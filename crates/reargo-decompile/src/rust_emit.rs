@@ -191,6 +191,7 @@ impl<'a> RustEmitter<'a> {
         if !self.cas.is_empty() {
             self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("let mut {n}: u8;"), crate::cas::RUST_FORMS);
         }
+        self.output = crate::flags::renumber_named_flags(&self.output, func);
         self.output.clone()
     }
 
@@ -1228,6 +1229,8 @@ fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
 
 fn reg_name(offset: u64, size: u32) -> String {
     match (offset, size) {
+        // a flag value named by what it computes (WS90, `flags::name_flag_webs`)
+        (off, 1) if off >= crate::flags::NAMED_FLAG_BASE && crate::flags::named_flag(off).is_some() => crate::flags::named_flag(off).unwrap_or_default(),
         (0x00, 8) => "rax".into(),
         (0x00, 4) => "eax".into(),
         (0x00, 2) => "ax".into(),

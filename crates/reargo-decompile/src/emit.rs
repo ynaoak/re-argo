@@ -260,8 +260,13 @@ impl<'a> CEmitter<'a> {
         self.line("}");
         // WS89: a compare-and-swap's flag read only by the next condition goes into it
         if !self.cas.is_empty() {
-            self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("uint8_t {n};"), crate::cas::C_FORMS);
+            self.output = crate::cas::fold_into_conditions(
+                &self.output,
+                &|n| if n.starts_with("var_") { format!("uint8_t {n};") } else { format!("bool {n};") },
+                crate::cas::C_FORMS,
+            );
         }
+        self.output = crate::flags::renumber_named_flags(&self.output, func);
         self.output.clone()
     }
 
@@ -278,7 +283,7 @@ impl<'a> CEmitter<'a> {
             {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
-                    let type_name = size_to_type(vn.data.size);
+                    let type_name = if crate::flags::named_flag(vn.data.offset).is_some() { "bool" } else { size_to_type(vn.data.size) };
                     let var_name = reg_name(vn.data.offset, vn.data.size);
                     if !params.contains(var_name.as_str()) {
                         linef!(self, "{} {};", type_name, var_name);
@@ -1786,6 +1791,8 @@ fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
 
 fn reg_name(offset: u64, size: u32) -> String {
     match (offset, size) {
+        // a flag value named by what it computes (WS90, `flags::name_flag_webs`)
+        (off, 1) if off >= crate::flags::NAMED_FLAG_BASE && crate::flags::named_flag(off).is_some() => crate::flags::named_flag(off).unwrap_or_default(),
         (0x00, 8) => "rax".into(),
         (0x00, 4) => "eax".into(),
         (0x00, 2) => "ax".into(),
@@ -1965,7 +1972,7 @@ pub(crate) fn select_conditions(
     let mut texts = rustc_hash::FxHashMap::default();
     let temp = |v: crate::ssa::VarId| {
         let d = &func.varnodes[v as usize].data;
-        d.space == SpaceId::UNIQUE || (d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset) && d.size == 1)
+        d.space == SpaceId::UNIQUE || (crate::flags::is_flag_storage(d) && d.size == 1)
     };
     // the value a site folds (its input), and whether its text is the negation
     let site = |op: &crate::ssa::SsaOp| -> Option<(crate::ssa::VarId, bool)> {
@@ -1974,7 +1981,7 @@ pub(crate) fn select_conditions(
         }
         let byte_reg = op.output.is_some_and(|w| {
             let d = &func.varnodes[w as usize].data;
-            d.space == SpaceId::REGISTER && d.size == 1 && !(0x200..0x210).contains(&d.offset)
+            d.space == SpaceId::REGISTER && d.size == 1 && !crate::flags::is_flag_storage(d)
         });
         let c = match op.opcode {
             OpCode::Select if op.inputs.len() == 3 => return Some((op.inputs[0], false)),
