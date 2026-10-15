@@ -4143,4 +4143,20 @@ mod tests {
             assert!(c.contains(s), "{s}: {c}");
         }
     }
+
+    /// WS90: `sbb` / `adc` after a `cmp` read the comparison as a number (they printed
+    /// `rdx = (rdx - 0xffffffffffffffff) - ((uint64_t)(uint8_t)var_201);` after `var_201 = …;`).
+    #[test]
+    fn carry_arithmetic_reads_the_comparison() {
+        let c1 = c_of(&[0x48, 0x81, 0xff, 0xf4, 0x01, 0x00, 0x00, 0x48, 0x83, 0xda, 0xff, 0x48, 0x89, 0x16, 0xc3]);
+        let c2 = c_of(&[0x39, 0xf7, 0x19, 0xc0, 0xc3]);
+        // cmp rdi, rsi; adc rdx, 0; mov [rcx], rdx; cmp edi, 5; sbb al, 0; mov [rcx], al; ret
+        let c3 = c_of(&[0x48, 0x39, 0xf7, 0x48, 0x83, 0xd2, 0x00, 0x48, 0x89, 0x11, 0x83, 0xff, 0x05, 0x1c, 0x00, 0x88, 0x01, 0xc3]);
+        assert!(c1.contains("rdx = (rdx + 1) - ((uint64_t)(rdi < 0x1f4));"), "{c1}");
+        assert!(c2.contains("eax = -((uint32_t)(edi < esi));"), "{c2}");
+        assert!(c3.contains("rdx = rdx + ((uint64_t)(rdi < rsi));") && c3.contains("al = al - ((uint8_t)(edi < 5));"), "{c3}");
+        for c in [&c1, &c2, &c3] {
+            assert!(!c.contains("lt_") && !c.contains("var_20"), "{c}");
+        }
+    }
 }

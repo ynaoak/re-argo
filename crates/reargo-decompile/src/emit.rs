@@ -596,12 +596,31 @@ impl<'a> CEmitter<'a> {
                     return Some(format!("{} = {} - {};", dst, a, small_hex(k)));
                 }
                 let b = self.input_expr(func, op, 1);
+                // WS90: `0xffffffffffffffff + x` (`adc rdx, -1` after a `cmp`) is `x - 1` (at 32 / 64
+                // bits, where unsigned arithmetic wraps and nothing is promoted)
+                if let Some(k) = self.wide_negative(func, op, 0)
+                    && func.varnodes[op.inputs[1] as usize].data.space != SpaceId::CONST
+                {
+                    return Some(format!("{} = {} - {};", dst, b, small_hex(k)));
+                }
                 Some(format!("{} = {} + {};", dst, a, b))
             }
             OpCode::IntSub => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
+                let c = |i: usize| func.varnodes[op.inputs[i] as usize].data;
+                // WS90: `x - 0` (`sbb al, 0`) is `x`, `0 - x` (`sbb eax, eax` after it is folded) `-x`,
+                // and `x - 0xffffffffffffffff` (`sbb rdx, -1`) `x + 1` at 32 / 64 bits
+                if c(1).space == SpaceId::CONST && c(1).offset == 0 {
+                    return Some(format!("{} = {};", dst, a));
+                }
+                if c(0).space == SpaceId::CONST && c(0).offset == 0 && c(1).space != SpaceId::CONST {
+                    return Some(format!("{} = -{};", dst, if crate::condition::is_atomic(&b) || is_deref(&b) { b } else { format!("({b})") }));
+                }
+                if let Some(k) = self.wide_negative(func, op, 1) {
+                    return Some(format!("{} = {} + {};", dst, a, small_hex(k)));
+                }
                 Some(format!("{} = {} - {};", dst, a, b))
             }
             OpCode::IntMult => {
@@ -895,6 +914,16 @@ impl<'a> CEmitter<'a> {
                 let dst_ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
                 // WS90: not when the operand already has that type (`(uint64_t)(uint32_t)eax` is
                 // `(uint64_t)eax`, `(uint32_t)(uint8_t)*(uint8_t*)p` is `(uint32_t)*(uint8_t*)p`)
+                // a comparison's value is 0 or 1: `(uint64_t)(rdi < 0x1f5)`
+                let boolean = func.varnodes[op.inputs[0] as usize].def_op.is_some_and(|d| {
+                    matches!(
+                        func.ops[d].opcode,
+                        OpCode::IntEqual | OpCode::IntNotEqual | OpCode::IntLess | OpCode::IntSLess | OpCode::IntLessEqual | OpCode::IntSLessEqual
+                    )
+                });
+                if boolean && crate::condition::is_atomic(&a) {
+                    return Some(format!("{} = ({}){};", dst, dst_ty, a));
+                }
                 let a = match self.c_int_type(func, op.inputs[0], &a) {
                     Some((w, false)) if w == src => return Some(format!("{} = ({}){};", dst, dst_ty, drop_widening_casts(&a))),
                     _ => a,
@@ -1258,6 +1287,12 @@ impl<'a> CEmitter<'a> {
             }
         }
         varnode_name(vn)
+    }
+
+    /// `k` when input `i` of `op` is the constant `-k` of a 32- or 64-bit operation (WS90).
+    fn wide_negative(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, i: usize) -> Option<u64> {
+        let d = func.varnodes[*op.inputs.get(i)? as usize].data;
+        (d.size >= 4).then(|| negative_constant(&d)).flatten()
     }
 
     /// The C integer type of `text` (the printed operand `v`) when it is certain (WS90): `(width

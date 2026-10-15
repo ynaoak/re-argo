@@ -138,11 +138,16 @@ pub(crate) fn candidates(
         }
         let Some(v) = op.output else { continue };
         let vd = func.varnodes[v as usize].data;
-        if vd.space != SpaceId::UNIQUE || !(pure(op.opcode) || op.opcode == OpCode::Load) {
-            continue;
-        }
         // (a call's `INDIRECT`s name its target only to say whose result / clobber they are)
         let rs: smallvec::SmallVec<[OpIdx; 2]> = readers.of(func, v).iter().copied().filter(|&u| func.ops[u].opcode != OpCode::Indirect).collect();
+        // WS90: a flag's integer comparison read only by the extension that turns it into a
+        // number (`cmp; sbb rdx, -1`, `adc`): `rdx = (rdx + 1) - (uint64_t)(rdi < 0x1f4);`
+        let counted = crate::flags::is_flag_storage(&vd)
+            && matches!(op.opcode, OpCode::IntEqual | OpCode::IntNotEqual | OpCode::IntLess | OpCode::IntSLess | OpCode::IntLessEqual | OpCode::IntSLessEqual)
+            && matches!(rs.as_slice(), [u] if func.ops[*u].opcode == OpCode::IntZExt);
+        if !counted && (vd.space != SpaceId::UNIQUE || !(pure(op.opcode) || op.opcode == OpCode::Load)) {
+            continue;
+        }
         if rs.is_empty() || rs.len() > MAX_SHARED {
             continue;
         }
