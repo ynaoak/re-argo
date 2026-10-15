@@ -83,13 +83,13 @@ impl Analyzer for LinearSweepAnalyzer {
         // Build set of (start, end) tuples for every existing
         // function body so we can reject candidates that fall
         // inside known territory.
-        let mut covered: Vec<(u64, u64)> = Vec::new();
+        let mut raw_ranges: Vec<(u64, u64)> = Vec::new();
         for f in program.listing.functions() {
             for r in f.body.ranges() {
-                covered.push((r.start.offset, r.start.offset + r.size));
+                raw_ranges.push((r.start.offset, r.start.offset + r.size));
             }
         }
-        covered.sort_by_key(|(s, _)| *s);
+        let mut covered = Covered::from_ranges(raw_ranges);
 
         let exec_sections: Vec<(u64, u64)> = program
             .info
@@ -112,7 +112,7 @@ impl Analyzer for LinearSweepAnalyzer {
                 // past `visited.insert` for the dominant case, so
                 // `visited` never populated and we re-walked every
                 // address.
-                if is_inside_function_body(addr, &covered) || !visited.insert(addr) {
+                if covered.contains(addr) || !visited.insert(addr) {
                     addr += 16;
                     continue;
                 }
@@ -136,12 +136,7 @@ impl Analyzer for LinearSweepAnalyzer {
                 if let Some(end) = validate_candidate_with_extent(&*lifter, program, addr, &covered)
                 {
                     new_functions.push((addr, end));
-                    covered.push((addr, end));
-                    // Re-sort so the binary-search-style scan stays
-                    // consistent. Cost is linear-in-N; the candidate
-                    // count is bounded by section size / 16 so this
-                    // doesn't dominate.
-                    covered.sort_by_key(|(s, _)| *s);
+                    covered.insert(addr, end);
                 }
                 addr += 16;
             }
@@ -175,8 +170,60 @@ impl Analyzer for LinearSweepAnalyzer {
     }
 }
 
-fn is_inside_function_body(addr: u64, covered: &[(u64, u64)]) -> bool {
-    covered.iter().any(|(s, e)| addr >= *s && addr < *e)
+/// Set of half-open address intervals with O(log n) membership queries.
+///
+/// Stored as a sorted `Vec` of *disjoint, non-adjacent* `[start, end)`
+/// intervals: overlapping, nested and touching input ranges are merged,
+/// which does not change the set of covered addresses. Empty ranges are
+/// dropped.
+#[derive(Debug, Default)]
+struct Covered {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl Covered {
+    fn from_ranges(mut raw: Vec<(u64, u64)>) -> Self {
+        raw.retain(|(s, e)| s < e);
+        raw.sort_unstable();
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
+        for (s, e) in raw {
+            match ranges.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => ranges.push((s, e)),
+            }
+        }
+        Self { ranges }
+    }
+
+    /// True iff `addr` lies in `[s, e)` of some range that was added.
+    fn contains(&self, addr: u64) -> bool {
+        let i = self.ranges.partition_point(|&(s, _)| s <= addr);
+        i > 0 && addr < self.ranges[i - 1].1
+    }
+
+    /// Add `[start, end)`, merging with any overlapping or touching
+    /// neighbours.
+    fn insert(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        // First interval that could merge: the last one starting at or
+        // before `start` if it reaches `start`, else the next one.
+        let mut lo = self.ranges.partition_point(|&(s, _)| s <= start);
+        if lo > 0 && self.ranges[lo - 1].1 >= start {
+            lo -= 1;
+        }
+        // One past the last interval starting at or before `end`.
+        let hi = self.ranges.partition_point(|&(s, _)| s <= end);
+        if lo >= hi {
+            self.ranges.insert(lo, (start, end));
+            return;
+        }
+        let new_start = start.min(self.ranges[lo].0);
+        let new_end = end.max(self.ranges[hi - 1].1);
+        self.ranges[lo] = (new_start, new_end);
+        self.ranges.drain(lo + 1..hi);
+    }
 }
 
 /// Match the four prologue families most x86_64 code uses. Keeping
@@ -234,7 +281,7 @@ fn validate_candidate_with_extent(
     lifter: &dyn PcodeLift,
     program: &Program,
     entry: u64,
-    covered: &[(u64, u64)],
+    covered: &Covered,
 ) -> Option<u64> {
     let lifted = lifter.lift_range(&program.info.memory, entry, 256).ok()?;
     if lifted.len() < 3 {
@@ -242,7 +289,7 @@ fn validate_candidate_with_extent(
     }
     let mut terminator_idx: Option<usize> = None;
     for (i, insn) in lifted.iter().enumerate() {
-        if is_inside_function_body(insn.address, covered) {
+        if covered.contains(insn.address) {
             return None;
         }
         // Look at the underlying `DecodedInstruction.flow_type` via
@@ -315,11 +362,81 @@ mod tests {
 
     #[test]
     fn coverage_overlap_detection() {
-        let covered = vec![(0x1000, 0x1100), (0x2000, 0x2050)];
-        assert!(is_inside_function_body(0x1050, &covered));
-        assert!(is_inside_function_body(0x2049, &covered));
-        assert!(!is_inside_function_body(0x1500, &covered));
-        assert!(!is_inside_function_body(0x2050, &covered));
+        let covered = Covered::from_ranges(vec![(0x1000, 0x1100), (0x2000, 0x2050)]);
+        assert!(covered.contains(0x1050));
+        assert!(covered.contains(0x2049));
+        assert!(!covered.contains(0x1500));
+        assert!(!covered.contains(0x2050));
+    }
+
+    /// Brute-force oracle: addr in [s, e) of some original range.
+    fn naive(raw: &[(u64, u64)], addr: u64) -> bool {
+        raw.iter().any(|&(s, e)| addr >= s && addr < e)
+    }
+
+    #[test]
+    fn covered_merges_overlapping_and_nested() {
+        let raw = vec![
+            (0x100, 0x200),
+            (0x150, 0x180), // nested
+            (0x190, 0x250), // overlaps tail
+            (0x250, 0x260), // touches
+            (0x400, 0x400), // empty
+            (0x300, 0x310),
+        ];
+        let c = Covered::from_ranges(raw.clone());
+        assert_eq!(c.ranges, vec![(0x100, 0x260), (0x300, 0x310)]);
+        for a in 0..0x500u64 {
+            assert_eq!(c.contains(a), naive(&raw, a), "addr {a:#x}");
+        }
+    }
+
+    #[test]
+    fn covered_boundaries() {
+        let c = Covered::from_ranges(vec![(0x10, 0x20)]);
+        assert!(!c.contains(0x0f));
+        assert!(c.contains(0x10));
+        assert!(c.contains(0x1f));
+        assert!(!c.contains(0x20));
+        assert!(!Covered::default().contains(0));
+    }
+
+    #[test]
+    fn covered_insert_merges_neighbours() {
+        let mut c = Covered::from_ranges(vec![(0x10, 0x20), (0x40, 0x50), (0x70, 0x80)]);
+        // Disjoint insert keeps order.
+        c.insert(0x28, 0x30);
+        assert_eq!(c.ranges, vec![(0x10, 0x20), (0x28, 0x30), (0x40, 0x50), (0x70, 0x80)]);
+        // Touches left neighbour.
+        c.insert(0x30, 0x34);
+        assert_eq!(c.ranges[1], (0x28, 0x34));
+        // Touches right neighbour.
+        c.insert(0x3c, 0x40);
+        assert_eq!(c.ranges[2], (0x3c, 0x50));
+        // Bridges several intervals.
+        c.insert(0x1c, 0x72);
+        assert_eq!(c.ranges, vec![(0x10, 0x80)]);
+        // Nested insert and empty insert are no-ops.
+        c.insert(0x20, 0x30);
+        c.insert(0x90, 0x90);
+        assert_eq!(c.ranges, vec![(0x10, 0x80)]);
+        // Insert before everything / after everything.
+        c.insert(0x0, 0x4);
+        c.insert(0x100, 0x104);
+        assert_eq!(c.ranges, vec![(0x0, 0x4), (0x10, 0x80), (0x100, 0x104)]);
+    }
+
+    #[test]
+    fn covered_insert_matches_oracle() {
+        let mut raw = vec![(0x20u64, 0x30u64), (0x60, 0x70)];
+        let mut c = Covered::from_ranges(raw.clone());
+        for &(s, e) in &[(0x28u64, 0x62u64), (0x00, 0x08), (0x08, 0x10), (0x90, 0x98), (0x30, 0x31)] {
+            raw.push((s, e));
+            c.insert(s, e);
+            for a in 0..0xa0u64 {
+                assert_eq!(c.contains(a), naive(&raw, a), "addr {a:#x} after {s:#x}..{e:#x}");
+            }
+        }
     }
 
     /// Synthesise a tiny ELF-shaped Program with a single
@@ -338,7 +455,7 @@ mod tests {
         let program = make_x86_64_program(&code, entry);
         let lifter = reargo_lift::x86::X86Lifter::new_64();
 
-        let end = validate_candidate_with_extent(&lifter, &program, entry, &[])
+        let end = validate_candidate_with_extent(&lifter, &program, entry, &Covered::default())
             .expect("simple ret-terminated routine should validate");
         // ret is the last byte: addr 0x1007, length 1 → end = 0x1008.
         assert_eq!(end, entry + code.len() as u64);
@@ -358,7 +475,7 @@ mod tests {
 
         // Cover 0x1004..0x1008 so the lift collides on its third
         // instruction (`xor eax, eax` at 0x1004).
-        let covered = vec![(0x1004u64, 0x1008u64)];
+        let covered = Covered::from_ranges(vec![(0x1004u64, 0x1008u64)]);
         assert!(
             validate_candidate_with_extent(&lifter, &program, entry, &covered).is_none(),
             "overlap with covered range must reject"
@@ -381,6 +498,6 @@ mod tests {
         let program = make_x86_64_program(&code, entry);
         let lifter = reargo_lift::x86::X86Lifter::new_64();
 
-        assert!(validate_candidate_with_extent(&lifter, &program, entry, &[]).is_none());
+        assert!(validate_candidate_with_extent(&lifter, &program, entry, &Covered::default()).is_none());
     }
 }
