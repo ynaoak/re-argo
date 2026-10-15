@@ -60,6 +60,10 @@ pub struct RustEmitter<'a> {
     frame: crate::frame::Frame,
     /// Temporaries printed as the register they are copied to (WS88, as in C).
     coalesced: crate::emit::Coalesced,
+    /// `lock cmpxchg` as one compare-and-swap, by its store (WS89, as in C)
+    cas: rustc_hash::FxHashMap<usize, crate::cas::Cas>,
+    /// the ops a compare-and-swap hides (its load is no reader that has to print)
+    cas_hidden: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for RustEmitter<'static> {
@@ -86,6 +90,8 @@ impl RustEmitter<'static> {
             select_conds: Default::default(),
             frame: Default::default(),
             coalesced: Default::default(),
+            cas: Default::default(),
+            cas_hidden: Default::default(),
         }
     }
 }
@@ -112,6 +118,8 @@ impl<'a> RustEmitter<'a> {
             select_conds: Default::default(),
             frame: Default::default(),
             coalesced: Default::default(),
+            cas: Default::default(),
+            cas_hidden: Default::default(),
         }
     }
 
@@ -152,6 +160,11 @@ impl<'a> RustEmitter<'a> {
         self.frame = crate::frame::Frame::new(func, &|_| true);
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
+        // WS89: `lock cmpxchg` as one statement at its store (as in C)
+        let (cas, cas_hidden) = crate::cas::find(func, &self.noise);
+        self.noise.extend(cas_hidden.iter().copied());
+        self.cas = cas;
+        self.cas_hidden = cas_hidden;
         // WS87: first, as the conditions fold the expressions printed inline (as in C)
         let inlined = self.inline_temporaries(func);
         self.coalesced = crate::emit::Coalesced::new(func, &self.noise, &inlined);
@@ -175,6 +188,9 @@ impl<'a> RustEmitter<'a> {
         self.emit_block(func, structured);
         self.indent -= 1;
         self.line("}");
+        if !self.cas.is_empty() {
+            self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("let mut {n}: u8;"), crate::cas::RUST_FORMS);
+        }
         self.output.clone()
     }
 
@@ -182,7 +198,10 @@ impl<'a> RustEmitter<'a> {
         let mut declared = std::collections::BTreeSet::new();
         for vn in &func.varnodes {
             if vn.data.space == SpaceId::REGISTER
-                && vn.def_op.is_some_and(|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d))
+                && vn.def_op.is_some_and(|d| {
+                    // (the flag and accumulator of a compare-and-swap print in its statement)
+                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d))
+                })
             {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
@@ -686,7 +705,11 @@ impl<'a> RustEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
-                let ty = if out_size == 4 { "f32" } else { "f64" };
+                let ty = match out_size {
+                    4 => "f32",
+                    10 => "f80",
+                    _ => "f64",
+                };
                 Some(format!("{} = {} as {};", dst, a, ty))
             }
             OpCode::FloatTrunc => {
@@ -830,6 +853,21 @@ impl<'a> RustEmitter<'a> {
                     dst, addr, ty
                 ))
             }
+            OpCode::Store if self.cas.contains_key(&op.index) => {
+                let c = &self.cas[&op.index];
+                let ptr = match self.frame.access(func, op.block, c.addr, c.size, true, true) {
+                    Some(slot) if !slot.starts_with('*') => format!("&raw mut {slot}"),
+                    _ => format!("{} as *mut {}", self.input_expr(func, op, 1), size_to_rust_type(c.size)),
+                };
+                let sel = func.varnodes[op.inputs[2] as usize].def_op?;
+                let expected = format!("mut {}", varnode_name(&func.varnodes[c.expected as usize]));
+                let call = crate::cas::call_text(&ptr, &expected, &self.input_expr(func, &func.ops[sel], 1));
+                Some(match c.flag {
+                    Some(f) if c.branch => format!("{} = {call};{}", varnode_name(&func.varnodes[f as usize]), crate::cas::FOLDABLE),
+                    Some(f) => format!("{} = {call};", varnode_name(&func.varnodes[f as usize])),
+                    None => format!("{call};"),
+                })
+            }
             OpCode::Store => {
                 let val = self.input_expr(func, op, 2);
                 let size = if op.inputs.len() > 2 {
@@ -945,7 +983,7 @@ impl<'a> RustEmitter<'a> {
     /// Fill `inlined` (see [`crate::inline`]); returns the definitions not to print.
     fn inline_temporaries(&self, func: &SsaFunction) -> Vec<usize> {
         self.inlined.borrow_mut().clear();
-        let prints = |u: usize| !self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some();
+        let prints = |u: usize| self.cas_hidden.contains(&u) || (!self.noise.contains(&u) && self.emit_op(func, &func.ops[u]).is_some());
         let prints_operands = |u: usize| {
             let op = &func.ops[u];
             op.opcode == OpCode::CallInd || !self.call_renderings.is_some_and(|r| r.contains_key(&op.address))
@@ -1112,6 +1150,7 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
 
     let return_type = match (has_return_value, func.return_float) {
         (false, _) => None,
+        _ if crate::emit::returns_long_double(func) => Some("f80"),
         (true, Some(4)) => Some("f32"),
         (true, Some(_)) => Some("f64"),
         (true, None) => Some("u64"),
@@ -1234,6 +1273,10 @@ fn reg_name(offset: u64, size: u32) -> String {
                 _ => format!("xmm{}_{}", n, sz),
             }
         }
+        // WS89: see `emit::reg_name`
+        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => format!("st{}", (off - 0x1100) / 0x10),
+        (0x10a0, 2) => "fpucw".into(),
+        (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
         _ => format!("var_{:x}", offset),
     }
 }
@@ -1269,6 +1312,8 @@ pub(crate) fn size_to_rust_type(size: u32) -> &'static str {
         4 => "u32",
         8 => "u64",
         16 => "u128",
+        // the x87's 80-bit float (no Rust type: `f80` names it, WS89)
+        10 => "f80",
         _ => "()",
     }
 }
@@ -1361,7 +1406,8 @@ mod tests {
         assert_eq!(size_to_rust_type(4), "u32");
         assert_eq!(size_to_rust_type(8), "u64");
         assert_eq!(size_to_rust_type(16), "u128");
-        assert_eq!(size_to_rust_type(10), "()");
+        assert_eq!(size_to_rust_type(10), "f80");
+        assert_eq!(size_to_rust_type(12), "()");
     }
 
     #[test]

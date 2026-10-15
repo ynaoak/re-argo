@@ -13,6 +13,7 @@ pub mod syscall;
 pub mod tui;
 pub mod watchpoint;
 pub mod trace;
+pub mod x87;
 
 pub use breakpoint::{BreakCondition, Breakpoint, BreakpointManager};
 pub use emulator::Emulator;

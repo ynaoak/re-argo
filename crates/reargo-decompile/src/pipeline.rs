@@ -599,6 +599,11 @@ fn apply_call_convention(
             continue;
         };
         let insn_addr = insn.address;
+        // WS89: the lifter found the callee returning a `long double` (the code after the call
+        // pops it): `INDIRECT(target)` of an x87 slot after the call; rax / xmm0 are clobbered
+        let x87_result = insn.ops[pos + 1..].iter().any(|o| {
+            o.opcode == OpCode::Indirect && o.output.is_some_and(|v| v.size == 10 && (0x1100..0x1180).contains(&v.offset))
+        });
         let call = &mut insn.ops[pos];
         let at = call.seq;
         let target = call.inputs.first().copied();
@@ -611,6 +616,7 @@ fn apply_call_convention(
         let clobber_mark = VarnodeData::new(reargo_core::address::SpaceId::CONST, CLOBBER_MARK, 1);
         // WS79: a callee known to return in one register only clobbers the other
         let returned = |i: usize| match call_returns.get(&insn_addr) {
+            _ if x87_result => false,
             Some(crate::callee_params::ReturnKind::Int) => i == 0,
             Some(crate::callee_params::ReturnKind::Float) => i == 1,
             _ => true,
@@ -3276,6 +3282,110 @@ mod tests {
         let code: Vec<u8> = [0xf3, 0x0f, 0x2a, 0xc7, 0x0f, 0x57, 0xc9, 0x0f, 0x2e, 0xc1].iter().chain(&tail).copied().collect();
         let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(c.contains("xmm0_d <= 0.0f") && !c.contains("!(xmm0_d"), "{c}");
+    }
+
+    /// WS89: x87 code prints with its stack slots as `long double` variables (`st0` = the
+    /// first value pushed), a function leaving a value on the stack returns `long double`, and
+    /// a callee whose result the caller pops defines `st0` (no `__ret`, no `rax` / `xmm0`).
+    #[test]
+    fn x87_prints_long_double_slots() {
+        let lifter = X86Lifter::new_64();
+        // fld tbyte [rsp+8]; fld tbyte [rsp+0x18]; fmulp st(1), st; ret
+        let code = [0xdb, 0x6c, 0x24, 0x08, 0xdb, 0x6c, 0x24, 0x18, 0xde, 0xc9, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("long double f(") && c.contains("return st0;"), "{c}");
+        assert!(c.contains("st0 * st1") && !c.contains("__unmodeled"), "{c}");
+        // call g; fstp tbyte [rbx]; ret   /   g: fld1; ret
+        let code = [0xe8, 0xfb, 0x0f, 0x00, 0x00, 0xdb, 0x3b, 0xc3];
+        let g = [0xd9, 0xe8, 0xc3];
+        let c = decompile(&lifter, &make_memory_parts(&[(0x1000, &code), (0x2000, &g)]), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("st0 = 0x2000(") && c.contains("*(long double*)rbx = st0;"), "{c}");
+        assert!(!c.contains("__ret") && !c.contains("xmm0"), "{c}");
+    }
+
+    /// WS89: a flag computed above statements that do not change what it compares folds into
+    /// the branch (`var_206 = rax == 0; rcx = *(uint64_t*)rsi; if (!var_206)` was printed);
+    /// one whose operand is overwritten in between stays a flag.
+    #[test]
+    fn a_flag_folds_past_unrelated_statements() {
+        let lifter = X86Lifter::new_64();
+        // test rax, rax; mov rcx, [rsi]; je L; mov [rdi], rcx; ret; L: ret
+        let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x0e, 0x74, 0x04, 0x48, 0x89, 0x0f, 0xc3, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("rcx = *(uint64_t*)rsi;") && c.contains("if (rax == 0)"), "{c}");
+        assert!(!c.contains("var_206"), "{c}");
+        // test rax, rax; mov rax, [rsi]; je L; ...: rax changes before the jump
+        let code = [0x48, 0x85, 0xc0, 0x48, 0x8b, 0x06, 0x74, 0x04, 0x48, 0x89, 0x07, 0xc3, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("var_206 = rax == 0;") && c.contains("var_206"), "{c}");
+        // cmp rax, rbx; sete cl; mov rbx, rax; test cl, cl; jne L; ...: the `sete` prints its
+        // comparison, which reads rbx before it changes — it stays a statement
+        let code = [0x48, 0x39, 0xd8, 0x0f, 0x94, 0xc1, 0x48, 0x89, 0xc3, 0x84, 0xc9, 0x75, 0x04, 0x48, 0x89, 0x1f, 0xc3, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("cl = rax == rbx;") || c.contains("var_206 = rax == rbx;"), "{c}");
+    }
+
+    /// WS89: a flag another block computed folds into the branch reading it when its operands
+    /// keep their values (`cmp rdi, rsi; je L; jb M` printed `var_201 = rdi < rsi;` and
+    /// `if (var_201)` in the next block).
+    #[test]
+    fn a_flag_from_another_block_folds() {
+        let lifter = X86Lifter::new_64();
+        // cmp rdi, rsi; je L1; jb L2; xor eax, eax; ret; L1: ret; L2: mov eax, 1; ret
+        let code = [0x48, 0x39, 0xf7, 0x74, 0x05, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("rdi < rsi") && !c.contains("var_201"), "{c}");
+        // mov in between: rdi changes before the `jb`
+        // cmp rdi, rsi; je L1; mov rdi, rdx; jb L2; xor eax, eax; ret; L1: ret; L2: mov rax, rdi; ret
+        let code = [0x48, 0x39, 0xf7, 0x74, 0x08, 0x48, 0x89, 0xd7, 0x72, 0x04, 0x31, 0xc0, 0xc3, 0xc3, 0x48, 0x89, 0xf8, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("var_201 = rdi < rsi;"), "{c}");
+    }
+
+    /// WS89: what a register's own statement computed from does not count as read by a
+    /// condition naming the register: the load's address temporary of `rdi = *(rbx + 0x20)`
+    /// shares its storage with the next load's and kept `var_206 = rdi == 0;`.
+    #[test]
+    fn a_flag_folds_past_a_load_reusing_a_temporary() {
+        let lifter = X86Lifter::new_64();
+        // mov rdi, [rbx+0x20]; test rdi, rdi; mov r15, [rsp+0x28]; je L; mov [rsi], r15; L: ret
+        let code = [0x48, 0x8b, 0x7b, 0x20, 0x48, 0x85, 0xff, 0x4c, 0x8b, 0x7c, 0x24, 0x28, 0x74, 0x03, 0x4c, 0x89, 0x3e, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("if (rdi != 0)") && !c.contains("var_206"), "{c}");
+    }
+
+    /// WS89: `lock cmpxchg` prints as one `__atomic_compare_exchange`, its flag in the loop
+    /// condition (it was `tmp_510 = *m; var_206 = rax == tmp_510; tmp_2030 = … ? rcx : tmp_510;
+    /// rax = … ? rax : tmp_510; *m = tmp_2030;`).
+    #[test]
+    fn cmpxchg_prints_as_compare_exchange() {
+        let lifter = X86Lifter::new_64();
+        // mov rax, [rdi]; L: lock cmpxchg [rdi], rcx; jne L; ret
+        let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x75, 0xf9, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("!__atomic_compare_exchange((uint64_t*)rdi, &rax, rcx)"), "{c}");
+        assert!(!c.contains("tmp_") && !c.contains("var_206"), "{c}");
+        // the flag read later too: a statement
+        // mov rax, [rdi]; lock cmpxchg [rdi], rcx; sete al; ret
+        let code = [0x48, 0x8b, 0x07, 0xf0, 0x48, 0x0f, 0xb1, 0x0f, 0x0f, 0x94, 0xc0, 0xc3];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("var_206 = __atomic_compare_exchange((uint64_t*)rdi, &rax, rcx);"), "{c}");
+        assert!(!c.contains("tmp_"), "{c}");
+    }
+
+    /// WS89: `fucomi` folds with its jump like `ucomisd` (`jbe` reads `!(b < a)`; it printed
+    /// `!(st0 <= st1) || ((st1 == st0) || (isnan(st1) || isnan(st0)))`).
+    #[test]
+    fn fucomi_folds_like_ucomisd() {
+        let lifter = X86Lifter::new_64();
+        // fld tbyte [rsp+8]; fld tbyte [rsp+0x18]; fucomi st, st(1); fstp st(0); fstp st(0);
+        // jbe L; mov eax, 1; L: ret
+        let code = [
+            0xdb, 0x6c, 0x24, 0x08, 0xdb, 0x6c, 0x24, 0x18, 0xdb, 0xe9, 0xdd, 0xd8, 0xdd, 0xd8, 0x76, 0x05, 0xb8, 0x01, 0x00,
+            0x00, 0x00, 0xc3,
+        ];
+        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        assert!(c.contains("st0 < st1") && !c.contains("isnan"), "{c}");
     }
 
     /// A write to a register's low byte prints as that write (WS84: it printed the lifter's

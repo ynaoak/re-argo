@@ -25,6 +25,8 @@ fn int_type_for_size(size: u32) -> String {
         2 => "uint16_t".into(),
         4 => "uint32_t".into(),
         8 => "uint64_t".into(),
+        // only an x87 value is 10 bytes (WS89)
+        10 => "long double".into(),
         _ => format!("uint{}_t", size * 8),
     }
 }
