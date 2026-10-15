@@ -64,6 +64,9 @@ pub struct RustEmitter<'a> {
     cas: rustc_hash::FxHashMap<usize, crate::cas::Cas>,
     /// the ops a compare-and-swap hides (its load is no reader that has to print)
     cas_hidden: rustc_hash::FxHashSet<usize>,
+    /// `fxch` printed as one swap, at its last copy (WS90, `swap::find`), and the copies hidden.
+    swaps: rustc_hash::FxHashMap<usize, (crate::ssa::VarId, crate::ssa::VarId)>,
+    swap_hidden: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for RustEmitter<'static> {
@@ -92,6 +95,8 @@ impl RustEmitter<'static> {
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
+            swaps: Default::default(),
+            swap_hidden: Default::default(),
         }
     }
 }
@@ -120,6 +125,8 @@ impl<'a> RustEmitter<'a> {
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
+            swaps: Default::default(),
+            swap_hidden: Default::default(),
         }
     }
 
@@ -165,6 +172,11 @@ impl<'a> RustEmitter<'a> {
         self.noise.extend(cas_hidden.iter().copied());
         self.cas = cas;
         self.cas_hidden = cas_hidden;
+        // WS90: `fxch` as one swap
+        let (swaps, swap_hidden) = crate::swap::find(func, &self.noise);
+        self.noise.extend(swap_hidden.iter().copied());
+        self.swaps = swaps;
+        self.swap_hidden = swap_hidden;
         // WS87: first, as the conditions fold the expressions printed inline (as in C)
         let inlined = self.inline_temporaries(func);
         self.coalesced = crate::emit::Coalesced::new(func, &self.noise, &inlined);
@@ -191,6 +203,7 @@ impl<'a> RustEmitter<'a> {
         if !self.cas.is_empty() {
             self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("let mut {n}: u8;"), crate::cas::RUST_FORMS);
         }
+        self.output = crate::flags::renumber_named_flags(&self.output, func);
         self.output.clone()
     }
 
@@ -200,7 +213,7 @@ impl<'a> RustEmitter<'a> {
             if vn.data.space == SpaceId::REGISTER
                 && vn.def_op.is_some_and(|d| {
                     // (the flag and accumulator of a compare-and-swap print in its statement)
-                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d))
+                    !func.ops[d].dead && !self.folded.contains(&d) && (!self.noise.contains(&d) || self.cas_hidden.contains(&d) || self.swap_hidden.contains(&d))
                 })
             {
                 let key = (vn.data.offset, vn.data.size);
@@ -479,6 +492,10 @@ impl<'a> RustEmitter<'a> {
         match op.opcode {
             // phi: same name on every incoming edge, nothing to print
             OpCode::MultiEqual => None,
+            OpCode::Copy if self.swaps.contains_key(&op.index) => {
+                let (a, b) = self.swaps[&op.index];
+                Some(format!("core::mem::swap(&mut {}, &mut {});", varnode_name(&func.varnodes[a as usize]), varnode_name(&func.varnodes[b as usize])))
+            }
             // a stack address by its slot (WS88): `rdi = &raw mut local_48;`
             OpCode::Copy | OpCode::IntAdd | OpCode::IntSub
                 if op.output.is_some_and(|o| {
@@ -750,6 +767,15 @@ impl<'a> RustEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
+                let zero = |i: usize| op.inputs.get(i).is_some_and(|&v| {
+                    let d = &func.varnodes[v as usize].data;
+                    d.space == SpaceId::CONST && d.offset == 0
+                });
+                match (zero(0), zero(1)) {
+                    (false, true) => return Some(format!("{dst} = {a};")),
+                    (true, false) => return Some(format!("{dst} = {b};")),
+                    _ => {}
+                }
                 Some(format!("{} = ({} != 0) != ({} != 0);", dst, a, b))
             }
             OpCode::BoolNegate => {
@@ -778,7 +804,9 @@ impl<'a> RustEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let src_ty = size_to_rust_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({} as {}) as u64;", dst, a, src_ty))
+                // (to the destination's own width, WS90: `eax = (x as u8) as u32;`, not `as u64`)
+                let dst_ty = size_to_rust_type(func.varnodes[op.output? as usize].data.size);
+                Some(format!("{} = ({} as {}) as {};", dst, a, src_ty, dst_ty))
             }
             OpCode::Piece if op.inputs.len() >= 2 => {
                 // PIECE(hi, lo): concatenation with `lo` in the low bytes.
@@ -972,6 +1000,19 @@ impl<'a> RustEmitter<'a> {
                 } else {
                     Some("unmodeled_insn(); // machine op not yet lifted (dataflow intact)".into())
                 }
+            }
+            // the carry / overflow flags of an add or a subtraction, with their operands (WS90)
+            OpCode::IntCarry | OpCode::IntSCarry | OpCode::IntSBorrow if op.inputs.len() == 2 => {
+                let dst = out_name?;
+                let size = func.varnodes[op.inputs[0] as usize].data.size;
+                let (ty, method) = match op.opcode {
+                    OpCode::IntCarry => (size_to_rust_type(size), "overflowing_add"),
+                    OpCode::IntSCarry => (size_to_rust_signed_type(size), "overflowing_add"),
+                    _ => (size_to_rust_signed_type(size), "overflowing_sub"),
+                };
+                let a = self.input_expr(func, op, 0);
+                let b = self.input_expr(func, op, 1);
+                Some(format!("{} = ({} as {}).{}({} as {}).1;", dst, a, ty, method, b, ty))
             }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
@@ -1215,6 +1256,8 @@ fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
 
 fn reg_name(offset: u64, size: u32) -> String {
     match (offset, size) {
+        // a flag value named by what it computes (WS90, `flags::name_flag_webs`)
+        (off, 1) if off >= crate::flags::NAMED_FLAG_BASE && crate::flags::named_flag(off).is_some() => crate::flags::named_flag(off).unwrap_or_default(),
         (0x00, 8) => "rax".into(),
         (0x00, 4) => "eax".into(),
         (0x00, 2) => "ax".into(),
