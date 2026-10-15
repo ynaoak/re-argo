@@ -247,6 +247,10 @@ enum Commands {
         /// a 200 MB binary; names / comments that only the analysis finds are missing.
         #[arg(long)]
         fast: bool,
+        /// Print every memory access as `*(T*)(p + k)`: no struct fields (`p->field_10`),
+        /// struct definitions, typed pointers or `p->vfn_6(…)` virtual calls
+        #[arg(long)]
+        no_structs: bool,
     },
     /// Decompile every discovered function in parallel
     DecompileAll {
@@ -265,6 +269,14 @@ enum Commands {
         /// writing an error file
         #[arg(long)]
         skip_errors: bool,
+        /// Print every memory access as `*(T*)(p + k)` (no struct view)
+        #[arg(long)]
+        no_structs: bool,
+        /// Print each function's struct definitions with it, also those of C++ classes (by
+        /// default a class's struct is printed once, merged over every function: first on
+        /// stdout, in `<dir>/structs.h` / `structs.rs` with `-o`)
+        #[arg(long)]
+        structs_per_function: bool,
     },
     /// Taint analysis: track parameters to dangerous sinks
     Taint {
@@ -916,8 +928,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             start,
             count,
         } => cmd_pcode(&file, start, count, cli.thumb),
-        Commands::Decompile { file, address, ssa, rust, annotate, fast } => cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate, fast),
-        Commands::DecompileAll { file, output_dir, rust, skip_errors } => cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb),
+        Commands::Decompile { file, address, ssa, rust, annotate, fast, no_structs } => {
+            cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate, fast, !no_structs)
+        }
+        Commands::DecompileAll { file, output_dir, rust, skip_errors, no_structs, structs_per_function } => {
+            cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb, !no_structs, structs_per_function)
+        }
         Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
         Commands::ExportXml { file, output } => cmd_export_xml(&file, output.as_deref()),
@@ -2665,7 +2681,8 @@ fn fast_program(path: &Path, address: Option<u64>) -> Result<Program, Box<dyn st
     Ok(program)
 }
 
-fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool, fast: bool) -> Result<(), Box<dyn std::error::Error>> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool, fast: bool, structs: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = if fast { fast_program(path, address)? } else { analyze_binary(path)? };
 
     let lifter = match make_lifter(&program.info, thumb) {
@@ -2678,7 +2695,8 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
 
     let entry = address.unwrap_or(program.entry_point());
 
-    let result = reargo_decompile::decompile_function(lifter.as_ref(), &program, entry)
+    let opts = reargo_decompile::DecompileOptions { structs };
+    let result = reargo_decompile::decompile_function_with_options(lifter.as_ref(), &program, entry, &opts)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // For --annotate: a binary-info + reloc map for classifying addresses that
@@ -2697,10 +2715,9 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
     if show_ssa {
         print!("{}", result.ssa_dump);
     } else {
-        if !result.recovered_structs.is_empty() {
-            for def in &result.recovered_structs {
-                println!("{}\n", def);
-            }
+        // the structs the body names (WS91)
+        for def in if show_rust { &result.rust_structs } else { &result.recovered_structs } {
+            println!("{}\n", def);
         }
         let code = if show_rust { &result.rust_code } else { &result.c_code };
         match &annot {
@@ -2726,6 +2743,8 @@ fn cmd_decompile_all(
     show_rust: bool,
     skip_errors: bool,
     thumb: bool,
+    structs: bool,
+    structs_per_function: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
@@ -2741,7 +2760,41 @@ fn cmd_decompile_all(
         std::fs::create_dir_all(dir)?;
     }
 
-    let results = reargo_decompile::decompile_all(lifter.as_ref(), &program);
+    let opts = reargo_decompile::DecompileOptions { structs };
+    let results = reargo_decompile::decompile_all_with_options(lifter.as_ref(), &program, &opts);
+
+    // WS91: the structs of C++ classes once, merged over every function (the anonymous ones are
+    // the function's own and print with it)
+    let shared = (!structs_per_function).then(|| {
+        reargo_decompile::structs::merge_class_structs(results.iter().filter_map(|(_, r)| r.as_ref().ok()).map(|r| r.structs.as_slice()))
+    });
+    if let Some((c_defs, rust_defs)) = &shared
+        && !c_defs.is_empty()
+    {
+        match output_dir {
+            Some(dir) => {
+                std::fs::write(dir.join("structs.h"), c_defs.join("\n\n") + "\n")?;
+                if show_rust {
+                    std::fs::write(dir.join("structs.rs"), rust_defs.join("\n\n") + "\n")?;
+                }
+            }
+            None => {
+                println!("// === structs ===");
+                for d in c_defs {
+                    println!("{d}\n");
+                }
+            }
+        }
+    }
+    // a function's own definitions: all of them, or only the anonymous ones
+    let own_defs = |r: &reargo_decompile::DecompileResult, rust: bool| -> String {
+        let defs = if rust { &r.rust_structs } else { &r.recovered_structs };
+        defs.iter()
+            .zip(&r.structs)
+            .filter(|(_, d)| shared.is_none() || d.class.is_none())
+            .map(|(t, _)| format!("{t}\n\n"))
+            .collect()
+    };
 
     let mut ok = 0usize;
     let mut err = 0usize;
@@ -2761,18 +2814,18 @@ fn cmd_decompile_all(
                         let safe = sanitize_filename(&name);
                         let stem = format!("{}_{:08x}", safe, entry);
                         let c_path = dir.join(format!("{}.c", stem));
-                        std::fs::write(&c_path, &r.c_code)?;
+                        std::fs::write(&c_path, own_defs(r, false) + &r.c_code)?;
                         if show_rust {
                             let rs_path = dir.join(format!("{}.rs", stem));
-                            std::fs::write(&rs_path, &r.rust_code)?;
+                            std::fs::write(&rs_path, own_defs(r, true) + &r.rust_code)?;
                         }
                     }
                     None => {
                         println!("// === {} @ 0x{:x} ===", name, entry);
-                        print!("{}", r.c_code);
+                        print!("{}{}", own_defs(r, false), r.c_code);
                         if show_rust {
                             println!("// --- rust ---");
-                            print!("{}", r.rust_code);
+                            print!("{}{}", own_defs(r, true), r.rust_code);
                         }
                         println!();
                     }

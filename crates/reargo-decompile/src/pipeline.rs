@@ -15,9 +15,27 @@ pub struct DecompileResult {
     pub c_code: String,
     pub rust_code: String,
     pub ssa_dump: String,
-    /// C definitions of structs recovered from memory access patterns.
+    /// C definitions of the structs the body's field accesses name (WS91, `structs`).
     pub recovered_structs: Vec<String>,
+    /// The same structs as Rust definitions.
+    pub rust_structs: Vec<String>,
+    /// The structs themselves (to merge the definitions of one class across functions).
+    pub structs: Vec<crate::structs::StructDef>,
     pub stats: DecompileStats,
+}
+
+/// What the decompiler prints (WS91).
+#[derive(Debug, Clone, Copy)]
+pub struct DecompileOptions {
+    /// Struct fields (`p->field_10`), typed pointers and member-style virtual calls
+    /// (`p->vfn_6(…)`); off: every access prints as `*(T*)(p + k)`.
+    pub structs: bool,
+}
+
+impl Default for DecompileOptions {
+    fn default() -> Self {
+        Self { structs: true }
+    }
 }
 
 pub struct DecompileStats {
@@ -47,6 +65,19 @@ pub fn decompile_with_symbols(
     max_instructions: usize,
     symbols: &std::collections::BTreeMap<u64, String>,
 ) -> Result<DecompileResult, String> {
+    decompile_with_options(lifter, memory, entry, func_name, max_instructions, symbols, &DecompileOptions::default())
+}
+
+/// [`decompile_with_symbols`] with [`DecompileOptions`] (WS91).
+pub fn decompile_with_options(
+    lifter: &dyn PcodeLift,
+    memory: &Memory,
+    entry: u64,
+    func_name: &str,
+    max_instructions: usize,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    opts: &DecompileOptions,
+) -> Result<DecompileResult, String> {
     let mut lifted = lifter
         .lift_range(memory, entry, max_instructions)
         .map_err(|e| e.to_string())?;
@@ -72,7 +103,7 @@ pub fn decompile_with_symbols(
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches)
+    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts)
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -243,9 +274,20 @@ pub fn decompile_function(
     program: &Program,
     func_entry: u64,
 ) -> Result<DecompileResult, String> {
+    decompile_function_with_options(lifter, program, func_entry, &DecompileOptions::default())
+}
+
+/// [`decompile_function`] with [`DecompileOptions`] (WS91: `--no-structs`).
+pub fn decompile_function_with_options(
+    lifter: &dyn PcodeLift,
+    program: &Program,
+    func_entry: u64,
+    opts: &DecompileOptions,
+) -> Result<DecompileResult, String> {
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
-    decompile_function_with_maps(
+    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    decompile_function_inner(
         lifter,
         program,
         func_entry,
@@ -253,6 +295,8 @@ pub fn decompile_function(
         &string_literals,
         Some(&annotations),
         Some(&program.call_renderings),
+        oracle.as_ref(),
+        opts,
     )
 }
 
@@ -322,6 +366,7 @@ pub fn decompile_function_with_maps(
         annotations,
         call_renderings,
         oracle.as_ref(),
+        &DecompileOptions::default(),
     )
 }
 
@@ -335,6 +380,7 @@ fn decompile_function_inner(
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
     oracle: Option<&CalleeParams<'_>>,
+    opts: &DecompileOptions,
 ) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
     let func_name = func
@@ -416,6 +462,7 @@ fn decompile_function_inner(
         Some((lifter, &program.info.memory)),
         &handlers,
         &switches,
+        opts,
     )
 }
 
@@ -1098,6 +1145,15 @@ pub fn decompile_all(
     lifter: &(dyn PcodeLift + Sync),
     program: &Program,
 ) -> Vec<(u64, Result<DecompileResult, String>)> {
+    decompile_all_with_options(lifter, program, &DecompileOptions::default())
+}
+
+/// [`decompile_all`] with [`DecompileOptions`] (WS91).
+pub fn decompile_all_with_options(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    opts: &DecompileOptions,
+) -> Vec<(u64, Result<DecompileResult, String>)> {
     let entries: Vec<u64> = program
         .listing
         .functions()
@@ -1130,6 +1186,7 @@ pub fn decompile_all(
                     Some(&annotations),
                     Some(&program.call_renderings),
                     oracle.as_ref(),
+                    opts,
                 ),
             )
         })
@@ -1202,6 +1259,7 @@ fn build_decompile_result(
     caller_hint: Option<(&dyn PcodeLift, &Memory)>,
     handlers: &[crate::exception::Handler],
     switches: &[crate::switch::JumpTable],
+    opts: &DecompileOptions,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -1274,15 +1332,17 @@ fn build_decompile_result(
     // cost ended up outweighing the parallel saving -- end-to-end
     // decompile got *slower*, not faster, by roughly 300 us per call.
     // Keep them sequential.
-    let mut type_engine = crate::typeinfer::TypeInferenceEngine::new();
-    type_engine.infer(&ssa);
-    type_engine.recover_aggregates(&ssa);
-    let recovered_structs: Vec<String> = type_engine
-        .structs()
-        .values()
-        .enumerate()
-        .map(|(i, s)| s.to_c_definition(&format!("recovered_{}", i)))
-        .collect();
+    // WS91: struct fields, typed pointers and virtual calls
+    let view = if opts.structs {
+        let memory = caller_hint.map(|(_, m)| m);
+        let this_reg = caller_hint.and_then(|(l, _)| l.call_convention()).and_then(|cc| cc.args.first().copied());
+        let ctx = crate::structs::Context { memory, this_reg, this_class: this_class(func_name, entry, memory) };
+        crate::structs::StructView::new(&ssa, &ctx)
+    } else {
+        crate::structs::StructView::default()
+    };
+    let recovered_structs = view.c_definitions();
+    let rust_structs = view.rust_definitions();
 
     // `if (a) goto X; if (b) goto X;` -> `if (a || b) goto X;` (on a copy of the CFG)
     let short = crate::condition::merge_short_circuits(&ssa);
@@ -1304,6 +1364,9 @@ fn build_decompile_result(
     if let Some(s) = &short {
         c_emitter = c_emitter.with_conditions(&s.conds);
     }
+    if opts.structs {
+        c_emitter = c_emitter.with_structs(&view);
+    }
     let c_code = c_emitter.emit_function(&ssa, &structured);
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
@@ -1316,6 +1379,9 @@ fn build_decompile_result(
     if let Some(s) = &short {
         rust_emitter = rust_emitter.with_conditions(&s.conds);
     }
+    if opts.structs {
+        rust_emitter = rust_emitter.with_structs(&view);
+    }
     let rust_code = rust_emitter.emit_function(&ssa, &structured);
 
     Ok(DecompileResult {
@@ -1323,6 +1389,8 @@ fn build_decompile_result(
         rust_code,
         ssa_dump,
         recovered_structs,
+        rust_structs,
+        structs: view.defs,
         stats: DecompileStats {
             instructions_lifted,
             pcode_ops: total_pcode,
@@ -1331,6 +1399,18 @@ fn build_decompile_result(
             live_ops_after: live_ops,
         },
     })
+}
+
+/// The class of the function's `this` (WS91): from its (mangled) name (`_ZN5Class6methodEv`),
+/// else the class whose primary vtable lists the function (the base of all such classes), with
+/// that vtable.
+fn this_class(name: &str, entry: u64, memory: Option<&Memory>) -> Option<(String, Option<u64>)> {
+    if let Some(c) = crate::structs::method_class(name) {
+        return Some((c, None));
+    }
+    let memory = memory?;
+    let vtables = crate::vcall::this_vtables(memory, entry);
+    crate::vcall::method_class(memory, &vtables).map(|(c, vt)| (c, Some(vt)))
 }
 
 fn trim_to_function_body(
@@ -1729,7 +1809,7 @@ mod tests {
             0xc3,
         ];
         let mem = make_memory(&code, 0x1000);
-        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let c = decompile_raw(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         let call = call_line(&c, "vfn[2]");
         assert!(call.contains(")(rdi);"), "{call}\n{c}");
     }
@@ -1876,7 +1956,7 @@ mod tests {
             0xff, 0x60, 0x18, // jmp [rax+0x18]
         ];
         let mem = make_memory(&code, 0x1000);
-        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let c = decompile_raw(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         // WS82: printed as the tail call it is, `rax = (*tmp)(rdi); // vfn[3]; return rax;`
         let j = c.lines().find(|l| l.contains("(*")).unwrap_or_else(|| panic!("{c}"));
         assert!(j.contains("vfn[3]"), "{j}
@@ -1903,6 +1983,16 @@ mod tests {
         let lifter = X86Lifter::new_64();
         let mem = make_memory(code, 0x1000);
         decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code
+    }
+
+    /// Decompiled with every memory access printed as `*(T*)(p + k)` (no struct view, WS91):
+    /// the tests of the raw forms.
+    fn decompile_raw(lifter: &dyn PcodeLift, mem: &Memory, entry: u64, name: &str, max: usize) -> Result<DecompileResult, String> {
+        decompile_with_options(lifter, mem, entry, name, max, &std::collections::BTreeMap::new(), &DecompileOptions { structs: false })
+    }
+
+    fn c_raw(code: &[u8]) -> String {
+        decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().c_code
     }
 
     /// WS79: a scalar float computed into `xmm0` last is the return value.
@@ -2567,7 +2657,7 @@ mod tests {
             0xff, 0x60, 0x20, // jmp qword ptr [rax+0x20]
         ];
         let mem = make_memory(&code, 0x1000);
-        let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
+        let c = decompile_raw(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("goto"), "{c}");
         assert!(c.contains("return"), "{c}");
         assert!(c.contains("(*"), "{c}");
@@ -2787,7 +2877,7 @@ mod tests {
             0x0f, 0x94, 0x46, 0x18, // sete [rsi+0x18]
             0xc3,
         ];
-        let c = c_of(&code);
+        let c = c_raw(&code);
         assert!(c.contains("rsi + 0x18"), "{c}");
         assert!(!c.contains("tmp_600") || c.contains("tmp_600 = rsi + 0x18;"), "{c}");
     }
@@ -2806,7 +2896,7 @@ mod tests {
             0x75, 0xf8, // 0x1010 jne L
             0xc3,
         ];
-        let c = c_of(&code);
+        let c = c_raw(&code);
         assert!(c.contains("rsi + 0x18"), "{c}");
         assert!(!c.contains("tmp_600") || c.contains("tmp_600 = rsi + 0x18;"), "{c}");
     }
@@ -2823,7 +2913,7 @@ mod tests {
             0x83, 0x46, 0x10, 0x01, // add dword [rsi+0x10], 1
             0xc3,
         ];
-        let c = c_of(&code);
+        let c = c_raw(&code);
         for s in [
             "arg_a0 = rsi;",
             "eax = *(uint32_t*)(rbx + 0x200);",
@@ -2874,14 +2964,14 @@ mod tests {
     /// `xmm1 = cvttps2dq(*(uint128_t*)(rsp + 0x30));`.
     #[test]
     fn temporaries_in_calls_selects_and_intrinsics_print_inline() {
-        let c = c_of(&[
+        let c = c_raw(&[
             0x48, 0x8b, 0x07, // mov rax, [rdi]
             0xff, 0x50, 0x30, // call [rax+0x30]
             0xc3,
         ]);
         assert!(c.contains("(**(uint64_t*)(rax + 0x30))(rdi);"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
-        let c = c_of(&[
+        let c = c_raw(&[
             0x84, 0xc0, // test al, al
             0x48, 0x0f, 0x45, 0x74, 0x24, 0x18, // cmovne rsi, [rsp+0x18]
             0x48, 0x89, 0x37, // mov [rdi], rsi
@@ -2889,7 +2979,7 @@ mod tests {
         ]);
         assert!(c.contains(": arg_18;") || c.contains("? arg_18 :"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
-        let c = c_of(&[
+        let c = c_raw(&[
             0xf3, 0x0f, 0x5b, 0x4c, 0x24, 0x30, // cvttps2dq xmm1, [rsp+0x30]
             0x0f, 0x11, 0x0f, // movups [rdi], xmm1
             0xc3,
@@ -3006,6 +3096,7 @@ mod tests {
             None,
             &handlers,
             &[],
+            &DecompileOptions::default(),
         )
         .unwrap();
         let c = r.c_code;
@@ -3116,16 +3207,16 @@ mod tests {
             0xc3,
             0xc3,
         ];
-        let c = c_of(&code);
+        let c = c_raw(&code);
         assert!(c.contains("rax = *(uint64_t*)(rdi + 0x10);"), "{c}");
         assert!(c.contains("*(uint64_t*)(rdi + 0x10) = rax - 1;"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
         let lifter = X86Lifter::new_64();
-        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        let rs = decompile_raw(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
         assert!(rs.contains("rax = unsafe { *(rdi.wrapping_add(0x10) as *const u64) };"), "{rs}");
         assert!(!rs.contains("tmp_"), "{rs}");
         // mov rax, [rdi+8]; lock xadd [rdi+8], rax: the store adds the old rax
-        let c = c_of(&[0x48, 0x8b, 0x47, 0x08, 0xf0, 0x48, 0x0f, 0xc1, 0x47, 0x08, 0x48, 0x89, 0x06, 0xc3]);
+        let c = c_raw(&[0x48, 0x8b, 0x47, 0x08, 0xf0, 0x48, 0x0f, 0xc1, 0x47, 0x08, 0x48, 0x89, 0x06, 0xc3]);
         let store = c.lines().map(str::trim).find(|l| l.starts_with("*(uint64_t*)") && l.contains(" = ")).unwrap_or_else(|| panic!("{c}"));
         assert!(store.ends_with("= tmp_510 + rax;"), "{c}");
     }
@@ -3143,7 +3234,7 @@ mod tests {
             0x48, 0x89, 0x57, 0x08, // mov [rdi+8], rdx
             0xc3,
         ];
-        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        let rs = decompile_raw(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
         assert!(rs.contains("al = (xmm0_d < xmm1_d) as u8;"), "{rs}");
         assert!(rs.contains("unsafe { *(rdi as *mut u8) = (xmm0_d < xmm1_d) as u8; }"), "{rs}");
         assert!(rs.contains("if rdx < rsi { rsi } else { rdx }"), "{rs}");
@@ -3155,11 +3246,11 @@ mod tests {
             0x0f, 0x97, 0x07, // seta [rdi]
             0xc3,
         ];
-        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        let rs = decompile_raw(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
         assert!(rs.contains("= (0.0f32 < xmm0_d) as u8;"), "{rs}");
         // an added negative constant is a subtraction
         let code = [0x48, 0x83, 0xc7, 0xfa, 0x48, 0x89, 0x3e, 0xc3]; // add rdi, -6; mov [rsi], rdi; ret
-        let rs = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        let rs = decompile_raw(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
         assert!(rs.contains("rdi.wrapping_sub(6)"), "{rs}");
     }
 
@@ -3207,7 +3298,7 @@ mod tests {
             0xff, 0x50, 0x30, // call [rax+0x30]
             0xc3,
         ];
-        let r = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap();
+        let r = decompile_raw(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap();
         let rs = &r.rust_code;
         assert!(!rs.contains("tmp_"), "{rs}");
         assert!(rs.contains("unsafe { *(rdi.wrapping_add(0xa0) as *mut u64) = rsi; }"), "{rs}");
@@ -3769,7 +3860,7 @@ mod tests {
             0xff, 0xe0, // jmp rax
             0x31, 0xc0, 0xc3, // L: xor eax, eax; ret
         ];
-        let c = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
+        let c = decompile_raw(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("goto *"), "{c}");
         assert!(c.contains("(*"), "{c}");
     }
@@ -4223,7 +4314,7 @@ mod tests {
     fn extensions_cast_once_when_the_operand_has_the_type() {
         // movzx eax, byte [rdi]; mov [rsi], rax; mov ecx, edx; add rcx, r8; mov [rsi+8], rcx; movsx r9, word [rdi+2]; mov [rsi+16], r9; ret
         let code = [0x0f, 0xb6, 0x07, 0x48, 0x89, 0x06, 0x89, 0xd1, 0x4c, 0x01, 0xc1, 0x48, 0x89, 0x4e, 0x08, 0x4c, 0x0f, 0xbf, 0x4f, 0x02, 0x4c, 0x89, 0x4e, 0x10, 0xc3];
-        let c = c_of(&code);
+        let c = c_raw(&code);
         for s in ["eax = (uint32_t)*(uint8_t*)rdi;", "rax = (uint64_t)eax;", "rcx = (uint64_t)ecx;", "r9 = (int64_t)(int16_t)*(uint16_t*)(rdi + 2);"] {
             assert!(c.contains(s), "{s}: {c}");
         }
@@ -4253,7 +4344,7 @@ mod tests {
     #[test]
     fn low_bytes_of_a_zero_extension_are_the_value() {
         // dec dword [rdi]; jne L; movzx ecx, byte [rdi+4]; and cl, 0xf0; cmp cl, 0x10; jne L; mov eax, 1; ret; L: xor eax, eax; ret
-        let c = c_of(&[0xff, 0x0f, 0x75, 0x12, 0x0f, 0xb6, 0x4f, 0x04, 0x80, 0xe1, 0xf0, 0x80, 0xf9, 0x10, 0x75, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
+        let c = c_raw(&[0xff, 0x0f, 0x75, 0x12, 0x0f, 0xb6, 0x4f, 0x04, 0x80, 0xe1, 0xf0, 0x80, 0xf9, 0x10, 0x75, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
         assert!(c.contains("(*(uint8_t*)(rdi + 4)) & 0xf0") || c.contains("*(uint8_t*)(rdi + 4) & 0xf0"), "{c}");
         assert!(!c.contains("(uint8_t)((uint32_t)"), "{c}");
     }
@@ -4301,7 +4392,7 @@ mod tests {
     #[test]
     fn signed_compare_of_a_truncated_load_casts_once() {
         // cmp esi, [rdi+0x18] (32-bit view of a 64-bit slot read as 32); jl L; mov eax, 1; ret; L: xor eax, eax; ret
-        let c = c_of(&[0x48, 0x8b, 0x47, 0x18, 0x39, 0xc6, 0x7c, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
+        let c = c_raw(&[0x48, 0x8b, 0x47, 0x18, 0x39, 0xc6, 0x7c, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
         assert!(!c.contains("(int32_t)((uint32_t)") && !c.contains("(int32_t)(uint32_t)"), "{c}");
         assert!(c.contains("(int32_t)esi < (int32_t)*(uint64_t*)(rdi + 0x18)") || c.contains("(int32_t)esi < (int32_t)(*(uint64_t*)(rdi + 0x18))"), "{c}");
     }

@@ -1,0 +1,1087 @@
+//! Struct fields and virtual calls (WS91): `*(uint32_t*)(rdx + 0x10)` -> `rdx->field_10`,
+//! `(**(uint64_t*)(rax + 0x30))(rdi)` -> `rdi->vfn_6()`.
+//!
+//! The pointers of a function are typed by unification (Steensgaard): the SSA values that hold
+//! the same pointer — a copy, the versions a phi joins, the pointers loaded from (or stored to)
+//! one field of one struct — share a type. A memory access `*(T*)(base + k)` whose base is such
+//! a pointer (a register or a pointer loaded from memory; not a stack address, which `frame`
+//! names, nor a constant) is an access of the field at offset `k` of the base's type. Each type
+//! with an access past offset 0 (or a vtable pointer) is a struct; its fields are the access
+//! starts, the widest access at each start, kept greedily — the most accessed first — when they
+//! do not overlap a field already kept. An access that is no field start (inside a wider field,
+//! a 16-byte copy over several fields, an indexed element) prints as before.
+//!
+//! The view changes no statement: an access prints as a field only where its address prints
+//! in place (`base + k` inlined into the access, or the base itself for offset 0), so the base
+//! named is the value at the access. A narrower access at a field start prints through the
+//! field (`(uint32_t)p->field_8`, `*(uint32_t*)&p->field_8 = v`).
+//!
+//! A field's type is a hint: `struct X*` when the values loaded from / stored to it are
+//! pointers of type X, `float` / `double` when every access reads or writes a float, `void**
+//! _vptr` for the vtable pointer at offset 0 (loaded to reach a virtual call's slot, or a
+//! vtable stored by a constructor), else an unsigned integer of its size.
+//!
+//! A virtual call `(*(*obj + 8·n))(obj, …)` prints as `obj->vfn_n(…)` when the slot is read
+//! through the vtable pointer loaded from `obj` in the same block with nothing written to
+//! memory in between and the first argument is `obj` (else as before). When the object's class
+//! is known — the function's `this` in a method listed in a class's primary vtable (the class
+//! from its RTTI), or a vtable stored into the object — the slot's function is named in the
+//! comment (`= BiomeSource3d::method_at_43fadc0`, or its symbol).
+
+use reargo_core::address::SpaceId;
+use reargo_core::pcode::{OpCode, VarnodeData};
+use reargo_loader::Memory;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::condition::{value_key, ValueKey};
+use crate::ssa::{OpIdx, SsaFunction, VarId};
+
+/// Field offsets past this are no struct fields (an address computed some other way).
+const MAX_FIELD: u64 = 0x10_0000;
+/// Passes of the field-type unification (each may join types and expose new pairs).
+const MAX_PASSES: usize = 16;
+const RSP: u64 = 0x20;
+
+/// Union-find over value nodes.
+#[derive(Default)]
+struct Uf {
+    parent: Vec<u32>,
+}
+
+impl Uf {
+    fn add(&mut self) -> u32 {
+        self.parent.push(self.parent.len() as u32);
+        self.parent.len() as u32 - 1
+    }
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            let p = self.parent[self.parent[x as usize] as usize];
+            self.parent[x as usize] = p;
+            x = p;
+        }
+        x
+    }
+    fn union(&mut self, a: u32, b: u32) -> bool {
+        let (a, b) = (self.find(a), self.find(b));
+        if a == b {
+            return false;
+        }
+        // (the smaller node stays the root: deterministic)
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        self.parent[hi as usize] = lo;
+        true
+    }
+}
+
+/// What a field holds (a hint printed in the struct's definition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Int,
+    Float,
+    /// A pointer to the struct with this index (`None`: dereferenced, but no struct).
+    Ptr(Option<usize>),
+    /// The vtable pointer at offset 0.
+    VPtr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    pub off: u64,
+    pub size: u32,
+    pub kind: FieldKind,
+}
+
+impl Field {
+    pub fn name(&self) -> String {
+        if self.kind == FieldKind::VPtr { "_vptr".into() } else { format!("field_{:x}", self.off) }
+    }
+}
+
+/// A recovered struct.
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    /// `struct_0`, or the C++ class name when known.
+    pub name: String,
+    /// The C++ class (from RTTI), when known.
+    pub class: Option<String>,
+    /// The class's vtable (its address point), when known.
+    pub vtable: Option<u64>,
+    /// Fields by offset, not overlapping.
+    pub fields: Vec<Field>,
+    /// The step of a pointer to it walking an array (an element is no longer).
+    pub stride: Option<u64>,
+}
+
+impl StructDef {
+    fn field_type(&self, f: &Field, defs: &[StructDef]) -> String {
+        match f.kind {
+            FieldKind::VPtr => "void**".into(),
+            FieldKind::Ptr(Some(i)) => format!("struct {}*", defs[i].name),
+            FieldKind::Ptr(None) => "void*".into(),
+            FieldKind::Float => crate::emit::float_type(f.size).into(),
+            FieldKind::Int => crate::emit::size_to_type(f.size).into(),
+        }
+    }
+
+    /// The C definition, with the gaps between fields as byte arrays (so the offsets hold).
+    pub fn c_definition(&self, defs: &[StructDef]) -> String {
+        let mut out = format!("struct {} {{", self.name);
+        match (&self.class, self.vtable) {
+            (Some(_), Some(v)) => out.push_str(&format!("  // class from RTTI, vtable 0x{v:x}")),
+            (Some(_), None) => out.push_str("  // class from RTTI"),
+            (None, Some(v)) => out.push_str(&format!("  // vtable 0x{v:x}")),
+            (None, None) => {}
+        }
+        if let Some(st) = self.stride {
+            out.push_str(&format!("  // array element: a pointer to it steps by 0x{st:x}"));
+        }
+        out.push('\n');
+        let mut at = 0u64;
+        for f in &self.fields {
+            if f.off > at {
+                out.push_str(&format!("    uint8_t _gap_{at:x}[0x{:x}];\n", f.off - at));
+            }
+            out.push_str(&format!("    {} {}; // +0x{:x}\n", self.field_type(f, defs), f.name(), f.off));
+            at = f.off + u64::from(f.size);
+        }
+        out.push_str("};");
+        out
+    }
+
+    /// The Rust definition (`#[repr(C)]`, gaps as byte arrays).
+    pub fn rust_definition(&self, defs: &[StructDef]) -> String {
+        let mut out = "#[repr(C)]\n".to_string();
+        out.push_str(&format!("struct {} {{", rust_ident(&self.name)));
+        if let Some(v) = self.vtable {
+            out.push_str(&format!("  // vtable 0x{v:x}"));
+        }
+        out.push('\n');
+        let mut at = 0u64;
+        for f in &self.fields {
+            if f.off > at {
+                out.push_str(&format!("    _gap_{at:x}: [u8; 0x{:x}],\n", f.off - at));
+            }
+            let ty = match f.kind {
+                FieldKind::VPtr => "*const *const u8".to_string(),
+                FieldKind::Ptr(Some(i)) => format!("*mut {}", rust_ident(&defs[i].name)),
+                FieldKind::Ptr(None) => "*mut u8".into(),
+                FieldKind::Float if f.size == 4 => "f32".into(),
+                FieldKind::Float if f.size == 8 => "f64".into(),
+                _ => crate::rust_emit::size_to_rust_type(f.size).into(),
+            };
+            out.push_str(&format!("    {}: {ty}, // +0x{:x}\n", f.name(), f.off));
+            at = f.off + u64::from(f.size);
+        }
+        out.push('}');
+        out
+    }
+}
+
+/// The structs of C++ classes merged over several functions (WS91: `decompile-all` prints a
+/// class's struct once): per class, the fields of every function's struct of it, kept when they
+/// do not overlap one kept before (the struct seen first wins). Pointer fields name their target
+/// struct; one that is a function's anonymous struct becomes `void*`. `(C, Rust)` definitions.
+pub fn merge_class_structs<'d>(per_function: impl Iterator<Item = &'d [StructDef]>) -> (Vec<String>, Vec<String>) {
+    let mut merged: Vec<StructDef> = Vec::new();
+    let mut by_name: FxHashMap<String, usize> = FxHashMap::default();
+    let mut targets: FxHashMap<(usize, u64), String> = FxHashMap::default();
+    for defs in per_function {
+        for d in defs.iter().filter(|d| d.class.is_some()) {
+            let i = *by_name.entry(d.name.clone()).or_insert_with(|| {
+                merged.push(StructDef { name: d.name.clone(), class: d.class.clone(), vtable: d.vtable, fields: Vec::new(), stride: None });
+                merged.len() - 1
+            });
+            if merged[i].vtable.is_none() {
+                merged[i].vtable = d.vtable;
+            }
+            for f in &d.fields {
+                let end = f.off + u64::from(f.size);
+                if merged[i].fields.iter().any(|g| !(end <= g.off || g.off + u64::from(g.size) <= f.off)) {
+                    continue;
+                }
+                let mut f = f.clone();
+                if let FieldKind::Ptr(Some(t)) = f.kind {
+                    f.kind = FieldKind::Ptr(None);
+                    if defs[t].class.is_some() {
+                        targets.insert((i, f.off), defs[t].name.clone());
+                    }
+                }
+                merged[i].fields.push(f);
+            }
+            merged[i].fields.sort_by_key(|f| f.off);
+        }
+    }
+    // pointer fields to classes: by name now
+    let index: FxHashMap<String, usize> = merged.iter().enumerate().map(|(i, d)| (d.name.clone(), i)).collect();
+    for ((i, off), name) in targets {
+        if let Some(f) = merged[i].fields.iter_mut().find(|f| f.off == off) {
+            f.kind = FieldKind::Ptr(index.get(&name).copied());
+        }
+    }
+    (merged.iter().map(|d| d.c_definition(&merged)).collect(), merged.iter().map(|d| d.rust_definition(&merged)).collect())
+}
+
+/// A Rust identifier for a C++ class name (`CachedBiomeSource<Pos2d>` -> `CachedBiomeSource_Pos2d_`).
+pub fn rust_ident(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect()
+}
+
+/// An access of a field: the struct, the field and where its base prints.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Access {
+    pub def: usize,
+    pub field: usize,
+    /// the access's own width
+    pub size: u32,
+    /// the `base + k` op computing the address (`None`: the address is the base itself)
+    pub add: Option<OpIdx>,
+    /// the base's input index in `add` (or in the access op when `add` is `None`)
+    pub base_input: usize,
+}
+
+/// A virtual call through the vtable pointer of a struct.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VCall {
+    pub def: usize,
+    /// the vtable byte offset of the slot
+    pub slot: u64,
+    /// the load of the vtable pointer from the object
+    pub vptr_load: OpIdx,
+    /// the object (copies looked through)
+    pub object: ValueKey,
+    /// the slot's function in the vtable of the object's class, when known
+    pub target: Option<u64>,
+}
+
+/// The struct view of one function (see the module documentation).
+#[derive(Default)]
+pub struct StructView {
+    pub defs: Vec<StructDef>,
+    /// value -> struct
+    pub(crate) value_def: FxHashMap<ValueKey, usize>,
+    /// load / store op -> the field it accesses
+    pub(crate) access: FxHashMap<OpIdx, Access>,
+    /// `CALLIND` op -> the virtual call
+    pub(crate) vcalls: FxHashMap<OpIdx, VCall>,
+    /// `INT_ADD`s stepping a register in place (`add r9, 0x18`): no field addresses
+    pub(crate) steps: FxHashSet<OpIdx>,
+}
+
+/// What `StructView::new` knows about the program around the function.
+#[derive(Default)]
+pub struct Context<'a> {
+    pub memory: Option<&'a Memory>,
+    /// The register holding `this` (the convention's first argument).
+    pub this_reg: Option<VarnodeData>,
+    /// The class of `this` and its vtable (from the vtables listing the function, or its
+    /// mangled name).
+    pub this_class: Option<(String, Option<u64>)>,
+}
+
+/// A raw access before the layout: op, base node, offset, width, value node (a pointer loaded
+/// or stored), float, address op, base input.
+struct Raw {
+    op: OpIdx,
+    base: u32,
+    off: u64,
+    size: u32,
+    value: Option<u32>,
+    float: bool,
+    add: Option<OpIdx>,
+    base_input: usize,
+    vptr: bool,
+    vtable_store: Option<u64>,
+    /// not a field access after all (a vtable slot, an element past an array stride)
+    skip: bool,
+}
+
+fn is_xmm(d: &VarnodeData) -> bool {
+    d.space == SpaceId::REGISTER && (0x1200..0x1300).contains(&d.offset)
+}
+
+/// `v` with copies looked through.
+pub(crate) fn strip_copies(func: &SsaFunction, mut v: VarId) -> VarId {
+    for _ in 0..16 {
+        match func.varnodes[v as usize].def_op.map(|d| &func.ops[d]) {
+            Some(op) if op.opcode == OpCode::Copy && op.inputs.len() == 1 && func.varnodes[op.inputs[0] as usize].data.space != SpaceId::CONST => {
+                v = op.inputs[0]
+            }
+            _ => break,
+        }
+    }
+    v
+}
+
+impl StructView {
+    pub fn new(func: &SsaFunction, ctx: &Context<'_>) -> Self {
+        let frame = crate::frame::Frame::new(func, &|_| true);
+        let readers = crate::condition::Readers::new(func);
+        let mut uf = Uf::default();
+        let mut nodes: FxHashMap<ValueKey, u32> = FxHashMap::default();
+        fn node(uf: &mut Uf, nodes: &mut FxHashMap<ValueKey, u32>, k: ValueKey) -> u32 {
+            *nodes.entry(k).or_insert_with(|| uf.add())
+        }
+
+        let konst = |v: VarId| func.varnodes[v as usize].data.space == SpaceId::CONST;
+        let def_of = |v: VarId| func.varnodes[v as usize].def_op.map(|d| &func.ops[d]);
+        // the base of an address: a register (not the stack pointer) or a value loaded / copied
+        let base_ok = |v: VarId| {
+            let d = &func.varnodes[v as usize].data;
+            if d.size != 8 || d.space == SpaceId::CONST || (d.space == SpaceId::REGISTER && d.offset == RSP) {
+                return false;
+            }
+            d.space == SpaceId::REGISTER || def_of(v).is_some_and(|o| matches!(o.opcode, OpCode::Load | OpCode::Copy | OpCode::MultiEqual))
+        };
+        let float_value = |v: VarId, is_load: bool| {
+            let d = func.varnodes[v as usize].data;
+            if is_xmm(&d) {
+                return true;
+            }
+            if is_load {
+                readers.of(func, v).iter().any(|&u| {
+                    let r = &func.ops[u];
+                    crate::emit::is_float_op(r.opcode) || (r.opcode == OpCode::Copy && r.output.is_some_and(|o| is_xmm(&func.varnodes[o as usize].data)))
+                })
+            } else {
+                def_of(v).is_some_and(|o| crate::emit::is_float_op(o.opcode))
+            }
+        };
+
+        // the accesses
+        let mut raws: Vec<Raw> = Vec::new();
+        for op in func.ops.iter().filter(|o| !o.dead && matches!(o.opcode, OpCode::Load | OpCode::Store)) {
+            let Some(size) = crate::frame::access_size(func, op) else { continue };
+            let Some(&addr) = op.inputs.get(1) else { continue };
+            if size == 0 || konst(addr) || frame.is_stack(func, addr, op.block) {
+                continue;
+            }
+            let (base, off, add, base_input) = match def_of(addr) {
+                Some(d) if d.opcode == OpCode::IntAdd && d.inputs.len() == 2 && (konst(d.inputs[0]) != konst(d.inputs[1])) => {
+                    let (bi, ki) = if konst(d.inputs[1]) { (0, 1) } else { (1, 0) };
+                    let k = func.varnodes[d.inputs[ki] as usize].data.offset;
+                    (d.inputs[bi], k, Some(d.index), bi)
+                }
+                _ => (addr, 0, None, 1),
+            };
+            if off >= MAX_FIELD || !base_ok(base) || frame.is_stack(func, base, op.block) {
+                continue;
+            }
+            let value = match op.opcode {
+                OpCode::Load => op.output.filter(|_| size == 8),
+                _ => op.inputs.get(2).copied().filter(|&v| size == 8 && !konst(v)),
+            };
+            let float = match op.opcode {
+                OpCode::Load => op.output.is_some_and(|o| float_value(o, true)),
+                _ => op.inputs.get(2).is_some_and(|&v| float_value(v, false)),
+            };
+            // a constructor's vtable store
+            let vtable_store = match (op.opcode, off, size, ctx.memory) {
+                (OpCode::Store, 0, 8, Some(mem)) => op.inputs.get(2).filter(|&&v| konst(v)).map(|&v| func.varnodes[v as usize].data.offset).filter(|&p| crate::vcall::is_vtable_point(mem, p)),
+                _ => None,
+            };
+            let b = node(&mut uf, &mut nodes, value_key(func, base));
+            let value = value.map(|v| node(&mut uf, &mut nodes, value_key(func, v)));
+            raws.push(Raw { op: op.index, base: b, off, size, value, float, add, base_input, vptr: vtable_store.is_some(), vtable_store, skip: false });
+        }
+        if raws.is_empty() {
+            return StructView::default();
+        }
+
+        // copies and phis hold the same pointer
+        for op in func.ops.iter().filter(|o| !o.dead && matches!(o.opcode, OpCode::Copy | OpCode::MultiEqual)) {
+            let Some(out) = op.output else { continue };
+            if func.varnodes[out as usize].data.size != 8 {
+                continue;
+            }
+            let o = node(&mut uf, &mut nodes, value_key(func, out));
+            for &i in &op.inputs {
+                let d = &func.varnodes[i as usize].data;
+                if d.size == 8 && d.space != SpaceId::CONST {
+                    let n = node(&mut uf, &mut nodes, value_key(func, i));
+                    uf.union(o, n);
+                }
+            }
+        }
+
+        // virtual calls: the slot is read through a vtable pointer loaded from the object
+        let raw_at: FxHashMap<OpIdx, usize> = raws.iter().enumerate().map(|(i, r)| (r.op, i)).collect();
+        let mut vcall_raw: Vec<(OpIdx, usize, u64)> = Vec::new();
+        let mut vtable_keys: Vec<ValueKey> = Vec::new();
+        for op in func.ops.iter().filter(|o| !o.dead && o.opcode == OpCode::CallInd) {
+            let Some(&t) = op.inputs.first() else { continue };
+            let Some(slot_load) = def_of(strip_copies(func, t)).filter(|o| o.opcode == OpCode::Load && o.inputs.len() == 2) else { continue };
+            let a = strip_copies(func, slot_load.inputs[1]);
+            let (vt, slot) = match def_of(a) {
+                Some(d) if d.opcode == OpCode::IntAdd && d.inputs.len() == 2 && konst(d.inputs[1]) && !konst(d.inputs[0]) => {
+                    (strip_copies(func, d.inputs[0]), func.varnodes[d.inputs[1] as usize].data.offset)
+                }
+                _ => (a, 0),
+            };
+            if slot % 8 != 0 || slot >= 0x8000 {
+                continue;
+            }
+            vtable_keys.push(value_key(func, vt));
+            let Some(vload) = def_of(vt).filter(|o| o.opcode == OpCode::Load) else { continue };
+            let Some(&ri) = raw_at.get(&vload.index) else { continue };
+            if raws[ri].off != 0 || raws[ri].size != 8 {
+                continue;
+            }
+            raws[ri].vptr = true;
+            vcall_raw.push((op.index, ri, slot));
+        }
+        // a vtable is no struct: the reads through a vtable pointer (the slots) print as before
+        let vtable_nodes: FxHashSet<u32> = vtable_keys
+            .iter()
+            .filter_map(|k| nodes.get(k).copied())
+            .chain(raws.iter().filter(|r| r.vptr).filter_map(|r| func.ops[r.op].output.and_then(|o| nodes.get(&value_key(func, o)).copied())))
+            .collect::<Vec<u32>>()
+            .into_iter()
+            .map(|n| uf.find(n))
+            .collect();
+        for r in raws.iter_mut() {
+            r.skip = vtable_nodes.contains(&uf.find(r.base));
+        }
+        vcall_raw.retain(|&(_, ri, _)| !raws[ri].skip);
+
+        // the pointers loaded from / stored to one field of one type are of one type
+        for _ in 0..MAX_PASSES {
+            let mut seen: FxHashMap<(u32, u64), u32> = FxHashMap::default();
+            let mut changed = false;
+            for r in raws.iter().filter(|r| !r.vptr && !r.skip) {
+                let Some(v) = r.value else { continue };
+                let key = (uf.find(r.base), r.off);
+                match seen.get(&key) {
+                    Some(&w) => changed |= uf.union(v, w),
+                    None => {
+                        seen.insert(key, v);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // a pointer stepping through an array (`p = p + 4` of its own type): the element is at
+        // most the step long, an access past it is another element's (it prints as before)
+        let mut stride: FxHashMap<u32, u64> = FxHashMap::default();
+        for op in func.ops.iter().filter(|o| !o.dead && matches!(o.opcode, OpCode::IntAdd | OpCode::IntSub) && o.inputs.len() == 2) {
+            let Some(out) = op.output else { continue };
+            let (b, k) = (op.inputs[0], op.inputs[1]);
+            if !konst(k) || konst(b) {
+                continue;
+            }
+            let k = (func.varnodes[k as usize].data.offset as i64).unsigned_abs();
+            let (Some(&o), Some(&n)) = (nodes.get(&value_key(func, out)), nodes.get(&value_key(func, b))) else { continue };
+            let root = uf.find(n);
+            if k > 0 && k < MAX_FIELD && uf.find(o) == root {
+                let e = stride.entry(root).or_insert(k);
+                *e = (*e).min(k);
+            }
+        }
+        for r in raws.iter_mut() {
+            if stride.get(&uf.find(r.base)).is_some_and(|&st| r.off + u64::from(r.size) > st) {
+                r.skip = true;
+            }
+        }
+        vcall_raw.retain(|&(_, ri, _)| !raws[ri].skip);
+
+        // the types that are structs: an access past offset 0, or a vtable pointer
+        let mut is_base: FxHashSet<u32> = FxHashSet::default();
+        let mut struct_roots: Vec<u32> = Vec::new();
+        for r in raws.iter().filter(|r| !r.skip) {
+            let root = uf.find(r.base);
+            is_base.insert(root);
+            if (r.off > 0 || r.vptr) && !struct_roots.contains(&root) {
+                struct_roots.push(root);
+            }
+        }
+        // `this` of a known class is a struct too
+        let this_root = ctx.this_reg.and_then(|reg| {
+            let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
+            nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
+        });
+        if let (Some(r), Some(_)) = (this_root, &ctx.this_class)
+            && is_base.contains(&r)
+            && !struct_roots.contains(&r)
+        {
+            struct_roots.push(r);
+        }
+        let def_of_root: FxHashMap<u32, usize> = struct_roots.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+
+        // the layout of each struct
+        let mut defs: Vec<StructDef> = (0..struct_roots.len())
+            .map(|i| StructDef { name: format!("struct_{i}"), class: None, vtable: None, fields: Vec::new(), stride: stride.get(&struct_roots[i]).copied() })
+            .collect();
+        let mut by_def: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
+        for (i, r) in raws.iter().enumerate().filter(|(_, r)| !r.skip) {
+            if let Some(&d) = def_of_root.get(&uf.find(r.base)) {
+                by_def[d].push(i);
+            }
+        }
+        let mut access: FxHashMap<OpIdx, Access> = FxHashMap::default();
+        for (d, list) in by_def.iter().enumerate() {
+            // candidates: the widest access (at most 16 bytes) at each start, and how often
+            let mut starts: std::collections::BTreeMap<u64, (u32, usize)> = std::collections::BTreeMap::new();
+            for &i in list {
+                let r = &raws[i];
+                if r.size > 16 {
+                    continue;
+                }
+                let e = starts.entry(r.off).or_insert((0, 0));
+                e.0 = e.0.max(r.size);
+                e.1 += 1;
+            }
+            let mut order: Vec<(u64, u32, usize)> = starts.iter().map(|(&o, &(s, n))| (o, s, n)).collect();
+            // (a 16-byte access is a copy of several fields more often than one: last)
+            order.sort_by_key(|&(o, s, n)| (s > 10, std::cmp::Reverse(n), o));
+            let mut kept: Vec<(u64, u32)> = Vec::new();
+            for (o, s, _) in order {
+                let end = o + u64::from(s);
+                if kept.iter().all(|&(ko, ks)| end <= ko || ko + u64::from(ks) <= o) {
+                    kept.push((o, s));
+                }
+            }
+            kept.sort();
+            let mut fields = Vec::new();
+            for (o, s) in kept {
+                let at: Vec<&Raw> = list.iter().map(|&i| &raws[i]).filter(|r| r.off == o).collect();
+                let kind = if o == 0 && s == 8 && at.iter().any(|r| r.vptr) {
+                    FieldKind::VPtr
+                } else if s == 8 && !at.is_empty() && at.iter().all(|r| r.size == 8 && r.value.is_some_and(|v| is_base.contains(&uf.find(v)))) {
+                    FieldKind::Ptr(at.iter().find_map(|r| r.value.and_then(|v| def_of_root.get(&uf.find(v)).copied())))
+                } else if matches!(s, 4 | 8) && at.iter().all(|r| r.size == s && r.float) {
+                    FieldKind::Float
+                } else {
+                    FieldKind::Int
+                };
+                fields.push(Field { off: o, size: s, kind });
+            }
+            for &i in list {
+                let r = &raws[i];
+                if let Some(fi) = fields.iter().position(|f| f.off == r.off && r.size <= f.size) {
+                    access.insert(r.op, Access { def: d, field: fi, size: r.size, add: r.add, base_input: r.base_input });
+                }
+                if let Some(v) = r.vtable_store {
+                    defs[d].vtable = Some(v);
+                }
+            }
+            defs[d].fields = fields;
+        }
+
+        // classes: `this`, and the vtables stored into objects
+        if let (Some(r), Some((name, vt))) = (this_root, &ctx.this_class)
+            && let Some(&d) = def_of_root.get(&r)
+        {
+            defs[d].class = Some(name.clone());
+            if defs[d].vtable.is_none() {
+                defs[d].vtable = *vt;
+            }
+        }
+        if let Some(mem) = ctx.memory {
+            for d in defs.iter_mut().filter(|d| d.class.is_none()) {
+                if let Some(v) = d.vtable {
+                    d.class = crate::vcall::vtable_class(mem, v);
+                }
+            }
+        }
+        // names: the class, else `struct_N` by first access; one struct per class name
+        let mut taken: FxHashMap<String, usize> = FxHashMap::default();
+        let mut anon = 0;
+        for d in defs.iter_mut() {
+            d.name = match &d.class {
+                Some(c) => {
+                    let n = taken.entry(c.clone()).or_insert(0);
+                    *n += 1;
+                    if *n == 1 { c.clone() } else { format!("{c}_{}", *n - 1) }
+                }
+                None => {
+                    anon += 1;
+                    format!("struct_{}", anon - 1)
+                }
+            };
+        }
+
+        let value_def: FxHashMap<ValueKey, usize> = nodes
+            .iter()
+            .filter_map(|(&k, &n)| def_of_root.get(&uf.find(n)).map(|&d| (k, d)))
+            .collect();
+        let mut vcalls = FxHashMap::default();
+        for (call, ri, slot) in vcall_raw {
+            let r = &raws[ri];
+            let Some(&d) = def_of_root.get(&uf.find(r.base)) else { continue };
+            let obj = strip_copies(func, func.ops[r.op].inputs[1]);
+            let target = defs[d].vtable.zip(ctx.memory).and_then(|(vt, mem)| crate::vcall::slot_target(mem, vt, slot));
+            vcalls.insert(call, VCall { def: d, slot, vptr_load: r.op, object: value_key(func, obj), target });
+        }
+        // a register stepped in place (`add r9, 0x18`, `lea r9, [r9+0x18]`) — unless the new value
+        // is passed to a call (`lea rdi, [rdi+0x10]; call f`: a member's address)
+        let same_register = |a: VarId, b: VarId| {
+            let (x, y) = (func.varnodes[a as usize].data, func.varnodes[b as usize].data);
+            x.space == SpaceId::REGISTER && y.space == SpaceId::REGISTER && x.offset == y.offset
+        };
+        let passed = |v: VarId| {
+            readers.of(func, v).iter().any(|&u| {
+                let c = &func.ops[u];
+                matches!(c.opcode, OpCode::Call | OpCode::CallInd) && c.inputs.iter().skip(1).any(|&i| value_key(func, i) == value_key(func, v))
+            })
+        };
+        let steps = func
+            .ops
+            .iter()
+            .filter(|o| !o.dead && o.opcode == OpCode::IntAdd && o.inputs.len() == 2)
+            .filter(|o| {
+                let Some(out) = o.output else { return false };
+                o.inputs.iter().any(|&b| {
+                    (same_register(out, b) && !passed(out))
+                        || readers.of(func, out).iter().any(|&u| {
+                            func.ops[u].opcode == OpCode::Copy && func.ops[u].output.is_some_and(|w| same_register(w, b) && !passed(w))
+                        })
+                })
+            })
+            .map(|o| o.index)
+            .collect();
+        StructView { defs, value_def, access, vcalls, steps }
+    }
+
+    /// The struct of value `v`, if it is a pointer to one.
+    pub(crate) fn def_of_value(&self, func: &SsaFunction, v: VarId) -> Option<usize> {
+        self.value_def.get(&value_key(func, v)).copied()
+    }
+
+    /// The struct a parameter register named `name` points to on entry.
+    pub(crate) fn param_def(&self, func: &SsaFunction, name: &str, reg_name: &dyn Fn(&VarnodeData) -> String) -> Option<usize> {
+        let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data.space == SpaceId::REGISTER && v.data.size == 8 && reg_name(&v.data) == name)?;
+        self.def_of_value(func, v.id)
+    }
+
+    /// The registers (by offset, 8 bytes) that point to one struct in every value the body
+    /// assigns them (`printed`: the defining op prints).
+    pub(crate) fn register_defs(&self, func: &SsaFunction, printed: &dyn Fn(OpIdx) -> bool) -> FxHashMap<u64, usize> {
+        let mut seen: FxHashMap<u64, Option<usize>> = FxHashMap::default();
+        for v in func.varnodes.iter().filter(|v| v.data.space == SpaceId::REGISTER && v.data.size == 8) {
+            let Some(d) = v.def_op.filter(|&d| printed(d)) else { continue };
+            let _ = d;
+            let def = self.def_of_value(func, v.id);
+            let e = seen.entry(v.data.offset).or_insert(def);
+            if *e != def {
+                *e = None;
+            }
+        }
+        seen.into_iter().filter_map(|(k, d)| Some((k, d?))).collect()
+    }
+
+    /// `base + k` as the address of a field (WS91, `&base->field_k`): the base's input index and
+    /// the field, when `op` adds a constant to a pointer to a struct with a field starting there.
+    pub(crate) fn field_address(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<(usize, &Field)> {
+        if op.opcode != OpCode::IntAdd || op.inputs.len() != 2 {
+            return None;
+        }
+        let konst = |i: usize| func.varnodes[op.inputs[i] as usize].data.space == SpaceId::CONST;
+        let (bi, ki) = match (konst(0), konst(1)) {
+            (false, true) => (0, 1),
+            (true, false) => (1, 0),
+            _ => return None,
+        };
+        let k = func.varnodes[op.inputs[ki] as usize].data.offset;
+        let d = self.def_of_value(func, op.inputs[bi])?;
+        // (a pointer of the type stepping on, `p = p + 4`, is no field's address; nor is a
+        // register stepped in place, `add r9, 0x18`)
+        if op.output.is_some_and(|o| self.def_of_value(func, o) == Some(d)) {
+            return None;
+        }
+        if self.steps.contains(&op.index) {
+            return None;
+        }
+        let f = self.defs[d].fields.iter().find(|f| f.off == k && k > 0)?;
+        Some((bi, f))
+    }
+
+    /// The statements that only load a vtable pointer for virtual calls printed as `obj->vfn_n()`
+    /// (WS91): the vptr's load (or the copy it is inlined into) when every reader of the value
+    /// is the slot load of such a call, inlined into it (`inlined`), and the call prints as a
+    /// member call (`member`). Folded into the calls, they print nothing.
+    pub(crate) fn folded_vptr_loads(
+        &self,
+        func: &SsaFunction,
+        inlined: &dyn Fn(OpIdx) -> bool,
+        member: &dyn Fn(OpIdx) -> bool,
+    ) -> Vec<OpIdx> {
+        let readers = crate::condition::Readers::new(func);
+        let mut out = Vec::new();
+        let loads: FxHashSet<OpIdx> = self.vcalls.values().map(|v| v.vptr_load).collect();
+        for &l in &loads {
+            let Some(v) = func.ops[l].output else { continue };
+            // the statement printing the vptr: the load, or the copy of the inlined load
+            let (stmt, w) = if inlined(l) {
+                match readers.of(func, v) {
+                    [c] if func.ops[*c].opcode == OpCode::Copy && func.ops[*c].output.is_some() => (*c, func.ops[*c].output.expect("checked")),
+                    _ => continue,
+                }
+            } else {
+                (l, v)
+            };
+            // a slot load inlined into member calls only (a call's INDIRECT annotations name it too)
+            let slot_load = |u: OpIdx| {
+                let r = &func.ops[u];
+                r.opcode == OpCode::Load && inlined(u) && r.output.is_some_and(|o| {
+                    let rs = readers.of(func, o);
+                    rs.iter().any(|&c| func.ops[c].opcode == OpCode::CallInd)
+                        && rs.iter().all(|&c| {
+                            let call = &func.ops[c];
+                            call.opcode == OpCode::Indirect
+                                || (call.opcode == OpCode::CallInd && call.inputs.first().is_some_and(|&t| value_key(func, t) == value_key(func, o)) && member(c))
+                        })
+                })
+            };
+            // ... read directly or through `vptr + 8·n` inlined into it
+            let ok = readers.of(func, w).iter().all(|&u| {
+                let r = &func.ops[u];
+                match r.opcode {
+                    OpCode::Load => slot_load(u),
+                    OpCode::IntAdd => inlined(u) && r.output.is_some_and(|o| {
+                        let rs = readers.of(func, o);
+                        !rs.is_empty() && rs.iter().all(|&l| slot_load(l))
+                    }),
+                    _ => false,
+                }
+            });
+            if ok && !readers.of(func, w).is_empty() {
+                out.push(stmt);
+            }
+        }
+        out
+    }
+
+    /// The C definitions, in order.
+    pub fn c_definitions(&self) -> Vec<String> {
+        self.defs.iter().map(|d| d.c_definition(&self.defs)).collect()
+    }
+
+    pub fn rust_definitions(&self) -> Vec<String> {
+        self.defs.iter().map(|d| d.rust_definition(&self.defs)).collect()
+    }
+
+    /// Whether virtual call `call` prints as `obj->vfn_n(…)`: the vtable pointer is loaded in
+    /// the call's block with no store or call between, and the first argument is the object.
+    pub(crate) fn member_call(&self, func: &SsaFunction, call: &crate::ssa::SsaOp) -> Option<&VCall> {
+        let vc = self.vcalls.get(&call.index)?;
+        let arg = *call.inputs.get(1)?;
+        if value_key(func, strip_copies(func, arg)) != vc.object {
+            return None;
+        }
+        let load = &func.ops[vc.vptr_load];
+        if load.block != call.block || load.index > call.index {
+            return None;
+        }
+        let between = func.ops[load.index + 1..call.index]
+            .iter()
+            .any(|o| !o.dead && o.block == call.block && matches!(o.opcode, OpCode::Store | OpCode::Call | OpCode::CallInd | OpCode::CallOther));
+        (!between).then_some(vc)
+    }
+}
+
+/// The name of the slot function `target` of a virtual call on an object of class `class`:
+/// its symbol (demangled), else `Class::method_at_<addr>`.
+pub(crate) fn method_name(symbols: &std::collections::BTreeMap<u64, String>, class: Option<&str>, target: u64) -> String {
+    if let Some(s) = symbols.get(&target) {
+        return demangle_symbol(s).unwrap_or_else(|| s.clone());
+    }
+    match class {
+        Some(c) => format!("{c}::method_at_{target:x}"),
+        None => format!("0x{target:x}"),
+    }
+}
+
+/// An Itanium-mangled function name as C++ (`_ZN5Class6methodEv` -> `Class::method()`).
+pub fn demangle_symbol(s: &str) -> Option<String> {
+    if !s.starts_with("_Z") {
+        return None;
+    }
+    cpp_demangle::Symbol::new(s.as_bytes()).ok()?.demangle(&cpp_demangle::DemangleOptions::default()).ok()
+}
+
+/// The class of a method from its (mangled or demangled) name: `_ZN5Class6methodEv` /
+/// `Class::method()` -> `Class`, `_ZNK2ns5Class3getEv` -> `ns::Class`. `None` for a free
+/// function, a name without a scope, or a function-local entity.
+pub fn method_class(name: &str) -> Option<String> {
+    let demangled = demangle_symbol(name);
+    let s = demangled.as_deref().unwrap_or(name);
+    // the qualified name ends at the top-level `(` of the parameter list
+    let mut depth = 0i32;
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            '(' if depth == 0 && !s[i..].starts_with("(anonymous namespace)") => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if end == s.len() && demangled.is_none() {
+        // not a demangled signature (a plain symbol like `FUN_401000`)
+        return None;
+    }
+    let q = &s[..end];
+    // split at the last top-level `::`
+    let mut depth = 0i32;
+    let mut cut = None;
+    let b = q.as_bytes();
+    for i in 0..b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && b.get(i + 1) == Some(&b':') => cut = Some(i),
+            _ => {}
+        }
+    }
+    let class = &q[..cut?];
+    let plain = class.replace("(anonymous namespace)", "");
+    (!class.is_empty() && !plain.contains('(') && !plain.ends_with(')')).then(|| class.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::pipeline::{decompile, decompile_with_options, DecompileOptions};
+    use reargo_core::address::Endian;
+    use reargo_lift::x86::X86Lifter;
+    use reargo_loader::memory::{MemoryBlock, MemoryFlags};
+    use std::sync::Arc;
+
+    fn block(name: &str, start: u64, data: Vec<u8>, flags: MemoryFlags) -> MemoryBlock {
+        MemoryBlock { name: name.into(), start, size: data.len() as u64, flags, data: Some(Arc::from(data.as_slice())) }
+    }
+
+    fn text(code: &[u8]) -> Memory {
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        mem.add_block(block(".text", 0x1000, code.to_vec(), MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem
+    }
+
+    fn c_of(code: &[u8]) -> crate::pipeline::DecompileResult {
+        decompile(&X86Lifter::new_64(), &text(code), 0x1000, "f", 100).unwrap()
+    }
+
+    fn raw_of(code: &[u8]) -> crate::pipeline::DecompileResult {
+        let opts = DecompileOptions { structs: false };
+        decompile_with_options(&X86Lifter::new_64(), &text(code), 0x1000, "f", 100, &Default::default(), &opts).unwrap()
+    }
+
+    #[test]
+    fn accesses_through_one_pointer_are_fields_of_one_struct() {
+        // mov [rdi+0x10], esi ; mov eax, [rdi+0x14] ; ret
+        let code = [0x89, 0x77, 0x10, 0x8b, 0x47, 0x14, 0xc3];
+        let r = c_of(&code);
+        assert!(r.c_code.contains("rdi->field_10 = esi;"), "{}", r.c_code);
+        assert!(r.c_code.contains("rdi->field_14"), "{}", r.c_code);
+        assert!(r.c_code.contains("(struct struct_0* rdi, uint64_t rsi)"), "{}", r.c_code);
+        assert_eq!(r.recovered_structs.len(), 1);
+        assert!(r.recovered_structs[0].contains("uint32_t field_10; // +0x10\n    uint32_t field_14; // +0x14"), "{}", r.recovered_structs[0]);
+        // the flag turns it off
+        let raw = raw_of(&code);
+        assert!(raw.c_code.contains("*(uint32_t*)(rdi + 0x10) = esi;"), "{}", raw.c_code);
+        assert!(!raw.c_code.contains("->") && raw.recovered_structs.is_empty(), "{}", raw.c_code);
+    }
+
+    #[test]
+    fn a_copied_pointer_has_the_same_struct() {
+        // mov rbx, rdi ; mov [rbx+8], esi ; mov eax, [rdi+0xc] ; ret
+        let r = c_of(&[0x48, 0x89, 0xfb, 0x89, 0x73, 0x08, 0x8b, 0x47, 0x0c, 0xc3]);
+        assert!(r.c_code.contains("rbx->field_8 = esi;"), "{}", r.c_code);
+        assert!(r.c_code.contains("rdi->field_c"), "{}", r.c_code);
+        assert_eq!(r.recovered_structs.len(), 1, "{:?}", r.recovered_structs);
+        assert!(r.c_code.contains("struct struct_0* rbx;"), "{}", r.c_code);
+    }
+
+    #[test]
+    fn an_access_inside_a_wider_field_stays_raw() {
+        // mov [rdi+8], rax ; mov ecx, [rdi+0xc] ; mov [rdi+0x18], ecx ; ret
+        let r = c_of(&[0x48, 0x89, 0x47, 0x08, 0x8b, 0x4f, 0x0c, 0x89, 0x4f, 0x18, 0xc3]);
+        assert!(r.c_code.contains("rdi->field_8 = rax;"), "{}", r.c_code);
+        assert!(r.c_code.contains("*(uint32_t*)(rdi + 0xc)"), "{}", r.c_code);
+        assert!(r.c_code.contains("rdi->field_18 = "), "{}", r.c_code);
+        assert!(!r.recovered_structs[0].contains("field_c;"), "{}", r.recovered_structs[0]);
+    }
+
+    #[test]
+    fn a_narrower_read_goes_through_the_field() {
+        // mov rax, [rdi+8] ; mov ecx, [rdi+8] ; mov [rsi], ecx ; ret
+        let r = c_of(&[0x48, 0x8b, 0x47, 0x08, 0x8b, 0x4f, 0x08, 0x89, 0x0e, 0xc3]);
+        assert!(r.c_code.contains("rax = rdi->field_8;"), "{}", r.c_code);
+        assert!(r.c_code.contains("(uint32_t)rdi->field_8"), "{}", r.c_code);
+    }
+
+    #[test]
+    fn a_loaded_pointer_is_a_typed_field() {
+        // mov rax, [rdi+8] ; mov ecx, [rax+0x10] ; mov eax, [rax+0x14] ; add eax, ecx ; ret
+        let r = c_of(&[0x48, 0x8b, 0x47, 0x08, 0x8b, 0x48, 0x10, 0x8b, 0x40, 0x14, 0x01, 0xc8, 0xc3]);
+        assert!(r.c_code.contains("rax = rdi->field_8;"), "{}", r.c_code);
+        assert!(r.c_code.contains("rax->field_10"), "{}", r.c_code);
+        assert!(r.recovered_structs[0].contains("struct struct_1* field_8;"), "{:?}", r.recovered_structs);
+    }
+
+    #[test]
+    fn a_pointer_stepping_through_an_array_has_no_fields_past_the_step() {
+        // xor ecx, ecx ; L: mov eax, [rdi+4] ; add eax, [rdi+0xc] ; mov [rdi], eax ; add rdi, 8 ; cmp rdi, rsi ; jne L ; ret
+        let code = [0x31, 0xc9, 0x8b, 0x47, 0x04, 0x03, 0x47, 0x0c, 0x89, 0x07, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xf7, 0x75, 0xef, 0xc3];
+        let r = c_of(&code);
+        assert!(r.c_code.contains("*(uint32_t*)(rdi + 0xc)"), "{}", r.c_code);
+        assert!(r.c_code.contains("rdi->field_4"), "{}", r.c_code);
+        assert!(r.c_code.contains("rdi = rdi + 8;"), "{}", r.c_code);
+        assert!(r.recovered_structs[0].contains("array element: a pointer to it steps by 0x8"), "{:?}", r.recovered_structs);
+    }
+
+    #[test]
+    fn a_members_address_passed_to_a_call() {
+        // mov rsi, [rdi+0x10] ; lea rdi, [rdi+0x10] ; call 0x2000 ; ret
+        let mut code = vec![0x48, 0x8b, 0x77, 0x10, 0x48, 0x8d, 0x7f, 0x10, 0xe8, 0xf3, 0x0f, 0x00, 0x00, 0xc3];
+        code.resize(0x1100, 0xcc);
+        // 0x2000: mov rax, [rsi] ; add rax, [rdi] ; ret
+        code[0x1000..0x1007].copy_from_slice(&[0x48, 0x8b, 0x06, 0x48, 0x03, 0x07, 0xc3]);
+        let r = c_of(&code);
+        assert!(r.c_code.contains("rdi = &rdi->field_10;"), "{}", r.c_code);
+    }
+
+    #[test]
+    fn a_virtual_call_on_an_object_is_a_member_call() {
+        // mov rax, [rdi] ; call [rax+0x18] ; ret
+        let code = [0x48, 0x8b, 0x07, 0xff, 0x50, 0x18, 0xc3];
+        let r = c_of(&code);
+        assert!(r.c_code.contains("rdi->vfn_3();  // vfn[3] (vtable+0x18)"), "{}", r.c_code);
+        assert!(!r.c_code.contains("_vptr;"), "the vtable pointer load prints in the call: {}", r.c_code);
+        assert!(r.recovered_structs[0].contains("void** _vptr; // +0x0"), "{:?}", r.recovered_structs);
+        assert!(raw_of(&code).c_code.contains("(**(uint64_t*)(rax + 0x18))(rdi);"));
+        // Rust too
+        assert!(r.rust_code.contains("unsafe { (*rdi).vfn_3() };"), "{}", r.rust_code);
+    }
+
+    #[test]
+    fn a_virtual_call_is_raw_when_memory_changes_after_the_vtable_load() {
+        // mov rax, [rdi] ; mov dword [rdi+8], 0 ; call [rax+0x18] ; ret
+        let r = c_of(&[0x48, 0x8b, 0x07, 0xc7, 0x47, 0x08, 0x00, 0x00, 0x00, 0x00, 0xff, 0x50, 0x18, 0xc3]);
+        assert!(r.c_code.contains("rax = rdi->_vptr;"), "{}", r.c_code);
+        assert!(r.c_code.contains("(**(uint64_t*)(rax + 0x18))(rdi);"), "{}", r.c_code);
+    }
+
+    #[test]
+    fn a_virtual_call_is_raw_when_this_is_another_object() {
+        // mov rax, [rdi] ; mov rdi, rsi ; call [rax+0x18] ; ret
+        let r = c_of(&[0x48, 0x8b, 0x07, 0x48, 0x89, 0xf7, 0xff, 0x50, 0x18, 0xc3]);
+        assert!(!r.c_code.contains("->vfn_"), "{}", r.c_code);
+    }
+
+    /// A PIE with a class `Shape`: vtable at 0x2010 (slot 0 = 0x1100, slot 1 = 0x1200), its
+    /// type_info at 0x2030 naming `5Shape` (at 0x3000); `ctor` at 0x1000, `method` at 0x1100.
+    fn shape(ctor: &[u8], method: &[u8]) -> Memory {
+        let mut t = vec![0xccu8; 0x300];
+        t[..ctor.len()].copy_from_slice(ctor);
+        t[0x100..0x100 + method.len()].copy_from_slice(method);
+        // 0x1200: mov eax, [rdi+4] ; ret (it reads `this`)
+        t[0x200..0x204].copy_from_slice(&[0x8b, 0x47, 0x04, 0xc3]);
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        mem.add_block(block(".text", 0x1000, t, MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.add_block(block(".data.rel.ro", 0x2000, vec![0; 0x40], MemoryFlags::READ | MemoryFlags::WRITE));
+        mem.add_block(block(".rodata", 0x3000, b"5Shape\0".to_vec(), MemoryFlags::READ));
+        let rela: Vec<u8> = [(0x2008u64, 8u64, 0x2030u64), (0x2010, 8, 0x1100), (0x2018, 8, 0x1200), (0x2038, 8, 0x3000)]
+            .iter()
+            .flat_map(|&(o, i, a)| [o.to_le_bytes(), i.to_le_bytes(), a.to_le_bytes()].concat())
+            .collect();
+        mem.set_dynamic_relocations(Arc::from(rela));
+        mem
+    }
+
+    #[test]
+    fn a_constructor_names_the_class_of_its_vtable() {
+        // lea rax, [0x2010] ; mov [rdi], rax ; mov rax, [rdi] ; call [rax+8] ; ret
+        let ctor = [0x48, 0x8d, 0x05, 0x09, 0x10, 0x00, 0x00, 0x48, 0x89, 0x07, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x08, 0xc3];
+        let r = decompile(&X86Lifter::new_64(), &shape(&ctor, &[0xc3]), 0x1000, "f", 100).unwrap();
+        assert!(r.c_code.contains("rdi->_vptr = 0x2010;  // vtable of Shape"), "{}", r.c_code);
+        assert!(r.c_code.contains("rdi->vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.recovered_structs[0].starts_with("struct Shape {  // class from RTTI, vtable 0x2010"), "{:?}", r.recovered_structs);
+        assert!(r.c_code.contains("(struct Shape* rdi)"), "{}", r.c_code);
+    }
+
+    #[test]
+    fn a_method_in_a_vtable_types_this_as_its_class() {
+        // 0x1100: mov eax, [rdi+8] ; mov rax, [rdi] ; call [rax+8] ; ret
+        let m = [0x8b, 0x47, 0x08, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x08, 0xc3];
+        let r = decompile(&X86Lifter::new_64(), &shape(&[0xc3], &m), 0x1100, "m", 100).unwrap();
+        assert!(r.c_code.contains("(struct Shape* rdi)"), "{}", r.c_code);
+        assert!(r.c_code.contains("= Shape::method_at_1200"), "{}", r.c_code);
+    }
+
+    #[test]
+    fn a_mangled_method_name_types_this() {
+        // mov eax, [rdi+8] ; ret
+        let r = decompile(&X86Lifter::new_64(), &text(&[0x8b, 0x47, 0x08, 0xc3]), 0x1000, "_ZNK5Shape4areaEv", 100).unwrap();
+        assert!(r.c_code.contains("(struct Shape* rdi)"), "{}", r.c_code);
+        assert!(r.recovered_structs[0].starts_with("struct Shape {"), "{:?}", r.recovered_structs);
+    }
+
+    #[test]
+    fn rust_output_names_the_same_fields() {
+        // mov [rdi+0x10], esi ; mov eax, [rdi+0x14] ; ret
+        let r = c_of(&[0x89, 0x77, 0x10, 0x8b, 0x47, 0x14, 0xc3]);
+        assert!(r.rust_code.contains("unsafe { (*rdi).field_10 = esi; }"), "{}", r.rust_code);
+        assert!(r.rust_code.contains("rdi: *mut struct_0"), "{}", r.rust_code);
+        assert!(r.rust_structs[0].contains("field_10: u32, // +0x10"), "{:?}", r.rust_structs);
+    }
+
+    #[test]
+    fn class_structs_merge_over_functions() {
+        let a = vec![StructDef { name: "Shape".into(), class: Some("Shape".into()), vtable: Some(0x2010), stride: None, fields: vec![Field { off: 8, size: 4, kind: FieldKind::Int }] }];
+        let b = vec![
+            StructDef {
+                name: "Shape".into(),
+                class: Some("Shape".into()),
+                vtable: None,
+                stride: None,
+                fields: vec![Field { off: 8, size: 8, kind: FieldKind::Int }, Field { off: 0x10, size: 8, kind: FieldKind::Ptr(Some(1)) }],
+            },
+            StructDef { name: "struct_1".into(), class: None, vtable: None, stride: None, fields: vec![] },
+        ];
+        let (c, _) = merge_class_structs([a.as_slice(), b.as_slice()].into_iter());
+        assert_eq!(c.len(), 1);
+        // field_8 of the first wins over the overlapping 8-byte one; a pointer to an anonymous struct is void*
+        assert!(c[0].contains("uint32_t field_8;") && c[0].contains("void* field_10;"), "{}", c[0]);
+    }
+
+    #[test]
+    fn method_class_from_mangled_and_demangled_names() {
+        assert_eq!(method_class("_ZN5Class6methodEv").as_deref(), Some("Class"));
+        assert_eq!(method_class("_ZNK2ns5Class3getEi").as_deref(), Some("ns::Class"));
+        assert_eq!(method_class("_ZN17CachedBiomeSourceI13BiomeSource3dE3getEv").as_deref(), Some("CachedBiomeSource<BiomeSource3d>"));
+        assert_eq!(method_class("Foo::bar(int)").as_deref(), Some("Foo"));
+        assert_eq!(method_class("_ZN12_GLOBAL__N_15Local3getEv").as_deref(), Some("(anonymous namespace)::Local"));
+        assert_eq!(method_class("_Z4freev"), None);
+        assert_eq!(method_class("FUN_401000"), None);
+        assert_eq!(method_class("main"), None);
+    }
+
+    #[test]
+    fn struct_definition_has_gaps_and_types() {
+        let defs = vec![
+            StructDef {
+                name: "Node".into(),
+                class: None,
+                vtable: None,
+                stride: None,
+                fields: vec![
+                    Field { off: 0, size: 8, kind: FieldKind::VPtr },
+                    Field { off: 0x10, size: 4, kind: FieldKind::Float },
+                    Field { off: 0x18, size: 8, kind: FieldKind::Ptr(Some(0)) },
+                ],
+            },
+        ];
+        let c = defs[0].c_definition(&defs);
+        assert_eq!(
+            c,
+            "struct Node {\n    void** _vptr; // +0x0\n    uint8_t _gap_8[0x8];\n    float field_10; // +0x10\n    uint8_t _gap_14[0x4];\n    struct Node* field_18; // +0x18\n};"
+        );
+    }
+}

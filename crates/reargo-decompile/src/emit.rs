@@ -88,6 +88,8 @@ pub struct CEmitter<'a> {
     /// `fxch` printed as one swap, at its last copy (WS90, `swap::find`), and the copies hidden.
     swaps: rustc_hash::FxHashMap<usize, (crate::ssa::VarId, crate::ssa::VarId)>,
     swap_hidden: rustc_hash::FxHashSet<usize>,
+    /// Struct fields and virtual calls (WS91, `structs`); `None`: every access prints raw.
+    structs: Option<&'a crate::structs::StructView>,
 }
 
 /// Temporaries printed as the register they are copied to (WS88, `inline::coalesced`): the
@@ -144,6 +146,7 @@ impl CEmitter<'static> {
             cas_hidden: Default::default(),
             swaps: Default::default(),
             swap_hidden: Default::default(),
+            structs: None,
         }
     }
 }
@@ -187,6 +190,7 @@ impl<'a> CEmitter<'a> {
             cas_hidden: Default::default(),
             swaps: Default::default(),
             swap_hidden: Default::default(),
+            structs: None,
         }
     }
 
@@ -211,6 +215,12 @@ impl<'a> CEmitter<'a> {
         renderings: &'a BTreeMap<u64, String>,
     ) -> Self {
         self.call_renderings = Some(renderings);
+        self
+    }
+
+    /// Print struct fields and virtual calls from `view` (WS91).
+    pub fn with_structs(mut self, view: &'a crate::structs::StructView) -> Self {
+        self.structs = Some(view);
         self
     }
 
@@ -256,7 +266,21 @@ impl<'a> CEmitter<'a> {
         self.folded.extend(hidden);
         self.folded.extend(inlined);
         self.select_conds = conds;
+        // WS91: a vtable pointer loaded only for `obj->vfn_n()` calls prints in them
+        if let Some(sv) = self.structs {
+            let inl: rustc_hash::FxHashSet<usize> = self.inlined.borrow().values().copied().collect();
+            let vptrs = sv.folded_vptr_loads(func, &|o| inl.contains(&o), &|c| self.member_call(func, &func.ops[c]).is_some());
+            self.folded.extend(vptrs);
+        }
         let mut sig = infer_signature(func);
+        // WS91: a parameter pointing to a struct is typed so
+        if let Some(sv) = self.structs {
+            for (ty, name) in sig.params.iter_mut() {
+                if let Some(d) = sv.param_def(func, name, &|r| reg_name(r.offset, r.size)) {
+                    *ty = format!("struct {}*", sv.defs[d].name);
+                }
+            }
+        }
         // the stack arguments (WS88) after the register parameters
         sig.params.extend(self.frame.slots().filter(|s| s.is_arg()).map(|s| match s.c_declaration().rsplit_once(' ') {
             Some((ty, name)) => (ty.to_string(), name.to_string()),
@@ -284,6 +308,11 @@ impl<'a> CEmitter<'a> {
 
     fn emit_var_declarations(&mut self, func: &SsaFunction, params: &std::collections::BTreeSet<&str>) {
         let mut declared = std::collections::BTreeSet::new();
+        // WS91: a register that points to one struct wherever the body assigns it is typed so
+        let typed = match self.structs {
+            Some(sv) => sv.register_defs(func, &|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d)),
+            None => Default::default(),
+        };
         for vn in &func.varnodes {
             // only registers the body assigns: a dead definition (most of a call's clobbers,
             // view syncs nobody reads) is not printed, so declaring it is noise
@@ -295,7 +324,11 @@ impl<'a> CEmitter<'a> {
             {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
-                    let type_name = if crate::flags::named_flag(vn.data.offset).is_some() { "bool" } else { size_to_type(vn.data.size) };
+                    let type_name = match (self.structs, typed.get(&vn.data.offset)) {
+                        (Some(sv), Some(&d)) if vn.data.size == 8 => format!("struct {}*", sv.defs[d].name),
+                        _ if crate::flags::named_flag(vn.data.offset).is_some() => "bool".to_string(),
+                        _ => size_to_type(vn.data.size).to_string(),
+                    };
                     let var_name = reg_name(vn.data.offset, vn.data.size);
                     if !params.contains(var_name.as_str()) {
                         linef!(self, "{} {};", type_name, var_name);
@@ -601,8 +634,23 @@ impl<'a> CEmitter<'a> {
                 if is_switch_index_copy(func, op) {
                     return None;
                 }
+                // a field's address copied to a register (WS91): `rdi = &rbx->field_98;`
+                if func.varnodes[op.output? as usize].data.space == SpaceId::REGISTER
+                    && let Some(d) = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[0])).copied()
+                    && let Some(sv) = self.structs
+                    && let Some((bi, f)) = sv.field_address(func, &func.ops[d])
+                {
+                    let base = self.input_expr(func, &func.ops[d], bi);
+                    if is_identifier(&base) {
+                        return Some(format!("{dst} = &{base}->{};", f.name()));
+                    }
+                }
                 let src = self.input_expr(func, op, 0);
                 Some(format!("{} = {};", dst, src))
+            }
+            // the address of a struct field (WS91): `rdi = &rbx->field_98;`
+            OpCode::IntAdd if self.field_address(func, op).is_some() => {
+                Some(format!("{} = {};", out_name?, self.field_address(func, op)?))
             }
             OpCode::IntAdd => {
                 let dst = out_name?;
@@ -1036,6 +1084,10 @@ impl<'a> CEmitter<'a> {
                 if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, out_size, false, false)) {
                     return Some(format!("{dst} = {slot};"));
                 }
+                // a struct field (WS91)
+                if let Some(f) = self.field_access(func, op, false) {
+                    return Some(format!("{dst} = {f};"));
+                }
                 let addr = self.input_expr(func, op, 1);
                 Some(format!("{} = *({}*){};", dst, size_to_type(out_size), addr))
             }
@@ -1062,6 +1114,19 @@ impl<'a> CEmitter<'a> {
                 };
                 if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, size, true, false)) {
                     return Some(format!("{slot} = {val};"));
+                }
+                if let Some(f) = self.field_access(func, op, true) {
+                    // (a constructor's vtable store names the class)
+                    let class = self.structs.and_then(|sv| {
+                        let a = sv.access.get(&op.index)?;
+                        let d = &sv.defs[a.def];
+                        let k = func.varnodes[*op.inputs.get(2)? as usize].data;
+                        (d.fields[a.field].kind == crate::structs::FieldKind::VPtr && k.space == SpaceId::CONST && d.vtable == Some(k.offset)).then(|| d.class.clone())?
+                    });
+                    return Some(match class {
+                        Some(c) => format!("{f} = {val};  // vtable of {c}"),
+                        None => format!("{f} = {val};"),
+                    });
                 }
                 let addr = self.input_expr(func, op, 1);
                 Some(format!("*({}*){} = {};", size_to_type(size), addr, val))
@@ -1128,6 +1193,19 @@ impl<'a> CEmitter<'a> {
                     .unwrap_or_default();
                 // WS79: an implementation of the slot, from the vtable of a class the function
                 // is a method of
+                // WS91: `obj->vfn_6(…)`, the slot's function named when the object's class is known
+                if let Some((obj, n, resolved)) = self.member_call(func, op) {
+                    let ann = match (resolved, func.vcall_targets.get(&op.address)) {
+                        (Some(m), _) => format!("  // vfn[{n}] (vtable+0x{:x}) = {m}", n * 8),
+                        // (an implementation from a vtable of `this`'s classes, WS79)
+                        (None, Some(t)) => {
+                            let name = self.symbol_names.get(t).cloned().unwrap_or_else(|| format!("0x{t:x}"));
+                            format!("  // vfn[{n}] (vtable+0x{:x}) e.g. {name}", n * 8)
+                        }
+                        (None, None) => format!("  // vfn[{n}] (vtable+0x{:x})", n * 8),
+                    };
+                    return Some(format!("{assign}{obj}->vfn_{n}({});{ann}", args[1..].join(", ")));
+                }
                 let ann = match func.vcall_targets.get(&op.address) {
                     Some(t) => {
                         let name = self.symbol_names.get(t).cloned().unwrap_or_else(|| format!("0x{t:x}"));
@@ -1208,6 +1286,62 @@ impl<'a> CEmitter<'a> {
                 Some(format!("{} = {}(...);", dst, op.opcode.name()))
             }
         }
+    }
+
+    /// A load / store of a struct field as `base->field_k` (WS91), when its address prints in
+    /// place: the address is the base itself, or `base + k` inlined into this access. A narrower
+    /// access at the field's start goes through the field: `(uint32_t)p->field_8` (an integer
+    /// field read), `*(uint32_t*)&p->field_8` (written, or a float / pointer field).
+    fn field_access(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, store: bool) -> Option<String> {
+        let sv = self.structs?;
+        let a = sv.access.get(&op.index)?;
+        let addr = *op.inputs.get(1)?;
+        let base = match a.add {
+            Some(d) => {
+                if self.inlined.borrow().get(&crate::condition::value_key(func, addr)) != Some(&d) {
+                    return None;
+                }
+                self.input_expr(func, &func.ops[d], a.base_input)
+            }
+            None => self.input_expr(func, op, 1),
+        };
+        if !(is_identifier(&base) || crate::condition::is_member(&base)) {
+            return None;
+        }
+        let f = &sv.defs[a.def].fields[a.field];
+        let m = format!("{base}->{}", f.name());
+        Some(if a.size == f.size {
+            m
+        } else if store || f.kind != crate::structs::FieldKind::Int {
+            format!("*({}*)&{m}", size_to_type(a.size))
+        } else {
+            format!("({}){m}", size_to_type(a.size))
+        })
+    }
+
+    /// `&base->field_k` for a register set to a struct pointer plus a field's offset (WS91).
+    fn field_address(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {
+        // (a register's own statement; a temporary inlined into an access stays `base + k`)
+        if !(op.output.is_some_and(|o| func.varnodes[o as usize].data.space == SpaceId::REGISTER) || self.coalesced.defs.contains_key(&op.index)) {
+            return None;
+        }
+        let (bi, f) = self.structs?.field_address(func, op)?;
+        let base = self.input_expr(func, op, bi);
+        is_identifier(&base).then(|| format!("&{base}->{}", f.name()))
+    }
+
+    /// A virtual call printed as `obj->vfn_n(…)` (WS91): the object's text, the slot number and
+    /// the slot's function when the object's class is known.
+    fn member_call(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<(String, u64, Option<String>)> {
+        let sv = self.structs?;
+        let vc = sv.member_call(func, op)?;
+        let obj = self.input_expr(func, op, 1);
+        if !(is_identifier(&obj) || crate::condition::is_member(&obj)) {
+            return None;
+        }
+        let def = &sv.defs[vc.def];
+        let resolved = vc.target.map(|t| crate::structs::method_name(self.symbol_names, def.class.as_deref(), t));
+        Some((obj, vc.slot / 8, resolved))
     }
 
     /// If `target` (a CALLIND callee) is a Load of `[base + const]` — the
@@ -1296,7 +1430,9 @@ impl<'a> CEmitter<'a> {
                 || op.opcode == OpCode::Copy
                 || (matches!(op.opcode, OpCode::Call | OpCode::CallOther) && idx > 0)
                 || (op.opcode == OpCode::CallInd && idx > 0);
-            return if whole || crate::condition::is_atomic(&rhs) || is_deref(&rhs) { rhs } else { format!("({rhs})") };
+            // (a cast of a struct field, `(uint16_t)p->field_8`, is unary like a dereference: WS91)
+            let unary_field = int_cast(&rhs).is_some_and(|(_, _, x)| crate::condition::is_member(x));
+            return if whole || crate::condition::is_atomic(&rhs) || is_deref(&rhs) || unary_field { rhs } else { format!("({rhs})") };
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
@@ -1345,6 +1481,14 @@ impl<'a> CEmitter<'a> {
             && is_deref(text)
         {
             return int_type_name(rest.split_once("*)")?.0);
+        }
+        // a struct field read whole (WS91): an integer field has its declared type
+        if let Some(sv) = self.structs
+            && crate::condition::is_member(text)
+            && let Some(a) = func.varnodes[v as usize].def_op.and_then(|d| sv.access.get(&d))
+        {
+            let f = &sv.defs[a.def].fields[a.field];
+            return (a.size == f.size && f.kind == crate::structs::FieldKind::Int && matches!(f.size, 1 | 2 | 4 | 8)).then_some((f.size, false));
         }
         let vn = &func.varnodes[v as usize];
         (vn.data.space == SpaceId::REGISTER && is_identifier(text) && text == varnode_name(vn) && matches!(vn.data.size, 1 | 2 | 4 | 8))

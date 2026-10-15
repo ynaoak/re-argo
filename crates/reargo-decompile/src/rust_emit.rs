@@ -67,6 +67,8 @@ pub struct RustEmitter<'a> {
     /// `fxch` printed as one swap, at its last copy (WS90, `swap::find`), and the copies hidden.
     swaps: rustc_hash::FxHashMap<usize, (crate::ssa::VarId, crate::ssa::VarId)>,
     swap_hidden: rustc_hash::FxHashSet<usize>,
+    /// Struct fields and virtual calls (WS91, as in C).
+    structs: Option<&'a crate::structs::StructView>,
 }
 
 impl Default for RustEmitter<'static> {
@@ -97,6 +99,7 @@ impl RustEmitter<'static> {
             cas_hidden: Default::default(),
             swaps: Default::default(),
             swap_hidden: Default::default(),
+            structs: None,
         }
     }
 }
@@ -127,6 +130,7 @@ impl<'a> RustEmitter<'a> {
             cas_hidden: Default::default(),
             swaps: Default::default(),
             swap_hidden: Default::default(),
+            structs: None,
         }
     }
 
@@ -150,10 +154,48 @@ impl<'a> RustEmitter<'a> {
         self
     }
 
+    /// Print struct fields and virtual calls from `view` (WS91, as in C).
+    pub fn with_structs(mut self, view: &'a crate::structs::StructView) -> Self {
+        self.structs = Some(view);
+        self
+    }
+
     /// Attach the merged short-circuit conditions (`condition::merge_short_circuits`).
     pub fn with_conditions(mut self, conds: &'a rustc_hash::FxHashMap<usize, crate::condition::Cond>) -> Self {
         self.conds = Some(conds);
         self
+    }
+
+    /// A virtual call printed as `(*obj).vfn_n(…)` (WS91), and the object's text.
+    fn member_call_obj(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<(&crate::structs::VCall, String)> {
+        let vc = self.structs?.member_call(func, op)?;
+        let obj = self.input_expr(func, op, 1);
+        crate::emit::is_identifier(&obj).then_some((vc, obj))
+    }
+
+    /// The place `(*base).field_k` of a struct field access (WS91, as `CEmitter::field_access`),
+    /// with the field. The base is a variable or another field place.
+    fn field_place(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<(String, crate::structs::Field)> {
+        let sv = self.structs?;
+        let a = sv.access.get(&op.index)?;
+        let addr = *op.inputs.get(1)?;
+        let base = match a.add {
+            Some(d) => {
+                if self.inlined.borrow().get(&crate::condition::value_key(func, addr)) != Some(&d) {
+                    return None;
+                }
+                self.input_expr(func, &func.ops[d], a.base_input)
+            }
+            None => self.input_expr(func, op, 1),
+        };
+        // (a field loaded in place prints `unsafe { (*p).field_8 }`: its place is the base)
+        let base = match base.strip_prefix("unsafe { ").and_then(|b| b.strip_suffix(" }")) {
+            Some(inner) if inner.starts_with("(*") && !inner.contains(" as ") => inner.to_string(),
+            _ if crate::emit::is_identifier(&base) => base,
+            _ => return None,
+        };
+        let f = sv.defs[a.def].fields[a.field].clone();
+        Some((format!("(*{base}).{}", f.name()), f))
     }
 
     pub fn emit_function(
@@ -190,7 +232,21 @@ impl<'a> RustEmitter<'a> {
         self.folded.extend(hidden);
         self.folded.extend(inlined);
         self.select_conds = conds;
+        // WS91: a vtable pointer loaded only for `obj.vfn_n()` calls prints in them (as in C)
+        if let Some(sv) = self.structs {
+            let inl: rustc_hash::FxHashSet<usize> = self.inlined.borrow().values().copied().collect();
+            let vptrs = sv.folded_vptr_loads(func, &|o| inl.contains(&o), &|c| self.member_call_obj(func, &func.ops[c]).is_some());
+            self.folded.extend(vptrs);
+        }
         let mut sig = infer_signature(func);
+        // WS91: a parameter pointing to a struct is typed so
+        if let Some(sv) = self.structs {
+            for (name, ty) in sig.params.iter_mut() {
+                if let Some(d) = sv.param_def(func, name, &|r| reg_name(r.offset, r.size)) {
+                    *ty = format!("*mut {}", crate::structs::rust_ident(&sv.defs[d].name));
+                }
+            }
+        }
         // the stack arguments (WS88) after the register parameters
         sig.params.extend(self.frame.slots().filter(|s| s.is_arg()).map(|s| (s.name(), s.rust_type())));
         self.line(&sig.to_rust_declaration(&func.name));
@@ -209,6 +265,11 @@ impl<'a> RustEmitter<'a> {
 
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
         let mut declared = std::collections::BTreeSet::new();
+        // WS91: a register that points to one struct wherever the body assigns it (as in C)
+        let typed = match self.structs {
+            Some(sv) => sv.register_defs(func, &|d| !func.ops[d].dead && !self.folded.contains(&d) && !self.noise.contains(&d)),
+            None => Default::default(),
+        };
         for vn in &func.varnodes {
             if vn.data.space == SpaceId::REGISTER
                 && vn.def_op.is_some_and(|d| {
@@ -218,7 +279,10 @@ impl<'a> RustEmitter<'a> {
             {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
-                    let type_name = size_to_rust_type(vn.data.size);
+                    let type_name = match (self.structs, typed.get(&vn.data.offset)) {
+                        (Some(sv), Some(&d)) if vn.data.size == 8 => format!("*mut {}", crate::structs::rust_ident(&sv.defs[d].name)),
+                        _ => size_to_rust_type(vn.data.size).to_string(),
+                    };
                     let var_name = reg_name(vn.data.offset, vn.data.size);
                     linef!(self, "let mut {}: {};", var_name, type_name);
                 }
@@ -874,6 +938,16 @@ impl<'a> RustEmitter<'a> {
                         false => format!("{dst} = {};", crate::emit::strip_outer_parens(&slot)),
                     });
                 }
+                // a struct field (WS91): `unsafe { (*rdi).field_10 }`
+                if let Some((place, f)) = self.field_place(func, op) {
+                    return Some(if out_size == f.size {
+                        format!("{dst} = unsafe {{ {place} }};")
+                    } else if f.kind == crate::structs::FieldKind::Int {
+                        format!("{dst} = unsafe {{ {place} }} as {};", size_to_rust_type(out_size))
+                    } else {
+                        format!("{dst} = unsafe {{ *(&raw const {place} as *const {}) }};", size_to_rust_type(out_size))
+                    });
+                }
                 let addr = self.input_expr(func, op, 1);
                 let ty = size_to_rust_type(out_size);
                 Some(format!(
@@ -907,6 +981,13 @@ impl<'a> RustEmitter<'a> {
                     return Some(match slot.starts_with('*') {
                         true => format!("unsafe {{ {slot} = {val}; }}"),
                         false => format!("{slot} = {val};"),
+                    });
+                }
+                if let Some((place, f)) = self.field_place(func, op) {
+                    return Some(if size == f.size {
+                        format!("unsafe {{ {place} = {val}; }}")
+                    } else {
+                        format!("unsafe {{ *(&raw mut {place} as *mut {}) = {val}; }}", size_to_rust_type(size))
                     });
                 }
                 let addr = self.input_expr(func, op, 1);
@@ -948,6 +1029,18 @@ impl<'a> RustEmitter<'a> {
                 let assign = crate::emit::call_result(func, op)
                     .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
                     .unwrap_or_default();
+                // WS91: `unsafe { (*rdi).vfn_6(rsi) }`, as in C
+                if let Some(sv) = self.structs
+                    && let Some((vc, obj)) = self.member_call_obj(func, op)
+                {
+                    let n = vc.slot / 8;
+                    let ann = match (vc.target, func.vcall_targets.get(&op.address)) {
+                        (Some(t), _) => format!(" // vfn[{n}] (vtable+0x{:x}) = {}", vc.slot, crate::structs::method_name(self.symbol_names, sv.defs[vc.def].class.as_deref(), t)),
+                        (None, Some(t)) => format!(" // vfn[{n}] (vtable+0x{:x}) e.g. {}", vc.slot, self.symbol_names.get(t).cloned().unwrap_or_else(|| format!("0x{t:x}"))),
+                        (None, None) => format!(" // vfn[{n}] (vtable+0x{:x})", vc.slot),
+                    };
+                    return Some(format!("{assign}unsafe {{ (*{obj}).vfn_{n}({}) }};{ann}", args[1..].join(", ")));
+                }
                 Some(format!("{assign}(*{})({});", target, args.join(", ")))
             }
             OpCode::Indirect => {
