@@ -27,8 +27,16 @@ use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
-use crate::callsite::resolve_call_sites_iterative;
+use crate::callsite::{
+    resolve_call_sites_iterative_from, walk_function_with, FunctionWalk, ParamSummaries,
+};
+use crate::func_lift::{function_jobs, lift_function};
 use crate::signatures::{FunctionSignature, SignatureDatabase};
+use rayon::prelude::*;
+
+/// What the shared lift of one function yields: its round-0 call-site
+/// walk, its `cfg_const` snapshots and its VSA snapshots.
+type FunctionResults = (FunctionWalk, crate::cfg_const::CallSnapshots, crate::vsa::CallSnapshots);
 
 pub struct CallSiteAnnotator;
 
@@ -62,6 +70,38 @@ impl Analyzer for CallSiteAnnotator {
         }
 
         let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
+        // One parallel pass lifts each function once and runs on that
+        // lift the three per-function analyses below (round 0 of the
+        // call-site resolver, the CFG constant tracker and VSA); the
+        // lift is dropped as soon as they are done, so memory stays at
+        // one lift per worker thread. Results are merged in listing
+        // order, as the sequential passes did.
+        let empty = ParamSummaries::default();
+        let per_func: Vec<FunctionResults> = function_jobs(program)
+            .par_iter()
+            .map(|&(entry, max_insns)| {
+                let Some(insns) = lift_function(&*lifter, program, entry, max_insns) else {
+                    let walk = FunctionWalk { entry, max_insns, sites: None };
+                    return (walk, Vec::new(), Vec::new());
+                };
+                let external = crate::func_lift::external_entries(program, &insns);
+                let sites = Some(walk_function_with(program, entry, &insns, &empty, &external));
+                (
+                    FunctionWalk { entry, max_insns, sites },
+                    crate::cfg_const::function_snapshots_with(program, entry, &insns, &external),
+                    crate::vsa::function_snapshots_with(program, entry, &insns, &external),
+                )
+            })
+            .collect();
+        let mut round0 = Vec::with_capacity(per_func.len());
+        let mut cfg_constants = crate::cfg_const::CallConstants::new();
+        let mut vsa_constants = crate::vsa::VsaResult::new();
+        for (walk, cfg_snaps, vsa_snaps) in per_func {
+            round0.push(walk);
+            crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
+            crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
+        }
+
         // Iterative inter-procedural resolver: a function whose
         // parameter has a *single* observed value across all
         // observed call sites is treated as a compile-time constant
@@ -69,23 +109,23 @@ impl Analyzer for CallSiteAnnotator {
         // constants through callback chains like
         //   register_parser(my_parser) -> list_add(my_parser) -> …
         // 4 rounds is enough for everything we've measured.
-        let mut sites = resolve_call_sites_iterative(&*lifter, program, 4)?;
+        let mut sites = resolve_call_sites_iterative_from(&*lifter, program, &round0, 4)?;
+        drop(round0);
 
         // Layer multi-block CFG-aware constant propagation on top:
         // anywhere the iterative resolver came back with `?` for an
-        // arg register, ask the CFG tracker whether it can pin a
-        // value by joining predecessor states. This is the "format
-        // string set in one block, used in the next" pattern that
-        // the linear resolver misses.
-        let cfg_constants = crate::cfg_const::build_call_constants(&*lifter, program);
-        // VSA runs on the same lifted P-code stream but tracks
-        // abstract value sets / ranges instead of point constants.
-        // When the iterative + cfg_const passes both gave `?`, ask
-        // VSA whether the value's still pinned (single set / degenerate
-        // range), which catches arguments built from a conditional
-        // join with two equal-valued predecessors that the point
-        // tracker can't represent.
-        let vsa_constants = crate::vsa::run_vsa(&*lifter, program);
+        // arg register, ask the CFG tracker (`cfg_constants`) whether
+        // it can pin a value by joining predecessor states. This is
+        // the "format string set in one block, used in the next"
+        // pattern that the linear resolver misses.
+        //
+        // VSA (`vsa_constants`) runs on the same lifted P-code stream
+        // but tracks abstract value sets / ranges instead of point
+        // constants. When the iterative + cfg_const passes both gave
+        // `?`, ask VSA whether the value's still pinned (single set /
+        // degenerate range), which catches arguments built from a
+        // conditional join with two equal-valued predecessors that the
+        // point tracker can't represent.
         for site in sites.iter_mut() {
             let snap = cfg_constants.get(&site.call_site);
             let vsa_snap = vsa_constants.get(&site.call_site);

@@ -76,6 +76,11 @@ impl Listing {
         self.functions.len()
     }
 
+    /// The first function whose entry is above `address`.
+    pub fn next_function_after(&self, address: u64) -> Option<&Function> {
+        self.functions.range(address.saturating_add(1)..).next().map(|(_, f)| f)
+    }
+
     pub fn function_containing(&self, address: u64) -> Option<&Function> {
         self.functions
             .range(..=address)

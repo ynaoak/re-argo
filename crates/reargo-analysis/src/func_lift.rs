@@ -1,0 +1,83 @@
+//! Per-function lifting shared by the call-site passes.
+//!
+//! `callsite`, `cfg_const` and `vsa` all walk every function's lifted
+//! P-code, lifted the same way: from the entry, `max(body bytes, 500)`
+//! instructions. These helpers fix that budget and the function order
+//! in one place so the passes can share one lift per function.
+
+use reargo_lift::{LiftedInstruction, PcodeLift};
+use reargo_program::Program;
+
+/// Instruction budget used for a function: the sum of its body range
+/// sizes in bytes, at least 500.
+pub fn lift_budget(func: &reargo_program::Function) -> usize {
+    func.body
+        .ranges()
+        .map(|r| r.size as usize)
+        .sum::<usize>()
+        .max(500)
+}
+
+/// `(entry, instruction budget)` of every function, in
+/// `program.listing.functions()` order.
+pub fn function_jobs(program: &Program) -> Vec<(u64, usize)> {
+    program
+        .listing
+        .functions()
+        .map(|f| (f.entry_point, lift_budget(f)))
+        .collect()
+}
+
+/// Lift one function; `None` when the lift errors (the passes skip
+/// such functions).
+pub fn lift_function(
+    lifter: &dyn PcodeLift,
+    program: &Program,
+    entry: u64,
+    max_insns: usize,
+) -> Option<Vec<LiftedInstruction>> {
+    lifter
+        .lift_range(&program.info.memory, entry, max_insns)
+        .ok()
+}
+
+/// Whether the instruction at `addr` belongs to the function at
+/// `entry`. A lift runs linearly past the function's end (and a lift
+/// from a bogus interior entry starts mid-function), so a pass that
+/// records per-instruction results keeps only the ones of the function
+/// it walked: another function's view of the code has the wrong
+/// predecessors.
+pub fn owns(program: &Program, entry: u64, addr: u64) -> bool {
+    program.listing.function_containing(addr).map(|f| f.entry_point) == Some(entry)
+}
+
+/// Instructions of `insns` that control can reach other than along
+/// the jumps and fall-throughs of `insns` itself: the targets of a
+/// recovered jump table (`IndirectJump` references) and of a jump from
+/// code outside the lift (a `.cold` part jumping back, another
+/// function's tail jump into the middle). A tracker must not assume
+/// it knows the state on entry to them.
+pub fn external_entries(program: &Program, insns: &[LiftedInstruction]) -> std::collections::BTreeSet<u64> {
+    use reargo_program::RefType;
+    // a linear lift: addresses increase
+    let lifted = |a: u64| insns.binary_search_by_key(&a, |i| i.address).is_ok();
+    insns
+        .iter()
+        .filter(|insn| {
+            program.references.get_refs_to(insn.address).iter().any(|r| match r.ref_type {
+                RefType::IndirectJump => true,
+                RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
+                _ => false,
+            })
+        })
+        .map(|insn| insn.address)
+        .collect()
+}
+
+/// Whether `addr` lies between the entry of the function at `entry`
+/// and the next function's entry: its body, including the parts the
+/// listing has not attributed to it (jump-table cases no discovery
+/// followed).
+pub fn in_extent(program: &Program, entry: u64, addr: u64) -> bool {
+    addr >= entry && program.listing.next_function_after(entry).is_none_or(|f| addr < f.entry_point)
+}
