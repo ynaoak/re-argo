@@ -709,14 +709,16 @@ impl<'a> CEmitter<'a> {
                 // implementation-defined width and would silently truncate
                 // 64-bit operands to 32 bits).
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({}){} < ({}){};", dst, ty, a, ty, b))
+                let w = func.varnodes[op.inputs[0] as usize].data.size;
+                Some(format!("{} = {} < {};", dst, signed_operand(ty, w, &a), signed_operand(ty, w, &b)))
             }
             OpCode::IntSLessEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({}){} <= ({}){};", dst, ty, a, ty, b))
+                let w = func.varnodes[op.inputs[0] as usize].data.size;
+                Some(format!("{} = {} <= {};", dst, signed_operand(ty, w, &a), signed_operand(ty, w, &b)))
             }
             OpCode::IntLess => {
                 let dst = out_name?;
@@ -1989,6 +1991,17 @@ fn text_int_type(s: &str) -> Option<(u32, bool)> {
     int_cast(s).map(|(k, signed, _)| (k, signed)).or_else(|| s.strip_prefix("*(").filter(|_| is_deref(s)).and_then(|r| int_type_name(r.split_once("*)")?.0)))
 }
 
+/// `(intW_t)text` for a signed comparison's operand (WS90), without a cast of the same width
+/// under it: `(int32_t)((uint32_t)*(uint64_t*)(rsp + 0x18))` is `(int32_t)*(uint64_t*)(rsp + 0x18)`
+/// — both keep the value modulo 2^W read as two's complement (C's conversion to a signed type
+/// out of its range is implementation-defined; GCC and Clang define it so).
+fn signed_operand(ty: &str, w: u32, text: &str) -> String {
+    match int_cast(strip_outer_parens(text)) {
+        Some((cw, _, y)) if cw == w => format!("({ty}){y}"),
+        _ => format!("({ty}){text}"),
+    }
+}
+
 /// `(uintA_t)(uintB_t)…x` with the casts made minimal (WS90): an unsigned cast whose operand
 /// is an unsigned cast to a type no wider is the identity on its value, so it goes —
 /// `(uint32_t)(uint8_t)x` stays, `(uint32_t)(uint32_t)x` and `(uint32_t)(uint16_t)(uint8_t)x`
@@ -2222,6 +2235,12 @@ pub(crate) fn select_conditions(
 /// Longest expression printed inside its reader (WS86).
 pub(crate) const MAX_INLINE_LEN: usize = 100;
 
+/// A dereference or an integer cast covering the whole text: a unary expression, no
+/// parentheses needed around it as an operand (WS90).
+pub(crate) fn is_unary(s: &str) -> bool {
+    is_deref(s) || int_cast(s).is_some()
+}
+
 /// `*(T*)x` with `x` atomic: a unary expression, no parentheses needed around it.
 fn is_deref(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("*(") else { return false };
@@ -2322,6 +2341,10 @@ mod tests {
         assert_eq!(drop_widening_casts("(uint32_t)(int8_t)x"), "(uint32_t)(int8_t)x");
         assert_eq!(drop_widening_casts("(uint32_t)x + 1"), "(uint32_t)x + 1");
         assert_eq!(drop_widening_casts("(uint32_t)*(uint8_t*)(rbx + 1)"), "*(uint8_t*)(rbx + 1)");
+        assert_eq!(signed_operand("int32_t", 4, "((uint32_t)(*(uint64_t*)(rsp + 0x18)))"), "(int32_t)(*(uint64_t*)(rsp + 0x18))");
+        assert_eq!(signed_operand("int32_t", 4, "((uint32_t)rax)"), "(int32_t)rax");
+        assert_eq!(signed_operand("int32_t", 4, "((uint16_t)rax)"), "(int32_t)((uint16_t)rax)");
+        assert_eq!(signed_operand("int32_t", 4, "ebp"), "(int32_t)ebp");
         assert_eq!(drop_widening_casts("(uint8_t)*(uint32_t*)rbx"), "(uint8_t)*(uint32_t*)rbx");
     }
     use crate::cfg::ControlFlowGraph;

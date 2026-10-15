@@ -682,7 +682,9 @@ impl Inliner {
             return None;
         }
         let s = exprs.get(&value_key(func, v))?;
-        Some(if is_atomic(s) { s.clone() } else { format!("({s})") })
+        // (WS90: a dereference or an integer cast is a unary expression too: `(int32_t)*(uint32_t*)rsp`,
+        // `(uint32_t)*(uint8_t*)(rax + 4) ^ 0x47`)
+        Some(if is_atomic(s) || crate::emit::is_unary(s) { s.clone() } else { format!("({s})") })
     }
 
     fn parts(&self, func: &SsaFunction) -> (&Vec<Vec<OpIdx>>, &Readers) {

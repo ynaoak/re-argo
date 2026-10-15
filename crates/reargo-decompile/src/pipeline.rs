@@ -4210,4 +4210,14 @@ mod tests {
             assert!(c.contains(&format!("{f} = ")), "{f} is never assigned: {c}");
         }
     }
+
+    /// WS90: a signed comparison of a truncated value casts once, and a dereference / cast
+    /// folded into a condition needs no parentheses (`(int32_t)((uint32_t)(*(uint64_t*)(…)))`).
+    #[test]
+    fn signed_compare_of_a_truncated_load_casts_once() {
+        // cmp esi, [rdi+0x18] (32-bit view of a 64-bit slot read as 32); jl L; mov eax, 1; ret; L: xor eax, eax; ret
+        let c = c_of(&[0x48, 0x8b, 0x47, 0x18, 0x39, 0xc6, 0x7c, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3]);
+        assert!(!c.contains("(int32_t)((uint32_t)") && !c.contains("(int32_t)(uint32_t)"), "{c}");
+        assert!(c.contains("(int32_t)esi < (int32_t)*(uint64_t*)(rdi + 0x18)") || c.contains("(int32_t)esi < (int32_t)(*(uint64_t*)(rdi + 0x18))"), "{c}");
+    }
 }
