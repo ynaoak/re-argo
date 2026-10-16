@@ -273,7 +273,9 @@ fn scan_with(
     // Decoded-byte printability per source byte value.
     let printable: [bool; 256] = std::array::from_fn(|b| is_printable(decode(b as u8)));
     let n = buf.len();
-    let m = opts.min_length;
+    // A zero minimum would count an empty run as a hit and never
+    // advance; clamp to 1 (identical behaviour for every m >= 1).
+    let m = opts.min_length.max(1);
     // Every maximal printable run of at least `m` bytes is examined,
     // in address order (a shorter run is skipped whole). `i` is always
     // the start of a maximal run (0 or just past a non-printable byte),
@@ -454,6 +456,21 @@ mod tests {
                 i += 1;
             }
         }
+    }
+
+    #[test]
+    fn min_length_zero_terminates() {
+        let mut buf = vec![0x01u8, 0x02, 0xff];
+        buf.extend_from_slice(b"HelloWorldKey");
+        buf.extend_from_slice(&[0x00, 0x80, 0x90]);
+        let opts = FlossOptions { min_length: 0, try_add: true, ..FlossOptions::default() };
+        let zero = decode_section(&buf, 0x1000, &opts);
+        let one = decode_section(&buf, 0x1000, &FlossOptions { min_length: 1, ..opts });
+        assert_eq!(zero.len(), one.len());
+        assert!(zero.iter().all(|d| !d.plaintext.is_empty()));
+        let mut out = Vec::new();
+        scan_with(&buf, 0x1000, &opts, &mut out, |b| b, DecodeMethod::Xor(0));
+        assert!(out.iter().all(|d| !d.plaintext.is_empty()));
     }
 
     #[test]

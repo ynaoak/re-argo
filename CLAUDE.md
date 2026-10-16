@@ -709,7 +709,7 @@ FLOSS-lite obfuscated-string decoder. Brute-force XOR (and optionally ROL / ADD)
 
 | Flag | Purpose |
 |---|---|
-| `--min-length N` | Minimum decoded-string length (default 8). Higher values cut noise. |
+| `--min-length N` | Minimum decoded-string length (default 8; 0 is treated as 1). Higher values cut noise. |
 | `--with-add` | Also try ADD-decode (default off — ADD is rarer and noisier) |
 | `--limit N` | Print only the first N hits (default 200, 0 = unlimited) |
 | `--include-printable-source` | Drop the conservative "encoded bytes must be non-printable" filter — noisier but catches the edge case where the encoded form also happens to be printable |
