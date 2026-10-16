@@ -338,15 +338,36 @@ impl<'a> CalleeParams<'a> {
     /// neighbouring bodies' overlapping ranges once per run of entries on a thread (x86 only;
     /// what a lookup would compute itself, so the answers do not change).
     pub fn prefill(&self, entries: &[u64]) {
-        use rayon::prelude::*;
         let Some(x86) = self.lifter.as_x86() else { return };
-        let mut entries: Vec<u64> = entries.to_vec();
-        entries.sort_unstable();
-        entries.dedup();
-        if let Ok(m) = self.summary_memo.lock() {
-            entries.retain(|e| !m.contains_key(e));
+        let mut todo: Vec<u64> = entries.to_vec();
+        // the entries' own parameters are looked up at the full depth: their inner calls one
+        // level below, those calls' callees another
+        for round in 0..=MAX_DEPTH {
+            let done = self.prefill_round(x86, todo);
+            if round == MAX_DEPTH {
+                break;
+            }
+            let mut next = Vec::new();
+            for s in done.iter().flatten() {
+                next.extend(s.calls.iter().filter_map(|c| c.target));
+                next.extend(s.ret_sites.iter().filter_map(|r| match r {
+                    RetSite::Call(t) => *t,
+                    RetSite::Kind(_) => None,
+                }));
+            }
+            todo = next;
         }
-        let done: Vec<(u64, Option<std::sync::Arc<Summary>>)> = entries
+    }
+
+    /// The summaries of `todo` not computed yet, computed in address order (and memoised).
+    fn prefill_round(&self, x86: &reargo_lift::x86::X86Lifter, mut todo: Vec<u64>) -> Vec<Option<std::sync::Arc<Summary>>> {
+        use rayon::prelude::*;
+        todo.sort_unstable();
+        todo.dedup();
+        if let Ok(m) = self.summary_memo.lock() {
+            todo.retain(|e| !m.contains_key(e));
+        }
+        let done: Vec<(u64, Option<std::sync::Arc<Summary>>)> = todo
             .par_iter()
             .with_min_len(64)
             .map_init(reargo_lift::x86::LiftCache::new, |cache, &e| {
@@ -355,11 +376,14 @@ impl<'a> CalleeParams<'a> {
                 (e, self.summarize_lifted(e, &range.insns()).map(std::sync::Arc::new))
             })
             .collect();
+        let mut out = Vec::with_capacity(done.len());
         if let Ok(mut m) = self.summary_memo.lock() {
             for (e, s) in done {
+                out.push(s.clone());
                 m.entry(e).or_insert(s);
             }
         }
+        out
     }
 
     fn summarize_body(&self, cfg: ControlFlowGraph, truncated: bool) -> Summary {
