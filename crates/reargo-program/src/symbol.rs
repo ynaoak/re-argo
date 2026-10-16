@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolType {
@@ -44,7 +44,11 @@ impl std::fmt::Display for Symbol {
 
 #[derive(Debug, Default)]
 pub struct SymbolTable {
-    by_address: HashMap<u64, Vec<Symbol>>,
+    /// Address-ordered so `iter()` / `function_symbols()` visit symbols
+    /// in the same order on every run (a `HashMap` here made the
+    /// analysis depend on the per-process hash seed).
+    by_address: BTreeMap<u64, Vec<Symbol>>,
+    /// Lookup only (never iterated), so hash order does not matter.
     by_name: HashMap<String, Vec<u64>>,
 }
 
