@@ -35,7 +35,7 @@ use reargo_loader::SectionFlags;
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Early};
 
 pub const DEFAULT_MIN_LENGTH: usize = 8;
 pub const MAX_KEYS_PER_BYTE: usize = 256;
@@ -84,43 +84,18 @@ impl Analyzer for FlossLiteAnalyzer {
     fn provides(&self) -> &'static [&'static str] {
         &["decoded_strings"]
     }
+    fn start_early(&self, program: &mut Program) {
+        // the sections' bytes are fixed for the run
+        let sections = section_bytes(program);
+        Early::<FlossLiteAnalyzer, usize>::start(program, move || count_decoded(sections, &pipeline_options()));
+    }
+
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        // Conservative defaults + min_length 12 (stricter than the
-        // CLI default) so the pipeline doesn't pollute tag space
-        // with brute-force noise. Users who want lower thresholds
-        // invoke `floss` directly.
-        let opts = FlossOptions {
-            min_length: 12,
-            ..FlossOptions::default()
+        let opts = pipeline_options();
+        let total = match Early::<FlossLiteAnalyzer, usize>::take(program) {
+            Some(total) => total,
+            None => count_decoded(section_bytes(program), &opts),
         };
-        let mut total = 0usize;
-        let mut sample: Option<DecodedString> = None;
-
-        let sections: Vec<(u64, u64)> = program
-            .info
-            .sections
-            .iter()
-            .filter(|s| {
-                s.size > 0
-                    && s.size <= 16 * 1024 * 1024
-                    && !s.flags.contains(SectionFlags::EXECUTE)
-            })
-            .map(|s| (s.address, s.size))
-            .collect();
-
-        for (addr, size) in sections {
-            let mut buf = vec![0u8; size as usize];
-            if program.info.memory.read_bytes(addr, &mut buf).is_err() {
-                continue;
-            }
-            let found = decode_section(&buf, addr, &opts);
-            if sample.is_none()
-                && let Some(d) = found.first()
-            {
-                sample = Some(d.clone());
-            }
-            total += found.len();
-        }
 
         // Only emit a single `obfuscated-string` tag at the entry
         // point summarising the count. Per-string tags would flood
@@ -135,7 +110,6 @@ impl Analyzer for FlossLiteAnalyzer {
                 ),
                 true,
             );
-            let _ = sample;
         }
         program
             .metadata
@@ -148,6 +122,35 @@ impl Analyzer for FlossLiteAnalyzer {
             instructions_decoded: 0,
         })
     }
+}
+
+/// The pipeline's options: conservative defaults + min_length 12
+/// (stricter than the CLI default) so the pipeline doesn't pollute tag
+/// space with brute-force noise. Users who want lower thresholds
+/// invoke `floss` directly.
+fn pipeline_options() -> FlossOptions {
+    FlossOptions { min_length: 12, ..FlossOptions::default() }
+}
+
+/// The address and bytes of every section the pipeline scans
+/// (non-executable, non-empty, at most 16 MiB, readable).
+fn section_bytes(program: &Program) -> Vec<(u64, Vec<u8>)> {
+    program
+        .info
+        .sections
+        .iter()
+        .filter(|s| s.size > 0 && s.size <= 16 * 1024 * 1024 && !s.flags.contains(SectionFlags::EXECUTE))
+        .filter_map(|s| {
+            let mut buf = vec![0u8; s.size as usize];
+            program.info.memory.read_bytes(s.address, &mut buf).ok()?;
+            Some((s.address, buf))
+        })
+        .collect()
+}
+
+/// The number of strings [`decode_section`] finds in all of `sections`.
+fn count_decoded(sections: Vec<(u64, Vec<u8>)>, opts: &FlossOptions) -> usize {
+    sections.iter().map(|(addr, buf)| decode_section(buf, *addr, opts).len()).sum()
 }
 
 #[derive(Debug, Clone, Copy)]

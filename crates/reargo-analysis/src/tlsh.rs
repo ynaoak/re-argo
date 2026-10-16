@@ -66,8 +66,18 @@ impl Analyzer for TlshAnalyzer {
     fn provides(&self) -> &'static [&'static str] {
         &["tlsh"]
     }
+    fn start_early(&self, program: &mut Program) {
+        // the loaded bytes are fixed for the run
+        let buf = binary_bytes(&program.info);
+        crate::analyzer::Early::<TlshAnalyzer, Option<String>>::start(program, move || hash(&buf));
+    }
+
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        if let Some(h) = compute_for_binary(&program.info) {
+        let digest = match crate::analyzer::Early::<TlshAnalyzer, Option<String>>::take(program) {
+            Some(digest) => digest,
+            None => compute_for_binary(&program.info),
+        };
+        if let Some(h) = digest {
             program.metadata.set_property("tlsh", h);
             return Ok(AnalysisResult {
                 analyzer_name: self.name().into(),
@@ -91,6 +101,11 @@ impl Analyzer for TlshAnalyzer {
 /// PE / ELF header bytes (which would otherwise dominate small
 /// samples). For multi-MB binaries the header noise is negligible.
 pub fn compute_for_binary(info: &BinaryInfo) -> Option<String> {
+    hash(&binary_bytes(info))
+}
+
+/// The bytes [`compute_for_binary`] hashes.
+fn binary_bytes(info: &BinaryInfo) -> Vec<u8> {
     let mut buf = Vec::new();
     for block in info.memory.blocks() {
         if let Some(data) = &block.data {
@@ -100,7 +115,7 @@ pub fn compute_for_binary(info: &BinaryInfo) -> Option<String> {
             }
         }
     }
-    hash(&buf)
+    buf
 }
 
 /// Compute a TLSH digest over the input bytes. Returns `None` if the
