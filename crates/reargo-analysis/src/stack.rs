@@ -150,27 +150,40 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
         let plt_of_got = |g: u64| got.as_ref().and_then(|got| got.plt_of_got(g));
         let out = crate::range_lift::map_with_lifter(&program.info.memory, &jobs, |job, lifter| {
             let entry = job.entry;
-            let pcode = if x86_64 {
-                lifter.with(entry, job.pcode, |insns| crate::pcoderef::scan_lifted(insns, &sections))
+            let mut stack = None;
+            let mut propagation = Vec::new();
+            let mut pcode = Vec::new();
+            let mut indirect = Vec::new();
+            let mut convention = None;
+            let mut arity = 0;
+            // the lifts of the analyzers, each exactly `lift_range(entry,
+            // budget)`, from one walk of the largest
+            const STACK: usize = 0;
+            const PCODE: usize = 1;
+            const INDIRECT: usize = 2;
+            const ARITY: usize = 3;
+            const CONVENTION: usize = 4;
+            let budgets: &[usize] = if x86_64 {
+                &[STACK_LIFT_BUDGET, job.pcode, job.indirect, job.arity, crate::callingconv::LIFT_BUDGET]
             } else {
-                Vec::new()
+                &[STACK_LIFT_BUDGET]
             };
-            let indirect = if x86_64 && got.is_some() {
-                lifter.with(entry, job.indirect, |insns| crate::indirect_resolve::resolve_lifted(insns, &plt_of_got))
-            } else {
-                Vec::new()
-            };
-            let arity = if x86_64 { lifter.with(entry, job.arity, |insns| crate::arity::infer_arity(insns)) } else { 0 };
-            let (stack, propagation) = lifter.with(entry, STACK_LIFT_BUDGET, |insns| {
-                (stack_info_lifted(entry, insns), crate::propagation::analyse_lifted(insns, &valid_ranges))
+            lifter.with_budgets(entry, budgets, |k, insns| match k {
+                STACK => {
+                    stack = Some(stack_info_lifted(entry, insns));
+                    propagation = crate::propagation::analyse_lifted(insns, &valid_ranges);
+                }
+                PCODE => pcode = crate::pcoderef::scan_lifted(insns, &sections),
+                INDIRECT => {
+                    if got.is_some() {
+                        indirect = crate::indirect_resolve::resolve_lifted(insns, &plt_of_got);
+                    }
+                }
+                ARITY => arity = crate::arity::infer_arity(insns),
+                CONVENTION => convention = crate::callingconv::convention_lifted(entry, insns),
+                _ => unreachable!("one result per budget"),
             });
-            let convention = if x86_64 {
-                lifter.with(entry, crate::callingconv::LIFT_BUDGET, |insns| {
-                    crate::callingconv::convention_lifted(entry, insns)
-                })
-            } else {
-                None
-            };
+            let stack = stack.expect("the stack lift");
             Out { stack, propagation, pcode, indirect, convention, arity }
         });
         (out, got.is_some())

@@ -61,20 +61,25 @@ pub fn external_entries<I: std::borrow::Borrow<LiftedInstruction>>(
     program: &Program,
     insns: &[I],
 ) -> std::collections::BTreeSet<u64> {
+    external_entries_at(program, &insns.iter().map(|i| i.borrow().address).collect::<Vec<_>>())
+}
+
+/// [`external_entries`] of a lift given by the addresses of its
+/// instructions, in lift order.
+pub fn external_entries_at(program: &Program, addrs: &[u64]) -> std::collections::BTreeSet<u64> {
     use reargo_program::RefType;
     // a linear lift: addresses increase
-    let lifted = |a: u64| insns.binary_search_by_key(&a, |i| i.borrow().address).is_ok();
-    insns
+    let lifted = |a: u64| addrs.binary_search(&a).is_ok();
+    addrs
         .iter()
-        .map(std::borrow::Borrow::borrow)
-        .filter(|insn: &&LiftedInstruction| {
-            program.references.get_refs_to(insn.address).iter().any(|r| match r.ref_type {
+        .copied()
+        .filter(|&a| {
+            program.references.get_refs_to(a).iter().any(|r| match r.ref_type {
                 RefType::IndirectJump => true,
                 RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
                 _ => false,
             })
         })
-        .map(|insn| insn.address)
         .collect()
 }
 
@@ -101,16 +106,21 @@ impl JumpIndex {
         program: &Program,
         insns: &[I],
     ) -> std::collections::BTreeSet<u64> {
+        self.external_entries_at(program, &insns.iter().map(|i| i.borrow().address).collect::<Vec<_>>())
+    }
+
+    /// [`JumpIndex::external_entries`] of a lift given by the addresses
+    /// of its instructions, in lift order.
+    pub fn external_entries_at(&self, program: &Program, addrs: &[u64]) -> std::collections::BTreeSet<u64> {
         use reargo_program::RefType;
-        let addr = |i: &I| i.borrow().address;
-        if !insns.windows(2).all(|w| addr(&w[0]) < addr(&w[1])) {
-            return external_entries(program, insns);
+        if !addrs.windows(2).all(|w| w[0] < w[1]) {
+            return external_entries_at(program, addrs);
         }
         let mut out = std::collections::BTreeSet::new();
-        let (Some(first), Some(last)) = (insns.first().map(addr), insns.last().map(addr)) else {
+        let (Some(&first), Some(&last)) = (addrs.first(), addrs.last()) else {
             return out;
         };
-        let lifted = |a: u64| insns.binary_search_by_key(&a, addr).is_ok();
+        let lifted = |a: u64| addrs.binary_search(&a).is_ok();
         let start = self.refs.partition_point(|r| r.0 < first);
         for &(to, from, ty) in self.refs[start..].iter().take_while(|r| r.0 <= last) {
             let enters = match ty {

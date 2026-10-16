@@ -164,33 +164,124 @@ fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
 
 /// Memo for [`X86Lifter::lift_range_cached`]: the lift of each address alone,
 /// without the integer PF (`None` where it fails).
+///
+/// What a range walk reads of each entry (the link to the next instruction,
+/// the length, the flags) is kept in dense arrays beside the lifted
+/// instructions, so walking a range already lifted touches only those.
 #[derive(Default)]
 pub struct LiftCache {
-    /// Index in `lifted` of each address lifted so far.
+    /// Index of each address lifted so far.
     map: rustc_hash::FxHashMap<u64, u32>,
-    lifted: Vec<Option<CacheEntry>>,
+    /// The lift of each index; `None` where it failed ([`FAILED`]).
+    lifted: Vec<Option<LiftedInstruction>>,
+    /// Index of the instruction right after each one, once a range has
+    /// stepped there ([`NO_NEXT`] until then): a range follows these links
+    /// instead of looking each address up in `map`.
+    next: Vec<u32>,
+    /// The length of each instruction (0 where the lift failed).
+    len: Vec<u8>,
+    /// [`X87`], [`READS_PF`], [`FAILED`] of each index.
+    flags: Vec<u8>,
+    /// The [`InsnShape`] of each index (its default where the lift failed).
+    shape: Vec<crate::lift::InsnShape>,
+    /// Instructions the last [`Self::trim`] kept.
+    kept: usize,
 }
 
-/// One instruction lifted alone, with what [`X86Lifter::lift_range_cached`]
-/// asks of it in every range holding it.
-struct CacheEntry {
-    insn: LiftedInstruction,
-    /// The x87 pass may rewrite it.
-    x87: bool,
-    /// It reads a PF it does not write first ([`reads_outside_pf`]).
-    reads_pf: bool,
-    /// Index in `lifted` of the instruction right after it, once a range
-    /// has stepped there ([`NO_NEXT`] until then): a range follows these
-    /// links instead of looking each address up in `map`.
-    next: u32,
-}
+/// The x87 pass may rewrite the instruction.
+const X87: u8 = 1;
+/// It reads a PF it does not write first ([`reads_outside_pf`]).
+const READS_PF: u8 = 2;
+/// The lift failed.
+const FAILED: u8 = 4;
 
-/// [`CacheEntry::next`] not known yet.
+/// [`LiftCache::next`] not known yet.
 const NO_NEXT: u32 = u32::MAX;
 
 impl LiftCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Instructions held.
+    pub fn len(&self) -> usize {
+        self.lifted.len()
+    }
+
+    /// Whether nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.lifted.is_empty()
+    }
+
+    /// [`Self::retain_from`] `start` once the cache holds more than
+    /// `at` instructions and twice what the last call kept: a pass
+    /// lifting ranges in ascending order of their starts bounds the
+    /// cache this way, at a cost linear in what it lifts.
+    pub fn trim(&mut self, start: u64, at: usize) {
+        if self.lifted.len() > at.max(2 * self.kept) {
+            self.retain_from(start);
+            self.kept = self.lifted.len();
+        }
+    }
+
+    /// Forget every address below `start`: a pass lifting ranges in
+    /// ascending order of their starts never reads them again. What is
+    /// kept is unchanged (a link always leads to a higher address, so
+    /// the links of the kept instructions stay).
+    pub fn retain_from(&mut self, start: u64) {
+        let mut kept: Vec<(u64, u32)> = self.map.iter().filter(|(a, _)| **a >= start).map(|(a, i)| (*a, *i)).collect();
+        kept.sort_unstable();
+        let mut new_index = vec![NO_NEXT; self.lifted.len()];
+        for (k, &(_, i)) in kept.iter().enumerate() {
+            new_index[i as usize] = u32::try_from(k).expect("lift cache index");
+        }
+        let mut old = std::mem::take(&mut self.lifted);
+        let (next, len, flags, shape) = (
+            std::mem::take(&mut self.next),
+            std::mem::take(&mut self.len),
+            std::mem::take(&mut self.flags),
+            std::mem::take(&mut self.shape),
+        );
+        self.map.clear();
+        for &(a, i) in &kept {
+            let i = i as usize;
+            self.map.insert(a, u32::try_from(self.lifted.len()).expect("lift cache index"));
+            self.lifted.push(old[i].take());
+            self.next.push(if next[i] == NO_NEXT { NO_NEXT } else { new_index[next[i] as usize] });
+            self.len.push(len[i]);
+            self.flags.push(flags[i]);
+            self.shape.push(shape[i]);
+        }
+    }
+
+    /// The instructions at `idxs`, all lifted.
+    fn insns(&self, idxs: &[u32]) -> Vec<&LiftedInstruction> {
+        idxs.iter().map(|&i| self.lifted[i as usize].as_ref().expect("lifted")).collect()
+    }
+
+    /// The index of `addr`, lifting it (with `fast`) when not cached.
+    fn index_of(&mut self, fast: &X86Lifter, memory: &Memory, addr: u64) -> u32 {
+        if let Some(&i) = self.map.get(&addr) {
+            return i;
+        }
+        let lifted = fast.lift_instruction(memory, addr).ok();
+        let (flags, len, shape) = match &lifted {
+            Some(insn) => {
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+                let flags = if x87 { X87 } else { 0 } | if reads_outside_pf(insn) { READS_PF } else { 0 };
+                let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
+                (flags, len, crate::lift::InsnShape::of(insn))
+            }
+            None => (FAILED, 0, crate::lift::InsnShape::default()),
+        };
+        let i = u32::try_from(self.lifted.len()).expect("lift cache index");
+        self.lifted.push(lifted);
+        self.next.push(NO_NEXT);
+        self.len.push(len);
+        self.flags.push(flags);
+        self.shape.push(shape);
+        self.map.insert(addr, i);
+        i
     }
 }
 
@@ -233,15 +324,6 @@ impl X86Lifter {
     pub fn without_parity(self) -> Self {
         Self { parity: false, ..self }
     }
-
-    /// [`PcodeLift::lift_range`] through `cache`, a memo of the range-independent
-    /// part of it: the single-instruction lifts without the integer PF, keyed by
-    /// address. Equal to `lift_range(memory, start, count)`: when the range holds
-    /// an instruction the x87 pass could rewrite (a mnemonic starting with `f`)
-    /// or a PF reader needs the integer PF ([`needs_integer_parity`]), the range
-    /// is lifted afresh with `lift_range` itself and nothing of it is cached.
-    /// Passes that lift many overlapping ranges (every function lifted linearly
-    /// past its end) lift each address once per cache this way.
     pub fn lift_range_cached<'c>(
         &self,
         memory: &Memory,
@@ -249,64 +331,111 @@ impl X86Lifter {
         count: usize,
         cache: &'c mut LiftCache,
     ) -> CachedRange<'c> {
+        match self.walk_cached(memory, start, count, cache) {
+            Some(idxs) => {
+                let cache: &'c LiftCache = cache;
+                CachedRange::Cached(cache.insns(&idxs))
+            }
+            None => CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default()),
+        }
+    }
+
+    /// The cache indices of `lift_range(memory, start, count)` when every
+    /// instruction of it is lifted alone, lifting into `cache` what it
+    /// lacks; `None` when the range must be lifted afresh as a whole (an
+    /// x87 instruction, or a PF reader needing the integer PF).
+    fn walk_cached(&self, memory: &Memory, start: u64, count: usize, cache: &mut LiftCache) -> Option<Vec<u32>> {
         let fast = X86Lifter { is_64: self.is_64, parity: false };
         let mut idxs: Vec<u32> = Vec::with_capacity(count.min(4096));
         let mut addr = start;
-        let mut x87 = false;
-        let mut reads_pf = false;
-        // the entry of the previous instruction of the range
+        let mut any = 0u8;
+        // the index of the previous instruction of the range
         let mut prev: Option<u32> = None;
         for _ in 0..count {
-            let linked = prev.and_then(|p| match &cache.lifted[p as usize] {
-                Some(e) if e.next != NO_NEXT => Some(e.next),
-                _ => None,
-            });
-            let i = match linked {
-                Some(i) => i,
-                None => {
-                    let i = match cache.map.get(&addr) {
-                        Some(&i) => i,
-                        None => {
-                            let entry = fast.lift_instruction(memory, addr).ok().map(|insn| CacheEntry {
-                                x87: insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87),
-                                reads_pf: reads_outside_pf(&insn),
-                                insn,
-                                next: NO_NEXT,
-                            });
-                            let i = u32::try_from(cache.lifted.len()).expect("lift cache index");
-                            cache.lifted.push(entry);
-                            cache.map.insert(addr, i);
-                            i
-                        }
-                    };
-                    if let Some(p) = prev
-                        && let Some(e) = &mut cache.lifted[p as usize]
-                    {
-                        e.next = i;
+            let i = match prev.map(|p| cache.next[p as usize]) {
+                Some(i) if i != NO_NEXT => i,
+                _ => {
+                    let i = cache.index_of(&fast, memory, addr);
+                    if let Some(p) = prev {
+                        cache.next[p as usize] = i;
                     }
                     i
                 }
             };
+            let flags = cache.flags[i as usize];
+            if flags & FAILED != 0 {
+                break;
+            }
             prev = Some(i);
-            let Some(e) = &cache.lifted[i as usize] else { break };
-            // The x87 pass rewrites nothing in a range without an x87
-            // instruction, so such a range lifts as the cache has it.
-            x87 |= e.x87;
-            reads_pf |= e.reads_pf;
+            any |= flags;
             idxs.push(i);
-            addr += e.insn.length as u64;
+            addr += u64::from(cache.len[i as usize]);
         }
-        if x87 {
-            return CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default());
+        // The x87 pass rewrites nothing in a range without an x87
+        // instruction, so such a range lifts as the cache has it.
+        if any & X87 != 0 {
+            return None;
         }
-        let cache: &'c LiftCache = cache;
-        let entry = |i: &u32| cache.lifted[*i as usize].as_ref().expect("lifted above");
-        let insns: Vec<&'c LiftedInstruction> = idxs.iter().map(|i| &entry(i).insn).collect();
         // `needs_integer_parity`, its per-instruction test read from the cache
-        if self.parity && reads_pf && parity_needed(&insns, |k| entry(&idxs[k]).reads_pf) {
-            return CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default());
+        if self.parity && any & READS_PF != 0 {
+            let insns = cache.insns(&idxs);
+            if parity_needed(&insns, |k| cache.flags[idxs[k] as usize] & READS_PF != 0) {
+                return None;
+            }
         }
-        CachedRange::Cached(insns)
+        Some(idxs)
+    }
+
+    /// `g(k, insns, shapes)` for the `k`-th of `budgets`, `insns` being
+    /// exactly `lift_range(memory, start, budgets[k])`, through `cache` as
+    /// [`Self::lift_range_cached`]: the largest range is walked once and
+    /// the others are its prefixes. (A prefix of a range lifted alone
+    /// instruction by instruction holds no x87 instruction and no PF
+    /// reader needing the integer PF either, so it is lifted alone too;
+    /// when the largest range is lifted afresh, each budget is lifted on
+    /// its own.) With `with_shapes`, `shapes` is the [`InsnShape`] of each
+    /// instruction when the cache holds them (`None` for a range lifted
+    /// afresh, or without `with_shapes`).
+    ///
+    /// [`InsnShape`]: crate::lift::InsnShape
+    pub fn lift_prefixes_cached<R>(
+        &self,
+        memory: &Memory,
+        start: u64,
+        budgets: &[usize],
+        with_shapes: bool,
+        cache: &mut LiftCache,
+        mut g: impl FnMut(usize, &[&LiftedInstruction], Option<&[crate::lift::InsnShape]>) -> R,
+    ) -> Vec<R> {
+        let max = budgets.iter().copied().max().unwrap_or(0);
+        if let Some(idxs) = self.walk_cached(memory, start, max, cache) {
+            let insns = cache.insns(&idxs);
+            let shapes: Option<Vec<crate::lift::InsnShape>> =
+                with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
+            return budgets
+                .iter()
+                .enumerate()
+                .map(|(k, &b)| {
+                    let n = b.min(insns.len());
+                    g(k, &insns[..n], shapes.as_ref().map(|s| &s[..n]))
+                })
+                .collect();
+        }
+        budgets
+            .iter()
+            .enumerate()
+            .map(|(k, &b)| match self.walk_cached(memory, start, b, cache) {
+                Some(idxs) => {
+                    let shapes: Option<Vec<crate::lift::InsnShape>> =
+                        with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
+                    g(k, &cache.insns(&idxs), shapes.as_deref())
+                }
+                None => {
+                    let insns = self.lift_range(memory, start, b).unwrap_or_default();
+                    g(k, &insns.iter().collect::<Vec<_>>(), None)
+                }
+            })
+            .collect()
     }
 
     /// Does the linear range `lift_range(memory, start, count)` would lift
@@ -3795,6 +3924,27 @@ mod tests {
                 let fresh = lifter.lift_range(&mem, 0x1000 + start, count).unwrap();
                 let cached = lifter.lift_range_cached(&mem, 0x1000 + start, count, &mut cache).insns().iter().map(|i| (*i).clone()).collect::<Vec<_>>();
                 assert_eq!(text(&cached.iter().collect::<Vec<_>>()), text(&fresh.iter().collect::<Vec<_>>()), "start +{start:#x} count {count}");
+            }
+            // every budget of one walk is its own `lift_range`
+            let budgets = [40, 1, 3, 2, 8, 5];
+            let mut prefix_cache = LiftCache::new();
+            let got = lifter.lift_prefixes_cached(&mem, 0x1000 + start, &budgets, true, &mut prefix_cache, |k, v, shapes| {
+                // the shapes, when given, are the instructions' own
+                if let Some(shapes) = shapes {
+                    assert_eq!(shapes, v.iter().map(|i| crate::lift::InsnShape::of(i)).collect::<Vec<_>>());
+                }
+                (k, text(v))
+            });
+            for (k, &count) in budgets.iter().enumerate() {
+                let fresh = lifter.lift_range(&mem, 0x1000 + start, count).unwrap();
+                assert_eq!(got[k], (k, text(&fresh.iter().collect::<Vec<_>>())), "prefix start +{start:#x} count {count}");
+            }
+            // dropping what lies below a start keeps every later range exact
+            prefix_cache.retain_from(0x1000 + start);
+            for count in [1, 3, 40] {
+                let fresh = lifter.lift_range(&mem, 0x1000 + start, count).unwrap();
+                let cached = lifter.lift_range_cached(&mem, 0x1000 + start, count, &mut prefix_cache).insns().iter().map(|i| (*i).clone()).collect::<Vec<_>>();
+                assert_eq!(text(&cached.iter().collect::<Vec<_>>()), text(&fresh.iter().collect::<Vec<_>>()), "retained start +{start:#x} count {count}");
             }
         }
     }

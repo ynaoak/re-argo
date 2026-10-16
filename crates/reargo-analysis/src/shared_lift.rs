@@ -149,8 +149,9 @@ pub(crate) fn compute(program: &mut Program, with_snapshots: bool) -> SharedLift
     // a lookup per lifted instruction costs less than the index).
     let stale = jobs.iter().filter(|j| j.2.is_none()).count();
     let jumps = (stale > jobs.len() / 8).then(|| crate::func_lift::JumpIndex::new(program));
-    // Chunks of consecutive functions share a lift cache: a function is
-    // lifted linearly well past its end, over its neighbours
+    // The consecutive functions a thread runs share a lift cache
+    // ([`crate::range_lift::map_with_lifter`]): a function is lifted
+    // linearly well past its end, over its neighbours
     // (`lift_range_cached` gives exactly what `lift_range` would).
     let x86 = reargo_lift::x86::X86Lifter::new_64();
     type Extra = Option<(u64, usize, usize, Option<(u64, &'static str)>)>;
@@ -159,42 +160,52 @@ pub(crate) fn compute(program: &mut Program, with_snapshots: bool) -> SharedLift
     } else {
         jobs.into_iter().map(|(e, m, k)| (e, m, k, 0)).collect()
     };
-    let chunks: Vec<Vec<(FunctionResults, Extra)>> = jobs
+    let computed: Vec<(FunctionResults, Extra)> = jobs
         .into_par_iter()
-        .chunks(LIFT_CHUNK)
-        .map(|chunk| {
-            let mut cache = reargo_lift::x86::LiftCache::new();
-            chunk
-                .into_iter()
-                .map(|(entry, max_insns, kept, arity_budget)| {
-                    if let Some(kept) = kept {
-                        return (kept, None);
-                    }
-                    let memory = &program.info.memory;
-                    let range = x86.lift_range_cached(memory, entry, max_insns, &mut cache);
-                    let results =
-                        compute_lifted(program, jumps.as_ref(), entry, max_insns, &range.insns(), with_snapshots);
-                    drop(range);
-                    // Arity and calling convention from the same lifted
-                    // instructions (exactly their own linear lifts).
-                    let extra = with_snapshots.then(|| {
-                        let arity =
-                            crate::arity::infer_arity(&x86.lift_range_cached(memory, entry, arity_budget, &mut cache).insns());
-                        let convention = crate::callingconv::convention_lifted(
+        .with_min_len(crate::range_lift::CHUNK)
+        .map_init(
+            reargo_lift::x86::LiftCache::new,
+            |cache, (entry, max_insns, kept, arity_budget)| {
+                if let Some(kept) = kept {
+                    return (kept, None);
+                }
+                crate::range_lift::trim(cache, entry);
+                let memory = &program.info.memory;
+                // The function's lift and, from the same walk (exactly
+                // their own linear lifts), Argument Arity's and Calling
+                // Convention's.
+                let mut results = None;
+                let mut arity = 0;
+                let mut convention = None;
+                let budgets: &[usize] = if with_snapshots {
+                    &[max_insns, arity_budget, crate::callingconv::LIFT_BUDGET]
+                } else {
+                    &[max_insns]
+                };
+                x86.lift_prefixes_cached(memory, entry, budgets, true, cache, |k, insns, shapes| match k {
+                    0 => {
+                        results = Some(compute_lifted(
+                            program,
+                            jumps.as_ref(),
                             entry,
-                            &x86.lift_range_cached(memory, entry, crate::callingconv::LIFT_BUDGET, &mut cache).insns(),
-                        );
-                        (entry, arity_budget, arity, convention)
-                    });
-                    (results, extra)
-                })
-                .collect()
-        })
+                            max_insns,
+                            insns,
+                            shapes,
+                            with_snapshots,
+                        ))
+                    }
+                    1 => arity = crate::arity::infer_arity(insns),
+                    _ => convention = crate::callingconv::convention_lifted(entry, insns),
+                });
+                let results = results.expect("the function's lift");
+                let extra = with_snapshots.then_some((entry, arity_budget, arity, convention));
+                (results, extra)
+            },
+        )
         .collect();
     let mut ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
-    let funcs: Vec<FunctionResults> = chunks
+    let funcs: Vec<FunctionResults> = computed
         .into_iter()
-        .flatten()
         .map(|(f, extra)| {
             if let (Some((arity, convention)), Some((entry, arity_budget, a, c))) = (ahead.as_mut(), extra) {
                 arity.insert((entry, arity_budget), a);
@@ -275,9 +286,6 @@ fn gained_external_entry(entry: u64, lifted: &[u32], external: &[u64], changed: 
     })
 }
 
-/// Consecutive functions sharing one lift cache in [`compute`].
-const LIFT_CHUNK: usize = 64;
-
 /// The results of the function at `entry` from its lift (the x86
 /// lift never fails: it stops at the first instruction it cannot lift).
 fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
@@ -286,15 +294,20 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     entry: u64,
     max_insns: usize,
     insns: &[I],
+    shapes: Option<&[reargo_lift::InsnShape]>,
     with_snapshots: bool,
 ) -> FunctionResults {
     let next_entry = program.listing.next_function_after(entry).map(|f| f.entry_point);
-    let external = match jumps {
-        Some(jumps) => jumps.external_entries(program, insns),
-        None => crate::func_lift::external_entries(program, insns),
+    // What the walk and the blocks need of each instruction, read once
+    // (or kept beside the lift).
+    let shape = match shapes {
+        Some(shapes) => crate::blockflow::LiftShape::from_shapes(insns, shapes),
+        None => crate::blockflow::LiftShape::of(insns),
     };
-    // What the walk and the blocks need of each instruction, read once.
-    let shape = crate::blockflow::LiftShape::of(insns);
+    let external = match jumps {
+        Some(jumps) => jumps.external_entries_at(program, &shape.addrs),
+        None => crate::func_lift::external_entries_at(program, &shape.addrs),
+    };
     // Who owns each call instruction, asked once: the walk, the blocks
     // the flows keep and the check of a cached result all ask.
     let calls: Vec<(u64, bool)> = shape
@@ -327,7 +340,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         (cfg, vsa)
     });
     let offsets: Option<Box<[u32]>> =
-        insns.iter().map(|i| i.borrow().address.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect();
+        shape.addrs.iter().map(|a| a.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect();
     // offsets increase (a linear lift), so the list is sorted
     let reusable = offsets.as_ref().is_some_and(|o| o.is_sorted_by(|a, b| a < b));
     let lifted = Some(offsets.unwrap_or_default());
