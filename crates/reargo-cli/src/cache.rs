@@ -25,8 +25,15 @@
 //!   only selects the lifters of `disasm` / `pcode` / `decompile` / …,
 //!   which run after the analysis and are not cached.
 //! * **Off switch**: the global `--no-cache` flag or `REARGO_NO_CACHE=1`.
+//! * **Compression**: the bincode payload is zstd-compressed
+//!   ([`ZSTD_LEVEL`]); the header's length and BLAKE3 cover the stored
+//!   (compressed) bytes, so corruption is caught before decompressing.
+//! * **Eviction**: after a write the directory is trimmed to
+//!   `$REARGO_CACHE_MAX_BYTES` (default [`DEFAULT_MAX_BYTES`], `0` =
+//!   unlimited) by deleting the least recently used `.rac` files (mtime,
+//!   refreshed on every hit), never the one just written.
 //! * **Integrity**: a header (magic, format, key, payload length, BLAKE3
-//!   of the payload) is checked before the payload is decoded; a file
+//!   of the stored payload) is checked before the payload is decoded; a file
 //!   that does not pass is ignored and rewritten. Files are written to a
 //!   temporary name and renamed into place, so a reader never sees a
 //!   partial file. A failure to read or write the cache never fails the
@@ -43,7 +50,15 @@ use reargo_program::program::{AnalysisState, AnalysisStateRef};
 /// Bump whenever the stored layout changes in a way the executable hash
 /// would not catch on its own (it always changes with the code, so this
 /// is a belt-and-braces version tag).
-pub const CACHE_FORMAT: u32 = 1;
+pub const CACHE_FORMAT: u32 = 2;
+
+/// zstd level of the stored payload.
+pub const ZSTD_LEVEL: i32 = 1;
+
+/// Default cap on the cache directory's total size (2 GiB).
+pub const DEFAULT_MAX_BYTES: u64 = 2 << 30;
+
+const EXT: &str = "rac";
 
 const MAGIC: &[u8; 16] = b"REARGO-ANACACHE\0";
 const HEADER_LEN: usize = 16 + 4 + 32 + 8 + 32;
@@ -103,7 +118,7 @@ pub fn entry_for(path: &Path) -> Option<Entry> {
     match compute_key(path) {
         Ok((key, canonical)) => {
             let name = blake3::hash(canonical.as_os_str().as_encoded_bytes());
-            let file = dir.join(format!("{}.rac", &name.to_hex()[..32]));
+            let file = dir.join(format!("{}.{EXT}", &name.to_hex()[..32]));
             Some(Entry { file, key })
         }
         Err(e) => {
@@ -199,13 +214,86 @@ pub fn load(entry: &Entry, program: &mut Program) -> bool {
     let Some(payload) = check(&data, &entry.key) else {
         return false;
     };
-    match codec().deserialize::<AnalysisState>(payload) {
+    let Ok(raw) = zstd::stream::decode_all(payload) else {
+        return false;
+    };
+    match codec().deserialize::<AnalysisState>(&raw) {
         Ok(state) => {
             program.restore_analysis_state(state);
+            touch(&entry.file);
             true
         }
         Err(_) => false,
     }
+}
+
+/// Mark `file` as just used (mtime = now) for the LRU eviction. Best
+/// effort: a read-only cache simply keeps its old times.
+fn touch(file: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().append(true).open(file) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// The size cap from `$REARGO_CACHE_MAX_BYTES` (`0` = unlimited).
+fn max_bytes() -> u64 {
+    match std::env::var("REARGO_CACHE_MAX_BYTES") {
+        Ok(v) => v.trim().parse().unwrap_or(DEFAULT_MAX_BYTES),
+        Err(_) => DEFAULT_MAX_BYTES,
+    }
+}
+
+/// Whether `path` is one of our cache files: `.rac` extension and the
+/// magic at its start.
+fn is_cache_file(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some(EXT) {
+        return false;
+    }
+    let mut magic = [0u8; 16];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == MAGIC
+}
+
+/// Delete the least recently used cache files in `dir` until their total
+/// size is at most `cap` (0 = unlimited), never `keep`. Returns the
+/// number of files deleted. Errors are ignored: eviction is best effort.
+fn evict(dir: &Path, keep: &Path, cap: u64) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for e in rd.flatten() {
+        let path = e.path();
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() || path.extension().and_then(|x| x.to_str()) != Some(EXT) {
+            continue;
+        }
+        if path != keep && !is_cache_file(&path) {
+            continue;
+        }
+        total += md.len();
+        if path != keep {
+            files.push((md.modified().unwrap_or(std::time::UNIX_EPOCH), md.len(), path));
+        }
+    }
+    if total <= cap {
+        return 0;
+    }
+    files.sort();
+    let mut removed = 0;
+    for (_, len, path) in files {
+        if total <= cap {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// The payload of a cache file, when its header is intact and matches
@@ -233,7 +321,9 @@ fn check<'a>(data: &'a [u8], key: &[u8; 32]) -> Option<&'a [u8]> {
 /// applied) for `entry`. Errors are for a warning only.
 pub fn store(entry: &Entry, program: &Program) -> Result<(), String> {
     let state: AnalysisStateRef<'_> = program.analysis_state();
-    let payload = codec().serialize(&state).map_err(|e| format!("encode: {e}"))?;
+    let raw = codec().serialize(&state).map_err(|e| format!("encode: {e}"))?;
+    let payload = zstd::stream::encode_all(&raw[..], ZSTD_LEVEL).map_err(|e| format!("compress: {e}"))?;
+    drop(raw);
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
@@ -253,7 +343,9 @@ pub fn store(entry: &Entry, program: &Program) -> Result<(), String> {
     std::fs::rename(&tmp, &entry.file).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("rename to {}: {e}", entry.file.display())
-    })
+    })?;
+    evict(dir, &entry.file, max_bytes());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -285,5 +377,51 @@ mod tests {
         let mut g = f.clone();
         g[16] ^= 1;
         assert_eq!(check(&g, &key), None);
+    }
+
+    fn cache_file(dir: &Path, name: &str, size: usize, mtime_secs: u64) -> PathBuf {
+        let p = dir.join(name);
+        let mut data = MAGIC.to_vec();
+        data.resize(size, 0);
+        std::fs::write(&p, data).unwrap();
+        let f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs)).unwrap();
+        p
+    }
+
+    #[test]
+    fn evict_removes_lru_keeps_new_and_foreign_files() {
+        let dir = std::env::temp_dir().join(format!("reargo-evict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = cache_file(&dir, "a.rac", 100, 1_000);
+        let mid = cache_file(&dir, "b.rac", 100, 2_000);
+        let new = cache_file(&dir, "c.rac", 100, 3_000);
+        let foreign = dir.join("d.rac"); // right extension, no magic
+        std::fs::write(&foreign, vec![1u8; 500]).unwrap();
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, vec![1u8; 500]).unwrap();
+
+        assert_eq!(evict(&dir, &new, 0), 0, "0 = unlimited");
+        assert_eq!(evict(&dir, &new, 1000), 0, "under the cap");
+        assert_eq!(evict(&dir, &new, 250), 1);
+        assert!(!old.exists() && mid.exists() && new.exists());
+        // Cap below the new entry alone: everything else goes, it stays.
+        assert_eq!(evict(&dir, &new, 10), 1);
+        assert!(!mid.exists() && new.exists());
+        assert!(foreign.exists() && other.exists(), "foreign files untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touch_refreshes_mtime() {
+        let dir = std::env::temp_dir().join(format!("reargo-touch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = cache_file(&dir, "a.rac", 40, 1_000);
+        touch(&p);
+        let m = std::fs::metadata(&p).unwrap().modified().unwrap();
+        assert!(m > std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
