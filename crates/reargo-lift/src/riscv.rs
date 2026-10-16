@@ -594,12 +594,12 @@ impl PcodeLift for RiscVLifter {
             let word = (half as u32) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
             let ops = self.lift_32(word, address);
             let mnemonic = self.disasm_text(&[b0, b1, b2, b3], address, word);
-            Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+            Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
         } else {
             // 16-bit compressed instruction
             let ops = self.lift_16(half, address);
             let mnemonic = self.disasm_text(&[b0, b1], address, half as u32);
-            Ok(LiftedInstruction { address, length: 2, mnemonic, ops })
+            Ok(LiftedInstruction { address, length: 2, mnemonic: mnemonic.into(), ops })
         }
     }
 }

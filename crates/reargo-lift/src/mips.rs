@@ -443,7 +443,7 @@ impl PcodeLift for MipsLifter {
             Err(_) => format!(".word 0x{:08x}", word),
         };
 
-        Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+        Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
     }
 }
 

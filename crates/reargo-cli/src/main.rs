@@ -1312,7 +1312,7 @@ fn addresses_in_insn(insn: &reargo_arch::arch::DecodedInstruction) -> Vec<u64> {
     // `[...h]` (rip-relative effective addresses). Bare immediates like
     // `sub rsp, 0A88h` (no closing `]`) are excluded; direct branch targets
     // come from `branch_target` above.
-    let ops = &insn.operands;
+    let ops = insn.operands();
     let bytes = ops.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -2347,11 +2347,11 @@ fn cmd_xrefs_fast(
             match arch.decode_instruction(&info.memory, addr) {
                 Ok(insn) => {
                     let hit = insn.branch_target == Some(address)
-                        || operands_reference(&insn.operands, address);
+                        || operands_reference(insn.operands(), address);
                     if hit {
                         println!(
                             "  CODE 0x{:x} [{}]  {:<7} {}",
-                            insn.address, section.name, insn.mnemonic, insn.operands
+                            insn.address, section.name, insn.mnemonic(), insn.operands()
                         );
                         code_hits += 1;
                     }
@@ -3470,7 +3470,7 @@ impl EmulatorTarget {
         for _ in 0..count {
             match self.lifter.lift_instruction(&self.memory, at) {
                 Ok(insn) => {
-                    out.push((at, insn.mnemonic.clone()));
+                    out.push((at, insn.mnemonic.to_string()));
                     if insn.length == 0 {
                         break;
                     }

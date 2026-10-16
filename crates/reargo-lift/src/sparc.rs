@@ -546,7 +546,7 @@ impl PcodeLift for SparcLifter {
         let word = u32::from_be_bytes(buf); // SPARC is big-endian
         let ops = self.lift_word(word, address);
         let mnemonic = self.disasm_text(&buf, address, word);
-        Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+        Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
     }
 
     fn lift_instruction_ctx(&self, memory: &Memory, address: u64, ctx: &mut LiftContext) -> Result<LiftedInstruction, LiftError> {

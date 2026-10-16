@@ -239,15 +239,7 @@ impl Architecture for ArmArch {
         let flow_type = classify_arm_flow(&mnemonic, &operands, self.is_64);
         let branch_target = extract_arm_branch_target(&operands, &flow_type);
 
-        Ok(DecodedInstruction {
-            address,
-            length,
-            mnemonic,
-            operands,
-            bytes,
-            flow_type,
-            branch_target,
-        })
+        Ok(DecodedInstruction::new(address, length, mnemonic, operands, bytes, flow_type, branch_target))
     }
 
     fn calling_conventions(&self) -> &[CallingConvention] {
@@ -338,7 +330,7 @@ mod tests {
         // NOP = 0xD503201F (little-endian)
         let mem = make_memory(&[0x1f, 0x20, 0x03, 0xd5], 0x1000, Endian::Little);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "nop");
+        assert_eq!(insn.mnemonic(), "nop");
         assert_eq!(insn.length, 4);
     }
 
@@ -348,7 +340,7 @@ mod tests {
         // RET = 0xD65F03C0 (little-endian)
         let mem = make_memory(&[0xc0, 0x03, 0x5f, 0xd6], 0x1000, Endian::Little);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "ret");
+        assert_eq!(insn.mnemonic(), "ret");
         assert!(insn.is_return());
     }
 
@@ -358,7 +350,7 @@ mod tests {
         // MOV R0, #0 = 0xE3A00000 (little-endian)
         let mem = make_memory(&[0x00, 0x00, 0xa0, 0xe3], 0x1000, Endian::Little);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "mov");
+        assert_eq!(insn.mnemonic(), "mov");
         assert_eq!(insn.length, 4);
     }
 
@@ -370,7 +362,7 @@ mod tests {
         let mem = make_memory(&[0x05, 0x20], 0x1000, Endian::Little);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
         assert_eq!(insn.length, 2);
-        assert_eq!(insn.mnemonic, "movs");
+        assert_eq!(insn.mnemonic(), "movs");
     }
 
     #[test]

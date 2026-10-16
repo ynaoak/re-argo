@@ -560,7 +560,7 @@ pub(crate) fn rewrite_tail_calls(instructions: &mut Vec<LiftedInstruction>) {
         let pos = instructions.partition_point(|i| i.address < at);
         instructions.insert(
             pos,
-            LiftedInstruction { address: at, length: 1, mnemonic: format!("jmp 0x{t:x}"), ops: vec![call, ret(seq(1))] },
+            LiftedInstruction { address: at, length: 1, mnemonic: format!("jmp 0x{t:x}").into(), ops: vec![call, ret(seq(1))] },
         );
     }
 }

@@ -418,7 +418,7 @@ fn tool_disassemble(program: &Program, args: &Value) -> Result<String, String> {
         }
         out.push_str(&format!(
             "0x{:08x}  {} ({}B)\n",
-            insn.address, insn.mnemonic, insn.length
+            insn.address, insn.mnemonic(), insn.length
         ));
         n += 1;
     }

@@ -154,15 +154,7 @@ impl Architecture for RiscVArch {
         let flow_type = classify_riscv_flow(&mnemonic, &operands);
         let branch_target = extract_riscv_target(&operands, &flow_type);
 
-        Ok(DecodedInstruction {
-            address,
-            length,
-            mnemonic,
-            operands,
-            bytes,
-            flow_type,
-            branch_target,
-        })
+        Ok(DecodedInstruction::new(address, length, mnemonic, operands, bytes, flow_type, branch_target))
     }
 
     fn calling_conventions(&self) -> &[CallingConvention] {

@@ -106,10 +106,7 @@ impl Architecture for PpcArch {
             s if s.starts_with("b") && (s.contains("eq") || s.contains("ne") || s.contains("lt") || s.contains("gt")) => FlowType::ConditionalJump,
             _ => FlowType::Fall,
         };
-        Ok(DecodedInstruction {
-            address, length: 4, mnemonic: mn, operands: ops,
-            bytes: insn.bytes().into(), flow_type: flow, branch_target: None,
-        })
+        Ok(DecodedInstruction::new(address, 4, mn, ops, insn.bytes().into(), flow, None))
     }
     fn calling_conventions(&self) -> &[CallingConvention] { &self.calling_conventions }
     fn default_calling_convention(&self) -> Option<&CallingConvention> { self.calling_conventions.first() }

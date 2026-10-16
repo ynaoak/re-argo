@@ -16,18 +16,79 @@ pub enum FlowType {
     Return,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DecodedInstruction {
     pub address: u64,
     pub length: u32,
-    pub mnemonic: String,
-    pub operands: String,
     pub bytes: SmallVec<[u8; 16]>,
     pub flow_type: FlowType,
     pub branch_target: Option<u64>,
+    /// The text (`mnemonic`, `operands`): given, or for x86 formatted from
+    /// `bytes` on first use ([`DecodedInstruction::mnemonic`]) — most passes
+    /// only read the flow, and formatting was a large part of decoding.
+    text: DisasmText,
+}
+
+#[derive(Clone)]
+struct DisasmText {
+    cell: std::sync::OnceLock<(String, String)>,
+    /// The x86 bitness to decode `bytes` with when the text is formatted
+    /// lazily; 0 when the text was given.
+    #[cfg_attr(not(feature = "x86"), allow(dead_code))]
+    lazy_x86_bitness: u8,
 }
 
 impl DecodedInstruction {
+    /// An instruction with its text given.
+    pub fn new(
+        address: u64,
+        length: u32,
+        mnemonic: String,
+        operands: String,
+        bytes: SmallVec<[u8; 16]>,
+        flow_type: FlowType,
+        branch_target: Option<u64>,
+    ) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set((mnemonic, operands));
+        Self { address, length, bytes, flow_type, branch_target, text: DisasmText { cell, lazy_x86_bitness: 0 } }
+    }
+
+    /// An x86 instruction whose text is formatted from `bytes` (exactly the
+    /// instruction's bytes) when it is first read.
+    #[cfg(feature = "x86")]
+    pub(crate) fn new_x86_lazy(
+        address: u64,
+        length: u32,
+        bytes: SmallVec<[u8; 16]>,
+        flow_type: FlowType,
+        branch_target: Option<u64>,
+        bitness: u32,
+    ) -> Self {
+        let text = DisasmText { cell: std::sync::OnceLock::new(), lazy_x86_bitness: bitness as u8 };
+        Self { address, length, bytes, flow_type, branch_target, text }
+    }
+
+    fn text(&self) -> &(String, String) {
+        self.text.cell.get_or_init(|| {
+            #[cfg(feature = "x86")]
+            if self.text.lazy_x86_bitness != 0 {
+                return crate::x86::format_text(&self.bytes, self.address, self.text.lazy_x86_bitness as u32);
+            }
+            (String::new(), String::new())
+        })
+    }
+
+    /// The mnemonic (with its prefixes), e.g. `mov` / `rep movsb`.
+    pub fn mnemonic(&self) -> &str {
+        &self.text().0
+    }
+
+    /// The operands, `, `-separated.
+    pub fn operands(&self) -> &str {
+        &self.text().1
+    }
+
     pub fn end_address(&self) -> u64 {
         self.address + self.length as u64
     }
@@ -52,6 +113,20 @@ impl DecodedInstruction {
     }
 }
 
+impl std::fmt::Debug for DecodedInstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedInstruction")
+            .field("address", &self.address)
+            .field("length", &self.length)
+            .field("mnemonic", &self.mnemonic())
+            .field("operands", &self.operands())
+            .field("bytes", &self.bytes)
+            .field("flow_type", &self.flow_type)
+            .field("branch_target", &self.branch_target)
+            .finish()
+    }
+}
+
 impl std::fmt::Display for DecodedInstruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "0x{:08x}  ", self.address)?;
@@ -65,10 +140,10 @@ impl std::fmt::Display for DecodedInstruction {
                 write!(f, " ")?;
             }
         }
-        if self.operands.is_empty() {
-            write!(f, "{}", self.mnemonic)
+        if self.operands().is_empty() {
+            write!(f, "{}", self.mnemonic())
         } else {
-            write!(f, "{:<8} {}", self.mnemonic, self.operands)
+            write!(f, "{:<8} {}", self.mnemonic(), self.operands())
         }
     }
 }

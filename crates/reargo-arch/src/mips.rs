@@ -119,11 +119,7 @@ impl Architecture for MipsArch {
             "beq" | "bne" | "bgtz" | "blez" | "bgez" | "bltz" | "beqz" | "bnez" => FlowType::ConditionalJump,
             _ => FlowType::Fall,
         };
-        Ok(DecodedInstruction {
-            address, length: insn.bytes().len() as u32,
-            mnemonic: mn, operands: ops,
-            bytes: insn.bytes().into(), flow_type: flow, branch_target: None,
-        })
+        Ok(DecodedInstruction::new(address, insn.bytes().len() as u32, mn, ops, insn.bytes().into(), flow, None))
     }
     fn calling_conventions(&self) -> &[CallingConvention] { &self.calling_conventions }
     fn default_calling_convention(&self) -> Option<&CallingConvention> { self.calling_conventions.first() }
