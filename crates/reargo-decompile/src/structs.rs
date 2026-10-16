@@ -1584,7 +1584,7 @@ mod tests {
 
     fn with_index(mem: &Memory, fs: &[(u64, u64)], entry: u64) -> crate::pipeline::DecompileResult {
         let idx = crate::thisclass::build(mem, fs, &[]);
-        let opts = DecompileOptions { structs: true, this_index: Some(Arc::new(idx)) };
+        let opts = DecompileOptions { structs: true, this_index: Some(Arc::new(idx)), ..Default::default() };
         decompile_with_options(&X86Lifter::new_64(), mem, entry, "f", 100, &Default::default(), &opts).unwrap()
     }
 

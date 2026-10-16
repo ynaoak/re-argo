@@ -32,11 +32,28 @@ pub struct DecompileOptions {
     pub structs: bool,
     /// The classes of the parameters inferred from the callers (WS93, [`crate::thisclass`]).
     pub this_index: Option<std::sync::Arc<crate::thisclass::ThisIndex>>,
+    /// Which texts the result carries: [`DecompileResult::c_code`] (with `recovered_structs`),
+    /// `rust_code` (with `rust_structs`) and `ssa_dump`; a text not asked for is left empty.
+    pub emit: Emit,
+}
+
+/// The texts a decompile renders ([`DecompileOptions::emit`]); all by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Emit {
+    pub c: bool,
+    pub rust: bool,
+    pub ssa: bool,
+}
+
+impl Default for Emit {
+    fn default() -> Self {
+        Self { c: true, rust: true, ssa: true }
+    }
 }
 
 impl Default for DecompileOptions {
     fn default() -> Self {
-        Self { structs: true, this_index: None }
+        Self { structs: true, this_index: None, emit: Emit::default() }
     }
 }
 
@@ -1346,7 +1363,7 @@ fn build_decompile_result(
     // The dump's purpose is to show the SSA used by the C/Rust
     // emitter (which also runs against the optimized form), so the
     // post-opt view is also the more useful debug output.
-    let ssa_dump = ssa.display_ssa();
+    let ssa_dump = if opts.emit.ssa { ssa.display_ssa() } else { String::new() };
 
     // Run type inference / structurer / emitters sequentially.
     //
@@ -1366,8 +1383,8 @@ fn build_decompile_result(
     } else {
         crate::structs::StructView::default()
     };
-    let recovered_structs = view.c_definitions();
-    let rust_structs = view.rust_definitions();
+    let recovered_structs = if opts.emit.c { view.c_definitions() } else { Vec::new() };
+    let rust_structs = if opts.emit.rust { view.rust_definitions() } else { Vec::new() };
 
     // `if (a) goto X; if (b) goto X;` -> `if (a || b) goto X;` (on a copy of the CFG)
     let short = crate::condition::merge_short_circuits(&ssa);
@@ -1392,7 +1409,7 @@ fn build_decompile_result(
     if opts.structs {
         c_emitter = c_emitter.with_structs(&view);
     }
-    let c_code = c_emitter.emit_function(&ssa, &structured);
+    let c_code = if opts.emit.c { c_emitter.emit_function(&ssa, &structured) } else { String::new() };
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
     if let Some(ann) = annotations {
@@ -1407,7 +1424,7 @@ fn build_decompile_result(
     if opts.structs {
         rust_emitter = rust_emitter.with_structs(&view);
     }
-    let rust_code = rust_emitter.emit_function(&ssa, &structured);
+    let rust_code = if opts.emit.rust { rust_emitter.emit_function(&ssa, &structured) } else { String::new() };
 
     Ok(DecompileResult {
         c_code,
