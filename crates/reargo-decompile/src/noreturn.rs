@@ -110,11 +110,87 @@ pub struct NoReturn<'a> {
     symbols: Option<&'a BTreeMap<u64, String>>,
     /// target -> verdict (and, for `Unsure`, the depth it was computed with)
     memo: Mutex<FxHashMap<u64, (Verdict, u32)>>,
+    /// The control flow of each instruction lifted alone, shared by the searches of a batch
+    /// (x86; [`FlowCache`]).
+    flow: Option<(&'a reargo_lift::x86::X86Lifter, &'a FlowCache)>,
+}
+
+/// What [`search`] reads of an instruction: its extent and control flow. Shared by every
+/// search of a batch: the same for an instruction lifted alone as lifted in a range (the PF
+/// and the x87 stack a range lift adds change no control flow).
+#[derive(Default)]
+pub struct FlowCache {
+    shards: Vec<Mutex<FxHashMap<u64, Option<std::sync::Arc<Flow>>>>>,
+}
+
+impl FlowCache {
+    pub fn new() -> Self {
+        Self { shards: (0..64).map(|_| Mutex::new(FxHashMap::default())).collect() }
+    }
+
+    /// The flow of the instruction at `addr` lifted alone (`None` when it cannot be lifted).
+    fn get(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64) -> Option<std::sync::Arc<Flow>> {
+        let shard = &self.shards[((addr ^ (addr >> 6)) % self.shards.len() as u64) as usize];
+        if let Some(f) = shard.lock().ok().and_then(|m| m.get(&addr).cloned()) {
+            return f;
+        }
+        let f = x86.lift_alone(memory, addr).ok().map(|i| std::sync::Arc::new(Flow::of(&i)));
+        if let Ok(mut m) = shard.lock() {
+            m.insert(addr, f.clone());
+        }
+        f
+    }
+}
+
+/// The control flow of one instruction, in op order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flow {
+    address: u64,
+    length: u32,
+    trap: bool,
+    events: SmallVec<[Event; 2]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Event {
+    /// `RETURN` / `BRANCHIND`: control leaves.
+    Exit,
+    /// `BRANCH` (`uncond`) / `CBRANCH`, with its target when it is an address.
+    Branch { uncond: bool, target: Option<u64> },
+    /// `CALL` of an address.
+    Call(u64),
+}
+
+impl Flow {
+    fn of(insn: &LiftedInstruction) -> Self {
+        let ram = |op: &PcodeOp| op.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset);
+        let mut events = SmallVec::new();
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Return | OpCode::BranchInd => events.push(Event::Exit),
+                OpCode::Branch | OpCode::CBranch => events.push(Event::Branch { uncond: op.opcode == OpCode::Branch, target: ram(op) }),
+                OpCode::Call => {
+                    if let Some(t) = ram(op) {
+                        events.push(Event::Call(t));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self { address: insn.address, length: insn.length, trap: crate::cfg::is_trap(insn), events }
+    }
 }
 
 impl<'a> NoReturn<'a> {
     pub fn new(lifter: &'a dyn PcodeLift, memory: &'a Memory, symbols: Option<&'a BTreeMap<u64, String>>) -> Self {
-        Self { lifter, memory, symbols, memo: Mutex::new(FxHashMap::default()) }
+        Self { lifter, memory, symbols, memo: Mutex::new(FxHashMap::default()), flow: None }
+    }
+
+    /// The same oracle reading the instructions' control flow from `cache` (x86 lifters only;
+    /// the answers do not change).
+    pub fn with_flow_cache(mut self, cache: Option<&'a FlowCache>) -> Self {
+        self.flow = self.lifter.as_x86().zip(cache);
+        self
     }
 
     /// Does the function at `target` never return?
@@ -148,7 +224,7 @@ impl<'a> NoReturn<'a> {
     }
 
     fn analyze(&self, target: u64, depth: u32, stack: &mut Vec<u64>) -> Verdict {
-        let mut code = Code { lifter: self.lifter, memory: self.memory, insns: Vec::new(), index: FxHashMap::default() };
+        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.flow, insns: Vec::new(), index: FxHashMap::default() };
         let Some(entry) = code.at(target) else { return Verdict::Returns };
         let mut unsure = false;
         let mut stops = |t: u64, s: &mut Vec<u64>| match self.verdict(t, depth - 1, s) {
@@ -172,7 +248,8 @@ impl<'a> NoReturn<'a> {
 struct Code<'a> {
     lifter: &'a dyn PcodeLift,
     memory: &'a Memory,
-    insns: Vec<LiftedInstruction>,
+    flow: Option<(&'a reargo_lift::x86::X86Lifter, &'a FlowCache)>,
+    insns: Vec<std::sync::Arc<Flow>>,
     index: FxHashMap<u64, usize>,
 }
 
@@ -189,12 +266,30 @@ impl Code<'_> {
         if self.insns.len() >= MAX_INSNS {
             return None;
         }
-        for insn in self.lifter.lift_range(self.memory, addr, CHUNK).ok()? {
-            if self.index.contains_key(&insn.address) {
-                break; // runs into code lifted before
+        match self.flow {
+            // `lift_range(addr, CHUNK)`'s instructions, one at a time (it stops at the first
+            // that cannot be lifted)
+            Some((x86, cache)) => {
+                let mut at = addr;
+                for _ in 0..CHUNK {
+                    let Some(f) = cache.get(x86, self.memory, at) else { break };
+                    if self.index.contains_key(&f.address) {
+                        break; // runs into code lifted before
+                    }
+                    at = f.address + u64::from(f.length);
+                    self.index.insert(f.address, self.insns.len());
+                    self.insns.push(f);
+                }
             }
-            self.index.insert(insn.address, self.insns.len());
-            self.insns.push(insn);
+            None => {
+                for insn in self.lifter.lift_range(self.memory, addr, CHUNK).ok()? {
+                    if self.index.contains_key(&insn.address) {
+                        break; // runs into code lifted before
+                    }
+                    self.index.insert(insn.address, self.insns.len());
+                    self.insns.push(std::sync::Arc::new(Flow::of(&insn)));
+                }
+            }
         }
         self.index.get(&addr).copied()
     }
@@ -237,35 +332,31 @@ fn search(
         if !seen.insert(i) {
             continue;
         }
-        let insn = &code.insns[i];
-        if crate::cfg::is_trap(insn) {
+        let insn = code.insns[i].clone();
+        if insn.trap {
             continue;
         }
         let next = insn.address + insn.length as u64;
-        let ram = |op: &PcodeOp| op.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset);
         let mut falls = true;
         let mut targets: SmallVec<[u64; 2]> = SmallVec::new();
-        for op in &insn.ops {
-            match op.opcode {
-                OpCode::Return | OpCode::BranchInd => return true,
-                OpCode::Branch | OpCode::CBranch => {
-                    if op.opcode == OpCode::Branch {
+        for ev in &insn.events {
+            match *ev {
+                Event::Exit => return true,
+                Event::Branch { uncond, target } => {
+                    if uncond {
                         falls = false;
                     }
                     // (a branch inside the instruction's own p-code — rep, cmov — has none)
-                    if let Some(t) = ram(op) {
+                    if let Some(t) = target {
                         targets.push(t);
                     }
                 }
-                OpCode::Call => {
-                    if let Some(t) = ram(op) {
-                        if !named(t) {
-                            queue.push_back(Item::Call { target: t, fall: next });
-                        }
-                        falls = false;
+                Event::Call(t) => {
+                    if !named(t) {
+                        queue.push_back(Item::Call { target: t, fall: next });
                     }
+                    falls = false;
                 }
-                _ => {}
             }
         }
         if falls {
@@ -362,6 +453,35 @@ mod tests {
         let syms = BTreeMap::from([(0x2000u64, "abort@plt".to_string())]);
         assert!(NoReturn::new(&lifter, &m, Some(&syms)).is_noreturn(0x2000));
         assert!(!NoReturn::new(&lifter, &m, None).is_noreturn(0x2000), "a PLT stub is unknown");
+    }
+
+    /// The control flow of an instruction lifted alone is the one it has in a range lift that
+    /// adds the integer PF and the x87 stack ([`FlowCache`]).
+    #[test]
+    fn flow_alone_equals_flow_in_a_range() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x83, 0xf8, 0x00, // cmp eax, 0
+            0x7a, 0x02, // jp +2 (reads the integer PF)
+            0xd9, 0x07, // fld dword [rdi]
+            0xde, 0xc1, // faddp st(1), st
+            0xf3, 0xa4, // rep movsb (a branch inside its p-code)
+            0xe8, 0x10, 0x00, 0x00, 0x00, // call +0x10
+            0xdd, 0x1e, // fstp qword [rsi]
+            0xff, 0xe0, // jmp rax
+            0xcc, // int3
+            0x0f, 0x0b, // ud2
+            0xc3, // ret
+        ];
+        let m = mem(&[(0x1000, code)]);
+        let x86 = lifter.as_x86().unwrap();
+        for start in 0..code.len() as u64 {
+            let range = lifter.lift_range(&m, 0x1000 + start, 40).unwrap();
+            for insn in &range {
+                let alone = x86.lift_alone(&m, insn.address).unwrap();
+                assert_eq!(Flow::of(insn), Flow::of(&alone), "{:#x}", insn.address);
+            }
+        }
     }
 
     #[test]

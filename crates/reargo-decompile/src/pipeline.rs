@@ -453,7 +453,7 @@ fn decompile_function_inner(
     };
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
-    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));
+    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()));
     crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
     // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
     let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);

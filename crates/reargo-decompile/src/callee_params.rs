@@ -90,6 +90,8 @@ pub struct CalleeParams<'a> {
     call_index: Option<crate::callers::CallIndex>,
     /// [`crate::callers::return_hint`] by function.
     hint_memo: Mutex<FxHashMap<u64, Option<crate::callers::ReturnHint>>>,
+    /// The control flow of the instructions the no-return searches read (x86).
+    flow_cache: Option<crate::noreturn::FlowCache>,
 }
 
 /// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
@@ -153,6 +155,7 @@ impl<'a> CalleeParams<'a> {
             facts: lifter.as_x86().map(|_| reargo_lift::x86::InsnFacts::new(memory)),
             call_index: None,
             hint_memo: Mutex::new(FxHashMap::default()),
+            flow_cache: lifter.as_x86().map(|_| crate::noreturn::FlowCache::new()),
         })
     }
 
@@ -161,6 +164,11 @@ impl<'a> CalleeParams<'a> {
     pub fn with_call_index(mut self) -> Self {
         self.call_index = crate::callers::CallIndex::build(self.memory);
         self
+    }
+
+    /// The control-flow cache the no-return searches of this oracle's batch share.
+    pub(crate) fn flow_cache(&self) -> Option<&crate::noreturn::FlowCache> {
+        self.flow_cache.as_ref()
     }
 
     /// [`crate::callers::return_hint`]`(lifter, memory, target)`, memoised.
