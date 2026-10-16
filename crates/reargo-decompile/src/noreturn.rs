@@ -120,7 +120,7 @@ pub struct NoReturn<'a> {
 /// and the x87 stack a range lift adds change no control flow).
 #[derive(Default)]
 pub struct FlowCache {
-    shards: Vec<Mutex<FxHashMap<u64, Option<std::sync::Arc<Flow>>>>>,
+    shards: Vec<Mutex<FxHashMap<u64, Option<Flow>>>>,
 }
 
 impl FlowCache {
@@ -129,12 +129,12 @@ impl FlowCache {
     }
 
     /// The flow of the instruction at `addr` lifted alone (`None` when it cannot be lifted).
-    fn get(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64) -> Option<std::sync::Arc<Flow>> {
+    fn get(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64) -> Option<Flow> {
         let shard = &self.shards[((addr ^ (addr >> 6)) % self.shards.len() as u64) as usize];
         if let Some(f) = shard.lock().ok().and_then(|m| m.get(&addr).cloned()) {
             return f;
         }
-        let f = x86.lift_alone(memory, addr).ok().map(|i| std::sync::Arc::new(Flow::of(&i)));
+        let f = x86.lift_alone(memory, addr).ok().map(|i| Flow::of(&i));
         if let Ok(mut m) = shard.lock() {
             m.insert(addr, f.clone());
         }
@@ -249,7 +249,7 @@ struct Code<'a> {
     lifter: &'a dyn PcodeLift,
     memory: &'a Memory,
     flow: Option<(&'a reargo_lift::x86::X86Lifter, &'a FlowCache)>,
-    insns: Vec<std::sync::Arc<Flow>>,
+    insns: Vec<Flow>,
     index: FxHashMap<u64, usize>,
 }
 
@@ -287,7 +287,7 @@ impl Code<'_> {
                         break; // runs into code lifted before
                     }
                     self.index.insert(insn.address, self.insns.len());
-                    self.insns.push(std::sync::Arc::new(Flow::of(&insn)));
+                    self.insns.push(Flow::of(&insn));
                 }
             }
         }

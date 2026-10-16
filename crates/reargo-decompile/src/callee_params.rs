@@ -69,6 +69,10 @@ pub struct CalleeParams<'a> {
     class_of: Vec<usize>,
     /// Arguments of each class, in parameter order.
     class_members: Vec<Vec<usize>>,
+    /// The space every argument is in, if they share one, and `(offset, 1 << arg)` of each
+    /// argument by offset (for [`Self::covering`]).
+    arg_space: Option<SpaceId>,
+    arg_offsets: Vec<(u64, u32)>,
     memo: Mutex<FxHashMap<(u64, u32), Option<ParamInfo>>>,
     /// The convention's return registers (`rax`, `xmm0`).
     pub(crate) returns: Vec<VarnodeData>,
@@ -138,7 +142,12 @@ impl<'a> CalleeParams<'a> {
     pub fn new(lifter: &'a dyn PcodeLift, memory: &'a Memory) -> Option<Self> {
         let cc = lifter.call_convention()?;
         let (class_of, class_members) = arg_classes(&cc.args);
+        let arg_space = cc.args.first().map(|a| a.space).filter(|&sp| cc.args.iter().all(|a| a.space == sp));
+        let mut arg_offsets: Vec<(u64, u32)> = cc.args.iter().enumerate().map(|(i, a)| (a.offset, 1u32 << i)).collect();
+        arg_offsets.sort_unstable();
         Some(Self {
+            arg_space,
+            arg_offsets,
             lifter,
             memory,
             args: cc.args,
@@ -567,6 +576,20 @@ impl<'a> CalleeParams<'a> {
     /// Arguments whose low byte lies in `[lo, hi)` of `space`.
     fn covering(&self, space: SpaceId, lo: u64, hi: u64) -> u32 {
         let mut m = 0;
+        // (the arguments by offset; `arg_space`: the one space they are all in)
+        if let Some(sp) = self.arg_space {
+            if space != sp {
+                return 0;
+            }
+            let from = self.arg_offsets.partition_point(|&(off, _)| off < lo);
+            for &(off, bit) in &self.arg_offsets[from..] {
+                if off >= hi {
+                    break;
+                }
+                m |= bit;
+            }
+            return m;
+        }
         for (i, a) in self.args.iter().enumerate() {
             if a.space == space && lo <= a.offset && a.offset < hi {
                 m |= 1 << i;
