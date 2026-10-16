@@ -284,6 +284,20 @@ pub(crate) fn walk_function_with<I: std::borrow::Borrow<LiftedInstruction>>(
     summaries: &ParamSummaries,
     external: &std::collections::BTreeSet<u64>,
 ) -> Vec<CallSite> {
+    walk_function_owning(entry, insns, summaries, external, |a| {
+        program.listing.function_containing(a).map(|f| f.entry_point) == Some(entry)
+    })
+}
+
+/// [`walk_function_with`] with whether the function owns the call
+/// instruction at an address given by `owns_call`.
+pub(crate) fn walk_function_owning<I: std::borrow::Borrow<LiftedInstruction>>(
+    entry: u64,
+    insns: &[I],
+    summaries: &ParamSummaries,
+    external: &std::collections::BTreeSet<u64>,
+    owns_call: impl Fn(u64) -> bool,
+) -> Vec<CallSite> {
     let mut out = Vec::new();
     let mut tracker = Tracker::new();
     if let Some(summary) = summaries.get(&entry) {
@@ -300,8 +314,7 @@ pub(crate) fn walk_function_with<I: std::borrow::Borrow<LiftedInstruction>>(
         .iter()
         .map(|insn| {
             let insn = insn.borrow();
-            insn.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd))
-                && program.listing.function_containing(insn.address).map(|f| f.entry_point) == Some(entry)
+            insn.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd)) && owns_call(insn.address)
         })
         .collect();
     // Nothing after the last owned call is recorded: the walk stops there.
