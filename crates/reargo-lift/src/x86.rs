@@ -182,7 +182,8 @@ pub struct LiftCache {
     len: Vec<u8>,
     /// [`X87`], [`READS_PF`], [`FAILED`] of each index.
     flags: Vec<u8>,
-    /// The [`InsnShape`] of each index (its default where the lift failed).
+    /// The [`InsnShape`] of each index (only its address where the lift
+    /// failed).
     shape: Vec<crate::lift::InsnShape>,
     /// Instructions the last [`Self::trim`] kept.
     kept: usize,
@@ -269,30 +270,32 @@ impl LiftCache {
     /// kept is unchanged (a link always leads to a higher address, so
     /// the links of the kept instructions stay).
     pub fn retain_from(&mut self, start: u64) {
-        let mut kept: Vec<(u64, u32)> = self.map.iter().filter(|(a, _)| **a >= start).map(|(a, i)| (*a, *i)).collect();
-        kept.sort_unstable();
-        let mut new_index = vec![NO_NEXT; self.lifted.len()];
-        for (k, &(_, i)) in kept.iter().enumerate() {
-            new_index[i as usize] = u32::try_from(k).expect("lift cache index");
+        // compacted in place, in index order
+        let keep: Vec<bool> = self.shape.iter().map(|s| s.address >= start).collect();
+        let mut new_index = vec![NO_NEXT; keep.len()];
+        let mut kept = 0u32;
+        for (i, _) in keep.iter().enumerate().filter(|(_, k)| **k) {
+            new_index[i] = kept;
+            kept += 1;
         }
-        let mut old = std::mem::take(&mut self.lifted);
-        let (next, len, flags, shape) = (
-            std::mem::take(&mut self.next),
-            std::mem::take(&mut self.len),
-            std::mem::take(&mut self.flags),
-            std::mem::take(&mut self.shape),
-        );
-        self.map.clear();
-        self.reserve(kept.len());
-        for &(a, i) in &kept {
-            let i = i as usize;
-            self.map.insert(a, u32::try_from(self.lifted.len()).expect("lift cache index"));
-            self.lifted.push(old[i].take());
-            self.next.push(if next[i] == NO_NEXT { NO_NEXT } else { new_index[next[i] as usize] });
-            self.len.push(len[i]);
-            self.flags.push(flags[i]);
-            self.shape.push(shape[i]);
+        fn compact<T>(v: &mut Vec<T>, keep: &[bool]) {
+            let mut k = keep.iter();
+            v.retain(|_| *k.next().expect("one flag per entry"));
         }
+        compact(&mut self.lifted, &keep);
+        compact(&mut self.next, &keep);
+        compact(&mut self.len, &keep);
+        compact(&mut self.flags, &keep);
+        compact(&mut self.shape, &keep);
+        for n in &mut self.next {
+            if *n != NO_NEXT {
+                *n = new_index[*n as usize];
+            }
+        }
+        self.map.retain(|_, i| {
+            *i = new_index[*i as usize];
+            *i != NO_NEXT
+        });
     }
 
     /// Room for `n` instructions and as many again (at least
@@ -336,7 +339,7 @@ impl LiftCache {
                 let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
                 (flags, len, crate::lift::InsnShape::of(insn))
             }
-            None => (FAILED, 0, crate::lift::InsnShape::default()),
+            None => (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() }),
         };
         let i = u32::try_from(self.lifted.len()).expect("lift cache index");
         self.lifted.push(lifted);
