@@ -75,37 +75,24 @@ impl Analyzer for SwitchTableOffsetAnalyzer {
             .map(|s| (s.address, s.address + s.size))
             .collect();
 
-        // Build a flat per-function instruction sequence so we can
-        // walk back from each indirect jump cheaply.
-        struct InsnInfo {
-            address: u64,
-            length: u32,
-            bytes: smallvec::SmallVec<[u8; 16]>,
-        }
-        let mut indirect_jumps: Vec<u64> = Vec::new();
-        let mut by_addr: std::collections::BTreeMap<u64, InsnInfo> = std::collections::BTreeMap::new();
-        for i in program.listing.instructions() {
-            if i.flow_type == FlowType::IndirectJump {
-                indirect_jumps.push(i.address);
-            }
-            by_addr.insert(
-                i.address,
-                InsnInfo {
-                    address: i.address,
-                    length: i.length,
-                    bytes: i.bytes.clone(),
-                },
-            );
-        }
+        // Walk back from each indirect jump straight through the
+        // listing's ordered instruction map (no per-run copy of every
+        // instruction).
+        let indirect_jumps: Vec<u64> = program
+            .listing
+            .instructions()
+            .filter(|i| i.flow_type == FlowType::IndirectJump)
+            .map(|i| i.address)
+            .collect();
 
         let mut candidates: Vec<(u64, u64)> = Vec::new();
         for jmp_addr in &indirect_jumps {
             // Walk backward up to 24 insns.
-            let preds: Vec<&InsnInfo> = by_addr
-                .range(..*jmp_addr)
+            let preds: Vec<&reargo_arch::DecodedInstruction> = program
+                .listing
+                .instructions_in_range(0, *jmp_addr)
                 .rev()
                 .take(24)
-                .map(|(_, v)| v)
                 .collect();
 
             // Find the most-recent `lea reg, [rip + disp32]`. That

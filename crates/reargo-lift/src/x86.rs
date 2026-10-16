@@ -151,6 +151,37 @@ fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
     })
 }
 
+/// Memo for [`X86Lifter::lift_range_cached`]: the lift of each address alone,
+/// without the integer PF (`None` where it fails).
+#[derive(Default)]
+pub struct LiftCache {
+    map: std::collections::HashMap<u64, Option<LiftedInstruction>>,
+}
+
+impl LiftCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// A range lifted by [`X86Lifter::lift_range_cached`].
+pub enum CachedRange<'c> {
+    /// Every instruction lifted alone, borrowed from the cache.
+    Cached(Vec<&'c LiftedInstruction>),
+    /// Lifted afresh as a whole range (x87 code or the integer PF needed).
+    Owned(Vec<LiftedInstruction>),
+}
+
+impl CachedRange<'_> {
+    /// The instructions in address order (the order `lift_range` returns them).
+    pub fn insns(&self) -> Vec<&LiftedInstruction> {
+        match self {
+            CachedRange::Cached(v) => v.clone(),
+            CachedRange::Owned(v) => v.iter().collect(),
+        }
+    }
+}
+
 pub struct X86Lifter {
     is_64: bool,
     /// Compute PF for integer instructions (WS85). On by default; [`PcodeLift::lift_range`]
@@ -165,6 +196,84 @@ impl X86Lifter {
 
     pub fn new_32() -> Self {
         Self { is_64: false, parity: true }
+    }
+
+    /// This lifter without the integer PF: its `lift_instruction` lifts an
+    /// instruction as the first pass of [`PcodeLift::lift_range`] does.
+    pub fn without_parity(self) -> Self {
+        Self { parity: false, ..self }
+    }
+
+    /// [`PcodeLift::lift_range`] through `cache`, a memo of the range-independent
+    /// part of it: the single-instruction lifts without the integer PF, keyed by
+    /// address. Equal to `lift_range(memory, start, count)`: when the range holds
+    /// an instruction the x87 pass could rewrite (a mnemonic starting with `f`)
+    /// or a PF reader needs the integer PF ([`needs_integer_parity`]), the range
+    /// is lifted afresh with `lift_range` itself and nothing of it is cached.
+    /// Passes that lift many overlapping ranges (every function lifted linearly
+    /// past its end) lift each address once per cache this way.
+    pub fn lift_range_cached<'c>(
+        &self,
+        memory: &Memory,
+        start: u64,
+        count: usize,
+        cache: &'c mut LiftCache,
+    ) -> CachedRange<'c> {
+        let fast = X86Lifter { is_64: self.is_64, parity: false };
+        let mut addrs: Vec<u64> = Vec::with_capacity(count.min(4096));
+        let mut addr = start;
+        let mut x87 = false;
+        for _ in 0..count {
+            let lifted = cache.map.entry(addr).or_insert_with(|| fast.lift_instruction(memory, addr).ok());
+            let Some(l) = lifted else { break };
+            x87 |= l.mnemonic.starts_with('f');
+            addrs.push(addr);
+            addr += l.length as u64;
+        }
+        if x87 {
+            return CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default());
+        }
+        let cache: &'c LiftCache = cache;
+        let insns: Vec<&'c LiftedInstruction> = addrs
+            .iter()
+            .map(|a| cache.map.get(a).and_then(Option::as_ref).expect("lifted above"))
+            .collect();
+        if self.parity && needs_integer_parity(&insns) {
+            return CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default());
+        }
+        CachedRange::Cached(insns)
+    }
+
+    /// Does the linear range `lift_range(memory, start, count)` would lift
+    /// hold an indirect `call` (`call reg` / `call [mem]`, the only source
+    /// of a `CallInd` op)? Decodes the range without lifting it: decoding
+    /// stops where an instruction is unreadable or invalid, never after a
+    /// lift would stop, so `false` means no `CallInd` in the lifted range.
+    pub fn range_has_indirect_call(&self, memory: &Memory, start: u64, count: usize) -> bool {
+        use iced_x86::OpKind;
+        let bitness = if self.is_64 { 64 } else { 32 };
+        let mut buf = [0u8; 15];
+        let mut insn = iced_x86::Instruction::default();
+        let mut addr = start;
+        for _ in 0..count {
+            let read_len = memory.read_instruction_bytes(addr, &mut buf);
+            if read_len == 0 {
+                return false;
+            }
+            let mut decoder =
+                iced_x86::Decoder::with_ip(bitness, &buf[..read_len], addr, iced_x86::DecoderOptions::NONE);
+            decoder.decode_out(&mut insn);
+            if insn.is_invalid() {
+                return false;
+            }
+            if insn.mnemonic() == iced_x86::Mnemonic::Call
+                && !matches!(insn.op_kind(0), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64)
+            {
+                return true;
+            }
+            addr += insn.len() as u64;
+        }
+        false
     }
 
     fn ptr_size(&self) -> u32 {
@@ -2469,17 +2578,18 @@ fn emit_pf(result: VarnodeData, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, addr
 /// instruction sets (WS85)? Walking back from it along the straight line (conditional jumps
 /// fall through): a float compare's PF write satisfies it; another flag write, the start of the
 /// range or other control flow does not.
-pub fn needs_integer_parity(lifted: &[LiftedInstruction]) -> bool {
+pub fn needs_integer_parity<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L]) -> bool {
     let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
     let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
     for (i, insn) in lifted.iter().enumerate() {
+        let insn = insn.borrow();
         let Some(read) = insn.ops.iter().position(|o| o.inputs.iter().any(pf)) else { continue };
         if insn.ops[..read].iter().any(|o| o.output.as_ref().is_some_and(pf)) {
             continue;
         }
         let mut satisfied = false;
         for j in (0..i).rev() {
-            let (p, next) = (&lifted[j], &lifted[j + 1]);
+            let (p, next) = (lifted[j].borrow(), lifted[j + 1].borrow());
             if p.address + u64::from(p.length) != next.address {
                 break;
             }

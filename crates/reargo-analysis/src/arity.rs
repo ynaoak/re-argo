@@ -29,7 +29,7 @@
 
 use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
-use reargo_lift::PcodeLift;
+use reargo_lift::LiftedInstruction;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
@@ -71,26 +71,21 @@ impl Analyzer for ArgumentArityAnalyzer {
             });
         }
 
-        let lifter: Box<dyn PcodeLift> = Box::new(reargo_lift::x86::X86Lifter::new_64());
-
-        let candidates: Vec<u64> = program
+        // Every candidate's linear lift (in parallel, neighbours sharing
+        // lifted instructions), then the writes in function order.
+        let jobs: Vec<(u64, usize)> = program
             .listing
             .functions()
             .filter(|f| f.name.starts_with("FUN_") && !f.is_thunk)
-            .map(|f| f.entry_point)
+            .map(|f| (f.entry_point, f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200)))
             .collect();
+        let arities: Vec<(u64, usize)> =
+            crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |entry, lifted| {
+                (entry, infer_arity(lifted))
+            });
 
         let mut annotated = 0usize;
-        for entry in candidates {
-            let max_insns = program
-                .listing
-                .get_function(entry)
-                .map(|f| f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200))
-                .unwrap_or(200);
-            let Ok(lifted) = lifter.lift_range(&program.info.memory, entry, max_insns) else {
-                continue;
-            };
-            let arity = infer_arity(&lifted);
+        for (entry, arity) in arities {
             program.metadata.set_property(
                 format!("func_{:x}_arity", entry),
                 arity.to_string(),
@@ -125,11 +120,11 @@ enum RegState {
 /// Walk the lifted P-code in linear order and classify each SysV arg
 /// register's first usage. Returns the number of leading registers
 /// classified as `ReadBeforeWrite` — i.e., the inferred SysV arity.
-fn infer_arity(lifted: &[reargo_lift::LiftedInstruction]) -> usize {
+fn infer_arity<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L]) -> usize {
     let mut state: [RegState; 6] = [RegState::Untouched; 6];
 
     for insn in lifted {
-        for op in &insn.ops {
+        for op in &insn.borrow().ops {
             // Reads: every input that targets a SysV register.
             for input in op.inputs.iter() {
                 if input.space == SpaceId::REGISTER
@@ -171,7 +166,6 @@ fn infer_arity(lifted: &[reargo_lift::LiftedInstruction]) -> usize {
 mod tests {
     use super::*;
     use reargo_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
-    use reargo_lift::LiftedInstruction;
 
     fn vn_reg(offset: u64) -> VarnodeData {
         VarnodeData {

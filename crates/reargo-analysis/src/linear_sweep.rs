@@ -99,7 +99,7 @@ impl Analyzer for LinearSweepAnalyzer {
             .map(|s| (s.address, s.address + s.size))
             .collect();
 
-        let lifter: Box<dyn PcodeLift> = Box::new(reargo_lift::x86::X86Lifter::new_64());
+        let lifter: Box<dyn PcodeLift> = Box::new(reargo_lift::x86::X86Lifter::new_64().without_parity());
         let mut new_functions: Vec<(u64, u64)> = Vec::new();
         let mut visited: BTreeSet<u64> = BTreeSet::new();
 
@@ -283,44 +283,60 @@ fn validate_candidate_with_extent(
     entry: u64,
     covered: &Covered,
 ) -> Option<u64> {
-    let lifted = lifter.lift_range(&program.info.memory, entry, 256).ok()?;
-    if lifted.len() < 3 {
-        return None;
-    }
-    let mut terminator_idx: Option<usize> = None;
-    for (i, insn) in lifted.iter().enumerate() {
-        if covered.contains(insn.address) {
-            return None;
-        }
-        // Look at the underlying `DecodedInstruction.flow_type` via
-        // the listing if the address is decoded, else inspect the
-        // P-code op to detect a Return. The lifter's
-        // `LiftedInstruction` carries the raw bytes + ops but not
-        // the high-level flow_type, so we check op opcode directly.
-        let pcode_terminates = insn.ops.iter().any(|op| {
-            matches!(
-                op.opcode,
-                reargo_core::pcode::OpCode::Return | reargo_core::pcode::OpCode::BranchInd
-            )
-        });
-        let flow_terminates = program
-            .listing
-            .instructions_in_range(insn.address, insn.address + 1)
-            .next()
-            .is_some_and(|m| {
+    // `lift_range(entry, 256)` would lift up to 256 instructions, but
+    // only the instructions up to the first terminator and the count
+    // (at least 3) decide the answer, and neither depends on the
+    // range-wide passes of `lift_range` (the integer PF, the x87
+    // stack): they only add or change ops of non-terminators. So lift
+    // one instruction at a time and stop as soon as the answer is known.
+    const BUDGET: usize = 256;
+    let memory = &program.info.memory;
+    let mut count = 0usize;
+    let mut addr = entry;
+    let mut end: Option<u64> = None;
+    while count < BUDGET {
+        let Ok(insn) = lifter.lift_instruction(memory, addr) else { break };
+        count += 1;
+        let next = addr + insn.length as u64;
+        if end.is_none() {
+            if covered.contains(insn.address) {
+                // Rejected unless the range is too short anyway — `None` both ways.
+                return None;
+            }
+            // Look at the underlying `DecodedInstruction.flow_type` via
+            // the listing if the address is decoded, else inspect the
+            // P-code op to detect a Return. The lifter's
+            // `LiftedInstruction` carries the raw bytes + ops but not
+            // the high-level flow_type, so we check op opcode directly.
+            let pcode_terminates = insn.ops.iter().any(|op| {
                 matches!(
-                    m.flow_type,
-                    FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall
+                    op.opcode,
+                    reargo_core::pcode::OpCode::Return | reargo_core::pcode::OpCode::BranchInd
                 )
             });
-        if pcode_terminates || flow_terminates {
-            terminator_idx = Some(i);
+            let flow_terminates = program
+                .listing
+                .instructions_in_range(insn.address, insn.address + 1)
+                .next()
+                .is_some_and(|m| {
+                    matches!(
+                        m.flow_type,
+                        FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall
+                    )
+                });
+            if pcode_terminates || flow_terminates {
+                end = Some(next);
+            }
+        }
+        if end.is_some() && count >= 3 {
             break;
         }
+        addr = next;
     }
-    let idx = terminator_idx?;
-    let last = &lifted[idx];
-    Some(last.address + last.length as u64)
+    if count < 3 {
+        return None;
+    }
+    end
 }
 
 #[cfg(test)]

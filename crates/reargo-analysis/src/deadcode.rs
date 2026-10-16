@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
+use rayon::prelude::*;
 use reargo_arch::FlowType;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
@@ -63,8 +64,11 @@ impl Analyzer for DeadCodeAnalyzer {
             })
             .collect();
 
-        let mut all_unreachable: Vec<u64> = Vec::new();
-        for snap in &snaps {
+        // Functions are independent: walk them in parallel, keeping
+        // the results in function order.
+        let listing = &program.listing;
+        let per_function: Vec<Vec<u64>> = snaps.par_iter().map(|snap| {
+            let mut unreachable: Vec<u64> = Vec::new();
             // Build the per-function block-start set by walking
             // instructions and noting:
             //   * the entry address
@@ -72,12 +76,19 @@ impl Analyzer for DeadCodeAnalyzer {
             //   * the fall-through of every branch / return
             let mut block_starts: BTreeSet<u64> = BTreeSet::new();
             block_starts.insert(snap.entry);
-            let in_body = |a: u64| snap.ranges.iter().any(|(s, e)| a >= *s && a < *e);
+            // A body holds one range per instruction: test membership
+            // by a binary search over the merged ranges instead of a
+            // scan of all of them.
+            let merged = merge_ranges(&snap.ranges);
+            let in_body = |a: u64| {
+                let i = merged.partition_point(|&(s, _)| s <= a);
+                i > 0 && a < merged[i - 1].1
+            };
 
             // Snapshot insns in body, sorted.
             let mut insns: Vec<(u64, u32, FlowType, Option<u64>)> = Vec::new();
             for (s, e) in &snap.ranges {
-                for i in program.listing.instructions_in_range(*s, *e) {
+                for i in listing.instructions_in_range(*s, *e) {
                     insns.push((i.address, i.length, i.flow_type, i.branch_target));
                 }
             }
@@ -161,10 +172,12 @@ impl Analyzer for DeadCodeAnalyzer {
 
             for &start in &block_starts {
                 if !reachable.contains(&start) {
-                    all_unreachable.push(start);
+                    unreachable.push(start);
                 }
             }
-        }
+            unreachable
+        }).collect();
+        let all_unreachable = per_function.into_iter().flatten();
 
         let mut emitted = 0usize;
         for addr in all_unreachable {
@@ -186,6 +199,21 @@ impl Analyzer for DeadCodeAnalyzer {
     }
 }
 
+/// `ranges` (half-open) sorted and merged where they overlap or touch:
+/// an address is in one of them exactly when it is in one of these.
+fn merge_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut raw: Vec<(u64, u64)> = ranges.iter().copied().filter(|(s, e)| s < e).collect();
+    raw.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
+    for (s, e) in raw {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +221,17 @@ mod tests {
     #[test]
     fn module_compiles() {
         let _ = DeadCodeAnalyzer;
+    }
+
+    #[test]
+    fn merged_ranges_keep_membership() {
+        let raw = [(0x10u64, 0x14u64), (0x14, 0x18), (0x30, 0x40), (0x32, 0x35), (0x3f, 0x50), (0x60, 0x60), (0x5, 0x8)];
+        let merged = merge_ranges(&raw);
+        assert_eq!(merged, vec![(0x5, 0x8), (0x10, 0x18), (0x30, 0x50)]);
+        for a in 0..0x70u64 {
+            let naive = raw.iter().any(|&(s, e)| a >= s && a < e);
+            let i = merged.partition_point(|&(s, _)| s <= a);
+            assert_eq!(i > 0 && a < merged[i - 1].1, naive, "{a:#x}");
+        }
     }
 }

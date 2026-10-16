@@ -23,16 +23,16 @@
 //! literally in the bytes.
 //!
 //! Same pattern as the existing parallel-collect / serial-apply
-//! analyzers: per-function lift runs under rayon, then the apply
-//! step writes into `program.references` serially.
+//! analyzers: per-function lift runs under rayon (neighbouring
+//! functions sharing their lifted instructions, see `range_lift`),
+//! then the apply step writes into `program.references` serially.
 
 use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
-use reargo_lift::PcodeLift;
+use reargo_lift::LiftedInstruction;
 use reargo_loader::SectionFlags;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
-use rayon::prelude::*;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -106,23 +106,29 @@ impl Analyzer for PcodeReferenceAnalyzer {
             });
         }
 
-        let lifter: Box<dyn PcodeLift> =
-            Box::new(reargo_lift::x86::X86Lifter::new_64());
-        let lifter = &*lifter;
         let sections = SectionMap::from(program);
 
-        let entries: Vec<u64> = program
+        // Same sizing as the decompile path: floor at 500 so a tiny
+        // discovery body still covers reachable lift.
+        let jobs: Vec<(u64, usize)> = program
             .listing
             .functions()
-            .map(|f| f.entry_point)
+            .map(|f| {
+                let budget = f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(500);
+                (f.entry_point, budget)
+            })
             .collect();
 
         // Phase 1 (parallel): per-function lift + scan. Each task
         // sees an immutable Program view and produces candidate
-        // refs; no per-call mutation contention.
-        let candidates: Vec<(u64, u64, RefType)> = entries
-            .par_iter()
-            .flat_map_iter(|&entry| scan_function(lifter, program, &sections, entry).into_iter())
+        // refs; no per-call mutation contention. Neighbouring
+        // functions' lifts overlap, so they share lifted instructions.
+        let candidates: Vec<(u64, u64, RefType)> =
+            crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |_, insns| {
+                scan_lifted(insns, &sections)
+            })
+            .into_iter()
+            .flatten()
             .collect();
 
         // Phase 2 (serial): dedup against existing refs and apply.
@@ -151,33 +157,11 @@ impl Analyzer for PcodeReferenceAnalyzer {
     }
 }
 
-/// Lift one function and return every `(from_insn_addr, target,
-/// kind)` reference its P-code reveals.
-fn scan_function(
-    lifter: &dyn PcodeLift,
-    program: &Program,
-    sections: &SectionMap,
-    entry: u64,
-) -> Vec<(u64, u64, RefType)> {
-    let func = match program.listing.get_function(entry) {
-        Some(f) => f,
-        None => return Vec::new(),
-    };
-    // Same sizing as the decompile path: floor at 500 so a tiny
-    // discovery body still covers reachable lift.
-    let max_insns = func
-        .body
-        .ranges()
-        .map(|r| r.size as usize)
-        .sum::<usize>()
-        .max(500);
-    let lifted = match lifter.lift_range(&program.info.memory, entry, max_insns) {
-        Ok(l) => l,
-        Err(_) => return Vec::new(),
-    };
-
+/// Every `(from_insn_addr, target, kind)` reference the P-code of
+/// one function's lifted range reveals.
+fn scan_lifted(lifted: &[&LiftedInstruction], sections: &SectionMap) -> Vec<(u64, u64, RefType)> {
     let mut out: Vec<(u64, u64, RefType)> = Vec::new();
-    for insn in &lifted {
+    for insn in lifted {
         for op in &insn.ops {
             match op.opcode {
                 // `lea reg, [absolute]` / `mov reg, &global` after

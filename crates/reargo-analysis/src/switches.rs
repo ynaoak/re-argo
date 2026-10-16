@@ -60,8 +60,7 @@ impl Analyzer for SwitchTableAnalyzer {
                 // nearest read-only section starting after the jump.
                 let insn_end = program
                     .listing
-                    .instructions()
-                    .find(|i| i.address == jmp_addr)
+                    .get_instruction(jmp_addr)
                     .map(|i| jmp_addr + i.bytes.len() as u64)
                     .unwrap_or(jmp_addr + 8);
                 let table_base = if read_only_ranges
