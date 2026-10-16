@@ -43,6 +43,65 @@ fn target(op: &PcodeOp) -> Option<u64> {
         .map(|t| t.offset)
 }
 
+/// What the block structure and the linear call-site walk need of each
+/// lifted instruction, read from its P-code once (the walks over a lift
+/// otherwise scan every instruction's ops several times).
+pub struct LiftShape {
+    /// The addresses strictly increase.
+    pub increasing: bool,
+    /// Each instruction's address.
+    pub addrs: Vec<u64>,
+    /// It has a `Call` / `CallInd` op.
+    pub has_call: Vec<bool>,
+    /// `(instruction index, target)` of every `Branch` / `CBranch` with
+    /// a jump target in the lift's space ([`target`]), in op order.
+    pub branches: Vec<(usize, u64)>,
+    /// It has a `Branch`, `CBranch`, `Return` or `BranchInd` op (it
+    /// ends its block).
+    pub ends_block: Vec<bool>,
+    /// It has a `Branch`, `Return` or `BranchInd` op (no fall-through).
+    pub stops: Vec<bool>,
+}
+
+impl LiftShape {
+    pub fn of<I: Borrow<LiftedInstruction>>(insns: &[I]) -> LiftShape {
+        let n = insns.len();
+        let mut shape = LiftShape {
+            increasing: insns.windows(2).all(|w| w[0].borrow().address < w[1].borrow().address),
+            addrs: Vec::with_capacity(n),
+            has_call: Vec::with_capacity(n),
+            branches: Vec::new(),
+            ends_block: Vec::with_capacity(n),
+            stops: Vec::with_capacity(n),
+        };
+        for (i, insn) in insns.iter().map(Borrow::borrow).enumerate() {
+            let (mut call, mut ends, mut stops) = (false, false, false);
+            for op in &insn.ops {
+                match op.opcode {
+                    OpCode::Call | OpCode::CallInd => call = true,
+                    OpCode::Branch | OpCode::CBranch => {
+                        if let Some(t) = target(op) {
+                            shape.branches.push((i, t));
+                        }
+                        ends = true;
+                        stops |= op.opcode == OpCode::Branch;
+                    }
+                    OpCode::Return | OpCode::BranchInd => {
+                        ends = true;
+                        stops = true;
+                    }
+                    _ => {}
+                }
+            }
+            shape.addrs.push(insn.address);
+            shape.has_call.push(call);
+            shape.ends_block.push(ends);
+            shape.stops.push(stops);
+        }
+        shape
+    }
+}
+
 /// The blocks of one function's lift, computed once and walked by
 /// every [`propagate_cfg`] over it.
 pub struct Cfg {
@@ -75,12 +134,17 @@ impl Cfg {
         external: &BTreeSet<u64>,
         in_body: impl Fn(u64) -> bool,
     ) -> Cfg {
-        let addr = |i: usize| insns[i].borrow().address;
-        let increasing = insns.windows(2).all(|w| w[0].borrow().address < w[1].borrow().address);
-        if !increasing || insns.is_empty() {
+        Cfg::build_shaped(&LiftShape::of(insns), external, in_body)
+    }
+
+    /// [`Cfg::build`] from the [`LiftShape`] of the instructions.
+    pub fn build_shaped(shape: &LiftShape, external: &BTreeSet<u64>, in_body: impl Fn(u64) -> bool) -> Cfg {
+        let addrs = &shape.addrs;
+        let addr = |i: usize| addrs[i];
+        if !shape.increasing || addrs.is_empty() {
             // the legacy walk asks `in_body` per block start; keep the
             // answers for every instruction address
-            let in_body_blocks = insns.iter().map(|i| i.borrow().address).filter(|a| in_body(*a)).collect();
+            let in_body_blocks = addrs.iter().copied().filter(|a| in_body(*a)).collect();
             return Cfg {
                 start_idx: Vec::new(),
                 start_addr: Vec::new(),
@@ -93,8 +157,8 @@ impl Cfg {
                 in_body_blocks,
             };
         }
-        let idx_of = |a: u64| insns.binary_search_by_key(&a, |i| i.borrow().address).ok();
-        let n = insns.len();
+        let idx_of = |a: u64| addrs.binary_search(&a).ok();
+        let n = addrs.len();
         let mut is_start = vec![false; n];
         is_start[0] = true;
         for &a in external {
@@ -104,34 +168,18 @@ impl Cfg {
         }
         // Branch / CBranch targets, by instruction; whether an
         // instruction stops the fall-through (Branch, Return, BranchInd)
-        let mut targets: Vec<(usize, u64)> = Vec::new();
-        let mut stops = vec![false; n];
-        let mut ends_block = false;
-        for (i, insn) in insns.iter().enumerate() {
-            if ends_block {
-                is_start[i] = true;
-            }
-            ends_block = false;
-            for op in &insn.borrow().ops {
-                match op.opcode {
-                    OpCode::Branch | OpCode::CBranch => {
-                        if let Some(t) = target(op) {
-                            targets.push((i, t));
-                            if let Some(t) = idx_of(t) {
-                                is_start[t] = true;
-                            }
-                        }
-                        ends_block = true;
-                        stops[i] |= op.opcode == OpCode::Branch;
-                    }
-                    OpCode::Return | OpCode::BranchInd => {
-                        ends_block = true;
-                        stops[i] = true;
-                    }
-                    _ => {}
-                }
+        for &(_, t) in &shape.branches {
+            if let Some(t) = idx_of(t) {
+                is_start[t] = true;
             }
         }
+        for i in 1..n {
+            if shape.ends_block[i - 1] {
+                is_start[i] = true;
+            }
+        }
+        let targets = &shape.branches;
+        let stops = &shape.stops;
         let start_idx: Vec<usize> = (0..n).filter(|&i| is_start[i]).collect();
         let start_addr: Vec<u64> = start_idx.iter().map(|&i| addr(i)).collect();
         let nb = start_idx.len();
@@ -193,11 +241,16 @@ impl Cfg {
     /// one that can (its successors cannot reach them either), so it
     /// changes no state, visit count or worklist order of theirs.
     pub fn keep_calls<I: Borrow<LiftedInstruction>>(&mut self, insns: &[I], wanted: impl Fn(&LiftedInstruction) -> bool) {
+        self.keep_calls_at(insns.len(), |i| wanted(insns[i].borrow()));
+    }
+
+    /// [`Cfg::keep_calls`] with `wanted` asked of instruction indices
+    /// (of the `n` instructions the blocks were built from).
+    pub fn keep_calls_at(&mut self, n: usize, wanted: impl Fn(usize) -> bool) {
         if self.legacy {
             return;
         }
         let nb = self.start_idx.len();
-        let n = insns.len();
         let mut preds_at = vec![0usize; nb + 1];
         for &s in &self.succs {
             preds_at[s + 1] += 1;
@@ -217,7 +270,7 @@ impl Cfg {
         let mut stack: Vec<usize> = Vec::new();
         for b in 0..nb {
             let end = self.start_idx.get(b + 1).copied().unwrap_or(n);
-            if insns[self.start_idx[b]..end].iter().any(|i| wanted(i.borrow())) {
+            if (self.start_idx[b]..end).any(&wanted) {
                 relevant[b] = true;
                 stack.push(b);
             }

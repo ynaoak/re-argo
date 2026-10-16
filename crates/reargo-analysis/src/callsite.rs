@@ -298,6 +298,19 @@ pub(crate) fn walk_function_owning<I: std::borrow::Borrow<LiftedInstruction>>(
     external: &std::collections::BTreeSet<u64>,
     owns_call: impl Fn(u64) -> bool,
 ) -> Vec<CallSite> {
+    walk_function_shaped(entry, insns, &crate::blockflow::LiftShape::of(insns), summaries, external, owns_call)
+}
+
+/// [`walk_function_owning`] with the [`crate::blockflow::LiftShape`]
+/// of `insns`.
+pub(crate) fn walk_function_shaped<I: std::borrow::Borrow<LiftedInstruction>>(
+    entry: u64,
+    insns: &[I],
+    shape: &crate::blockflow::LiftShape,
+    summaries: &ParamSummaries,
+    external: &std::collections::BTreeSet<u64>,
+    owns_call: impl Fn(u64) -> bool,
+) -> Vec<CallSite> {
     let mut out = Vec::new();
     let mut tracker = Tracker::new();
     if let Some(summary) = summaries.get(&entry) {
@@ -310,20 +323,14 @@ pub(crate) fn walk_function_owning<I: std::borrow::Borrow<LiftedInstruction>>(
     // *its* tracker state (e.g. all unresolved), and the dedup would
     // block the real owner from re-recording it with the correct
     // seeded state.
-    let owned: Vec<bool> = insns
-        .iter()
-        .map(|insn| {
-            let insn = insn.borrow();
-            insn.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd)) && owns_call(insn.address)
-        })
-        .collect();
+    let owned: Vec<bool> = shape.has_call.iter().zip(&shape.addrs).map(|(&call, &a)| call && owns_call(a)).collect();
     // Nothing after the last owned call is recorded: the walk stops there.
     let Some(last) = owned.iter().rposition(|&o| o) else {
         return out;
     };
-    let mut joins = join_points(insns);
-    for (j, insn) in joins.iter_mut().zip(insns) {
-        *j |= external.contains(&insn.borrow().address);
+    let mut joins = join_points_shaped(shape);
+    for (j, a) in joins.iter_mut().zip(&shape.addrs) {
+        *j |= external.contains(a);
     }
     for ((insn, &join), &owned) in insns[..=last].iter().map(std::borrow::Borrow::borrow).zip(&joins).zip(&owned) {
         if join {
@@ -741,26 +748,21 @@ fn frame_address(op: &reargo_core::pcode::PcodeOp) -> Option<i64> {
 /// target inside the lift, or the instruction after an unconditional
 /// jump / indirect jump / return. State reaching them along the
 /// previous instruction is not the only state reaching them.
+#[cfg(test)]
 fn join_points<I: std::borrow::Borrow<LiftedInstruction>>(insns: &[I]) -> Vec<bool> {
-    let mut targets: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-    for insn in insns.iter().map(std::borrow::Borrow::borrow) {
-        for op in &insn.ops {
-            if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
-                && let Some(t) = op.inputs.first()
-                && t.space == SpaceId::RAM
-            {
-                targets.insert(t.offset);
-            }
-        }
-    }
-    let mut out = vec![false; insns.len()];
+    join_points_shaped(&crate::blockflow::LiftShape::of(insns))
+}
+
+/// [`join_points`] from the [`crate::blockflow::LiftShape`] of the
+/// instructions: the targets of their `Branch` / `CBranch` ops, and
+/// the instructions after a `Branch` / `BranchInd` / `Return`.
+fn join_points_shaped(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
+    let targets: rustc_hash::FxHashSet<u64> = shape.branches.iter().map(|&(_, t)| t).collect();
+    let mut out = vec![false; shape.addrs.len()];
     let mut after_terminator = false;
-    for (i, insn) in insns.iter().map(std::borrow::Borrow::borrow).enumerate() {
-        out[i] = after_terminator || targets.contains(&insn.address);
-        after_terminator = insn
-            .ops
-            .iter()
-            .any(|op| matches!(op.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Return));
+    for (i, &a) in shape.addrs.iter().enumerate() {
+        out[i] = after_terminator || targets.contains(&a);
+        after_terminator = shape.stops[i];
     }
     out
 }
