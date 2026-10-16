@@ -80,12 +80,12 @@ impl LiftShape {
             ends_block: Vec::with_capacity(n),
             stops: Vec::with_capacity(n),
         };
-        for i in 0..n {
+        for (i, insn) in insns.iter().enumerate() {
             let s = shape_of(i);
             if s.flags & InsnShape::TARGET != 0 {
                 shape.branches.push((i, s.target));
             } else if s.flags & InsnShape::TARGETS != 0 {
-                for op in &insns[i].borrow().ops {
+                for op in &insn.borrow().ops {
                     if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
                         && let Some(t) = target(op)
                     {

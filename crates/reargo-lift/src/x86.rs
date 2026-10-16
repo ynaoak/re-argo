@@ -273,10 +273,8 @@ impl LiftCache {
         // compacted in place, in index order
         let keep: Vec<bool> = self.shape.iter().map(|s| s.address >= start).collect();
         let mut new_index = vec![NO_NEXT; keep.len()];
-        let mut kept = 0u32;
-        for (i, _) in keep.iter().enumerate().filter(|(_, k)| **k) {
-            new_index[i] = kept;
-            kept += 1;
+        for (kept, (i, _)) in keep.iter().enumerate().filter(|(_, k)| **k).enumerate() {
+            new_index[i] = u32::try_from(kept).expect("lift cache index");
         }
         fn compact<T>(v: &mut Vec<T>, keep: &[bool]) {
             let mut k = keep.iter();
