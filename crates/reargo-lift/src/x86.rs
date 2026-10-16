@@ -556,12 +556,6 @@ impl X86Lifter {
             return lifted;
         }
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        // Most instructions lift to a handful of ops plus their flags:
-        // room for 8 up front instead of growing 4 -> 8 (a larger
-        // first allocation measured slower).
-        let mut ops: Vec<PcodeOp> = Vec::with_capacity(8);
-        let mut seq_base: u32 = 0;
-        let ps = self.ptr_size();
 
         // SSE / scalar-float instructions are lifted to FLOAT_* p-code so the
         // SSA/dataflow passes can track noise/biome math (the BDS world-gen is
@@ -573,6 +567,11 @@ impl X86Lifter {
         if let Some(lifted) = self.lift_bits(insn, address) {
             return lifted;
         }
+        // The ops are built in a reused buffer ([`scratch::take`]); the
+        // lift keeps an exact copy ([`scratch::finish`]).
+        let mut ops: Vec<PcodeOp> = scratch::take();
+        let mut seq_base: u32 = 0;
+        let ps = self.ptr_size();
 
         match insn.mnemonic() {
             Nop | Endbr64 | Endbr32 => {}
@@ -1497,7 +1496,7 @@ impl X86Lifter {
     ) -> Result<Vec<PcodeOp>, LiftError> {
         use iced_x86::Mnemonic::*;
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut ops: Vec<PcodeOp> = scratch::take();
         let mut sb: u32 = 0;
 
         // Scalar element width for this mnemonic group (sd=8, ss=4, packed=16).
@@ -2652,11 +2651,8 @@ impl X86Lifter {
         address: u64,
         x87: Option<X87Ctx>,
     ) -> Result<LiftedInstruction, LiftError> {
-        let mut pcode_ops = self.lift_iced(&insn, address, x87)?;
-        if self.is_64 {
-            pcode_ops = zero_extend_gpr32_writes(pcode_ops);
-        }
-        pcode_ops = sync_xmm_views(pcode_ops, xmm_write_zeroes_upper(&insn));
+        let pcode_ops = self.lift_iced(&insn, address, x87)?;
+        let pcode_ops = self.finish_ops(pcode_ops, &insn);
 
         Ok(LiftedInstruction {
             address,
@@ -2664,6 +2660,33 @@ impl X86Lifter {
             mnemonic: crate::lift::InsnText::x86_lazy(insn),
             ops: pcode_ops,
         })
+    }
+
+    /// The ops `lift_iced` built, with the register views kept coherent
+    /// ([`zero_extend_gpr32_writes`], [`sync_xmm_views`]), in a vector of
+    /// exactly their number: the lift holds no spare room, and the ops are
+    /// moved once where only the GPR views are added.
+    fn finish_ops(&self, mut ops: Vec<PcodeOp>, insn: &iced_x86::Instruction) -> Vec<PcodeOp> {
+        let xmm = needs_xmm_views(&ops);
+        if self.is_64 && touches_gpr(&ops) {
+            let extra: usize = ops.iter().map(gpr_extra).sum();
+            if extra == 0 {
+                for (i, op) in ops.iter_mut().enumerate() {
+                    op.seq.order = i as u32;
+                }
+            } else {
+                let out = if xmm { scratch::take() } else { Vec::with_capacity(ops.len() + extra) };
+                let out = zero_extend_gpr32_writes(&mut ops, out);
+                scratch::give(std::mem::replace(&mut ops, out));
+                if !xmm {
+                    return ops;
+                }
+            }
+        }
+        if xmm {
+            ops = sync_xmm_views(ops, xmm_write_zeroes_upper(insn));
+        }
+        scratch::finish(ops)
     }
 
     /// WS89: lift the x87 instructions of a range lifted from a function's entry again with the
@@ -2941,21 +2964,119 @@ fn parity_needed<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L], reads_
     false
 }
 
-fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
-    let gpr = |v: &VarnodeData| {
-        (v.space == REG_SPACE && v.offset < 0xC0 && v.offset.is_multiple_of(8) && matches!(v.size, 1 | 2 | 4 | 8))
-            .then_some(*v)
-    };
-    // ah/ch/dh/bh: byte 1 of rax..rbx (WS84)
-    let high = |v: &VarnodeData| v.space == REG_SPACE && v.offset < 0x20 && v.offset % 8 == 1 && v.size == 1;
-    if !ops.iter().any(|o| {
-        o.output.as_ref().is_some_and(|v| gpr(v).is_some() || high(v)) || o.inputs.iter().any(high)
-    }) {
-        return ops;
+/// Reused buffers the ops of one instruction are built in, per thread:
+/// a lift keeps only an exact-sized copy of its ops, so the buffers'
+/// room (and the post-passes' second buffer) is allocated once rather
+/// than for every instruction — a kept lift held about twice its ops'
+/// size in spare capacity before.
+mod scratch {
+    use super::PcodeOp;
+    use std::cell::Cell;
+
+    thread_local! {
+        static A: Cell<Vec<PcodeOp>> = const { Cell::new(Vec::new()) };
+        static B: Cell<Vec<PcodeOp>> = const { Cell::new(Vec::new()) };
     }
-    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 4);
+
+    /// An empty buffer.
+    pub(super) fn take() -> Vec<PcodeOp> {
+        let v = A.take();
+        if v.capacity() != 0 {
+            return v;
+        }
+        let v = B.take();
+        if v.capacity() != 0 { v } else { Vec::with_capacity(16) }
+    }
+
+    /// Return a buffer for reuse (two are kept per thread).
+    pub(super) fn give(mut ops: Vec<PcodeOp>) {
+        if ops.capacity() == 0 || ops.capacity() > 256 {
+            return;
+        }
+        ops.clear();
+        let old = A.replace(ops);
+        if old.capacity() != 0 {
+            B.set(old);
+        }
+    }
+
+    /// The ops of `ops` in a vector of exactly their size, the buffer
+    /// returned for reuse.
+    pub(super) fn finish(mut ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
+        let mut exact: Vec<PcodeOp> = Vec::with_capacity(ops.len());
+        exact.append(&mut ops);
+        give(ops);
+        exact
+    }
+}
+
+/// A GPR view [`zero_extend_gpr32_writes`] keeps.
+fn gpr_view(v: &VarnodeData) -> bool {
+    v.space == REG_SPACE && v.offset < 0xC0 && v.offset.is_multiple_of(8) && matches!(v.size, 1 | 2 | 4 | 8)
+}
+
+/// `ah`/`ch`/`dh`/`bh`: byte 1 of rax..rbx (WS84).
+fn high_byte(v: &VarnodeData) -> bool {
+    v.space == REG_SPACE && v.offset < 0x20 && v.offset % 8 == 1 && v.size == 1
+}
+
+/// Whether [`zero_extend_gpr32_writes`] rewrites `ops` (renumbering them
+/// at least).
+fn touches_gpr(ops: &[PcodeOp]) -> bool {
+    ops.iter().any(|o| o.output.as_ref().is_some_and(|v| gpr_view(v) || high_byte(v)) || o.inputs.iter().any(high_byte))
+}
+
+/// The ops [`zero_extend_gpr32_writes`] adds around `op`.
+fn gpr_extra(op: &PcodeOp) -> usize {
+    let mut reads = 0;
+    let mut last: Option<VarnodeData> = None;
+    for v in op.inputs.iter().filter(|v| high_byte(v)) {
+        if last != Some(*v) {
+            reads += 1;
+        }
+        last = Some(*v);
+    }
+    let Some(w) = op.output else { return reads };
+    if high_byte(&w) {
+        return reads + 4;
+    }
+    if !gpr_view(&w) {
+        return reads;
+    }
+    let is_rsp = w.offset == 0x20;
+    reads
+        + match w.size {
+            8 if !is_rsp => 3,
+            8 => 0,
+            4 => 1 + if is_rsp { 0 } else { 2 },
+            _ if !is_rsp => 4,
+            _ => 0,
+        }
+}
+
+/// Whether [`sync_xmm_views`] rewrites `ops`.
+fn needs_xmm_views(ops: &[PcodeOp]) -> bool {
+    ops.iter().any(|o| o.output.as_ref().and_then(xmm_view).is_some())
+}
+
+/// The XMM register a 4 / 8 / 16-byte view of it starts.
+fn xmm_view(v: &VarnodeData) -> Option<u64> {
+    let end = XMM_BASE + 16 * 0x10;
+    (v.space == REG_SPACE
+        && v.offset >= XMM_BASE
+        && v.offset < end
+        && (v.offset - XMM_BASE).is_multiple_of(0x10)
+        && matches!(v.size, 4 | 8 | 16))
+        .then_some(v.offset)
+}
+
+/// The ops of `ops` (drained) with the GPR views kept coherent, in `out`
+/// (empty; [`touches_gpr`] holds for `ops`).
+fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>) -> Vec<PcodeOp> {
+    let gpr = |v: &VarnodeData| gpr_view(v).then_some(*v);
+    let high = high_byte;
     let mut tmp = 0x7e00u64;
-    for op in ops {
+    for op in ops.drain(..) {
         let at = op.seq.addr;
         let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
             opcode,
@@ -3052,21 +3173,11 @@ fn xmm_write_zeroes_upper(insn: &iced_x86::Instruction) -> bool {
 /// 4/8-byte write the wider views are rebuilt with PIECE(old_high, new_low),
 /// or ZEXT for the forms that clear the upper bits.
 fn sync_xmm_views(ops: Vec<PcodeOp>, zero_upper: bool) -> Vec<PcodeOp> {
-    let xmm_of = |v: &VarnodeData| -> Option<u64> {
-        let end = XMM_BASE + 16 * 0x10;
-        (v.space == REG_SPACE
-            && v.offset >= XMM_BASE
-            && v.offset < end
-            && (v.offset - XMM_BASE).is_multiple_of(0x10)
-            && matches!(v.size, 4 | 8 | 16))
-            .then_some(v.offset)
-    };
-    if !ops.iter().any(|o| o.output.as_ref().and_then(xmm_of).is_some()) {
-        return ops;
-    }
-    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 4);
+    let xmm_of = xmm_view;
+    let mut ops = ops;
+    let mut out: Vec<PcodeOp> = scratch::take();
     let mut tmp = 0x7f00u64;
-    for op in ops {
+    for op in ops.drain(..) {
         let w = op.output.filter(|v| xmm_of(v).is_some());
         let at = op.seq.addr;
         out.push(op);
@@ -3110,6 +3221,7 @@ fn sync_xmm_views(ops: Vec<PcodeOp>, zero_upper: bool) -> Vec<PcodeOp> {
             }
         }
     }
+    scratch::give(ops);
     for (i, op) in out.iter_mut().enumerate() {
         op.seq.order = i as u32;
     }
