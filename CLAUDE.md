@@ -106,6 +106,8 @@ cargo test --workspace   # ~600 tests across all crates
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Optional profile-guided build: `tools/pgo.sh [TRAINING_BIN ...]` (default `/usr/bin/ls /usr/bin/bash`) builds an instrumented binary, trains it with `analyze` + `decompile-all` (`--no-cache`), then rebuilds with the merged profile into `target/pgo/re-argo` (~7 min). Needs `rustup component add llvm-tools` (the script prints this and exits 1 if `llvm-profdata` is missing). Measured gain on bash / python3.12 is only ~3-4% wall time. Always pass `--no-cache` when benchmarking, otherwise you measure on-disk cache hits.
+
 ---
 
 ## Common workflows (multi-command recipes)
