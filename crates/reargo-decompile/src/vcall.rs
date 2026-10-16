@@ -275,16 +275,26 @@ pub fn slot_target(memory: &Memory, vt: u64, slot: u64) -> Option<u64> {
     pointer_at(memory, vt + slot).filter(|&f| is_code(memory, f))
 }
 
-/// The direct bases of the class whose `type_info` is at `ti`: `__si_class_type_info` has one
-/// pointer at `ti+16`, `__vmi_class_type_info` a count at `ti+20` and `{base, flags}` pairs
-/// from `ti+24`. A base must be a `type_info` (it names a mangled type).
+/// The direct bases at offset 0 of the class whose `type_info` is at `ti` (not virtual): the
+/// one base of a `__si_class_type_info` (`ti+16`), the bases of a `__vmi_class_type_info` (a
+/// `u32` flags at `ti+16`, a `u32` count at `ti+20`, `{base, offset_flags}` pairs from `ti+24`;
+/// offset = offset_flags >> 8, bit 0 = virtual) whose offset is 0. A pointer to the object is a
+/// pointer to these bases, and only their methods are listed in its primary vtable; a base at
+/// another offset is reached through `this + k`, another value. A base must be a `type_info`
+/// (it names a mangled type). Shared by the decompiler (WS91) and the `this` index (WS93 C).
 pub(crate) fn type_info_bases(memory: &Memory, ti: u64) -> Vec<u64> {
     let is_ti = |b: u64| type_info_name(memory, b).is_some();
-    if let Some(b) = pointer_at(memory, ti + 16) {
-        return if is_ti(b) { vec![b] } else { Vec::new() };
+    if let Some(b) = pointer_at(memory, ti + 16).filter(|&b| is_ti(b)) {
+        return vec![b];
     }
     let Some(n) = memory.read_u32(ti + 20).ok().filter(|n| (1..=64).contains(n)) else { return Vec::new() };
-    (0..u64::from(n)).filter_map(|i| pointer_at(memory, ti + 24 + 16 * i)).filter(|&b| is_ti(b)).collect()
+    (0..u64::from(n))
+        .filter_map(|i| {
+            let b = pointer_at(memory, ti + 24 + 16 * i).filter(|&b| is_ti(b))?;
+            let flags = memory.read_u64(ti + 32 + 16 * i).ok()? as i64;
+            (flags & 1 == 0 && flags >> 8 == 0).then_some(b)
+        })
+        .collect()
 }
 
 /// The class a method listed in the primary vtables `vtables` belongs to (WS91): the class
@@ -520,6 +530,56 @@ mod tests {
         mem.add_block(block(".text", 0x1000, text, MemoryFlags::READ | MemoryFlags::EXECUTE));
         mem.add_block(block(".data.rel.ro", 0x2000, vec![0; 0x120], MemoryFlags::READ | MemoryFlags::WRITE));
         mem
+    }
+
+    /// Three classes in plain data: `B1` and `B2` (no bases) and `D : B1, B2`
+    /// (`__vmi_class_type_info`: flags 0, 2 bases, `B1` at offset 0, `B2` at +0x10). Primary
+    /// vtables (address points): `B1` 0x2418, `B2` 0x2438, `D` 0x2458; `D`'s lists `B1`'s method
+    /// 0x1000 (inherited, not overridden) and its own 0x1100; `B1`'s lists 0x1000.
+    fn vmi_binary() -> Memory {
+        let mut d = vec![0u8; 0x500];
+        let mut w = |at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        // type_infos: D 0x2000, B1 0x2100, B2 0x2200; names at 0x2300..
+        w(0x008, 0x2300);
+        w(0x010, 2 << 32);
+        w(0x018, 0x2100);
+        w(0x020, 2);
+        w(0x028, 0x2200);
+        w(0x030, (0x10 << 8) | 2);
+        w(0x108, 0x2310);
+        w(0x208, 0x2320);
+        // vtables: {offset-to-top 0, type_info, slots...}
+        w(0x410, 0x2100);
+        w(0x418, 0x1000);
+        w(0x430, 0x2200);
+        w(0x438, 0x1200);
+        w(0x450, 0x2000);
+        w(0x458, 0x1000);
+        w(0x460, 0x1100);
+        d[0x300..0x302].copy_from_slice(b"1D");
+        d[0x310..0x313].copy_from_slice(b"2B1");
+        d[0x320..0x323].copy_from_slice(b"2B2");
+        let mut mem = Memory::new(SpaceId(1), Endian::Little);
+        mem.add_block(block(".text", 0x1000, vec![0xc3; 0x300], MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.add_block(block(".data.rel.ro", 0x2000, d, MemoryFlags::READ));
+        mem
+    }
+
+    /// A class with several bases (`__vmi_class_type_info`) derives from those at offset 0
+    /// (it used to have no base at all: `ti+16` holds its flags and count, not a pointer).
+    #[test]
+    fn a_class_with_several_bases_derives_from_those_at_offset_zero() {
+        let mem = vmi_binary();
+        assert_eq!(type_info_bases(&mem, 0x2000), [0x2100]);
+        assert!(type_info_bases(&mem, 0x2100).is_empty());
+        let (b1, b2, dd) = (("B1".to_string(), 0x2418), ("B2".to_string(), 0x2438), ("D".to_string(), 0x2458));
+        assert_eq!(most_derived(&mem, &[b1.clone(), dd.clone()]), Some(dd.clone()));
+        assert_eq!(most_derived(&mem, &[dd.clone(), b1.clone()]), Some(dd.clone()));
+        // B2 is at +0x10 of a D: a pointer to a D is not a pointer to its B2
+        assert_eq!(most_derived(&mem, &[b2.clone(), dd.clone()]), None);
+        // B1's method, inherited by D: the class of `this` is B1
+        assert_eq!(method_class(&mem, &[0x2418, 0x2458]), Some(b1));
+        assert_eq!(method_class(&mem, &[0x2458]), Some(dd));
     }
 
     #[test]

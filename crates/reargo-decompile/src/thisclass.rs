@@ -908,26 +908,6 @@ fn vtables(mem: &Memory, words: &[(u64, u64)]) -> Vec<(u64, i64, u64, Vec<u64>)>
     out
 }
 
-/// The direct bases at offset 0 of the class whose `type_info` is at `ti` (not virtual): the
-/// one base of a `__si_class_type_info` (`ti+16`), the bases of a `__vmi_class_type_info` (a
-/// count at `ti+20`, `{base, offset_flags}` pairs from `ti+24`; offset = flags >> 8, bit 0 =
-/// virtual) whose offset is 0. A pointer to the object is a pointer to these bases; a base at
-/// another offset is reached through `this + k`, another value.
-fn zero_offset_bases(mem: &Memory, ti: u64) -> Vec<u64> {
-    let is_ti = |b: u64| crate::vcall::type_info_name(mem, b).is_some();
-    if let Some(b) = crate::vcall::pointer_at(mem, ti + 16).filter(|&b| is_ti(b)) {
-        return vec![b];
-    }
-    let Some(n) = mem.read_u32(ti + 20).ok().filter(|n| (1..=64).contains(n)) else { return Vec::new() };
-    (0..u64::from(n))
-        .filter_map(|i| {
-            let b = crate::vcall::pointer_at(mem, ti + 24 + 16 * i).filter(|&b| is_ti(b))?;
-            let flags = mem.read_u64(ti + 32 + 16 * i).ok()? as i64;
-            (flags & 1 == 0 && flags >> 8 == 0).then_some(b)
-        })
-        .collect()
-}
-
 /// What [`solve`] needs to know about the binary.
 pub struct Universe {
     pub hierarchy: Hierarchy,
@@ -955,11 +935,11 @@ pub fn universe(mem: &Memory) -> Universe {
             tis.push(*ti);
         }
     }
-    let direct: Vec<Vec<u64>> = tis.par_iter().map(|&ti| zero_offset_bases(mem, ti)).collect();
+    let direct: Vec<Vec<u64>> = tis.par_iter().map(|&ti| crate::vcall::type_info_bases(mem, ti)).collect();
     let direct_of: FxHashMap<u64, &Vec<u64>> = tis.iter().copied().zip(direct.iter()).collect();
     for &ti in &tis {
         let mut seen: Vec<u64> = Vec::new();
-        let mut work: Vec<u64> = direct_of.get(&ti).map(|v| v.to_vec()).unwrap_or_else(|| zero_offset_bases(mem, ti));
+        let mut work: Vec<u64> = direct_of.get(&ti).map(|v| v.to_vec()).unwrap_or_else(|| crate::vcall::type_info_bases(mem, ti));
         while let Some(t) = work.pop() {
             if seen.contains(&t) || seen.len() > 64 {
                 continue;
@@ -967,7 +947,7 @@ pub fn universe(mem: &Memory) -> Universe {
             seen.push(t);
             match direct_of.get(&t) {
                 Some(v) => work.extend(v.iter().copied()),
-                None => work.extend(zero_offset_bases(mem, t)),
+                None => work.extend(crate::vcall::type_info_bases(mem, t)),
             }
         }
         hier.bases.push(seen.iter().filter_map(|t| by_ti.get(t).copied()).collect());
@@ -1709,8 +1689,8 @@ mod tests {
         d[0x320..0x323].copy_from_slice(b"2B2");
         let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
         mem.add_block(MemoryBlock { name: ".data.rel.ro".into(), start: 0x2000, size: d.len() as u64, flags: MemoryFlags::READ, data: Some(Arc::from(d.as_slice())) });
-        assert_eq!(zero_offset_bases(&mem, 0x2000), [0x2100]);
-        assert_eq!(zero_offset_bases(&mem, 0x2100), Vec::<u64>::new());
+        assert_eq!(crate::vcall::type_info_bases(&mem, 0x2000), [0x2100]);
+        assert_eq!(crate::vcall::type_info_bases(&mem, 0x2100), Vec::<u64>::new());
     }
 
     /// The join of two classes is their nearest common base.
