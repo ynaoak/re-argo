@@ -35,6 +35,8 @@ impl InsnShape {
     pub const TARGET: u8 = 8;
     /// It has several: read them from the ops.
     pub const TARGETS: u8 = 16;
+    /// It has a `CallInd` op.
+    pub const CALLIND: u8 = 32;
 
     /// The jump target of a `Branch` / `CBranch` op, when it is an
     /// address in the RAM space.
@@ -47,7 +49,8 @@ impl InsnShape {
         let mut shape = InsnShape { address: insn.address, target: 0, flags: 0 };
         for op in &insn.ops {
             match op.opcode {
-                OpCode::Call | OpCode::CallInd => shape.flags |= Self::CALL,
+                OpCode::Call => shape.flags |= Self::CALL,
+                OpCode::CallInd => shape.flags |= Self::CALL | Self::CALLIND,
                 OpCode::Branch | OpCode::CBranch => {
                     if let Some(t) = Self::branch_target(op) {
                         if shape.flags & (Self::TARGET | Self::TARGETS) == 0 {

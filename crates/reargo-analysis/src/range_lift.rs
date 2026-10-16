@@ -10,7 +10,7 @@
 
 use rayon::prelude::*;
 use reargo_lift::x86::{LiftCache, X86Lifter};
-use reargo_lift::LiftedInstruction;
+use reargo_lift::{InsnShape, LiftedInstruction};
 use reargo_loader::Memory;
 
 /// Fewest consecutive jobs run on one thread with one cache: the
@@ -74,18 +74,19 @@ impl RangeLifter<'_> {
         g(&range.insns())
     }
 
-    /// `g(k, insns)` for the `k`-th of `budgets`, `insns` being exactly
-    /// `X86Lifter::new_64().lift_range(memory, entry, budgets[k])`: one
+    /// `g(k, insns, shapes)` for the `k`-th of `budgets`, `insns` being
+    /// exactly `X86Lifter::new_64().lift_range(memory, entry, budgets[k])`
+    /// and `shapes` their [`InsnShape`]s when the cache holds them: one
     /// walk of the largest range, the others its prefixes
     /// ([`X86Lifter::lift_prefixes_cached`]).
     pub fn with_budgets<R>(
         &mut self,
         entry: u64,
         budgets: &[usize],
-        mut g: impl FnMut(usize, &[&LiftedInstruction]) -> R,
+        g: impl FnMut(usize, &[&LiftedInstruction], Option<&[InsnShape]>) -> R,
     ) -> Vec<R> {
         trim(&mut self.cache, entry);
-        self.lifter.lift_prefixes_cached(self.memory, entry, budgets, false, &mut self.cache, |k, insns, _| g(k, insns))
+        self.lifter.lift_prefixes_cached(self.memory, entry, budgets, true, &mut self.cache, g)
     }
 }
 

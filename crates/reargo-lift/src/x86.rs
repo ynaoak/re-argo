@@ -195,6 +195,9 @@ const READS_PF: u8 = 2;
 /// The lift failed.
 const FAILED: u8 = 4;
 
+/// Instructions a [`LiftCache`] makes room for at once.
+const CACHE_RESERVE: usize = 2048;
+
 /// [`LiftCache::next`] not known yet.
 const NO_NEXT: u32 = u32::MAX;
 
@@ -243,6 +246,7 @@ impl LiftCache {
             std::mem::take(&mut self.shape),
         );
         self.map.clear();
+        self.reserve(kept.len());
         for &(a, i) in &kept {
             let i = i as usize;
             self.map.insert(a, u32::try_from(self.lifted.len()).expect("lift cache index"));
@@ -254,6 +258,19 @@ impl LiftCache {
         }
     }
 
+    /// Room for `n` instructions and as many again (at least
+    /// [`CACHE_RESERVE`]): the instructions are large, so growing the
+    /// arrays one doubling at a time moved them over and over.
+    fn reserve(&mut self, n: usize) {
+        let n = (2 * n).max(CACHE_RESERVE);
+        self.map.reserve(n);
+        self.lifted.reserve(n);
+        self.next.reserve(n);
+        self.len.reserve(n);
+        self.flags.reserve(n);
+        self.shape.reserve(n);
+    }
+
     /// The instructions at `idxs`, all lifted.
     fn insns(&self, idxs: &[u32]) -> Vec<&LiftedInstruction> {
         idxs.iter().map(|&i| self.lifted[i as usize].as_ref().expect("lifted")).collect()
@@ -263,6 +280,9 @@ impl LiftCache {
     fn index_of(&mut self, fast: &X86Lifter, memory: &Memory, addr: u64) -> u32 {
         if let Some(&i) = self.map.get(&addr) {
             return i;
+        }
+        if self.lifted.len() == self.lifted.capacity() {
+            self.reserve(self.lifted.len());
         }
         let lifted = fast.lift_instruction(memory, addr).ok();
         let (flags, len, shape) = match &lifted {

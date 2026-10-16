@@ -168,15 +168,23 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
             } else {
                 &[STACK_LIFT_BUDGET]
             };
-            lifter.with_budgets(entry, budgets, |k, insns| match k {
+            lifter.with_budgets(entry, budgets, |k, insns, shapes| match k {
                 STACK => {
                     stack = Some(stack_info_lifted(entry, insns));
                     propagation = crate::propagation::analyse_lifted(insns, &valid_ranges);
                 }
                 PCODE => pcode = crate::pcoderef::scan_lifted(insns, &sections),
                 INDIRECT => {
-                    if got.is_some() {
-                        indirect = crate::indirect_resolve::resolve_lifted(insns, &plt_of_got);
+                    // Only a `CallInd` gives a result, and the walk runs
+                    // forward: what follows the last one changes nothing.
+                    let last = match shapes {
+                        Some(shapes) => shapes.iter().rposition(|s| s.flags & reargo_lift::InsnShape::CALLIND != 0),
+                        None => insns.len().checked_sub(1),
+                    };
+                    if got.is_some()
+                        && let Some(last) = last
+                    {
+                        indirect = crate::indirect_resolve::resolve_lifted(&insns[..=last], &plt_of_got);
                     }
                 }
                 ARITY => arity = crate::arity::infer_arity(insns),
