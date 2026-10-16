@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use reargo_core::address::{Address, AddressRange, Endian, SpaceId};
@@ -55,7 +54,10 @@ impl MemoryBlock {
 
 #[derive(Debug)]
 pub struct Memory {
-    blocks: BTreeMap<u64, MemoryBlock>,
+    /// By start address, at most one per start (a block added at the
+    /// start of another replaces it). A sorted vector: a handful of
+    /// blocks, looked up for every instruction decoded.
+    blocks: Vec<MemoryBlock>,
     space_id: SpaceId,
     endian: Endian,
     /// The raw dynamic relocation table (ELF64 `Elf64_Rela` entries of `.rela.dyn`), kept
@@ -68,7 +70,7 @@ pub struct Memory {
 impl Memory {
     pub fn new(space_id: SpaceId, endian: Endian) -> Self {
         Self {
-            blocks: BTreeMap::new(),
+            blocks: Vec::new(),
             space_id,
             endian,
             dynamic_relocations: None,
@@ -86,7 +88,10 @@ impl Memory {
     }
 
     pub fn add_block(&mut self, block: MemoryBlock) {
-        self.blocks.insert(block.start, block);
+        match self.blocks.binary_search_by_key(&block.start, |b| b.start) {
+            Ok(i) => self.blocks[i] = block,
+            Err(i) => self.blocks.insert(i, block),
+        }
     }
 
     pub fn space_id(&self) -> SpaceId {
@@ -98,11 +103,10 @@ impl Memory {
     }
 
     pub fn find_block(&self, offset: u64) -> Option<&MemoryBlock> {
-        self.blocks
-            .range(..=offset)
-            .next_back()
-            .map(|(_, block)| block)
-            .filter(|block| block.contains(offset))
+        // The last block starting at or before `offset`.
+        let i = self.blocks.partition_point(|b| b.start <= offset);
+        let block = self.blocks.get(i.checked_sub(1)?)?;
+        block.contains(offset).then_some(block)
     }
 
     pub fn read_byte(&self, offset: u64) -> Option<u8> {
@@ -121,7 +125,9 @@ impl Memory {
         if end > data.len() || end as u64 > block.size {
             return None;
         }
-        if len > 1 && self.blocks.range(offset + 1..offset + len).next().is_some() {
+        // A block starting in `offset + 1 .. offset + len`.
+        let next_start = |a: u64| self.blocks.partition_point(|b| b.start < a);
+        if len > 1 && next_start(offset + 1) < next_start(offset + len) {
             return None;
         }
         Some(&data[start..end])
@@ -162,24 +168,25 @@ impl Memory {
     }
 
     pub fn read_instruction_bytes(&self, address: u64, buf: &mut [u8; 15]) -> usize {
-        let available = self
-            .find_block(address)
-            .map(|b| (b.start + b.size - address) as usize)
-            .unwrap_or(0);
+        let Some(block) = self.find_block(address) else {
+            return 0;
+        };
+        let available = (block.start + block.size - address) as usize;
         let read_len = buf.len().min(available);
         if read_len > 0 {
-            let _ = self.read_bytes(address, &mut buf[..read_len]);
+            // `read_bytes` would find this same block again.
+            let _ = block.read_bytes(address, &mut buf[..read_len]);
         }
         read_len
     }
 
     pub fn blocks(&self) -> impl Iterator<Item = &MemoryBlock> {
-        self.blocks.values()
+        self.blocks.iter()
     }
 
     pub fn address_range(&self) -> Option<AddressRange> {
-        let first = self.blocks.values().next()?;
-        let last = self.blocks.values().next_back()?;
+        let first = self.blocks.first()?;
+        let last = self.blocks.last()?;
         Some(AddressRange::new(
             Address::new(self.space_id, first.start),
             last.start + last.size - first.start,
@@ -201,6 +208,43 @@ mod tests {
             data: Some(Arc::from([0x01, 0x02, 0x03, 0x04].as_slice())),
         });
         mem
+    }
+
+    /// Blocks kept by start: lookups pick the last block starting at or
+    /// before the address, a block added at an existing start replaces
+    /// it, and `slice` refuses a range another block starts inside.
+    #[test]
+    fn blocks_by_start() {
+        let block = |start: u64, size: u64, fill: u8| MemoryBlock {
+            name: format!("b{start:x}"),
+            start,
+            size,
+            flags: MemoryFlags::READ,
+            data: Some(Arc::from(vec![fill; size as usize])),
+        };
+        let mut mem = Memory::new(SpaceId(1), Endian::Little);
+        mem.add_block(block(0x3000, 0x10, 3));
+        mem.add_block(block(0x1000, 0x10, 1));
+        mem.add_block(block(0x2000, 0x10, 2));
+        mem.add_block(block(0x2008, 0x10, 4));
+        assert_eq!(mem.blocks().map(|b| b.start).collect::<Vec<_>>(), [0x1000, 0x2000, 0x2008, 0x3000]);
+        assert!(mem.find_block(0xfff).is_none());
+        assert_eq!(mem.read_byte(0x1000), Some(1));
+        assert_eq!(mem.read_byte(0x100f), Some(1));
+        assert!(mem.find_block(0x1010).is_none());
+        assert_eq!(mem.read_byte(0x2007), Some(2));
+        assert_eq!(mem.read_byte(0x2008), Some(4));
+        assert_eq!(mem.read_byte(0x3000), Some(3));
+        assert!(mem.slice(0x2000, 8).is_some());
+        assert!(mem.slice(0x2000, 9).is_none());
+        mem.add_block(block(0x2000, 0x4, 5));
+        assert_eq!(mem.read_byte(0x2000), Some(5));
+        assert!(mem.find_block(0x2004).is_none());
+        let mut buf = [0u8; 15];
+        assert_eq!(mem.read_instruction_bytes(0x300c, &mut buf), 4);
+        assert_eq!(buf[..5], [3, 3, 3, 3, 0]);
+        assert_eq!(mem.read_instruction_bytes(0x5000, &mut buf), 0);
+        assert_eq!(mem.address_range().map(|r| (r.start.offset, r.size)), Some((0x1000, 0x2010)));
     }
 
     #[test]

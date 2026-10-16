@@ -47,15 +47,17 @@ impl Analyzer for DeadCodeAnalyzer {
         905
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        struct FuncSnap {
+        struct FuncSnap<'a> {
             entry: u64,
             ranges: Vec<(u64, u64)>,
+            body: &'a reargo_core::address::AddressSet,
         }
         let snaps: Vec<FuncSnap> = program
             .listing
             .functions()
             .map(|f| FuncSnap {
                 entry: f.entry_point,
+                body: &f.body,
                 ranges: f
                     .body
                     .ranges()
@@ -87,11 +89,9 @@ impl Analyzer for DeadCodeAnalyzer {
 
             // Snapshot insns in body, sorted.
             let mut insns: Vec<(u64, u32, FlowType, Option<u64>)> = Vec::new();
-            for (s, e) in &snap.ranges {
-                for i in listing.instructions_in_range(*s, *e) {
-                    insns.push((i.address, i.length, i.flow_type, i.branch_target));
-                }
-            }
+            listing.for_each_body_instruction(snap.body, |_, i| {
+                insns.push((i.address, i.length, i.flow_type, i.branch_target));
+            });
             insns.sort_by_key(|(a, _, _, _)| *a);
 
             let mut prev_was_terminator = false;
@@ -201,7 +201,7 @@ impl Analyzer for DeadCodeAnalyzer {
 
 /// `ranges` (half-open) sorted and merged where they overlap or touch:
 /// an address is in one of them exactly when it is in one of these.
-fn merge_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+pub(crate) fn merge_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut raw: Vec<(u64, u64)> = ranges.iter().copied().filter(|(s, e)| s < e).collect();
     raw.sort_unstable();
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());

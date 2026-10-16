@@ -54,6 +54,7 @@ use cpp_demangle::{DemangleOptions, Symbol as CppSymbol};
 use reargo_loader::SectionFlags;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -135,31 +136,43 @@ impl Analyzer for RttiAnalyzer {
         // section; if `*S` points at a string that the C++
         // demangler can read as a typeinfo name string (`_ZTS<s>`),
         // the type_info structure starts at `S - ptr_size`.
-        let mut typeinfos: FxHashMap<u64, String> = FxHashMap::default();
-        for &(start, end) in &data_sections {
-            let mut addr = (start + ptr_size - 1) & !(ptr_size - 1);
-            while addr + ptr_size <= end {
-                let Ok(name_ptr) = program.info.memory.read_u64(addr) else {
-                    addr += ptr_size;
-                    continue;
-                };
-                if !in_any_range(name_ptr, &all_ranges) {
-                    addr += ptr_size;
-                    continue;
-                }
-                if let Some(mangled) = read_cstring(program, name_ptr, MAX_NAME_LEN)
-                    && let Some(demangled) = demangle_typeinfo_name(&mangled)
-                {
+        //
+        // The slots are read in parallel (chunks of each section, in
+        // order) and the hits inserted in slot order, as a serial walk
+        // would. Pointer checks test the merged ranges.
+        let all_set = MergedRanges::new(&all_ranges);
+        let code_set = MergedRanges::new(&code_ranges);
+        let chunks = slot_chunks(&data_sections, ptr_size, ptr_size);
+        let hits: Vec<(u64, String)> = chunks
+            .par_iter()
+            .flat_map_iter(|&(first, last, start)| {
+                let program = &*program;
+                let all_set = &all_set;
+                (0..=(last - first) / ptr_size).filter_map(move |k| {
+                    let addr = first + k * ptr_size;
+                    let name_ptr = program.info.memory.read_u64(addr).ok()?;
+                    if !all_set.contains(name_ptr) {
+                        return None;
+                    }
+                    // A typeinfo name starts with a digit (the length of
+                    // its first component) or `N`: anything else never
+                    // demangles below, so its string is not read.
+                    let first_byte = program.info.memory.read_byte(name_ptr)?;
+                    if !first_byte.is_ascii_digit() && first_byte != b'N' {
+                        return None;
+                    }
+                    let mangled = read_cstring(program, name_ptr, MAX_NAME_LEN)?;
+                    let demangled = demangle_typeinfo_name(&mangled)?;
                     // The type_info structure starts one slot
                     // before this -- the `name` field is the
                     // second member after the vtable_ptr.
-                    if addr >= start + ptr_size {
-                        let ti_addr = addr - ptr_size;
-                        typeinfos.entry(ti_addr).or_insert(demangled);
-                    }
-                }
-                addr += ptr_size;
-            }
+                    (addr >= start + ptr_size).then(|| (addr - ptr_size, demangled))
+                })
+            })
+            .collect();
+        let mut typeinfos: FxHashMap<u64, String> = FxHashMap::default();
+        for (ti_addr, demangled) in hits {
+            typeinfos.entry(ti_addr).or_insert(demangled);
         }
 
         // Phase 2: link vtables to recovered type_infos.
@@ -184,25 +197,23 @@ impl Analyzer for RttiAnalyzer {
         // convention -- common RTTI walkers in Ghidra/IDA report the
         // header address, the C++ linker reports +ptr_size, and we
         // want xref to succeed at both.
-        let mut vtables: Vec<(u64, u64, String)> = Vec::new();
-        for &(start, end) in &data_sections {
-            let mut addr = (start + ptr_size - 1) & !(ptr_size - 1);
-            while addr + ptr_size * 2 <= end {
-                let Ok(val) = program.info.memory.read_u64(addr) else {
-                    addr += ptr_size;
-                    continue;
-                };
-                if let Some(class_name) = typeinfos.get(&val) {
+        let chunks = slot_chunks(&data_sections, ptr_size, ptr_size * 2);
+        let vtables: Vec<(u64, u64, String)> = chunks
+            .par_iter()
+            .flat_map_iter(|&(first, last, _)| {
+                let program = &*program;
+                let typeinfos = &typeinfos;
+                let code_set = &code_set;
+                (0..=(last - first) / ptr_size).filter_map(move |k| {
+                    let addr = first + k * ptr_size;
+                    let val = program.info.memory.read_u64(addr).ok()?;
+                    let class_name = typeinfos.get(&val)?;
                     let vt_addr = addr + ptr_size;
-                    if let Ok(first_vfunc) = program.info.memory.read_u64(vt_addr)
-                        && in_any_range(first_vfunc, &code_ranges)
-                    {
-                        vtables.push((addr, vt_addr, class_name.clone()));
-                    }
-                }
-                addr += ptr_size;
-            }
-        }
+                    let first_vfunc = program.info.memory.read_u64(vt_addr).ok()?;
+                    code_set.contains(first_vfunc).then(|| (addr, vt_addr, class_name.clone()))
+                })
+            })
+            .collect();
 
         // Phase 3: apply symbols.
         let mut classes_found = 0usize;
@@ -264,8 +275,48 @@ impl RttiAnalyzer {
     }
 }
 
-fn in_any_range(addr: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges.iter().any(|&(s, e)| addr >= s && addr < e)
+/// The pointer-aligned slots `addr` of each `(start, end)` section with
+/// `addr + need <= end`, from its first aligned slot, as chunks
+/// `(first, last, section start)` (both slots included) in order.
+fn slot_chunks(sections: &[(u64, u64)], ptr_size: u64, need: u64) -> Vec<(u64, u64, u64)> {
+    const SLOTS: u64 = 4096;
+    let mut out = Vec::new();
+    for &(start, end) in sections {
+        let mut addr = (start + ptr_size - 1) & !(ptr_size - 1);
+        while addr + need <= end {
+            // The last slot of this chunk: at most SLOTS slots, none past
+            // the last one that fits.
+            let fit = (end - need - addr) / ptr_size;
+            let last = addr + fit.min(SLOTS - 1) * ptr_size;
+            out.push((addr, last, start));
+            addr = last + ptr_size;
+        }
+    }
+    out
+}
+
+/// Membership in the union of `[s, e)` ranges, as a binary search over
+/// them merged (the same answer as testing each range).
+struct MergedRanges(Vec<(u64, u64)>);
+
+impl MergedRanges {
+    fn new(ranges: &[(u64, u64)]) -> Self {
+        let mut raw: Vec<(u64, u64)> = ranges.iter().copied().filter(|(s, e)| s < e).collect();
+        raw.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
+        for (s, e) in raw {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        Self(merged)
+    }
+
+    fn contains(&self, addr: u64) -> bool {
+        let i = self.0.partition_point(|&(s, _)| s <= addr);
+        i > 0 && addr < self.0[i - 1].1
+    }
 }
 
 /// Read a NULL-terminated ASCII string, capped at `max_len`. We

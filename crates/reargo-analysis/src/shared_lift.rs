@@ -8,6 +8,11 @@
 //! ([`Program::analysis_cache`]), so the next analyzer redoes only the
 //! functions whose results may differ on the program as it is by then.
 //!
+//! The annotator's lifts also give Argument Arity (780) and Calling
+//! Convention (770) their per-function results ([`store_ahead`]): those
+//! depend only on the function's own linear lift, which the lift cache
+//! holds by then.
+//!
 //! CRT / main Recovery (710) keeps its own pass: Late Discovery and
 //! Linear Sweep run between it and the annotator and change about half
 //! of the functions (python3.12: 1723 of 3592 still valid at 750), so
@@ -79,7 +84,14 @@ pub(crate) struct FunctionResults {
 pub(crate) struct SharedLift {
     pub funcs: Vec<FunctionResults>,
     jump_mark: reargo_program::reference::JumpMark,
+    /// With the snapshots: the Argument Arity and Calling Convention
+    /// results of the functions lifted here, from the same lifts (see
+    /// [`store_ahead`]).
+    ahead: Option<AheadResults>,
 }
+
+/// Argument Arity and Calling Convention results, by `(entry, budget)`.
+type AheadResults = (crate::range_lift::AheadMap<usize>, crate::range_lift::AheadMap<Option<(u64, &'static str)>>);
 
 /// What [`store`] leaves on the program.
 struct Cached {
@@ -120,6 +132,9 @@ pub(crate) fn compute(program: &mut Program, with_snapshots: bool) -> SharedLift
         .into_iter()
         .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
         .collect();
+    // Argument Arity's budget of each function, in the same order.
+    let arity_budgets: Vec<usize> =
+        if with_snapshots { program.listing.functions().map(crate::arity::budget).collect() } else { Vec::new() };
     drop(cached_funcs);
     // The cached results that still hold; the others are computed again.
     let jobs: Vec<(u64, usize, Option<FunctionResults>)> = jobs
@@ -139,25 +154,70 @@ pub(crate) fn compute(program: &mut Program, with_snapshots: bool) -> SharedLift
     // lifted linearly well past its end, over its neighbours
     // (`lift_range_cached` gives exactly what `lift_range` would).
     let x86 = reargo_lift::x86::X86Lifter::new_64();
-    let chunks: Vec<Vec<FunctionResults>> = jobs
+    type Extra = Option<(u64, usize, usize, Option<(u64, &'static str)>)>;
+    let jobs: Vec<(u64, usize, Option<FunctionResults>, usize)> = if with_snapshots {
+        jobs.into_iter().zip(arity_budgets).map(|((e, m, k), a)| (e, m, k, a)).collect()
+    } else {
+        jobs.into_iter().map(|(e, m, k)| (e, m, k, 0)).collect()
+    };
+    let chunks: Vec<Vec<(FunctionResults, Extra)>> = jobs
         .into_par_iter()
         .chunks(LIFT_CHUNK)
         .map(|chunk| {
             let mut cache = reargo_lift::x86::LiftCache::new();
             chunk
                 .into_iter()
-                .map(|(entry, max_insns, kept)| {
+                .map(|(entry, max_insns, kept, arity_budget)| {
                     if let Some(kept) = kept {
-                        return kept;
+                        return (kept, None);
                     }
-                    let range = x86.lift_range_cached(&program.info.memory, entry, max_insns, &mut cache);
-                    compute_lifted(program, jumps.as_ref(), entry, max_insns, &range.insns(), with_snapshots)
+                    let memory = &program.info.memory;
+                    let range = x86.lift_range_cached(memory, entry, max_insns, &mut cache);
+                    let results =
+                        compute_lifted(program, jumps.as_ref(), entry, max_insns, &range.insns(), with_snapshots);
+                    drop(range);
+                    // Arity and calling convention from the same lifted
+                    // instructions (exactly their own linear lifts).
+                    let extra = with_snapshots.then(|| {
+                        let arity =
+                            crate::arity::infer_arity(&x86.lift_range_cached(memory, entry, arity_budget, &mut cache).insns());
+                        let convention = crate::callingconv::convention_lifted(
+                            entry,
+                            &x86.lift_range_cached(memory, entry, crate::callingconv::LIFT_BUDGET, &mut cache).insns(),
+                        );
+                        (entry, arity_budget, arity, convention)
+                    });
+                    (results, extra)
                 })
                 .collect()
         })
         .collect();
-    let funcs: Vec<FunctionResults> = chunks.into_iter().flatten().collect();
-    SharedLift { funcs, jump_mark }
+    let mut ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
+    let funcs: Vec<FunctionResults> = chunks
+        .into_iter()
+        .flatten()
+        .map(|(f, extra)| {
+            if let (Some((arity, convention)), Some((entry, arity_budget, a, c))) = (ahead.as_mut(), extra) {
+                arity.insert((entry, arity_budget), a);
+                convention.insert((entry, crate::callingconv::LIFT_BUDGET), c);
+            }
+            f
+        })
+        .collect();
+    SharedLift { funcs, jump_mark, ahead }
+}
+
+/// Leave the Argument Arity and Calling Convention results [`compute`]
+/// took from its lifts on the program for those analyzers (beside the
+/// ones computed ahead before).
+pub(crate) fn store_ahead(program: &mut Program, shared: &mut SharedLift) {
+    let Some((arity, convention)) = shared.ahead.take() else { return };
+    let mut a = program.analysis_cache.take::<crate::arity::Ahead>().map(|a| a.0).unwrap_or_default();
+    a.extend(arity);
+    program.analysis_cache.insert(crate::arity::Ahead(a));
+    let mut c = program.analysis_cache.take::<crate::callingconv::Ahead>().map(|c| c.0).unwrap_or_default();
+    c.extend(convention);
+    program.analysis_cache.insert(crate::callingconv::Ahead(c));
 }
 
 /// Leave `shared` on the program for the next [`compute`]. The

@@ -40,13 +40,13 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 /// filter is a tight tuple comparison instead of an O(sections)
 /// linear scan with bitflag tests.
 #[derive(Debug, Clone)]
-struct SectionMap {
+pub(crate) struct SectionMap {
     /// (start, end, is_executable)
     ranges: Vec<(u64, u64, bool)>,
 }
 
 impl SectionMap {
-    fn from(program: &Program) -> Self {
+    pub(crate) fn from(program: &Program) -> Self {
         let ranges = program
             .info
             .sections
@@ -108,28 +108,25 @@ impl Analyzer for PcodeReferenceAnalyzer {
 
         let sections = SectionMap::from(program);
 
-        // Same sizing as the decompile path: floor at 500 so a tiny
-        // discovery body still covers reachable lift.
-        let jobs: Vec<(u64, usize)> = program
-            .listing
-            .functions()
-            .map(|f| {
-                let budget = f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(500);
-                (f.entry_point, budget)
-            })
-            .collect();
+        let jobs: Vec<(u64, usize)> =
+            program.listing.functions().map(|f| (f.entry_point, budget(f))).collect();
 
         // Phase 1 (parallel): per-function lift + scan. Each task
         // sees an immutable Program view and produces candidate
         // refs; no per-call mutation contention. Neighbouring
         // functions' lifts overlap, so they share lifted instructions.
-        let candidates: Vec<(u64, u64, RefType)> =
-            crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |_, insns| {
+        // A function's candidates depend only on its lift and the
+        // sections: those the Stack Frame analyzer computed ahead
+        // ([`Ahead`]) for the same lift are taken as they are.
+        let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
+        let candidates: Vec<(u64, u64, RefType)> = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
+            crate::range_lift::map_lifted_ranges(&program.info.memory, missing, |_, insns| {
                 scan_lifted(insns, &sections)
             })
-            .into_iter()
-            .flatten()
-            .collect();
+        })
+        .into_iter()
+        .flatten()
+        .collect();
 
         // Phase 2 (serial): dedup against existing refs and apply.
         let mut refs_found = 0usize;
@@ -157,9 +154,20 @@ impl Analyzer for PcodeReferenceAnalyzer {
     }
 }
 
+/// The instructions lifted from a function's entry: same sizing as the
+/// decompile path, floored at 500 so a tiny discovery body still covers
+/// reachable lift.
+pub(crate) fn budget(f: &reargo_program::function::Function) -> usize {
+    f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(500)
+}
+
+/// [`scan_lifted`] of functions, computed ahead of this analyzer from
+/// the same lift, by `(entry, budget)`.
+pub(crate) struct Ahead(pub crate::range_lift::AheadMap<Vec<(u64, u64, RefType)>>);
+
 /// Every `(from_insn_addr, target, kind)` reference the P-code of
 /// one function's lifted range reveals.
-fn scan_lifted(lifted: &[&LiftedInstruction], sections: &SectionMap) -> Vec<(u64, u64, RefType)> {
+pub(crate) fn scan_lifted(lifted: &[&LiftedInstruction], sections: &SectionMap) -> Vec<(u64, u64, RefType)> {
     let mut out: Vec<(u64, u64, RefType)> = Vec::new();
     for insn in lifted {
         for op in &insn.ops {

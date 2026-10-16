@@ -83,11 +83,10 @@ impl Analyzer for LinearSweepAnalyzer {
         // Build set of (start, end) tuples for every existing
         // function body so we can reject candidates that fall
         // inside known territory.
+        // (A body's runs of adjacent ranges cover what its ranges do.)
         let mut raw_ranges: Vec<(u64, u64)> = Vec::new();
         for f in program.listing.functions() {
-            for r in f.body.ranges() {
-                raw_ranges.push((r.start.offset, r.start.offset + r.size));
-            }
+            raw_ranges.extend(f.body.runs());
         }
         let mut covered = Covered::from_ranges(raw_ranges);
 
@@ -102,6 +101,10 @@ impl Analyzer for LinearSweepAnalyzer {
         let lifter: Box<dyn PcodeLift> = Box::new(reargo_lift::x86::X86Lifter::new_64().without_parity());
         let mut new_functions: Vec<(u64, u64)> = Vec::new();
         let mut visited: BTreeSet<u64> = BTreeSet::new();
+        // What lifting each address gave (the lift is a pure function of
+        // the bytes): candidates in one uncovered stretch walk the same
+        // instructions.
+        let mut lifts: Lifts = Lifts::default();
 
         for (sec_start, sec_end) in &exec_sections {
             let mut addr = (*sec_start + 15) & !15;
@@ -133,7 +136,7 @@ impl Analyzer for LinearSweepAnalyzer {
                 // candidates inside the newly-found body get skipped
                 // by the next iteration's `is_inside_function_body`
                 // check (and not re-validated).
-                if let Some(end) = validate_candidate_with_extent(&*lifter, program, addr, &covered)
+                if let Some(end) = validate_candidate_with_extent(&*lifter, program, addr, &covered, &mut lifts)
                 {
                     new_functions.push((addr, end));
                     covered.insert(addr, end);
@@ -277,11 +280,17 @@ fn looks_like_prologue(bytes: &[u8]) -> bool {
 /// exclusive (last_insn.address + last_insn.length). Callers feed
 /// this back into `covered` so adjacent candidates inside the
 /// just-discovered body get skipped without re-lifting.
+/// The lift of each address [`validate_candidate_with_extent`] looked at:
+/// the instruction's length and whether its P-code ends the flow
+/// (`Return` / `BranchInd`), or `None` when it does not lift.
+type Lifts = rustc_hash::FxHashMap<u64, Option<(u32, bool)>>;
+
 fn validate_candidate_with_extent(
     lifter: &dyn PcodeLift,
     program: &Program,
     entry: u64,
     covered: &Covered,
+    lifts: &mut Lifts,
 ) -> Option<u64> {
     // `lift_range(entry, 256)` would lift up to 256 instructions, but
     // only the instructions up to the first terminator and the count
@@ -295,29 +304,33 @@ fn validate_candidate_with_extent(
     let mut addr = entry;
     let mut end: Option<u64> = None;
     while count < BUDGET {
-        let Ok(insn) = lifter.lift_instruction(memory, addr) else { break };
+        let lifted = *lifts.entry(addr).or_insert_with(|| {
+            lifter.lift_instruction(memory, addr).ok().map(|insn| {
+                // Look at the underlying `DecodedInstruction.flow_type` via
+                // the listing if the address is decoded (below), else inspect
+                // the P-code op to detect a Return. The lifter's
+                // `LiftedInstruction` carries the raw bytes + ops but not
+                // the high-level flow_type, so we check op opcode directly.
+                let pcode_terminates = insn.ops.iter().any(|op| {
+                    matches!(
+                        op.opcode,
+                        reargo_core::pcode::OpCode::Return | reargo_core::pcode::OpCode::BranchInd
+                    )
+                });
+                (insn.length, pcode_terminates)
+            })
+        });
+        let Some((length, pcode_terminates)) = lifted else { break };
         count += 1;
-        let next = addr + insn.length as u64;
+        let next = addr + length as u64;
         if end.is_none() {
-            if covered.contains(insn.address) {
+            if covered.contains(addr) {
                 // Rejected unless the range is too short anyway — `None` both ways.
                 return None;
             }
-            // Look at the underlying `DecodedInstruction.flow_type` via
-            // the listing if the address is decoded, else inspect the
-            // P-code op to detect a Return. The lifter's
-            // `LiftedInstruction` carries the raw bytes + ops but not
-            // the high-level flow_type, so we check op opcode directly.
-            let pcode_terminates = insn.ops.iter().any(|op| {
-                matches!(
-                    op.opcode,
-                    reargo_core::pcode::OpCode::Return | reargo_core::pcode::OpCode::BranchInd
-                )
-            });
             let flow_terminates = program
                 .listing
-                .instructions_in_range(insn.address, insn.address + 1)
-                .next()
+                .get_instruction(addr)
                 .is_some_and(|m| {
                     matches!(
                         m.flow_type,
@@ -471,7 +484,7 @@ mod tests {
         let program = make_x86_64_program(&code, entry);
         let lifter = reargo_lift::x86::X86Lifter::new_64();
 
-        let end = validate_candidate_with_extent(&lifter, &program, entry, &Covered::default())
+        let end = validate_candidate_with_extent(&lifter, &program, entry, &Covered::default(), &mut Lifts::default())
             .expect("simple ret-terminated routine should validate");
         // ret is the last byte: addr 0x1007, length 1 → end = 0x1008.
         assert_eq!(end, entry + code.len() as u64);
@@ -493,7 +506,7 @@ mod tests {
         // instruction (`xor eax, eax` at 0x1004).
         let covered = Covered::from_ranges(vec![(0x1004u64, 0x1008u64)]);
         assert!(
-            validate_candidate_with_extent(&lifter, &program, entry, &covered).is_none(),
+            validate_candidate_with_extent(&lifter, &program, entry, &covered, &mut Lifts::default()).is_none(),
             "overlap with covered range must reject"
         );
     }
@@ -514,6 +527,6 @@ mod tests {
         let program = make_x86_64_program(&code, entry);
         let lifter = reargo_lift::x86::X86Lifter::new_64();
 
-        assert!(validate_candidate_with_extent(&lifter, &program, entry, &Covered::default()).is_none());
+        assert!(validate_candidate_with_extent(&lifter, &program, entry, &Covered::default(), &mut Lifts::default()).is_none());
     }
 }

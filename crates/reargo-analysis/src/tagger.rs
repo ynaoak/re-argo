@@ -22,8 +22,8 @@
 //!   when their text matches a known pattern, so override workflows
 //!   get tagging for free.
 
-use reargo_program::comments::CommentType;
 use reargo_program::tags::TagKind;
+use rayon::prelude::*;
 use reargo_program::Program;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -44,22 +44,24 @@ impl Analyzer for TagAnalyzer {
         950
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        // Snapshot comments so the iteration borrow doesn't fight
-        // the tag-manager mutation.
-        let comments: Vec<(u64, CommentType, String)> = program
-            .comments
-            .iter()
-            .map(|c| (c.address, c.comment_type, c.text))
-            .collect();
+        // The tags of every comment, derived in parallel (in comment
+        // order), then added in that order.
+        let derived: Vec<(u64, TagKind, String)> = {
+            let comments: Vec<(u64, &str)> = program.comments.iter_refs().map(|(a, _, t)| (a, t)).collect();
+            comments
+                .par_iter()
+                .flat_map_iter(|&(addr, text)| {
+                    derive_tags(text)
+                        .into_iter()
+                        .map(move |(cat, derived_text)| (addr, cat, derived_text.unwrap_or_else(|| text.to_string())))
+                })
+                .collect()
+        };
 
         let mut tag_count = 0usize;
-        for (addr, _kind, text) in &comments {
-            for (cat, derived_text) in derive_tags(text) {
-                program
-                    .tags
-                    .add_address(*addr, cat, derived_text.unwrap_or_else(|| text.clone()), true);
-                tag_count += 1;
-            }
+        for (addr, cat, text) in derived {
+            program.tags.add_address(addr, cat, text, true);
+            tag_count += 1;
         }
 
         // Function-scope tags from Function flags.

@@ -23,3 +23,4 @@ serde_json = { workspace = true }
 iced-x86 = { workspace = true }
 md-5 = { workspace = true }
 goblin = { workspace = true }
+memchr = "2"

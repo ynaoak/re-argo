@@ -24,6 +24,7 @@
 //!   listings legible.
 
 use reargo_program::comments::CommentType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -56,27 +57,28 @@ impl Analyzer for StringXrefAnnotator {
 
         // We only want to annotate from-sites that are actually
         // instructions — references from data sections (relocs,
-        // vtable entries…) belong to a different surface.
+        // vtable entries…) belong to a different surface. The
+        // previews are read in parallel (pure reads of the image) and
+        // applied in edge order: the first edge of a site with no
+        // comment yet sets it.
+        let previews: Vec<(u64, String)> = {
+            let program = &*program;
+            edges
+                .par_iter()
+                .filter_map(|&(from, to)| {
+                    program.listing.get_instruction(from)?;
+                    let preview = read_c_string(program, to)?;
+                    let trimmed = truncate_preview(&preview, 48);
+                    Some((from, format!("\"{}\"", escape(&trimmed))))
+                })
+                .collect()
+        };
         let mut emitted = 0usize;
-        for (from, to) in edges {
-            if program
-                .listing
-                .instructions_in_range(from, from + 1)
-                .next()
-                .is_none()
-            {
-                continue;
-            }
+        for (from, text) in previews {
             if program.comments.get(from, CommentType::Eol).is_some() {
                 continue;
             }
-            let Some(preview) = read_c_string(program, to) else {
-                continue;
-            };
-            let trimmed = truncate_preview(&preview, 48);
-            program
-                .comments
-                .set(from, CommentType::Eol, format!("\"{}\"", escape(&trimmed)));
+            program.comments.set(from, CommentType::Eol, text);
             emitted += 1;
         }
 

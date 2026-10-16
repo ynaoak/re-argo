@@ -143,8 +143,7 @@ impl Analyzer for ExceptionFlowAnalyzer {
             // also point at these symbols but aren't user-meaningful.
             if program
                 .listing
-                .instructions_in_range(from, from + 1)
-                .next()
+                .get_instruction(from)
                 .is_none()
             {
                 continue;

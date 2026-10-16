@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -368,9 +367,48 @@ impl PartialOrd for AddressRange {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+/// A set of address ranges, in order.
+///
+/// Kept as a sorted vector of distinct ranges: a function body holds one
+/// range per instruction and is built once ([`FromIterator`]), then read
+/// many times (`contains` is a binary search). Serialized as the sequence
+/// of its ranges, as a `BTreeSet` of them was.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AddressSet {
-    ranges: BTreeSet<AddressRange>,
+    #[serde(deserialize_with = "deserialize_ranges")]
+    ranges: Vec<AddressRange>,
+}
+
+/// The sort key of an [`AddressRange`]: its order (space, offset, size)
+/// on plain integers; equal keys are equal ranges.
+fn range_key(r: &AddressRange) -> (u32, u64, u64) {
+    (r.start.space.0, r.start.offset, r.size)
+}
+
+/// Sort and dedup `ranges` (a no-op check when they already are).
+fn normalize(ranges: &mut Vec<AddressRange>) {
+    if !ranges.is_sorted_by(|a, b| range_key(a) < range_key(b)) {
+        ranges.sort_unstable_by_key(range_key);
+        ranges.dedup();
+    }
+}
+
+fn deserialize_ranges<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<AddressRange>, D::Error> {
+    let mut ranges = <Vec<AddressRange> as serde::Deserialize>::deserialize(d)?;
+    normalize(&mut ranges);
+    Ok(ranges)
+}
+
+impl fmt::Debug for AddressSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Set<'a>(&'a [AddressRange]);
+        impl fmt::Debug for Set<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_set().entries(self.0).finish()
+            }
+        }
+        f.debug_struct("AddressSet").field("ranges", &Set(&self.ranges)).finish()
+    }
 }
 
 impl AddressSet {
@@ -379,18 +417,27 @@ impl AddressSet {
     }
 
     pub fn add(&mut self, range: AddressRange) {
-        self.ranges.insert(range);
+        let key = range_key(&range);
+        match self.ranges.last() {
+            None => self.ranges.push(range),
+            Some(last) if range_key(last) < key => self.ranges.push(range),
+            _ => {
+                if let Err(i) = self.ranges.binary_search_by_key(&key, range_key) {
+                    self.ranges.insert(i, range);
+                }
+            }
+        }
     }
 
     pub fn contains(&self, addr: &Address) -> bool {
-        let probe = AddressRange::new(*addr, u64::MAX);
-        self.ranges
-            .range(..=probe)
-            .next_back()
-            .is_some_and(|r| r.contains(addr))
+        // The last range starting at or before `addr`.
+        let i = self
+            .ranges
+            .partition_point(|r| (r.start.space, r.start.offset) <= (addr.space, addr.offset));
+        i > 0 && self.ranges[i - 1].contains(addr)
     }
 
-    pub fn ranges(&self) -> impl Iterator<Item = &AddressRange> {
+    pub fn ranges(&self) -> impl DoubleEndedIterator<Item = &AddressRange> + ExactSizeIterator {
         self.ranges.iter()
     }
 
@@ -398,8 +445,36 @@ impl AddressSet {
         self.ranges.is_empty()
     }
 
+    /// The offsets `(start, end)` (`end = start + size`) of the ranges
+    /// in order, each run of ranges where one starts at the end of the
+    /// one before merged into one: the addresses of a run are those
+    /// of its ranges, in the same order. A body holds one range per
+    /// instruction, so this is about one entry per straight-line run.
+    pub fn runs(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for r in &self.ranges {
+            let (s, e) = (r.start.offset, r.start.offset.wrapping_add(r.size));
+            match out.last_mut() {
+                // (a range wrapping past the end of the space stays alone)
+                Some(last) if last.1 == s && e >= s => last.1 = e,
+                _ => out.push((s, e)),
+            }
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.ranges.len()
+    }
+}
+
+/// The set of the ranges given (repeats once), as `add` of each would
+/// build it.
+impl FromIterator<AddressRange> for AddressSet {
+    fn from_iter<I: IntoIterator<Item = AddressRange>>(iter: I) -> Self {
+        let mut ranges: Vec<AddressRange> = iter.into_iter().collect();
+        normalize(&mut ranges);
+        Self { ranges }
     }
 }
 
@@ -588,6 +663,44 @@ mod tests {
         let r3 = AddressRange::new(Address::new(SpaceId(1), 0x200), 0x100);
         assert!(r1.overlaps(&r2));
         assert!(!r1.overlaps(&r3));
+    }
+
+    /// The set kept as a sorted vector answers as the `BTreeSet` of the
+    /// same ranges did: the same ranges in the same order, and `contains`
+    /// looks at the last range starting at or before the address (with
+    /// overlapping ranges, not at an earlier one that spans it).
+    #[test]
+    fn address_set_matches_btree_set() {
+        use std::collections::BTreeSet;
+        let r = |space: u32, off: u64, size: u64| AddressRange::new(Address::new(SpaceId(space), off), size);
+        let input = [
+            r(1, 0x100, 4), r(1, 0x104, 2), r(1, 0x100, 4), r(1, 0x106, 0), r(1, 0x106, 3),
+            r(1, 0x0f0, 0x40), r(1, 0x200, 8), r(1, 0x200, 2), r(2, 0x100, 4), r(1, 0x105, 1),
+        ];
+        let tree: BTreeSet<AddressRange> = input.iter().copied().collect();
+        let mut added = AddressSet::new();
+        for x in input {
+            added.add(x);
+        }
+        let collected: AddressSet = input.iter().copied().collect();
+        for set in [&added, &collected] {
+            assert_eq!(set.ranges().copied().collect::<Vec<_>>(), tree.iter().copied().collect::<Vec<_>>());
+            assert_eq!(set.len(), tree.len());
+            for space in [1, 2, 3] {
+                for off in 0xe0..0x220u64 {
+                    let a = Address::new(SpaceId(space), off);
+                    let old = tree.range(..=AddressRange::new(a, u64::MAX)).next_back().is_some_and(|x| x.contains(&a));
+                    assert_eq!(set.contains(&a), old, "{space} {off:#x}");
+                }
+            }
+        }
+        // runs: ranges each starting where the one before ends, merged
+        let runs: AddressSet = [r(1, 0x10, 2), r(1, 0x12, 3), r(1, 0x15, 0), r(1, 0x15, 1), r(1, 0x20, 1), r(1, 0x21, 1)]
+            .into_iter()
+            .collect();
+        assert_eq!(runs.runs(), [(0x10, 0x16), (0x20, 0x22)]);
+        let overlapping: AddressSet = [r(1, 0x10, 4), r(1, 0x12, 4)].into_iter().collect();
+        assert_eq!(overlapping.runs(), [(0x10, 0x14), (0x12, 0x16)]);
     }
 
     #[test]

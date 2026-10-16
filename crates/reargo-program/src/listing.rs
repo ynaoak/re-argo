@@ -19,6 +19,19 @@ impl Listing {
         self.instructions.insert(insn.address, insn);
     }
 
+    /// The instruction at `address`: the one listed, else `decode()`'s,
+    /// which is listed (`None` when there is none and it gives none).
+    pub fn instruction_or_insert_with(
+        &mut self,
+        address: u64,
+        decode: impl FnOnce() -> Option<DecodedInstruction>,
+    ) -> Option<&DecodedInstruction> {
+        match self.instructions.entry(address) {
+            std::collections::btree_map::Entry::Occupied(e) => Some(e.into_mut()),
+            std::collections::btree_map::Entry::Vacant(e) => Some(e.insert(decode()?)),
+        }
+    }
+
     pub fn get_instruction(&self, address: u64) -> Option<&DecodedInstruction> {
         self.instructions.get(&address)
     }
@@ -37,6 +50,40 @@ impl Listing {
         end: u64,
     ) -> impl DoubleEndedIterator<Item = &DecodedInstruction> {
         self.instructions.range(start..end).map(|(_, v)| v)
+    }
+
+    /// Calls `f(first, insn)` for the instructions of every range of
+    /// `body`, in the order and with the repetitions of
+    /// `for r in body.ranges() { for insn in instructions_in_range(r.start, r.end) { … } }`;
+    /// `first` is true for the first instruction of each range.
+    ///
+    /// A body holds one range per instruction, so a range lookup per
+    /// range costs a tree search per instruction. Here a run of ranges
+    /// each starting where the one before ends is walked with one
+    /// lookup: their instructions are those of the whole run, in order.
+    pub fn for_each_body_instruction<'a>(
+        &'a self,
+        body: &reargo_core::address::AddressSet,
+        mut f: impl FnMut(bool, &'a DecodedInstruction),
+    ) {
+        let ranges: Vec<(u64, u64)> =
+            body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).collect();
+        let mut i = 0;
+        while i < ranges.len() {
+            let mut j = i;
+            while j + 1 < ranges.len() && ranges[j + 1].0 == ranges[j].1 {
+                j += 1;
+            }
+            let mut it = self.instructions.range(ranges[i].0..ranges[j].1).peekable();
+            for &(_, end) in &ranges[i..=j] {
+                let mut first = true;
+                while let Some((_, insn)) = it.next_if(|(a, _)| **a < end) {
+                    f(first, insn);
+                    first = false;
+                }
+            }
+            i = j + 1;
+        }
     }
 
     pub fn instruction_count(&self) -> usize {
@@ -87,5 +134,71 @@ impl Listing {
             .next_back()
             .map(|(_, f)| f)
             .filter(|f| f.body.contains(&reargo_core::address::Address::new(reargo_core::address::SpaceId::RAM, address)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reargo_arch::FlowType;
+    use reargo_core::address::{Address, AddressRange, AddressSet, SpaceId};
+
+    fn listing(insns: &[(u64, u32)]) -> Listing {
+        let mut l = Listing::new();
+        for &(a, len) in insns {
+            l.add_instruction(DecodedInstruction::new(
+                a,
+                len,
+                "nop".into(),
+                String::new(),
+                smallvec::smallvec![0x90; len as usize],
+                FlowType::Fall,
+                None,
+            ));
+        }
+        l
+    }
+
+    /// The walk gives what a range lookup per range gives, with the
+    /// first instruction of each range marked.
+    #[test]
+    fn body_walk_matches_range_lookups() {
+        let l = listing(&[(0x10, 2), (0x12, 3), (0x15, 1), (0x16, 4), (0x20, 1), (0x21, 2), (0x22, 1), (0x30, 1)]);
+        let r = |off: u64, size: u64| AddressRange::new(Address::new(SpaceId::RAM, off), size);
+        let bodies: Vec<AddressSet> = vec![
+            [r(0x10, 2), r(0x12, 3), r(0x15, 1)].into_iter().collect(),
+            [r(0x10, 6), r(0x16, 4)].into_iter().collect(),
+            [r(0x12, 3), r(0x20, 1), r(0x21, 2)].into_iter().collect(),
+            // overlapping and empty ranges, and a range holding two instructions
+            [r(0x20, 3), r(0x21, 2), r(0x22, 0), r(0x22, 1), r(0x30, 1)].into_iter().collect(),
+            AddressSet::new(),
+        ];
+        for body in &bodies {
+            let mut expected: Vec<(bool, u64)> = Vec::new();
+            for range in body.ranges() {
+                let start = range.start.offset;
+                for (i, insn) in l.instructions_in_range(start, start + range.size).enumerate() {
+                    expected.push((i == 0, insn.address));
+                }
+            }
+            let mut walked: Vec<(bool, u64)> = Vec::new();
+            l.for_each_body_instruction(body, |first, insn| walked.push((first, insn.address)));
+            assert_eq!(walked, expected, "{body:?}");
+        }
+    }
+
+    /// A set serializes as the `BTreeSet` of its ranges did (the
+    /// on-disk analysis cache) and reads back sorted and deduplicated.
+    #[test]
+    fn address_set_serializes_as_a_btree_set() {
+        let r = |off: u64, size: u64| AddressRange::new(Address::new(SpaceId::RAM, off), size);
+        let ranges = [r(0x30, 1), r(0x10, 2), r(0x12, 3), r(0x10, 1)];
+        let set: AddressSet = ranges.into_iter().collect();
+        let tree: std::collections::BTreeSet<AddressRange> = ranges.into_iter().collect();
+        assert_eq!(bincode::serialize(&set).unwrap(), bincode::serialize(&tree).unwrap());
+        let unsorted: Vec<AddressRange> = vec![r(0x30, 1), r(0x10, 2), r(0x30, 1)];
+        let back: AddressSet = bincode::deserialize(&bincode::serialize(&unsorted).unwrap()).unwrap();
+        assert_eq!(back.ranges().copied().collect::<Vec<_>>(), [r(0x10, 2), r(0x30, 1)]);
+        assert_eq!(format!("{set:?}"), format!("AddressSet {{ ranges: {tree:?} }}"));
     }
 }

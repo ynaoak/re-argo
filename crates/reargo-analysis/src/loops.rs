@@ -25,6 +25,7 @@
 
 use reargo_arch::FlowType;
 use reargo_program::comments::CommentType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -46,59 +47,54 @@ impl Analyzer for LoopAnalyzer {
         785
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        struct FuncSnap {
-            entry: u64,
-            ranges: Vec<(u64, u64)>,
-        }
-        let funcs: Vec<FuncSnap> = program
-            .listing
-            .functions()
-            .map(|f| FuncSnap {
-                entry: f.entry_point,
-                ranges: f
-                    .body
-                    .ranges()
-                    .map(|r| (r.start.offset, r.start.offset + r.size))
-                    .collect(),
-            })
-            .collect();
-
         // (branch_addr, target_addr, function_entry) — emitted in
         // two passes so we can also write the header annotation
         // without re-iterating.
-        let mut back_edges: Vec<(u64, u64, u64)> = Vec::new();
-        for snap in &funcs {
-            for (start, end) in &snap.ranges {
-                for insn in program.listing.instructions_in_range(*start, *end) {
+        // Functions are independent: walked in parallel, the edges kept
+        // in function order.
+        let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
+        let listing = &program.listing;
+        let back_edges: Vec<(u64, u64, u64)> = funcs
+            .par_iter()
+            .flat_map_iter(|f| {
+                let mut edges: Vec<(u64, u64, u64)> = Vec::new();
+                let entry = f.entry_point;
+                // A body holds one range per instruction: test membership
+                // by a binary search over the merged ranges (of its runs
+                // of adjacent ranges, the same addresses).
+                let merged = crate::deadcode::merge_ranges(&f.body.runs());
+                let inside = |a: u64| {
+                    let i = merged.partition_point(|&(s, _)| s <= a);
+                    i > 0 && a < merged[i - 1].1
+                };
+                listing.for_each_body_instruction(&f.body, |_, insn| {
                     let is_branch = matches!(
                         insn.flow_type,
                         FlowType::ConditionalJump | FlowType::UnconditionalJump
                     );
                     if !is_branch {
-                        continue;
+                        return;
                     }
                     let Some(target) = insn.branch_target else {
-                        continue;
+                        return;
                     };
                     // Backward branch inside this function's body.
                     if target >= insn.address {
-                        continue;
+                        return;
                     }
-                    if target == snap.entry {
+                    if target == entry {
                         // recursion-to-entry — skip
-                        continue;
+                        return;
                     }
-                    let inside = snap
-                        .ranges
-                        .iter()
-                        .any(|(s, e)| target >= *s && target < *e);
-                    if !inside {
-                        continue;
+                    if !inside(target) {
+                        return;
                     }
-                    back_edges.push((insn.address, target, snap.entry));
-                }
-            }
-        }
+                    edges.push((insn.address, target, entry));
+                });
+                edges
+            })
+            .collect();
+        drop(funcs);
 
         let mut header_set: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
         let mut emitted = 0usize;

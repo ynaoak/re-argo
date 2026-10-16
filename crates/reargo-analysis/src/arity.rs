@@ -77,12 +77,15 @@ impl Analyzer for ArgumentArityAnalyzer {
             .listing
             .functions()
             .filter(|f| f.name.starts_with("FUN_") && !f.is_thunk)
-            .map(|f| (f.entry_point, f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200)))
+            .map(|f| (f.entry_point, budget(f)))
             .collect();
-        let arities: Vec<(u64, usize)> =
-            crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |entry, lifted| {
-                (entry, infer_arity(lifted))
-            });
+        // A function's arity depends only on its lift: those the Stack
+        // Frame analyzer computed ahead ([`Ahead`]) are taken as they are.
+        let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
+        let arities: Vec<usize> = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
+            crate::range_lift::map_lifted_ranges(&program.info.memory, missing, |_, lifted| infer_arity(lifted))
+        });
+        let arities: Vec<(u64, usize)> = jobs.iter().map(|j| j.0).zip(arities).collect();
 
         let mut annotated = 0usize;
         for (entry, arity) in arities {
@@ -109,6 +112,15 @@ impl Analyzer for ArgumentArityAnalyzer {
     }
 }
 
+/// The instructions lifted from a function's entry.
+pub(crate) fn budget(f: &reargo_program::function::Function) -> usize {
+    f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200)
+}
+
+/// [`infer_arity`] of functions, computed ahead of this analyzer from
+/// the same lift, by `(entry, budget)`.
+pub(crate) struct Ahead(pub crate::range_lift::AheadMap<usize>);
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum RegState {
     #[default]
@@ -120,7 +132,7 @@ enum RegState {
 /// Walk the lifted P-code in linear order and classify each SysV arg
 /// register's first usage. Returns the number of leading registers
 /// classified as `ReadBeforeWrite` — i.e., the inferred SysV arity.
-fn infer_arity<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L]) -> usize {
+pub(crate) fn infer_arity<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L]) -> usize {
     let mut state: [RegState; 6] = [RegState::Untouched; 6];
 
     for insn in lifted {

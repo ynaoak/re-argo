@@ -287,7 +287,7 @@ impl X86Arch {
         }
 
         let len = instruction.len() as u32;
-        let bytes: SmallVec<[u8; 16]> = data[..len as usize].into();
+        let bytes: SmallVec<[u8; 16]> = SmallVec::from_slice(&data[..len as usize]);
 
         let flow_type = classify_flow(&instruction);
         let branch_target = extract_branch_target(&instruction);

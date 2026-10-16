@@ -1,8 +1,6 @@
 use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
-use reargo_lift::PcodeLift;
 use reargo_program::Program;
-use rayon::prelude::*;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -28,17 +26,19 @@ impl Analyzer for CallingConventionAnalyzer {
             });
         }
 
-        let lifter: Box<dyn PcodeLift> = Box::new(reargo_lift::x86::X86Lifter::new_64());
-        let lifter: &dyn PcodeLift = &*lifter;
-
         let func_entries: Vec<u64> = program.listing.functions().map(|f| f.entry_point).collect();
 
         // Phase 1: infer convention for each function in parallel
-        // against an immutable Program view.
-        let inferences: Vec<Option<(u64, &'static str)>> = func_entries
-            .par_iter()
-            .map(|&entry| infer_convention(lifter, program, entry))
-            .collect();
+        // against an immutable Program view. The lifts of neighbouring functions overlap: share them
+        // ([`crate::range_lift::map_lifted_ranges`] gives each exactly
+        // `lift_range(entry, 50)`).
+        // Those the Stack Frame analyzer computed ahead from the same lift
+        // ([`Ahead`]) are taken as they are.
+        let jobs: Vec<(u64, usize)> = func_entries.iter().map(|&e| (e, LIFT_BUDGET)).collect();
+        let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
+        let inferences: Vec<Option<(u64, &'static str)>> = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
+            crate::range_lift::map_lifted_ranges(&program.info.memory, missing, convention_lifted)
+        });
 
         // Phase 2: apply serially. Each entry targets a distinct
         // function so ordering doesn't matter.
@@ -61,24 +61,25 @@ impl Analyzer for CallingConventionAnalyzer {
     }
 }
 
+/// Instructions lifted from a function's entry.
+pub(crate) const LIFT_BUDGET: usize = 50;
+
+/// [`convention_lifted`] of functions, computed ahead of this analyzer
+/// from the same lift, by `(entry, LIFT_BUDGET)`.
+pub(crate) struct Ahead(pub crate::range_lift::AheadMap<Option<(u64, &'static str)>>);
+
 /// Score `entry`'s body against Windows (RCX/RDX/R8/R9) vs System V
 /// (RDI/RSI/RDX/RCX) argument register usage; return the winning
 /// convention name, or `None` if neither set was touched. Pure
-/// function-local work -- no `&mut Program` is held.
-fn infer_convention(
-    lifter: &dyn PcodeLift,
-    program: &reargo_program::Program,
-    entry: u64,
-) -> Option<(u64, &'static str)> {
-    let lifted = lifter.lift_range(&program.info.memory, entry, 50).ok()?;
-
+/// function-local work on the instructions `lifted` from `entry`.
+pub(crate) fn convention_lifted(entry: u64, lifted: &[&reargo_lift::LiftedInstruction]) -> Option<(u64, &'static str)> {
     let win_regs = [0x08u64, 0x10, 0x80, 0x88]; // RCX, RDX, R8, R9
     let sysv_regs = [0x38u64, 0x30, 0x10, 0x08]; // RDI, RSI, RDX, RCX
 
     let mut win_score = 0;
     let mut sysv_score = 0;
 
-    for insn in &lifted {
+    for insn in lifted {
         for op in &insn.ops {
             for inp in &op.inputs {
                 if inp.space == SpaceId::REGISTER {

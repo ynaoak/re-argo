@@ -141,8 +141,10 @@ impl Analyzer for CapaAnalyzer {
 }
 
 struct CapaContext {
-    imports: BTreeSet<String>,
     imports_lower: BTreeSet<String>,
+    /// For each lower-cased import, the first import (in sorted
+    /// order) that lower-cases to it.
+    original_import: std::collections::BTreeMap<String, String>,
     strings_lower: Vec<String>,
     present_tags: BTreeSet<String>,
 }
@@ -156,14 +158,17 @@ fn build_context(program: &Program) -> CapaContext {
         let n = sym.name.strip_suffix("@plt").unwrap_or(&sym.name);
         imports.insert(n.to_string());
     }
-    let imports_lower: BTreeSet<String> =
-        imports.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let mut original_import: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for s in &imports {
+        original_import.entry(s.to_ascii_lowercase()).or_insert_with(|| s.clone());
+    }
+    let imports_lower: BTreeSet<String> = original_import.keys().cloned().collect();
 
     // Pull strings from inline comments / immediate-string annotations
     // (every string the analyzer cared about flows through these).
     let mut strings_lower: Vec<String> = Vec::new();
-    for c in program.comments.iter() {
-        strings_lower.push(c.text.to_ascii_lowercase());
+    for (_, _, text) in program.comments.iter_refs() {
+        strings_lower.push(text.to_ascii_lowercase());
     }
 
     let mut present_tags: BTreeSet<String> = BTreeSet::new();
@@ -175,8 +180,8 @@ fn build_context(program: &Program) -> CapaContext {
     }
 
     CapaContext {
-        imports,
         imports_lower,
+        original_import,
         strings_lower,
         present_tags,
     }
@@ -188,15 +193,16 @@ fn eval(p: &Predicate, ctx: &CapaContext, evidence: &mut Vec<String>) -> bool {
             let mut hit = false;
             for needle in *needles {
                 let nl = needle.to_ascii_lowercase();
+                // `imp.contains(&nl)`, with the searcher built once
+                let finder = memchr::memmem::Finder::new(nl.as_bytes());
                 for imp in &ctx.imports_lower {
-                    if imp.contains(&nl) {
+                    if finder.find(imp.as_bytes()).is_some() {
                         // Find the original-cased name for the
-                        // evidence list (use ctx.imports — there
+                        // evidence list (from ctx.original_import — there
                         // may be exact matches).
                         let original = ctx
-                            .imports
-                            .iter()
-                            .find(|s| s.to_ascii_lowercase() == *imp)
+                            .original_import
+                            .get(imp)
                             .cloned()
                             .unwrap_or_else(|| (*needle).to_string());
                         evidence.push(format!("import {}", original));
@@ -220,8 +226,10 @@ fn eval(p: &Predicate, ctx: &CapaContext, evidence: &mut Vec<String>) -> bool {
             let mut hit = false;
             for needle in *needles {
                 let nl = needle.to_ascii_lowercase();
+                // `s.contains(&nl)`, with the searcher built once
+                let finder = memchr::memmem::Finder::new(nl.as_bytes());
                 for s in &ctx.strings_lower {
-                    if s.contains(&nl) {
+                    if finder.find(s.as_bytes()).is_some() {
                         evidence.push(format!("string {:?}", needle));
                         hit = true;
                         break;
@@ -435,11 +443,14 @@ mod tests {
 
     fn ctx_with_imports(names: &[&str]) -> CapaContext {
         let imports: BTreeSet<String> = names.iter().map(|s| s.to_string()).collect();
-        let imports_lower: BTreeSet<String> =
-            imports.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let mut original_import = std::collections::BTreeMap::new();
+        for s in &imports {
+            original_import.entry(s.to_ascii_lowercase()).or_insert_with(|| s.clone());
+        }
+        let imports_lower: BTreeSet<String> = original_import.keys().cloned().collect();
         CapaContext {
-            imports,
             imports_lower,
+            original_import,
             strings_lower: vec![],
             present_tags: BTreeSet::new(),
         }

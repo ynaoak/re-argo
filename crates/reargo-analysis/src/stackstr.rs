@@ -34,6 +34,7 @@
 //! strings — those are off in DT_RODATA — and not handled here.
 
 use reargo_program::comments::CommentType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -64,39 +65,31 @@ impl Analyzer for StackStringAnalyzer {
             });
         }
 
-        // Snapshot each function's body as a flat list of address
-        // ranges. `AddressSet` keeps one range per basic block (or per
-        // contiguous instruction), so we have to walk *every* range to
-        // see the full body — taking just the first one only scans the
-        // function prologue.
-        let func_ranges: Vec<Vec<(u64, u64)>> = program
-            .listing
-            .functions()
-            .map(|f| {
-                f.body
-                    .ranges()
-                    .map(|r| (r.start.offset, r.start.offset + r.size))
-                    .collect()
-            })
-            .collect();
-
-        let mut pending: Vec<(u64, String)> = Vec::new();
-
-        for ranges in &func_ranges {
-            let mut captures: Vec<StackImmStore> = Vec::new();
-            for (start, end) in ranges {
-                for insn in program.listing.instructions_in_range(*start, *end) {
+        // Functions walked in parallel, the strings kept in function
+        // order.
+        let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
+        let listing = &program.listing;
+        let pending: Vec<(u64, String)> = funcs
+            .par_iter()
+            .flat_map_iter(|f| {
+                let mut captures: Vec<StackImmStore> = Vec::new();
+                // Every range of the body, in order (see
+                // `Listing::for_each_body_instruction`).
+                listing.for_each_body_instruction(&f.body, |_, insn| {
                     if let Some(cap) = parse_stack_imm_store(insn.address, &insn.bytes) {
                         captures.push(cap);
                     }
+                });
+                let mut found: Vec<(u64, String)> = Vec::new();
+                for run in stitch_runs(&captures) {
+                    if let Some(text) = printable_preview(&run.bytes) {
+                        found.push((run.first_addr, format!("stack_string: \"{}\"", text)));
+                    }
                 }
-            }
-            for run in stitch_runs(&captures) {
-                if let Some(text) = printable_preview(&run.bytes) {
-                    pending.push((run.first_addr, format!("stack_string: \"{}\"", text)));
-                }
-            }
-        }
+                found
+            })
+            .collect();
+        drop(funcs);
 
         let mut emitted = 0usize;
         for (addr, text) in pending {

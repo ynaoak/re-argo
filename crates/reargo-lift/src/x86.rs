@@ -49,12 +49,23 @@ fn rdi(sz: u32) -> VarnodeData { reg(0x38, sz) }
 
 fn iced_reg_to_varnode(r: iced_x86::Register) -> Option<VarnodeData> {
     use std::sync::OnceLock;
-    use std::collections::HashMap;
     use iced_x86::Register;
 
-    static REG_MAP: OnceLock<HashMap<Register, VarnodeData>> = OnceLock::new();
+    /// Indexed by the register's number: a table lookup instead of a
+    /// SipHash map (the lifter maps every register operand).
+    struct RegTable(Vec<Option<VarnodeData>>);
+    impl RegTable {
+        fn insert(&mut self, r: Register, v: VarnodeData) {
+            let i = r as usize;
+            if self.0.len() <= i {
+                self.0.resize(i + 1, None);
+            }
+            self.0[i] = Some(v);
+        }
+    }
+    static REG_MAP: OnceLock<RegTable> = OnceLock::new();
     let map = REG_MAP.get_or_init(|| {
-        let mut m = HashMap::with_capacity(48);
+        let mut m = RegTable(Vec::new());
         // AH/CH/DH/BH = byte 1 of rax/rcx/rdx/rbx (Ghidra's offsets). They were missing, so
         // `movzx eax, ah` failed to lift and the function stopped there (WS84). Reads and
         // writes are tied to the full register by `zero_extend_gpr32_writes`.
@@ -110,7 +121,7 @@ fn iced_reg_to_varnode(r: iced_x86::Register) -> Option<VarnodeData> {
         }
         m
     });
-    map.get(&r).copied()
+    map.0.get(r as usize).copied().flatten()
 }
 
 /// XMM register file base in REGISTER space. Mirrors Ghidra's x86-64 SLEIGH
@@ -324,7 +335,10 @@ impl X86Lifter {
             return lifted;
         }
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        let mut ops: Vec<PcodeOp> = Vec::new();
+        // Most instructions lift to a handful of ops plus their flags:
+        // room for 8 up front instead of growing 4 -> 8 (a larger
+        // first allocation measured slower).
+        let mut ops: Vec<PcodeOp> = Vec::with_capacity(8);
         let mut seq_base: u32 = 0;
         let ps = self.ptr_size();
 

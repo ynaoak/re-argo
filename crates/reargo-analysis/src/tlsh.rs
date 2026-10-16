@@ -44,6 +44,7 @@
 const MIN_INPUT_LEN: usize = 50;
 
 use reargo_loader::BinaryInfo;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -190,32 +191,69 @@ const DIFF_TABLE: [[u32; 4]; 4] = [
 ];
 
 fn build_buckets(data: &[u8]) -> ([u32; 128], u8) {
-    let mut buckets = [0u32; 128];
-    let mut checksum: u8 = 0;
     if data.len() < 5 {
-        return (buckets, checksum);
+        return ([0u32; 128], 0);
     }
     // Slide a 5-byte window. Each window produces 6 bucket index
-    // updates (one per salt) and a checksum update.
-    for w in data.windows(5) {
-        // The TLSH bucket-mapping function pairs the salts with
-        // specific byte positions to spread information across the
-        // sliding window. Mapping per the published spec.
-        let p = w;
-        let salts = [(2, p[0], p[1], p[2]),
-                     (3, p[0], p[1], p[3]),
-                     (5, p[0], p[2], p[3]),
-                     (7, p[0], p[2], p[4]),
-                     (11, p[0], p[1], p[4]),
-                     (13, p[0], p[3], p[4])];
-        for (salt, a, b, c) in salts {
-            let idx = b_mapping(salt, a, b, c);
-            buckets[(idx & 0x7F) as usize] += 1;
-        }
-        // Checksum: 17 salt, pair of bytes
-        checksum = b_mapping(checksum, p[0], p[1], 0);
+    // updates (one per salt) and a checksum update. The bucket counts
+    // are sums over the windows, so chunks of windows are counted in
+    // parallel and added up; the checksum chains window to window and
+    // runs alongside.
+    let windows = data.len() - 4;
+    const CHUNK: usize = 1 << 18;
+    rayon::join(
+        || {
+            (0..windows.div_ceil(CHUNK))
+                .into_par_iter()
+                .map(|c| {
+                    let mut b = [0u32; 128];
+                    let end = ((c + 1) * CHUNK).min(windows);
+                    for w in data[c * CHUNK..end + 4].windows(5) {
+                        bucket_window(&mut b, w);
+                    }
+                    b
+                })
+                .reduce(
+                    || [0u32; 128],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(b) {
+                            *x += y;
+                        }
+                        a
+                    },
+                )
+        },
+        || {
+            // Checksum: `c = b_mapping(c, w[0], w[1], 0)` per window,
+            // i.e. `c = V[h]` with `h = V[V[V[c] ^ w[0]] ^ w[1]]`. The
+            // chain runs on `h` instead, `h = V[V[VV[h] ^ w[0]] ^ w[1]]`
+            // (`VV = V[V[x]]`): three dependent lookups per byte, not four.
+            let vv: [u8; 256] = std::array::from_fn(|x| V_TABLE[V_TABLE[x] as usize]);
+            let step = |first: u8, a: u8, b: u8| V_TABLE[(V_TABLE[(first ^ a) as usize] ^ b) as usize];
+            let mut h = step(V_TABLE[0], data[0], data[1]);
+            for i in 1..windows {
+                h = step(vv[h as usize], data[i], data[i + 1]);
+            }
+            V_TABLE[h as usize]
+        },
+    )
+}
+
+/// Count the 6 bucket updates of one 5-byte window `p`.
+fn bucket_window(buckets: &mut [u32; 128], p: &[u8]) {
+    // The TLSH bucket-mapping function pairs the salts with
+    // specific byte positions to spread information across the
+    // sliding window. Mapping per the published spec.
+    let salts = [(2, p[0], p[1], p[2]),
+                 (3, p[0], p[1], p[3]),
+                 (5, p[0], p[2], p[3]),
+                 (7, p[0], p[2], p[4]),
+                 (11, p[0], p[1], p[4]),
+                 (13, p[0], p[3], p[4])];
+    for (salt, a, b, c) in salts {
+        let idx = b_mapping(salt, a, b, c);
+        buckets[(idx & 0x7F) as usize] += 1;
     }
-    (buckets, checksum)
 }
 
 /// Pearson hash with salt — see TLSH reference. Three inputs are
@@ -318,6 +356,28 @@ fn hex_nibble(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `build_buckets` as one serial pass, window by window.
+    fn build_buckets_naive(data: &[u8]) -> ([u32; 128], u8) {
+        let mut buckets = [0u32; 128];
+        let mut checksum: u8 = 0;
+        if data.len() < 5 {
+            return (buckets, checksum);
+        }
+        for w in data.windows(5) {
+            bucket_window(&mut buckets, w);
+            checksum = b_mapping(checksum, w[0], w[1], 0);
+        }
+        (buckets, checksum)
+    }
+
+    #[test]
+    fn buckets_match_serial_pass() {
+        for (len, seed) in [(5usize, 1u64), (6, 2), (777, 3), ((1 << 18) + 3, 4), ((1 << 19) + 4, 5), (3 << 18, 6)] {
+            let data = random_bytes(len, seed);
+            assert_eq!(build_buckets(&data), build_buckets_naive(&data), "len {len}");
+        }
+    }
 
     fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
         let mut s = seed;

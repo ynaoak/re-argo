@@ -38,6 +38,7 @@ use std::collections::BTreeSet;
 
 use reargo_arch::FlowType;
 use reargo_program::comments::CommentType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -73,23 +74,20 @@ impl Analyzer for PanicLikeAnalyzer {
             direct_call_count: usize,
             insn_count: usize,
         }
-        let snaps: Vec<FuncSnap> = program
-            .listing
-            .functions()
+        // Functions walked in parallel, kept in function order.
+        let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
+        let listing = &program.listing;
+        let snaps: Vec<FuncSnap> = funcs
+            .par_iter()
             .map(|f| {
                 let mut direct_call_count = 0usize;
                 let mut insn_count = 0usize;
-                for r in f.body.ranges() {
-                    for ins in program
-                        .listing
-                        .instructions_in_range(r.start.offset, r.start.offset + r.size)
-                    {
-                        insn_count += 1;
-                        if ins.flow_type == FlowType::Call {
-                            direct_call_count += 1;
-                        }
+                listing.for_each_body_instruction(&f.body, |_, ins| {
+                    insn_count += 1;
+                    if ins.flow_type == FlowType::Call {
+                        direct_call_count += 1;
                     }
-                }
+                });
                 FuncSnap {
                     entry: f.entry_point,
                     call_targets: f.call_targets.clone(),

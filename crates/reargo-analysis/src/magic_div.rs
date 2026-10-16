@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use iced_x86::{Decoder, DecoderOptions, Instruction as IcedInsn, Mnemonic, OpKind};
+use rayon::prelude::*;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
@@ -151,22 +152,22 @@ impl Analyzer for MagicDivisionAnalyzer {
             });
         }
 
-        let insns: Vec<(u64, Vec<u8>)> = program
-            .listing
-            .instructions()
-            .map(|i| (i.address, i.bytes.to_vec()))
+        // Decode in parallel against an immutable view; the hits keep
+        // listing order and are applied in that order.
+        let insns: Vec<&reargo_arch::DecodedInstruction> = program.listing.instructions().collect();
+        let hits: Vec<(u64, u32)> = insns
+            .par_iter()
+            .filter_map(|i| decode_magic_imul(i.address, &i.bytes).map(|d| (i.address, d)))
             .collect();
+        drop(insns);
 
         let mut annotated = 0usize;
-        for (addr, bytes) in &insns {
-            let Some(d) = decode_magic_imul(*addr, bytes) else {
-                continue;
-            };
-            if program.comments.get(*addr, CommentType::Eol).is_some() {
+        for &(addr, d) in &hits {
+            if program.comments.get(addr, CommentType::Eol).is_some() {
                 continue;
             }
             program.comments.set(
-                *addr,
+                addr,
                 CommentType::Eol,
                 format!("÷{} (division magic)", d),
             );
