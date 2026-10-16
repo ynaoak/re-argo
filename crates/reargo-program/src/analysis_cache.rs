@@ -29,6 +29,11 @@ impl AnalysisCache {
             .map(|b| *b)
     }
 
+    /// Whether a `T` is stored.
+    pub fn contains<T: Any + Send + Sync>(&self) -> bool {
+        self.slots.contains_key(&TypeId::of::<T>())
+    }
+
     /// Store `value`, replacing any `T` stored before.
     pub fn insert<T: Any + Send + Sync>(&mut self, value: T) {
         self.slots.insert(TypeId::of::<T>(), Box::new(value));
