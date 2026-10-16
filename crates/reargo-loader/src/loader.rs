@@ -136,21 +136,67 @@ pub struct BinaryLoader;
 /// does **not** appear in the on-disk bytes (the slot reads as zero; the
 /// value lives in the relocation addend). This lets tools find indirect /
 /// vtable references that a raw byte search or code-operand scan cannot see.
+/// An absolute relocation against a symbol the image defines itself
+/// (`R_X86_64_64` / `R_AARCH64_ABS64`) is such a pointer too (WS94): a shared
+/// library refers to its exported vtables, `type_info`s and functions that way.
+/// Sorted by slot.
 pub fn elf_pointer_relocations(data: &[u8]) -> Vec<(u64, u64)> {
-    const R_X86_64_RELATIVE: u32 = 8;
-    const R_AARCH64_RELATIVE: u32 = 1027;
     let Ok(elf) = goblin::elf::Elf::parse(data) else {
         return Vec::new();
     };
+    local_pointer_relocations(&elf, false)
+}
+
+/// [`elf_pointer_relocations`] of a parsed image; with `got`, also the GOT slots bound to a
+/// symbol the image defines (`GLOB_DAT` / `JUMP_SLOT`: a shared library calling its own
+/// exported function through its PLT).
+fn local_pointer_relocations(elf: &goblin::elf::Elf, got: bool) -> Vec<(u64, u64)> {
+    let relocs = elf.dynrelas.iter().chain(elf.pltrelocs.iter()).map(|r| {
+        let sym = elf.dynsyms.get(r.r_sym).map(|s| (s.st_value, s.st_shndx, goblin::elf::sym::st_type(s.st_info)));
+        (r.r_type, r.r_offset, r.r_addend, sym)
+    });
+    resolve_pointer_relocations(elf.header.e_machine, got, relocs)
+}
+
+/// The pointers relocations write (see [`local_pointer_relocations`]): `(type, slot, addend,
+/// symbol (value, section index, type))` -> `(slot, target)` sorted by slot.
+fn resolve_pointer_relocations(machine: u16, got: bool, relocs: impl Iterator<Item = (u32, u64, Option<i64>, Option<(u64, usize, u8)>)>) -> Vec<(u64, u64)> {
+    const R_X86_64_RELATIVE: u32 = 8;
+    const R_AARCH64_RELATIVE: u32 = 1027;
+    // absolute, then GLOB_DAT, JUMP_SLOT
+    let absolute: &[u32] = match (machine, got) {
+        (goblin::elf::header::EM_X86_64, false) => &[1],
+        (goblin::elf::header::EM_X86_64, true) => &[1, 6, 7],
+        (goblin::elf::header::EM_AARCH64, false) => &[257],
+        (goblin::elf::header::EM_AARCH64, true) => &[257, 1025, 1026],
+        _ => &[],
+    };
     let mut out = Vec::new();
-    for reloc in elf.dynrelas.iter().chain(elf.pltrelocs.iter()) {
-        if (reloc.r_type == R_X86_64_RELATIVE || reloc.r_type == R_AARCH64_RELATIVE)
-            && let Some(addend) = reloc.r_addend
+    for (ty, slot, addend, sym) in relocs {
+        if ty == R_X86_64_RELATIVE || ty == R_AARCH64_RELATIVE {
+            if let Some(a) = addend {
+                out.push((slot, a as u64));
+            }
+        } else if absolute.contains(&ty)
+            && let Some((value, shndx, st_type)) = sym
+            && shndx != 0
+            && value != 0
+            && st_type != goblin::elf::sym::STT_TLS
         {
-            out.push((reloc.r_offset, addend as u64));
+            out.push((slot, value.wrapping_add(addend.unwrap_or(0) as u64)));
         }
     }
+    out.sort_unstable();
+    out.dedup_by_key(|r| r.0);
     out
+}
+
+/// [`local_pointer_relocations`] (with the GOT slots) as the RELA table
+/// `Memory::dynamic_relocations` reads: every entry relative (`R_X86_64_RELATIVE`, or
+/// `R_AARCH64_RELATIVE` for an AArch64 image).
+fn relative_rela_table(elf: &goblin::elf::Elf) -> Vec<u8> {
+    let ty: u64 = if elf.header.e_machine == goblin::elf::header::EM_AARCH64 { 1027 } else { 8 };
+    local_pointer_relocations(elf, true).into_iter().flat_map(|(o, a)| [o.to_le_bytes(), ty.to_le_bytes(), a.to_le_bytes()].concat()).collect()
 }
 
 /// The functions an ELF exports (WS93): defined `STT_FUNC` / `STT_GNU_IFUNC` dynamic symbols
@@ -280,12 +326,9 @@ impl BinaryLoader {
 
             // the dynamic relocations of a 64-bit image, for reading the pointers a PIE's
             // loader writes (`Memory::dynamic_relocations`)
-            if sh.sh_type == goblin::elf::section_header::SHT_RELA
-                && name == ".rela.dyn"
-                && elf.is_64
-                && let Some(table) = data.get(sh.sh_offset as usize..(sh.sh_offset + sh.sh_size) as usize)
-            {
-                memory.set_dynamic_relocations(Arc::from(table));
+            // (WS94: relative, and absolute against a symbol the image defines, sorted)
+            if sh.sh_type == goblin::elf::section_header::SHT_RELA && name == ".rela.dyn" && elf.is_64 {
+                memory.set_dynamic_relocations(Arc::from(relative_rela_table(elf)));
             }
 
             if sh.sh_type == goblin::elf::section_header::SHT_PROGBITS
@@ -821,7 +864,7 @@ impl std::fmt::Display for SymbolKind {
 
 #[cfg(test)]
 mod reloc_tests {
-    use super::{elf_exported_functions, elf_pointer_relocations};
+    use super::{elf_exported_functions, elf_pointer_relocations, resolve_pointer_relocations};
 
     /// WS93: no exports in what is no ELF; a BDS-internal function (`REARGO_TEST_BDS`) is none.
     #[test]
@@ -830,6 +873,25 @@ mod reloc_tests {
         let Ok(path) = std::env::var("REARGO_TEST_BDS") else { return };
         let ex = elf_exported_functions(&std::fs::read(path).unwrap());
         assert!(!ex.contains(&0x4bd0820), "{} exports", ex.len());
+    }
+
+    /// WS94: relative relocations, and absolute (and GOT, when asked) ones against a symbol the
+    /// image defines (not an undefined one, not a thread-local one), sorted by slot.
+    #[test]
+    fn pointer_relocations_resolve_the_symbols_the_image_defines() {
+        use goblin::elf::{header::EM_X86_64, sym::{STT_FUNC, STT_OBJECT, STT_TLS}};
+        let relocs = vec![
+            (8u32, 0x3010u64, Some(0x1100i64), None),
+            (1, 0x3000, Some(0x10), Some((0x2000u64, 12usize, STT_OBJECT))), // a vtable + 0x10
+            (1, 0x3008, Some(0), Some((0, 0, STT_FUNC))),                     // an import
+            (7, 0x4000, Some(0), Some((0x1200, 11, STT_FUNC))),               // its own function's GOT slot
+            (6, 0x4008, Some(0), Some((0x80, 13, STT_TLS))),                  // thread-local
+            (5, 0x4010, Some(0), Some((0x1300, 11, STT_FUNC))),               // a copy relocation
+        ];
+        assert_eq!(resolve_pointer_relocations(EM_X86_64, true, relocs.clone().into_iter()), [(0x3000, 0x2010), (0x3010, 0x1100), (0x4000, 0x1200)]);
+        assert_eq!(resolve_pointer_relocations(EM_X86_64, false, relocs.into_iter()), [(0x3000, 0x2010), (0x3010, 0x1100)], "no GOT slots");
+        let relative_only = vec![(8u32, 0x3010u64, Some(0x1100i64), None), (1, 0x3000, Some(0x10), Some((0x2000u64, 12usize, STT_OBJECT)))];
+        assert_eq!(resolve_pointer_relocations(0, true, relative_only.into_iter()), [(0x3010, 0x1100)], "another machine");
     }
 
     #[test]
