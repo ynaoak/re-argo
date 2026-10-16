@@ -63,7 +63,7 @@ pub fn pointer_at(memory: &Memory, addr: u64) -> Option<u64> {
     memory.read_u64(addr).ok().filter(|&v| v != 0)
 }
 
-fn is_code(memory: &Memory, addr: u64) -> bool {
+pub(crate) fn is_code(memory: &Memory, addr: u64) -> bool {
     memory.find_block(addr).is_some_and(|b| b.flags.contains(MemoryFlags::EXECUTE))
 }
 
@@ -236,12 +236,12 @@ pub fn is_vtable_point(memory: &Memory, p: u64) -> bool {
 }
 
 /// The offset-to-top of the vtable at address point `p` (0 for a class's primary vtable).
-fn offset_to_top(memory: &Memory, p: u64) -> Option<i64> {
+pub(crate) fn offset_to_top(memory: &Memory, p: u64) -> Option<i64> {
     memory.read_u64(p.checked_sub(16)?).ok().map(|v| v as i64)
 }
 
 /// The mangled name a `type_info` points to (`13BiomeSource3d`).
-fn type_info_name(memory: &Memory, ti: u64) -> Option<String> {
+pub(crate) fn type_info_name(memory: &Memory, ti: u64) -> Option<String> {
     let name = pointer_at(memory, ti + 8)?;
     let mut s = Vec::new();
     for i in 0..512 {
@@ -278,7 +278,7 @@ pub fn slot_target(memory: &Memory, vt: u64, slot: u64) -> Option<u64> {
 /// The direct bases of the class whose `type_info` is at `ti`: `__si_class_type_info` has one
 /// pointer at `ti+16`, `__vmi_class_type_info` a count at `ti+20` and `{base, flags}` pairs
 /// from `ti+24`. A base must be a `type_info` (it names a mangled type).
-fn type_info_bases(memory: &Memory, ti: u64) -> Vec<u64> {
+pub(crate) fn type_info_bases(memory: &Memory, ti: u64) -> Vec<u64> {
     let is_ti = |b: u64| type_info_name(memory, b).is_some();
     if let Some(b) = pointer_at(memory, ti + 16) {
         return if is_ti(b) { vec![b] } else { Vec::new() };
