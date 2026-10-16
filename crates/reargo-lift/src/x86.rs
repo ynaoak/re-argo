@@ -390,18 +390,19 @@ impl InsnFacts {
         if base >= end {
             return Self { base: 0, end: 0, pages: Vec::new() };
         }
-        let n = ((end - base) >> FACT_PAGE_BITS) as usize + 1;
+        let n = ((end - 1) >> FACT_PAGE_BITS) as usize - (base >> FACT_PAGE_BITS) as usize + 1;
         Self { base, end, pages: (0..n).map(|_| std::sync::OnceLock::new()).collect() }
     }
 
-    fn cell(&self, addr: u64) -> Option<&std::sync::atomic::AtomicU16> {
+    /// The cells of the page `addr` is in (pages are aligned to their size), `None` outside
+    /// the table.
+    fn page(&self, addr: u64) -> Option<&[std::sync::atomic::AtomicU16]> {
         if addr < self.base || addr >= self.end {
             return None;
         }
-        let off = addr - self.base;
-        let page = self.pages[(off >> FACT_PAGE_BITS) as usize]
-            .get_or_init(|| (0..1usize << FACT_PAGE_BITS).map(|_| std::sync::atomic::AtomicU16::new(0)).collect());
-        Some(&page[(off & ((1 << FACT_PAGE_BITS) - 1)) as usize])
+        let k = ((addr >> FACT_PAGE_BITS) - (self.base >> FACT_PAGE_BITS)) as usize;
+        let page = self.pages.get(k)?.get_or_init(|| (0..1usize << FACT_PAGE_BITS).map(|_| std::sync::atomic::AtomicU16::new(0)).collect());
+        Some(page)
     }
 }
 
@@ -459,12 +460,22 @@ impl X86Lifter {
         use std::sync::atomic::Ordering;
         let fast = X86Lifter { is_64: self.is_64, parity: false };
         let mut addrs: Vec<u64> = Vec::with_capacity(count.min(4096));
-        let mut flags: Vec<u16> = Vec::with_capacity(count.min(4096));
-        let mut any = 0u16;
         let mut addr = start;
         let mut block = None;
+        // the page of cells `addr` is in (`page_base` its first address)
+        let mut page: &[std::sync::atomic::AtomicU16] = &[];
+        let mut page_base = 0u64;
+        // `parity_needed`, forward: whether the PF an instruction reads was written after the
+        // last instruction that ends its look back (the instructions of a walk are contiguous)
+        let check_pf = self.parity;
+        let mut pf_written = false;
         for _ in 0..count {
-            let cell = facts.cell(addr)?;
+            let off = addr.wrapping_sub(page_base);
+            if off >= page.len() as u64 {
+                page = facts.page(addr)?;
+                page_base = addr & !((1u64 << FACT_PAGE_BITS) - 1);
+            }
+            let cell = &page[(addr - page_base) as usize];
             let mut f = cell.load(Ordering::Relaxed);
             if f & FACT_KNOWN == 0 {
                 f = FACT_KNOWN
@@ -489,34 +500,21 @@ impl X86Lifter {
             if f & FACT_FAILED != 0 {
                 break;
             }
-            any |= f;
-            addrs.push(addr);
-            flags.push(f);
-            addr += u64::from(f & 0xf);
-        }
-        if any & FACT_X87 != 0 {
-            return None;
-        }
-        // `parity_needed` from the flags (the instructions of a linear walk are contiguous)
-        if self.parity && any & FACT_READS_PF != 0 {
-            for i in 0..flags.len() {
-                if flags[i] & FACT_READS_PF == 0 {
-                    continue;
-                }
-                let mut satisfied = false;
-                for j in (0..i).rev() {
-                    if flags[j] & FACT_WRITES_PF != 0 {
-                        satisfied = true;
-                        break;
-                    }
-                    if flags[j] & FACT_STOPS != 0 {
-                        break;
-                    }
-                }
-                if !satisfied {
+            if f & FACT_X87 != 0 {
+                return None;
+            }
+            if check_pf {
+                if f & FACT_READS_PF != 0 && !pf_written {
                     return None;
                 }
+                if f & FACT_WRITES_PF != 0 {
+                    pf_written = true;
+                } else if f & FACT_STOPS != 0 {
+                    pf_written = false;
+                }
             }
+            addrs.push(addr);
+            addr += u64::from(f & 0xf);
         }
         Some(addrs)
     }
