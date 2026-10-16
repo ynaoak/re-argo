@@ -140,18 +140,9 @@ impl Analyzer for SwitchTableOffsetAnalyzer {
         let candidates: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
         let mut refs_found = 0usize;
         for (from, to) in candidates {
-            let already = program
-                .references
-                .get_refs_from(from)
-                .iter()
-                .any(|r| r.to == to);
-            if already {
-                continue;
+            if program.references.add_unless(Reference::new(from, to, RefType::IndirectJump), |r| r.to == to) {
+                refs_found += 1;
             }
-            program
-                .references
-                .add(Reference::new(from, to, RefType::IndirectJump));
-            refs_found += 1;
         }
 
         Ok(AnalysisResult {

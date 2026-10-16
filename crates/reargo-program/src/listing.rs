@@ -78,7 +78,7 @@ impl Listing {
             for &(_, end) in &ranges[i..=j] {
                 let mut first = true;
                 while let Some((_, insn)) = it.next_if(|(a, _)| **a < end) {
-                    f(first, &**insn);
+                    f(first, insn);
                     first = false;
                 }
             }

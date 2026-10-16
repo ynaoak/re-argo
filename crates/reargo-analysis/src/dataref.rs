@@ -76,18 +76,9 @@ impl Analyzer for DataReferenceAnalyzer {
         // Phase 2: apply serially, deduplicating against existing refs.
         let mut refs_found = 0;
         for (addr, val) in candidates {
-            if program
-                .references
-                .get_refs_from(addr)
-                .iter()
-                .any(|r| r.to == val)
-            {
-                continue;
+            if program.references.add_unless(Reference::new(addr, val, RefType::DataRead), |r| r.to == val) {
+                refs_found += 1;
             }
-            program
-                .references
-                .add(Reference::new(addr, val, RefType::DataRead));
-            refs_found += 1;
         }
 
         Ok(AnalysisResult {

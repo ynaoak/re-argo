@@ -103,12 +103,11 @@ impl Analyzer for StringReferenceAnalyzer {
 
         // Snapshot per-instruction bytes once so the per-instruction
         // scan can run in parallel against an immutable view.
-        // `Instruction::bytes` is a `SmallVec<[u8; 16]>` -- cheap to
-        // clone when bytes fit inline.
-        let insn_snapshot: Vec<(u64, smallvec::SmallVec<[u8; 16]>)> = program
+        // (borrowed: the program does not change while it is read)
+        let insn_snapshot: Vec<(u64, &[u8])> = program
             .listing
             .instructions()
-            .map(|i| (i.address, i.bytes.clone()))
+            .map(|i| (i.address, &i.bytes[..]))
             .collect();
 
         // Phase 1: scan each instruction's bytes against the address
@@ -138,11 +137,9 @@ impl Analyzer for StringReferenceAnalyzer {
         let candidates: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
         let mut refs_found = 0;
         for (insn_addr, str_addr) in candidates {
-            if program.references.get_refs_from(insn_addr).iter().any(|r| r.to == str_addr) {
-                continue;
+            if program.references.add_unless(Reference::new(insn_addr, str_addr, RefType::DataRead), |r| r.to == str_addr) {
+                refs_found += 1;
             }
-            program.references.add(Reference::new(insn_addr, str_addr, RefType::DataRead));
-            refs_found += 1;
         }
 
         Ok(AnalysisResult {

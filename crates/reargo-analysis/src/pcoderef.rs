@@ -134,18 +134,9 @@ impl Analyzer for PcodeReferenceAnalyzer {
         // Phase 2 (serial): dedup against existing refs and apply.
         let mut refs_found = 0usize;
         for (from, to, kind) in candidates {
-            if program
-                .references
-                .get_refs_from(from)
-                .iter()
-                .any(|r| r.to == to && r.ref_type == kind)
-            {
-                continue;
+            if program.references.add_unless(Reference::new(from, to, kind), |r| r.to == to && r.ref_type == kind) {
+                refs_found += 1;
             }
-            program
-                .references
-                .add(Reference::new(from, to, kind));
-            refs_found += 1;
         }
 
         Ok(AnalysisResult {

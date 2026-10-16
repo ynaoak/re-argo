@@ -72,14 +72,16 @@ impl Analyzer for StringXrefAnnotator {
         // applied in edge order: the first edge of a site with no
         // comment yet sets it.
         let previews: Vec<(u64, String)> = edges
-                .par_iter()
-                .filter_map(|&(from, to)| {
-                    program.listing.get_instruction(from)?;
-                    let preview = read_c_string(program, to)?;
-                    let trimmed = truncate_preview(&preview, 48);
-                    Some((from, format!("\"{}\"", escape(&trimmed))))
-                })
-                .collect();
+            .par_iter()
+            .filter_map(|&(from, to)| {
+                // (most targets are no string: tested first, it saves
+                // the instruction lookup)
+                let preview = read_c_string(program, to)?;
+                program.listing.get_instruction(from)?;
+                let trimmed = truncate_preview(&preview, 48);
+                Some((from, format!("\"{}\"", escape(&trimmed))))
+            })
+            .collect();
         Box::new(previews)
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {

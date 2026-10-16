@@ -133,18 +133,9 @@ impl Analyzer for IndirectCallResolver {
         // Dedupe against existing references from each call site.
         let mut added = 0usize;
         for (from, to) in resolved {
-            let already = program
-                .references
-                .get_refs_from(from)
-                .iter()
-                .any(|r| r.to == to);
-            if already {
-                continue;
+            if program.references.add_unless(Reference::new(from, to, RefType::UnconditionalCall), |r| r.to == to) {
+                added += 1;
             }
-            program
-                .references
-                .add(Reference::new(from, to, RefType::UnconditionalCall));
-            added += 1;
         }
 
         Ok(AnalysisResult {

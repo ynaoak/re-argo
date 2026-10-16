@@ -145,6 +145,23 @@ impl ReferenceManager {
             .push(reference);
     }
 
+    /// Add `reference` unless a reference from its source already
+    /// satisfies `present` (as `get_refs_from(from).iter().any(present)`
+    /// then `add`, with one lookup of the source). Returns whether it
+    /// was added.
+    pub fn add_unless(&mut self, reference: Reference, present: impl Fn(&Reference) -> bool) -> bool {
+        let from = self.refs_from.entry(reference.from).or_default();
+        if from.iter().any(present) {
+            return false;
+        }
+        from.push(reference);
+        if reference.ref_type.is_jump() {
+            self.jumps.push(reference);
+        }
+        self.refs_to.entry(reference.to).or_default().push(reference);
+        true
+    }
+
     /// A mark for [`Self::jump_targets_since`]: the number of jump
     /// references (`RefType::is_jump`) added so far.
     pub fn jump_mark(&self) -> JumpMark {
