@@ -60,7 +60,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let mut work_queue: VecDeque<u64> = VecDeque::new();
-        let mut visited: FxHashSet<u64> = FxHashSet::default();
+        let mut visited = Visited::default();
         let mut functions_found = 0;
         let mut references_found = 0;
         let mut instructions_decoded = 0;
@@ -114,7 +114,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             if functions_found >= MAX_FUNCTIONS || instructions_decoded >= MAX_INSTRUCTIONS {
                 break;
             }
-            if visited.contains(&func_entry) {
+            if visited.contains(func_entry) {
                 continue;
             }
             // A pre-existing function with an empty body (added by
@@ -166,7 +166,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                     }
 
                     for call_target in &discovery.call_targets {
-                        if !visited.contains(call_target)
+                        if !visited.contains(*call_target)
                             && !program.listing.has_function(*call_target)
                         {
                             work_queue.push_back(*call_target);
@@ -186,6 +186,31 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
     }
 }
 
+/// The instruction addresses a discovery run visited: a bit per
+/// address in pages of [`PAGE`] addresses. A run visits addresses
+/// mostly in order, so this is much cheaper to probe than a hash set
+/// of addresses.
+#[derive(Default)]
+struct Visited {
+    pages: rustc_hash::FxHashMap<u64, Box<[u64; (PAGE / 64) as usize]>>,
+}
+
+/// Addresses per page of [`Visited`].
+const PAGE: u64 = 4096;
+
+impl Visited {
+    fn contains(&self, addr: u64) -> bool {
+        let bit = addr % PAGE;
+        self.pages.get(&(addr / PAGE)).is_some_and(|p| p[(bit / 64) as usize] & (1 << (bit % 64)) != 0)
+    }
+
+    fn insert(&mut self, addr: u64) {
+        let bit = addr % PAGE;
+        self.pages.entry(addr / PAGE).or_insert_with(|| Box::new([0; (PAGE / 64) as usize]))[(bit / 64) as usize] |=
+            1 << (bit % 64);
+    }
+}
+
 struct FunctionDiscovery {
     body: AddressSet,
     call_targets: BTreeSet<u64>,
@@ -196,7 +221,7 @@ struct FunctionDiscovery {
 fn disassemble_function(
     program: &mut Program,
     entry: u64,
-    global_visited: &mut FxHashSet<u64>,
+    global_visited: &mut Visited,
 ) -> Result<FunctionDiscovery, AnalysisError> {
     let mut block_queue: VecDeque<u64> = VecDeque::new();
     let mut block_visited: FxHashSet<u64> = FxHashSet::default();
@@ -219,7 +244,7 @@ fn disassemble_function(
         let max_insns = 10_000;
 
         for _ in 0..max_insns {
-            if global_visited.contains(&addr) && addr != block_start {
+            if global_visited.contains(addr) && addr != block_start {
                 break;
             }
 
