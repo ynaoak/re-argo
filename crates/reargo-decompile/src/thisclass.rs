@@ -709,6 +709,25 @@ impl ThisIndex {
         (l >= 2).then(|| self.vt(l - 2)).flatten()
     }
 
+    /// The fields and member objects of known class of the class whose primary vtable is `vt`
+    /// (its own and its bases'): `(offset, class vtable, member)` by offset.
+    pub fn class_fields(&self, vt: u64) -> Vec<(i32, u64, bool)> {
+        let Some(c) = self.class_of_vtable(vt) else { return Vec::new() };
+        let mut offs: Vec<(i32, bool)> = Vec::new();
+        for k in std::iter::once(c).chain(self.hierarchy.bases[c as usize].iter().copied()) {
+            offs.extend(self.fields.keys().filter(|f| f.0 == k).map(|f| (f.1, false)));
+            offs.extend(self.members.keys().filter(|f| f.0 == k).map(|f| (f.1, true)));
+        }
+        offs.sort_unstable();
+        offs.dedup();
+        offs.into_iter()
+            .filter_map(|(off, m)| {
+                let l = lookup(&self.hierarchy, if m { &self.members } else { &self.fields }, c, off);
+                Some((off, self.vt((l >= 2).then(|| l - 2)?)?, m))
+            })
+            .collect()
+    }
+
     /// The number of functions whose parameter `i` has a class from the callers.
     pub fn count_known(&self, i: usize) -> usize {
         self.params.values().filter(|p| p[i] != u32::MAX).count()
@@ -865,12 +884,79 @@ pub fn universe(mem: &Memory) -> Universe {
     Universe { hierarchy: hier, vt_points: vts.iter().map(|v| v.0).collect(), primary, listing, taken }
 }
 
+/// The classes known in a round, to evaluate the values of one function.
+struct Ctx<'a> {
+    h: &'a Hierarchy,
+    starts: &'a [u64],
+    sums: &'a [Summary],
+    evidence: &'a [FxHashMap<(Src, i32), u32>],
+    p: &'a [[u32; 6]],
+    r: &'a [u32],
+    fields: &'a FxHashMap<(u32, i32), u32>,
+    members: &'a FxHashMap<(u32, i32), u32>,
+}
+
+impl Ctx<'_> {
+    fn fidx(&self, a: u64) -> Option<usize> {
+        self.starts.binary_search(&a).ok()
+    }
+
+    /// The class of the object `src` points to in function `k` (`ld`: of its loaded values).
+    fn base(&self, k: usize, src: Src, ld: &[u32]) -> u32 {
+        let ev = &self.evidence[k];
+        match src {
+            Src::Arg(i) => self.p[k][i as usize],
+            Src::Stack => TOP,
+            Src::Ret(c) => ev.get(&(src, 0)).copied().unwrap_or_else(|| match self.fidx(self.sums[k].call_targets[c as usize]) {
+                Some(t) => self.r[t],
+                None => TOP,
+            }),
+            Src::Ld(l) => ev.get(&(src, 0)).copied().unwrap_or(ld[l as usize]),
+        }
+    }
+
+    /// The class of the object at `src + off` (a member object when `off` is not 0).
+    fn value(&self, k: usize, src: Src, off: i32, ld: &[u32]) -> u32 {
+        if src == Src::Stack {
+            return self.evidence[k].get(&(Src::Stack, off)).copied().unwrap_or(TOP);
+        }
+        let b = self.base(k, src, ld);
+        if off == 0 || b < 2 {
+            return b;
+        }
+        match lookup(self.h, self.members, b - 2, off) {
+            BOT => TOP,
+            m => m,
+        }
+    }
+
+    /// The classes of the values function `k` loads (a field's class by its container's).
+    fn loads(&self, k: usize) -> Vec<u32> {
+        let s = &self.sums[k];
+        let mut ld = vec![BOT; s.loads.len()];
+        for l in 0..s.loads.len() {
+            let (src, off) = s.loads[l];
+            let c = self.base(k, src, &ld);
+            ld[l] = if c >= 2 {
+                match lookup(self.h, self.fields, c - 2, off) {
+                    BOT => TOP,
+                    v => v,
+                }
+            } else {
+                c
+            };
+        }
+        ld
+    }
+}
+
 /// What one function contributes in a round: `(callee, parameter, class)`, its return class,
 /// field classes and member classes by `(container class, offset)`.
 type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>);
 
-/// The propagation over the summaries of the functions `starts` (address order).
-pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], max_rounds: usize) -> ThisIndex {
+/// The propagation over the summaries of the functions `starts` (address order); `external`
+/// functions (exported) may be called with anything.
+pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSet<u64>, max_rounds: usize) -> ThisIndex {
     let h = &u.hierarchy;
     let n = starts.len();
     let fidx = |a: u64| starts.binary_search(&a).ok();
@@ -911,7 +997,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], max_rounds: usize) 
                 seed[k][this] = common.map_or(TOP, cls);
             }
         }
-        if listed || u.taken.contains(&f) || taken[k] || !has_callers[k] {
+        if listed || u.taken.contains(&f) || taken[k] || !has_callers[k] || external.contains(&f) {
             for i in 0..6 {
                 if !fixed[k][i] {
                     fixed[k][i] = true;
@@ -987,44 +1073,10 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], max_rounds: usize) 
             .into_par_iter()
             .map(|k| {
                 let s = &sums[k];
-                let ev = &evidence[k];
-                let mut ld = vec![BOT; s.loads.len()];
-                let base = |src: Src, ld: &[u32]| -> u32 {
-                    match src {
-                        Src::Arg(i) => p[k][i as usize],
-                        Src::Stack => TOP,
-                        Src::Ret(c) => ev.get(&(src, 0)).copied().unwrap_or_else(|| match fidx(s.call_targets[c as usize]) {
-                            Some(t) => r[t],
-                            None => TOP,
-                        }),
-                        Src::Ld(l) => ev.get(&(src, 0)).copied().unwrap_or(ld[l as usize]),
-                    }
-                };
-                let value = |src: Src, off: i32, ld: &[u32]| -> u32 {
-                    if src == Src::Stack {
-                        return ev.get(&(Src::Stack, off)).copied().unwrap_or(TOP);
-                    }
-                    let b = base(src, ld);
-                    if off == 0 || b < 2 {
-                        return b;
-                    }
-                    match lookup(h, &members, b - 2, off) {
-                        BOT => TOP,
-                        m => m,
-                    }
-                };
-                for l in 0..s.loads.len() {
-                    let (src, off) = s.loads[l];
-                    let c = base(src, &ld);
-                    ld[l] = if c >= 2 {
-                        match lookup(h, &fields, c - 2, off) {
-                            BOT => TOP,
-                            v => v,
-                        }
-                    } else {
-                        c
-                    };
-                }
+                let cx = Ctx { h, starts, sums, evidence: &evidence, p: &p, r: &r, fields: &fields, members: &members };
+                let ld = cx.loads(k);
+                let value = |src: Src, off: i32, ld: &[u32]| cx.value(k, src, off, ld);
+                let base = |src: Src, ld: &[u32]| cx.base(k, src, ld);
                 let mut contrib = Vec::new();
                 for &(c, j, src, off) in &s.args {
                     let Some(t) = fidx(s.call_targets[c as usize]) else { continue };
@@ -1093,52 +1145,44 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], max_rounds: usize) 
         }
     }
 
-    if std::env::var_os("REARGO_THIS_DEBUG").is_some() {
-        let (mut free, mut bot, mut top, mut known, mut st0, mut fixed_top, mut fixed_cls) = (0, 0, 0, 0, 0, 0, 0);
-        for k in 0..n {
-            if fixed[k][0] {
-                if seed[k][0] >= 2 { fixed_cls += 1 } else { fixed_top += 1 }
+    // (development: `REARGO_THIS_EXPLAIN=0x…,0x…` prints why `this` of those functions is what it is)
+    if let Some(list) = std::env::var_os("REARGO_THIS_EXPLAIN") {
+        let cx = Ctx { h, starts, sums, evidence: &evidence, p: &p, r: &r, fields: &fields, members: &members };
+        let show = |v: u32| match v {
+            BOT => "nothing".to_string(),
+            TOP => "unknown".to_string(),
+            c => format!("class vtable 0x{:x}", h.vtables[(c - 2) as usize]),
+        };
+        for t in list.to_string_lossy().split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()) {
+            let Some(ti) = fidx(t) else {
+                eprintln!("[explain] 0x{t:x}: no function");
                 continue;
-            }
-            free += 1;
-            match p[k][0] {
-                BOT => bot += 1,
-                TOP => {
-                    top += 1;
-                    if static_top[k] & 1 != 0 {
-                        st0 += 1;
+            };
+            eprintln!(
+                "[explain] 0x{t:x}: this = {} (fixed {}, listed {}, taken {}, callers {}, a caller passes no pointer {})",
+                show(p[ti][0]),
+                fixed[ti][0],
+                u.listing.contains_key(&t),
+                u.taken.contains(&t) || taken[ti] || external.contains(&t),
+                has_callers[ti],
+                static_top[ti] & 1 != 0
+            );
+            for (k, s) in sums.iter().enumerate() {
+                if s.top_args.iter().any(|&(x, m)| x == t && m & 1 != 0) {
+                    eprintln!("[explain]   0x{:x} passes no pointer", starts[k]);
+                }
+                let ld = cx.loads(k);
+                for &(c, j, src, off) in &s.args {
+                    if j == 0 && s.call_targets[c as usize] == t {
+                        let detail = match src {
+                            Src::Ld(l) => format!("{:?}", s.loads[l as usize]),
+                            _ => String::new(),
+                        };
+                        eprintln!("[explain]   0x{:x} passes {src:?}+{off:#x} {detail}: {}", starts[k], show(cx.value(k, src, off, &ld)));
                     }
                 }
-                _ => known += 1,
             }
         }
-        eprintln!("[this-index] this: fixed class {fixed_cls}, fixed unknown {fixed_top}; from callers {free}: class {known}, unknown {top} (a caller passes no pointer: {st0}), nothing {bot}");
-        // why: the sources of the unknown contributions to `this`
-        let mut why: FxHashMap<&'static str, usize> = FxHashMap::default();
-        for (k, s) in sums.iter().enumerate() {
-            for &(c, j, src, off) in &s.args {
-                if j != 0 {
-                    continue;
-                }
-                let Some(t) = fidx(s.call_targets[c as usize]) else { continue };
-                if fixed[t][0] || p[t][0] != TOP {
-                    continue;
-                }
-                let kind = match src {
-                    Src::Arg(i) if off == 0 => if p[k][i as usize] == TOP { "arg (unknown)" } else { "arg (known)" },
-                    Src::Arg(_) => "arg + k (member)",
-                    Src::Stack => "stack object",
-                    Src::Ret(_) if off == 0 => "call result",
-                    Src::Ret(_) => "call result + k",
-                    Src::Ld(_) if off == 0 => "loaded field",
-                    Src::Ld(_) => "loaded field + k",
-                };
-                *why.entry(kind).or_default() += 1;
-            }
-        }
-        let mut w: Vec<_> = why.into_iter().collect();
-        w.sort_by_key(|e| std::cmp::Reverse(e.1));
-        eprintln!("[this-index] pointer args to an unknown `this`: {w:?}");
     }
     let mut idx = ThisIndex { hierarchy: h.clone(), ..Default::default() };
     for k in 0..n {
@@ -1162,8 +1206,9 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], max_rounds: usize) 
     idx
 }
 
-/// The index of the functions `[start, start + len)` of `mem`.
-pub fn build(mem: &Memory, functions: &[(u64, u64)]) -> ThisIndex {
+/// The index of the functions `[start, start + len)` of `mem`; `external` are the functions
+/// another module may call (exported).
+pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIndex {
     let t0 = std::time::Instant::now();
     let u = universe(mem);
     let mut fs: Vec<(u64, u64)> = functions.to_vec();
@@ -1172,7 +1217,7 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)]) -> ThisIndex {
     let sums: Vec<Summary> = fs.par_iter().map(|&(s, l)| summarize(mem, s, l, &u.vt_points)).collect();
     let t1 = std::time::Instant::now();
     let starts: Vec<u64> = fs.iter().map(|f| f.0).collect();
-    let mut idx = solve(&u, &starts, &sums, MAX_ROUNDS);
+    let mut idx = solve(&u, &starts, &sums, &external.iter().copied().collect(), MAX_ROUNDS);
     idx.stats.summarize_ms = (t1 - t0).as_millis() as u64;
     idx.stats.solve_ms = t1.elapsed().as_millis() as u64;
     idx
@@ -1180,7 +1225,7 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)]) -> ThisIndex {
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 1;
+const INDEX_VERSION: u8 = 2;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -1343,7 +1388,8 @@ pub fn load_or_build(binary: &std::path::Path, mem: &Memory, hdr: Option<u64>, r
     if functions.is_empty() {
         return None;
     }
-    let idx = build(mem, &functions);
+    let external = std::fs::read(binary).map(|d| reargo_loader::elf_exported_functions(&d)).unwrap_or_default();
+    let idx = build(mem, &functions, &external);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));

@@ -18,6 +18,6 @@ pub mod symbols;
 pub use error::LoaderError;
 pub use ehframe::{elf_eh_frame_function, fde_function, fde_functions, landing_pads, CallSite, EhAction};
 pub use dwarf::{DwarfInfo, DwarfFunctionInfo};
-pub use loader::{elf_pointer_relocations, Architecture, BinaryFormat, BinaryInfo, BinaryLoader, DynamicInfo, ImportEntry, LoadSymbol, Section, SectionFlags, SymbolKind};
+pub use loader::{elf_exported_functions, elf_pointer_relocations, Architecture, BinaryFormat, BinaryInfo, BinaryLoader, DynamicInfo, ImportEntry, LoadSymbol, Section, SectionFlags, SymbolKind};
 pub use imports::{ImportExportTable, ImportedFunction, ExportedFunction};
 pub use memory::{Memory, MemoryBlock, MemoryFlags};
