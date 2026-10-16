@@ -98,50 +98,37 @@ impl Analyzer for LinearSweepAnalyzer {
             .map(|s| (s.address, s.address + s.size))
             .collect();
 
-        let lifter: Box<dyn PcodeLift> = Box::new(reargo_lift::x86::X86Lifter::new_64().without_parity());
+        let lifter = reargo_lift::x86::X86Lifter::new_64().without_parity();
         let mut new_functions: Vec<(u64, u64)> = Vec::new();
         let mut visited: BTreeSet<u64> = BTreeSet::new();
-        // What lifting each address gave (the lift is a pure function of
-        // the bytes): candidates in one uncovered stretch walk the same
-        // instructions.
-        let mut lifts: Lifts = Lifts::default();
-
-        for (sec_start, sec_end) in &exec_sections {
-            let mut addr = (*sec_start + 15) & !15;
-            while addr + 8 < *sec_end {
-                // Skip when EITHER the address is already inside a
-                // known function body OR we've already tried it this
-                // run. The previous form used `&&` AND short-circuited
-                // past `visited.insert` for the dominant case, so
-                // `visited` never populated and we re-walked every
-                // address.
-                if covered.contains(addr) || !visited.insert(addr) {
-                    addr += 16;
-                    continue;
-                }
-                // Pull 16 bytes to test against the prologue dict.
-                let mut probe = [0u8; 16];
-                if program.info.memory.read_bytes(addr, &mut probe).is_err() {
-                    addr += 16;
-                    continue;
-                }
-                if !looks_like_prologue(&probe) {
-                    addr += 16;
-                    continue;
-                }
-                // Speculatively lift up to 256 insns. Accept the
-                // candidate iff the lift reaches a Return / IndirectJump
-                // and doesn't overlap existing functions. On accept,
-                // record the lifted range so subsequent 16-byte-aligned
-                // candidates inside the newly-found body get skipped
-                // by the next iteration's `is_inside_function_body`
-                // check (and not re-validated).
-                if let Some(end) = validate_candidate_with_extent(&*lifter, program, addr, &covered, &mut lifts)
-                {
-                    new_functions.push((addr, end));
-                    covered.insert(addr, end);
-                }
-                addr += 16;
+        // The candidates the sweep can try and what validating each
+        // finds when nothing it looks at is covered, computed ahead in
+        // parallel (see [`Candidate`]).
+        let candidates = candidates(program, &lifter, &exec_sections, &covered);
+        // Every 16-byte boundary of the executable sections in order;
+        // those that are no candidate are skipped here whatever happens
+        // (covered before the sweep, or no prologue).
+        for candidate in &candidates {
+            let addr = candidate.entry;
+            // Skip when EITHER the address is already inside a
+            // known function body OR we've already tried it this
+            // run. The previous form used `&&` AND short-circuited
+            // past `visited.insert` for the dominant case, so
+            // `visited` never populated and we re-walked every
+            // address.
+            if covered.contains(addr) || !visited.insert(addr) {
+                continue;
+            }
+            // Speculatively lift up to 256 insns. Accept the
+            // candidate iff the lift reaches a Return / IndirectJump
+            // and doesn't overlap existing functions. On accept,
+            // record the lifted range so subsequent 16-byte-aligned
+            // candidates inside the newly-found body get skipped
+            // by the next iteration's `is_inside_function_body`
+            // check (and not re-validated).
+            if let Some(end) = candidate.validate(&covered) {
+                new_functions.push((addr, end));
+                covered.insert(addr, end);
             }
         }
 
@@ -281,10 +268,124 @@ fn looks_like_prologue(bytes: &[u8]) -> bool {
 /// this back into `covered` so adjacent candidates inside the
 /// just-discovered body get skipped without re-lifting.
 /// The lift of each address [`validate_candidate_with_extent`] looked at:
-/// the instruction's length and whether its P-code ends the flow
-/// (`Return` / `BranchInd`), or `None` when it does not lift.
+/// the instruction's length and whether it ends the flow (its P-code
+/// has a `Return` / `BranchInd`, or the listing has a returning or
+/// indirect-flow instruction there), or `None` when it does not lift.
 type Lifts = rustc_hash::FxHashMap<u64, Option<(u32, bool)>>;
 
+/// A 16-byte boundary of an executable section, outside the bodies
+/// known before the sweep, starting with a prologue: a candidate the
+/// sweep may try.
+struct Candidate {
+    entry: u64,
+    /// The addresses [`validate_candidate_with_extent`] checks against
+    /// the covered bodies (in order; it rejects the candidate at the
+    /// first covered one) ...
+    checked: Vec<u64>,
+    /// ... and its answer when none is covered.
+    end: Option<u64>,
+}
+
+impl Candidate {
+    /// [`validate_candidate_with_extent`] of the candidate with the
+    /// bodies `covered`.
+    fn validate(&self, covered: &Covered) -> Option<u64> {
+        if self.checked.iter().any(|&a| covered.contains(a)) { None } else { self.end }
+    }
+}
+
+/// Every [`Candidate`] of the executable sections, in the sweep's
+/// order, with its walk computed in parallel. The walk is a pure
+/// function of the bytes and the listing (which the sweep does not
+/// change); only the covered bodies, which grow as it goes, are left
+/// to the sweep.
+fn candidates(
+    program: &Program,
+    lifter: &reargo_lift::x86::X86Lifter,
+    exec_sections: &[(u64, u64)],
+    covered: &Covered,
+) -> Vec<Candidate> {
+    use rayon::prelude::*;
+    let mut entries: Vec<u64> = Vec::new();
+    for &(sec_start, sec_end) in exec_sections {
+        let mut addr = (sec_start + 15) & !15;
+        while addr + 8 < sec_end {
+            // Pull 16 bytes to test against the prologue dict.
+            let mut probe = [0u8; 16];
+            if !covered.contains(addr)
+                && program.info.memory.read_bytes(addr, &mut probe).is_ok()
+                && looks_like_prologue(&probe)
+            {
+                entries.push(addr);
+            }
+            addr += 16;
+        }
+    }
+    entries
+        .par_chunks(64)
+        .map(|chunk| {
+            // neighbouring candidates walk the same instructions
+            let mut lifts = Lifts::default();
+            chunk
+                .iter()
+                .map(|&entry| walk_candidate(lifter, program, entry, &mut lifts))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<Vec<Candidate>>>()
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The [`Candidate`] at `entry`: [`validate_candidate_with_extent`]
+/// with the covered checks left out.
+fn walk_candidate(lifter: &dyn PcodeLift, program: &Program, entry: u64, lifts: &mut Lifts) -> Candidate {
+    let mut checked = Vec::new();
+    let mut count = 0usize;
+    let mut addr = entry;
+    let mut end: Option<u64> = None;
+    while count < VALIDATE_BUDGET {
+        let Some((length, terminates)) = lift_at(lifter, program, addr, lifts) else { break };
+        count += 1;
+        let next = addr + length as u64;
+        if end.is_none() {
+            checked.push(addr);
+            if terminates {
+                end = Some(next);
+            }
+        }
+        if end.is_some() && count >= 3 {
+            break;
+        }
+        addr = next;
+    }
+    Candidate { entry, checked, end: if count < 3 { None } else { end } }
+}
+
+/// Instructions [`validate_candidate_with_extent`] lifts at most.
+const VALIDATE_BUDGET: usize = 256;
+
+/// The lift of `addr` for [`Lifts`], from `lifts` or lifted now.
+fn lift_at(lifter: &dyn PcodeLift, program: &Program, addr: u64, lifts: &mut Lifts) -> Option<(u32, bool)> {
+    *lifts.entry(addr).or_insert_with(|| {
+        lifter.lift_instruction(&program.info.memory, addr).ok().map(|insn| {
+            // Look at the underlying `DecodedInstruction.flow_type` via
+            // the listing if the address is decoded, else inspect
+            // the P-code op to detect a Return. The lifter's
+            // `LiftedInstruction` carries the raw bytes + ops but not
+            // the high-level flow_type, so we check op opcode directly.
+            let pcode_terminates = insn.ops.iter().any(|op| {
+                matches!(op.opcode, reargo_core::pcode::OpCode::Return | reargo_core::pcode::OpCode::BranchInd)
+            });
+            let flow_terminates = program.listing.get_instruction(addr).is_some_and(|m| {
+                matches!(m.flow_type, FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall)
+            });
+            (insn.length, pcode_terminates || flow_terminates)
+        })
+    })
+}
+
+#[cfg(test)]
 fn validate_candidate_with_extent(
     lifter: &dyn PcodeLift,
     program: &Program,
@@ -298,29 +399,13 @@ fn validate_candidate_with_extent(
     // range-wide passes of `lift_range` (the integer PF, the x87
     // stack): they only add or change ops of non-terminators. So lift
     // one instruction at a time and stop as soon as the answer is known.
-    const BUDGET: usize = 256;
-    let memory = &program.info.memory;
+    const BUDGET: usize = VALIDATE_BUDGET;
     let mut count = 0usize;
     let mut addr = entry;
     let mut end: Option<u64> = None;
     while count < BUDGET {
-        let lifted = *lifts.entry(addr).or_insert_with(|| {
-            lifter.lift_instruction(memory, addr).ok().map(|insn| {
-                // Look at the underlying `DecodedInstruction.flow_type` via
-                // the listing if the address is decoded (below), else inspect
-                // the P-code op to detect a Return. The lifter's
-                // `LiftedInstruction` carries the raw bytes + ops but not
-                // the high-level flow_type, so we check op opcode directly.
-                let pcode_terminates = insn.ops.iter().any(|op| {
-                    matches!(
-                        op.opcode,
-                        reargo_core::pcode::OpCode::Return | reargo_core::pcode::OpCode::BranchInd
-                    )
-                });
-                (insn.length, pcode_terminates)
-            })
-        });
-        let Some((length, pcode_terminates)) = lifted else { break };
+        let lifted = lift_at(lifter, program, addr, lifts);
+        let Some((length, terminates)) = lifted else { break };
         count += 1;
         let next = addr + length as u64;
         if end.is_none() {
@@ -328,16 +413,7 @@ fn validate_candidate_with_extent(
                 // Rejected unless the range is too short anyway — `None` both ways.
                 return None;
             }
-            let flow_terminates = program
-                .listing
-                .get_instruction(addr)
-                .is_some_and(|m| {
-                    matches!(
-                        m.flow_type,
-                        FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall
-                    )
-                });
-            if pcode_terminates || flow_terminates {
+            if terminates {
                 end = Some(next);
             }
         }
@@ -466,6 +542,44 @@ mod tests {
                 assert_eq!(c.contains(a), naive(&raw, a), "addr {a:#x} after {s:#x}..{e:#x}");
             }
         }
+    }
+
+    /// The walk computed ahead answers as the validation does, for any
+    /// covered bodies.
+    #[test]
+    fn candidate_walk_matches_validation() {
+        use crate::testutil::helpers::make_x86_64_program;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        // short instructions: push / pop / xor / mov / ret / jmp rax
+        let pieces: [&[u8]; 7] = [&[0x55], &[0x53], &[0x5d], &[0x31, 0xc0], &[0x48, 0x89, 0xe5], &[0xc3], &[0xff, 0xe0]];
+        let mut code = Vec::new();
+        while code.len() < 400 {
+            code.extend_from_slice(pieces[(next() as usize) % pieces.len()]);
+        }
+        let base = 0x1000u64;
+        let program = make_x86_64_program(&code, base);
+        let lifter = reargo_lift::x86::X86Lifter::new_64().without_parity();
+        let mut accepted = 0;
+        for round in 0..300 {
+            let ranges: Vec<(u64, u64)> = (0..next() % 4)
+                .map(|_| {
+                    let s = base + u64::from(next() % 400);
+                    (s, s + u64::from(next() % 40))
+                })
+                .collect();
+            let covered = Covered::from_ranges(ranges);
+            let entry = base + u64::from(next() % 380);
+            let walk = walk_candidate(&lifter, &program, entry, &mut Lifts::default());
+            let want = validate_candidate_with_extent(&lifter, &program, entry, &covered, &mut Lifts::default());
+            assert_eq!(walk.validate(&covered), want, "round {round} entry {entry:#x}");
+            accepted += usize::from(want.is_some());
+        }
+        assert!(accepted > 20, "{accepted}");
     }
 
     /// Synthesise a tiny ELF-shaped Program with a single
