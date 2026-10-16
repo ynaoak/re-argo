@@ -90,6 +90,33 @@ pub fn resolve_call_sites(
     resolve_inner(lifter, program, &ParamSummaries::default())
 }
 
+/// [`resolve_call_sites`] restricted to the functions whose entry is in
+/// `entries`. A call site is recorded only by the function owning it
+/// and a walk reads only its own lift, so the result is exactly the
+/// sites of [`resolve_call_sites`] owned by those functions, in the
+/// same order.
+pub fn resolve_call_sites_in(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    entries: &rustc_hash::FxHashSet<u64>,
+) -> Result<Vec<CallSite>, AnalysisError> {
+    if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+        return Ok(Vec::new());
+    }
+    let summaries = ParamSummaries::default();
+    let per_func: Vec<Option<Vec<CallSite>>> = function_jobs(program)
+        .into_iter()
+        .filter(|(entry, _)| entries.contains(entry))
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|&(entry, max)| {
+            let insns = lift_function(lifter, program, entry, max)?;
+            Some(walk_function(program, entry, &insns, &summaries))
+        })
+        .collect();
+    Ok(dedup_sites(per_func.iter().flatten().map(Vec::as_slice)))
+}
+
 /// Per-function summary of values its parameter registers have ever
 /// been called with. Indexed by argument position 0..5 in
 /// calling-convention order (RDI, RSI, RDX, RCX, R8, R9 for SysV).
