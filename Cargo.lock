@@ -605,6 +605,7 @@ dependencies = [
  "bincode",
  "blake3",
  "clap",
+ "libmimalloc-sys",
  "mimalloc",
  "reargo-analysis",
  "reargo-arch",

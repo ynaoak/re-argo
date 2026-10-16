@@ -26,6 +26,7 @@ bincode = { workspace = true }
 blake3 = { workspace = true }
 zstd = { workspace = true }
 mimalloc = { workspace = true }
+libmimalloc-sys = { workspace = true }
 
 [dev-dependencies]
 reargo-sleigh = { workspace = true }

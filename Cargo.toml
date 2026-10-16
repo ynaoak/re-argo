@@ -53,6 +53,7 @@ bincode = "1.3"
 blake3 = "1"
 zstd = "0.13"
 mimalloc = { version = "0.1", default-features = false, features = ["no_thp"] }
+libmimalloc-sys = { version = "0.1.49", default-features = false }
 
 [profile.release]
 lto = "fat"
