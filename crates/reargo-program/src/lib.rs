@@ -1,3 +1,4 @@
+pub mod analysis_cache;
 pub mod comments;
 pub mod diff;
 pub mod export;

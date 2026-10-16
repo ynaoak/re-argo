@@ -29,7 +29,6 @@ use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
-use crate::callsite::resolve_call_sites;
 
 pub struct FormatVarargsAnalyzer;
 
@@ -56,7 +55,10 @@ impl Analyzer for FormatVarargsAnalyzer {
         }
 
         let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
-        let sites = resolve_call_sites(&*lifter, program)?;
+        // The round-0 call sites, reusing the walks the Call Site
+        // Annotator (750) left for the functions unchanged since. The
+        // last reader: the shared results are dropped here.
+        let sites = crate::shared_lift::compute(&*lifter, program, false).round0_sites();
 
         let mut per_callee_max: BTreeMap<String, usize> = BTreeMap::new();
         let mut emitted = 0usize;
