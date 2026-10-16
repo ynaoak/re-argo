@@ -195,6 +195,43 @@ const READS_PF: u8 = 2;
 /// The lift failed.
 const FAILED: u8 = 4;
 
+/// An iced decoder over the bytes of one memory block, for the
+/// instructions a range walk lifts there ([`X86Lifter::decode_in_block`]).
+struct BlockDecoder<'m> {
+    /// The block's start and size.
+    start: u64,
+    size: u64,
+    /// The addresses below `start + end` read from this block
+    /// ([`Memory::find_block`]: no other block starts before it).
+    end: u64,
+    /// Bytes of the block's data the decoder reads (`min(size, data)`).
+    limit: u64,
+    decoder: iced_x86::Decoder<'m>,
+}
+
+impl<'m> BlockDecoder<'m> {
+    /// A decoder over the block `address` reads from, when it has data.
+    fn new(memory: &'m Memory, address: u64, bitness: u32) -> Option<Self> {
+        let block = memory.find_block(address)?;
+        let data = block.data.as_ref()?;
+        let next = memory.blocks().map(|b| b.start).filter(|&s| s > block.start).min();
+        let end = next.map_or(block.size, |n| (n - block.start).min(block.size));
+        let limit = block.size.min(data.len() as u64);
+        let decoder = iced_x86::Decoder::try_with_ip(
+            bitness,
+            &data[..usize::try_from(limit).ok()?],
+            block.start,
+            iced_x86::DecoderOptions::NONE,
+        )
+        .ok()?;
+        Some(Self { start: block.start, size: block.size, end, limit, decoder })
+    }
+
+    fn holds(&self, address: u64) -> bool {
+        address >= self.start && address - self.start < self.end
+    }
+}
+
 /// Instructions a [`LiftCache`] makes room for at once.
 const CACHE_RESERVE: usize = 2048;
 
@@ -276,15 +313,22 @@ impl LiftCache {
         idxs.iter().map(|&i| self.lifted[i as usize].as_ref().expect("lifted")).collect()
     }
 
-    /// The index of `addr`, lifting it (with `fast`) when not cached.
-    fn index_of(&mut self, fast: &X86Lifter, memory: &Memory, addr: u64) -> u32 {
+    /// The index of `addr`, lifting it (with `fast`, decoding through
+    /// `block`) when not cached.
+    fn index_of<'m>(
+        &mut self,
+        fast: &X86Lifter,
+        memory: &'m Memory,
+        addr: u64,
+        block: &mut Option<BlockDecoder<'m>>,
+    ) -> u32 {
         if let Some(&i) = self.map.get(&addr) {
             return i;
         }
         if self.lifted.len() == self.lifted.capacity() {
             self.reserve(self.lifted.len());
         }
-        let lifted = fast.lift_instruction(memory, addr).ok();
+        let lifted = fast.decode_in_block(memory, addr, block).and_then(|insn| fast.lift_decoded(insn, addr, None)).ok();
         let (flags, len, shape) = match &lifted {
             Some(insn) => {
                 let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
@@ -371,11 +415,12 @@ impl X86Lifter {
         let mut any = 0u8;
         // the index of the previous instruction of the range
         let mut prev: Option<u32> = None;
+        let mut block = None;
         for _ in 0..count {
             let i = match prev.map(|p| cache.next[p as usize]) {
                 Some(i) if i != NO_NEXT => i,
                 _ => {
-                    let i = cache.index_of(&fast, memory, addr);
+                    let i = cache.index_of(&fast, memory, addr, &mut block);
                     if let Some(p) = prev {
                         cache.next[p as usize] = i;
                     }
@@ -2537,6 +2582,13 @@ impl X86Lifter {
         address: u64,
         x87: Option<X87Ctx>,
     ) -> Result<(LiftedInstruction, iced_x86::Instruction), LiftError> {
+        let insn = self.decode_one(memory, address)?;
+        Ok((self.lift_decoded(insn, address, x87)?, insn))
+    }
+
+    /// The instruction at `address`, decoded from the (up to 15) bytes
+    /// [`Memory::read_instruction_bytes`] reads there.
+    fn decode_one(&self, memory: &Memory, address: u64) -> Result<iced_x86::Instruction, LiftError> {
         let mut buf = [0u8; 15];
         let read_len = memory.read_instruction_bytes(address, &mut buf);
         if read_len == 0 {
@@ -2555,22 +2607,62 @@ impl X86Lifter {
                 reason: "invalid instruction".into(),
             });
         }
+        Ok(insn)
+    }
 
+    /// [`Self::decode_one`] through `block`, a decoder over the bytes of
+    /// the memory block the last address was in: positioning a decoder
+    /// costs less than making one for every instruction.
+    fn decode_in_block<'m>(
+        &self,
+        memory: &'m Memory,
+        address: u64,
+        block: &mut Option<BlockDecoder<'m>>,
+    ) -> Result<iced_x86::Instruction, LiftError> {
+        if block.as_ref().is_none_or(|b| !b.holds(address)) {
+            *block = BlockDecoder::new(memory, address, if self.is_64 { 64 } else { 32 });
+        }
+        let Some(b) = block.as_mut().filter(|b| b.holds(address)) else {
+            return self.decode_one(memory, address);
+        };
+        let offset = address - b.start;
+        // `read_instruction_bytes` reads up to 15 bytes, to the block's
+        // end; past its data they read as zeros: decoded the slow way.
+        let read_len = b.size.saturating_sub(offset).min(15);
+        if read_len == 0 || offset + read_len > b.limit || b.decoder.set_position(offset as usize).is_err() {
+            return self.decode_one(memory, address);
+        }
+        b.decoder.set_ip(address);
+        let mut insn = iced_x86::Instruction::default();
+        b.decoder.decode_out(&mut insn);
+        if insn.is_invalid() {
+            return Err(LiftError::DecodeFailed {
+                address,
+                reason: "invalid instruction".into(),
+            });
+        }
+        Ok(insn)
+    }
+
+    /// `insn`, decoded at `address`, lifted.
+    fn lift_decoded(
+        &self,
+        insn: iced_x86::Instruction,
+        address: u64,
+        x87: Option<X87Ctx>,
+    ) -> Result<LiftedInstruction, LiftError> {
         let mut pcode_ops = self.lift_iced(&insn, address, x87)?;
         if self.is_64 {
             pcode_ops = zero_extend_gpr32_writes(pcode_ops);
         }
         pcode_ops = sync_xmm_views(pcode_ops, xmm_write_zeroes_upper(&insn));
 
-        Ok((
-            LiftedInstruction {
-                address,
-                length: insn.len() as u32,
-                mnemonic: crate::lift::InsnText::x86_lazy(insn),
-                ops: pcode_ops,
-            },
-            insn,
-        ))
+        Ok(LiftedInstruction {
+            address,
+            length: insn.len() as u32,
+            mnemonic: crate::lift::InsnText::x86_lazy(insn),
+            ops: pcode_ops,
+        })
     }
 
     /// WS89: lift the x87 instructions of a range lifted from a function's entry again with the
@@ -3066,6 +3158,38 @@ mod tests {
             data: Some(Arc::from(data)),
         });
         mem
+    }
+
+    /// Decoding through a block decoder reads what `read_instruction_bytes`
+    /// reads: up to the block's end, zeros where its data stops short of
+    /// it, and the block a later one overlaps only below the later start.
+    #[test]
+    fn block_decoder_reads_as_read_instruction_bytes() {
+        // mov rax, [rip+0x10]; add eax, 1; ret ... repeated
+        let code: Vec<u8> = [0x48, 0x8b, 0x05, 0x10, 0, 0, 0, 0x83, 0xc0, 0x01, 0xc3, 0x90].repeat(6);
+        let mut mem = Memory::new(SpaceId(1), Endian::Little);
+        let block = |name: &str, start: u64, size: u64, data: &[u8]| MemoryBlock {
+            name: name.into(),
+            start,
+            size,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: Some(Arc::from(data)),
+        };
+        // data shorter than the block, and a block starting inside it
+        mem.add_block(block(".a", 0x1000, 0x40, &code[..0x30]));
+        mem.add_block(block(".b", 0x1020, 0x30, &code[3..0x33]));
+        mem.add_block(block(".c", 0x2000, 0x8, &code[..0x10]));
+        mem.add_block(block(".d", 0x3000, 0x20, &code[..0x13]));
+        let lifter = X86Lifter::new_64();
+        let mut dec = None;
+        for addr in (0xff8..0x1060).chain(0x1ff8..0x2010).chain(0x2ff8..0x3028) {
+            let slow = lifter.decode_one(&mem, addr);
+            let fast = lifter.decode_in_block(&mem, addr, &mut dec);
+            match (fast, slow) {
+                (Ok(f), Ok(s)) => assert!(f.eq_all_bits(&s), "at {addr:#x}: {f} / {s}"),
+                (f, s) => assert_eq!(format!("{f:?}"), format!("{s:?}"), "at {addr:#x}"),
+            }
+        }
     }
 
     #[test]
