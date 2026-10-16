@@ -238,3 +238,114 @@ fn analyze_always_runs_the_pipeline_and_no_cache_env_bypasses() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Offset of the payload in a cache file (magic 16 + format 4 + key 32 +
+/// length 8 + BLAKE3 32).
+const HEADER_LEN: usize = 92;
+
+fn cache_files(cache: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "rac"))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn payload_is_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
+    let Some((dir, bin)) = setup("zstd") else {
+        eprintln!("analysis cache test skipped: no gcc available");
+        return;
+    };
+    let cache = dir.join("cache");
+    let out = dir.join("out.json");
+    let (cold, _) = export(&cache, &bin, &out, false);
+    let file = cache_files(&cache).pop().expect("cache file");
+    let bytes = std::fs::read(&file).unwrap();
+    assert_eq!(&bytes[HEADER_LEN..HEADER_LEN + 4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd frame magic");
+    // The compressed round trip hits and matches.
+    let (warm, warm_err) = export(&cache, &bin, &out, false);
+    assert!(warm_err.contains(HIT) && warm == cold);
+
+    // A flipped byte in the middle of the compressed payload, a
+    // truncation: both ignored, then the entry is rewritten and hits.
+    for damage in 0..2 {
+        let mut b = bytes.clone();
+        if damage == 0 {
+            let mid = HEADER_LEN + (b.len() - HEADER_LEN) / 2;
+            b[mid] ^= 0x55;
+        } else {
+            b.truncate(b.len() - 7);
+        }
+        std::fs::write(&file, &b).unwrap();
+        let (again, again_err) = export(&cache, &bin, &out, false);
+        assert!(!again_err.contains(HIT), "damage {damage} must not be used");
+        assert!(again == cold);
+        let (_, healed_err) = export(&cache, &bin, &out, false);
+        assert!(healed_err.contains(HIT), "damage {damage}: entry should be rewritten");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn size_cap_evicts_the_least_recently_used_entry_but_keeps_the_newest() {
+    let Some((dir, bin)) = setup("evict") else {
+        eprintln!("analysis cache test skipped: no gcc available");
+        return;
+    };
+    let bin2 = dir.join("prog2");
+    std::fs::copy(&bin, &bin2).unwrap();
+    let cache = dir.join("cache");
+    let run = |b: &Path, cap: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_re-argo"));
+        c.env("REARGO_CACHE_DIR", &cache).env_remove("REARGO_NO_CACHE");
+        match cap {
+            Some(v) => c.env("REARGO_CACHE_MAX_BYTES", v),
+            None => c.env_remove("REARGO_CACHE_MAX_BYTES"),
+        };
+        let o = c.arg("functions").arg(b).output().unwrap();
+        assert!(o.status.success(), "{}", stderr(&o));
+        stderr(&o)
+    };
+    // Unlimited (0): both stay.
+    run(&bin, Some("0"));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    run(&bin2, Some("0"));
+    let files = cache_files(&cache);
+    assert_eq!(files.len(), 2, "cap 0 = unlimited");
+    // A foreign file with our extension but no magic is never deleted.
+    let foreign = cache.join("foreign.rac");
+    std::fs::write(&foreign, b"not ours").unwrap();
+
+    // Use `bin` again: it becomes the most recently used (mtime touched
+    // on the hit), so `bin2`'s entry is the one to go.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(run(&bin, Some("0")).contains(HIT));
+    let size_of = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
+    let total: u64 = files.iter().map(size_of).sum();
+    let newest_alone = files.iter().map(size_of).max().unwrap();
+    assert!(newest_alone < total);
+
+    // Rewrite bin2's entry under a cap that holds only one file: bin2
+    // (just written) stays, bin's older entry is evicted.
+    std::fs::write(&bin2, {
+        let mut b = std::fs::read(&bin2).unwrap();
+        b.push(0);
+        b
+    })
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    run(&bin2, Some(&newest_alone.max(size_of(&files[0])).to_string()));
+    let left = cache_files(&cache);
+    assert!(foreign.exists(), "foreign file untouched");
+    assert_eq!(left.len(), 2, "one cache entry + the foreign file: {left:?}");
+    assert!(run(&bin2, Some("0")).contains(HIT), "the newest entry survived");
+    assert!(!run(&bin, Some("0")).contains(HIT), "the older entry was evicted");
+
+    // An unparsable cap falls back to the default and evicts nothing.
+    run(&bin2, Some("lots"));
+    assert!(cache_files(&cache).len() >= 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
