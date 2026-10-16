@@ -22,7 +22,7 @@
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct InlineMemAnalyzer;
 
@@ -38,14 +38,19 @@ impl Analyzer for InlineMemAnalyzer {
         // each insn, but before xref-report consumes the comment stream.
         680
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(Vec::<(u64, &'static str)>::new());
         }
 
         let candidates: Vec<(u64, &'static str)> = program
@@ -54,6 +59,10 @@ impl Analyzer for InlineMemAnalyzer {
             .filter_map(|i| classify(&i.bytes).map(|c| (i.address, c)))
             .collect();
 
+        Box::new(candidates)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let candidates: Vec<(u64, &'static str)> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for (addr, note) in candidates {
             if program.comments.get(addr, CommentType::Pre).is_some() {

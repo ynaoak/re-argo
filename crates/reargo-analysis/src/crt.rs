@@ -28,12 +28,15 @@ use reargo_program::function::Function;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 use crate::callsite::resolve_call_sites_in;
 
 pub struct CrtAnalyzer;
 
 impl Analyzer for CrtAnalyzer {
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::FUNCTIONS)
+    }
     fn name(&self) -> &str {
         "CRT / main Recovery"
     }

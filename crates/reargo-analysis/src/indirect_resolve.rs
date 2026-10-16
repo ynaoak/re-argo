@@ -39,11 +39,14 @@ use rustc_hash::FxHashMap;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct IndirectCallResolver;
 
 impl Analyzer for IndirectCallResolver {
+    fn writes(&self) -> State {
+        State::REFERENCES.union(State::CACHE)
+    }
     fn name(&self) -> &str {
         "Indirect Call Resolver"
     }

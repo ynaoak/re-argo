@@ -3,9 +3,21 @@ use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct ScalarReferenceAnalyzer;
+
+/// With each constant, what the serial phase asks of it that
+/// depends only on the bytes and on the references the
+/// instruction had before this pass: whether it is one already,
+/// whether it is in an executable section, and whether a string
+/// starts there.
+struct Constant {
+    target: u64,
+    known: bool,
+    executable: bool,
+    string: bool,
+}
 
 impl Analyzer for ScalarReferenceAnalyzer {
     fn name(&self) -> &str {
@@ -20,9 +32,18 @@ impl Analyzer for ScalarReferenceAnalyzer {
         300
     }
 
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS.union(State::REFERENCES))
+    }
+    fn writes(&self) -> State {
+        State::REFERENCES.union(State::SYMBOLS)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut refs_found = 0;
-
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// Each instruction with pointer-shaped constants, and those.
+    fn prepare(&self, program: &Program) -> Prepared {
         let valid_ranges: Vec<(u64, u64)> = program
             .info
             .sections
@@ -48,17 +69,6 @@ impl Analyzer for ScalarReferenceAnalyzer {
         let lowest = valid_ranges.iter().map(|r| r.0).min().unwrap_or(0);
         let highest = valid_ranges.iter().map(|r| r.1).max().unwrap_or(0);
 
-        // With each constant, what the serial phase asks of it that
-        // depends only on the bytes and on the references the
-        // instruction had before this pass: whether it is one already,
-        // whether it is in an executable section, and whether a string
-        // starts there.
-        struct Constant {
-            target: u64,
-            known: bool,
-            executable: bool,
-            string: bool,
-        }
         let instructions: Vec<(u64, Vec<Constant>)> = insn_snapshot
             .par_iter()
             .map(|(addr, bytes)| {
@@ -84,6 +94,11 @@ impl Analyzer for ScalarReferenceAnalyzer {
             .filter(|(_, c)| !c.is_empty())
             .collect();
 
+        Box::new(instructions)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let instructions: Vec<(u64, Vec<Constant>)> = crate::analyzer::prepared(prepared);
+        let mut refs_found = 0;
         for (insn_addr, constants) in &instructions {
             for (k, c) in constants.iter().enumerate() {
                 let target = c.target;

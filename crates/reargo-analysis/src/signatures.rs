@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionSignature {
@@ -479,6 +479,9 @@ impl SignatureDatabase {
 pub struct SignatureApplierAnalyzer;
 
 impl Analyzer for SignatureApplierAnalyzer {
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::FUNC_OTHER).union(State::FUNC_NO_RETURN).union(State::FUNC_CC)
+    }
     fn name(&self) -> &str {
         "Signature Applier"
     }

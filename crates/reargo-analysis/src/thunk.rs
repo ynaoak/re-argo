@@ -2,11 +2,14 @@ use reargo_arch::FlowType;
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct ThunkDetectorAnalyzer;
 
 impl Analyzer for ThunkDetectorAnalyzer {
+    fn writes(&self) -> State {
+        State::FUNC_THUNK
+    }
     fn name(&self) -> &str {
         "Thunk Detector"
     }

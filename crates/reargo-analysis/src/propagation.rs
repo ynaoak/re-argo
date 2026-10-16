@@ -6,11 +6,14 @@ use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct ConstantPropagationAnalyzer;
 
 impl Analyzer for ConstantPropagationAnalyzer {
+    fn writes(&self) -> State {
+        State::REFERENCES.union(State::SYMBOLS).union(State::CACHE)
+    }
     fn name(&self) -> &str {
         "Constant Propagation"
     }

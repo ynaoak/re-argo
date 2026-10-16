@@ -57,7 +57,7 @@ use reargo_program::Program;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 /// Cap on how many bytes we'll walk looking for a class-name's
 /// null terminator. Real Itanium-mangled class names from
@@ -66,6 +66,10 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 const MAX_NAME_LEN: usize = 512;
 
 pub struct RttiAnalyzer;
+
+/// The type_infos found (address → class name) and the vtables (header
+/// slot, vtable address, class name).
+type Found = (FxHashMap<u64, String>, Vec<(u64, u64, String)>);
 
 impl Analyzer for RttiAnalyzer {
     fn name(&self) -> &str {
@@ -83,14 +87,25 @@ impl Analyzer for RttiAnalyzer {
         610
     }
 
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::NONE)
+    }
+    fn writes(&self) -> State {
+        State::SYMBOLS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The type_infos and the vtables found, by address (`None`: not a 64-bit binary).
+    fn prepare(&self, program: &Program) -> Prepared {
         let ptr_size = (program.info.bits / 8) as u64;
         if ptr_size != 8 {
             // Itanium ABI on 32-bit follows the same shape but
             // 32-bit C++ binaries are rare in modern RE targets;
             // gate on 64-bit until we have a binary to validate
             // against and keep this PR focused.
-            return Ok(self.empty_result());
+            return Box::new(None::<Found>);
         }
 
         // (start, end, exec) ranges for "is this a sensible
@@ -215,6 +230,13 @@ impl Analyzer for RttiAnalyzer {
             })
             .collect();
 
+        Box::new(Some((typeinfos, vtables)))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let found: Option<Found> = crate::analyzer::prepared(prepared);
+        let Some((typeinfos, vtables)) = found else {
+            return Ok(self.empty_result());
+        };
         // Phase 3: apply symbols.
         let mut classes_found = 0usize;
         for (ti_addr, class_name) in &typeinfos {

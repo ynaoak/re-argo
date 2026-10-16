@@ -34,7 +34,7 @@ use reargo_loader::SectionFlags;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 /// Section classification cached up-front so the per-instruction
 /// filter is a tight tuple comparison instead of an O(sections)
@@ -77,6 +77,9 @@ impl SectionMap {
 pub struct PcodeReferenceAnalyzer;
 
 impl Analyzer for PcodeReferenceAnalyzer {
+    fn writes(&self) -> State {
+        State::REFERENCES.union(State::CACHE)
+    }
     fn name(&self) -> &str {
         "P-code Reference"
     }
