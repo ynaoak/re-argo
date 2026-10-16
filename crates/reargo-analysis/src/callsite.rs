@@ -396,16 +396,48 @@ pub fn resolve_call_sites_iterative(
         return Ok(Vec::new());
     }
     let empty = ParamSummaries::default();
-    let round0: Vec<FunctionWalk> = function_jobs(program)
-        .par_iter()
-        .map(|&(entry, max_insns)| FunctionWalk {
-            entry,
-            max_insns,
-            sites: lift_function(lifter, program, entry, max_insns)
-                .map(|insns| walk_function(program, entry, &insns, &empty)),
-        })
+    let jobs = function_jobs(program);
+    let jumps = crate::func_lift::JumpIndex::new(program);
+    let walks = map_function_lifts(lifter, program, &jobs, |entry, insns| {
+        let external = jumps.external_entries(program, insns);
+        walk_function_with(program, entry, insns, &empty, &external)
+    });
+    let round0: Vec<FunctionWalk> = jobs
+        .iter()
+        .zip(walks)
+        .map(|(&(entry, max_insns), sites)| FunctionWalk { entry, max_insns, sites })
         .collect();
     resolve_call_sites_iterative_from(lifter, program, &round0, max_iters)
+}
+
+/// `f(entry, lift_function(lifter, program, entry, max))` for every job, in order (`None` where
+/// the lift fails). An x86 lifter lifts the consecutive jobs a thread runs through one
+/// [`reargo_lift::x86::LiftCache`] (`lift_range_cached` gives exactly what `lift_range` does):
+/// the linear lifts of neighbouring functions overlap.
+fn map_function_lifts<T, F>(lifter: &(dyn PcodeLift + Sync), program: &Program, jobs: &[(u64, usize)], f: F) -> Vec<Option<T>>
+where
+    T: Send,
+    F: Fn(u64, &[&reargo_lift::LiftedInstruction]) -> T + Sync,
+{
+    let memory = &program.info.memory;
+    match lifter.as_x86() {
+        Some(x86) => jobs
+            .par_iter()
+            .with_min_len(crate::range_lift::CHUNK)
+            .map_init(reargo_lift::x86::LiftCache::new, |cache, &(entry, max_insns)| {
+                crate::range_lift::trim(cache, entry);
+                let range = x86.lift_range_cached(memory, entry, max_insns, cache);
+                Some(f(entry, &range.insns()))
+            })
+            .collect(),
+        None => jobs
+            .par_iter()
+            .map(|&(entry, max_insns)| {
+                let insns = lift_function(lifter, program, entry, max_insns)?;
+                Some(f(entry, &insns.iter().collect::<Vec<_>>()))
+            })
+            .collect(),
+    }
 }
 
 /// [`resolve_call_sites_iterative`] from round-0 walks already done
