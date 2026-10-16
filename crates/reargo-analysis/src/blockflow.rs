@@ -173,10 +173,8 @@ impl Cfg {
                 is_start[t] = true;
             }
         }
-        for i in 1..n {
-            if shape.ends_block[i - 1] {
-                is_start[i] = true;
-            }
+        for (start, &ends) in is_start[1..].iter_mut().zip(&shape.ends_block) {
+            *start |= ends;
         }
         let targets = &shape.branches;
         let stops = &shape.stops;
@@ -268,10 +266,10 @@ impl Cfg {
         }
         let mut relevant = vec![false; nb];
         let mut stack: Vec<usize> = Vec::new();
-        for b in 0..nb {
+        for (b, rel) in relevant.iter_mut().enumerate() {
             let end = self.start_idx.get(b + 1).copied().unwrap_or(n);
             if (self.start_idx[b]..end).any(&wanted) {
-                relevant[b] = true;
+                *rel = true;
                 stack.push(b);
             }
         }
