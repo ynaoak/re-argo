@@ -94,8 +94,8 @@ pub struct JumpIndex {
 
 impl JumpIndex {
     pub fn new(program: &Program) -> Self {
-        // `jump_refs_by_target` yields them by target already
-        let refs = program.references.jump_refs_by_target().map(|r| (r.to, r.from, r.ref_type)).collect();
+        // sorted by target already
+        let refs = program.references.jump_refs_sorted_by_target().into_iter().map(|r| (r.to, r.from, r.ref_type)).collect();
         Self { refs }
     }
 
