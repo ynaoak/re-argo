@@ -437,7 +437,9 @@ impl fmt::Display for VarnodeData {
 pub struct SeqNum {
     pub addr: Address,
     pub order: u32,
-    pub uniq: u64,
+    /// A 32-bit field so the op's sequence number takes 24 bytes, not 32
+    /// (no pass reads it; the lifters leave it 0).
+    pub uniq: u32,
 }
 
 impl SeqNum {
@@ -449,7 +451,7 @@ impl SeqNum {
         }
     }
 
-    pub fn with_uniq(addr: Address, order: u32, uniq: u64) -> Self {
+    pub fn with_uniq(addr: Address, order: u32, uniq: u32) -> Self {
         Self { addr, order, uniq }
     }
 }
