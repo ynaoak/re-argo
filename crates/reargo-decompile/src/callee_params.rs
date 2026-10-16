@@ -84,6 +84,8 @@ pub struct CalleeParams<'a> {
     pub(crate) class_fields_memo: Mutex<FxHashMap<u64, ClassFields>>,
     /// The lifted-once, depth-independent analysis of each body.
     summary_memo: Mutex<FxHashMap<u64, Option<std::sync::Arc<Summary>>>>,
+    /// The lengths and flags of the instructions lifted alone, for the range walks (x86).
+    facts: Option<reargo_lift::x86::InsnFacts>,
 }
 
 /// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
@@ -144,6 +146,7 @@ impl<'a> CalleeParams<'a> {
             unwind_table: None,
             class_fields_memo: Mutex::new(FxHashMap::default()),
             summary_memo: Mutex::new(FxHashMap::default()),
+            facts: lifter.as_x86().map(|_| reargo_lift::x86::InsnFacts::new(memory)),
         })
     }
 
@@ -310,6 +313,12 @@ impl<'a> CalleeParams<'a> {
     }
 
     fn summarize(&self, target: u64) -> Option<Summary> {
+        if let (Some(x86), Some(facts)) = (self.lifter.as_x86(), &self.facts)
+            && let Some(addrs) = x86.plain_range(self.memory, target, MAX_INSNS, facts)
+            && let Some(s) = self.summarize_plain(x86, target, &addrs)
+        {
+            return Some(s);
+        }
         let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
         if lifted.is_empty() || lifted[0].address != target {
             return None;
@@ -322,68 +331,28 @@ impl<'a> CalleeParams<'a> {
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
     }
 
-    /// [`Self::summarize`] of `lift_range(target, MAX_INSNS)` given as `lifted`.
-    fn summarize_lifted(&self, target: u64, lifted: &[&LiftedInstruction]) -> Option<Summary> {
-        if lifted.is_empty() || lifted[0].address != target {
+    /// [`Self::summarize`] of a range that is the lifts of `addrs` alone
+    /// ([`reargo_lift::x86::X86Lifter::plain_range`]): only the instructions the trim keeps
+    /// are lifted.
+    fn summarize_plain(&self, x86: &reargo_lift::x86::X86Lifter, target: u64, addrs: &[u64]) -> Option<Summary> {
+        if addrs.first() != Some(&target) {
             return None;
         }
-        let last = lifted.last().map(|i| i.address);
-        let hit_limit = lifted.len() >= MAX_INSNS;
-        let insns = crate::pipeline::trim_to_return_refs(lifted);
-        let truncated = hit_limit && insns.last().map(|i| i.address) == last;
+        let idx_of = |a: u64| addrs.binary_search(&a).ok();
+        let mut lifted: Vec<Option<LiftedInstruction>> = vec![None; addrs.len()];
+        let mut stack = vec![0usize];
+        while let Some(idx) = stack.pop() {
+            if lifted[idx].is_some() {
+                continue;
+            }
+            let insn = x86.lift_alone(self.memory, addrs[idx]).ok()?;
+            crate::pipeline::reach_successors(&insn, idx_of, &mut stack);
+            lifted[idx] = Some(insn);
+        }
+        let insns: Vec<LiftedInstruction> = lifted.into_iter().flatten().collect();
+        let hit_limit = addrs.len() >= MAX_INSNS;
+        let truncated = hit_limit && insns.last().map(|i| i.address) == addrs.last().copied();
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
-    }
-
-    /// Compute the summaries of the functions at `entries` ahead of their lookups, lifting the
-    /// neighbouring bodies' overlapping ranges once per run of entries on a thread (x86 only;
-    /// what a lookup would compute itself, so the answers do not change).
-    pub fn prefill(&self, entries: &[u64]) {
-        let Some(x86) = self.lifter.as_x86() else { return };
-        let mut todo: Vec<u64> = entries.to_vec();
-        // the entries' own parameters are looked up at the full depth: their inner calls one
-        // level below, those calls' callees another
-        for round in 0..=MAX_DEPTH {
-            let done = self.prefill_round(x86, todo);
-            if round == MAX_DEPTH {
-                break;
-            }
-            let mut next = Vec::new();
-            for s in done.iter().flatten() {
-                next.extend(s.calls.iter().filter_map(|c| c.target));
-                next.extend(s.ret_sites.iter().filter_map(|r| match r {
-                    RetSite::Call(t) => *t,
-                    RetSite::Kind(_) => None,
-                }));
-            }
-            todo = next;
-        }
-    }
-
-    /// The summaries of `todo` not computed yet, computed in address order (and memoised).
-    fn prefill_round(&self, x86: &reargo_lift::x86::X86Lifter, mut todo: Vec<u64>) -> Vec<Option<std::sync::Arc<Summary>>> {
-        use rayon::prelude::*;
-        todo.sort_unstable();
-        todo.dedup();
-        if let Ok(m) = self.summary_memo.lock() {
-            todo.retain(|e| !m.contains_key(e));
-        }
-        let done: Vec<(u64, Option<std::sync::Arc<Summary>>)> = todo
-            .par_iter()
-            .with_min_len(64)
-            .map_init(reargo_lift::x86::LiftCache::new, |cache, &e| {
-                cache.trim(e, 4096);
-                let range = x86.lift_range_cached(self.memory, e, MAX_INSNS, cache);
-                (e, self.summarize_lifted(e, &range.insns()).map(std::sync::Arc::new))
-            })
-            .collect();
-        let mut out = Vec::with_capacity(done.len());
-        if let Ok(mut m) = self.summary_memo.lock() {
-            for (e, s) in done {
-                out.push(s.clone());
-                m.entry(e).or_insert(s);
-            }
-        }
-        out
     }
 
     fn summarize_body(&self, cfg: ControlFlowGraph, truncated: bool) -> Summary {

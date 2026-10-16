@@ -1194,10 +1194,6 @@ pub fn decompile_all_with_options(
     let annotations = build_annotations(program);
     // one callee-parameter memo for the whole batch
     let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
-    // every function's own parameters are looked up: analyse the bodies in address order
-    if let Some(o) = &oracle {
-        o.prefill(&entries);
-    }
 
     entries
         .par_iter()
@@ -1534,18 +1530,8 @@ pub(crate) fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<Lifted
         .collect()
 }
 
-/// [`trim_to_return`] of borrowed instructions: the kept ones cloned.
-pub(crate) fn trim_to_return_refs(instructions: &[&LiftedInstruction]) -> Vec<LiftedInstruction> {
-    let visited = reachability(instructions);
-    if visited.is_empty() {
-        return instructions.iter().map(|&i| i.clone()).collect();
-    }
-    instructions.iter().zip(visited).filter_map(|(&insn, keep)| keep.then(|| insn.clone())).collect()
-}
-
 fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructions: &[I]) -> Vec<bool> {
     use rustc_hash::FxHashMap;
-    use reargo_core::pcode::OpCode;
 
     if instructions.is_empty() {
         return Vec::new();
@@ -1566,51 +1552,56 @@ fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructions: &[I]) -
             continue;
         }
         visited[idx] = true;
-        let insn: &LiftedInstruction = instructions[idx].borrow();
-
-        let mut has_unconditional_transfer = false;
-        let mut has_return_or_indjmp = false;
-        for op in &insn.ops {
-            match op.opcode {
-                OpCode::Branch => {
-                    has_unconditional_transfer = true;
-                    if let Some(tgt) = op.inputs.first()
-                        && tgt.space == reargo_core::address::SpaceId::RAM
-                        && let Some(&t_idx) = addr_to_idx.get(&tgt.offset)
-                    {
-                        stack.push(t_idx);
-                    }
-                }
-                OpCode::CBranch => {
-                    if let Some(tgt) = op.inputs.first()
-                        && tgt.space == reargo_core::address::SpaceId::RAM
-                        && let Some(&t_idx) = addr_to_idx.get(&tgt.offset)
-                    {
-                        stack.push(t_idx);
-                    }
-                }
-                OpCode::Return | OpCode::BranchInd => {
-                    has_return_or_indjmp = true;
-                    // a recovered jump table's cases (WS83, `switch`)
-                    for t in op.inputs.iter().skip(1).filter(|t| op.opcode == OpCode::BranchInd && t.space == reargo_core::address::SpaceId::RAM) {
-                        if let Some(&t_idx) = addr_to_idx.get(&t.offset) {
-                            stack.push(t_idx);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if !has_return_or_indjmp && !has_unconditional_transfer && !crate::cfg::is_trap(insn) {
-            let fall = insn.address + insn.length as u64;
-            if let Some(&f_idx) = addr_to_idx.get(&fall) {
-                stack.push(f_idx);
-            }
-        }
+        reach_successors(instructions[idx].borrow(), |a| addr_to_idx.get(&a).copied(), &mut stack);
     }
 
     visited
+}
+
+/// Push onto `stack` the indices (`idx_of`) of the instructions [`reachability`] reaches from
+/// `insn`.
+pub(crate) fn reach_successors(insn: &LiftedInstruction, idx_of: impl Fn(u64) -> Option<usize>, stack: &mut Vec<usize>) {
+    use reargo_core::pcode::OpCode;
+    let mut has_unconditional_transfer = false;
+    let mut has_return_or_indjmp = false;
+    for op in &insn.ops {
+        match op.opcode {
+            OpCode::Branch => {
+                has_unconditional_transfer = true;
+                if let Some(tgt) = op.inputs.first()
+                    && tgt.space == reargo_core::address::SpaceId::RAM
+                    && let Some(t_idx) = idx_of(tgt.offset)
+                {
+                    stack.push(t_idx);
+                }
+            }
+            OpCode::CBranch => {
+                if let Some(tgt) = op.inputs.first()
+                    && tgt.space == reargo_core::address::SpaceId::RAM
+                    && let Some(t_idx) = idx_of(tgt.offset)
+                {
+                    stack.push(t_idx);
+                }
+            }
+            OpCode::Return | OpCode::BranchInd => {
+                has_return_or_indjmp = true;
+                // a recovered jump table's cases (WS83, `switch`)
+                for t in op.inputs.iter().skip(1).filter(|t| op.opcode == OpCode::BranchInd && t.space == reargo_core::address::SpaceId::RAM) {
+                    if let Some(t_idx) = idx_of(t.offset) {
+                        stack.push(t_idx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !has_return_or_indjmp && !has_unconditional_transfer && !crate::cfg::is_trap(insn) {
+        let fall = insn.address + insn.length as u64;
+        if let Some(f_idx) = idx_of(fall) {
+            stack.push(f_idx);
+        }
+    }
 }
 
 #[cfg(test)]
