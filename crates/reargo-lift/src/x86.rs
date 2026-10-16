@@ -226,7 +226,9 @@ impl X86Lifter {
         for _ in 0..count {
             let lifted = cache.map.entry(addr).or_insert_with(|| fast.lift_instruction(memory, addr).ok());
             let Some(l) = lifted else { break };
-            x87 |= l.mnemonic.starts_with('f');
+            // The x87 pass rewrites nothing in a range without an x87
+            // instruction, so such a range lifts as the cache has it.
+            x87 |= l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
             addrs.push(addr);
             addr += l.length as u64;
         }
@@ -2339,20 +2341,6 @@ impl X86Lifter {
             });
         }
 
-        let mnemonic = {
-            use std::cell::RefCell;
-            thread_local! {
-                static FMT: RefCell<(iced_x86::IntelFormatter, String)> =
-                    RefCell::new((iced_x86::IntelFormatter::new(), String::with_capacity(32)));
-            }
-            FMT.with(|cell| {
-                let (fmt, buf) = &mut *cell.borrow_mut();
-                buf.clear();
-                fmt.format(&insn, buf);
-                buf.clone()
-            })
-        };
-
         let mut pcode_ops = self.lift_iced(&insn, address, x87)?;
         if self.is_64 {
             pcode_ops = zero_extend_gpr32_writes(pcode_ops);
@@ -2363,7 +2351,7 @@ impl X86Lifter {
             LiftedInstruction {
                 address,
                 length: insn.len() as u32,
-                mnemonic,
+                mnemonic: crate::lift::InsnText::x86_lazy(insn),
                 ops: pcode_ops,
             },
             insn,
@@ -2375,6 +2363,12 @@ impl X86Lifter {
     /// slot it leaves (`INDIRECT(target)`, like the convention's return registers), and a `ret`
     /// with a value on the stack returns it (a further input of its RETURN).
     fn lift_x87_range(&self, memory: &Memory, lifted: &mut [LiftedInstruction]) {
+        // Only a range with an x87 instruction (checked on the decoded
+        // instructions first: formatting the text costs more) and an
+        // instruction whose text starts with `f` is rewritten.
+        if !lifted.iter().any(|l| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87)) {
+            return;
+        }
         if !lifted.iter().any(|l| l.mnemonic.starts_with('f')) {
             return;
         }
@@ -2572,6 +2566,22 @@ fn emit_pf(result: VarnodeData, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, addr
     if let Some(last) = ops.last_mut() {
         last.output = Some(reg(PF_OFFSET, 1));
     }
+}
+
+/// The Intel-syntax text of `insn` (with its operands), as a
+/// [`LiftedInstruction`]'s `mnemonic` reads.
+pub(crate) fn format_instruction(insn: &iced_x86::Instruction) -> String {
+    use std::cell::RefCell;
+    thread_local! {
+        static FMT: RefCell<(iced_x86::IntelFormatter, String)> =
+            RefCell::new((iced_x86::IntelFormatter::new(), String::with_capacity(32)));
+    }
+    FMT.with(|cell| {
+        let (fmt, buf) = &mut *cell.borrow_mut();
+        buf.clear();
+        fmt.format(insn, buf);
+        buf.clone()
+    })
 }
 
 /// Does a PF reader in `lifted` (lifted without the integer PF) read a PF that an integer

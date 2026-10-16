@@ -437,7 +437,7 @@ impl PcodeLift for PpcLifter {
         let word = self.read_word(&buf);
         let ops = self.lift_word(word, address);
         let mnemonic = self.disasm_text(&buf, address, word);
-        Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+        Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
     }
 }
 

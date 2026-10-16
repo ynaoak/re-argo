@@ -408,7 +408,7 @@ mod tests {
         LiftedInstruction {
             address: addr,
             length: len,
-            mnemonic: format!("insn_{:x}", addr),
+            mnemonic: format!("insn_{:x}", addr).into(),
             ops,
         }
     }

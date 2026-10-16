@@ -1771,11 +1771,11 @@ impl PcodeLift for Arm32Lifter {
                 let hw2 = self.read_half(b2, b3);
                 let ops = self.lift_thumb32(hw1, hw2, address);
                 let mnemonic = self.disasm_text(&[b0, b1, b2, b3], address, ((hw1 as u32) << 16) | hw2 as u32);
-                Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+                Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
             } else {
                 let ops = self.lift_thumb16(hw1, address);
                 let mnemonic = self.disasm_text(&[b0, b1], address, hw1 as u32);
-                Ok(LiftedInstruction { address, length: 2, mnemonic, ops })
+                Ok(LiftedInstruction { address, length: 2, mnemonic: mnemonic.into(), ops })
             }
         } else {
             let mut buf = [0u8; 4];
@@ -1785,7 +1785,7 @@ impl PcodeLift for Arm32Lifter {
             let word = self.read_word(&buf);
             let ops = self.lift_word(word, address);
             let mnemonic = self.disasm_text(&buf, address, word);
-            Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
+            Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
         }
     }
 

@@ -1325,7 +1325,7 @@ impl PcodeLift for Aarch64Lifter {
         Ok(LiftedInstruction {
             address,
             length: insn.len() as u32,
-            mnemonic,
+            mnemonic: mnemonic.into(),
             ops: pcode_ops,
         })
     }

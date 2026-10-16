@@ -272,7 +272,7 @@ impl X86Arch {
         data: &[u8],
         address: u64,
     ) -> Result<DecodedInstruction, DisasmError> {
-        use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter, Instruction};
+        use iced_x86::{Decoder, DecoderOptions, Instruction};
 
         let bitness = if self.is_64 { 64 } else { 32 };
         let mut decoder = Decoder::with_ip(bitness, data, address, DecoderOptions::NONE);
@@ -289,47 +289,51 @@ impl X86Arch {
         let len = instruction.len() as u32;
         let bytes: SmallVec<[u8; 16]> = data[..len as usize].into();
 
-        // One formatter per thread (building one per instruction was a
-        // large share of the decode); its output does not depend on
-        // earlier calls.
-        thread_local! {
-            static FORMATTER: std::cell::RefCell<IntelFormatter> = std::cell::RefCell::new(IntelFormatter::new());
-        }
-        let (mnemonic_output, operand_output) = FORMATTER.with(|cell| {
-            let formatter = &mut *cell.borrow_mut();
-            let mut mnemonic_output = String::new();
-            formatter.format_mnemonic(&instruction, &mut mnemonic_output);
-
-            let mut operand_output = String::new();
-            // Use the *formatter's* operand count: it differs from
-            // `instruction.op_count()` for pseudo-ops (`cmpltss` hides the
-            // predicate imm) and for 3-operand `imul r, r, imm` with dst == src,
-            // which iced prints in its 2-operand short form. Iterating the raw
-            // count printed `imul eax, 93h, ` / `cmpltss xmm3, xmm0, ` with a
-            // dangling separator and an empty operand.
-            let operand_count = formatter.operand_count(&instruction);
-            for i in 0..operand_count {
-                if i > 0 {
-                    operand_output.push_str(", ");
-                }
-                let _ = formatter.format_operand(&instruction, &mut operand_output, i);
-            }
-            (mnemonic_output, operand_output)
-        });
-
         let flow_type = classify_flow(&instruction);
         let branch_target = extract_branch_target(&instruction);
 
-        Ok(DecodedInstruction {
-            address,
-            length: len,
-            mnemonic: mnemonic_output,
-            operands: operand_output,
-            bytes,
-            flow_type,
-            branch_target,
-        })
+        // The text is formatted from `bytes` when first read (`format_text`).
+        Ok(DecodedInstruction::new_x86_lazy(address, len, bytes, flow_type, branch_target, bitness))
     }
+}
+
+/// The Intel-syntax text `(mnemonic, operands)` of the x86 instruction
+/// `bytes` (exactly its bytes) at `address`, as [`DecodedInstruction`]
+/// prints it.
+pub(crate) fn format_text(bytes: &[u8], address: u64, bitness: u32) -> (String, String) {
+    use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter, Instruction};
+
+    let mut decoder = Decoder::with_ip(bitness, bytes, address, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    decoder.decode_out(&mut instruction);
+
+    // One formatter per thread (building one per instruction was a
+    // large share of the decode); its output does not depend on
+    // earlier calls.
+    thread_local! {
+        static FORMATTER: std::cell::RefCell<IntelFormatter> = std::cell::RefCell::new(IntelFormatter::new());
+    }
+    FORMATTER.with(|cell| {
+        let formatter = &mut *cell.borrow_mut();
+        let mut mnemonic_output = String::new();
+        formatter.format_mnemonic(&instruction, &mut mnemonic_output);
+
+        let mut operand_output = String::new();
+        // Use the *formatter's* operand count: it differs from
+        // `instruction.op_count()` for pseudo-ops (`cmpltss` hides the
+        // predicate imm) and for 3-operand `imul r, r, imm` with dst == src,
+        // which iced prints in its 2-operand short form. Iterating the raw
+        // count printed `imul eax, 93h, ` / `cmpltss xmm3, xmm0, ` with a
+        // dangling separator and an empty operand.
+        let operand_count = formatter.operand_count(&instruction);
+        for i in 0..operand_count {
+            if i > 0 {
+                operand_output.push_str(", ");
+            }
+            let _ = formatter.format_operand(&instruction, &mut operand_output, i);
+        }
+        (mnemonic_output, operand_output)
+    })
 }
 
 fn classify_flow(insn: &iced_x86::Instruction) -> FlowType {
@@ -449,7 +453,7 @@ mod tests {
         let arch = X86Arch::new_64();
         let mem = make_memory(&[0x90], 0x1000);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "nop");
+        assert_eq!(insn.mnemonic(), "nop");
         assert_eq!(insn.length, 1);
         assert_eq!(insn.flow_type, FlowType::Fall);
     }
@@ -460,13 +464,13 @@ mod tests {
         // imul eax, eax, 93h = 69 c0 93 00 00 00
         let mem = make_memory(&[0x69, 0xc0, 0x93, 0x00, 0x00, 0x00], 0x1000);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert!(!insn.operands.trim_end().ends_with(','), "got {:?}", insn.operands);
-        assert!(insn.operands.contains("93h"), "got {:?}", insn.operands);
+        assert!(!insn.operands().trim_end().ends_with(','), "got {:?}", insn.operands());
+        assert!(insn.operands().contains("93h"), "got {:?}", insn.operands());
         // cmpltss xmm3, xmm0 = f3 0f c2 d8 01
         let mem = make_memory(&[0xf3, 0x0f, 0xc2, 0xd8, 0x01], 0x1000);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "cmpltss");
-        assert_eq!(insn.operands, "xmm3, xmm0");
+        assert_eq!(insn.mnemonic(), "cmpltss");
+        assert_eq!(insn.operands(), "xmm3, xmm0");
     }
 
     #[test]
@@ -474,7 +478,7 @@ mod tests {
         let arch = X86Arch::new_64();
         let mem = make_memory(&[0xc3], 0x1000);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "ret");
+        assert_eq!(insn.mnemonic(), "ret");
         assert!(insn.is_return());
     }
 
@@ -484,7 +488,7 @@ mod tests {
         // CALL rel32 (e8 XX XX XX XX)
         let mem = make_memory(&[0xe8, 0x10, 0x00, 0x00, 0x00], 0x1000);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "call");
+        assert_eq!(insn.mnemonic(), "call");
         assert!(insn.is_call());
         assert_eq!(insn.branch_target, Some(0x1015));
     }
@@ -495,7 +499,7 @@ mod tests {
         // JMP rel8 (eb XX)
         let mem = make_memory(&[0xeb, 0x10], 0x1000);
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "jmp");
+        assert_eq!(insn.mnemonic(), "jmp");
         assert!(insn.is_unconditional_jump());
         assert_eq!(insn.branch_target, Some(0x1012));
     }
@@ -519,7 +523,7 @@ mod tests {
             0x1000,
         );
         let insn = arch.decode_instruction(&mem, 0x1000).unwrap();
-        assert_eq!(insn.mnemonic, "mov");
+        assert_eq!(insn.mnemonic(), "mov");
         assert_eq!(insn.length, 10);
     }
 
@@ -531,11 +535,11 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let insns = arch.decode_linear(&mem, 0x1000, 10).unwrap();
         assert_eq!(insns.len(), 5);
-        assert_eq!(insns[0].mnemonic, "push");
-        assert_eq!(insns[1].mnemonic, "mov");
-        assert_eq!(insns[2].mnemonic, "nop");
-        assert_eq!(insns[3].mnemonic, "pop");
-        assert_eq!(insns[4].mnemonic, "ret");
+        assert_eq!(insns[0].mnemonic(), "push");
+        assert_eq!(insns[1].mnemonic(), "mov");
+        assert_eq!(insns[2].mnemonic(), "nop");
+        assert_eq!(insns[3].mnemonic(), "pop");
+        assert_eq!(insns[4].mnemonic(), "ret");
     }
 
     #[test]

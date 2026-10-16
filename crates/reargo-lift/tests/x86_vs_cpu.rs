@@ -287,7 +287,7 @@ fn lift(start: usize, end: usize) -> (Vec<PcodeOp>, String) {
             .unwrap_or_else(|e| panic!("lift {bytes:02x?}: {e:?}"));
         at += u64::from(l.length);
         ops.extend(l.ops);
-        text.push(l.mnemonic);
+        text.push(l.mnemonic.to_string());
     }
     assert_eq!(at, end as u64, "{text:?}: instruction boundaries");
     (ops, text.join("; "))
@@ -1511,7 +1511,7 @@ fn lift_range(start: usize, end: usize) -> (Vec<PcodeOp>, String) {
     let lifted = X86Lifter::new_64().lift_range(&mem, start as u64, 64).expect("lift");
     let last = lifted.last().map(|l| l.address + u64::from(l.length));
     assert_eq!(last, Some(end as u64), "{bytes:02x?}: instruction boundaries");
-    let text = lifted.iter().map(|l| l.mnemonic.clone()).collect::<Vec<_>>().join("; ");
+    let text = lifted.iter().map(|l| l.mnemonic.to_string()).collect::<Vec<_>>().join("; ");
     (lifted.into_iter().flat_map(|l| l.ops).collect(), text)
 }
 

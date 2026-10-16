@@ -5,8 +5,87 @@ use reargo_loader::Memory;
 pub struct LiftedInstruction {
     pub address: u64,
     pub length: u32,
-    pub mnemonic: String,
+    /// The instruction's text (x86: Intel syntax with its operands), read as a `&str`.
+    pub mnemonic: InsnText,
     pub ops: Vec<PcodeOp>,
+}
+
+/// The text of a [`LiftedInstruction`]: given, or for x86 formatted from the
+/// decoded instruction when it is first read — the analysis passes lift far
+/// more than they print, and formatting was a large part of each lift.
+/// Reads as a `str` (`Deref`), so `l.mnemonic.starts_with("pop ")` works as on
+/// a `String`.
+#[derive(Clone)]
+pub struct InsnText {
+    cell: std::sync::OnceLock<String>,
+    x86: Option<iced_x86::Instruction>,
+}
+
+impl InsnText {
+    /// The text of `insn`, formatted when first read.
+    pub fn x86_lazy(insn: iced_x86::Instruction) -> Self {
+        Self { cell: std::sync::OnceLock::new(), x86: Some(insn) }
+    }
+
+    /// The decoded x86 instruction the text is formatted from, if any.
+    pub fn x86_instruction(&self) -> Option<&iced_x86::Instruction> {
+        self.x86.as_ref()
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.cell.get_or_init(|| self.x86.as_ref().map(crate::x86::format_instruction).unwrap_or_default())
+    }
+}
+
+impl From<String> for InsnText {
+    fn from(text: String) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(text);
+        Self { cell, x86: None }
+    }
+}
+
+impl From<&str> for InsnText {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_string())
+    }
+}
+
+impl std::ops::Deref for InsnText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for InsnText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for InsnText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Debug for InsnText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq<str> for InsnText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for InsnText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
 }
 
 impl LiftedInstruction {
