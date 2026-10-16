@@ -118,7 +118,10 @@ pub fn decompile_with_options(
     let call_returns = callee_return_map(&trimmed, oracle.as_ref(), &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&trimmed));
     let mut trimmed = trimmed;
-    long_double_tail_returns(&mut trimmed, &call_returns, &mut || crate::callers::return_hint(lifter, memory, entry));
+    long_double_tail_returns(&mut trimmed, &call_returns, &mut || match oracle.as_ref() {
+        Some(o) => o.return_hint(entry),
+        None => crate::callers::return_hint(lifter, memory, entry),
+    });
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
@@ -461,7 +464,10 @@ fn decompile_function_inner(
     let call_returns = callee_return_map(&terminated, oracle, &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&terminated));
     let mut terminated = terminated;
-    long_double_tail_returns(&mut terminated, &call_returns, &mut || crate::callers::return_hint(lifter, &program.info.memory, func_entry));
+    long_double_tail_returns(&mut terminated, &call_returns, &mut || match oracle {
+        Some(o) => o.return_hint(func_entry),
+        None => crate::callers::return_hint(lifter, &program.info.memory, func_entry),
+    });
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
     // WS82: the exception landing pads, printed after the body
@@ -1210,7 +1216,8 @@ pub fn decompile_all_with_options(
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
     // one callee-parameter memo for the whole batch
-    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
+    let oracle = CalleeParams::new(lifter, &program.info.memory)
+        .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index());
 
     entries
         .par_iter()
@@ -1329,7 +1336,12 @@ fn build_decompile_result(
             .iter()
             .any(|o| matches!(o.opcode, reargo_core::pcode::OpCode::Call | reargo_core::pcode::OpCode::CallInd) && o.inputs.len() > 1);
 
-    let mut hint = |f: u64| caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, f));
+    let mut hint = |f: u64| {
+        caller_hint.and_then(|(lifter, memory)| match oracle {
+            Some(o) if std::ptr::eq(o.memory, memory) => o.return_hint(f),
+            _ => crate::callers::return_hint(lifter, memory, f),
+        })
+    };
     ssa.return_float = choose_return_register(&mut ssa, entry, &mut hint);
     settle_unknown_returns(&mut ssa);
     let mut opt_stats = run_optimization_passes(&mut ssa);

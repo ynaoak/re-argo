@@ -86,6 +86,10 @@ pub struct CalleeParams<'a> {
     summary_memo: Mutex<FxHashMap<u64, Option<std::sync::Arc<Summary>>>>,
     /// The lengths and flags of the instructions lifted alone, for the range walks (x86).
     facts: Option<reargo_lift::x86::InsnFacts>,
+    /// The direct call sites by target, when a batch built them ([`Self::with_call_index`]).
+    call_index: Option<crate::callers::CallIndex>,
+    /// [`crate::callers::return_hint`] by function.
+    hint_memo: Mutex<FxHashMap<u64, Option<crate::callers::ReturnHint>>>,
 }
 
 /// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
@@ -147,7 +151,31 @@ impl<'a> CalleeParams<'a> {
             class_fields_memo: Mutex::new(FxHashMap::default()),
             summary_memo: Mutex::new(FxHashMap::default()),
             facts: lifter.as_x86().map(|_| reargo_lift::x86::InsnFacts::new(memory)),
+            call_index: None,
+            hint_memo: Mutex::new(FxHashMap::default()),
         })
+    }
+
+    /// The same oracle with the direct call sites of the whole binary indexed once (for a batch
+    /// of decompiles: each looks its callers up).
+    pub fn with_call_index(mut self) -> Self {
+        self.call_index = crate::callers::CallIndex::build(self.memory);
+        self
+    }
+
+    /// [`crate::callers::return_hint`]`(lifter, memory, target)`, memoised.
+    pub fn return_hint(&self, target: u64) -> Option<crate::callers::ReturnHint> {
+        if let Some(h) = self.hint_memo.lock().ok().and_then(|m| m.get(&target).copied()) {
+            return h;
+        }
+        let h = match &self.call_index {
+            Some(index) => crate::callers::return_hint_indexed(self.lifter, self.memory, target, index),
+            None => crate::callers::return_hint(self.lifter, self.memory, target),
+        };
+        if let Ok(mut m) = self.hint_memo.lock() {
+            m.insert(target, h);
+        }
+        h
     }
 
     /// The same oracle, finding the function that covers an address through the
