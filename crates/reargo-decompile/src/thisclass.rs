@@ -708,7 +708,8 @@ pub fn summarize(mem: &Memory, start: u64, len: u64, vt_points: &FxHashSet<u64>)
 pub struct Hierarchy {
     /// class -> its primary vtable (address point)
     pub vtables: Vec<u64>,
-    /// class -> its bases (transitively; not itself)
+    /// class -> its bases at offset 0 (transitively; not itself): a pointer to an object is a
+    /// pointer to each of them
     pub bases: Vec<Vec<u32>>,
 }
 
@@ -907,6 +908,26 @@ fn vtables(mem: &Memory, words: &[(u64, u64)]) -> Vec<(u64, i64, u64, Vec<u64>)>
     out
 }
 
+/// The direct bases at offset 0 of the class whose `type_info` is at `ti` (not virtual): the
+/// one base of a `__si_class_type_info` (`ti+16`), the bases of a `__vmi_class_type_info` (a
+/// count at `ti+20`, `{base, offset_flags}` pairs from `ti+24`; offset = flags >> 8, bit 0 =
+/// virtual) whose offset is 0. A pointer to the object is a pointer to these bases; a base at
+/// another offset is reached through `this + k`, another value.
+fn zero_offset_bases(mem: &Memory, ti: u64) -> Vec<u64> {
+    let is_ti = |b: u64| crate::vcall::type_info_name(mem, b).is_some();
+    if let Some(b) = crate::vcall::pointer_at(mem, ti + 16).filter(|&b| is_ti(b)) {
+        return vec![b];
+    }
+    let Some(n) = mem.read_u32(ti + 20).ok().filter(|n| (1..=64).contains(n)) else { return Vec::new() };
+    (0..u64::from(n))
+        .filter_map(|i| {
+            let b = crate::vcall::pointer_at(mem, ti + 24 + 16 * i).filter(|&b| is_ti(b))?;
+            let flags = mem.read_u64(ti + 32 + 16 * i).ok()? as i64;
+            (flags & 1 == 0 && flags >> 8 == 0).then_some(b)
+        })
+        .collect()
+}
+
 /// What [`solve`] needs to know about the binary.
 pub struct Universe {
     pub hierarchy: Hierarchy,
@@ -934,11 +955,11 @@ pub fn universe(mem: &Memory) -> Universe {
             tis.push(*ti);
         }
     }
-    let direct: Vec<Vec<u64>> = tis.par_iter().map(|&ti| crate::vcall::type_info_bases(mem, ti)).collect();
+    let direct: Vec<Vec<u64>> = tis.par_iter().map(|&ti| zero_offset_bases(mem, ti)).collect();
     let direct_of: FxHashMap<u64, &Vec<u64>> = tis.iter().copied().zip(direct.iter()).collect();
     for &ti in &tis {
         let mut seen: Vec<u64> = Vec::new();
-        let mut work: Vec<u64> = direct_of.get(&ti).map(|v| v.to_vec()).unwrap_or_else(|| crate::vcall::type_info_bases(mem, ti));
+        let mut work: Vec<u64> = direct_of.get(&ti).map(|v| v.to_vec()).unwrap_or_else(|| zero_offset_bases(mem, ti));
         while let Some(t) = work.pop() {
             if seen.contains(&t) || seen.len() > 64 {
                 continue;
@@ -946,7 +967,7 @@ pub fn universe(mem: &Memory) -> Universe {
             seen.push(t);
             match direct_of.get(&t) {
                 Some(v) => work.extend(v.iter().copied()),
-                None => work.extend(crate::vcall::type_info_bases(mem, t)),
+                None => work.extend(zero_offset_bases(mem, t)),
             }
         }
         hier.bases.push(seen.iter().filter_map(|t| by_ti.get(t).copied()).collect());
@@ -1256,7 +1277,9 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                     }
                 }
                 let mut fs = Vec::new();
-                for &(src, off, vs, vo) in &s.field_stores {
+                // (a field is past the vtable pointer; a negative offset is no field of this
+                // class: `this` of a base class's method reaching the derived object around it)
+                for &(src, off, vs, vo) in s.field_stores.iter().filter(|f| f.1 > 0) {
                     let b = base(src, &ld);
                     if b >= 2 {
                         fs.push(((b - 2, off), value(vs, vo, &ld)));
@@ -1264,7 +1287,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 }
                 let mut ms = Vec::new();
                 for &(src, off, vt) in &s.vt_stores {
-                    if off == 0 || src == Src::Stack {
+                    if off <= 0 || src == Src::Stack {
                         continue;
                     }
                     let b = base(src, &ld);
@@ -1393,7 +1416,7 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIn
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 6;
+const INDEX_VERSION: u8 = 8;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -1664,6 +1687,30 @@ mod tests {
         let s = summarize(&text(&code), 0x1000, code.len() as u64, &vts);
         assert_eq!(s.made_alias, [((0, 0), (1, 0))]);
         assert_eq!(s.made_vt, [(0, 0, 0x2000)]);
+    }
+
+    /// The bases of a class with several (`__vmi_class_type_info`): only those at offset 0.
+    #[test]
+    fn only_bases_at_offset_zero_count() {
+        let mut d = vec![0u8; 0x400];
+        let mut w = |at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        // 0x2000: D (vmi) — name 0x2300, flags 0 / 2 bases: 0x2100 at 0 (public), 0x2200 at +0x10
+        w(0x08, 0x2300);
+        w(0x10, 2 << 32);
+        w(0x18, 0x2100);
+        w(0x20, 2);
+        w(0x28, 0x2200);
+        w(0x30, (0x10 << 8) | 2);
+        // 0x2100: B1, 0x2200: B2 (no bases)
+        w(0x108, 0x2310);
+        w(0x208, 0x2320);
+        d[0x300..0x302].copy_from_slice(b"1D");
+        d[0x310..0x313].copy_from_slice(b"2B1");
+        d[0x320..0x323].copy_from_slice(b"2B2");
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        mem.add_block(MemoryBlock { name: ".data.rel.ro".into(), start: 0x2000, size: d.len() as u64, flags: MemoryFlags::READ, data: Some(Arc::from(d.as_slice())) });
+        assert_eq!(zero_offset_bases(&mem, 0x2000), [0x2100]);
+        assert_eq!(zero_offset_bases(&mem, 0x2100), Vec::<u64>::new());
     }
 
     /// The join of two classes is their nearest common base.
