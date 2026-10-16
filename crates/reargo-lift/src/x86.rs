@@ -187,6 +187,9 @@ pub struct LiftCache {
     shape: Vec<crate::lift::InsnShape>,
     /// Instructions the last [`Self::trim`] kept.
     kept: usize,
+    /// The lifts with the integer PF, of the ranges that need it
+    /// ([`X86Lifter::lift_range_from_cache`]), made when first needed.
+    parity: Option<Box<LiftCache>>,
 }
 
 /// The x87 pass may rewrite the instruction.
@@ -263,6 +266,9 @@ impl LiftCache {
             self.retain_from(start);
             self.kept = self.lifted.len();
         }
+        if let Some(p) = &mut self.parity {
+            p.trim(start, at);
+        }
     }
 
     /// Forget every address below `start`: a pass lifting ranges in
@@ -314,11 +320,11 @@ impl LiftCache {
         idxs.iter().map(|&i| self.lifted[i as usize].as_ref().expect("lifted")).collect()
     }
 
-    /// The index of `addr`, lifting it (with `fast`, decoding through
-    /// `block`) when not cached.
+    /// The index of `addr`, lifting it (with `lifter`, decoding through
+    /// `block`) when not cached: a cache holds the lifts of one lifter.
     fn index_of<'m>(
         &mut self,
-        fast: &X86Lifter,
+        lifter: &X86Lifter,
         memory: &'m Memory,
         addr: u64,
         block: &mut Option<BlockDecoder<'m>>,
@@ -329,7 +335,8 @@ impl LiftCache {
         if self.lifted.len() == self.lifted.capacity() {
             self.reserve(self.lifted.len());
         }
-        let lifted = fast.decode_in_block(memory, addr, block).and_then(|insn| fast.lift_decoded(insn, addr, None)).ok();
+        let lifted =
+            lifter.decode_in_block(memory, addr, block).and_then(|insn| lifter.lift_decoded(insn, addr, None)).ok();
         let (flags, len, shape) = match &lifted {
             Some(insn) => {
                 let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
@@ -397,19 +404,57 @@ impl X86Lifter {
         cache: &'c mut LiftCache,
     ) -> CachedRange<'c> {
         match self.walk_cached(memory, start, count, cache) {
-            Some(idxs) => {
+            Ok(idxs) => {
                 let cache: &'c LiftCache = cache;
                 CachedRange::Cached(cache.insns(&idxs))
             }
-            None => CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default()),
+            Err(idxs) => CachedRange::Owned(self.lift_range_from_cache(memory, start, count, &idxs, cache)),
         }
+    }
+
+    /// `lift_range(memory, start, count)` for a range whose instructions
+    /// are the cache's `idxs` (as [`Self::walk_cached`] walked them) but
+    /// must be lifted as a whole (an x87 instruction, or the integer PF
+    /// needed): the lifts of the instructions alone are taken from the
+    /// cache (the PF ones from its parity cache) instead of decoding and
+    /// lifting them again, then finished as `lift_range` finishes them.
+    fn lift_range_from_cache(
+        &self,
+        memory: &Memory,
+        start: u64,
+        count: usize,
+        idxs: &[u32],
+        cache: &mut LiftCache,
+    ) -> Vec<LiftedInstruction> {
+        let fast_lifter = X86Lifter { is_64: self.is_64, parity: false };
+        let mut fast: Vec<LiftedInstruction> =
+            idxs.iter().map(|&i| cache.lifted[i as usize].clone().expect("lifted")).collect();
+        fast_lifter.lift_x87_range(memory, &mut fast);
+        if !(self.parity && needs_integer_parity(&fast)) {
+            return fast;
+        }
+        // `lift(self)` of `lift_range`: each instruction lifted alone with
+        // the PF (up to the first that fails), then the x87 pass
+        let parity = cache.parity.get_or_insert_with(Default::default);
+        let mut block = None;
+        let mut out = Vec::with_capacity(fast.len());
+        let mut addr = start;
+        for _ in 0..count {
+            let i = parity.index_of(self, memory, addr, &mut block);
+            let Some(l) = &parity.lifted[i as usize] else { break };
+            addr += u64::from(l.length);
+            out.push(l.clone());
+        }
+        self.lift_x87_range(memory, &mut out);
+        out
     }
 
     /// The cache indices of `lift_range(memory, start, count)` when every
     /// instruction of it is lifted alone, lifting into `cache` what it
-    /// lacks; `None` when the range must be lifted afresh as a whole (an
-    /// x87 instruction, or a PF reader needing the integer PF).
-    fn walk_cached(&self, memory: &Memory, start: u64, count: usize, cache: &mut LiftCache) -> Option<Vec<u32>> {
+    /// lacks; `Err` with them when the range must be lifted as a whole
+    /// (an x87 instruction, or a PF reader needing the integer PF:
+    /// [`Self::lift_range_from_cache`]).
+    fn walk_cached(&self, memory: &Memory, start: u64, count: usize, cache: &mut LiftCache) -> Result<Vec<u32>, Vec<u32>> {
         let fast = X86Lifter { is_64: self.is_64, parity: false };
         let mut idxs: Vec<u32> = Vec::with_capacity(count.min(4096));
         let mut addr = start;
@@ -440,16 +485,16 @@ impl X86Lifter {
         // The x87 pass rewrites nothing in a range without an x87
         // instruction, so such a range lifts as the cache has it.
         if any & X87 != 0 {
-            return None;
+            return Err(idxs);
         }
         // `needs_integer_parity`, its per-instruction test read from the cache
         if self.parity && any & READS_PF != 0 {
             let insns = cache.insns(&idxs);
             if parity_needed(&insns, |k| cache.flags[idxs[k] as usize] & READS_PF != 0) {
-                return None;
+                return Err(idxs);
             }
         }
-        Some(idxs)
+        Ok(idxs)
     }
 
     /// `g(k, insns, shapes)` for the `k`-th of `budgets`, `insns` being
@@ -474,7 +519,7 @@ impl X86Lifter {
         mut g: impl FnMut(usize, &[&LiftedInstruction], Option<&[crate::lift::InsnShape]>) -> R,
     ) -> Vec<R> {
         let max = budgets.iter().copied().max().unwrap_or(0);
-        if let Some(idxs) = self.walk_cached(memory, start, max, cache) {
+        if let Ok(idxs) = self.walk_cached(memory, start, max, cache) {
             let insns = cache.insns(&idxs);
             let shapes: Option<Vec<crate::lift::InsnShape>> =
                 with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
@@ -491,13 +536,13 @@ impl X86Lifter {
             .iter()
             .enumerate()
             .map(|(k, &b)| match self.walk_cached(memory, start, b, cache) {
-                Some(idxs) => {
+                Ok(idxs) => {
                     let shapes: Option<Vec<crate::lift::InsnShape>> =
                         with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
                     g(k, &cache.insns(&idxs), shapes.as_deref())
                 }
-                None => {
-                    let insns = self.lift_range(memory, start, b).unwrap_or_default();
+                Err(idxs) => {
+                    let insns = self.lift_range_from_cache(memory, start, b, &idxs, cache);
                     g(k, &insns.iter().collect::<Vec<_>>(), None)
                 }
             })
@@ -2530,8 +2575,10 @@ impl PcodeLift for X86Lifter {
         let lift = |lifter: &X86Lifter| {
             let mut results = Vec::with_capacity(count);
             let mut addr = start;
+            // decoded through one decoder over the block, as a range walk does
+            let mut block = None;
             for _ in 0..count {
-                match lifter.lift_instruction(memory, addr) {
+                match lifter.decode_in_block(memory, addr, &mut block).and_then(|insn| lifter.lift_decoded(insn, addr, None)) {
                     Ok(lifted) => {
                         addr += lifted.length as u64;
                         results.push(lifted);
@@ -2700,12 +2747,22 @@ impl X86Lifter {
         if !lifted.iter().any(|l| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87)) {
             return;
         }
-        if !lifted.iter().any(|l| l.mnemonic.starts_with('f')) {
+        // (the texts of the x87 ones first: they are the ones that start
+        // with `f`, and each text is formatted when first read)
+        let maybe_x87 = |l: &LiftedInstruction| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+        if !lifted.iter().filter(|l| maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
+            && !lifted.iter().filter(|l| !maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
+        {
             return;
         }
+        // the instruction a lift was made from is the one decoded at its
+        // address again
         let decoded: Vec<Option<iced_x86::Instruction>> = lifted
             .iter()
             .map(|l| {
+                if let Some(insn) = l.mnemonic.x86_instruction() {
+                    return Some(*insn);
+                }
                 let mut buf = [0u8; 15];
                 let n = memory.read_instruction_bytes(l.address, &mut buf);
                 let mut d = iced_x86::Decoder::with_ip(if self.is_64 { 64 } else { 32 }, &buf[..n], l.address, iced_x86::DecoderOptions::NONE);
