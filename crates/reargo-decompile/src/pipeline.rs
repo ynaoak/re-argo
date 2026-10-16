@@ -425,19 +425,32 @@ fn decompile_function_inner(
         })
         .unwrap_or(500);
 
-    let mut lifted = lifter
-        .lift_range(&program.info.memory, func_entry, max_insns)
-        .map_err(|e| e.to_string())?;
-
-    if lifted.is_empty() {
-        return Err(format!("no instructions at 0x{:x}", func_entry));
-    }
     // WS83: the function ends where its FDE does. Lifted further, a tail `jmp` into the next
     // function was followed into that function's code (0x39f04e0 printed 0x39f0520's loop);
     // dropped, the `jmp` leaves the code and becomes a tail call
-    if let Some((start, len)) = fde_bounds(&program.info.memory, &program.info.sections, func_entry) {
-        lifted = keep_fde_body(lifted, start, start + len);
-    }
+    let fde = fde_bounds(&program.info.memory, &program.info.sections, func_entry);
+    // (only the instructions kept are lifted, when the range allows)
+    let kept = fde.and_then(|(start, len)| oracle?.lift_fde_body(func_entry, max_insns, start, start + len));
+    let mut lifted = match kept {
+        Some((any, kept)) => {
+            if !any {
+                return Err(format!("no instructions at 0x{:x}", func_entry));
+            }
+            kept
+        }
+        None => {
+            let mut lifted = lifter
+                .lift_range(&program.info.memory, func_entry, max_insns)
+                .map_err(|e| e.to_string())?;
+            if lifted.is_empty() {
+                return Err(format!("no instructions at 0x{:x}", func_entry));
+            }
+            if let Some((start, len)) = fde {
+                lifted = keep_fde_body(lifted, start, start + len);
+            }
+            lifted
+        }
+    };
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
     let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));

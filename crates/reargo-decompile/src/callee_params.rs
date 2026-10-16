@@ -327,6 +327,29 @@ impl<'a> CalleeParams<'a> {
         Some(ControlFlowGraph::build_owned(crate::pipeline::trim_to_return(lifted)))
     }
 
+    /// `keep_fde_body(lift_range(start, count), lo, hi)` (the instructions in `[lo, hi)` and the
+    /// `int3`s right after `hi`), lifting only those when the range is the lifts of its
+    /// instructions alone; with whether the range was empty. `None` when it must be lifted as
+    /// a whole.
+    pub(crate) fn lift_fde_body(&self, start: u64, count: usize, lo: u64, hi: u64) -> Option<(bool, Vec<LiftedInstruction>)> {
+        let x86 = self.lifter.as_x86()?;
+        let addrs = x86.plain_range(self.memory, start, count, self.facts.as_ref()?)?;
+        let mut out = Vec::new();
+        let mut next = hi;
+        for &a in &addrs {
+            if a >= lo && a < hi {
+                out.push(x86.lift_alone(self.memory, a).ok()?);
+            } else if a == next {
+                let insn = x86.lift_alone(self.memory, a).ok()?;
+                if insn.mnemonic.trim() == "int3" {
+                    next += u64::from(insn.length);
+                    out.push(insn);
+                }
+            }
+        }
+        Some((!addrs.is_empty(), out))
+    }
+
     /// The depth-independent part of the analysis of the function at `target`, lifted once
     /// and shared by every depth (`None` when it cannot be lifted).
     fn summary(&self, target: u64) -> Option<std::sync::Arc<Summary>> {
@@ -367,17 +390,20 @@ impl<'a> CalleeParams<'a> {
             return None;
         }
         let idx_of = |a: u64| addrs.binary_search(&a).ok();
-        let mut lifted: Vec<Option<LiftedInstruction>> = vec![None; addrs.len()];
+        let mut seen = vec![false; addrs.len()];
+        let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
         let mut stack = vec![0usize];
         while let Some(idx) = stack.pop() {
-            if lifted[idx].is_some() {
+            if seen[idx] {
                 continue;
             }
+            seen[idx] = true;
             let insn = x86.lift_alone(self.memory, addrs[idx]).ok()?;
             crate::pipeline::reach_successors(&insn, idx_of, &mut stack);
-            lifted[idx] = Some(insn);
+            lifted.push((idx, insn));
         }
-        let insns: Vec<LiftedInstruction> = lifted.into_iter().flatten().collect();
+        lifted.sort_unstable_by_key(|(idx, _)| *idx);
+        let insns: Vec<LiftedInstruction> = lifted.into_iter().map(|(_, i)| i).collect();
         let hit_limit = addrs.len() >= MAX_INSNS;
         let truncated = hit_limit && insns.last().map(|i| i.address) == addrs.last().copied();
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
