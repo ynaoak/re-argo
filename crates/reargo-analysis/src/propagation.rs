@@ -44,13 +44,7 @@ impl Analyzer for ConstantPropagationAnalyzer {
         };
         let lifter: &dyn PcodeLift = &*lifter;
 
-        let valid_ranges: Vec<(u64, u64)> = program
-            .info
-            .sections
-            .iter()
-            .filter(|s| s.address != 0 && s.size > 0)
-            .map(|s| (s.address, s.address + s.size))
-            .collect();
+        let valid_ranges = valid_ranges(program);
 
         let func_entries: Vec<u64> = program
             .listing
@@ -60,11 +54,24 @@ impl Analyzer for ConstantPropagationAnalyzer {
 
         // Phase 1: per-function constant tracking in parallel against
         // an immutable view of `program`. Each thread emits the
-        // candidate (from, to) reference pairs it discovers.
-        let per_func: Vec<Vec<(u64, u64)>> = func_entries
-            .par_iter()
-            .map(|&entry| analyse_function(lifter, program, entry, &valid_ranges))
-            .collect();
+        // candidate (from, to) reference pairs it discovers. A
+        // function's candidates depend only on its entry, the bytes
+        // and the sections, so those the Stack Frame analyzer computed
+        // on the same lift ([`Precomputed`]) are taken as they are.
+        let ahead = program.analysis_cache.take::<Precomputed>().map(|p| p.0);
+        let jobs: Vec<(u64, usize)> = func_entries.iter().map(|&e| (e, LIFT_BUDGET)).collect();
+        let per_func: Vec<Vec<(u64, u64)>> = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
+            if is_64 {
+                crate::range_lift::map_lifted_ranges(&program.info.memory, missing, |_, insns| {
+                    analyse_lifted(insns, &valid_ranges)
+                })
+            } else {
+                missing
+                    .par_iter()
+                    .map(|&(entry, _)| analyse_function(lifter, program, entry, &valid_ranges))
+                    .collect()
+            }
+        });
 
         // Phase 2: merge discovered references / symbols into the
         // shared Program serially. Dedup against existing refs as
@@ -112,16 +119,44 @@ fn analyse_function(
     entry: u64,
     valid_ranges: &[(u64, u64)],
 ) -> Vec<(u64, u64)> {
-    let lifted = match lifter.lift_range(&program.info.memory, entry, 200) {
+    let lifted = match lifter.lift_range(&program.info.memory, entry, LIFT_BUDGET) {
         Ok(l) => l,
         Err(_) => return Vec::new(),
     };
+    analyse_lifted(&lifted.iter().collect::<Vec<_>>(), valid_ranges)
+}
 
+/// Instructions lifted from a function's entry (`lift_range(entry,
+/// LIFT_BUDGET)`).
+pub(crate) const LIFT_BUDGET: usize = 200;
+
+/// Candidates of functions computed ahead of this analyzer by the Stack
+/// Frame analyzer from the same lift, by `(entry, LIFT_BUDGET)`
+/// ([`analyse_lifted`] of `lift_range(entry, LIFT_BUDGET)` with the
+/// program's section ranges).
+pub(crate) struct Precomputed(pub crate::range_lift::AheadMap<Vec<(u64, u64)>>);
+
+/// The section ranges [`analyse_lifted`] tests pointers against.
+pub(crate) fn valid_ranges(program: &Program) -> Vec<(u64, u64)> {
+    program
+        .info
+        .sections
+        .iter()
+        .filter(|s| s.address != 0 && s.size > 0)
+        .map(|s| (s.address, s.address + s.size))
+        .collect()
+}
+
+/// [`analyse_function`] on the instructions `lifted` from its entry.
+pub(crate) fn analyse_lifted(
+    lifted: &[&reargo_lift::LiftedInstruction],
+    valid_ranges: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
     let mut reg_values: std::collections::BTreeMap<u64, u64> =
         std::collections::BTreeMap::new();
     let mut found = Vec::new();
 
-    for insn in &lifted {
+    for insn in lifted {
         for op in &insn.ops {
             if op.opcode == OpCode::Copy
                 && let (Some(out), Some(inp)) = (&op.output, op.inputs.first())

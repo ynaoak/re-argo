@@ -200,7 +200,9 @@ fn disassemble_function(
 ) -> Result<FunctionDiscovery, AnalysisError> {
     let mut block_queue: VecDeque<u64> = VecDeque::new();
     let mut block_visited: FxHashSet<u64> = FxHashSet::default();
-    let mut body = AddressSet::new();
+    // The body's ranges, gathered here and made a set at the end (in
+    // bulk: one range per instruction, re-decoded block starts repeat).
+    let mut body: Vec<AddressRange> = Vec::new();
     let mut call_targets: BTreeSet<u64> = BTreeSet::new();
     let mut references = Vec::new();
     let mut instruction_count = 0;
@@ -221,12 +223,16 @@ fn disassemble_function(
                 break;
             }
 
-            let insn = match program
-                .arch
-                .decode_instruction(&program.info.memory, addr)
-            {
-                Ok(insn) => insn,
-                Err(_) => break,
+            // Decoding is a pure function of the bytes, and only this
+            // pass lists instructions: one listed at `addr` is the one
+            // decoding gives (a block starting inside code decoded
+            // before, or a later run of the pass).
+            let (arch, memory) = (&program.arch, &program.info.memory);
+            let Some(insn) = program
+                .listing
+                .instruction_or_insert_with(addr, || arch.decode_instruction(memory, addr).ok())
+            else {
+                break;
             };
 
             let insn_addr = insn.address;
@@ -235,13 +241,11 @@ fn disassemble_function(
             let branch_target = insn.branch_target;
 
             global_visited.insert(insn_addr);
-            body.add(AddressRange::new(
+            body.push(AddressRange::new(
                 Address::new(SpaceId::RAM, insn_addr),
                 insn_len,
             ));
             instruction_count += 1;
-
-            program.listing.add_instruction(insn);
 
             match flow {
                 FlowType::Call => {
@@ -324,7 +328,7 @@ fn disassemble_function(
     }
 
     Ok(FunctionDiscovery {
-        body,
+        body: body.into_iter().collect::<AddressSet>(),
         call_targets,
         references,
         instruction_count,

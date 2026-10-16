@@ -56,10 +56,10 @@ impl Analyzer for WrapperFunctionAnalyzer {
         795
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        struct FuncSnap {
+        struct FuncSnap<'a> {
             entry: u64,
-            ranges: Vec<(u64, u64)>,
-            call_targets: BTreeSet<u64>,
+            body: &'a reargo_core::address::AddressSet,
+            call_targets: &'a BTreeSet<u64>,
             is_thunk: bool,
         }
         let snaps: Vec<FuncSnap> = program
@@ -67,12 +67,8 @@ impl Analyzer for WrapperFunctionAnalyzer {
             .functions()
             .map(|f| FuncSnap {
                 entry: f.entry_point,
-                ranges: f
-                    .body
-                    .ranges()
-                    .map(|r| (r.start.offset, r.start.offset + r.size))
-                    .collect(),
-                call_targets: f.call_targets.clone(),
+                body: &f.body,
+                call_targets: &f.call_targets,
                 is_thunk: f.is_thunk,
             })
             .collect();
@@ -96,14 +92,12 @@ impl Analyzer for WrapperFunctionAnalyzer {
 
             let mut insn_count = 0usize;
             let mut has_call = false;
-            for (s, e) in &snap.ranges {
-                for ins in program.listing.instructions_in_range(*s, *e) {
-                    insn_count += 1;
-                    if matches!(ins.flow_type, FlowType::Call | FlowType::IndirectCall) {
-                        has_call = true;
-                    }
+            program.listing.for_each_body_instruction(snap.body, |_, ins| {
+                insn_count += 1;
+                if matches!(ins.flow_type, FlowType::Call | FlowType::IndirectCall) {
+                    has_call = true;
                 }
-            }
+            });
             // 1..=18 covers debug-build wrappers (`-O0` adds a
             // prologue + per-arg save/reload pattern that pushes
             // insn count up to ~15 even for `return f(args)` with

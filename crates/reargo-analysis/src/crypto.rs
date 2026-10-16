@@ -98,14 +98,14 @@ impl Analyzer for CryptoConstantAnalyzer {
     }
 }
 
-/// Boyer-Moore would be overkill here — the haystacks are bounded at
-/// 1 MiB per section and we run at most a few dozen needles. Linear
-/// scan keeps the implementation auditable.
+/// The first offset of `needle` in `haystack` (a SIMD substring
+/// search: a window-by-window compare cost a `memcmp` call per byte of
+/// every data section, for each of the needles).
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 struct Fingerprint {

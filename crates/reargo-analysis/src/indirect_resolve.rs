@@ -68,29 +68,20 @@ impl Analyzer for IndirectCallResolver {
             });
         }
 
+        // The results the Stack Frame analyzer computed ahead from the
+        // same lifts ([`Ahead`]) are taken as they are.
+        let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
+
         // Build a GOT-address → import name map.
-        let by_got: BTreeMap<u64, &str> = program
-            .info
-            .imports
-            .iter()
-            .map(|imp| (imp.got_address, imp.name.as_str()))
-            .collect();
-        if by_got.is_empty() {
+        let Some(got) = GotMap::new(program) else {
             return Ok(AnalysisResult {
                 analyzer_name: self.name().into(),
                 functions_found: 0,
                 references_found: 0,
                 instructions_decoded: 0,
             });
-        }
-
-        // First import of each name → its PLT address (what a
-        // linear `imports.iter().find(name)` returns).
-        let mut plt_by_name: FxHashMap<&str, u64> = FxHashMap::default();
-        for imp in &program.info.imports {
-            plt_by_name.entry(imp.name.as_str()).or_insert(imp.plt_address);
-        }
-        let plt_of_got = |got: u64| by_got.get(&got).and_then(|name| plt_by_name.get(name).copied());
+        };
+        let plt_of_got = |g: u64| got.plt_of_got(g);
 
         // (1) Bytewise pass over decoded instructions for the dominant
         // `call qword ptr [rip+disp32]` and `jmp qword ptr [rip+disp32]`
@@ -114,23 +105,25 @@ impl Analyzer for IndirectCallResolver {
         // A range without an indirect `call` has no `CallInd` and so
         // resolves nothing: only the ranges holding one (found by a
         // decode, much cheaper than the lift) are lifted.
-        let jobs: Vec<(u64, usize)> = program
-            .listing
-            .functions()
-            .map(|f| {
-                let budget = f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200);
-                (f.entry_point, budget)
-            })
-            .collect();
+        let jobs: Vec<(u64, usize)> =
+            program.listing.functions().map(|f| (f.entry_point, budget(f))).collect();
         let scanner = reargo_lift::x86::X86Lifter::new_64();
         let memory = &program.info.memory;
-        let jobs: Vec<(u64, usize)> = jobs
-            .par_iter()
-            .filter(|&&(entry, budget)| scanner.range_has_indirect_call(memory, entry, budget))
-            .copied()
-            .collect();
-        let per_function = crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |_, lifted| {
-            resolve_lifted(lifted, &plt_of_got)
+        let per_function = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
+            let has_call: Vec<bool> = missing
+                .par_iter()
+                .map(|&(entry, budget)| scanner.range_has_indirect_call(memory, entry, budget))
+                .collect();
+            let lift: Vec<(u64, usize)> =
+                missing.iter().zip(&has_call).filter(|(_, h)| **h).map(|(j, _)| *j).collect();
+            let mut lifted = crate::range_lift::map_lifted_ranges(memory, &lift, |_, lifted| {
+                resolve_lifted(lifted, &plt_of_got)
+            })
+            .into_iter();
+            has_call
+                .iter()
+                .map(|&h| if h { lifted.next().expect("one result per lifted job") } else { Vec::new() })
+                .collect()
         });
         resolved.extend(per_function.into_iter().flatten());
 
@@ -160,12 +153,54 @@ impl Analyzer for IndirectCallResolver {
     }
 }
 
+/// The instructions lifted from a function's entry.
+pub(crate) fn budget(f: &reargo_program::function::Function) -> usize {
+    f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200)
+}
+
+/// [`resolve_lifted`] of functions, computed ahead of this analyzer
+/// from the same lift, by `(entry, budget)`.
+pub(crate) struct Ahead(pub crate::range_lift::AheadMap<Vec<(u64, u64)>>);
+
+/// The import of each GOT slot: what a call through the slot reaches.
+pub(crate) struct GotMap<'p> {
+    by_got: BTreeMap<u64, &'p str>,
+    plt_by_name: FxHashMap<&'p str, u64>,
+}
+
+impl<'p> GotMap<'p> {
+    /// `None` when the program imports nothing (no call resolves).
+    pub(crate) fn new(program: &'p Program) -> Option<Self> {
+        let by_got: BTreeMap<u64, &str> = program
+            .info
+            .imports
+            .iter()
+            .map(|imp| (imp.got_address, imp.name.as_str()))
+            .collect();
+        if by_got.is_empty() {
+            return None;
+        }
+        // First import of each name → its PLT address (what a
+        // linear `imports.iter().find(name)` returns).
+        let mut plt_by_name: FxHashMap<&str, u64> = FxHashMap::default();
+        for imp in &program.info.imports {
+            plt_by_name.entry(imp.name.as_str()).or_insert(imp.plt_address);
+        }
+        Some(Self { by_got, plt_by_name })
+    }
+
+    /// The PLT address of the import whose GOT slot is `got`.
+    pub(crate) fn plt_of_got(&self, got: u64) -> Option<u64> {
+        self.by_got.get(&got).and_then(|name| self.plt_by_name.get(name).copied())
+    }
+}
+
 /// `(call site, target)` of every `CallInd` in `lifted` whose target
 /// register provably holds a constant: a caller-saved-aware constness
 /// map per varnode `(space, offset)` key. Size is ignored so 4-byte
 /// and 8-byte writes both kill the prior constant; good enough for the
 /// GOT-load pattern.
-fn resolve_lifted(lifted: &[&LiftedInstruction], plt_of_got: &dyn Fn(u64) -> Option<u64>) -> Vec<(u64, u64)> {
+pub(crate) fn resolve_lifted(lifted: &[&LiftedInstruction], plt_of_got: &dyn Fn(u64) -> Option<u64>) -> Vec<(u64, u64)> {
     let mut resolved: Vec<(u64, u64)> = Vec::new();
     let mut const_for: FxHashMap<(SpaceId, u64), u64> = FxHashMap::default();
     for insn in lifted {

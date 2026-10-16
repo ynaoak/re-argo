@@ -10,6 +10,7 @@
 //! Perlin `1/64` coordinate scale).
 
 use iced_x86::{Decoder, DecoderOptions, Instruction as IcedInsn, Mnemonic, OpKind, Register};
+use rayon::prelude::*;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
@@ -144,63 +145,76 @@ impl Analyzer for FloatConstantAnalyzer {
             .map(|s| (s.address, s.address + s.size))
             .collect();
 
-        // Snapshot (addr, bytes) so we decode against an immutable view.
-        let insns: Vec<(u64, Vec<u8>)> = program
-            .listing
-            .instructions()
-            .map(|i| (i.address, i.bytes.to_vec()))
+        // Decode every instruction once, in parallel against an
+        // immutable view; the hits keep listing order and are applied
+        // in that order below.
+        enum Hit {
+            Packed(u64, u32),
+            Scalar(u64, u32),
+        }
+        let insns: Vec<&reargo_arch::DecodedInstruction> = program.listing.instructions().collect();
+        let hits: Vec<(u64, Hit)> = insns
+            .par_iter()
+            .filter_map(|i| {
+                let ii = decode_one(i.address, &i.bytes)?;
+                if let Some(t) = packed_const_load(&ii) {
+                    return Some((i.address, Hit::Packed(t.0, t.1)));
+                }
+                float_const_load(&ii).map(|t| (i.address, Hit::Scalar(t.0, t.1)))
+            })
             .collect();
+        drop(insns);
 
         let mut annotated = 0usize;
-        for (addr, bytes) in &insns {
-            if let Some((target, width)) = decode_packed_const_load(*addr, bytes) {
-                if !ranges.iter().any(|(s, e)| target >= *s && target + 16 <= *e) {
-                    continue;
-                }
-                let lanes = 16 / width;
-                let mut vals = Vec::with_capacity(lanes as usize);
-                for k in 0..lanes {
-                    let a = target + (k * width) as u64;
-                    let v = match width {
-                        4 => program.info.memory.read_u32(a).ok().map(|b| f32::from_bits(b) as f64),
-                        _ => program.info.memory.read_u64(a).ok().map(f64::from_bits),
-                    };
-                    match v {
-                        Some(v) => vals.push(v),
-                        None => break,
+        for (addr, hit) in &hits {
+            match *hit {
+                Hit::Packed(target, width) => {
+                    if !ranges.iter().any(|(s, e)| target >= *s && target + 16 <= *e) {
+                        continue;
                     }
+                    let lanes = 16 / width;
+                    let mut vals = Vec::with_capacity(lanes as usize);
+                    for k in 0..lanes {
+                        let a = target + (k * width) as u64;
+                        let v = match width {
+                            4 => program.info.memory.read_u32(a).ok().map(|b| f32::from_bits(b) as f64),
+                            _ => program.info.memory.read_u64(a).ok().map(f64::from_bits),
+                        };
+                        match v {
+                            Some(v) => vals.push(v),
+                            None => break,
+                        }
+                    }
+                    if vals.len() as u32 != lanes
+                        || program.comments.get(*addr, CommentType::Eol).is_some()
+                    {
+                        continue;
+                    }
+                    program
+                        .comments
+                        .set(*addr, CommentType::Eol, format_packed(&vals, width));
+                    annotated += 1;
                 }
-                if vals.len() as u32 != lanes
-                    || program.comments.get(*addr, CommentType::Eol).is_some()
-                {
-                    continue;
+                Hit::Scalar(target, width) => {
+                    if !ranges.iter().any(|(s, e)| target >= *s && target < *e) {
+                        continue;
+                    }
+                    let value = match width {
+                        4 => program.info.memory.read_u32(target).ok().map(|b| f32::from_bits(b) as f64),
+                        8 => program.info.memory.read_u64(target).ok().map(f64::from_bits),
+                        _ => None,
+                    };
+                    let Some(v) = value else { continue };
+                    // Don't clobber an existing EOL comment.
+                    if program.comments.get(*addr, CommentType::Eol).is_some() {
+                        continue;
+                    }
+                    program
+                        .comments
+                        .set(*addr, CommentType::Eol, format_const(v, width));
+                    annotated += 1;
                 }
-                program
-                    .comments
-                    .set(*addr, CommentType::Eol, format_packed(&vals, width));
-                annotated += 1;
-                continue;
             }
-            let Some((target, width)) = decode_float_const_load(*addr, bytes) else {
-                continue;
-            };
-            if !ranges.iter().any(|(s, e)| target >= *s && target < *e) {
-                continue;
-            }
-            let value = match width {
-                4 => program.info.memory.read_u32(target).ok().map(|b| f32::from_bits(b) as f64),
-                8 => program.info.memory.read_u64(target).ok().map(f64::from_bits),
-                _ => None,
-            };
-            let Some(v) = value else { continue };
-            // Don't clobber an existing EOL comment.
-            if program.comments.get(*addr, CommentType::Eol).is_some() {
-                continue;
-            }
-            program
-                .comments
-                .set(*addr, CommentType::Eol, format_const(v, width));
-            annotated += 1;
         }
 
         Ok(AnalysisResult {
@@ -241,15 +255,23 @@ pub fn rip_relative_data_targets(code: &[u8], base: u64, bits: u32) -> Vec<(u64,
     out
 }
 
-/// If `bytes` at `addr` decode to a float SSE op with a rip-relative memory
-/// operand, return `(effective_target_address, element_width_bytes)`.
-fn decode_float_const_load(addr: u64, bytes: &[u8]) -> Option<(u64, u32)> {
+/// Decode the instruction `bytes` at `addr` (64-bit); `None` when invalid.
+fn decode_one(addr: u64, bytes: &[u8]) -> Option<IcedInsn> {
     let mut dec = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);
     let mut ii = IcedInsn::default();
     dec.decode_out(&mut ii);
-    if ii.is_invalid() {
-        return None;
-    }
+    (!ii.is_invalid()).then_some(ii)
+}
+
+/// If `bytes` at `addr` decode to a float SSE op with a rip-relative memory
+/// operand, return `(effective_target_address, element_width_bytes)`.
+#[cfg(test)]
+fn decode_float_const_load(addr: u64, bytes: &[u8]) -> Option<(u64, u32)> {
+    float_const_load(&decode_one(addr, bytes)?)
+}
+
+/// `decode_float_const_load` of a decoded instruction.
+fn float_const_load(ii: &IcedInsn) -> Option<(u64, u32)> {
     let width = float_width(ii.mnemonic())?;
     // Must have a memory operand based on RIP (a constant pool reference).
     let mem = (0..ii.op_count()).any(|i| ii.op_kind(i) == OpKind::Memory);
@@ -263,13 +285,13 @@ fn decode_float_const_load(addr: u64, bytes: &[u8]) -> Option<(u64, u32)> {
 
 /// If `bytes` at `addr` decode to a packed-float op whose memory operand is a
 /// RIP-relative 128-bit constant, return `(target, element_width_bytes)`.
+#[cfg(test)]
 fn decode_packed_const_load(addr: u64, bytes: &[u8]) -> Option<(u64, u32)> {
-    let mut dec = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);
-    let mut ii = IcedInsn::default();
-    dec.decode_out(&mut ii);
-    if ii.is_invalid() {
-        return None;
-    }
+    packed_const_load(&decode_one(addr, bytes)?)
+}
+
+/// `decode_packed_const_load` of a decoded instruction.
+fn packed_const_load(ii: &IcedInsn) -> Option<(u64, u32)> {
     let width = packed_float_width(ii.mnemonic())?;
     let mem = (0..ii.op_count()).any(|i| ii.op_kind(i) == OpKind::Memory);
     if !mem || ii.memory_base() != Register::RIP || ii.memory_size().size() != 16 {

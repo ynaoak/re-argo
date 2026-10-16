@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 
 use reargo_arch::FlowType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -60,38 +61,26 @@ impl Analyzer for ComplexityAnalyzer {
             }
         }
 
-        // Snapshot per-function so the iteration borrow doesn't fight
-        // the metadata writes downstream.
-        struct Snap {
-            entry: u64,
-            ranges: Vec<(u64, u64)>,
-            call_targets_count: usize,
-            stack_size: u64,
-        }
-        let snaps: Vec<Snap> = program
-            .listing
-            .functions()
-            .map(|f| Snap {
-                entry: f.entry_point,
-                ranges: f
-                    .body
-                    .ranges()
-                    .map(|r| (r.start.offset, r.start.offset + r.size))
-                    .collect(),
-                call_targets_count: f.call_targets.len(),
-                stack_size: f.stack_frame.local_size,
-            })
-            .collect();
-
-        let mut counted = 0usize;
-        for snap in &snaps {
-            let mut instructions = 0usize;
-            let mut conditional = 0usize;
-            let mut block_starts: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-            block_starts.insert(snap.entry);
-            for (start, end) in &snap.ranges {
+        // Compute every function's metrics first, then write them, so
+        // the listing borrow doesn't fight the metadata writes.
+        // Functions are independent: computed in parallel, kept in
+        // function order.
+        let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
+        let listing = &program.listing;
+        let computed: Vec<(u64, FunctionMetrics)> = funcs
+            .par_iter()
+            .map(|f| {
+                let entry = f.entry_point;
+                let mut instructions = 0usize;
+                let mut conditional = 0usize;
+                let mut block_starts: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+                block_starts.insert(entry);
+                // `prev_was_branch` starts false in each body range.
                 let mut prev_was_branch = false;
-                for insn in program.listing.instructions_in_range(*start, *end) {
+                listing.for_each_body_instruction(&f.body, |first, insn| {
+                    if first {
+                        prev_was_branch = false;
+                    }
                     instructions += 1;
                     if prev_was_branch {
                         block_starts.insert(insn.address);
@@ -113,22 +102,27 @@ impl Analyzer for ComplexityAnalyzer {
                         }
                         _ => {}
                     }
-                }
-            }
-            let basic_blocks = block_starts.len().max(1);
-            let cyclomatic = conditional + 1;
+                });
+                let basic_blocks = block_starts.len().max(1);
+                let cyclomatic = conditional + 1;
 
-            let metrics = FunctionMetrics {
-                instructions,
-                basic_blocks,
-                cyclomatic,
-                fan_in: callers_of.get(&snap.entry).copied().unwrap_or(0),
-                fan_out: snap.call_targets_count,
-                stack_size: snap.stack_size,
-            };
+                let metrics = FunctionMetrics {
+                    instructions,
+                    basic_blocks,
+                    cyclomatic,
+                    fan_in: callers_of.get(&entry).copied().unwrap_or(0),
+                    fan_out: f.call_targets.len(),
+                    stack_size: f.stack_frame.local_size,
+                };
+                (entry, metrics)
+            })
+            .collect();
+        drop(funcs);
 
+        let mut counted = 0usize;
+        for (entry, metrics) in computed {
             program.metadata.set_property(
-                format!("func_{:x}_metrics", snap.entry),
+                format!("func_{:x}_metrics", entry),
                 format!(
                     "insns={} blocks={} mccabe={} fan_in={} fan_out={} stack={}",
                     metrics.instructions,

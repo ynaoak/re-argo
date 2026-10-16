@@ -61,33 +61,24 @@ impl Analyzer for StringHintRenameAnalyzer {
 
         struct Candidate {
             entry: u64,
-            ranges: Vec<(u64, u64)>,
+            // The body's addresses, as runs of adjacent ranges.
+            runs: Vec<(u64, u64)>,
         }
         let candidates: Vec<Candidate> = program
             .listing
             .functions()
             .filter(|f| f.name.starts_with("FUN_") && !f.is_thunk)
-            .map(|f| Candidate {
-                entry: f.entry_point,
-                ranges: f
-                    .body
-                    .ranges()
-                    .map(|r| (r.start.offset, r.start.offset + r.size))
-                    .collect(),
-            })
+            .map(|f| Candidate { entry: f.entry_point, runs: f.body.runs() })
             .collect();
 
         let mut renames: Vec<(u64, String)> = Vec::new();
         for cand in &candidates {
             // References whose source is inside this function and
-            // whose target dereferences to a printable string.
+            // whose target dereferences to a printable string: those
+            // from each body address in turn.
             let mut best: Option<(u64, String)> = None;
-            for (start, end) in &cand.ranges {
-                for from in *start..*end {
-                    let refs = program.references.get_refs_from(from);
-                    if refs.is_empty() {
-                        continue;
-                    }
+            for (start, end) in &cand.runs {
+                for refs in program.references.refs_from_range(*start, *end) {
                     for r in refs {
                         let Some(s) = read_c_string(program, r.to) else {
                             continue;

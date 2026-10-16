@@ -97,8 +97,7 @@ impl Analyzer for AntiDebugAnalyzer {
         for (addr, note) in &api_edges {
             if program
                 .listing
-                .instructions_in_range(*addr, *addr + 1)
-                .next()
+                .get_instruction(*addr)
                 .is_none()
             {
                 continue;

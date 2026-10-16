@@ -85,12 +85,18 @@ pub struct JumpMark {
     len: usize,
 }
 
+/// The references from (or to) one address, in the order added.
+type RefList = smallvec::SmallVec<[Reference; 2]>;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceManager {
     // Address-ordered so `all_refs()` yields references in the same
     // order on every run (a `HashMap` made it depend on the hash seed).
-    refs_from: BTreeMap<u64, Vec<Reference>>,
-    refs_to: BTreeMap<u64, Vec<Reference>>,
+    // Most addresses have one or two references each way (a call or a
+    // conditional jump: the target and the fall-through): kept inline,
+    // without an allocation (serialized as a sequence, like a `Vec`).
+    refs_from: BTreeMap<u64, RefList>,
+    refs_to: BTreeMap<u64, RefList>,
     // Every jump reference (`RefType::is_jump`), in the order added:
     // lets a cache of per-function results tell which code gained a
     // jump into it since a mark (references are only ever added,
@@ -182,6 +188,14 @@ impl ReferenceManager {
         self.refs_to.values().flatten().filter(|r| r.ref_type.is_jump())
     }
 
+    /// The references from each address in `start..end` that has any,
+    /// in address order (as `get_refs_from` of each address in turn
+    /// gives them); nothing when `start >= end`.
+    pub fn refs_from_range(&self, start: u64, end: u64) -> impl Iterator<Item = &[Reference]> {
+        let range = (start < end).then(|| self.refs_from.range(start..end));
+        range.into_iter().flatten().map(|(_, v)| v.as_slice())
+    }
+
     pub fn all_refs(&self) -> impl Iterator<Item = &Reference> {
         self.refs_from.values().flat_map(|v| v.iter())
     }
@@ -222,5 +236,27 @@ mod tests {
         // a mark of another manager is not read against this one
         let other = ReferenceManager::new();
         assert_eq!(other.jumps_since(mark), None);
+    }
+
+    #[test]
+    fn refs_from_range_walks_addresses_in_order() {
+        let mut mgr = ReferenceManager::new();
+        mgr.add(Reference::new(0x1008, 0x3000, RefType::DataRead));
+        mgr.add(Reference::new(0x1000, 0x2000, RefType::UnconditionalCall));
+        mgr.add(Reference::new(0x1000, 0x1005, RefType::FallThrough));
+        mgr.add(Reference::new(0x1000, 0x2008, RefType::DataRead));
+        mgr.add(Reference::new(0x1010, 0x3000, RefType::DataRead));
+        let walk = |s: u64, e: u64| -> Vec<Reference> {
+            mgr.refs_from_range(s, e).flatten().copied().collect()
+        };
+        let per_address = |s: u64, e: u64| -> Vec<Reference> {
+            (s..e).flat_map(|a| mgr.get_refs_from(a).iter().copied()).collect()
+        };
+        for (s, e) in [(0x1000, 0x1010), (0x1001, 0x1011), (0x0, 0x2000), (0x1008, 0x1008), (0x1009, 0x1001)] {
+            assert_eq!(walk(s, e), per_address(s, e), "{s:#x}..{e:#x}");
+        }
+        // three references from one address: kept in the order added
+        assert_eq!(mgr.get_refs_from(0x1000).iter().map(|r| r.to).collect::<Vec<_>>(), [0x2000, 0x1005, 0x2008]);
+        assert_eq!(mgr.get_refs_to(0x3000).len(), 2);
     }
 }

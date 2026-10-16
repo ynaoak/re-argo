@@ -33,10 +33,10 @@ impl Analyzer for DataReferenceAnalyzer {
         // ScalarReferenceAnalyzer (round 2) and
         // StringReferenceAnalyzer (round 9): per-window pointer
         // detection is read-only and embarrassingly parallel.
-        let instructions: Vec<(u64, Vec<u8>)> = program
+        let instructions: Vec<(u64, &[u8])> = program
             .listing
             .instructions()
-            .map(|i| (i.address, i.bytes.to_vec()))
+            .map(|i| (i.address, &i.bytes[..]))
             .collect();
 
         // Phase 1: scan windows in parallel, collect candidate refs.
@@ -57,6 +57,7 @@ impl Analyzer for DataReferenceAnalyzer {
                 out.into_iter()
             })
             .collect();
+        drop(instructions);
 
         // Phase 2: apply serially, deduplicating against existing refs.
         let mut refs_found = 0;

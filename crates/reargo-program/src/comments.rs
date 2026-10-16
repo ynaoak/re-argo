@@ -45,6 +45,11 @@ impl CommentManager {
             .collect()
     }
 
+    /// Every comment as `iter` gives them (same order), borrowed.
+    pub fn iter_refs(&self) -> impl Iterator<Item = (u64, CommentType, &str)> + '_ {
+        self.comments.iter().map(|((addr, ct), text)| (*addr, *ct, text.as_str()))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = Comment> + '_ {
         self.comments.iter().map(|((addr, ct), text)| Comment {
             address: *addr,

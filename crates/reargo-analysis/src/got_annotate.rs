@@ -84,8 +84,7 @@ impl Analyzer for GotAnnotator {
         for (from, to) in edges {
             if program
                 .listing
-                .instructions_in_range(from, from + 1)
-                .next()
+                .get_instruction(from)
                 .is_none()
             {
                 continue;

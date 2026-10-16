@@ -515,6 +515,7 @@ dependencies = [
  "goblin",
  "iced-x86",
  "md-5",
+ "memchr",
  "petgraph",
  "rayon",
  "reargo-arch",

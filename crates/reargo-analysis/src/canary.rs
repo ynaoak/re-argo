@@ -20,6 +20,7 @@
 //! still report on inlined-fail paths that don't `call` the helper).
 
 use reargo_program::comments::CommentType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -58,9 +59,9 @@ impl Analyzer for StackCanaryAnalyzer {
             .map(|s| s.address)
             .collect();
 
-        struct FuncSnap {
+        struct FuncSnap<'a> {
             entry: u64,
-            ranges: Vec<(u64, u64)>,
+            body: &'a reargo_core::address::AddressSet,
             calls_chk: bool,
         }
         let func_ranges: Vec<FuncSnap> = program
@@ -68,30 +69,28 @@ impl Analyzer for StackCanaryAnalyzer {
             .functions()
             .map(|f| FuncSnap {
                 entry: f.entry_point,
-                ranges: f
-                    .body
-                    .ranges()
-                    .map(|r| (r.start.offset, r.start.offset + r.size))
-                    .collect(),
+                body: &f.body,
                 calls_chk: f.call_targets.iter().any(|t| chk_fail_addrs.contains(t)),
             })
             .collect();
 
+        // Functions walked in parallel, kept in function order.
+        let listing = &program.listing;
+        let has_load: Vec<bool> = func_ranges
+            .par_iter()
+            .map(|snap| {
+                let mut has_canary_load = false;
+                listing.for_each_body_instruction(snap.body, |_, insn| {
+                    if !has_canary_load && is_canary_load(&insn.bytes) {
+                        has_canary_load = true;
+                    }
+                });
+                has_canary_load
+            })
+            .collect();
         let mut marked = 0usize;
         let mut annotations: Vec<(u64, &'static str)> = Vec::new();
-        for snap in &func_ranges {
-            let mut has_canary_load = false;
-            for (start, end) in &snap.ranges {
-                for insn in program.listing.instructions_in_range(*start, *end) {
-                    if is_canary_load(&insn.bytes) {
-                        has_canary_load = true;
-                        break;
-                    }
-                }
-                if has_canary_load {
-                    break;
-                }
-            }
+        for (snap, has_canary_load) in func_ranges.iter().zip(has_load) {
             if has_canary_load && snap.calls_chk {
                 annotations.push((snap.entry, "stack-protected"));
                 marked += 1;
