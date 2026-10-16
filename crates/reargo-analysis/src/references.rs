@@ -42,24 +42,41 @@ impl Analyzer for ScalarReferenceAnalyzer {
         // because `program.listing.instructions()` is a serial
         // iterator; collecting once and then `par_iter`ing is cheaper
         // than locking on every step.
-        let insn_snapshot: Vec<_> = program
-            .listing
-            .instructions()
-            .map(|insn| (insn.address, insn.bytes.clone()))
-            .collect();
+        let insn_snapshot: Vec<_> = program.listing.instructions().map(|insn| (insn.address, &insn.bytes)).collect();
+        // no section below `lowest` or at / above `highest`: most
+        // windows are rejected by these two compares
+        let lowest = valid_ranges.iter().map(|r| r.0).min().unwrap_or(0);
+        let highest = valid_ranges.iter().map(|r| r.1).max().unwrap_or(0);
 
-        let instructions: Vec<(u64, Vec<u64>)> = insn_snapshot
+        // With each constant, what the serial phase asks of it that
+        // depends only on the bytes and on the references the
+        // instruction had before this pass: whether it is one already,
+        // whether it is in an executable section, and whether a string
+        // starts there.
+        struct Constant {
+            target: u64,
+            known: bool,
+            executable: bool,
+            string: bool,
+        }
+        let instructions: Vec<(u64, Vec<Constant>)> = insn_snapshot
             .par_iter()
             .map(|(addr, bytes)| {
-                let constants: Vec<u64> = bytes
+                let constants: Vec<Constant> = bytes
                     .windows(4)
                     .filter_map(|w| {
                         let val = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as u64;
-                        if is_valid_pointer(val, &valid_ranges) {
+                        if val >= lowest && val < highest && is_valid_pointer(val, &valid_ranges) {
                             Some(val)
                         } else {
                             None
                         }
+                    })
+                    .map(|target| Constant {
+                        target,
+                        known: program.references.get_refs_from(*addr).iter().any(|r| r.to == target),
+                        executable: is_in_executable_section(target, &program.info.sections),
+                        string: try_read_string(&program.info.memory, target).is_some(),
                     })
                     .collect();
                 (*addr, constants)
@@ -68,11 +85,14 @@ impl Analyzer for ScalarReferenceAnalyzer {
             .collect();
 
         for (insn_addr, constants) in &instructions {
-            for &target in constants {
-                if program.references.get_refs_from(*insn_addr).iter().any(|r| r.to == target) {
+            for (k, c) in constants.iter().enumerate() {
+                let target = c.target;
+                // the references from this instruction: those before
+                // this pass, and those it added for the constants before
+                if c.known || constants[..k].iter().any(|p| !p.known && p.target == target) {
                     continue;
                 }
-                let ref_type = if is_in_executable_section(target, &program.info.sections) {
+                let ref_type = if c.executable {
                     RefType::UnconditionalJump
                 } else {
                     RefType::DataRead
@@ -80,16 +100,14 @@ impl Analyzer for ScalarReferenceAnalyzer {
                 program.references.add(Reference::new(*insn_addr, target, ref_type));
                 refs_found += 1;
 
-                if program.symbol_table.primary_at(target).is_none()
-                    && let Some(s) = try_read_string(&program.info.memory, target) {
-                        program.symbol_table.add(Symbol::new(
-                            format!("DAT_{:x}", target),
-                            target,
-                            SymbolType::Data,
-                            SourceType::Analysis,
-                        ));
-                        let _ = s;
-                    }
+                if c.string && program.symbol_table.primary_at(target).is_none() {
+                    program.symbol_table.add(Symbol::new(
+                        format!("DAT_{:x}", target),
+                        target,
+                        SymbolType::Data,
+                        SourceType::Analysis,
+                    ));
+                }
             }
         }
 
