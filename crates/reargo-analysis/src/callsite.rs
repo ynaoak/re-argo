@@ -416,10 +416,13 @@ pub fn resolve_call_sites_iterative_from(
     }
     let mut sites = dedup_sites(round0.iter().filter_map(|w| w.sites.as_deref()));
     let mut prev_total_known = count_known_args(&sites);
+    // the lifts of the functions rewalked, for the next rounds (mostly
+    // the same functions)
+    let mut lifts = RewalkLifts::default();
     for _ in 0..max_iters {
         let mut summaries = build_param_summaries(&sites);
         keep_closed_callers(program, &sites, &mut summaries);
-        let next = rewalk_round(lifter, program, round0, &summaries);
+        let next = rewalk_round_with(lifter, program, round0, &summaries, &mut lifts);
         let next_known = count_known_args(&next);
         sites = next;
         if next_known == prev_total_known {
@@ -438,14 +441,48 @@ pub fn rewalk_round(
     round0: &[FunctionWalk],
     summaries: &ParamSummaries,
 ) -> Vec<CallSite> {
+    rewalk_round_with(lifter, program, round0, summaries, &mut RewalkLifts::default())
+}
+
+/// A function's lift (`None` when it failed) and its
+/// [`crate::func_lift::external_entries`], by `(entry, budget)`.
+type RewalkLifts =
+    FxHashMap<(u64, usize), Option<(Vec<LiftedInstruction>, std::collections::BTreeSet<u64>)>>;
+
+/// [`rewalk_round`] reusing (and adding to) the lifts in `lifts`; the
+/// program must not change between the rounds that share them.
+fn rewalk_round_with(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    round0: &[FunctionWalk],
+    summaries: &ParamSummaries,
+    lifts: &mut RewalkLifts,
+) -> Vec<CallSite> {
+    let rewalk = |w: &FunctionWalk| w.sites.is_some() && seeds_anything(summaries.get(&w.entry));
+    let missing: Vec<(u64, usize)> = round0
+        .iter()
+        .filter(|w| rewalk(w) && !lifts.contains_key(&(w.entry, w.max_insns)))
+        .map(|w| (w.entry, w.max_insns))
+        .collect();
+    let lifted: Vec<_> = missing
+        .par_iter()
+        .map(|&(entry, max_insns)| {
+            lift_function(lifter, program, entry, max_insns).map(|insns| {
+                let external = crate::func_lift::external_entries(program, &insns);
+                (insns, external)
+            })
+        })
+        .collect();
+    lifts.extend(missing.into_iter().zip(lifted));
+    let lifts = &*lifts;
     let rewalked: Vec<Option<Vec<CallSite>>> = round0
         .par_iter()
         .map(|w| {
-            if w.sites.is_none() || !seeds_anything(summaries.get(&w.entry)) {
+            if !rewalk(w) {
                 return None;
             }
-            let insns = lift_function(lifter, program, w.entry, w.max_insns)?;
-            Some(walk_function(program, w.entry, &insns, summaries))
+            let (insns, external) = lifts.get(&(w.entry, w.max_insns))?.as_ref()?;
+            Some(walk_function_with(program, w.entry, insns, summaries, external))
         })
         .collect();
     dedup_sites(
