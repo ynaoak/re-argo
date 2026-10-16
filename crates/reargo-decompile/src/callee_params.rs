@@ -82,6 +82,8 @@ pub struct CalleeParams<'a> {
     /// The classes of the objects a class's constructors store in its fields (WS92,
     /// `classfields`), by the class's vtable.
     pub(crate) class_fields_memo: Mutex<FxHashMap<u64, ClassFields>>,
+    /// The lifted-once, depth-independent analysis of each body.
+    summary_memo: Mutex<FxHashMap<u64, Option<std::sync::Arc<Summary>>>>,
 }
 
 /// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
@@ -141,6 +143,7 @@ impl<'a> CalleeParams<'a> {
             fields_memo: Mutex::new(FxHashMap::default()),
             unwind_table: None,
             class_fields_memo: Mutex::new(FxHashMap::default()),
+            summary_memo: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -190,13 +193,15 @@ impl<'a> CalleeParams<'a> {
         memo(self).unwrap_or(ReturnKind::Unknown)
     }
 
-    /// The return register of a lifted body (see `return_kind`).
-    fn return_kind_of(&self, cfg: &ControlFlowGraph, depth_left: u32) -> ReturnKind {
+    /// What each `ret` of a lifted body returns (see `return_kind`): the return register it
+    /// wrote last (looking back through straight-line predecessors), or the call right before
+    /// it, whose callee's return kind is looked up at the depth asked.
+    fn return_sites(&self, cfg: &ControlFlowGraph) -> Vec<RetSite> {
+        let mut kinds = Vec::new();
         if self.returns.len() < 2 {
-            return ReturnKind::Unknown;
+            return kinds;
         }
         let (int_reg, float_reg) = (self.returns[0], self.returns[1]);
-        let mut kinds = Vec::new();
         for b in 0..cfg.blocks.len() {
             if !cfg.blocks[b].is_return() {
                 continue;
@@ -211,17 +216,14 @@ impl<'a> CalleeParams<'a> {
                                 .then(|| op.inputs.first())
                                 .flatten()
                                 .filter(|t| t.space == SpaceId::RAM);
-                            break 'search match callee {
-                                Some(t) if depth_left > 0 => self.return_kind_at(t.offset, depth_left - 1),
-                                _ => ReturnKind::Unknown,
-                            };
+                            break 'search RetSite::Call(callee.map(|t| t.offset));
                         }
                         let Some(out) = op.output else { continue };
                         if out.space != SpaceId::REGISTER {
                             continue;
                         }
                         if out.offset == int_reg.offset && out.size <= int_reg.size {
-                            break 'search ReturnKind::Int;
+                            break 'search RetSite::Kind(ReturnKind::Int);
                         }
                         // a scalar float result (`xmm0_d` / `xmm0_q`, not the lifter's view sync),
                         // or a whole-register copy from another vector register
@@ -233,18 +235,34 @@ impl<'a> CalleeParams<'a> {
                             && op.opcode == OpCode::Copy
                             && op.inputs.first().is_some_and(|i| i.space == SpaceId::REGISTER && i.size == float_reg.size);
                         if scalar || copy {
-                            break 'search ReturnKind::Float;
+                            break 'search RetSite::Kind(ReturnKind::Float);
                         }
                     }
                 }
                 let preds = &cfg.blocks[cur].predecessors;
                 steps += 1;
                 if preds.len() != 1 || steps > 8 {
-                    break ReturnKind::Unknown;
+                    break RetSite::Kind(ReturnKind::Unknown);
                 }
                 cur = preds[0];
             };
             kinds.push(kind);
+        }
+        kinds
+    }
+
+    /// The return register of a summarised body at `depth_left` (see `return_kind`).
+    fn return_kind_of(&self, sites: &[RetSite], depth_left: u32) -> ReturnKind {
+        if self.returns.len() < 2 {
+            return ReturnKind::Unknown;
+        }
+        let mut kinds = Vec::with_capacity(sites.len());
+        for s in sites {
+            kinds.push(match *s {
+                RetSite::Kind(k) => k,
+                RetSite::Call(Some(t)) if depth_left > 0 => self.return_kind_at(t, depth_left - 1),
+                RetSite::Call(_) => ReturnKind::Unknown,
+            });
         }
         let any = |k| kinds.contains(&k);
         match (any(ReturnKind::Int), any(ReturnKind::Float)) {
@@ -278,7 +296,20 @@ impl<'a> CalleeParams<'a> {
         Some(ControlFlowGraph::build_owned(crate::pipeline::trim_to_return(lifted)))
     }
 
-    fn analyze(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
+    /// The depth-independent part of the analysis of the function at `target`, lifted once
+    /// and shared by every depth (`None` when it cannot be lifted).
+    fn summary(&self, target: u64) -> Option<std::sync::Arc<Summary>> {
+        if let Some(s) = self.summary_memo.lock().ok().and_then(|m| m.get(&target).cloned()) {
+            return s;
+        }
+        let s = self.summarize(target).map(std::sync::Arc::new);
+        if let Ok(mut m) = self.summary_memo.lock() {
+            m.insert(target, s.clone());
+        }
+        s
+    }
+
+    fn summarize(&self, target: u64) -> Option<Summary> {
         let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
         if lifted.is_empty() || lifted[0].address != target {
             return None;
@@ -289,28 +320,20 @@ impl<'a> CalleeParams<'a> {
         // the body runs past the lift limit (its last lifted instruction is live)
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
         let cfg = ControlFlowGraph::build_owned(insns);
-        if depth_left == MAX_DEPTH {
-            let fields = std::sync::Arc::new(param_accesses(&cfg, &self.args, &self.caller_saved, self.returns.first()));
-            if let Ok(mut m) = self.fields_memo.lock() {
-                m.insert(target, fields);
-            }
-        }
-        let kind = self.return_kind_of(&cfg, depth_left);
-        if let Ok(mut m) = self.ret_memo.lock() {
-            m.insert((target, depth_left), kind);
-        }
+        let fields = std::sync::Arc::new(param_accesses(&cfg, &self.args, &self.caller_saved, self.returns.first()));
+        let ret_sites = self.return_sites(&cfg);
         let n = cfg.blocks.len();
         let rpo = crate::dominator::reverse_post_order(&cfg);
 
         // must-defined (by low byte) sets at block entry; None = not reached yet
         let mut inn: Vec<Option<u32>> = vec![None; n];
         inn[cfg.entry_block] = Some(0);
-        let mut acc = Acc { reads: 0, complete: !truncated };
+        let mut acc = Acc { reads: 0, complete: !truncated, calls: Vec::new() };
         loop {
             let mut changed = false;
             for &b in &rpo {
                 let Some(state) = inn[b] else { continue };
-                let out = self.run_block(&cfg, b, state, depth_left, None);
+                let out = self.run_block(&cfg, b, state, None);
                 for &s in &cfg.blocks[b].successors {
                     let new = match inn[s] {
                         None => out,
@@ -328,21 +351,32 @@ impl<'a> CalleeParams<'a> {
         }
         for &b in &rpo {
             if let Some(state) = inn[b] {
-                self.run_block(&cfg, b, state, depth_left, Some(&mut acc));
+                self.run_block(&cfg, b, state, Some(&mut acc));
             }
         }
-        Some(ParamInfo { mask: acc.reads, complete: acc.complete })
+        Some(Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields })
     }
 
-    /// Transfer function of one block; with `acc`, records the reads.
-    fn run_block(
-        &self,
-        cfg: &ControlFlowGraph,
-        b: usize,
-        mut defined: u32,
-        depth_left: u32,
-        mut acc: Option<&mut Acc>,
-    ) -> u32 {
+    fn analyze(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
+        let s = self.summary(target)?;
+        if depth_left == MAX_DEPTH
+            && let Ok(mut m) = self.fields_memo.lock()
+        {
+            m.entry(target).or_insert_with(|| s.fields.clone());
+        }
+        let kind = self.return_kind_of(&s.ret_sites, depth_left);
+        if let Ok(mut m) = self.ret_memo.lock() {
+            m.insert((target, depth_left), kind);
+        }
+        let mut reads = s.reads;
+        for c in &s.calls {
+            reads |= self.inner_call_reads(c.target, c.window, depth_left) & !c.defined;
+        }
+        Some(ParamInfo { mask: reads, complete: s.complete })
+    }
+
+    /// Transfer function of one block; with `acc`, records the reads and the inner calls.
+    fn run_block(&self, cfg: &ControlFlowGraph, b: usize, mut defined: u32, mut acc: Option<&mut Acc>) -> u32 {
         let all = (1u32 << self.args.len()) - 1;
         // registers written since the block start / the last call: the setup window an unknown
         // inner callee's argument prefix is judged by (a loop temporary written earlier is not
@@ -359,7 +393,7 @@ impl<'a> CalleeParams<'a> {
                                 .flatten()
                                 .filter(|t| t.space == SpaceId::RAM)
                                 .map(|t| t.offset);
-                            a.reads |= self.inner_call_reads(direct, window, depth_left) & !defined;
+                            a.calls.push(InnerCall { target: direct, window, defined });
                         }
                         defined = all; // every argument register is caller-saved
                         window = 0;
@@ -371,7 +405,7 @@ impl<'a> CalleeParams<'a> {
                             && cfg.block_at(t.offset).is_none()
                             && let Some(a) = acc.as_deref_mut()
                         {
-                            a.reads |= self.inner_call_reads(Some(t.offset), window, depth_left) & !defined;
+                            a.calls.push(InnerCall { target: Some(t.offset), window, defined });
                         }
                         continue;
                     }
@@ -452,6 +486,32 @@ impl<'a> CalleeParams<'a> {
 struct Acc {
     reads: u32,
     complete: bool,
+    calls: Vec<InnerCall>,
+}
+
+/// A call (or tail jump) inside a summarised body: its direct target, the argument registers
+/// set up right before it and those defined on every path to it.
+struct InnerCall {
+    target: Option<u64>,
+    window: u32,
+    defined: u32,
+}
+
+/// What a `ret` returns: a known register, or what the call right before it returns.
+#[derive(Clone, Copy)]
+enum RetSite {
+    Kind(ReturnKind),
+    Call(Option<u64>),
+}
+
+/// The depth-independent analysis of one body: the argument registers read before written
+/// outside the inner calls, the inner calls, the `ret`s and the parameter accesses.
+struct Summary {
+    reads: u32,
+    complete: bool,
+    calls: Vec<InnerCall>,
+    ret_sites: Vec<RetSite>,
+    fields: std::sync::Arc<ParamUse>,
 }
 
 /// Field offsets past this are no struct fields.
