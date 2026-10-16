@@ -606,10 +606,10 @@ pub fn summarize(mem: &Memory, start: u64, len: u64, vt_points: &FxHashSet<u64>)
                     leader[k + 1] = true;
                 }
             }
-            FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Interrupt | FlowControl::Exception => {
-                if k + 1 < insns.len() {
-                    leader[k + 1] = true;
-                }
+            FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Interrupt | FlowControl::Exception
+                if k + 1 < insns.len() =>
+            {
+                leader[k + 1] = true;
             }
             _ => {}
         }

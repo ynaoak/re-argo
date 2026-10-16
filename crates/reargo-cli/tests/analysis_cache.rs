@@ -128,7 +128,12 @@ fn second_run_reads_the_cache_and_prints_the_same() {
     }
 
     // A damaged cache file is ignored (and rewritten).
-    let file = std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap().path();
+    // (the analysis entry: `decompile` also caches its `this-index` here)
+    let file = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "rac"))
+        .expect("an analysis cache entry");
     let mut bytes = std::fs::read(&file).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff;
