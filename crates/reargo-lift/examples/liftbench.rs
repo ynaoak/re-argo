@@ -42,7 +42,20 @@ fn main() {
     );
     let reps: usize = std::env::var("REPS").ok().and_then(|r| r.parse().ok()).unwrap_or(5);
     let mut best = [f64::MAX; 4];
+    let only_cached = std::env::var("MODE").is_ok_and(|m| m == "cached");
     for _ in 0..reps {
+        if only_cached {
+            let lifter = X86Lifter::new_64();
+            let mut cache = LiftCache::new();
+            let mut sink = 0usize;
+            for chunk in addrs.chunks(50) {
+                cache.trim(chunk[0], 4096);
+                let r = lifter.lift_range_cached(mem, chunk[0], 300, &mut cache);
+                sink += r.insns().len();
+            }
+            std::hint::black_box(sink);
+            continue;
+        }
         // 1. lift each alone and drop it
         let t = Instant::now();
         let mut sink = 0usize;
