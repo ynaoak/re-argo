@@ -36,7 +36,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SpaceId(pub u32);
 
 impl SpaceId {
@@ -248,7 +248,7 @@ pub struct DefaultSpaces {
     pub unique: SpaceId,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Address {
     pub space: SpaceId,
     pub offset: u64,
@@ -327,7 +327,7 @@ impl fmt::Display for Address {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AddressRange {
     pub start: Address,
     pub size: u64,
@@ -368,7 +368,7 @@ impl PartialOrd for AddressRange {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AddressSet {
     ranges: BTreeSet<AddressRange>,
 }

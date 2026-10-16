@@ -9,3 +9,4 @@ description = "Core types for RE-Argo: address model, P-code IR, data types"
 thiserror = { workspace = true }
 smallvec = { workspace = true }
 bitflags = { workspace = true }
+serde = { workspace = true }

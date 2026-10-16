@@ -78,9 +78,22 @@ cargo run --release -- <command> <args>     # development build
 target/release/re-argo <command> <args> # after a release build
 ```
 
-All commands accept `--thumb` (global flag, before the subcommand or after) to decode ARM code in Thumb mode. Most users on x86_64 / aarch64 binaries can ignore it.
+All commands accept `--thumb` (global flag, before the subcommand or after) to decode ARM code in Thumb mode. Most users on x86_64 / aarch64 binaries can ignore it. `--no-cache` (global) bypasses the on-disk analysis cache (see below).
 
 Hex addresses can be written as `0x401000`, `401000`, or `0X401000`.
+
+### Analysis cache (`--no-cache`, `REARGO_CACHE_DIR`)
+
+Every command that needs the analysed program (`functions`, `decompile`, `xrefs`, `tags`, `export`, `summary`, `triage`, `callsites`, `metrics`, `find`, `cfg`, `callgraph`, `backtrace`, `decompile-all`, `taint`, `coverage`, `capa`, `vuln`, `ioc`, `packer`, `entropy`, `iterate`, `diff`, `semantic-diff`, `carve --address`, `symbols --all`, `mcp` — at startup and on each re-analysis after a correction —, …; `decompile --fast` analyses only its function and is uncached) stores the analyzer pipeline's results on disk after the first run and reads them back on later runs on the same, unchanged binary: the pipeline is skipped, the output is byte-identical. Measured (release build, cold = empty cache, analyses and writes the entry; warm = reads it): `functions` on `/usr/bin/ls` 0.29 s → 0.03 s, `/usr/bin/bash` 2.9 s → 0.19 s, `python3.12` 6.6 s → 0.41 s; `decompile -a <main>` on `python3.12` 6.4 s → 0.44 s.
+
+* **Where**: `$REARGO_CACHE_DIR`, else `$XDG_CACHE_HOME/re-argo`, else `~/.cache/re-argo` — never next to the binary. One `<hash of the binary's canonical path>.rac` file per analysed path, replaced when the key changes (nothing is evicted otherwise: delete the directory to reclaim the space). Size is roughly 6–10× the binary (ls 0.9 MB, bash 15 MB, python3.12 48 MB).
+* **Key** (stored in the file and compared on every load, so a stale hit is impossible): a cache-format number, the re-argo version, a BLAKE3 hash of the running `re-argo` executable itself (any rebuild invalidates every entry), the binary's canonical path and a BLAKE3 hash of its full contents, the contents of the `<binary>.gra.json` override sidecar (or its absence), and the file `./<binary file name>` relative to the working directory (absent / the binary itself / its contents — the PE Rich-header and Authenticode analyzers read it).
+* **Sidecar**: an `annotate` / `iterate --apply` edit changes the key, so the next command re-runs the pipeline once. The cache holds the results *before* the overrides; the sidecar is applied on top on every run, exactly as after a fresh analysis. **Flags**: no flag reaches the pipeline — `--thumb` only selects the lifters of `disasm` / `pcode` / `decompile` / …, which run after it, so it is not in the key.
+* **Bypass**: global `--no-cache` (`re-argo --no-cache functions <bin>`) or `REARGO_NO_CACHE=1` — the pipeline runs and the cache is neither read nor written.
+* **stderr**: a hit prints `[cache] analysis results loaded from <file>` instead of the per-analyzer lines (stdout is unchanged); `triage` stays silent.
+* **Always run the pipeline**: `analyze` (it prints the per-analyzer lines; it also *refreshes* the entry, so `analyze` warms the cache for the commands after it) and `bench` (it measures the pipeline; it neither reads nor writes the cache). `script` keeps its own in-process analysis (uncached). The loader-only commands (`info`, `sections`, `symbols` without `--all`, `disasm`, `pcode`, `xref-scan`, `func-start`, `carve --start`, `classes`, `vtable`, `whatis`, `members`, `strings`, `search`, `hexdump`, `rop`, `embedded`, `floss`, `yara`, …) never ran the pipeline and are unaffected.
+* **What is stored**: the listing (decoded instructions — an x86 instruction without its text, which is formatted again from its bytes on first use, as after decoding — + functions with bodies / frames / signatures), symbol table, references, comments, metadata, call renderings and tags, as bincode (varint) behind a header (magic, format, key, payload length, BLAKE3 of the payload). A truncated / corrupt / foreign file fails the header check and is ignored and rewritten; files are written to a temporary name and renamed into place; a cache read or write failure never fails the command (a write failure is a `[cache] WARNING` on stderr). Rebuilt on load instead of stored: the binary itself (`info`, memory, `arch`: the loader runs as usual), `data_types` (re-imported from DWARF, as the Type Recovery analyzer does) and the analyzers' in-run scratch `analysis_cache`.
+* Code: `crates/reargo-cli/src/cache.rs` (key, file format), `Program::analysis_state` / `restore_analysis_state` (`crates/reargo-program/src/program.rs`); bump `CACHE_FORMAT` when the stored layout changes. Tests: `crates/reargo-cli/tests/analysis_cache.rs`.
 
 ---
 
@@ -251,7 +264,7 @@ Find printable strings (default minimum length 4) in data sections (or `--all` s
 
 Run the **full** 68-analyzer pipeline on the binary. Most other commands run the pipeline implicitly, so `analyze` is mainly used to:
 1. Verify each analyzer's contribution (per-analyzer line is printed to stderr)
-2. Warm the in-memory cache for subsequent commands
+2. Warm (refresh) the on-disk analysis cache for subsequent commands — `analyze` itself always runs the pipeline, never reads the cache (see **Analysis cache**)
 3. Run only the pipeline without picking a specific output
 
 #### `functions <FILE>`
@@ -272,7 +285,7 @@ Address            Name                              insns blocks mccabe  fanIn 
 
 #### `bench <FILE> [--top N]`
 
-Wall-clock + per-stage breakdown of the analysis. Output keys: `Load`, `Analysis (total)`, `Analyzers OK / Err`, `Functions`, `Instructions`, `References`, `Comments`.
+Wall-clock + per-stage breakdown of the analysis (always runs the pipeline; the analysis cache is not used). Output keys: `Load`, `Analysis (total)`, `Analyzers OK / Err`, `Functions`, `Instructions`, `References`, `Comments`.
 
 Followed by a per-analyzer table (after a 72-char `-` rule), slowest first: `Analyzer  ms  % total  status` (`ms` 1 decimal, `% total` of `Analysis (total)`, `status` ok/err). `--top N` limits it to the N slowest (default 15, 0 = all).
 
@@ -769,9 +782,9 @@ Output is one block per matched rule with per-string hit counts and the first N 
 
 1. **Hex addresses are required for `<ADDRESS>` arguments.** `0x401000` or `401000`, not `4198400`.
 2. **`symbols` defaults to loader-side only.** On stripped binaries, pass `--all` to see analyzer-recovered names.
-3. **`cargo run` rebuilds on every invocation.** Build once (`cargo build --release`) then call `target/release/re-argo` directly to avoid the rebuild cost. The CLI is idempotent and re-runs the analysis pipeline per invocation.
+3. **`cargo run` rebuilds on every invocation.** Build once (`cargo build --release`) then call `target/release/re-argo` directly to avoid the rebuild cost. The CLI is idempotent; the first command on a binary runs the analysis pipeline, later ones read its results from the on-disk analysis cache (a rebuilt `re-argo` starts with a cold cache).
 4. **`--thumb` is only relevant for 32-bit ARM binaries.** x86_64 / aarch64 binaries should not pass it.
-5. **`analyze` runs the same pipeline `decompile`, `xrefs`, `tags` etc. already run internally.** Use it when you want the per-analyzer summary line on stderr, not to "warm up" a cache (there is no persistent cache between invocations — except for the `<binary>.gra.json` override sidecar).
+5. **`analyze` runs the same pipeline `decompile`, `xrefs`, `tags` etc. already run internally**, and the results persist between invocations in the on-disk analysis cache (`~/.cache/re-argo`, see **Analysis cache**): only the first command on an unchanged binary pays for the pipeline. `analyze` always re-runs it (per-analyzer lines on stderr) and refreshes the cache; `--no-cache` / `REARGO_NO_CACHE=1` bypass it. Editing the `<binary>.gra.json` override sidecar (part of the key) re-runs the pipeline once.
 6. **`find <bin> <query>` is case-insensitive substring** — use it before more specific queries; it's the fastest way to locate a name across functions / symbols / comments / tags in one shot.
 7. **`backtrace`'s default depth is 6**. For hub functions in large binaries, you'll likely need `--depth 12 --max-paths 1024`.
 8. **`decompile`'s output includes inline analyzer comments.** Lines starting with `// printf(format=…)` or `// stack-protected` are the annotations; the actual code line is the next one.
