@@ -319,7 +319,50 @@ impl<'a> CalleeParams<'a> {
         let insns = crate::pipeline::trim_to_return(lifted);
         // the body runs past the lift limit (its last lifted instruction is live)
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
-        let cfg = ControlFlowGraph::build_owned(insns);
+        Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
+    }
+
+    /// [`Self::summarize`] of `lift_range(target, MAX_INSNS)` given as `lifted`.
+    fn summarize_lifted(&self, target: u64, lifted: &[&LiftedInstruction]) -> Option<Summary> {
+        if lifted.is_empty() || lifted[0].address != target {
+            return None;
+        }
+        let last = lifted.last().map(|i| i.address);
+        let hit_limit = lifted.len() >= MAX_INSNS;
+        let insns = crate::pipeline::trim_to_return_refs(lifted);
+        let truncated = hit_limit && insns.last().map(|i| i.address) == last;
+        Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
+    }
+
+    /// Compute the summaries of the functions at `entries` ahead of their lookups, lifting the
+    /// neighbouring bodies' overlapping ranges once per run of entries on a thread (x86 only;
+    /// what a lookup would compute itself, so the answers do not change).
+    pub fn prefill(&self, entries: &[u64]) {
+        use rayon::prelude::*;
+        let Some(x86) = self.lifter.as_x86() else { return };
+        let mut entries: Vec<u64> = entries.to_vec();
+        entries.sort_unstable();
+        entries.dedup();
+        if let Ok(m) = self.summary_memo.lock() {
+            entries.retain(|e| !m.contains_key(e));
+        }
+        let done: Vec<(u64, Option<std::sync::Arc<Summary>>)> = entries
+            .par_iter()
+            .with_min_len(64)
+            .map_init(reargo_lift::x86::LiftCache::new, |cache, &e| {
+                cache.trim(e, 4096);
+                let range = x86.lift_range_cached(self.memory, e, MAX_INSNS, cache);
+                (e, self.summarize_lifted(e, &range.insns()).map(std::sync::Arc::new))
+            })
+            .collect();
+        if let Ok(mut m) = self.summary_memo.lock() {
+            for (e, s) in done {
+                m.entry(e).or_insert(s);
+            }
+        }
+    }
+
+    fn summarize_body(&self, cfg: ControlFlowGraph, truncated: bool) -> Summary {
         let fields = std::sync::Arc::new(param_accesses(&cfg, &self.args, &self.caller_saved, self.returns.first()));
         let ret_sites = self.return_sites(&cfg);
         let n = cfg.blocks.len();
@@ -354,7 +397,7 @@ impl<'a> CalleeParams<'a> {
                 self.run_block(&cfg, b, state, Some(&mut acc));
             }
         }
-        Some(Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields })
+        Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields }
     }
 
     fn analyze(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {

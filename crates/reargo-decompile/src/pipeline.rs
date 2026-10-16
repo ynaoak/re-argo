@@ -1194,6 +1194,10 @@ pub fn decompile_all_with_options(
     let annotations = build_annotations(program);
     // one callee-parameter memo for the whole batch
     let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
+    // every function's own parameters are looked up: analyse the bodies in address order
+    if let Some(o) = &oracle {
+        o.prefill(&entries);
+    }
 
     entries
         .par_iter()
@@ -1530,7 +1534,16 @@ pub(crate) fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<Lifted
         .collect()
 }
 
-fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
+/// [`trim_to_return`] of borrowed instructions: the kept ones cloned.
+pub(crate) fn trim_to_return_refs(instructions: &[&LiftedInstruction]) -> Vec<LiftedInstruction> {
+    let visited = reachability(instructions);
+    if visited.is_empty() {
+        return instructions.iter().map(|&i| i.clone()).collect();
+    }
+    instructions.iter().zip(visited).filter_map(|(&insn, keep)| keep.then(|| insn.clone())).collect()
+}
+
+fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructions: &[I]) -> Vec<bool> {
     use rustc_hash::FxHashMap;
     use reargo_core::pcode::OpCode;
 
@@ -1542,7 +1555,7 @@ fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
     let addr_to_idx: FxHashMap<u64, usize> = instructions
         .iter()
         .enumerate()
-        .map(|(idx, insn)| (insn.address, idx))
+        .map(|(idx, insn)| (insn.borrow().address, idx))
         .collect();
 
     let mut visited = vec![false; n];
@@ -1553,7 +1566,7 @@ fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
             continue;
         }
         visited[idx] = true;
-        let insn = &instructions[idx];
+        let insn: &LiftedInstruction = instructions[idx].borrow();
 
         let mut has_unconditional_transfer = false;
         let mut has_return_or_indjmp = false;

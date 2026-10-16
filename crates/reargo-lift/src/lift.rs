@@ -189,6 +189,13 @@ pub trait PcodeLift: Send + Sync {
         None
     }
 
+    /// This lifter as the x86 lifter, when it is one: its
+    /// [`crate::x86::X86Lifter::lift_range_cached`] gives exactly what its
+    /// `lift_range` does, sharing the lifts of overlapping ranges.
+    fn as_x86(&self) -> Option<&crate::x86::X86Lifter> {
+        None
+    }
+
     fn lift_instruction(
         &self,
         memory: &Memory,

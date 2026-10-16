@@ -2569,6 +2569,10 @@ impl X86Lifter {
 }
 
 impl PcodeLift for X86Lifter {
+    fn as_x86(&self) -> Option<&X86Lifter> {
+        Some(self)
+    }
+
     /// The trait's contiguous lift without the integer PF; again with it when a PF reader
     /// in the range reads a PF no float compare set ([`needs_integer_parity`]).
     fn lift_range(&self, memory: &Memory, start: u64, count: usize) -> Result<Vec<LiftedInstruction>, LiftError> {
