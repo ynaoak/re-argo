@@ -1389,6 +1389,8 @@ fn build_decompile_result(
     // emitter (which also runs against the optimized form), so the
     // post-opt view is also the more useful debug output.
     let ssa_dump = if opts.emit.ssa { ssa.display_ssa() } else { String::new() };
+    // (the SSA does not change any more: its readers are computed once for what follows)
+    let _frozen = crate::condition::FrozenReaders::new(&ssa);
 
     // Run type inference / structurer / emitters sequentially.
     //
