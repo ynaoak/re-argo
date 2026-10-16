@@ -57,13 +57,17 @@ pub fn owns(program: &Program, entry: u64, addr: u64) -> bool {
 /// code outside the lift (a `.cold` part jumping back, another
 /// function's tail jump into the middle). A tracker must not assume
 /// it knows the state on entry to them.
-pub fn external_entries(program: &Program, insns: &[LiftedInstruction]) -> std::collections::BTreeSet<u64> {
+pub fn external_entries<I: std::borrow::Borrow<LiftedInstruction>>(
+    program: &Program,
+    insns: &[I],
+) -> std::collections::BTreeSet<u64> {
     use reargo_program::RefType;
     // a linear lift: addresses increase
-    let lifted = |a: u64| insns.binary_search_by_key(&a, |i| i.address).is_ok();
+    let lifted = |a: u64| insns.binary_search_by_key(&a, |i| i.borrow().address).is_ok();
     insns
         .iter()
-        .filter(|insn| {
+        .map(std::borrow::Borrow::borrow)
+        .filter(|insn: &&LiftedInstruction| {
             program.references.get_refs_to(insn.address).iter().any(|r| match r.ref_type {
                 RefType::IndirectJump => true,
                 RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
@@ -72,6 +76,54 @@ pub fn external_entries(program: &Program, insns: &[LiftedInstruction]) -> std::
         })
         .map(|insn| insn.address)
         .collect()
+}
+
+/// The jump references of a program by target, to compute
+/// [`external_entries`] of many lifts: a lift's are found among the
+/// references into its address range instead of by a lookup per
+/// lifted instruction.
+pub struct JumpIndex {
+    /// `(to, from, type)`, sorted by `to`.
+    refs: Vec<(u64, u64, reargo_program::RefType)>,
+}
+
+impl JumpIndex {
+    pub fn new(program: &Program) -> Self {
+        // `jump_refs_by_target` yields them by target already
+        let refs = program.references.jump_refs_by_target().map(|r| (r.to, r.from, r.ref_type)).collect();
+        Self { refs }
+    }
+
+    /// [`external_entries`] of `insns`, while the program's references
+    /// are those the index was built from.
+    pub fn external_entries<I: std::borrow::Borrow<LiftedInstruction>>(
+        &self,
+        program: &Program,
+        insns: &[I],
+    ) -> std::collections::BTreeSet<u64> {
+        use reargo_program::RefType;
+        let addr = |i: &I| i.borrow().address;
+        if !insns.windows(2).all(|w| addr(&w[0]) < addr(&w[1])) {
+            return external_entries(program, insns);
+        }
+        let mut out = std::collections::BTreeSet::new();
+        let (Some(first), Some(last)) = (insns.first().map(addr), insns.last().map(addr)) else {
+            return out;
+        };
+        let lifted = |a: u64| insns.binary_search_by_key(&a, addr).is_ok();
+        let start = self.refs.partition_point(|r| r.0 < first);
+        for &(to, from, ty) in self.refs[start..].iter().take_while(|r| r.0 <= last) {
+            let enters = match ty {
+                RefType::IndirectJump => true,
+                RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(from),
+                _ => false,
+            };
+            if enters && lifted(to) {
+                out.insert(to);
+            }
+        }
+        out
+    }
 }
 
 /// Whether `addr` lies between the entry of the function at `entry`

@@ -177,6 +177,11 @@ impl ReferenceManager {
             .collect()
     }
 
+    /// Every jump reference (`RefType::is_jump`), by target address.
+    pub fn jump_refs_by_target(&self) -> impl Iterator<Item = &Reference> {
+        self.refs_to.values().flatten().filter(|r| r.ref_type.is_jump())
+    }
+
     pub fn all_refs(&self) -> impl Iterator<Item = &Reference> {
         self.refs_from.values().flat_map(|v| v.iter())
     }

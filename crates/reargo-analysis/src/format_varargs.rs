@@ -24,7 +24,6 @@
 
 use std::collections::BTreeMap;
 
-use reargo_lift::PcodeLift;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
@@ -54,11 +53,10 @@ impl Analyzer for FormatVarargsAnalyzer {
             });
         }
 
-        let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
         // The round-0 call sites, reusing the walks the Call Site
         // Annotator (750) left for the functions unchanged since. The
         // last reader: the shared results are dropped here.
-        let sites = crate::shared_lift::compute(&*lifter, program, false).round0_sites();
+        let sites = crate::shared_lift::compute(program, false).round0_sites();
 
         let mut per_callee_max: BTreeMap<String, usize> = BTreeMap::new();
         let mut emitted = 0usize;

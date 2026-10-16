@@ -90,6 +90,33 @@ pub fn resolve_call_sites(
     resolve_inner(lifter, program, &ParamSummaries::default())
 }
 
+/// [`resolve_call_sites`] restricted to the functions whose entry is in
+/// `entries`. A call site is recorded only by the function owning it
+/// and a walk reads only its own lift, so the result is exactly the
+/// sites of [`resolve_call_sites`] owned by those functions, in the
+/// same order.
+pub fn resolve_call_sites_in(
+    lifter: &(dyn PcodeLift + Sync),
+    program: &Program,
+    entries: &rustc_hash::FxHashSet<u64>,
+) -> Result<Vec<CallSite>, AnalysisError> {
+    if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+        return Ok(Vec::new());
+    }
+    let summaries = ParamSummaries::default();
+    let per_func: Vec<Option<Vec<CallSite>>> = function_jobs(program)
+        .into_iter()
+        .filter(|(entry, _)| entries.contains(entry))
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|&(entry, max)| {
+            let insns = lift_function(lifter, program, entry, max)?;
+            Some(walk_function(program, entry, &insns, &summaries))
+        })
+        .collect();
+    Ok(dedup_sites(per_func.iter().flatten().map(Vec::as_slice)))
+}
+
 /// Per-function summary of values its parameter registers have ever
 /// been called with. Indexed by argument position 0..5 in
 /// calling-convention order (RDI, RSI, RDX, RCX, R8, R9 for SysV).
@@ -250,10 +277,10 @@ pub fn walk_function(
 
 /// [`walk_function`] with the lift's
 /// [`crate::func_lift::external_entries`] already computed.
-pub(crate) fn walk_function_with(
+pub(crate) fn walk_function_with<I: std::borrow::Borrow<LiftedInstruction>>(
     program: &Program,
     entry: u64,
-    insns: &[LiftedInstruction],
+    insns: &[I],
     summaries: &ParamSummaries,
     external: &std::collections::BTreeSet<u64>,
 ) -> Vec<CallSite> {
@@ -263,29 +290,36 @@ pub(crate) fn walk_function_with(
         tracker.seed_from_summary(summary);
     }
 
+    // Only record a call site if we're actually walking the function
+    // that *owns* it. Without this gate, an earlier function whose
+    // lift_range bled past its own body would record the call with
+    // *its* tracker state (e.g. all unresolved), and the dedup would
+    // block the real owner from re-recording it with the correct
+    // seeded state.
+    let owned: Vec<bool> = insns
+        .iter()
+        .map(|insn| {
+            let insn = insn.borrow();
+            insn.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd))
+                && program.listing.function_containing(insn.address).map(|f| f.entry_point) == Some(entry)
+        })
+        .collect();
+    // Nothing after the last owned call is recorded: the walk stops there.
+    let Some(last) = owned.iter().rposition(|&o| o) else {
+        return out;
+    };
     let mut joins = join_points(insns);
     for (j, insn) in joins.iter_mut().zip(insns) {
-        *j |= external.contains(&insn.address);
+        *j |= external.contains(&insn.borrow().address);
     }
-    for (insn, &join) in insns.iter().zip(&joins) {
+    for ((insn, &join), &owned) in insns[..=last].iter().map(std::borrow::Borrow::borrow).zip(&joins).zip(&owned) {
         if join {
             tracker.reset();
         }
         for op in &insn.ops {
             match op.opcode {
                 OpCode::Call | OpCode::CallInd => {
-                    // Only record this call site if we're actually
-                    // walking the function that *owns* it. Without
-                    // this gate, an earlier function whose lift_range
-                    // bled past its own body would record the call
-                    // with *its* tracker state (e.g. all unresolved),
-                    // and the dedup would block the real owner from
-                    // re-recording it with the correct seeded state.
-                    let true_caller = program
-                        .listing
-                        .function_containing(insn.address)
-                        .map(|f| f.entry_point);
-                    if true_caller == Some(entry) {
+                    if owned {
                         let target = direct_call_target(op);
                         let args = X86_64_SYSV_ARG_REGS
                             .iter()
@@ -657,9 +691,9 @@ fn frame_address(op: &reargo_core::pcode::PcodeOp) -> Option<i64> {
 /// target inside the lift, or the instruction after an unconditional
 /// jump / indirect jump / return. State reaching them along the
 /// previous instruction is not the only state reaching them.
-fn join_points(insns: &[LiftedInstruction]) -> Vec<bool> {
+fn join_points<I: std::borrow::Borrow<LiftedInstruction>>(insns: &[I]) -> Vec<bool> {
     let mut targets: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-    for insn in insns {
+    for insn in insns.iter().map(std::borrow::Borrow::borrow) {
         for op in &insn.ops {
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
                 && let Some(t) = op.inputs.first()
@@ -671,7 +705,7 @@ fn join_points(insns: &[LiftedInstruction]) -> Vec<bool> {
     }
     let mut out = vec![false; insns.len()];
     let mut after_terminator = false;
-    for (i, insn) in insns.iter().enumerate() {
+    for (i, insn) in insns.iter().map(std::borrow::Borrow::borrow).enumerate() {
         out[i] = after_terminator || targets.contains(&insn.address);
         after_terminator = insn
             .ops

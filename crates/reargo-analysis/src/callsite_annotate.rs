@@ -66,7 +66,7 @@ impl Analyzer for CallSiteAnnotator {
         // and VSA snapshots, from one lift per function (dropped as soon
         // as they are done), merged in listing order. The walks are left
         // on the program for Format Varargs (780).
-        let mut shared = crate::shared_lift::compute(&*lifter, program, true);
+        let mut shared = crate::shared_lift::compute(program, true);
         let mut round0 = Vec::with_capacity(shared.funcs.len());
         let mut cfg_constants = crate::cfg_const::CallConstants::new();
         let mut vsa_constants = crate::vsa::VsaResult::new();

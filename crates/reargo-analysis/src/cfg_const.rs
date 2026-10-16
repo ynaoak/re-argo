@@ -105,6 +105,19 @@ pub(crate) fn function_snapshots_unowned(
     propagate_with(insns, external, |a| in_extent(program, entry, a))
 }
 
+/// [`function_snapshots_unowned`] over blocks already built for the
+/// lift ([`blockflow::Cfg::build`] with the same `external` and
+/// [`in_extent`] of the function).
+pub(crate) fn function_snapshots_cfg<I: std::borrow::Borrow<LiftedInstruction>>(
+    cfg: &blockflow::Cfg,
+    insns: &[I],
+) -> CallSnapshots {
+    if insns.is_empty() {
+        return Vec::new();
+    }
+    blockflow::propagate_cfg::<State, _, _>(cfg, insns, |st| st.regs.full_values().collect())
+}
+
 /// Fold one function's call snapshots into the program-wide map.
 pub fn merge_snapshots(out: &mut CallConstants, snaps: CallSnapshots) {
     for (addr, regs) in snaps {

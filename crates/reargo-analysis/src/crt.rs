@@ -29,7 +29,7 @@ use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
-use crate::callsite::resolve_call_sites;
+use crate::callsite::resolve_call_sites_in;
 
 pub struct CrtAnalyzer;
 
@@ -81,7 +81,10 @@ impl Analyzer for CrtAnalyzer {
         }
 
         let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
-        let sites = resolve_call_sites(&*lifter, program)?;
+        // Only a function that can own a call to `__libc_start_main`
+        // is walked: the sites of the others never match below.
+        let owners = candidate_owners(program, &lsm_addrs, &lsm_slots);
+        let sites = resolve_call_sites_in(&*lifter, program, &owners)?;
 
         // Per SysV: arg0=rdi=main, arg3=rcx=init, arg4=r8=fini.
         // (arg1=rsi=argc, arg2=rdx=argv come from _start's prologue.)
@@ -127,6 +130,63 @@ fn lsm_got_slots(
         .filter(|(_, n)| is_lsm(n))
         .map(|(a, _)| *a)
         .collect()
+}
+
+/// Entries of the functions that may own a call matched by
+/// [`CrtAnalyzer`]: a direct `call` (opcode `E8`, the only direct call
+/// the lifter emits) to one of `lsm_addrs`, or a `call [rip+disp]` /
+/// `call [disp32]` (`FF 15` / `FF 14 SIB`) through one of `lsm_slots`.
+/// Every byte of every initialized block is tried as that opcode, so
+/// any decode of such a call — at any alignment, after any prefixes
+/// (at most 14 bytes before the opcode) — is covered: the result is a
+/// superset of the owners of the matched sites.
+fn candidate_owners(
+    program: &Program,
+    lsm_addrs: &std::collections::BTreeSet<u64>,
+    lsm_slots: &std::collections::BTreeSet<u64>,
+) -> rustc_hash::FxHashSet<u64> {
+    let sext32 = |b: &[u8]| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64 as u64;
+    let mut hits: Vec<u64> = Vec::new();
+    for block in program.info.memory.blocks() {
+        let Some(data) = block.data.as_deref() else { continue };
+        for (i, &b) in data.iter().enumerate() {
+            let p = block.start.wrapping_add(i as u64);
+            let rest = &data[i + 1..];
+            let hit = match b {
+                0xE8 if !lsm_addrs.is_empty() => {
+                    // rel32, or rel16 under an operand-size prefix
+                    (rest.len() >= 4 && lsm_addrs.contains(&p.wrapping_add(5).wrapping_add(sext32(rest))))
+                        || (rest.len() >= 2 && {
+                            let rel = i16::from_le_bytes([rest[0], rest[1]]) as i64 as u64;
+                            lsm_addrs.contains(&(p.wrapping_add(3).wrapping_add(rel) & 0xffff))
+                        })
+                }
+                0xFF if !lsm_slots.is_empty() && rest.len() >= 5 => {
+                    let slot = match rest[0] {
+                        // rip-relative: the instruction ends after disp32
+                        0x15 => Some(p.wrapping_add(6).wrapping_add(sext32(&rest[1..]))),
+                        // SIB, no base: absolute disp32
+                        0x14 if rest.len() >= 6 => Some(sext32(&rest[2..])),
+                        _ => None,
+                    };
+                    slot.is_some_and(|s| lsm_slots.contains(&s) || lsm_slots.contains(&(s & 0xffff_ffff)))
+                }
+                _ => false,
+            };
+            if hit {
+                hits.push(p);
+            }
+        }
+    }
+    let mut owners = rustc_hash::FxHashSet::default();
+    for p in hits {
+        for q in p.saturating_sub(14)..=p {
+            if let Some(f) = program.listing.function_containing(q) {
+                owners.insert(f.entry_point);
+            }
+        }
+    }
+    owners
 }
 
 /// For the instruction at `addr`, if it is `call qword ptr [rip+disp]` or
