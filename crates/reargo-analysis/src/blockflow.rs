@@ -15,9 +15,8 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use reargo_core::address::SpaceId;
 use reargo_core::pcode::{OpCode, PcodeOp};
-use reargo_lift::LiftedInstruction;
+use reargo_lift::{InsnShape, LiftedInstruction};
 
 /// Per-block visit cap, so an irreducible / cycle-heavy CFG cannot
 /// loop forever; reducible CFGs converge in a few visits. A block
@@ -37,10 +36,7 @@ pub trait FlowState: Clone + PartialEq + Default {
 
 /// Jump target of a `Branch` / `CBranch` inside the lift.
 fn target(op: &PcodeOp) -> Option<u64> {
-    op.inputs
-        .first()
-        .filter(|t| t.space == SpaceId::RAM)
-        .map(|t| t.offset)
+    InsnShape::branch_target(op)
 }
 
 /// What the block structure and the linear call-site walk need of each
@@ -65,38 +61,45 @@ pub struct LiftShape {
 
 impl LiftShape {
     pub fn of<I: Borrow<LiftedInstruction>>(insns: &[I]) -> LiftShape {
+        Self::build(insns, |i| InsnShape::of(insns[i].borrow()))
+    }
+
+    /// [`LiftShape::of`] from the [`InsnShape`] of each instruction.
+    pub fn from_shapes<I: Borrow<LiftedInstruction>>(insns: &[I], shapes: &[InsnShape]) -> LiftShape {
+        debug_assert_eq!(insns.len(), shapes.len());
+        Self::build(insns, |i| shapes[i])
+    }
+
+    fn build<I: Borrow<LiftedInstruction>>(insns: &[I], shape_of: impl Fn(usize) -> InsnShape) -> LiftShape {
         let n = insns.len();
         let mut shape = LiftShape {
-            increasing: insns.windows(2).all(|w| w[0].borrow().address < w[1].borrow().address),
+            increasing: true,
             addrs: Vec::with_capacity(n),
             has_call: Vec::with_capacity(n),
             branches: Vec::new(),
             ends_block: Vec::with_capacity(n),
             stops: Vec::with_capacity(n),
         };
-        for (i, insn) in insns.iter().map(Borrow::borrow).enumerate() {
-            let (mut call, mut ends, mut stops) = (false, false, false);
-            for op in &insn.ops {
-                match op.opcode {
-                    OpCode::Call | OpCode::CallInd => call = true,
-                    OpCode::Branch | OpCode::CBranch => {
-                        if let Some(t) = target(op) {
-                            shape.branches.push((i, t));
-                        }
-                        ends = true;
-                        stops |= op.opcode == OpCode::Branch;
+        for (i, insn) in insns.iter().enumerate() {
+            let s = shape_of(i);
+            if s.flags & InsnShape::TARGET != 0 {
+                shape.branches.push((i, s.target));
+            } else if s.flags & InsnShape::TARGETS != 0 {
+                for op in &insn.borrow().ops {
+                    if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
+                        && let Some(t) = target(op)
+                    {
+                        shape.branches.push((i, t));
                     }
-                    OpCode::Return | OpCode::BranchInd => {
-                        ends = true;
-                        stops = true;
-                    }
-                    _ => {}
                 }
             }
-            shape.addrs.push(insn.address);
-            shape.has_call.push(call);
-            shape.ends_block.push(ends);
-            shape.stops.push(stops);
+            if shape.addrs.last().is_some_and(|&last| last >= s.address) {
+                shape.increasing = false;
+            }
+            shape.addrs.push(s.address);
+            shape.has_call.push(s.flags & InsnShape::CALL != 0);
+            shape.ends_block.push(s.flags & InsnShape::ENDS != 0);
+            shape.stops.push(s.flags & InsnShape::STOPS != 0);
         }
         shape
     }
@@ -622,7 +625,7 @@ fn propagate_legacy<S: FlowState, T, I: Borrow<LiftedInstruction>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reargo_core::address::Address;
+    use reargo_core::address::{Address, SpaceId};
     use reargo_core::pcode::{SeqNum, VarnodeData};
 
     /// Point constants of registers, joined by intersection.

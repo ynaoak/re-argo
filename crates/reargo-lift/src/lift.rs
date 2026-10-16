@@ -10,6 +10,69 @@ pub struct LiftedInstruction {
     pub ops: Vec<PcodeOp>,
 }
 
+/// What the block structure of a lift reads of one instruction's P-code
+/// (its address, calls, jumps and their targets), read once: a pass
+/// that lifts each address once keeps it beside the lift, and the walks
+/// over many overlapping lifts read it instead of every op again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InsnShape {
+    pub address: u64,
+    /// The jump target when [`InsnShape::TARGET`] is set.
+    pub target: u64,
+    pub flags: u8,
+}
+
+impl InsnShape {
+    /// It has a `Call` / `CallInd` op.
+    pub const CALL: u8 = 1;
+    /// It has a `Branch`, `CBranch`, `Return` or `BranchInd` op (it ends
+    /// its block).
+    pub const ENDS: u8 = 2;
+    /// It has a `Branch`, `Return` or `BranchInd` op (no fall-through).
+    pub const STOPS: u8 = 4;
+    /// It has exactly one `Branch` / `CBranch` with a target in the RAM
+    /// space ([`InsnShape::branch_target`]): `target`.
+    pub const TARGET: u8 = 8;
+    /// It has several: read them from the ops.
+    pub const TARGETS: u8 = 16;
+    /// It has a `CallInd` op.
+    pub const CALLIND: u8 = 32;
+
+    /// The jump target of a `Branch` / `CBranch` op, when it is an
+    /// address in the RAM space.
+    pub fn branch_target(op: &PcodeOp) -> Option<u64> {
+        op.inputs.first().filter(|t| t.space == reargo_core::address::SpaceId::RAM).map(|t| t.offset)
+    }
+
+    pub fn of(insn: &LiftedInstruction) -> InsnShape {
+        use reargo_core::pcode::OpCode;
+        let mut shape = InsnShape { address: insn.address, target: 0, flags: 0 };
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Call => shape.flags |= Self::CALL,
+                OpCode::CallInd => shape.flags |= Self::CALL | Self::CALLIND,
+                OpCode::Branch | OpCode::CBranch => {
+                    if let Some(t) = Self::branch_target(op) {
+                        if shape.flags & (Self::TARGET | Self::TARGETS) == 0 {
+                            shape.flags |= Self::TARGET;
+                            shape.target = t;
+                        } else {
+                            shape.flags = (shape.flags & !Self::TARGET) | Self::TARGETS;
+                        }
+                    }
+                    shape.flags |= Self::ENDS;
+                    if op.opcode == OpCode::Branch {
+                        shape.flags |= Self::STOPS;
+                    }
+                }
+                OpCode::Return | OpCode::BranchInd => shape.flags |= Self::ENDS | Self::STOPS,
+                _ => {}
+            }
+        }
+        shape
+    }
+}
+
 /// The text of a [`LiftedInstruction`]: given, or for x86 formatted from the
 /// decoded instruction when it is first read — the analysis passes lift far
 /// more than they print, and formatting was a large part of each lift.

@@ -4,18 +4,29 @@
 //! budget of instructions well past its end (`lift_range(entry, n)`),
 //! so the ranges of neighbouring functions overlap several times over.
 //! [`map_lifted_ranges`] hands each job the same instructions
-//! `lift_range` would, lifting each address once per chunk of
-//! consecutive jobs ([`X86Lifter::lift_range_cached`]), and runs the
-//! chunks in parallel with the results kept in job order.
+//! `lift_range` would, lifting each address once per run of
+//! consecutive jobs on one thread ([`X86Lifter::lift_range_cached`]),
+//! and runs the runs in parallel with the results kept in job order.
 
 use rayon::prelude::*;
 use reargo_lift::x86::{LiftCache, X86Lifter};
-use reargo_lift::LiftedInstruction;
+use reargo_lift::{InsnShape, LiftedInstruction};
 use reargo_loader::Memory;
 
-/// Consecutive jobs sharing one cache: large enough that the overlap
-/// into the next chunk is small, small enough to spread over threads.
-const CHUNK: usize = 64;
+/// Fewest consecutive jobs run on one thread with one cache: the
+/// overlap into the next run of jobs is lifted again.
+pub(crate) const CHUNK: usize = 64;
+
+/// Instructions a cache holds before those below the range being lifted
+/// are dropped ([`trim`]).
+const RETAIN_AT: usize = 4096;
+
+/// Bound `cache` before lifting from `start`: the jobs of a run lift in
+/// ascending order of their starts, so what lies below `start` is not
+/// read again (and would only be lifted again if it were).
+pub(crate) fn trim(cache: &mut LiftCache, start: u64) {
+    cache.trim(start, RETAIN_AT);
+}
 
 /// `f(entry, insns)` for every job `(entry, count)` in order, `insns`
 /// being exactly `X86Lifter::new_64().lift_range(memory, entry, count)`.
@@ -28,22 +39,22 @@ where
 }
 
 /// `f(job, lifter)` for every job in order, where `lifter` lifts any
-/// ranges the job needs ([`RangeLifter::with`]); consecutive jobs share
-/// the lifted instructions.
+/// ranges the job needs ([`RangeLifter::with`]); the consecutive jobs a
+/// thread runs (runs of at least [`CHUNK`]) share the lifted
+/// instructions, the instructions below the job's ranges dropped as the
+/// run moves on ([`trim`]).
 pub fn map_with_lifter<J, T, F>(memory: &Memory, jobs: &[J], f: F) -> Vec<T>
 where
     J: Sync,
     T: Send,
     F: Fn(&J, &mut RangeLifter) -> T + Sync,
 {
-    jobs.par_chunks(CHUNK)
-        .map(|chunk| {
-            let mut lifter = RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() };
-            chunk.iter().map(|job| f(job, &mut lifter)).collect::<Vec<T>>()
-        })
-        .collect::<Vec<Vec<T>>>()
-        .into_iter()
-        .flatten()
+    jobs.par_iter()
+        .with_min_len(CHUNK)
+        .map_init(
+            || RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() },
+            |lifter, job| f(job, lifter),
+        )
         .collect()
 }
 
@@ -58,8 +69,24 @@ impl RangeLifter<'_> {
     /// `g(insns)`, `insns` being exactly
     /// `X86Lifter::new_64().lift_range(memory, entry, count)`.
     pub fn with<R>(&mut self, entry: u64, count: usize, g: impl FnOnce(&[&LiftedInstruction]) -> R) -> R {
+        trim(&mut self.cache, entry);
         let range = self.lifter.lift_range_cached(self.memory, entry, count, &mut self.cache);
         g(&range.insns())
+    }
+
+    /// `g(k, insns, shapes)` for the `k`-th of `budgets`, `insns` being
+    /// exactly `X86Lifter::new_64().lift_range(memory, entry, budgets[k])`
+    /// and `shapes` their [`InsnShape`]s when the cache holds them: one
+    /// walk of the largest range, the others its prefixes
+    /// ([`X86Lifter::lift_prefixes_cached`]).
+    pub fn with_budgets<R>(
+        &mut self,
+        entry: u64,
+        budgets: &[usize],
+        g: impl FnMut(usize, &[&LiftedInstruction], Option<&[InsnShape]>) -> R,
+    ) -> Vec<R> {
+        trim(&mut self.cache, entry);
+        self.lifter.lift_prefixes_cached(self.memory, entry, budgets, true, &mut self.cache, g)
     }
 }
 
