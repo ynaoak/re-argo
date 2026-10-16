@@ -11,6 +11,7 @@ reargo-loader = { workspace = true }
 reargo-lift = { workspace = true }
 reargo-program = { workspace = true }
 smallvec = { workspace = true }
+iced-x86 = { workspace = true }
 thiserror = { workspace = true }
 rustc-hash = { workspace = true }
 rayon = { workspace = true }

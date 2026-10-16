@@ -25,16 +25,18 @@ pub struct DecompileResult {
 }
 
 /// What the decompiler prints (WS91).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DecompileOptions {
     /// Struct fields (`p->field_10`), typed pointers and member-style virtual calls
     /// (`p->vfn_6(…)`); off: every access prints as `*(T*)(p + k)`.
     pub structs: bool,
+    /// The classes of the parameters inferred from the callers (WS93, [`crate::thisclass`]).
+    pub this_index: Option<std::sync::Arc<crate::thisclass::ThisIndex>>,
 }
 
 impl Default for DecompileOptions {
     fn default() -> Self {
-        Self { structs: true }
+        Self { structs: true, this_index: None }
     }
 }
 
@@ -1359,7 +1361,7 @@ fn build_decompile_result(
         let memory = caller_hint.map(|(_, m)| m);
         let cc = caller_hint.and_then(|(l, _)| l.call_convention());
         let arg_regs = [cc.as_ref().and_then(|c| c.args.first().copied()), cc.as_ref().and_then(|c| c.args.get(1).copied())];
-        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle, name: Some(func_name), symbols: Some(symbols) };
+        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle, name: Some(func_name), symbols: Some(symbols), this_index: opts.this_index.as_deref() };
         crate::structs::StructView::new(&ssa, &ctx)
     } else {
         crate::structs::StructView::default()
@@ -1999,7 +2001,7 @@ mod tests {
     /// Decompiled with every memory access printed as `*(T*)(p + k)` (no struct view, WS91):
     /// the tests of the raw forms.
     fn decompile_raw(lifter: &dyn PcodeLift, mem: &Memory, entry: u64, name: &str, max: usize) -> Result<DecompileResult, String> {
-        decompile_with_options(lifter, mem, entry, name, max, &std::collections::BTreeMap::new(), &DecompileOptions { structs: false })
+        decompile_with_options(lifter, mem, entry, name, max, &std::collections::BTreeMap::new(), &DecompileOptions { structs: false, ..Default::default() })
     }
 
     fn c_raw(code: &[u8]) -> String {

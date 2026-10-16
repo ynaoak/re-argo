@@ -36,6 +36,7 @@ pub mod taint;
 pub mod token;
 pub mod typeinfer;
 pub mod varrecovery;
+pub mod thisclass;
 pub mod vcall;
 
 pub use pipeline::{

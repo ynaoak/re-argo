@@ -636,6 +636,7 @@ name = "reargo-decompile"
 version = "0.1.0"
 dependencies = [
  "cpp_demangle",
+ "iced-x86",
  "memchr",
  "rayon",
  "reargo-core",

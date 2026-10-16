@@ -153,6 +153,31 @@ pub fn elf_pointer_relocations(data: &[u8]) -> Vec<(u64, u64)> {
     out
 }
 
+/// The functions an ELF exports (WS93): defined `STT_FUNC` / `STT_GNU_IFUNC` dynamic symbols
+/// with global or weak binding and default or protected visibility — another module may call
+/// them with anything.
+pub fn elf_exported_functions(data: &[u8]) -> Vec<u64> {
+    use goblin::elf::sym;
+    let Ok(elf) = goblin::elf::Elf::parse(data) else {
+        return Vec::new();
+    };
+    let mut out: Vec<u64> = elf
+        .dynsyms
+        .iter()
+        .filter(|s| {
+            s.st_value != 0
+                && s.st_shndx != 0
+                && matches!(sym::st_type(s.st_info), sym::STT_FUNC | sym::STT_GNU_IFUNC)
+                && matches!(sym::st_bind(s.st_info), sym::STB_GLOBAL | sym::STB_WEAK)
+                && matches!(sym::st_visibility(s.st_other), sym::STV_DEFAULT | sym::STV_PROTECTED)
+        })
+        .map(|s| s.st_value)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 impl BinaryLoader {
     pub fn load(path: &Path) -> Result<BinaryInfo, LoaderError> {
         let data = std::fs::read(path)?;
@@ -796,7 +821,16 @@ impl std::fmt::Display for SymbolKind {
 
 #[cfg(test)]
 mod reloc_tests {
-    use super::elf_pointer_relocations;
+    use super::{elf_exported_functions, elf_pointer_relocations};
+
+    /// WS93: no exports in what is no ELF; a BDS-internal function (`REARGO_TEST_BDS`) is none.
+    #[test]
+    fn exported_functions() {
+        assert!(elf_exported_functions(b"not an elf").is_empty());
+        let Ok(path) = std::env::var("REARGO_TEST_BDS") else { return };
+        let ex = elf_exported_functions(&std::fs::read(path).unwrap());
+        assert!(!ex.contains(&0x4bd0820), "{} exports", ex.len());
+    }
 
     #[test]
     fn non_elf_returns_empty_without_panicking() {

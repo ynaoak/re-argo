@@ -263,6 +263,10 @@ enum Commands {
         /// struct definitions, typed pointers or `p->vfn_6(…)` virtual calls
         #[arg(long)]
         no_structs: bool,
+        /// Do not use (or build) the whole-binary index of the classes the callers pass
+        /// (`this-index`): `this` of a non-virtual method stays without class
+        #[arg(long)]
+        no_this_index: bool,
     },
     /// Decompile every discovered function in parallel
     DecompileAll {
@@ -289,6 +293,10 @@ enum Commands {
         /// stdout, in `<dir>/structs.h` / `structs.rs` with `-o`)
         #[arg(long)]
         structs_per_function: bool,
+        /// Do not use (or build) the whole-binary index of the classes the callers pass
+        /// (`this-index`): `this` of a non-virtual method stays without class
+        #[arg(long)]
+        no_this_index: bool,
     },
     /// Taint analysis: track parameters to dangerous sinks
     Taint {
@@ -818,6 +826,24 @@ enum Commands {
         #[arg(long, default_value_t = 8192)]
         max_back: u64,
     },
+    /// The classes of `this` (and the other pointer parameters) inferred from the callers (WS93):
+    /// build (or read from the cache) the whole-binary index `decompile` uses and print its
+    /// statistics, or the classes of the functions given with `-a`.
+    ThisIndex {
+        /// Path to the binary file
+        file: PathBuf,
+        /// Functions to show (hex, repeatable)
+        #[arg(short, long, value_parser = parse_hex)]
+        address: Vec<u64>,
+        /// Ignore the cached index and build it again
+        #[arg(long)]
+        rebuild: bool,
+        /// Check the classes against the binary's own symbols (a binary with symbols): build
+        /// the index (not cached, the exported functions taken as called only from inside) and
+        /// compare each `this` class found with the class of the method's mangled name
+        #[arg(long)]
+        check: bool,
+    },
     /// List every C++ class in a PIE binary (RTTI class inventory).
     ///
     /// Scans the RELATIVE relocations for Itanium `type_info` name strings,
@@ -943,11 +969,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             start,
             count,
         } => cmd_pcode(&file, start, count, cli.thumb),
-        Commands::Decompile { file, address, ssa, rust, annotate, fast, no_structs } => {
-            cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate, fast, !no_structs)
+        Commands::Decompile { file, address, ssa, rust, annotate, fast, no_structs, no_this_index } => {
+            cmd_decompile(&file, address, ssa, rust, cli.thumb, annotate, fast, !no_structs, !no_this_index)
         }
-        Commands::DecompileAll { file, output_dir, rust, skip_errors, no_structs, structs_per_function } => {
-            cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb, !no_structs, structs_per_function)
+        Commands::DecompileAll { file, output_dir, rust, skip_errors, no_structs, structs_per_function, no_this_index } => {
+            cmd_decompile_all(&file, output_dir.as_deref(), rust, skip_errors, cli.thumb, !no_structs, structs_per_function, !no_this_index)
         }
         Commands::Taint { file, address, params } => cmd_taint(&file, address, params, cli.thumb),
         Commands::Export { file, output } => cmd_export(&file, output.as_deref()),
@@ -978,6 +1004,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::XrefScan { file, target, limit } => cmd_xref_scan(&file, target, limit),
         Commands::Vtable { file, address, name } => cmd_vtable(&file, address, name.as_deref()),
         Commands::FuncStart { file, address, max_back } => cmd_funcstart(&file, address, max_back),
+        Commands::ThisIndex { file, address, rebuild, check } => cmd_this_index(&file, &address, rebuild, check),
         Commands::Classes { file, filter, derives, slot, limit } => {
             cmd_classes(&file, filter.as_deref(), derives.as_deref(), &slot, limit)
         }
@@ -2748,8 +2775,18 @@ fn fast_program(path: &Path, address: Option<u64>) -> Result<Program, Box<dyn st
     Ok(program)
 }
 
+/// The index of the classes the callers pass (WS93), for the struct view of an x86-64 binary
+/// with an `.eh_frame_hdr` table: read from the cache, built (a few seconds) the first time.
+fn this_index(path: &Path, program: &Program, wanted: bool) -> Option<std::sync::Arc<reargo_decompile::thisclass::ThisIndex>> {
+    if !wanted || program.info.arch != reargo_loader::Architecture::X86_64 {
+        return None;
+    }
+    let hdr = program.info.sections.iter().find(|s| s.name == ".eh_frame_hdr").map(|s| s.address)?;
+    reargo_decompile::thisclass::load_or_build(path, &program.info.memory, Some(hdr), false).map(std::sync::Arc::new)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool, fast: bool, structs: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: bool, thumb: bool, annotate: bool, fast: bool, structs: bool, use_index: bool) -> Result<(), Box<dyn std::error::Error>> {
     let program = if fast { fast_program(path, address)? } else { analyze_binary(path)? };
 
     let lifter = match make_lifter(&program.info, thumb) {
@@ -2762,7 +2799,7 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
 
     let entry = address.unwrap_or(program.entry_point());
 
-    let opts = reargo_decompile::DecompileOptions { structs };
+    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index) };
     let result = reargo_decompile::decompile_function_with_options(lifter.as_ref(), &program, entry, &opts)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -2804,6 +2841,7 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_decompile_all(
     path: &Path,
     output_dir: Option<&Path>,
@@ -2812,6 +2850,7 @@ fn cmd_decompile_all(
     thumb: bool,
     structs: bool,
     structs_per_function: bool,
+    use_index: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let program = analyze_binary(path)?;
 
@@ -2827,7 +2866,7 @@ fn cmd_decompile_all(
         std::fs::create_dir_all(dir)?;
     }
 
-    let opts = reargo_decompile::DecompileOptions { structs };
+    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index) };
     let results = reargo_decompile::decompile_all_with_options(lifter.as_ref(), &program, &opts);
 
     // WS91: the structs of C++ classes once, merged over every function (the anonymous ones are
@@ -4540,6 +4579,136 @@ fn rtti_derives_from(
         stack.extend(bases_of(b));
     }
     false
+}
+
+/// `this-index --check`: the `this` classes found from the callers against the classes of the
+/// mangled method names.
+fn this_index_check(info: &reargo_loader::BinaryInfo, hdr: u64) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    let functions = reargo_loader::fde_functions(&info.memory, hdr);
+    let idx = reargo_decompile::thisclass::build(&info.memory, &functions, &[]);
+    let names: BTreeMap<u64, &str> = info
+        .symbols
+        .iter()
+        .filter(|s| s.kind == reargo_loader::SymbolKind::Function && s.address != 0)
+        .map(|s| (s.address, s.name.as_str()))
+        .collect();
+    let h = &idx.hierarchy;
+    let class_name = |c: usize| reargo_decompile::vcall::vtable_class(&info.memory, h.vtables[c]).unwrap_or_default();
+    let by_name: std::collections::HashMap<String, usize> = (0..h.vtables.len()).map(|c| (class_name(c), c)).collect();
+    let (mut same, mut derived, mut base, mut other, mut no_name, mut no_class) = (0, 0, 0, 0, 0, 0);
+    let mut bad: Vec<String> = Vec::new();
+    let mut fs: Vec<(&u64, &[u32; 6])> = idx.params.iter().collect();
+    fs.sort();
+    for (f, p) in fs {
+        let Some(found) = (p[0] != u32::MAX).then_some(p[0] as usize) else { continue };
+        let Some(want) = names.get(f).and_then(|n| reargo_decompile::structs::method_class(n)) else {
+            no_name += 1;
+            continue;
+        };
+        let found_name = class_name(found);
+        let Some(&w) = by_name.get(&want) else {
+            // a free function in a namespace, a class without vtable
+            no_class += 1;
+            if bad.len() < 60 {
+                bad.push(format!("0x{f:x} {}: {} (no class {want})", names[f], class_name(found)));
+            }
+            continue;
+        };
+        if found_name == want {
+            same += 1;
+        } else if h.bases[found].contains(&(w as u32)) {
+            derived += 1;
+            if bad.len() < 60 {
+                bad.push(format!("0x{f:x} {}: {found_name} (derived from {want})", names[f]));
+            }
+        } else if h.bases[w].contains(&(found as u32)) {
+            base += 1;
+            if bad.len() < 60 {
+                bad.push(format!("0x{f:x} {}: {found_name} (a base of {want})", names[f]));
+            }
+        } else {
+            other += 1;
+            if bad.len() < 60 {
+                bad.push(format!("0x{f:x} {}: {found_name} (not {want})", names[f]));
+            }
+        }
+    }
+    // the methods of polymorphic classes (by their symbol) with no `this` class from anywhere
+    let listed = |f: u64| reargo_decompile::vcall::this_vtables(&info.memory, f).is_empty();
+    let mut missed: Vec<String> = Vec::new();
+    let mut n_missed = 0;
+    for (&f, n) in &names {
+        if idx.param_class(f, 0).is_some() || n.contains(".cold") || n.contains("C1E") || n.contains("C2E") || n.contains("D0E") || n.contains("D1E") || n.contains("D2E") {
+            continue;
+        }
+        let Some(want) = reargo_decompile::structs::method_class(n) else { continue };
+        if by_name.contains_key(&want) && listed(f) {
+            n_missed += 1;
+            if missed.len() < 30 {
+                missed.push(format!("0x{f:x} {n}"));
+            }
+        }
+    }
+    println!("non-virtual methods of polymorphic classes with no class from the callers: {n_missed}");
+    for m in missed {
+        println!("  {m}");
+    }
+    println!("`this` classes from the callers vs the class of the method's symbol:");
+    println!("  the same class          {same}");
+    println!("  a derived class         {derived}");
+    println!("  a base class            {base}");
+    println!("  an unrelated class      {other}");
+    println!("  no polymorphic class    {no_class}");
+    println!("  no method name          {no_name}");
+    for b in bad {
+        println!("  {b}");
+    }
+    Ok(())
+}
+
+fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let info = BinaryLoader::load(path)?;
+    let hdr = info.sections.iter().find(|s| s.name == ".eh_frame_hdr").map(|s| s.address);
+    if check {
+        return this_index_check(&info, hdr.ok_or("no .eh_frame_hdr table")?);
+    }
+    let t = std::time::Instant::now();
+    let idx = reargo_decompile::thisclass::load_or_build(path, &info.memory, hdr, rebuild).ok_or("no .eh_frame_hdr table: no index")?;
+    let key = reargo_decompile::thisclass::file_key(path)?;
+    eprintln!("[this-index] {} ({} ms)", reargo_decompile::thisclass::cache_path(path, key).display(), t.elapsed().as_millis());
+    let s = &idx.stats;
+    let class = |vt: Option<u64>| vt.map(|v| format!("{} (vtable 0x{v:x})", reargo_decompile::vcall::vtable_class(&info.memory, v).unwrap_or_default())).unwrap_or_else(|| "-".into());
+    if addresses.is_empty() {
+        println!("functions        {}", s.functions);
+        println!("classes          {}", s.classes);
+        println!("rounds           {} ({})", s.rounds, if s.converged { "converged" } else { "budget reached" });
+        println!("build            summaries {} ms, propagation {} ms", s.summarize_ms, s.solve_ms);
+        println!("this from vtables {}", s.seeded_this);
+        println!("this from callers {}", idx.count_known(0));
+        for i in 1..6 {
+            println!("param {i} from callers {}", idx.count_known(i));
+        }
+        println!("return classes   {}", idx.rets.len());
+        println!("field classes    {}", idx.fields.len());
+        println!("member classes   {}", idx.members.len());
+    }
+    for &a in addresses {
+        println!("0x{a:x}");
+        for i in 0..6 {
+            if let Some(vt) = idx.param_class(a, i) {
+                println!("  param {i}: {}", class(Some(vt)));
+            }
+        }
+        if let Some(vt) = idx.ret_class(a) {
+            println!("  returns: {}", class(Some(vt)));
+        }
+        // a class's vtable: the classes of its fields and members (its own and its bases')
+        for (off, vt, member) in idx.class_fields(a) {
+            println!("  {} +0x{off:x}: {}", if member { "member" } else { "field" }, class(Some(vt)));
+        }
+    }
+    Ok(())
 }
 
 fn cmd_classes(
