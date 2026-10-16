@@ -10,7 +10,11 @@
 //!   register on entry (`Arg(i)`), the result of a call (`Ret(c)`), a value loaded from a
 //!   field of a pointer (`Ld(l)`: `[source + k]`) or the stack (an address in the frame). A
 //!   block no jump reaches (a jump table's case, a landing pad) starts from the meet of the
-//!   states after the calls and at the indirect jumps. The facts kept: the direct calls and
+//!   states after the calls and at the indirect jumps. A stack object is followed through the
+//!   flow, as a slot may be reused for another object: it is the one the first call it is given
+//!   to made (its constructor, when that callee is one; or the vtable an inlined constructor
+//!   stored) until the slot is written again, and the objects a slot holds on two joined paths
+//!   are one. The facts kept: the direct calls and
 //!   tail jumps with the pointers passed in `rdi rsi rdx rcx r8 r9` (an argument that is no
 //!   pointer — unknown, a constant other than 0 — makes the callee's parameter unknown), the
 //!   vtables stored at `[p + 0]` (a constructor or destructor; a primary vtable at `[p + k]`:
@@ -27,8 +31,9 @@
 //!   unknown (it can be called from anywhere).
 //! * **Propagation.** The class of parameter `j` of `f` is the join of what every direct call
 //!   of `f` passes there: the caller's own parameter's class, a local object's class (from the
-//!   vtables stored into it, the constructors called on it — seeds only, or the callee's return
-//!   class for a call result), the class of a field of an object of a known class (the join of
+//!   vtables stored into it and the seeds of the calls made on it — its constructor, destructor,
+//!   virtual methods called directly; or the callee's return class for a call result), the
+//!   class of a field of an object of a known class (the join of
 //!   the objects stored there by any function of that class or its bases), an embedded member's
 //!   class. The join of two classes is their nearest common base (unknown when there is none);
 //!   one unknown caller makes the parameter unknown. The return class of a function is the
@@ -78,6 +83,22 @@ enum Val {
     Unk,
     Const(u64),
     Ptr(Src, i32),
+    /// (a stack slot only) the object here was first given to call `c` as argument `j` since
+    /// the slot was last written: its constructor, when that callee is one
+    Made(u32, u8),
+}
+
+/// A stack object, by the call it was first given to and the argument: `(call, argument)`.
+pub type Instance = (u32, u8);
+
+/// What says the class of a stack object passed to a call, at that call (WS93): the vtable
+/// pointer it holds (an inlined constructor stored it), or the call it was first given to
+/// (`(call, argument)`: its constructor, when that callee stores a vtable into it). A stack slot
+/// is reused for several objects, so this is followed through the function's flow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StackEv {
+    Vtable(u64),
+    Made(u32, u8),
 }
 
 /// What one function does with pointers (see the module documentation).
@@ -89,6 +110,13 @@ pub struct Summary {
     pub args: Vec<(u32, u8, Src, i32)>,
     /// `(target, mask)`: the arguments a direct call passes that are no pointer
     pub top_args: Vec<(u64, u8)>,
+    /// `(call, argument, evidence)`: the class evidence of a stack object passed to a call
+    pub stack_ev: Vec<(u32, u8, StackEv)>,
+    /// `(call, argument, vtable)`: a vtable stored into the stack object first given to that
+    /// call (an inlined destructor or constructor of it)
+    pub made_vt: Vec<(u32, u8, u64)>,
+    /// two stack objects (by the call first given each) that are one after a join
+    pub made_alias: Vec<(Instance, Instance)>,
     /// `(source, offset, vtable)`: a vtable stored at `source + offset`
     pub vt_stores: Vec<(Src, i32, u64)>,
     /// `(source, offset, value source, value offset)`: a pointer stored into a field
@@ -132,6 +160,12 @@ impl St {
 
     /// `self ∧= o`; whether `self` changed.
     fn meet(&mut self, o: &St) -> bool {
+        self.meet_objects(o, &mut Vec::new())
+    }
+
+    /// [`St::meet`]; two objects a slot holds on two paths (two markers) are one object after
+    /// the join: the slot keeps the first marker and `aliases` gets the pair.
+    fn meet_objects(&mut self, o: &St, aliases: &mut Vec<(Instance, Instance)>) -> bool {
         let mut changed = false;
         for (a, b) in self.r.iter_mut().zip(o.r.iter()) {
             if *a != *b && *a != Val::Unk {
@@ -139,12 +173,30 @@ impl St {
                 changed = true;
             }
         }
-        let before = self.slots.len();
-        self.slots.retain(|s| o.slots.contains(s));
-        changed | (self.slots.len() != before)
+        let before = self.slots.clone();
+        self.slots.retain(|s| match (s.1, o.slot_raw(s.0)) {
+            (Val::Made(a, i), Val::Made(b, j)) if (a, i) != (b, j) => {
+                let pair = ((a, i).min((b, j)), (a, i).max((b, j)));
+                if !aliases.contains(&pair) {
+                    aliases.push(pair);
+                }
+                s.1 = Val::Made(pair.0 .0, pair.0 .1);
+                true
+            }
+            (x, y) => x == y && o.slots.iter().any(|t| t.0 == s.0),
+        });
+        changed | (self.slots != before)
     }
 
+    /// The value in the stack slot at `off` (a marker is no value).
     fn slot(&self, off: i32) -> Val {
+        match self.slot_raw(off) {
+            Val::Made(..) => Val::Unk,
+            v => v,
+        }
+    }
+
+    fn slot_raw(&self, off: i32) -> Val {
         self.slots.iter().find(|s| s.0 == off).map_or(Val::Unk, |s| s.1)
     }
 
@@ -170,7 +222,7 @@ fn add(v: Val, k: i64) -> Val {
     match v {
         Val::Ptr(s, o) => i32::try_from(i64::from(o) + k).map_or(Val::Unk, |o| Val::Ptr(s, o)),
         Val::Const(c) => Val::Const(c.wrapping_add(k as u64)),
-        Val::Unk => Val::Unk,
+        Val::Unk | Val::Made(..) => Val::Unk,
     }
 }
 
@@ -225,6 +277,13 @@ impl Interp<'_> {
     fn store(&mut self, st: &mut St, a: Val, size: u32, v: Val, emit: bool) {
         match a {
             Val::Ptr(Src::Stack, s) => {
+                if emit
+                    && size == 8
+                    && let (Val::Made(c, j), Val::Const(vt)) = (st.slot_raw(s), v)
+                    && self.vt_points.contains(&vt)
+                {
+                    self.out.made_vt.push((c, j, vt));
+                }
                 st.store_slot(s, size, v);
                 if emit && size == 8
                     && let Val::Const(c) = v
@@ -251,12 +310,28 @@ impl Interp<'_> {
         }
     }
 
+    /// What the stack slot at `s` says of the object there (see [`StackEv`]).
+    fn stack_ev(&self, st: &St, s: i32) -> Option<StackEv> {
+        match st.slot_raw(s) {
+            Val::Const(c) if self.vt_points.contains(&c) => Some(StackEv::Vtable(c)),
+            Val::Made(c, j) => Some(StackEv::Made(c, j)),
+            _ => None,
+        }
+    }
+
     /// The arguments of call `id` to `target` (0: indirect).
     fn call_args(&mut self, st: &St, id: u32, target: u64) {
         let mut mask = 0u8;
         for (j, &a) in ARG_REGS.iter().enumerate() {
             match st.r[a] {
-                Val::Ptr(s, k) => self.out.args.push((id, j as u8, s, k)),
+                Val::Ptr(s, k) => {
+                    self.out.args.push((id, j as u8, s, k));
+                    if s == Src::Stack
+                        && let Some(e) = self.stack_ev(st, k)
+                    {
+                        self.out.stack_ev.push((id, j as u8, e));
+                    }
+                }
                 Val::Const(0) => {}
                 _ => mask |= 1 << j,
             }
@@ -371,16 +446,34 @@ impl Interp<'_> {
                 if emit && id != u32::MAX {
                     self.call_args(st, id, target);
                 }
-                // a stack object passed to the call may be written by it
-                let low = ARG_REGS
+                // a stack object passed to the call may be written by it; it stays the object it
+                // was (its vtable pointer, the call it was first given to), else this call made it
+                let objects: SmallVec<[(i32, Val); 2]> = ARG_REGS
                     .iter()
-                    .filter_map(|&a| match st.r[a] {
-                        Val::Ptr(Src::Stack, s) => Some(s),
+                    .enumerate()
+                    .filter_map(|(j, &a)| match st.r[a] {
+                        Val::Ptr(Src::Stack, s) => Some((
+                            s,
+                            match self.stack_ev(st, s) {
+                                Some(StackEv::Vtable(c)) => Val::Const(c),
+                                Some(StackEv::Made(c, k)) => Val::Made(c, k),
+                                None if id != u32::MAX => Val::Made(id, j as u8),
+                                None => Val::Unk,
+                            },
+                        )),
                         _ => None,
                     })
-                    .min();
-                if let Some(low) = low {
-                    st.slots.retain(|s| s.0 + 8 <= low);
+                    .collect();
+                // (what other objects in the frame are — a marker, a vtable pointer — stays)
+                if let Some(low) = objects.iter().map(|o| o.0).min() {
+                    let vt_points = self.vt_points;
+                    st.slots.retain(|s| {
+                        s.0 + 8 <= low
+                            || (!objects.iter().any(|o| o.0 == s.0) && (matches!(s.1, Val::Made(..)) || matches!(s.1, Val::Const(c) if vt_points.contains(&c))))
+                    });
+                }
+                for &(s, v) in objects.iter().rev() {
+                    st.store_slot(s, 8, v);
                 }
                 for &c in &CALLER_SAVED {
                     st.r[c] = Val::Unk;
@@ -571,7 +664,7 @@ pub fn summarize(mem: &Memory, start: u64, len: u64, vt_points: &FxHashSet<u64>)
             }
             for s in succs(b) {
                 let changed = match &mut states[s] {
-                    Some(old) => old.meet(&st),
+                    Some(old) => old.meet_objects(&st, &mut it.out.made_alias),
                     None => {
                         states[s] = Some(st.clone());
                         true
@@ -890,6 +983,7 @@ struct Ctx<'a> {
     starts: &'a [u64],
     sums: &'a [Summary],
     evidence: &'a [FxHashMap<(Src, i32), u32>],
+    stack: &'a [FxHashMap<(u32, u8), u32>],
     p: &'a [[u32; 6]],
     r: &'a [u32],
     fields: &'a FxHashMap<(u32, i32), u32>,
@@ -915,10 +1009,18 @@ impl Ctx<'_> {
         }
     }
 
+    /// The class of argument `j` of call `c` of function `k`, the object at `src + off`.
+    fn arg_value(&self, k: usize, c: u32, j: u8, src: Src, off: i32, ld: &[u32]) -> u32 {
+        match src {
+            Src::Stack => self.stack[k].get(&(c, j)).copied().unwrap_or(TOP),
+            _ => self.value(k, src, off, ld),
+        }
+    }
+
     /// The class of the object at `src + off` (a member object when `off` is not 0).
     fn value(&self, k: usize, src: Src, off: i32, ld: &[u32]) -> u32 {
         if src == Src::Stack {
-            return self.evidence[k].get(&(Src::Stack, off)).copied().unwrap_or(TOP);
+            return TOP;
         }
         let b = self.base(k, src, ld);
         if off == 0 || b < 2 {
@@ -1035,8 +1137,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             let mut ev: FxHashMap<(Src, i32), Vec<u32>> = FxHashMap::default();
             for &(src, k, vt) in &s.vt_stores {
                 let key = match src {
-                    Src::Stack => (Src::Stack, k),
-                    Src::Arg(_) => continue,
+                    Src::Stack | Src::Arg(_) => continue,
                     _ if k == 0 => (src, 0),
                     _ => continue,
                 };
@@ -1046,11 +1147,10 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             }
             for &(c, j, src, k) in &s.args {
                 let Some(t) = fidx(s.call_targets[c as usize]) else { continue };
-                if !fixed[t][j as usize] || seed[t][j as usize] < 2 || matches!(src, Src::Arg(_)) {
+                if !fixed[t][j as usize] || seed[t][j as usize] < 2 || matches!(src, Src::Arg(_) | Src::Stack) {
                     continue;
                 }
                 let key = match src {
-                    Src::Stack => (Src::Stack, k),
                     _ if k == 0 => (src, 0),
                     _ => continue,
                 };
@@ -1059,7 +1159,69 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             ev.into_iter().map(|(key, cs)| (key, h.most_derived(&cs).map_or(TOP, cls))).collect()
         })
         .collect();
-
+    // the stack objects passed to calls: the vtable they hold there, else the most derived of
+    // the seeds of the calls made on that object — the one first given to call `c` as argument
+    // `j` (its constructor, the destructor, the virtual methods called directly) — and of the
+    // vtables stored into it (an inlined destructor)
+    let stack: Vec<FxHashMap<(u32, u8), u32>> = sums
+        .par_iter()
+        .map(|s| {
+            let seed_of = |c: u32, j: u8| match fidx(s.call_targets[c as usize]) {
+                Some(t) if fixed[t][j as usize] && seed[t][j as usize] >= 2 => Some(seed[t][j as usize] - 2),
+                _ => None,
+            };
+            // (objects joined at a merge of paths are one)
+            let mut parent: FxHashMap<(u32, u8), (u32, u8)> = FxHashMap::default();
+            fn root(parent: &FxHashMap<(u32, u8), (u32, u8)>, mut x: (u32, u8)) -> (u32, u8) {
+                while let Some(&p) = parent.get(&x) {
+                    if p == x {
+                        break;
+                    }
+                    x = p;
+                }
+                x
+            }
+            for &(a, b) in &s.made_alias {
+                let (ra, rb) = (root(&parent, a), root(&parent, b));
+                if ra != rb {
+                    parent.insert(ra.max(rb), ra.min(rb));
+                }
+            }
+            let mut objects: FxHashMap<(u32, u8), Vec<u32>> = FxHashMap::default();
+            for &(c, j, vt) in &s.made_vt {
+                objects.entry(root(&parent, (c, j))).or_default().extend(class_of_vt(vt));
+            }
+            for &(c, j, e) in &s.stack_ev {
+                if let StackEv::Made(c2, j2) = e {
+                    let o = objects.entry(root(&parent, (c2, j2))).or_default();
+                    o.extend(seed_of(c2, j2));
+                    o.extend(seed_of(c, j));
+                }
+            }
+            for &(a, b) in &s.made_alias {
+                for x in [a, b] {
+                    objects.entry(root(&parent, x)).or_default().extend(seed_of(x.0, x.1));
+                }
+            }
+            // (a call given an object with no evidence yet made it: the object is that instance)
+            let ev: FxHashMap<(u32, u8), StackEv> = s.stack_ev.iter().map(|&(c, j, e)| ((c, j), e)).collect();
+            s.args
+                .iter()
+                .filter(|a| a.2 == Src::Stack)
+                .map(|&(c, j, _, _)| {
+                    let v = match ev.get(&(c, j)).copied().unwrap_or(StackEv::Made(c, j)) {
+                        StackEv::Vtable(vt) => class_of_vt(vt).map_or(TOP, cls),
+                        StackEv::Made(c2, j2) => {
+                            let mut cs = objects.get(&root(&parent, (c2, j2))).cloned().unwrap_or_default();
+                            cs.extend(seed_of(c2, j2));
+                            if cs.is_empty() { TOP } else { h.most_derived(&cs).map_or(TOP, cls) }
+                        }
+                    };
+                    ((c, j), v)
+                })
+                .collect()
+        })
+        .collect();
     let mut p = init.clone();
     let mut r = vec![BOT; n];
     let mut fields: FxHashMap<(u32, i32), u32> = FxHashMap::default();
@@ -1073,7 +1235,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             .into_par_iter()
             .map(|k| {
                 let s = &sums[k];
-                let cx = Ctx { h, starts, sums, evidence: &evidence, p: &p, r: &r, fields: &fields, members: &members };
+                let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members };
                 let ld = cx.loads(k);
                 let value = |src: Src, off: i32, ld: &[u32]| cx.value(k, src, off, ld);
                 let base = |src: Src, ld: &[u32]| cx.base(k, src, ld);
@@ -1083,7 +1245,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                     if fixed[t][j as usize] {
                         continue;
                     }
-                    contrib.push((t as u32, j, value(src, off, &ld)));
+                    contrib.push((t as u32, j, cx.arg_value(k, c, j, src, off, &ld)));
                 }
                 let mut ret = BOT;
                 if s.ret_unknown {
@@ -1147,7 +1309,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
 
     // (development: `REARGO_THIS_EXPLAIN=0x…,0x…` prints why `this` of those functions is what it is)
     if let Some(list) = std::env::var_os("REARGO_THIS_EXPLAIN") {
-        let cx = Ctx { h, starts, sums, evidence: &evidence, p: &p, r: &r, fields: &fields, members: &members };
+        let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members };
         let show = |v: u32| match v {
             BOT => "nothing".to_string(),
             TOP => "unknown".to_string(),
@@ -1176,9 +1338,15 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                     if j == 0 && s.call_targets[c as usize] == t {
                         let detail = match src {
                             Src::Ld(l) => format!("{:?}", s.loads[l as usize]),
+                            Src::Stack => {
+                                let ev: Vec<_> = s.stack_ev.iter().filter(|e| e.0 == c && e.1 == j).collect();
+                                let made: Vec<_> = s.made_vt.iter().collect();
+                                let on: Vec<_> = s.stack_ev.iter().filter(|e| ev.iter().any(|x| x.2 == e.2)).map(|e| (format!("{:#x}", s.call_targets[e.0 as usize]), e.1)).collect();
+                                format!("call {c} ev {ev:?} vtables {made:?} calls on it {on:?}")
+                            }
                             _ => String::new(),
                         };
-                        eprintln!("[explain]   0x{:x} passes {src:?}+{off:#x} {detail}: {}", starts[k], show(cx.value(k, src, off, &ld)));
+                        eprintln!("[explain]   0x{:x} passes {src:?}+{off:#x} {detail}: {}", starts[k], show(cx.arg_value(k, c, j, src, off, &ld)));
                     }
                 }
             }
@@ -1201,7 +1369,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     }
     idx.fields = fields.into_iter().filter(|e| e.1 >= 2).collect();
     idx.members = members.into_iter().filter(|e| e.1 >= 2).collect();
-    let seeded_this = (0..n).filter(|&k| seed[k][0] >= 2 || (seed[k][1] >= 2 && u.listing.contains_key(&starts[k]))).count() as u64;
+    let seeded_this = (0..n).filter(|&k| seed[k][usize::from(sums[k].returns_first())] >= 2).count() as u64;
     idx.stats = IndexStats { functions: n as u64, classes: h.vtables.len() as u64, rounds: rounds as u64, converged, seeded_this, ..Default::default() };
     idx
 }
@@ -1225,7 +1393,7 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIn
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 2;
+const INDEX_VERSION: u8 = 6;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -1464,6 +1632,38 @@ mod tests {
         assert!(s.top_args.iter().any(|&(t, m)| t == 0x1100 && m & 1 != 0), "{:?}", s.top_args);
         assert_eq!(s.vt_stores, [(Src::Arg(0), 0, 0x2000)]);
         assert!(s.refs.contains(&0x2000));
+    }
+
+    /// A stack object is the one its first call made (its constructor, when that callee is
+    /// one) until the slot is written again: a reused slot holds another object.
+    #[test]
+    fn a_stack_object_is_followed_through_the_reuse_of_its_slot() {
+        // sub rsp, 0x28 ; mov rdi, rsp ; call 0x1100 ; mov rdi, rsp ; call 0x1200 ;
+        // mov qword [rsp], 5 ; mov rdi, rsp ; call 0x1300 ; add rsp, 0x28 ; ret
+        let code = [
+            0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0xe7, 0xe8, 0xf4, 0x00, 0x00, 0x00, 0x48, 0x89, 0xe7, 0xe8, 0xec, 0x01, 0x00, 0x00, 0x48, 0xc7, 0x04, 0x24,
+            0x05, 0x00, 0x00, 0x00, 0x48, 0x89, 0xe7, 0xe8, 0xdc, 0x02, 0x00, 0x00, 0x48, 0x83, 0xc4, 0x28, 0xc3,
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        assert_eq!(this_args(&s), [(0x1100, Src::Stack, -0x28), (0x1200, Src::Stack, -0x28), (0x1300, Src::Stack, -0x28)]);
+        // the second call gets the object the first one made; the third one another object
+        assert_eq!(s.stack_ev, [(1, 0, StackEv::Made(0, 0))]);
+    }
+
+    /// Two objects a slot holds on two paths are one after the join: a vtable stored there
+    /// afterwards (an inlined destructor) is the class of both.
+    #[test]
+    fn stack_objects_joined_at_a_merge_are_one() {
+        // sub rsp, 0x28 ; test esi, esi ; je L ; mov rdi, rsp ; call 0x1100 ; jmp M ;
+        // L: mov rdi, rsp ; call 0x1200 ; M: lea rax, [0x2000] ; mov [rsp], rax ; add rsp, 0x28 ; ret
+        let code = [
+            0x48, 0x83, 0xec, 0x28, 0x85, 0xf6, 0x74, 0x0a, 0x48, 0x89, 0xe7, 0xe8, 0xf0, 0x00, 0x00, 0x00, 0xeb, 0x08, 0x48, 0x89, 0xe7, 0xe8, 0xe6, 0x01,
+            0x00, 0x00, 0x48, 0x8d, 0x05, 0xdf, 0x0f, 0x00, 0x00, 0x48, 0x89, 0x04, 0x24, 0x48, 0x83, 0xc4, 0x28, 0xc3,
+        ];
+        let vts: FxHashSet<u64> = [0x2000].into_iter().collect();
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &vts);
+        assert_eq!(s.made_alias, [((0, 0), (1, 0))]);
+        assert_eq!(s.made_vt, [(0, 0, 0x2000)]);
     }
 
     /// The join of two classes is their nearest common base.
