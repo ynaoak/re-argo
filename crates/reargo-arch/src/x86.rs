@@ -289,24 +289,33 @@ impl X86Arch {
         let len = instruction.len() as u32;
         let bytes: SmallVec<[u8; 16]> = data[..len as usize].into();
 
-        let mut formatter = IntelFormatter::new();
-        let mut mnemonic_output = String::new();
-        formatter.format_mnemonic(&instruction, &mut mnemonic_output);
-
-        let mut operand_output = String::new();
-        // Use the *formatter's* operand count: it differs from
-        // `instruction.op_count()` for pseudo-ops (`cmpltss` hides the
-        // predicate imm) and for 3-operand `imul r, r, imm` with dst == src,
-        // which iced prints in its 2-operand short form. Iterating the raw
-        // count printed `imul eax, 93h, ` / `cmpltss xmm3, xmm0, ` with a
-        // dangling separator and an empty operand.
-        let operand_count = formatter.operand_count(&instruction);
-        for i in 0..operand_count {
-            if i > 0 {
-                operand_output.push_str(", ");
-            }
-            let _ = formatter.format_operand(&instruction, &mut operand_output, i);
+        // One formatter per thread (building one per instruction was a
+        // large share of the decode); its output does not depend on
+        // earlier calls.
+        thread_local! {
+            static FORMATTER: std::cell::RefCell<IntelFormatter> = std::cell::RefCell::new(IntelFormatter::new());
         }
+        let (mnemonic_output, operand_output) = FORMATTER.with(|cell| {
+            let formatter = &mut *cell.borrow_mut();
+            let mut mnemonic_output = String::new();
+            formatter.format_mnemonic(&instruction, &mut mnemonic_output);
+
+            let mut operand_output = String::new();
+            // Use the *formatter's* operand count: it differs from
+            // `instruction.op_count()` for pseudo-ops (`cmpltss` hides the
+            // predicate imm) and for 3-operand `imul r, r, imm` with dst == src,
+            // which iced prints in its 2-operand short form. Iterating the raw
+            // count printed `imul eax, 93h, ` / `cmpltss xmm3, xmm0, ` with a
+            // dangling separator and an empty operand.
+            let operand_count = formatter.operand_count(&instruction);
+            for i in 0..operand_count {
+                if i > 0 {
+                    operand_output.push_str(", ");
+                }
+                let _ = formatter.format_operand(&instruction, &mut operand_output, i);
+            }
+            (mnemonic_output, operand_output)
+        });
 
         let flow_type = classify_flow(&instruction);
         let branch_target = extract_branch_target(&instruction);

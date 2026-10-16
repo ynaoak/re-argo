@@ -25,9 +25,19 @@ impl Analyzer for FillerBytesAnalyzer {
             .collect();
 
         for &(addr, size) in &text_sections {
+            // Read the section once: a byte that is no filler byte
+            // moves on by one whatever the listing holds, so the
+            // instruction lookup is only needed for filler bytes.
+            let section_bytes = program.info.memory.slice(addr, size);
             let mut offset = 0u64;
             while offset < size {
                 let current = addr + offset;
+                if let Some(bytes) = section_bytes
+                    && !matches!(bytes[offset as usize], 0xCC | 0x90 | 0x00)
+                {
+                    offset += 1;
+                    continue;
+                }
                 if program.listing.has_instruction(current) {
                     offset += 1;
                     continue;
@@ -38,7 +48,11 @@ impl Analyzer for FillerBytesAnalyzer {
                         let start = current;
                         let mut end = current + 1;
                         while end < addr + size {
-                            if program.info.memory.read_byte(end) != Some(filler_byte) {
+                            let next = match section_bytes {
+                                Some(bytes) => Some(bytes[(end - addr) as usize]),
+                                None => program.info.memory.read_byte(end),
+                            };
+                            if next != Some(filler_byte) {
                                 break;
                             }
                             end += 1;

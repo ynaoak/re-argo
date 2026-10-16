@@ -109,6 +109,24 @@ impl Memory {
         self.find_block(offset)?.read_byte(offset)
     }
 
+    /// The initialized bytes of `[offset, offset + len)` as one slice, when
+    /// every address in it reads from the same block — no other block starts
+    /// inside the range — so a per-address [`Memory::read_byte`] /
+    /// [`Memory::read_bytes`] there sees exactly these bytes. `None` otherwise.
+    pub fn slice(&self, offset: u64, len: u64) -> Option<&[u8]> {
+        let block = self.find_block(offset)?;
+        let data = block.data.as_ref()?;
+        let start = usize::try_from(offset - block.start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        if end > data.len() || end as u64 > block.size {
+            return None;
+        }
+        if len > 1 && self.blocks.range(offset + 1..offset + len).next().is_some() {
+            return None;
+        }
+        Some(&data[start..end])
+    }
+
     pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), LoaderError> {
         let block = self
             .find_block(offset)

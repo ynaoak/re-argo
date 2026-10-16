@@ -31,9 +31,11 @@
 
 use std::collections::BTreeMap;
 
+use rayon::prelude::*;
 use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
-use reargo_lift::PcodeLift;
+use reargo_lift::LiftedInstruction;
+use rustc_hash::FxHashMap;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
 
@@ -82,6 +84,14 @@ impl Analyzer for IndirectCallResolver {
             });
         }
 
+        // First import of each name → its PLT address (what a
+        // linear `imports.iter().find(name)` returns).
+        let mut plt_by_name: FxHashMap<&str, u64> = FxHashMap::default();
+        for imp in &program.info.imports {
+            plt_by_name.entry(imp.name.as_str()).or_insert(imp.plt_address);
+        }
+        let plt_of_got = |got: u64| by_got.get(&got).and_then(|name| plt_by_name.get(name).copied());
+
         // (1) Bytewise pass over decoded instructions for the dominant
         // `call qword ptr [rip+disp32]` and `jmp qword ptr [rip+disp32]`
         // shapes. Lifter currently folds these into plain `Call` /
@@ -91,134 +101,38 @@ impl Analyzer for IndirectCallResolver {
         let mut resolved: Vec<(u64, u64)> = Vec::new();
         for insn in program.listing.instructions() {
             if let Some(target_got) = parse_call_rip_disp32(insn.address, insn.length, &insn.bytes)
-                && by_got.contains_key(&target_got)
-                && let Some(name) = by_got.get(&target_got)
-                && let Some(imp) = program.info.imports.iter().find(|i| i.name == *name)
+                && let Some(plt) = plt_of_got(target_got)
             {
-                resolved.push((insn.address, imp.plt_address));
+                resolved.push((insn.address, plt));
             }
         }
-
-        let lifter: Box<dyn PcodeLift> = Box::new(reargo_lift::x86::X86Lifter::new_64());
 
         // (2) P-code walk for `call <reg>` patterns where the lifter
-        // does emit `CallInd` — caller-saved-aware constness map per
-        // varnode `(space, offset)` key. Size is ignored so 4-byte
-        // and 8-byte writes both kill the prior constant; good
-        // enough for the GOT-load pattern.
-        for func in program.listing.functions() {
-            let max_insns = func
-                .body
-                .ranges()
-                .map(|r| r.size as usize)
-                .sum::<usize>()
-                .max(200);
-            let Ok(lifted) = lifter.lift_range(&program.info.memory, func.entry_point, max_insns)
-            else {
-                continue;
-            };
-
-            let mut const_for: BTreeMap<(SpaceId, u64), u64> = BTreeMap::new();
-            for insn in &lifted {
-                for op in &insn.ops {
-                    match op.opcode {
-                        OpCode::Copy => {
-                            // `dst = src` — propagate constness if
-                            // the source is a CONST or an alias of a
-                            // known constant register.
-                            if let Some(dst) = op.output.as_ref()
-                                && let Some(src) = op.inputs.first()
-                            {
-                                let v = if src.space == SpaceId::CONST {
-                                    Some(src.offset)
-                                } else {
-                                    const_for.get(&(src.space, src.offset)).copied()
-                                };
-                                let dst_key = (dst.space, dst.offset);
-                                match v {
-                                    Some(val) => {
-                                        const_for.insert(dst_key, val);
-                                    }
-                                    None => {
-                                        const_for.remove(&dst_key);
-                                    }
-                                }
-                            }
-                        }
-                        OpCode::Load => {
-                            // `dst = LOAD(space, addr)` — when addr
-                            // is a CONST we know to be a GOT slot,
-                            // tag dst with the *import's plt
-                            // address* (the eventual call target).
-                            if let Some(dst) = op.output.as_ref()
-                                && op.inputs.len() == 2
-                            {
-                                let addr_vn = &op.inputs[1];
-                                let v = if addr_vn.space == SpaceId::CONST {
-                                    Some(addr_vn.offset)
-                                } else {
-                                    const_for.get(&(addr_vn.space, addr_vn.offset)).copied()
-                                };
-                                if let Some(addr_val) = v
-                                    && let Some(name) = by_got.get(&addr_val)
-                                {
-                                    // Resolve to the matching PLT
-                                    // address from `imports` — that's
-                                    // what `IndirectCallAnalyzer`
-                                    // emits and what the symbol table
-                                    // already names as `<name>@plt`.
-                                    if let Some(imp) =
-                                        program.info.imports.iter().find(|i| i.name == *name)
-                                    {
-                                        const_for.insert(
-                                            (dst.space, dst.offset),
-                                            imp.plt_address,
-                                        );
-                                        continue;
-                                    }
-                                }
-                                const_for.remove(&(dst.space, dst.offset));
-                            }
-                        }
-                        OpCode::Call | OpCode::CallInd => {
-                            // Find the call-target varnode. For
-                            // CALLIND it's input[0] (the indirect
-                            // target); for CALL the input is usually
-                            // already a CONST and gets handled by the
-                            // direct call resolver.
-                            if op.opcode == OpCode::CallInd
-                                && let Some(t) = op.inputs.first()
-                            {
-                                let v = if t.space == SpaceId::CONST {
-                                    Some(t.offset)
-                                } else {
-                                    const_for.get(&(t.space, t.offset)).copied()
-                                };
-                                if let Some(target) = v
-                                    && target != 0
-                                {
-                                    resolved.push((insn.address, target));
-                                }
-                            }
-                            // Per SysV every caller-saved register
-                            // is clobbered across a call. Be
-                            // conservative and drop the whole map —
-                            // the alternative is hard-coding a
-                            // preserved-register set we'd have to
-                            // keep in sync with the call-conv DB.
-                            const_for.clear();
-                        }
-                        _ => {
-                            // Any other write kills the constness
-                            // of its output (we don't model arithmetic).
-                            if let Some(dst) = op.output.as_ref() {
-                                const_for.remove(&(dst.space, dst.offset));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // does emit `CallInd`, per function over its linear lift
+        // (functions in parallel, neighbours sharing lifted
+        // instructions; results in function order).
+        // A range without an indirect `call` has no `CallInd` and so
+        // resolves nothing: only the ranges holding one (found by a
+        // decode, much cheaper than the lift) are lifted.
+        let jobs: Vec<(u64, usize)> = program
+            .listing
+            .functions()
+            .map(|f| {
+                let budget = f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200);
+                (f.entry_point, budget)
+            })
+            .collect();
+        let scanner = reargo_lift::x86::X86Lifter::new_64();
+        let memory = &program.info.memory;
+        let jobs: Vec<(u64, usize)> = jobs
+            .par_iter()
+            .filter(|&&(entry, budget)| scanner.range_has_indirect_call(memory, entry, budget))
+            .copied()
+            .collect();
+        let per_function = crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |_, lifted| {
+            resolve_lifted(lifted, &plt_of_got)
+        });
+        resolved.extend(per_function.into_iter().flatten());
 
         // Dedupe against existing references from each call site.
         let mut added = 0usize;
@@ -244,6 +158,106 @@ impl Analyzer for IndirectCallResolver {
             instructions_decoded: 0,
         })
     }
+}
+
+/// `(call site, target)` of every `CallInd` in `lifted` whose target
+/// register provably holds a constant: a caller-saved-aware constness
+/// map per varnode `(space, offset)` key. Size is ignored so 4-byte
+/// and 8-byte writes both kill the prior constant; good enough for the
+/// GOT-load pattern.
+fn resolve_lifted(lifted: &[&LiftedInstruction], plt_of_got: &dyn Fn(u64) -> Option<u64>) -> Vec<(u64, u64)> {
+    let mut resolved: Vec<(u64, u64)> = Vec::new();
+    let mut const_for: FxHashMap<(SpaceId, u64), u64> = FxHashMap::default();
+    for insn in lifted {
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Copy => {
+                    // `dst = src` — propagate constness if
+                    // the source is a CONST or an alias of a
+                    // known constant register.
+                    if let Some(dst) = op.output.as_ref()
+                        && let Some(src) = op.inputs.first()
+                    {
+                        let v = if src.space == SpaceId::CONST {
+                            Some(src.offset)
+                        } else {
+                            const_for.get(&(src.space, src.offset)).copied()
+                        };
+                        let dst_key = (dst.space, dst.offset);
+                        match v {
+                            Some(val) => {
+                                const_for.insert(dst_key, val);
+                            }
+                            None => {
+                                const_for.remove(&dst_key);
+                            }
+                        }
+                    }
+                }
+                OpCode::Load => {
+                    // `dst = LOAD(space, addr)` — when addr
+                    // is a CONST we know to be a GOT slot,
+                    // tag dst with the *import's plt
+                    // address* (the eventual call target) —
+                    // what `IndirectCallAnalyzer` emits and what
+                    // the symbol table already names as `<name>@plt`.
+                    if let Some(dst) = op.output.as_ref()
+                        && op.inputs.len() == 2
+                    {
+                        let addr_vn = &op.inputs[1];
+                        let v = if addr_vn.space == SpaceId::CONST {
+                            Some(addr_vn.offset)
+                        } else {
+                            const_for.get(&(addr_vn.space, addr_vn.offset)).copied()
+                        };
+                        if let Some(addr_val) = v
+                            && let Some(plt) = plt_of_got(addr_val)
+                        {
+                            const_for.insert((dst.space, dst.offset), plt);
+                            continue;
+                        }
+                        const_for.remove(&(dst.space, dst.offset));
+                    }
+                }
+                OpCode::Call | OpCode::CallInd => {
+                    // Find the call-target varnode. For
+                    // CALLIND it's input[0] (the indirect
+                    // target); for CALL the input is usually
+                    // already a CONST and gets handled by the
+                    // direct call resolver.
+                    if op.opcode == OpCode::CallInd
+                        && let Some(t) = op.inputs.first()
+                    {
+                        let v = if t.space == SpaceId::CONST {
+                            Some(t.offset)
+                        } else {
+                            const_for.get(&(t.space, t.offset)).copied()
+                        };
+                        if let Some(target) = v
+                            && target != 0
+                        {
+                            resolved.push((insn.address, target));
+                        }
+                    }
+                    // Per SysV every caller-saved register
+                    // is clobbered across a call. Be
+                    // conservative and drop the whole map —
+                    // the alternative is hard-coding a
+                    // preserved-register set we'd have to
+                    // keep in sync with the call-conv DB.
+                    const_for.clear();
+                }
+                _ => {
+                    // Any other write kills the constness
+                    // of its output (we don't model arithmetic).
+                    if let Some(dst) = op.output.as_ref() {
+                        const_for.remove(&(dst.space, dst.offset));
+                    }
+                }
+            }
+        }
+    }
+    resolved
 }
 
 /// Decode `ff 15 disp32` (CALL m64) and `ff 25 disp32` (JMP m64)

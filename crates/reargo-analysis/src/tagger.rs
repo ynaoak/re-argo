@@ -25,6 +25,7 @@
 use reargo_program::comments::CommentType;
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -104,6 +105,22 @@ impl Analyzer for TagAnalyzer {
             .filter(|k| k.starts_with("scc_") && k.ends_with("_funcs"))
             .cloned()
             .collect();
+        // The address of the first symbol (in symbol-table order)
+        // carrying each cluster member's name, found in one pass over
+        // the symbols instead of one scan per name.
+        let wanted: FxHashSet<&str> = scc_keys
+            .iter()
+            .filter_map(|k| program.metadata.properties.get(k))
+            .flat_map(|v| v.split(", "))
+            .collect();
+        let mut first_by_name: FxHashMap<String, u64> = FxHashMap::default();
+        if !wanted.is_empty() {
+            for sym in program.symbol_table.iter() {
+                if wanted.contains(sym.name.as_str()) && !first_by_name.contains_key(sym.name.as_str()) {
+                    first_by_name.insert(sym.name.clone(), sym.address);
+                }
+            }
+        }
         for k in scc_keys {
             // The value is a comma-separated function name list;
             // we tag each function name's entry address.
@@ -111,13 +128,9 @@ impl Analyzer for TagAnalyzer {
                 continue;
             };
             for name in value.split(", ") {
-                if let Some(sym) = program
-                    .symbol_table
-                    .iter()
-                    .find(|s| s.name == name)
-                {
+                if let Some(&address) = first_by_name.get(name) {
                     program.tags.add_function(
-                        sym.address,
+                        address,
                         TagKind::Recursive,
                         format!("{}: cluster {}", name, k),
                         true,

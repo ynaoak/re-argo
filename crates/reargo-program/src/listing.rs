@@ -35,7 +35,7 @@ impl Listing {
         &self,
         start: u64,
         end: u64,
-    ) -> impl Iterator<Item = &DecodedInstruction> {
+    ) -> impl DoubleEndedIterator<Item = &DecodedInstruction> {
         self.instructions.range(start..end).map(|(_, v)| v)
     }
 

@@ -30,6 +30,7 @@
 //! * Skip strings that already appear in `strings` output (i.e. the
 //!   original bytes without decode). Those are visible without us.
 
+use rayon::prelude::*;
 use reargo_loader::SectionFlags;
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
@@ -192,29 +193,42 @@ impl Default for FlossOptions {
 /// can use the engine outside of the analyzer pipeline (CLI `floss`
 /// command).
 pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<DecodedString> {
-    let mut hits: Vec<DecodedString> = Vec::new();
-
+    // Every (method, key) pass is independent: run them in parallel
+    // batches, then append their hits in the fixed XOR → ADD → ROL,
+    // ascending-key order with the same per-pass cap check as a serial
+    // run (which stops at the first pass that overflows the cap; a
+    // batch past that point is not started).
+    let mut methods: Vec<DecodeMethod> = Vec::new();
     if opts.try_xor {
-        for key in 1u8..=255 {
-            scan_with(buf, base_addr, opts, &mut hits, |b| b ^ key, DecodeMethod::Xor(key));
-            if hits.len() > opts.max_per_section {
-                hits.truncate(opts.max_per_section);
-                return hits;
-            }
-        }
+        methods.extend((1u8..=255).map(DecodeMethod::Xor));
     }
     if opts.try_add {
-        for key in 1u8..=255 {
-            scan_with(buf, base_addr, opts, &mut hits, |b| b.wrapping_add(key), DecodeMethod::Add(key));
-            if hits.len() > opts.max_per_section {
-                hits.truncate(opts.max_per_section);
-                return hits;
-            }
-        }
+        methods.extend((1u8..=255).map(DecodeMethod::Add));
     }
     if opts.try_rol {
-        for r in 1u8..=7 {
-            scan_with(buf, base_addr, opts, &mut hits, |b| b.rotate_left(r as u32), DecodeMethod::Rol(r));
+        methods.extend((1u8..=7).map(DecodeMethod::Rol));
+    }
+    let batch = rayon::current_num_threads().max(1) * 2;
+    let mut hits: Vec<DecodedString> = Vec::new();
+    for group in methods.chunks(batch) {
+        let per_method: Vec<Vec<DecodedString>> = group
+            .par_iter()
+            .map(|&method| {
+                let mut out = Vec::new();
+                match method {
+                    DecodeMethod::Xor(key) => scan_with(buf, base_addr, opts, &mut out, |b| b ^ key, method),
+                    DecodeMethod::Add(key) => {
+                        scan_with(buf, base_addr, opts, &mut out, |b| b.wrapping_add(key), method)
+                    }
+                    DecodeMethod::Rol(r) => {
+                        scan_with(buf, base_addr, opts, &mut out, |b| b.rotate_left(r as u32), method)
+                    }
+                }
+                out
+            })
+            .collect();
+        for found in per_method {
+            hits.extend(found);
             if hits.len() > opts.max_per_section {
                 hits.truncate(opts.max_per_section);
                 return hits;
@@ -256,19 +270,35 @@ fn scan_with(
     decode: impl Fn(u8) -> u8,
     method: DecodeMethod,
 ) {
+    // Decoded-byte printability per source byte value.
+    let printable: [bool; 256] = std::array::from_fn(|b| is_printable(decode(b as u8)));
     let n = buf.len();
+    let m = opts.min_length;
+    // Every maximal printable run of at least `m` bytes is examined,
+    // in address order (a shorter run is skipped whole). `i` is always
+    // the start of a maximal run (0 or just past a non-printable byte),
+    // so a run of `m` from `i` needs `buf[i..i + m]` all printable:
+    // test its last byte first and, when it is printable, look back
+    // for the last non-printable one — the next run cannot start
+    // before it. Most windows fail on the first byte tested.
     let mut i = 0;
-    while i + opts.min_length <= n {
-        let mut j = i;
-        while j < n {
-            let decoded = decode(buf[j]);
-            if !is_printable(decoded) {
-                break;
+    while i + m <= n {
+        if m > 0 {
+            if !printable[buf[i + m - 1] as usize] {
+                i += m;
+                continue;
             }
+            if let Some(k) = (i..i + m - 1).rev().find(|&k| !printable[buf[k] as usize]) {
+                i = k + 1;
+                continue;
+            }
+        }
+        let mut j = i + m;
+        while j < n && printable[buf[j] as usize] {
             j += 1;
         }
         let run_len = j - i;
-        if run_len >= opts.min_length {
+        if run_len >= m {
             // Conservative mode: the ORIGINAL bytes at this window
             // must be ≥ 50% non-printable. Real obfuscated strings
             // have encoded bytes that look like binary noise; if
@@ -295,7 +325,10 @@ fn scan_with(
             // sub-strings for the same key.
             i = j;
         } else {
-            i += 1;
+            // Every start inside this short run ends at the same `j`,
+            // so its runs are shorter still; `j` itself starts an
+            // empty run. Resume after it.
+            i = j + 1;
         }
     }
 }
@@ -391,6 +424,67 @@ fn passes_filter(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan before the skip search: every start, one byte at a time.
+    fn scan_naive(buf: &[u8], opts: &FlossOptions, out: &mut Vec<DecodedString>, decode: impl Fn(u8) -> u8, method: DecodeMethod) {
+        let n = buf.len();
+        let mut i = 0;
+        while i + opts.min_length <= n {
+            let mut j = i;
+            while j < n && is_printable(decode(buf[j])) {
+                j += 1;
+            }
+            let run_len = j - i;
+            if run_len >= opts.min_length {
+                if opts.require_nonprintable_source {
+                    let np = buf[i..j].iter().filter(|b| !is_printable(**b)).count();
+                    if np * 2 < run_len {
+                        i = j;
+                        continue;
+                    }
+                }
+                let decoded_bytes: Vec<u8> = buf[i..j].iter().map(|b| decode(*b)).collect();
+                if let Ok(s) = std::str::from_utf8(&decoded_bytes)
+                    && passes_filter(s)
+                {
+                    out.push(DecodedString { address: 0x1000 + i as u64, method, plaintext: s.to_string() });
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn skip_scan_matches_naive_scan() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut hits = 0usize;
+        for round in 0..200 {
+            let len = (next() % 600) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| match next() % 4 {
+                    0 => (next() % 256) as u8,
+                    _ => b"abcdefghijklmnopqrstuvwxyzEXAMPLE/:.-_ 0123"[(next() % 43) as usize] ^ 0x5a,
+                })
+                .collect();
+            for &(m, strict) in &[(1usize, false), (3, true), (6, false), (8, true), (12, false), (40, true)] {
+                let opts = FlossOptions { min_length: m, require_nonprintable_source: strict, ..FlossOptions::default() };
+                for key in [0x5au8, 0x01, 0xa0] {
+                    let (mut fast, mut slow) = (Vec::new(), Vec::new());
+                    scan_with(&buf, 0x1000, &opts, &mut fast, |b| b ^ key, DecodeMethod::Xor(key));
+                    scan_naive(&buf, &opts, &mut slow, |b| b ^ key, DecodeMethod::Xor(key));
+                    assert_eq!(fast, slow, "round {round} m {m} strict {strict} key {key:#x}");
+                    hits += fast.len();
+                }
+            }
+        }
+        assert!(hits > 100, "the buffers should decode to some strings ({hits})");
+    }
 
     #[test]
     fn xor_decode_recovers_string() {

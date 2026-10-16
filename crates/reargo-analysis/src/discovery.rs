@@ -6,6 +6,7 @@ use reargo_program::function::Function;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::symbol::SymbolType;
 use reargo_program::Program;
+use rustc_hash::FxHashSet;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -59,7 +60,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let mut work_queue: VecDeque<u64> = VecDeque::new();
-        let mut visited: BTreeSet<u64> = BTreeSet::new();
+        let mut visited: FxHashSet<u64> = FxHashSet::default();
         let mut functions_found = 0;
         let mut references_found = 0;
         let mut instructions_decoded = 0;
@@ -195,10 +196,10 @@ struct FunctionDiscovery {
 fn disassemble_function(
     program: &mut Program,
     entry: u64,
-    global_visited: &mut BTreeSet<u64>,
+    global_visited: &mut FxHashSet<u64>,
 ) -> Result<FunctionDiscovery, AnalysisError> {
     let mut block_queue: VecDeque<u64> = VecDeque::new();
-    let mut block_visited: BTreeSet<u64> = BTreeSet::new();
+    let mut block_visited: FxHashSet<u64> = FxHashSet::default();
     let mut body = AddressSet::new();
     let mut call_targets: BTreeSet<u64> = BTreeSet::new();
     let mut references = Vec::new();

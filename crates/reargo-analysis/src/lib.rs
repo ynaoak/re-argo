@@ -72,6 +72,7 @@ pub mod packer;
 pub mod panic_like;
 pub mod patterns;
 pub mod pcoderef;
+pub mod range_lift;
 pub mod pe_enrich;
 pub mod pe_seh;
 pub mod rtti;

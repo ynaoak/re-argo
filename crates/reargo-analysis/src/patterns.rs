@@ -66,9 +66,24 @@ impl Analyzer for PatternFunctionAnalyzer {
             .collect();
 
         for &(base, size) in &text_sections {
+            // Read the section once and test the (cheap) byte pattern
+            // before the listing lookups: an address that matches no
+            // prologue moves on by one byte whatever the listing says,
+            // so only matches need the "already inside a function"
+            // checks. A section not readable as one slice takes the
+            // per-address path.
+            let section_bytes = program.info.memory.slice(base, size);
             let mut offset = 0u64;
             while offset + 4 <= size {
                 let addr = base + offset;
+
+                if let Some(bytes) = section_bytes {
+                    let tail = &bytes[offset as usize..];
+                    if !X86_64_PROLOGUE_PATTERNS.iter().any(|pat| tail.starts_with(pat)) {
+                        offset += 1;
+                        continue;
+                    }
+                }
 
                 // Skip addresses that are already known to be inside
                 // a function body. `has_function` only catches the
