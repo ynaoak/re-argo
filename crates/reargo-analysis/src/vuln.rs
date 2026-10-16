@@ -31,9 +31,12 @@ use std::collections::BTreeMap;
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct VulnAnalyzer;
+
+/// A dangerous callee: its name, CWE id and label.
+type Hit = (String, &'static str, &'static str);
 
 impl Analyzer for VulnAnalyzer {
     fn name(&self) -> &str {
@@ -53,7 +56,17 @@ impl Analyzer for VulnAnalyzer {
     fn provides(&self) -> &'static [&'static str] {
         &["vuln-patterns"]
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::SYMBOLS.union(State::CODE))
+    }
+    fn writes(&self) -> State {
+        State::TAGS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // Build a quick (address -> name) map. Strip @plt suffix so
         // both PLT thunks and direct calls resolve to the same name.
         let mut name_by_addr: BTreeMap<u64, String> = BTreeMap::new();
@@ -62,7 +75,6 @@ impl Analyzer for VulnAnalyzer {
             name_by_addr.entry(sym.address).or_insert(n);
         }
 
-        type Hit = (String, &'static str, &'static str);
         let mut findings: Vec<(u64, Vec<Hit>)> = Vec::new();
         for f in program.listing.functions() {
             let mut hits: Vec<Hit> = Vec::new();
@@ -79,6 +91,10 @@ impl Analyzer for VulnAnalyzer {
             }
         }
 
+        Box::new(findings)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let findings: Vec<(u64, Vec<Hit>)> = crate::analyzer::prepared(prepared);
         let total = findings.len();
         for (entry, hits) in findings {
             for (name, cwe, label) in hits {

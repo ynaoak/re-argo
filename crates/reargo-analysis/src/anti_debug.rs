@@ -27,9 +27,13 @@ use std::collections::BTreeSet;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct AntiDebugAnalyzer;
+
+/// The bytewise findings and the direct calls to debugger APIs, each
+/// with its note.
+type Found = (Vec<(u64, &'static str)>, Vec<(u64, &'static str)>);
 
 impl Analyzer for AntiDebugAnalyzer {
     fn name(&self) -> &str {
@@ -43,14 +47,19 @@ impl Analyzer for AntiDebugAnalyzer {
         // ExceptionFlow (790). Both write Post / Plate slots.
         795
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE.union(State::REFERENCES).union(State::SYMBOLS))
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(None::<Found>);
         }
 
         // (1)+(2)+(3) — bytewise scan of every decoded instruction.
@@ -84,6 +93,19 @@ impl Analyzer for AntiDebugAnalyzer {
             })
             .filter_map(|r| api_addrs.get(&r.to).map(|note| (r.from, *note)))
             .collect();
+
+        Box::new(Some::<Found>((bytewise, api_edges)))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let found: Option<Found> = crate::analyzer::prepared(prepared);
+        let Some((bytewise, api_edges)) = found else {
+            return Ok(AnalysisResult {
+                analyzer_name: self.name().into(),
+                functions_found: 0,
+                references_found: 0,
+                instructions_decoded: 0,
+            });
+        };
 
         // Emit.
         let mut emitted = 0usize;

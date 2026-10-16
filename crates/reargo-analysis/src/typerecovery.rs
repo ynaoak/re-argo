@@ -1,11 +1,14 @@
 // Type recovery analyzer: applies DWARF/PDB types to functions and variables.
 
 use reargo_program::Program;
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct TypeRecoveryAnalyzer;
 
 impl Analyzer for TypeRecoveryAnalyzer {
+    fn writes(&self) -> State {
+        State::FUNC_NAME.union(State::DATA_TYPES)
+    }
     fn name(&self) -> &str { "Type Recovery" }
     fn description(&self) -> &str { "Recovers variable and function types from debug info and analysis" }
     fn priority(&self) -> u32 { 780 }
@@ -38,6 +41,9 @@ impl Analyzer for TypeRecoveryAnalyzer {
 pub struct DataTypeAnalyzer;
 
 impl Analyzer for DataTypeAnalyzer {
+    fn writes(&self) -> State {
+        State::NONE
+    }
     fn name(&self) -> &str { "Data Type" }
     fn description(&self) -> &str { "Infers data types from memory access patterns" }
     fn priority(&self) -> u32 { 790 }

@@ -2,7 +2,7 @@ use reargo_program::Program;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct CrossReferenceReportAnalyzer;
 
@@ -11,7 +11,17 @@ impl Analyzer for CrossReferenceReportAnalyzer {
     fn description(&self) -> &str { "Generates cross-reference statistics and identifies hot addresses" }
     fn priority(&self) -> u32 { 950 }
 
+    fn prepare_reads(&self) -> Option<State> { Some(State::REFERENCES) }
+    fn writes(&self) -> State { State::NONE }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn apply(&self, _program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        Ok(crate::analyzer::prepared(prepared))
+    }
+    /// Only counts: the result is all there is to apply.
+    fn prepare(&self, program: &Program) -> Prepared {
         // Tally reference targets via FxHashMap rather than BTreeMap.
         // The keys are integer addresses with no need for ordered
         // iteration -- we only fold over `values()` to compute the
@@ -35,7 +45,7 @@ impl Analyzer for CrossReferenceReportAnalyzer {
             }
         }
 
-        Ok(AnalysisResult {
+        Box::new(AnalysisResult {
             analyzer_name: self.name().into(),
             functions_found: hot_addresses,
             references_found: max_refs_to,
@@ -51,7 +61,17 @@ impl Analyzer for UnreferencedFunctionAnalyzer {
     fn description(&self) -> &str { "Identifies functions with no incoming call references" }
     fn priority(&self) -> u32 { 960 }
 
+    fn prepare_reads(&self) -> Option<State> { Some(State::CODE.union(State::REFERENCES)) }
+    fn writes(&self) -> State { State::NONE }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn apply(&self, _program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        Ok(crate::analyzer::prepared(prepared))
+    }
+    /// Only counts: the result is all there is to apply.
+    fn prepare(&self, program: &Program) -> Prepared {
         let entry = program.entry_point();
         let entries: Vec<u64> = program
             .listing
@@ -67,7 +87,7 @@ impl Analyzer for UnreferencedFunctionAnalyzer {
             .filter(|&&ep| ep != entry && program.references.call_refs_to(ep).is_empty())
             .count();
 
-        Ok(AnalysisResult {
+        Box::new(AnalysisResult {
             analyzer_name: self.name().into(),
             functions_found: unreferenced,
             references_found: 0,

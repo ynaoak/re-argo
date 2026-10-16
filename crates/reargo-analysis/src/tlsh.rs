@@ -47,11 +47,14 @@ use reargo_loader::BinaryInfo;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct TlshAnalyzer;
 
 impl Analyzer for TlshAnalyzer {
+    fn writes(&self) -> State {
+        State::METADATA
+    }
     fn name(&self) -> &str {
         "TLSH"
     }

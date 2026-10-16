@@ -2,7 +2,7 @@ use reargo_program::reference::{RefType, Reference};
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct VTableAnalyzer;
 
@@ -16,8 +16,19 @@ impl Analyzer for VTableAnalyzer {
     fn priority(&self) -> u32 {
         600
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::NONE)
+    }
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::REFERENCES)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut vtables_found = 0;
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// Each vtable's address and slot count, in scan order.
+    fn prepare(&self, program: &Program) -> Prepared {
+        let mut vtables: Vec<(u64, u64)> = Vec::new();
         let ptr_size = (program.info.bits / 8) as u64;
 
         let code_ranges: Vec<(u64, u64)> = program
@@ -66,34 +77,43 @@ impl Analyzer for VTableAnalyzer {
                 }
 
                 if consecutive_code_ptrs >= 3 {
-                    let vtable_name = format!("vtable_{:x}", addr);
-                    if program.symbol_table.primary_at(addr).is_none() {
-                        program.symbol_table.add(Symbol::new(
-                            vtable_name,
-                            addr,
-                            SymbolType::Data,
-                            SourceType::Analysis,
-                        ));
-                    }
-
-                    for i in 0..consecutive_code_ptrs {
-                        let entry_addr = addr + i * ptr_size;
-                        let target = if ptr_size == 8 {
-                            program.info.memory.read_u64(entry_addr).unwrap_or(0)
-                        } else {
-                            program.info.memory.read_u32(entry_addr).unwrap_or(0) as u64
-                        };
-                        program
-                            .references
-                            .add(Reference::new(entry_addr, target, RefType::DataRead));
-                    }
-
-                    vtables_found += 1;
+                    vtables.push((addr, consecutive_code_ptrs));
                     offset += consecutive_code_ptrs * ptr_size;
                 } else {
                     offset += ptr_size;
                 }
             }
+        }
+        Box::new(vtables)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let vtables: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
+        let ptr_size = (program.info.bits / 8) as u64;
+        let mut vtables_found = 0;
+        for (addr, consecutive_code_ptrs) in vtables {
+            let vtable_name = format!("vtable_{:x}", addr);
+            if program.symbol_table.primary_at(addr).is_none() {
+                program.symbol_table.add(Symbol::new(
+                    vtable_name,
+                    addr,
+                    SymbolType::Data,
+                    SourceType::Analysis,
+                ));
+            }
+
+            for i in 0..consecutive_code_ptrs {
+                let entry_addr = addr + i * ptr_size;
+                let target = if ptr_size == 8 {
+                    program.info.memory.read_u64(entry_addr).unwrap_or(0)
+                } else {
+                    program.info.memory.read_u32(entry_addr).unwrap_or(0) as u64
+                };
+                program
+                    .references
+                    .add(Reference::new(entry_addr, target, RefType::DataRead));
+            }
+
+            vtables_found += 1;
         }
 
         Ok(AnalysisResult {

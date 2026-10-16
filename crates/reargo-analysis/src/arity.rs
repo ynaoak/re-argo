@@ -33,7 +33,7 @@ use reargo_lift::LiftedInstruction;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 /// SysV arg-register offsets in REGISTER space, in declaration order.
 /// Identical to the table in `callsite.rs` — kept inline so this
@@ -50,6 +50,9 @@ const ARG_REGS: [(u64, &str); 6] = [
 pub struct ArgumentArityAnalyzer;
 
 impl Analyzer for ArgumentArityAnalyzer {
+    fn writes(&self) -> State {
+        State::METADATA.union(State::COMMENTS).union(State::CACHE)
+    }
     fn name(&self) -> &str {
         "Argument Arity"
     }

@@ -30,12 +30,15 @@
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 use crate::strings::{find_strings, is_data_section};
 
 pub struct IocExtractor;
 
 impl Analyzer for IocExtractor {
+    fn writes(&self) -> State {
+        State::TAGS.union(State::METADATA)
+    }
     fn name(&self) -> &str {
         "IoC Extractor"
     }
@@ -53,30 +56,18 @@ impl Analyzer for IocExtractor {
     fn provides(&self) -> &'static [&'static str] {
         &["iocs"]
     }
+    fn start_early(&self, program: &mut Program) {
+        // the data sections' bytes are fixed for the run
+        let sections = data_section_bytes(program);
+        crate::analyzer::Early::<IocExtractor, Vec<(u64, IocKind, String)>>::start(program, move || {
+            find_iocs(&sections)
+        });
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let data_sections: Vec<(u64, u64)> = program
-            .info
-            .sections
-            .iter()
-            .filter(|s| is_data_section(&s.name) && s.size > 0)
-            .map(|s| (s.address, s.size))
-            .collect();
-
-        let mut matches: Vec<(u64, IocKind, String)> = Vec::new();
-        for (addr, size) in data_sections {
-            // Cap section sample at 8 MiB to keep this cheap on
-            // resource-heavy binaries.
-            let read = (size).min(8 * 1024 * 1024) as usize;
-            let mut buf = vec![0u8; read];
-            if program.info.memory.read_bytes(addr, &mut buf).is_err() {
-                continue;
-            }
-            for (sym_addr, s) in find_strings(&buf, addr) {
-                if let Some(kind) = classify(&s) {
-                    matches.push((sym_addr, kind, s));
-                }
-            }
-        }
+        let matches = match crate::analyzer::Early::<IocExtractor, Vec<(u64, IocKind, String)>>::take(program) {
+            Some(matches) => matches,
+            None => find_iocs(&data_section_bytes(program)),
+        };
 
         let total = matches.len();
         for (addr, kind, s) in &matches {
@@ -106,6 +97,37 @@ impl Analyzer for IocExtractor {
             instructions_decoded: 0,
         })
     }
+}
+
+/// The address and bytes of each data section (at most its first
+/// 8 MiB, to keep this cheap on resource-heavy binaries), in section
+/// order.
+fn data_section_bytes(program: &Program) -> Vec<(u64, Vec<u8>)> {
+    program
+        .info
+        .sections
+        .iter()
+        .filter(|s| is_data_section(&s.name) && s.size > 0)
+        .filter_map(|s| {
+            let mut buf = vec![0u8; s.size.min(8 * 1024 * 1024) as usize];
+            program.info.memory.read_bytes(s.address, &mut buf).ok()?;
+            Some((s.address, buf))
+        })
+        .collect()
+}
+
+/// Every string of `sections` that is an IoC, in section and address
+/// order.
+fn find_iocs(sections: &[(u64, Vec<u8>)]) -> Vec<(u64, IocKind, String)> {
+    let mut matches: Vec<(u64, IocKind, String)> = Vec::new();
+    for (addr, buf) in sections {
+        for (sym_addr, s) in find_strings(buf, *addr) {
+            if let Some(kind) = classify(&s) {
+                matches.push((sym_addr, kind, s));
+            }
+        }
+    }
+    matches
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

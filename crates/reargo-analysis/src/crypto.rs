@@ -24,11 +24,14 @@ use reargo_program::comments::CommentType;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct CryptoConstantAnalyzer;
 
 impl Analyzer for CryptoConstantAnalyzer {
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::COMMENTS)
+    }
     fn name(&self) -> &str {
         "Crypto Constant"
     }

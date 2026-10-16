@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct FloatConstantAnalyzer;
 
@@ -109,6 +109,13 @@ fn format_const(v: f64, width: u32) -> String {
     s
 }
 
+/// A constant load found by decoding an instruction: its target and
+/// width.
+enum Hit {
+    Packed(u64, u32),
+    Scalar(u64, u32),
+}
+
 impl Analyzer for FloatConstantAnalyzer {
     fn name(&self) -> &str {
         "Float Constant"
@@ -126,7 +133,42 @@ impl Analyzer for FloatConstantAnalyzer {
         &["comments"]
     }
 
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
+        if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+            return Box::new(Vec::<(u64, Hit)>::new());
+        }
+        // Decode every instruction once, in parallel against an
+        // immutable view; the hits keep listing order and are applied
+        // in that order.
+        let insns: Vec<&reargo_arch::DecodedInstruction> = program.listing.instructions().collect();
+        let hits: Vec<(u64, Hit)> = insns
+            .par_iter()
+            .filter_map(|i| {
+                // every scalar / packed float op matched is an SSE (0x0f)
+                // or VEX / EVEX instruction
+                if !matches!(crate::utils::x86_64_opcode_byte(&i.bytes), Some(0x0f | 0xc4 | 0xc5 | 0x62)) {
+                    return None;
+                }
+                let ii = decode_one(i.address, &i.bytes)?;
+                if let Some(t) = packed_const_load(&ii) {
+                    return Some((i.address, Hit::Packed(t.0, t.1)));
+                }
+                float_const_load(&ii).map(|t| (i.address, Hit::Scalar(t.0, t.1)))
+            })
+            .collect();
+        Box::new(hits)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
             return Ok(AnalysisResult {
                 analyzer_name: self.name().into(),
@@ -135,6 +177,7 @@ impl Analyzer for FloatConstantAnalyzer {
                 instructions_decoded: 0,
             });
         }
+        let hits: Vec<(u64, Hit)> = crate::analyzer::prepared(prepared);
 
         // Valid target ranges = initialized sections (so we don't read holes).
         let ranges: Vec<(u64, u64)> = program
@@ -144,26 +187,6 @@ impl Analyzer for FloatConstantAnalyzer {
             .filter(|s| s.address != 0 && s.size > 0)
             .map(|s| (s.address, s.address + s.size))
             .collect();
-
-        // Decode every instruction once, in parallel against an
-        // immutable view; the hits keep listing order and are applied
-        // in that order below.
-        enum Hit {
-            Packed(u64, u32),
-            Scalar(u64, u32),
-        }
-        let insns: Vec<&reargo_arch::DecodedInstruction> = program.listing.instructions().collect();
-        let hits: Vec<(u64, Hit)> = insns
-            .par_iter()
-            .filter_map(|i| {
-                let ii = decode_one(i.address, &i.bytes)?;
-                if let Some(t) = packed_const_load(&ii) {
-                    return Some((i.address, Hit::Packed(t.0, t.1)));
-                }
-                float_const_load(&ii).map(|t| (i.address, Hit::Scalar(t.0, t.1)))
-            })
-            .collect();
-        drop(insns);
 
         let mut annotated = 0usize;
         for (addr, hit) in &hits {

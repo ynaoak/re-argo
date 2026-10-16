@@ -30,6 +30,19 @@ impl CommentManager {
         self.comments.insert((address, comment_type), text.into());
     }
 
+    /// Set the comment unless one of this type is there already (as
+    /// `get(..).is_none()` then `set`, with one lookup). Returns whether
+    /// it was set.
+    pub fn set_if_absent(&mut self, address: u64, comment_type: CommentType, text: impl Into<String>) -> bool {
+        match self.comments.entry((address, comment_type)) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(text.into());
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        }
+    }
+
     pub fn get(&self, address: u64, comment_type: CommentType) -> Option<&str> {
         self.comments.get(&(address, comment_type)).map(|s| s.as_str())
     }

@@ -25,11 +25,14 @@
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct PackerAnalyzer;
 
 impl Analyzer for PackerAnalyzer {
+    fn writes(&self) -> State {
+        State::METADATA.union(State::TAGS)
+    }
     fn name(&self) -> &str {
         "Packer Detection"
     }

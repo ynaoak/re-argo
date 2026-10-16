@@ -93,7 +93,7 @@ pub(crate) struct SharedLift {
 type AheadResults = (crate::range_lift::AheadMap<usize>, crate::range_lift::AheadMap<Option<(u64, &'static str)>>);
 
 /// What [`store`] leaves on the program.
-struct Cached {
+pub(crate) struct Cached {
     funcs: FxHashMap<u64, FunctionResults>,
     jump_mark: reargo_program::reference::JumpMark,
 }
@@ -112,7 +112,18 @@ impl SharedLift {
 /// holds; the cache is emptied (give the results back with [`store`]).
 pub(crate) fn compute(program: &mut Program, with_snapshots: bool) -> SharedLift {
     let cached = program.analysis_cache.take::<Cached>();
-    let program = &*program;
+    compute_from(program, cached, with_snapshots)
+}
+
+/// Whether results [`store`]d earlier are on the program (for
+/// [`compute`] to reuse).
+pub(crate) fn has_stored(program: &Program) -> bool {
+    program.analysis_cache.contains::<Cached>()
+}
+
+/// [`compute`] reusing the results in `cached` (taken out of the
+/// program's analysis cache) that still hold.
+pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snapshots: bool) -> SharedLift {
     let jump_mark = program.references.jump_mark();
     // The jump references added since the cached results, by target.
     let (mut cached_funcs, changed): (FxHashMap<u64, FunctionResults>, Option<Vec<Reference>>) = match cached {

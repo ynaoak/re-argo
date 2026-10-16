@@ -26,7 +26,7 @@ use reargo_arch::FlowType;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct ComplexityAnalyzer;
 
@@ -52,7 +52,17 @@ impl Analyzer for ComplexityAnalyzer {
         // Same band as CrossReferenceReport (900).
         900
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE.union(State::FUNC_OTHER))
+    }
+    fn writes(&self) -> State {
+        State::METADATA
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // Build a global "called function entries" multiset for fan_in.
         let mut callers_of: BTreeMap<u64, usize> = BTreeMap::new();
         for func in program.listing.functions() {
@@ -73,8 +83,8 @@ impl Analyzer for ComplexityAnalyzer {
                 let entry = f.entry_point;
                 let mut instructions = 0usize;
                 let mut conditional = 0usize;
-                let mut block_starts: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-                block_starts.insert(entry);
+                // (sorted and deduplicated once all are in)
+                let mut block_starts: Vec<u64> = vec![entry];
                 // `prev_was_branch` starts false in each body range.
                 let mut prev_was_branch = false;
                 listing.for_each_body_instruction(&f.body, |first, insn| {
@@ -83,26 +93,28 @@ impl Analyzer for ComplexityAnalyzer {
                     }
                     instructions += 1;
                     if prev_was_branch {
-                        block_starts.insert(insn.address);
+                        block_starts.push(insn.address);
                     }
                     prev_was_branch = false;
                     match insn.flow_type {
                         FlowType::ConditionalJump => {
                             conditional += 1;
                             if let Some(t) = insn.branch_target {
-                                block_starts.insert(t);
+                                block_starts.push(t);
                             }
                             prev_was_branch = true;
                         }
                         FlowType::UnconditionalJump => {
                             if let Some(t) = insn.branch_target {
-                                block_starts.insert(t);
+                                block_starts.push(t);
                             }
                             prev_was_branch = true;
                         }
                         _ => {}
                     }
                 });
+                block_starts.sort_unstable();
+                block_starts.dedup();
                 let basic_blocks = block_starts.len().max(1);
                 let cyclomatic = conditional + 1;
 
@@ -118,7 +130,10 @@ impl Analyzer for ComplexityAnalyzer {
             })
             .collect();
         drop(funcs);
-
+        Box::new(computed)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let computed: Vec<(u64, FunctionMetrics)> = crate::analyzer::prepared(prepared);
         let mut counted = 0usize;
         for (entry, metrics) in computed {
             program.metadata.set_property(

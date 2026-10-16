@@ -145,6 +145,23 @@ impl ReferenceManager {
             .push(reference);
     }
 
+    /// Add `reference` unless a reference from its source already
+    /// satisfies `present` (as `get_refs_from(from).iter().any(present)`
+    /// then `add`, with one lookup of the source). Returns whether it
+    /// was added.
+    pub fn add_unless(&mut self, reference: Reference, present: impl Fn(&Reference) -> bool) -> bool {
+        let from = self.refs_from.entry(reference.from).or_default();
+        if from.iter().any(present) {
+            return false;
+        }
+        from.push(reference);
+        if reference.ref_type.is_jump() {
+            self.jumps.push(reference);
+        }
+        self.refs_to.entry(reference.to).or_default().push(reference);
+        true
+    }
+
     /// A mark for [`Self::jump_targets_since`]: the number of jump
     /// references (`RefType::is_jump`) added so far.
     pub fn jump_mark(&self) -> JumpMark {
@@ -186,6 +203,16 @@ impl ReferenceManager {
     /// Every jump reference (`RefType::is_jump`), by target address.
     pub fn jump_refs_by_target(&self) -> impl Iterator<Item = &Reference> {
         self.refs_to.values().flatten().filter(|r| r.ref_type.is_jump())
+    }
+
+    /// The references [`Self::jump_refs_by_target`] yields, in that
+    /// order (by target, those to one target in the order added), from
+    /// the log of jumps instead of a walk over every reference.
+    pub fn jump_refs_sorted_by_target(&self) -> Vec<Reference> {
+        let mut jumps = self.jumps.clone();
+        // stable: the references to one target stay in the order added
+        jumps.sort_by_key(|r| r.to);
+        jumps
     }
 
     /// The references from each address in `start..end` that has any,
@@ -258,5 +285,34 @@ mod tests {
         // three references from one address: kept in the order added
         assert_eq!(mgr.get_refs_from(0x1000).iter().map(|r| r.to).collect::<Vec<_>>(), [0x2000, 0x1005, 0x2008]);
         assert_eq!(mgr.get_refs_to(0x3000).len(), 2);
+    }
+
+    #[test]
+    fn add_unless_and_jumps_by_target_agree_with_the_plain_forms() {
+        let refs = [
+            Reference::new(0x1010, 0x3000, RefType::UnconditionalJump),
+            Reference::new(0x1000, 0x3000, RefType::ConditionalJump),
+            Reference::new(0x1004, 0x2000, RefType::DataRead),
+            Reference::new(0x1008, 0x2000, RefType::IndirectJump),
+            Reference::new(0x1000, 0x3000, RefType::ConditionalJump),
+            Reference::new(0x1018, 0x1000, RefType::UnconditionalJump),
+            Reference::new(0x1004, 0x2000, RefType::DataRead),
+        ];
+        let (mut plain, mut once) = (ReferenceManager::new(), ReferenceManager::new());
+        for r in refs {
+            let present = |e: &Reference| e.to == r.to && e.ref_type == r.ref_type;
+            let added = !plain.get_refs_from(r.from).iter().any(present);
+            if added {
+                plain.add(r);
+            }
+            assert_eq!(once.add_unless(r, present), added);
+        }
+        assert_eq!(plain.all_refs().collect::<Vec<_>>(), once.all_refs().collect::<Vec<_>>());
+        for to in [0x1000, 0x2000, 0x3000] {
+            assert_eq!(plain.get_refs_to(to), once.get_refs_to(to));
+        }
+        let by_target: Vec<Reference> = once.jump_refs_by_target().copied().collect();
+        assert_eq!(once.jump_refs_sorted_by_target(), by_target);
+        assert_eq!(by_target.iter().map(|r| r.from).collect::<Vec<_>>(), [0x1018, 0x1008, 0x1010, 0x1000]);
     }
 }

@@ -32,7 +32,7 @@ use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 /// Minimum number of consecutive in-section pointers to accept as a
 /// "table". Three entries is short enough to catch tiny callback
@@ -62,15 +62,20 @@ impl Analyzer for AddressTableAnalyzer {
         520
     }
 
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::NONE)
+    }
+    fn writes(&self) -> State {
+        State::REFERENCES
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         let ptr_size = (program.info.bits / 8) as u64;
         if !(ptr_size == 4 || ptr_size == 8) {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(Vec::<(u64, u64, RefType)>::new());
         }
 
         // Section classification cache: (start, end, is_executable).
@@ -111,20 +116,15 @@ impl Analyzer for AddressTableAnalyzer {
             .collect();
 
         // Phase 2 (serial): dedup against existing refs and apply.
+        Box::new(candidates)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let candidates: Vec<(u64, u64, RefType)> = crate::analyzer::prepared(prepared);
         let mut refs_found = 0usize;
         for (from, to, kind) in candidates {
-            if program
-                .references
-                .get_refs_from(from)
-                .iter()
-                .any(|r| r.to == to && r.ref_type == kind)
-            {
-                continue;
+            if program.references.add_unless(Reference::new(from, to, kind), |r| r.to == to && r.ref_type == kind) {
+                refs_found += 1;
             }
-            program
-                .references
-                .add(Reference::new(from, to, kind));
-            refs_found += 1;
         }
 
         Ok(AnalysisResult {

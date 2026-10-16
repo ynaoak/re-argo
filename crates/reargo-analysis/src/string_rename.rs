@@ -26,9 +26,9 @@
 //! * Skips trivial / generic strings (single common word) — those
 //!   make worse names than `FUN_*`.
 
-use std::collections::BTreeSet;
 
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
@@ -50,14 +50,15 @@ impl Analyzer for StringHintRenameAnalyzer {
         740
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        // Collect existing names so we don't propose a colliding rename.
-        let mut taken: BTreeSet<String> = BTreeSet::new();
-        for f in program.listing.functions() {
-            taken.insert(f.name.clone());
-        }
-        for s in program.symbol_table.iter() {
-            taken.insert(s.name.clone());
-        }
+        // Collect existing names so we don't propose a colliding rename
+        // (the existing ones borrowed, the renames proposed below owned).
+        let existing: rustc_hash::FxHashSet<&str> = program
+            .listing
+            .functions()
+            .map(|f| f.name.as_str())
+            .chain(program.symbol_table.iter().map(|s| s.name.as_str()))
+            .collect();
+        let mut proposed_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
 
         struct Candidate {
             entry: u64,
@@ -71,43 +72,56 @@ impl Analyzer for StringHintRenameAnalyzer {
             .map(|f| Candidate { entry: f.entry_point, runs: f.body.runs() })
             .collect();
 
-        let mut renames: Vec<(u64, String)> = Vec::new();
-        for cand in &candidates {
-            // References whose source is inside this function and
-            // whose target dereferences to a printable string: those
-            // from each body address in turn.
-            let mut best: Option<(u64, String)> = None;
-            for (start, end) in &cand.runs {
-                for refs in program.references.refs_from_range(*start, *end) {
-                    for r in refs {
-                        let Some(s) = read_c_string(program, r.to) else {
-                            continue;
-                        };
-                        let Some(slug) = sanitize_slug(&s) else {
-                            continue;
-                        };
-                        let proposed = format!("f_{}", slug);
-                        if taken.contains(&proposed) {
-                            continue;
-                        }
-                        // Prefer the lowest-address string — picks
-                        // a stable "first" candidate so re-runs are
-                        // deterministic.
-                        match &best {
-                            None => best = Some((r.to, proposed)),
-                            Some((cur_addr, _)) if r.to < *cur_addr => {
-                                best = Some((r.to, proposed));
-                            }
-                            _ => {}
+        // References whose source is inside each function and whose
+        // target dereferences to a printable string, with the name it
+        // proposes: those from each body address in turn. Found for
+        // every function in parallel; which one is taken depends on the
+        // names taken before, so that is decided in order below.
+        let found: Vec<Vec<(u64, String)>> = candidates
+            .par_iter()
+            .map(|cand| {
+                let mut found = Vec::new();
+                for (start, end) in &cand.runs {
+                    for refs in program.references.refs_from_range(*start, *end) {
+                        for r in refs {
+                            let Some(s) = read_c_string(program, r.to) else {
+                                continue;
+                            };
+                            let Some(slug) = sanitize_slug(&s) else {
+                                continue;
+                            };
+                            found.push((r.to, format!("f_{}", slug)));
                         }
                     }
                 }
+                found
+            })
+            .collect();
+
+        let mut renames: Vec<(u64, String)> = Vec::new();
+        for (cand, found) in candidates.iter().zip(found) {
+            let mut best: Option<(u64, String)> = None;
+            for (to, proposed) in found {
+                if existing.contains(proposed.as_str()) || proposed_names.contains(&proposed) {
+                    continue;
+                }
+                // Prefer the lowest-address string — picks
+                // a stable "first" candidate so re-runs are
+                // deterministic.
+                match &best {
+                    None => best = Some((to, proposed)),
+                    Some((cur_addr, _)) if to < *cur_addr => {
+                        best = Some((to, proposed));
+                    }
+                    _ => {}
+                }
             }
             if let Some((_addr, name)) = best {
-                taken.insert(name.clone());
+                proposed_names.insert(name.clone());
                 renames.push((cand.entry, name));
             }
         }
+        drop(existing);
 
         let mut renamed = 0usize;
         for (entry, name) in renames {

@@ -2,11 +2,14 @@ use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct CallingConventionAnalyzer;
 
 impl Analyzer for CallingConventionAnalyzer {
+    fn writes(&self) -> State {
+        State::FUNC_CC.union(State::CACHE)
+    }
     fn name(&self) -> &str {
         "Calling Convention"
     }

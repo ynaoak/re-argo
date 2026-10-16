@@ -35,7 +35,7 @@ use reargo_program::function::Function;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct CrtPatternAnalyzer;
 
@@ -52,14 +52,22 @@ impl Analyzer for CrtPatternAnalyzer {
         // annotation output.
         470
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::FUNCS.union(State::FUNC_NAME))
+    }
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::COMMENTS).union(State::FUNCTIONS)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The CRT helpers found and their names, by address. Renaming one
+    /// changes only the function at its own address, so each is found
+    /// as it would be after the renames before it.
+    fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(Vec::<(u64, &'static str)>::new());
         }
 
         let patterns = patterns();
@@ -94,7 +102,7 @@ impl Analyzer for CrtPatternAnalyzer {
             }
         }
 
-        let mut recovered = 0usize;
+        let mut found: Vec<(u64, &'static str)> = Vec::new();
         for entry in candidates {
             // Skip candidates that already host a function with a
             // non-generic name (user / DWARF / earlier analyzer wins).
@@ -116,11 +124,18 @@ impl Analyzer for CrtPatternAnalyzer {
             let bytes = &buf[..n];
             for pattern in &patterns {
                 if matches_pattern(bytes, pattern.prefix, pattern.mask) {
-                    apply_rename(program, entry, pattern.name);
-                    recovered += 1;
+                    found.push((entry, pattern.name));
                     break;
                 }
             }
+        }
+        Box::new(found)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let found: Vec<(u64, &'static str)> = crate::analyzer::prepared(prepared);
+        let recovered = found.len();
+        for (entry, name) in found {
+            apply_rename(program, entry, name);
         }
 
         Ok(AnalysisResult {

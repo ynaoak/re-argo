@@ -43,7 +43,7 @@ use reargo_arch::FlowType;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct SwitchTableOffsetAnalyzer;
 
@@ -57,14 +57,19 @@ impl Analyzer for SwitchTableOffsetAnalyzer {
     fn priority(&self) -> u32 {
         555 // right after the absolute-pointer SwitchTableAnalyzer (550)
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS)
+    }
+    fn writes(&self) -> State {
+        State::REFERENCES
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(Vec::<(u64, u64)>::new());
         }
 
         let valid_code_ranges: Vec<(u64, u64)> = program
@@ -129,20 +134,15 @@ impl Analyzer for SwitchTableOffsetAnalyzer {
             }
         }
 
+        Box::new(candidates)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let candidates: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
         let mut refs_found = 0usize;
         for (from, to) in candidates {
-            let already = program
-                .references
-                .get_refs_from(from)
-                .iter()
-                .any(|r| r.to == to);
-            if already {
-                continue;
+            if program.references.add_unless(Reference::new(from, to, RefType::IndirectJump), |r| r.to == to) {
+                refs_found += 1;
             }
-            program
-                .references
-                .add(Reference::new(from, to, RefType::IndirectJump));
-            refs_found += 1;
         }
 
         Ok(AnalysisResult {

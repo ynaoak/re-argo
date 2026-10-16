@@ -23,11 +23,14 @@ use reargo_program::comments::CommentType;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct StackCanaryAnalyzer;
 
 impl Analyzer for StackCanaryAnalyzer {
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn name(&self) -> &str {
         "Stack Canary"
     }

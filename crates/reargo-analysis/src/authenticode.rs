@@ -30,11 +30,14 @@ use reargo_loader::BinaryFormat;
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct AuthenticodeAnalyzer;
 
 impl Analyzer for AuthenticodeAnalyzer {
+    fn writes(&self) -> State {
+        State::METADATA.union(State::TAGS)
+    }
     fn name(&self) -> &str {
         "Authenticode"
     }

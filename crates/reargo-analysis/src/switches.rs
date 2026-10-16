@@ -3,7 +3,7 @@ use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct SwitchTableAnalyzer;
 
@@ -17,8 +17,17 @@ impl Analyzer for SwitchTableAnalyzer {
     fn priority(&self) -> u32 {
         550
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS)
+    }
+    fn writes(&self) -> State {
+        State::REFERENCES
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut refs_found = 0;
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         let ptr_size = (program.info.bits / 8) as u64;
 
         let indirect_jumps: Vec<u64> = program
@@ -95,6 +104,11 @@ impl Analyzer for SwitchTableAnalyzer {
             })
             .collect();
 
+        Box::new(candidates)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let candidates: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
+        let mut refs_found = 0;
         for (jmp_addr, target_addr) in candidates {
             program.references.add(Reference::new(jmp_addr, target_addr, RefType::IndirectJump));
             refs_found += 1;
@@ -121,9 +135,17 @@ impl Analyzer for TailCallAnalyzer {
     fn priority(&self) -> u32 {
         560
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS.union(State::FUNCS).union(State::REFERENCES))
+    }
+    fn writes(&self) -> State {
+        State::REFERENCES
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let mut tail_calls = 0;
-
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         let jumps: Vec<(u64, Option<u64>)> = program
             .listing
             .instructions()
@@ -160,6 +182,11 @@ impl Analyzer for TailCallAnalyzer {
             })
             .collect();
 
+        Box::new(candidates)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let candidates: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
+        let mut tail_calls = 0;
         for (jmp_addr, target_addr) in candidates {
             program.references.add(Reference::new(jmp_addr, target_addr, RefType::UnconditionalCall));
             tail_calls += 1;
