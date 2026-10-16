@@ -154,6 +154,11 @@ impl Analyzer for FloatConstantAnalyzer {
         let hits: Vec<(u64, Hit)> = insns
             .par_iter()
             .filter_map(|i| {
+                // every scalar / packed float op matched is an SSE (0x0f)
+                // or VEX / EVEX instruction
+                if !matches!(crate::utils::x86_64_opcode_byte(&i.bytes), Some(0x0f | 0xc4 | 0xc5 | 0x62)) {
+                    return None;
+                }
                 let ii = decode_one(i.address, &i.bytes)?;
                 if let Some(t) = packed_const_load(&ii) {
                     return Some((i.address, Hit::Packed(t.0, t.1)));

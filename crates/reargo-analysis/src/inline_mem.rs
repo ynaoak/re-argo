@@ -65,11 +65,9 @@ impl Analyzer for InlineMemAnalyzer {
         let candidates: Vec<(u64, &'static str)> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for (addr, note) in candidates {
-            if program.comments.get(addr, CommentType::Pre).is_some() {
-                continue;
+            if program.comments.set_if_absent(addr, CommentType::Pre, note) {
+                emitted += 1;
             }
-            program.comments.set(addr, CommentType::Pre, note);
-            emitted += 1;
         }
 
         Ok(AnalysisResult {

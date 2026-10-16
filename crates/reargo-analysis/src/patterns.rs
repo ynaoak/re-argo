@@ -34,6 +34,9 @@ fn is_boundary_byte(b: u8) -> bool {
 }
 
 impl Analyzer for PatternFunctionAnalyzer {
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::FUNCTIONS)
+    }
     fn name(&self) -> &str {
         "Pattern Function"
     }

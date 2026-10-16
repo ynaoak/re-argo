@@ -23,7 +23,7 @@
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 /// Threshold above which we mark a section as "high entropy". Below
 /// this you still get the raw number in `metadata`, just no tag.
@@ -36,6 +36,9 @@ pub const ENTROPY_PACKED_THRESHOLD: f64 = 7.5;
 pub struct EntropyAnalyzer;
 
 impl Analyzer for EntropyAnalyzer {
+    fn writes(&self) -> State {
+        State::METADATA.union(State::TAGS)
+    }
     fn name(&self) -> &str {
         "Entropy"
     }

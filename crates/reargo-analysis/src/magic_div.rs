@@ -220,6 +220,10 @@ pub fn magic_imul_divisor(addr: u64, bytes: &[u8]) -> Option<u32> {
 /// If `bytes` at `addr` decode to a 3-operand `imul reg, reg, imm` whose
 /// immediate is a known division magic, return the divisor.
 fn decode_magic_imul(addr: u64, bytes: &[u8]) -> Option<u32> {
+    // `imul r, r/m, imm32` / `imm8`: no other opcode decodes as one
+    if !matches!(crate::utils::x86_64_opcode_byte(bytes), Some(0x69 | 0x6b)) {
+        return None;
+    }
     let mut dec = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);
     let mut ii = IcedInsn::default();
     dec.decode_out(&mut ii);

@@ -2,7 +2,7 @@ use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 const MIN_STRING_LENGTH: usize = 4;
 const MAX_STRING_LENGTH: usize = 4096;
@@ -10,6 +10,9 @@ const MAX_STRING_LENGTH: usize = 4096;
 pub struct StringSearchAnalyzer;
 
 impl Analyzer for StringSearchAnalyzer {
+    fn writes(&self) -> State {
+        State::SYMBOLS
+    }
     fn name(&self) -> &str {
         "String Search"
     }

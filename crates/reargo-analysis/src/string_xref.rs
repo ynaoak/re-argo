@@ -86,11 +86,9 @@ impl Analyzer for StringXrefAnnotator {
         let previews: Vec<(u64, String)> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for (from, text) in previews {
-            if program.comments.get(from, CommentType::Eol).is_some() {
-                continue;
+            if program.comments.set_if_absent(from, CommentType::Eol, text) {
+                emitted += 1;
             }
-            program.comments.set(from, CommentType::Eol, text);
-            emitted += 1;
         }
 
         Ok(AnalysisResult {

@@ -1,6 +1,6 @@
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct NoReturnPropagationAnalyzer;
 
@@ -75,7 +75,18 @@ impl Analyzer for DuplicateCodeAnalyzer {
     fn priority(&self) -> u32 {
         900
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS.union(State::FUNCS))
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn apply(&self, _program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        Ok(crate::analyzer::prepared(prepared))
+    }
+    /// Only counts: the result is all there is to apply.
+    fn prepare(&self, program: &Program) -> Prepared {
         let mut duplicates = 0;
         let mut seen_hashes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
 
@@ -106,7 +117,7 @@ impl Analyzer for DuplicateCodeAnalyzer {
             }
         }
 
-        Ok(AnalysisResult {
+        Box::new(AnalysisResult {
             analyzer_name: self.name().into(),
             functions_found: duplicates,
             references_found: 0,

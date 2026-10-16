@@ -37,7 +37,9 @@ use std::collections::BTreeSet;
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use rayon::prelude::*;
+
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -90,12 +92,41 @@ impl Analyzer for CapaAnalyzer {
     fn provides(&self) -> &'static [&'static str] {
         &["capabilities"]
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::SYMBOLS.union(State::COMMENTS))
+    }
+    fn writes(&self) -> State {
+        State::TAGS.union(State::METADATA)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let ctx = build_context(program);
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The import and string predicates of every rule evaluated: they
+    /// do not depend on the tags (which the Tagger, right before, adds).
+    fn prepare(&self, program: &Program) -> Prepared {
+        let ctx = build_context(program, BTreeSet::new());
+        let mut found: Vec<&'static Predicate> = Vec::new();
+        for rule in builtin_rules() {
+            collect_leaves(&rule.predicate, &mut found);
+        }
+        let leaves: Leaves = found
+            .par_iter()
+            .map(|&p| {
+                let mut evidence = Vec::new();
+                let hit = eval(p, &ctx, &mut evidence);
+                (leaf_key(p), (hit, evidence))
+            })
+            .collect();
+        Box::new(leaves)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let leaves: Leaves = crate::analyzer::prepared(prepared);
+        let present_tags = present_tags(program);
         let mut findings = Vec::new();
         for rule in builtin_rules() {
             let mut evidence = Vec::new();
-            if eval(&rule.predicate, &ctx, &mut evidence) {
+            if eval_with(&rule.predicate, &present_tags, &leaves, &mut evidence) {
                 findings.push(CapabilityFinding {
                     rule: rule.name,
                     namespace: rule.namespace,
@@ -149,28 +180,58 @@ struct CapaContext {
     present_tags: BTreeSet<String>,
 }
 
-fn build_context(program: &Program) -> CapaContext {
-    let mut imports: BTreeSet<String> = BTreeSet::new();
-    for imp in &program.info.imports {
-        imports.insert(imp.name.clone());
-    }
-    for sym in program.symbol_table.iter() {
-        let n = sym.name.strip_suffix("@plt").unwrap_or(&sym.name);
-        imports.insert(n.to_string());
-    }
-    let mut original_import: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for s in &imports {
-        original_import.entry(s.to_ascii_lowercase()).or_insert_with(|| s.clone());
-    }
-    let imports_lower: BTreeSet<String> = original_import.keys().cloned().collect();
+/// The result and evidence of each import / string predicate, by
+/// [`leaf_key`].
+type Leaves = rustc_hash::FxHashMap<(bool, usize), (bool, Vec<String>)>;
 
-    // Pull strings from inline comments / immediate-string annotations
-    // (every string the analyzer cared about flows through these).
-    let mut strings_lower: Vec<String> = Vec::new();
-    for (_, _, text) in program.comments.iter_refs() {
-        strings_lower.push(text.to_ascii_lowercase());
+/// An import / string predicate's key: its kind and the address of its
+/// (static) needle list.
+fn leaf_key(p: &Predicate) -> (bool, usize) {
+    match p {
+        Predicate::ImportsAnyOf(needles) => (true, needles.as_ptr() as usize),
+        Predicate::StringsAnyOf(needles) => (false, needles.as_ptr() as usize),
+        _ => unreachable!("not an import / string predicate"),
     }
+}
 
+/// The import and string predicates in `p`, in [`eval`] order.
+fn collect_leaves(p: &'static Predicate, out: &mut Vec<&'static Predicate>) {
+    match p {
+        Predicate::ImportsAnyOf(_) | Predicate::StringsAnyOf(_) => out.push(p),
+        Predicate::TagPresent(_) => {}
+        Predicate::AllOf(parts) | Predicate::AnyOf(parts) => {
+            for part in *parts {
+                collect_leaves(part, out);
+            }
+        }
+    }
+}
+
+/// [`eval`] with the tags present and the import / string predicates
+/// already evaluated (`leaves`): the same result and evidence.
+fn eval_with(p: &Predicate, present_tags: &BTreeSet<String>, leaves: &Leaves, evidence: &mut Vec<String>) -> bool {
+    match p {
+        Predicate::ImportsAnyOf(_) | Predicate::StringsAnyOf(_) => {
+            let (hit, found) = &leaves[&leaf_key(p)];
+            evidence.extend(found.iter().cloned());
+            *hit
+        }
+        Predicate::TagPresent(kind) => {
+            let slug = kind.as_str().to_string();
+            if present_tags.contains(&slug) {
+                evidence.push(format!("tag {}", slug));
+                true
+            } else {
+                false
+            }
+        }
+        Predicate::AllOf(parts) => parts.iter().all(|p| eval_with(p, present_tags, leaves, evidence)),
+        Predicate::AnyOf(parts) => parts.iter().any(|p| eval_with(p, present_tags, leaves, evidence)),
+    }
+}
+
+/// The kinds of the tags on the program, as slugs.
+fn present_tags(program: &Program) -> BTreeSet<String> {
     let mut present_tags: BTreeSet<String> = BTreeSet::new();
     for (_, tag) in program.tags.iter_addresses() {
         present_tags.insert(tag.kind.as_str().to_string());
@@ -178,6 +239,30 @@ fn build_context(program: &Program) -> CapaContext {
     for (_, tag) in program.tags.iter_functions() {
         present_tags.insert(tag.kind.as_str().to_string());
     }
+    present_tags
+}
+
+fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaContext {
+    // Every import name and symbol name (without `@plt`), sorted and
+    // deduplicated.
+    let mut imports: Vec<&str> = program.info.imports.iter().map(|imp| imp.name.as_str()).collect();
+    imports.extend(program.symbol_table.iter().map(|sym| sym.name.strip_suffix("@plt").unwrap_or(&sym.name)));
+    imports.par_sort_unstable();
+    imports.dedup();
+    // For each lower-cased name, the first name (in sorted order) that
+    // lower-cases to it: a stable sort by the lower-cased name keeps
+    // that one first.
+    let mut lowered: Vec<(String, &str)> = imports.par_iter().map(|s| (s.to_ascii_lowercase(), *s)).collect();
+    lowered.par_sort_by(|a, b| a.0.cmp(&b.0));
+    lowered.dedup_by(|later, first| later.0 == first.0);
+    let original_import: std::collections::BTreeMap<String, String> =
+        lowered.into_iter().map(|(lower, s)| (lower, s.to_string())).collect();
+    let imports_lower: BTreeSet<String> = original_import.keys().cloned().collect();
+
+    // Pull strings from inline comments / immediate-string annotations
+    // (every string the analyzer cared about flows through these).
+    let comments: Vec<&str> = program.comments.iter_refs().map(|(_, _, text)| text).collect();
+    let strings_lower: Vec<String> = comments.par_iter().map(|text| text.to_ascii_lowercase()).collect();
 
     CapaContext {
         imports_lower,

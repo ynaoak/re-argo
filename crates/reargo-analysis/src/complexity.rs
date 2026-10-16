@@ -83,8 +83,8 @@ impl Analyzer for ComplexityAnalyzer {
                 let entry = f.entry_point;
                 let mut instructions = 0usize;
                 let mut conditional = 0usize;
-                let mut block_starts: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-                block_starts.insert(entry);
+                // (sorted and deduplicated once all are in)
+                let mut block_starts: Vec<u64> = vec![entry];
                 // `prev_was_branch` starts false in each body range.
                 let mut prev_was_branch = false;
                 listing.for_each_body_instruction(&f.body, |first, insn| {
@@ -93,26 +93,28 @@ impl Analyzer for ComplexityAnalyzer {
                     }
                     instructions += 1;
                     if prev_was_branch {
-                        block_starts.insert(insn.address);
+                        block_starts.push(insn.address);
                     }
                     prev_was_branch = false;
                     match insn.flow_type {
                         FlowType::ConditionalJump => {
                             conditional += 1;
                             if let Some(t) = insn.branch_target {
-                                block_starts.insert(t);
+                                block_starts.push(t);
                             }
                             prev_was_branch = true;
                         }
                         FlowType::UnconditionalJump => {
                             if let Some(t) = insn.branch_target {
-                                block_starts.insert(t);
+                                block_starts.push(t);
                             }
                             prev_was_branch = true;
                         }
                         _ => {}
                     }
                 });
+                block_starts.sort_unstable();
+                block_starts.dedup();
                 let basic_blocks = block_starts.len().max(1);
                 let cyclomatic = conditional + 1;
 

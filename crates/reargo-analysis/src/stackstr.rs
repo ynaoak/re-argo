@@ -102,11 +102,9 @@ impl Analyzer for StackStringAnalyzer {
         let pending: Vec<(u64, String)> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for (addr, text) in pending {
-            if program.comments.get(addr, CommentType::Pre).is_some() {
-                continue;
+            if program.comments.set_if_absent(addr, CommentType::Pre, text) {
+                emitted += 1;
             }
-            program.comments.set(addr, CommentType::Pre, text);
-            emitted += 1;
         }
 
         Ok(AnalysisResult {

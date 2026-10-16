@@ -82,6 +82,9 @@ struct Window {
 
 pub struct AnalysisManager {
     analyzers: Vec<Box<dyn Analyzer>>,
+    /// Whether the split analyzers prepare ahead, overlapped (the
+    /// default); without, each runs alone at its place.
+    overlap: bool,
 }
 
 impl Default for AnalysisManager {
@@ -176,7 +179,15 @@ impl AnalysisManager {
             Box::new(CapaAnalyzer),
         ];
         analyzers.sort_by_key(|a| a.priority());
-        Self { analyzers }
+        Self { analyzers, overlap: true }
+    }
+
+    /// The same pipeline with every analyzer run alone at its place,
+    /// nothing overlapped: the result is the same, slower. For checking
+    /// the overlap.
+    pub fn without_overlap(mut self) -> Self {
+        self.overlap = false;
+        self
     }
 
     pub fn add_analyzer(&mut self, analyzer: Box<dyn Analyzer>) {
@@ -245,7 +256,7 @@ impl AnalysisManager {
         let mut current = Window { analyzers: 0..0, prepared: Vec::new() };
         let mut written = State::NONE;
         for (i, analyzer) in self.analyzers.iter().enumerate() {
-            if let Some(reads) = analyzer.prepare_reads() {
+            if let Some(reads) = analyzer.prepare_reads().filter(|_| self.overlap) {
                 if reads.intersects(written) {
                     let next = Window { analyzers: i..i, prepared: Vec::new() };
                     windows.push(std::mem::replace(&mut current, next));

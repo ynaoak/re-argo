@@ -168,6 +168,9 @@ fn try_read_string(memory: &reargo_loader::Memory, addr: u64) -> Option<String> 
 pub struct NoReturnAnalyzer;
 
 impl Analyzer for NoReturnAnalyzer {
+    fn writes(&self) -> State {
+        State::FUNC_NO_RETURN
+    }
     fn name(&self) -> &str {
         "No-Return Detection"
     }

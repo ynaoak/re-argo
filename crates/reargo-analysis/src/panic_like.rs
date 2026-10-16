@@ -79,18 +79,21 @@ impl Analyzer for PanicLikeAnalyzer {
             .map(|f| f.entry_point)
             .collect();
 
+        // Only a function with a direct call, a call target and at most
+        // 30 instructions can be marked: those are walked below. They
+        // are walked in parallel, kept in function order.
         struct FuncSnap {
             entry: u64,
-            call_targets: BTreeSet<u64>,
-            direct_call_count: usize,
-            insn_count: usize,
+            call_targets: Vec<u64>,
         }
-        // Functions walked in parallel, kept in function order.
         let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
         let listing = &program.listing;
         let snaps: Vec<FuncSnap> = funcs
             .par_iter()
-            .map(|f| {
+            .filter_map(|f| {
+                if f.call_targets.is_empty() {
+                    return None;
+                }
                 let mut direct_call_count = 0usize;
                 let mut insn_count = 0usize;
                 listing.for_each_body_instruction(&f.body, |_, ins| {
@@ -99,40 +102,30 @@ impl Analyzer for PanicLikeAnalyzer {
                         direct_call_count += 1;
                     }
                 });
-                FuncSnap {
-                    entry: f.entry_point,
-                    call_targets: f.call_targets.clone(),
-                    direct_call_count,
-                    insn_count,
-                }
+                (direct_call_count != 0 && insn_count <= 30)
+                    .then(|| FuncSnap { entry: f.entry_point, call_targets: f.call_targets.iter().copied().collect() })
             })
             .collect();
 
         // Fixpoint: repeatedly add functions whose call_targets are a
-        // non-empty subset of `no_return`. Cap iterations to N_funcs
-        // — by induction at most that many can be added.
+        // non-empty subset of `no_return` (the set reached does not
+        // depend on the order they are added in).
+        //
+        // Strict propagation rule: *every* direct call in the
+        // body targets a known no-return primitive AND the
+        // function is small. `any_no_return` would also catch
+        // `if (!p) panic(); return q;` shapes where the
+        // conditional success path still returns normally —
+        // that's a wrong rename, so we hold to the subset
+        // check even at the cost of some recall.
         let mut added = 0usize;
-        for _ in 0..snaps.len() {
+        loop {
             let mut changed = false;
             for snap in &snaps {
                 if no_return.contains(&snap.entry) {
                     continue;
                 }
-                if snap.direct_call_count == 0 || snap.call_targets.is_empty() {
-                    continue;
-                }
-                // Strict propagation rule: *every* direct call in the
-                // body targets a known no-return primitive AND the
-                // function is small. `any_no_return` would also catch
-                // `if (!p) panic(); return q;` shapes where the
-                // conditional success path still returns normally —
-                // that's a wrong rename, so we hold to the subset
-                // check even at the cost of some recall.
-                let all_no_return = snap.call_targets.iter().all(|t| no_return.contains(t));
-                if !all_no_return {
-                    continue;
-                }
-                if snap.insn_count > 30 {
+                if !snap.call_targets.iter().all(|t| no_return.contains(t)) {
                     continue;
                 }
                 no_return.insert(snap.entry);
@@ -144,14 +137,14 @@ impl Analyzer for PanicLikeAnalyzer {
             }
         }
 
-        // Apply the new no_return flag to the listing + emit a
-        // plate comment so the user sees it without grepping
-        // metadata.
         let _ = added;
         Box::new(no_return.into_iter().collect::<Vec<u64>>())
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         let to_mark: Vec<u64> = crate::analyzer::prepared(prepared);
+        // Apply the new no_return flag to the listing + emit a
+        // plate comment so the user sees it without grepping
+        // metadata.
         let mut marked = 0usize;
         for entry in to_mark {
             if let Some(f) = program.listing.get_function_mut(entry)

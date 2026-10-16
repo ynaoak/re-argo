@@ -34,11 +34,14 @@ use reargo_loader::BinaryFormat;
 use reargo_program::Program;
 use md5::{Digest, Md5};
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct ImphashAnalyzer;
 
 impl Analyzer for ImphashAnalyzer {
+    fn writes(&self) -> State {
+        State::METADATA
+    }
     fn name(&self) -> &str {
         "Imphash"
     }

@@ -65,11 +65,9 @@ impl Analyzer for TlsVariableAnalyzer {
         let candidates: Vec<(u64, String)> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for (addr, note) in candidates {
-            if program.comments.get(addr, CommentType::Eol).is_some() {
-                continue;
+            if program.comments.set_if_absent(addr, CommentType::Eol, note) {
+                emitted += 1;
             }
-            program.comments.set(addr, CommentType::Eol, note);
-            emitted += 1;
         }
 
         Ok(AnalysisResult {

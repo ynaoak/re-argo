@@ -2,7 +2,7 @@ use reargo_arch::FlowType;
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct FunctionBoundaryAnalyzer;
 
@@ -19,7 +19,18 @@ impl Analyzer for FunctionBoundaryAnalyzer {
     fn priority(&self) -> u32 {
         850
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS.union(State::FUNCS))
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn apply(&self, _program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        Ok(crate::analyzer::prepared(prepared))
+    }
+    /// Only counts: the result is all there is to apply.
+    fn prepare(&self, program: &Program) -> Prepared {
         let func_entries: Vec<u64> = program.listing.functions().map(|f| f.entry_point).collect();
 
         // Each entry's body is scanned independently against an
@@ -45,7 +56,7 @@ impl Analyzer for FunctionBoundaryAnalyzer {
             })
             .count();
 
-        Ok(AnalysisResult {
+        Box::new(AnalysisResult {
             analyzer_name: self.name().into(),
             functions_found: 0,
             references_found: fixes,

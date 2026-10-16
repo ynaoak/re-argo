@@ -23,7 +23,7 @@
 //! listing. Downstream coverage / xref consumers may want to know
 //! the bytes exist even though no normal-flow caller reaches them.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use rayon::prelude::*;
 use reargo_arch::FlowType;
@@ -86,8 +86,8 @@ impl Analyzer for DeadCodeAnalyzer {
             //   * the entry address
             //   * every branch target inside the body
             //   * the fall-through of every branch / return
-            let mut block_starts: BTreeSet<u64> = BTreeSet::new();
-            block_starts.insert(snap.entry);
+            // (sorted and deduplicated once all are in)
+            let mut block_starts: Vec<u64> = vec![snap.entry];
             // A body holds one range per instruction: test membership
             // by a binary search over the merged ranges instead of a
             // scan of all of them.
@@ -107,7 +107,7 @@ impl Analyzer for DeadCodeAnalyzer {
             let mut prev_was_terminator = false;
             for (addr, _len, ft, tgt) in &insns {
                 if prev_was_terminator {
-                    block_starts.insert(*addr);
+                    block_starts.push(*addr);
                 }
                 prev_was_terminator = false;
                 match ft {
@@ -115,7 +115,7 @@ impl Analyzer for DeadCodeAnalyzer {
                         if let Some(t) = tgt
                             && in_body(*t)
                         {
-                            block_starts.insert(*t);
+                            block_starts.push(*t);
                         }
                         prev_was_terminator = true;
                     }
@@ -124,9 +124,12 @@ impl Analyzer for DeadCodeAnalyzer {
                 }
             }
 
+            block_starts.sort_unstable();
+            block_starts.dedup();
+
             // Walk reachability from entry using fall-through +
             // branch edges.
-            let mut reachable: BTreeSet<u64> = BTreeSet::new();
+            let mut reachable: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
             let mut queue: VecDeque<u64> = VecDeque::new();
             queue.push_back(snap.entry);
             while let Some(b) = queue.pop_front() {
@@ -137,8 +140,7 @@ impl Analyzer for DeadCodeAnalyzer {
                 // bump into the next block start.
                 let mut cur = b;
                 let next_start = block_starts
-                    .range(b + 1..)
-                    .next()
+                    .get(block_starts.partition_point(|&s| s <= b))
                     .copied()
                     .unwrap_or(u64::MAX);
                 let mut idx = insns.binary_search_by_key(&cur, |(a, _, _, _)| *a);
@@ -174,7 +176,11 @@ impl Analyzer for DeadCodeAnalyzer {
                         }
                         _ => {
                             cur = after;
-                            idx = insns.binary_search_by_key(&cur, |(a, _, _, _)| *a);
+                            // mostly the next instruction
+                            idx = match insns.get(i + 1) {
+                                Some(next) if next.0 == cur => Ok(i + 1),
+                                _ => insns.binary_search_by_key(&cur, |(a, _, _, _)| *a),
+                            };
                         }
                     }
                 }
@@ -193,13 +199,9 @@ impl Analyzer for DeadCodeAnalyzer {
         let all_unreachable: Vec<u64> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for addr in all_unreachable {
-            if program.comments.get(addr, CommentType::Plate).is_some() {
-                continue;
+            if program.comments.set_if_absent(addr, CommentType::Plate, "unreachable from function entry") {
+                emitted += 1;
             }
-            program
-                .comments
-                .set(addr, CommentType::Plate, "unreachable from function entry");
-            emitted += 1;
         }
 
         Ok(AnalysisResult {
