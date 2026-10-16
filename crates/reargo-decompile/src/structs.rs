@@ -727,6 +727,18 @@ impl StructView {
         if let (Some(oracle), Some(mem)) = (ctx.oracle, ctx.memory)
             && !vcall_raw.is_empty()
         {
+            // the parameters' nodes: `(node, integer parameter)`
+            let param_roots: Vec<(u32, usize)> = oracle
+                .args()
+                .iter()
+                .filter(|a| a.size == 8)
+                .take(6)
+                .enumerate()
+                .filter_map(|(i, reg)| {
+                    let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)?;
+                    Some((*nodes.get(&value_key(func, v.id))?, i))
+                })
+                .collect();
             let objects: FxHashSet<u32> = vcall_raw.iter().map(|&(_, ri, _)| uf.find(raws[ri].base)).collect();
             for _ in 0..2 {
                 let mut added = false;
@@ -741,9 +753,13 @@ impl StructView {
                         (true, Some((_, Some(vt)))) => Some(*vt),
                         _ => root_classes.get(&base).and_then(|cs| crate::vcall::most_derived(mem, cs)).map(|c| c.1),
                     };
-                    let Some(vt) = vt else { continue };
                     // (WS93: else the class the index joins over every store into that field)
-                    let ovt = oracle.class_fields(vt).iter().find(|f| f.0 == r.off).map(|f| f.1).or_else(|| ctx.this_index?.field_class(vt, r.off as i64));
+                    let ovt = vt.and_then(|vt| oracle.class_fields(vt).iter().find(|f| f.0 == r.off).map(|f| f.1).or_else(|| ctx.this_index?.field_class(vt, r.off as i64)));
+                    // (WS94: a field of a parameter: the class every caller put there)
+                    let ovt = ovt.or_else(|| {
+                        let i = param_roots.iter().find(|p| uf.find_const(p.0) == base)?.1;
+                        ctx.this_index?.param_field_class(ctx.entry, i, r.off as i64)
+                    });
                     if let Some(ovt) = ovt
                         && let Some(c) = crate::vcall::vtable_class(mem, ovt)
                     {
@@ -1613,6 +1629,64 @@ mod tests {
         assert_eq!(idx.param_class(0x1500, 0), None, "{idx:?}");
         let r = with_index(&mem, &fs, 0x1500);
         assert!(!r.c_code.contains("Holder") && !r.c_code.contains("= Shape::"), "{}", r.c_code);
+    }
+
+    /// [`holder`] plus the helper `0x1500` (`this->field_8->vfn_1()`) called by `0x1540` on a
+    /// stack object whose `+8` holds a new `Shape` (built by its constructor); with `holder`,
+    /// `0x1580` calls it too on a stack object whose `+8` holds a new `Holder`.
+    fn stack_object_helper(holder: bool) -> (Memory, Vec<(u64, u64)>) {
+        let helper = [0x48, 0x8b, 0x7f, 0x08, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x08, 0xc3];
+        // push rbx ; sub rsp, 0x20 ; mov edi, 0x10 ; call 0x1400 (new) ; mov rbx, rax ;
+        // mov rdi, rax ; call <constructor> ; mov [rsp+8], rbx ; mov rdi, rsp ; call 0x1500 ;
+        // add rsp, 0x20 ; pop rbx ; ret
+        let caller = |new: [u8; 4], ctor: [u8; 4], helper: [u8; 4]| -> Vec<u8> {
+            [
+                &[0x53, 0x48, 0x83, 0xec, 0x20, 0xbf, 0x10, 0x00, 0x00, 0x00, 0xe8][..],
+                &new,
+                &[0x48, 0x89, 0xc3, 0x48, 0x89, 0xc7, 0xe8],
+                &ctor,
+                &[0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0xe7, 0xe8],
+                &helper,
+                &[0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3],
+            ]
+            .concat()
+        };
+        let shape = caller([0xb1, 0xfe, 0xff, 0xff], [0x26, 0xfb, 0xff, 0xff], [0x99, 0xff, 0xff, 0xff]);
+        let other = caller([0x71, 0xfe, 0xff, 0xff], [0x66, 0xfa, 0xff, 0xff], [0x59, 0xff, 0xff, 0xff]);
+        let mut extra: Vec<(usize, &[u8])> = vec![(0x500, &helper), (0x540, &shape)];
+        let mut fs = vec![(0x1000, 0x26), (0x1080, 0xb), (0x1100, 1), (0x1200, 4), (0x1300, 0xb), (0x1310, 1), (0x1400, 3), (0x1500, 0xb), (0x1540, 0x2d)];
+        if holder {
+            extra.push((0x580, &other));
+            fs.push((0x1580, 0x2d));
+        }
+        (holder_with(&extra), fs)
+    }
+
+    /// WS94: a field of an object the callers pass has the class every caller put there (here a
+    /// stack object whose `+8` holds a `Shape`), so a virtual call on `rdi->field_8` names the
+    /// slot even though `rdi` has no class.
+    #[test]
+    fn a_field_of_an_object_the_callers_pass_has_their_class() {
+        let (mem, fs) = stack_object_helper(false);
+        let idx = crate::thisclass::build(&mem, &fs, &[]);
+        assert_eq!(idx.param_class(0x1500, 0), None, "{idx:?}");
+        assert_eq!(idx.param_field_class(0x1500, 0, 8), Some(0x2010), "{idx:?}");
+        let r = with_index(&mem, &fs, 0x1500);
+        assert!(r.c_code.contains("vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.recovered_structs.iter().any(|d| d.contains("struct Shape* field_8; // +0x8")), "{:?}", r.recovered_structs);
+        // without the index nothing is known
+        let r = decompile(&X86Lifter::new_64(), &mem, 0x1500, "f", 100).unwrap();
+        assert!(!r.c_code.contains("= Shape::"), "{}", r.c_code);
+    }
+
+    /// WS94: two callers putting objects of unrelated classes there: no class.
+    #[test]
+    fn callers_putting_unrelated_classes_in_a_field_leave_it_without_class() {
+        let (mem, fs) = stack_object_helper(true);
+        let idx = crate::thisclass::build(&mem, &fs, &[]);
+        assert_eq!(idx.param_field_class(0x1500, 0, 8), None, "{idx:?}");
+        let r = with_index(&mem, &fs, 0x1500);
+        assert!(!r.c_code.contains("= Shape::") && !r.c_code.contains("= Holder::"), "{}", r.c_code);
     }
 
     /// WS92: a phi joining objects of two unrelated classes does not merge their types: the
