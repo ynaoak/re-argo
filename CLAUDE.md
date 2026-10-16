@@ -297,6 +297,8 @@ Followed by a per-analyzer table (after a 72-char `-` rule), slowest first: `Ana
 
 For profiling, `cargo build --profile profiling` builds release-optimised code with line tables (`target/profiling/re-argo`) for `perf` / `cargo flamegraph`.
 
+Lift sharing (measured, not adopted): Stack Frame and the Call Site Annotator lift the same instructions (~640k / ~810k single-instruction lifts on python3.12). Keeping Stack Frame's lifts for the annotator was tried both as a packed store (~91 B/insn, +15% peak RSS) and as the full lifts (~2.4x peak RSS): reading a lift back (~500 ns) costs as much as lifting it again (~550 ns in the pipeline, dominated by writing the fresh `LiftedInstruction` + P-code ops), so neither was faster. Don't retry without first making a lift itself cheaper to materialise.
+
 #### `coverage <FILE> [--annotated]`
 
 Percentage of executable bytes the analysis decoded, plus per-section breakdown. With `--annotated` also reports comment density and call-rendering count.
