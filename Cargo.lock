@@ -612,6 +612,7 @@ dependencies = [
  "reargo-core",
  "reargo-emulator",
  "reargo-loader",
+ "rustc-hash",
  "smallvec",
  "thiserror",
 ]

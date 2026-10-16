@@ -155,7 +155,19 @@ fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
 /// without the integer PF (`None` where it fails).
 #[derive(Default)]
 pub struct LiftCache {
-    map: std::collections::HashMap<u64, Option<LiftedInstruction>>,
+    /// Index in `lifted` of each address lifted so far.
+    map: rustc_hash::FxHashMap<u64, u32>,
+    lifted: Vec<Option<CacheEntry>>,
+}
+
+/// One instruction lifted alone, with what [`X86Lifter::lift_range_cached`]
+/// asks of it in every range holding it.
+struct CacheEntry {
+    insn: LiftedInstruction,
+    /// The x87 pass may rewrite it.
+    x87: bool,
+    /// It reads a PF it does not write first ([`reads_outside_pf`]).
+    reads_pf: bool,
 }
 
 impl LiftCache {
@@ -220,27 +232,41 @@ impl X86Lifter {
         cache: &'c mut LiftCache,
     ) -> CachedRange<'c> {
         let fast = X86Lifter { is_64: self.is_64, parity: false };
-        let mut addrs: Vec<u64> = Vec::with_capacity(count.min(4096));
+        let mut idxs: Vec<u32> = Vec::with_capacity(count.min(4096));
         let mut addr = start;
         let mut x87 = false;
+        let mut reads_pf = false;
         for _ in 0..count {
-            let lifted = cache.map.entry(addr).or_insert_with(|| fast.lift_instruction(memory, addr).ok());
-            let Some(l) = lifted else { break };
+            let i = match cache.map.get(&addr) {
+                Some(&i) => i,
+                None => {
+                    let entry = fast.lift_instruction(memory, addr).ok().map(|insn| CacheEntry {
+                        x87: insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87),
+                        reads_pf: reads_outside_pf(&insn),
+                        insn,
+                    });
+                    let i = u32::try_from(cache.lifted.len()).expect("lift cache index");
+                    cache.lifted.push(entry);
+                    cache.map.insert(addr, i);
+                    i
+                }
+            };
+            let Some(e) = &cache.lifted[i as usize] else { break };
             // The x87 pass rewrites nothing in a range without an x87
             // instruction, so such a range lifts as the cache has it.
-            x87 |= l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
-            addrs.push(addr);
-            addr += l.length as u64;
+            x87 |= e.x87;
+            reads_pf |= e.reads_pf;
+            idxs.push(i);
+            addr += e.insn.length as u64;
         }
         if x87 {
             return CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default());
         }
         let cache: &'c LiftCache = cache;
-        let insns: Vec<&'c LiftedInstruction> = addrs
-            .iter()
-            .map(|a| cache.map.get(a).and_then(Option::as_ref).expect("lifted above"))
-            .collect();
-        if self.parity && needs_integer_parity(&insns) {
+        let entry = |i: &u32| cache.lifted[*i as usize].as_ref().expect("lifted above");
+        let insns: Vec<&'c LiftedInstruction> = idxs.iter().map(|i| &entry(i).insn).collect();
+        // `needs_integer_parity`, its per-instruction test read from the cache
+        if self.parity && reads_pf && parity_needed(&insns, |k| entry(&idxs[k]).reads_pf) {
             return CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default());
         }
         CachedRange::Cached(insns)
@@ -2589,12 +2615,24 @@ pub(crate) fn format_instruction(insn: &iced_x86::Instruction) -> String {
 /// fall through): a float compare's PF write satisfies it; another flag write, the start of the
 /// range or other control flow does not.
 pub fn needs_integer_parity<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L]) -> bool {
+    parity_needed(lifted, |i| reads_outside_pf(lifted[i].borrow()))
+}
+
+/// Whether `insn` reads PF before (or without) writing it itself: the
+/// value comes from an earlier instruction.
+fn reads_outside_pf(insn: &LiftedInstruction) -> bool {
+    let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
+    let Some(read) = insn.ops.iter().position(|o| o.inputs.iter().any(pf)) else { return false };
+    !insn.ops[..read].iter().any(|o| o.output.as_ref().is_some_and(pf))
+}
+
+/// [`needs_integer_parity`] with [`reads_outside_pf`] of the `i`-th
+/// instruction given by `reads_pf(i)`.
+fn parity_needed<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L], reads_pf: impl Fn(usize) -> bool) -> bool {
     let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
     let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
-    for (i, insn) in lifted.iter().enumerate() {
-        let insn = insn.borrow();
-        let Some(read) = insn.ops.iter().position(|o| o.inputs.iter().any(pf)) else { continue };
-        if insn.ops[..read].iter().any(|o| o.output.as_ref().is_some_and(pf)) {
+    for i in 0..lifted.len() {
+        if !reads_pf(i) {
             continue;
         }
         let mut satisfied = false;
@@ -3687,6 +3725,38 @@ mod tests {
         // lift_instruction alone always has it
         let one = lifter.lift_instruction(&make_memory(&[0x83, 0xf8, 0x00], 0x1000), 0x1000).unwrap();
         assert!(one.ops.iter().any(|o| o.opcode == OpCode::PopCount));
+    }
+
+    /// `lift_range_cached` through one shared cache equals `lift_range`
+    /// for every start and length: ranges with an integer PF reader, a
+    /// float compare's PF reader, x87 code, or none of them.
+    #[test]
+    fn cached_range_lift_equals_range_lift() {
+        let code: &[u8] = &[
+            0x83, 0xf8, 0x00, // cmp eax, 0
+            0x7a, 0x00, // jp +0 (reads the integer PF)
+            0x48, 0x89, 0xc3, // mov rbx, rax
+            0x0f, 0x2e, 0xc1, // ucomiss xmm0, xmm1
+            0x75, 0x02, // jne +2
+            0x7a, 0x00, // jp +0 (reads the float compare's PF)
+            0x01, 0xd8, // add eax, ebx
+            0xd9, 0x07, // fld dword [rdi]
+            0xde, 0xc1, // faddp st(1), st
+            0xdd, 0x1e, // fstp qword [rsi]
+            0x48, 0x83, 0xc4, 0x08, // add rsp, 8
+            0xc3, // ret
+        ];
+        let mem = make_memory(code, 0x1000);
+        let lifter = X86Lifter::new_64();
+        let text = |v: &[&LiftedInstruction]| format!("{:?}", v.iter().map(|i| (i.address, i.length, &i.ops)).collect::<Vec<_>>());
+        let mut cache = LiftCache::new();
+        for start in 0..code.len() as u64 {
+            for count in [1, 2, 3, 5, 8, 40] {
+                let fresh = lifter.lift_range(&mem, 0x1000 + start, count).unwrap();
+                let cached = lifter.lift_range_cached(&mem, 0x1000 + start, count, &mut cache).insns().iter().map(|i| (*i).clone()).collect::<Vec<_>>();
+                assert_eq!(text(&cached.iter().collect::<Vec<_>>()), text(&fresh.iter().collect::<Vec<_>>()), "start +{start:#x} count {count}");
+            }
+        }
     }
 
     #[test]

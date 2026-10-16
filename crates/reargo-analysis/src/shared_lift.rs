@@ -40,12 +40,11 @@ use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 use reargo_core::pcode::OpCode;
-use reargo_lift::PcodeLift;
 use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
 use crate::callsite::{walk_function_with, CallSite, ParamSummaries};
-use crate::func_lift::{external_entries, function_jobs, lift_function, owns};
+use crate::func_lift::{function_jobs, in_extent, owns};
 
 /// One function's results.
 pub(crate) struct FunctionResults {
@@ -64,7 +63,7 @@ pub(crate) struct FunctionResults {
     /// depends on nothing the analyzers change. A lift whose offsets do
     /// not fit is not kept (`reusable` is false).
     lifted: Option<Box<[u32]>>,
-    /// The lift's [`external_entries`], sorted.
+    /// The lift's [`crate::func_lift::external_entries`], sorted.
     external: Box<[u64]>,
     /// Whether the result may be reused at all.
     reusable: bool,
@@ -96,11 +95,11 @@ impl SharedLift {
     }
 }
 
-/// Results of every function of `program` (x86-64: callers check the
-/// architecture), with the `cfg_const` / VSA snapshots too when
+/// Results of every function of `program`, lifted with the x86-64
+/// lifter (callers check the architecture), with the `cfg_const` / VSA snapshots too when
 /// `with_snapshots`. Reuses each result [`store`]d earlier that still
 /// holds; the cache is emptied (give the results back with [`store`]).
-pub(crate) fn compute(lifter: &(dyn PcodeLift + Sync), program: &mut Program, with_snapshots: bool) -> SharedLift {
+pub(crate) fn compute(program: &mut Program, with_snapshots: bool) -> SharedLift {
     let cached = program.analysis_cache.take::<Cached>();
     let program = &*program;
     let jump_mark = program.references.jump_mark();
@@ -122,18 +121,42 @@ pub(crate) fn compute(lifter: &(dyn PcodeLift + Sync), program: &mut Program, wi
         .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
         .collect();
     drop(cached_funcs);
-    let funcs: Vec<FunctionResults> = jobs
+    // The cached results that still hold; the others are computed again.
+    let jobs: Vec<(u64, usize, Option<FunctionResults>)> = jobs
         .into_par_iter()
         .map(|(entry, max_insns, old)| {
-            if let Some(old) = old
-                && let Some(changed) = &changed
-                && still_valid(&old, program, max_insns, changed, with_snapshots)
-            {
-                return old;
-            }
-            compute_one(lifter, program, entry, max_insns, with_snapshots)
+            let kept = old.filter(|old| {
+                changed.as_ref().is_some_and(|changed| still_valid(old, program, max_insns, changed, with_snapshots))
+            });
+            (entry, max_insns, kept)
         })
         .collect();
+    // Index the jump references when many functions are computed (else
+    // a lookup per lifted instruction costs less than the index).
+    let stale = jobs.iter().filter(|j| j.2.is_none()).count();
+    let jumps = (stale > jobs.len() / 8).then(|| crate::func_lift::JumpIndex::new(program));
+    // Chunks of consecutive functions share a lift cache: a function is
+    // lifted linearly well past its end, over its neighbours
+    // (`lift_range_cached` gives exactly what `lift_range` would).
+    let x86 = reargo_lift::x86::X86Lifter::new_64();
+    let chunks: Vec<Vec<FunctionResults>> = jobs
+        .into_par_iter()
+        .chunks(LIFT_CHUNK)
+        .map(|chunk| {
+            let mut cache = reargo_lift::x86::LiftCache::new();
+            chunk
+                .into_iter()
+                .map(|(entry, max_insns, kept)| {
+                    if let Some(kept) = kept {
+                        return kept;
+                    }
+                    let range = x86.lift_range_cached(&program.info.memory, entry, max_insns, &mut cache);
+                    compute_lifted(program, jumps.as_ref(), entry, max_insns, &range.insns(), with_snapshots)
+                })
+                .collect()
+        })
+        .collect();
+    let funcs: Vec<FunctionResults> = chunks.into_iter().flatten().collect();
     SharedLift { funcs, jump_mark }
 }
 
@@ -169,7 +192,7 @@ fn still_valid(
 }
 
 /// Whether one of the jump references `changed` (sorted by target)
-/// makes [`external_entries`] of the lift `lifted` (offsets from
+/// makes [`crate::func_lift::external_entries`] of the lift `lifted` (offsets from
 /// `entry`) differ from `external`: it reaches a lifted instruction
 /// not in `external` through a jump table, or from outside the lift.
 fn gained_external_entry(entry: u64, lifted: &[u32], external: &[u64], changed: &[Reference]) -> bool {
@@ -193,38 +216,41 @@ fn gained_external_entry(entry: u64, lifted: &[u32], external: &[u64], changed: 
     })
 }
 
-fn compute_one(
-    lifter: &(dyn PcodeLift + Sync),
+/// Consecutive functions sharing one lift cache in [`compute`].
+const LIFT_CHUNK: usize = 64;
+
+/// The results of the function at `entry` from its lift (the x86
+/// lift never fails: it stops at the first instruction it cannot lift).
+fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     program: &Program,
+    jumps: Option<&crate::func_lift::JumpIndex>,
     entry: u64,
     max_insns: usize,
+    insns: &[I],
     with_snapshots: bool,
 ) -> FunctionResults {
     let next_entry = program.listing.next_function_after(entry).map(|f| f.entry_point);
-    let Some(insns) = lift_function(lifter, program, entry, max_insns) else {
-        return FunctionResults {
-            entry,
-            max_insns,
-            walk: None,
-            snapshots: with_snapshots.then(|| (Vec::new(), Vec::new())),
-            lifted: None,
-            external: Box::new([]),
-            reusable: true,
-            next_entry,
-            owned: Vec::new(),
-        };
+    let external = match jumps {
+        Some(jumps) => jumps.external_entries(program, insns),
+        None => crate::func_lift::external_entries(program, insns),
     };
-    let external = external_entries(program, &insns);
-    let walk = walk_function_with(program, entry, &insns, &ParamSummaries::default(), &external);
+    let walk = walk_function_with(program, entry, insns, &ParamSummaries::default(), &external);
     // The walk asks who owns each call instruction.
     let mut addrs: BTreeSet<u64> = insns
         .iter()
+        .map(std::borrow::Borrow::borrow)
         .filter(|i| i.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd)))
         .map(|i| i.address)
         .collect();
     let snapshots = with_snapshots.then(|| {
-        let mut cfg = crate::cfg_const::function_snapshots_unowned(program, entry, &insns, &external);
-        let mut vsa = crate::vsa::function_snapshots_unowned(program, entry, &insns, &external);
+        // both flows walk the same blocks
+        let mut blocks = crate::blockflow::Cfg::build(insns, &external, |a| in_extent(program, entry, a));
+        // only the snapshots of the calls the function owns are kept
+        blocks.keep_calls(insns, |i| {
+            i.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd)) && owns(program, entry, i.address)
+        });
+        let mut cfg = crate::cfg_const::function_snapshots_cfg(&blocks, insns);
+        let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, insns);
         addrs.extend(cfg.iter().map(|(a, _)| *a));
         addrs.extend(vsa.iter().map(|(a, _)| *a));
         cfg.retain(|(a, _)| owns(program, entry, *a));
@@ -232,7 +258,7 @@ fn compute_one(
         (cfg, vsa)
     });
     let offsets: Option<Box<[u32]>> =
-        insns.iter().map(|i| i.address.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect();
+        insns.iter().map(|i| i.borrow().address.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect();
     // offsets increase (a linear lift), so the list is sorted
     let reusable = offsets.as_ref().is_some_and(|o| o.is_sorted_by(|a, b| a < b));
     let lifted = Some(offsets.unwrap_or_default());
