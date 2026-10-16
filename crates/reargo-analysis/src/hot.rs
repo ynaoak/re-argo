@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 use crate::callgraph::CallGraph;
 
 pub struct HotFunctionAnalyzer;
@@ -43,7 +43,18 @@ impl Analyzer for HotFunctionAnalyzer {
         // After Complexity (900) + CallGraphSccAnalyzer (910).
         915
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE.union(State::REFERENCES))
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// Each function's fan-in and incoming reference count.
+    fn prepare(&self, program: &Program) -> Prepared {
         let cg = CallGraph::build(program);
         // fan_in via call-graph (distinct callers).
         let mut fan_in: BTreeMap<u64, usize> = BTreeMap::new();
@@ -56,6 +67,10 @@ impl Analyzer for HotFunctionAnalyzer {
             xref_in.insert(f.entry_point, program.references.get_refs_to(f.entry_point).len());
         }
 
+        Box::new((fan_in, xref_in))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let (fan_in, xref_in): (BTreeMap<u64, usize>, BTreeMap<u64, usize>) = crate::analyzer::prepared(prepared);
         // Filter out thunks / @plt entries — they're never the
         // user-interesting hot spot.
         struct Cand {

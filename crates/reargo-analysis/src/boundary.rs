@@ -2,11 +2,14 @@ use reargo_arch::FlowType;
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct FunctionBoundaryAnalyzer;
 
 impl Analyzer for FunctionBoundaryAnalyzer {
+    fn writes(&self) -> State {
+        State::NONE
+    }
     fn name(&self) -> &str {
         "Function Boundary"
     }
@@ -54,6 +57,9 @@ impl Analyzer for FunctionBoundaryAnalyzer {
 pub struct VariadicFunctionAnalyzer;
 
 impl Analyzer for VariadicFunctionAnalyzer {
+    fn writes(&self) -> State {
+        State::NONE
+    }
     fn name(&self) -> &str {
         "Variadic Function"
     }

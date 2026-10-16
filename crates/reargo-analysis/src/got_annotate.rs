@@ -24,7 +24,7 @@
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct GotAnnotator;
 
@@ -41,7 +41,17 @@ impl Analyzer for GotAnnotator {
         // GOT for both a string and an import resolution.
         770
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::REFERENCES.union(State::CODE))
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // Index GOT addresses → import names. Use BTreeMap so iteration
         // is deterministic for tests and reproducible builds.
         let by_got: std::collections::BTreeMap<u64, String> = program
@@ -51,6 +61,22 @@ impl Analyzer for GotAnnotator {
             .map(|imp| (imp.got_address, imp.name.clone()))
             .collect();
 
+        // GOT-touching references at instructions, in reference order
+        let edges: Vec<(u64, u64)> = if by_got.is_empty() {
+            Vec::new()
+        } else {
+            program
+                .references
+                .all_refs()
+                .filter(|r| by_got.contains_key(&r.to))
+                .filter(|r| program.listing.get_instruction(r.from).is_some())
+                .map(|r| (r.from, r.to))
+                .collect()
+        };
+        Box::new((by_got, edges))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let (by_got, edges): (std::collections::BTreeMap<u64, String>, Vec<(u64, u64)>) = crate::analyzer::prepared(prepared);
         if by_got.is_empty() {
             return Ok(AnalysisResult {
                 analyzer_name: self.name().into(),
@@ -74,21 +100,7 @@ impl Analyzer for GotAnnotator {
         }
 
         // (2) EOL comments at code that loads through the GOT slot.
-        let edges: Vec<(u64, u64)> = program
-            .references
-            .all_refs()
-            .filter(|r| by_got.contains_key(&r.to))
-            .map(|r| (r.from, r.to))
-            .collect();
-
         for (from, to) in edges {
-            if program
-                .listing
-                .get_instruction(from)
-                .is_none()
-            {
-                continue;
-            }
             if program.comments.get(from, CommentType::Eol).is_some() {
                 continue;
             }

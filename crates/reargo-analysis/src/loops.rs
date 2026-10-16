@@ -28,7 +28,7 @@ use reargo_program::comments::CommentType;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct LoopAnalyzer;
 
@@ -46,7 +46,17 @@ impl Analyzer for LoopAnalyzer {
         // branch back).
         785
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // (branch_addr, target_addr, function_entry) — emitted in
         // two passes so we can also write the header annotation
         // without re-iterating.
@@ -94,8 +104,10 @@ impl Analyzer for LoopAnalyzer {
                 edges
             })
             .collect();
-        drop(funcs);
-
+        Box::new(back_edges)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let back_edges: Vec<(u64, u64, u64)> = crate::analyzer::prepared(prepared);
         let mut header_set: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
         let mut emitted = 0usize;
 

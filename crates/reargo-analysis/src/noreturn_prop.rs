@@ -1,10 +1,13 @@
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct NoReturnPropagationAnalyzer;
 
 impl Analyzer for NoReturnPropagationAnalyzer {
+    fn writes(&self) -> State {
+        State::NONE
+    }
     fn name(&self) -> &str {
         "No-Return Propagation"
     }
@@ -60,6 +63,9 @@ impl Analyzer for NoReturnPropagationAnalyzer {
 pub struct DuplicateCodeAnalyzer;
 
 impl Analyzer for DuplicateCodeAnalyzer {
+    fn writes(&self) -> State {
+        State::NONE
+    }
     fn name(&self) -> &str {
         "Duplicate Code"
     }

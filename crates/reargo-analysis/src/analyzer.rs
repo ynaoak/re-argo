@@ -33,6 +33,110 @@ pub trait Analyzer: Send + Sync {
     /// at its place in the pipeline, as before. The work overlaps the
     /// analyzers that leave cores idle.
     fn start_early(&self, _program: &mut Program) {}
+
+    /// The program state this analyzer may change (in `analyze` /
+    /// `apply`). The default, everything, is always correct; a narrower
+    /// set lets the pipeline prepare later analyzers before this one
+    /// runs (see [`prepare_reads`](Self::prepare_reads)).
+    fn writes(&self) -> State {
+        State::ALL
+    }
+
+    /// For an analyzer split in two — a read-only [`prepare`]
+    /// (Self::prepare) and an [`apply`](Self::apply) of its result —
+    /// everything `prepare` reads of the program state (besides the
+    /// loaded binary, which no analyzer changes). The pipeline may then
+    /// run `prepare` earlier, at the same time as other analyzers'
+    /// `prepare`, on the program as it is when no analyzer between
+    /// there and this one has changed any of it (each declares what it
+    /// changes with [`writes`](Self::writes)), and calls `apply` at the
+    /// analyzer's own place. `None` (the default): not split.
+    fn prepare_reads(&self) -> Option<State> {
+        None
+    }
+
+    /// The read-only first part of a split analyzer (see
+    /// [`prepare_reads`](Self::prepare_reads)).
+    fn prepare(&self, _program: &Program) -> Prepared {
+        unreachable!("{} is not split", self.name())
+    }
+
+    /// The second part of a split analyzer, given what its `prepare`
+    /// returned. The default ignores it and runs `analyze`.
+    fn apply(&self, program: &mut Program, _prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        self.analyze(program)
+    }
+}
+
+/// What [`Analyzer::prepare`] hands to [`Analyzer::apply`].
+pub type Prepared = Box<dyn std::any::Any + Send>;
+
+/// The value of type `T` that a `prepare` returned.
+pub(crate) fn prepared<T: 'static>(prepared: Prepared) -> T {
+    *prepared.downcast::<T>().expect("the result of the analyzer's own prepare")
+}
+
+/// Parts of the program state, for what an analyzer reads
+/// ([`Analyzer::prepare_reads`]) and writes ([`Analyzer::writes`]).
+/// The loaded binary (`program.info`, `name`, `arch`) is not among
+/// them: no analyzer changes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct State(u32);
+
+impl State {
+    pub const NONE: State = State(0);
+    /// The listing's instructions.
+    pub const INSNS: State = State(1 << 0);
+    /// The listing's set of functions and each function's entry, body
+    /// and call targets.
+    pub const FUNCS: State = State(1 << 1);
+    /// Each function's `is_thunk` and `thunk_target`.
+    pub const FUNC_THUNK: State = State(1 << 2);
+    /// Each function's `name`.
+    pub const FUNC_NAME: State = State(1 << 3);
+    /// Each function's `calling_convention`.
+    pub const FUNC_CC: State = State(1 << 4);
+    /// Each function's `no_return`.
+    pub const FUNC_NO_RETURN: State = State(1 << 5);
+    /// The other function fields: `stack_frame`, `return_type`,
+    /// `parameters`, `library`.
+    pub const FUNC_OTHER: State = State(1 << 6);
+    pub const SYMBOLS: State = State(1 << 7);
+    pub const REFERENCES: State = State(1 << 8);
+    pub const COMMENTS: State = State(1 << 9);
+    pub const TAGS: State = State(1 << 10);
+    pub const METADATA: State = State(1 << 11);
+    pub const CALL_RENDERINGS: State = State(1 << 12);
+    pub const DATA_TYPES: State = State(1 << 13);
+    /// `program.analysis_cache`.
+    pub const CACHE: State = State(1 << 14);
+    /// The instructions and the functions' code: [`INSNS`](Self::INSNS),
+    /// [`FUNCS`](Self::FUNCS) and [`FUNC_THUNK`](Self::FUNC_THUNK).
+    pub const CODE: State = Self::INSNS.union(Self::FUNCS).union(Self::FUNC_THUNK);
+    /// Every part of the functions: what adding or removing one
+    /// changes (with [`FUNCS`](Self::FUNCS)).
+    pub const FUNCTIONS: State = Self::FUNCS
+        .union(Self::FUNC_THUNK)
+        .union(Self::FUNC_NAME)
+        .union(Self::FUNC_CC)
+        .union(Self::FUNC_NO_RETURN)
+        .union(Self::FUNC_OTHER);
+    pub const ALL: State = State(u32::MAX);
+
+    pub const fn union(self, other: State) -> State {
+        State(self.0 | other.0)
+    }
+
+    pub const fn intersects(self, other: State) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl std::ops::BitOr for State {
+    type Output = State;
+    fn bitor(self, other: State) -> State {
+        self.union(other)
+    }
 }
 
 /// A result computed on another thread from inputs fixed for the run

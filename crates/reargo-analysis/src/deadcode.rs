@@ -30,7 +30,7 @@ use reargo_arch::FlowType;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct DeadCodeAnalyzer;
 
@@ -46,7 +46,17 @@ impl Analyzer for DeadCodeAnalyzer {
         // can add functions / refs.
         905
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         struct FuncSnap<'a> {
             entry: u64,
             ranges: Vec<(u64, u64)>,
@@ -177,8 +187,10 @@ impl Analyzer for DeadCodeAnalyzer {
             }
             unreachable
         }).collect();
-        let all_unreachable = per_function.into_iter().flatten();
-
+        Box::new(per_function.into_iter().flatten().collect::<Vec<u64>>())
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let all_unreachable: Vec<u64> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for addr in all_unreachable {
             if program.comments.get(addr, CommentType::Plate).is_some() {

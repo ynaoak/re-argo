@@ -26,7 +26,7 @@ use reargo_arch::FlowType;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct ComplexityAnalyzer;
 
@@ -52,7 +52,17 @@ impl Analyzer for ComplexityAnalyzer {
         // Same band as CrossReferenceReport (900).
         900
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE.union(State::FUNC_OTHER))
+    }
+    fn writes(&self) -> State {
+        State::METADATA
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // Build a global "called function entries" multiset for fan_in.
         let mut callers_of: BTreeMap<u64, usize> = BTreeMap::new();
         for func in program.listing.functions() {
@@ -118,7 +128,10 @@ impl Analyzer for ComplexityAnalyzer {
             })
             .collect();
         drop(funcs);
-
+        Box::new(computed)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let computed: Vec<(u64, FunctionMetrics)> = crate::analyzer::prepared(prepared);
         let mut counted = 0usize;
         for (entry, metrics) in computed {
             program.metadata.set_property(

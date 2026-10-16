@@ -41,7 +41,7 @@ use reargo_program::comments::CommentType;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct PanicLikeAnalyzer;
 
@@ -57,7 +57,18 @@ impl Analyzer for PanicLikeAnalyzer {
         // start from its result.
         870
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE.union(State::FUNC_NO_RETURN))
+    }
+    fn writes(&self) -> State {
+        State::FUNC_NO_RETURN.union(State::COMMENTS)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The functions to mark (those already no-return included).
+    fn prepare(&self, program: &Program) -> Prepared {
         // Seed: every function already flagged `no_return = true`
         // by an earlier analyzer (NoReturnAnalyzer / signature DB /
         // NoReturnPropagationAnalyzer).
@@ -136,8 +147,12 @@ impl Analyzer for PanicLikeAnalyzer {
         // Apply the new no_return flag to the listing + emit a
         // plate comment so the user sees it without grepping
         // metadata.
+        let _ = added;
+        Box::new(no_return.into_iter().collect::<Vec<u64>>())
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let to_mark: Vec<u64> = crate::analyzer::prepared(prepared);
         let mut marked = 0usize;
-        let to_mark: Vec<u64> = no_return.iter().copied().collect();
         for entry in to_mark {
             if let Some(f) = program.listing.get_function_mut(entry)
                 && !f.no_return
@@ -153,7 +168,6 @@ impl Analyzer for PanicLikeAnalyzer {
                 );
             }
         }
-        let _ = added;
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

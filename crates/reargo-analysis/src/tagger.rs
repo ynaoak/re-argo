@@ -27,7 +27,7 @@ use rayon::prelude::*;
 use reargo_program::Program;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct TagAnalyzer;
 
@@ -43,7 +43,26 @@ impl Analyzer for TagAnalyzer {
         // written its comments / metadata.
         950
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(
+            State::COMMENTS
+                .union(State::CODE)
+                .union(State::FUNC_NAME)
+                .union(State::FUNC_NO_RETURN)
+                .union(State::METADATA)
+                .union(State::SYMBOLS),
+        )
+    }
+    fn writes(&self) -> State {
+        State::TAGS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The address tags, then the function tags, in the order they are
+    /// added.
+    fn prepare(&self, program: &Program) -> Prepared {
         // The tags of every comment, derived in parallel (in comment
         // order), then added in that order.
         let derived: Vec<(u64, TagKind, String)> = {
@@ -58,11 +77,7 @@ impl Analyzer for TagAnalyzer {
                 .collect()
         };
 
-        let mut tag_count = 0usize;
-        for (addr, cat, text) in derived {
-            program.tags.add_address(addr, cat, text, true);
-            tag_count += 1;
-        }
+        let mut function_tags: Vec<(u64, TagKind, String)> = Vec::new();
 
         // Function-scope tags from Function flags.
         let func_facts: Vec<(u64, bool, bool, String)> = program
@@ -72,30 +87,15 @@ impl Analyzer for TagAnalyzer {
             .collect();
         for (entry, no_return, is_thunk, name) in func_facts {
             if no_return {
-                program.tags.add_function(
-                    entry,
-                    TagKind::NoReturn,
-                    format!("{}: no-return", name),
-                    true,
-                );
-                tag_count += 1;
+                function_tags.push((entry, TagKind::NoReturn, format!("{}: no-return", name)));
             }
             if is_thunk {
-                program
-                    .tags
-                    .add_function(entry, TagKind::Library, format!("{}: thunk", name), true);
-                tag_count += 1;
+                function_tags.push((entry, TagKind::Library, format!("{}: thunk", name)));
             }
             // Standard library names get a `library` tag so users can
             // filter their report to "what touches libc?"
             if name.contains("@plt") || name.contains("@GLIBC") || name.contains("@GOT") {
-                program.tags.add_function(
-                    entry,
-                    TagKind::Library,
-                    format!("{}: import", name),
-                    true,
-                );
-                tag_count += 1;
+                function_tags.push((entry, TagKind::Library, format!("{}: import", name)));
             }
         }
 
@@ -131,15 +131,21 @@ impl Analyzer for TagAnalyzer {
             };
             for name in value.split(", ") {
                 if let Some(&address) = first_by_name.get(name) {
-                    program.tags.add_function(
-                        address,
-                        TagKind::Recursive,
-                        format!("{}: cluster {}", name, k),
-                        true,
-                    );
-                    tag_count += 1;
+                    function_tags.push((address, TagKind::Recursive, format!("{}: cluster {}", name, k)));
                 }
             }
+        }
+        Box::new((derived, function_tags))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        type Tags = Vec<(u64, TagKind, String)>;
+        let (derived, function_tags): (Tags, Tags) = crate::analyzer::prepared(prepared);
+        let tag_count = derived.len() + function_tags.len();
+        for (addr, cat, text) in derived {
+            program.tags.add_address(addr, cat, text, true);
+        }
+        for (entry, cat, text) in function_tags {
+            program.tags.add_function(entry, cat, text, true);
         }
 
         Ok(AnalysisResult {

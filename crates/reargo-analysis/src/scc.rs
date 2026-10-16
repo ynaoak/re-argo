@@ -21,7 +21,7 @@
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 use crate::callgraph::CallGraph;
 
 pub struct CallGraphSccAnalyzer;
@@ -40,12 +40,37 @@ impl Analyzer for CallGraphSccAnalyzer {
         // metadata block is contiguous.
         910
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS.union(State::METADATA)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The recursive clusters' functions (named in `apply`).
+    fn prepare(&self, program: &Program) -> Prepared {
         let cg = CallGraph::build(program);
         // Filter to *cyclic* components only — a 1-node SCC is cyclic
         // only when the node has an edge to itself; the helper on
         // CallGraph handles that gate.
-        let clusters = cg.recursive_clusters();
+        let clusters: Vec<Vec<u64>> =
+            cg.recursive_clusters().into_iter().map(|m| m.into_iter().map(|(a, _)| a).collect()).collect();
+        Box::new(clusters)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let clusters: Vec<Vec<u64>> = crate::analyzer::prepared(prepared);
+        // the call graph's node names: the functions' names
+        let clusters: Vec<Vec<(u64, String)>> = clusters
+            .into_iter()
+            .map(|m| {
+                m.into_iter()
+                    .map(|a| (a, program.listing.get_function(a).map(|f| f.name.clone()).unwrap_or_default()))
+                    .collect()
+            })
+            .collect();
 
         let mut emitted_plates = 0usize;
         for (scc_id, members) in clusters.iter().enumerate() {

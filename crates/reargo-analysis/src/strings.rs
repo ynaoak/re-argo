@@ -22,52 +22,32 @@ impl Analyzer for StringSearchAnalyzer {
         200
     }
 
+    fn start_early(&self, program: &mut Program) {
+        // the data sections' bytes are fixed for the run
+        let sections = data_section_bytes(program);
+        crate::analyzer::Early::<StringSearchAnalyzer, Vec<SectionStrings>>::start(program, move || {
+            sections.into_par_iter().map(section_strings).collect()
+        });
+    }
+
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let data_sections: Vec<(String, u64, u64)> = program
-            .info
-            .sections
-            .iter()
-            .filter(|s| is_data_section(&s.name))
-            .map(|s| (s.name.clone(), s.address, s.size))
-            .collect();
+        let per_section = match crate::analyzer::Early::<StringSearchAnalyzer, Vec<SectionStrings>>::take(program) {
+            Some(per_section) => per_section,
+            None => data_section_bytes(program).into_par_iter().map(section_strings).collect(),
+        };
 
-        // Phase 1: scan each data section independently in parallel.
-        // The memory read + linear printable-ASCII walk is read-only
-        // against an immutable Program view, so per-section work fans
-        // out cleanly to rayon. The bigger gain isn't section count
-        // (typically 1-3) but that the dominant cost -- the byte
-        // scan itself -- now runs on multiple cores when there ARE
-        // multiple sections.
-        type SectionStrings = (String, u64, Vec<(u64, String)>);
-        let per_section: Vec<SectionStrings> = data_sections
-            .par_iter()
-            .filter_map(|(name, addr, size)| {
-                let mut buf = vec![0u8; *size as usize];
-                program.info.memory.read_bytes(*addr, &mut buf).ok()?;
-                let found = find_strings(&buf, *addr);
-                Some((name.clone(), *size, found))
-            })
-            .collect();
-
-        // Phase 2: apply serially -- symbol table inserts and the
-        // per-section log line.
         let mut strings_found = 0;
         for (section_name, size, found) in per_section {
-            for (string_addr, string_val) in &found {
-                let label = sanitize_string_label(string_val);
-                program.symbol_table.add(Symbol::new(
-                    format!("s_{}_{:x}", label, string_addr),
-                    *string_addr,
-                    SymbolType::Data,
-                    SourceType::Analysis,
-                ));
+            let count = found.len();
+            for (string_addr, name) in found {
+                program.symbol_table.add(Symbol::new(name, string_addr, SymbolType::Data, SourceType::Analysis));
                 strings_found += 1;
             }
-            if !found.is_empty() {
+            if count > 0 {
                 eprintln!(
                     "  [{}] {} strings in {} ({} bytes)",
                     self.name(),
-                    found.len(),
+                    count,
                     section_name,
                     size
                 );
@@ -81,6 +61,37 @@ impl Analyzer for StringSearchAnalyzer {
             instructions_decoded: strings_found,
         })
     }
+}
+
+/// A data section's name and size, and the address and symbol name of
+/// each string found in it.
+type SectionStrings = (String, u64, Vec<(u64, String)>);
+
+/// The name, address, size and bytes of each readable data section, in
+/// section order.
+fn data_section_bytes(program: &Program) -> Vec<(String, u64, u64, Vec<u8>)> {
+    program
+        .info
+        .sections
+        .iter()
+        .filter(|s| is_data_section(&s.name))
+        .filter_map(|s| {
+            let mut buf = vec![0u8; s.size as usize];
+            program.info.memory.read_bytes(s.address, &mut buf).ok()?;
+            Some((s.name.clone(), s.address, s.size, buf))
+        })
+        .collect()
+}
+
+fn section_strings((name, addr, size, buf): (String, u64, u64, Vec<u8>)) -> SectionStrings {
+    let found = find_strings(&buf, addr)
+        .into_iter()
+        .map(|(string_addr, string_val)| {
+            let label = sanitize_string_label(&string_val);
+            (string_addr, format!("s_{}_{:x}", label, string_addr))
+        })
+        .collect();
+    (name, size, found)
 }
 
 pub fn is_data_section(name: &str) -> bool {

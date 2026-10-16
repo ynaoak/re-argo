@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct MagicDivisionAnalyzer;
 
@@ -154,13 +154,39 @@ impl Analyzer for MagicDivisionAnalyzer {
 
         // Decode in parallel against an immutable view; the hits keep
         // listing order and are applied in that order.
+        let hits: Vec<(u64, u32)> = crate::analyzer::prepared(self.prepare(program));
+        self.apply_hits(program, hits)
+    }
+
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
+        if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+            return Box::new(Vec::<(u64, u32)>::new());
+        }
         let insns: Vec<&reargo_arch::DecodedInstruction> = program.listing.instructions().collect();
         let hits: Vec<(u64, u32)> = insns
             .par_iter()
             .filter_map(|i| decode_magic_imul(i.address, &i.bytes).map(|d| (i.address, d)))
             .collect();
         drop(insns);
+        Box::new(hits)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+            return self.analyze(program);
+        }
+        let hits: Vec<(u64, u32)> = crate::analyzer::prepared(prepared);
+        self.apply_hits(program, hits)
+    }
+}
 
+impl MagicDivisionAnalyzer {
+    fn apply_hits(&self, program: &mut Program, hits: Vec<(u64, u32)>) -> Result<AnalysisResult, AnalysisError> {
         let mut annotated = 0usize;
         for &(addr, d) in &hits {
             if program.comments.get(addr, CommentType::Eol).is_some() {

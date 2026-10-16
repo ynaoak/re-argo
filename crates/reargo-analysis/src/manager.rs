@@ -1,6 +1,6 @@
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 use crate::boundary::{FunctionBoundaryAnalyzer, VariadicFunctionAnalyzer};
 use crate::callingconv::CallingConventionAnalyzer;
 use crate::anti_debug::AntiDebugAnalyzer;
@@ -72,6 +72,13 @@ use crate::typerecovery::{DataTypeAnalyzer, TypeRecoveryAnalyzer};
 use crate::vtable::VTableAnalyzer;
 use crate::wrapper::WrapperFunctionAnalyzer;
 use crate::xref_report::{CrossReferenceReportAnalyzer, UnreferencedFunctionAnalyzer};
+
+/// A run of consecutive analyzers (indices into the pipeline) and the
+/// ones among them that prepare at its start, in order.
+struct Window {
+    analyzers: std::ops::Range<usize>,
+    prepared: Vec<usize>,
+}
 
 pub struct AnalysisManager {
     analyzers: Vec<Box<dyn Analyzer>>,
@@ -195,12 +202,62 @@ impl AnalysisManager {
             analyzer.start_early(program);
         }
         let mut results = Vec::with_capacity(self.analyzers.len());
-        for analyzer in &self.analyzers {
-            let t = std::time::Instant::now();
-            let r = analyzer.analyze(program);
-            results.push((analyzer.name(), t.elapsed(), r));
+        for window in self.windows() {
+            // The prepares run at the same time, on the program as it is
+            // here; each one's result is the same as at its analyzer's
+            // own place (nothing in between writes what it reads).
+            let mut prepared: Vec<Option<(Prepared, std::time::Duration)>> =
+                window.prepared.iter().map(|_| None).collect();
+            if window.prepared.len() >= 2 {
+                let shared = &*program;
+                rayon::scope(|s| {
+                    for (slot, &i) in prepared.iter_mut().zip(&window.prepared) {
+                        let analyzer = &*self.analyzers[i];
+                        s.spawn(move |_| {
+                            let t = std::time::Instant::now();
+                            *slot = Some((analyzer.prepare(shared), t.elapsed()));
+                        });
+                    }
+                });
+            }
+            let mut prepared = window.prepared.iter().copied().zip(prepared).peekable();
+            for i in window.analyzers {
+                let analyzer = &self.analyzers[i];
+                let t = std::time::Instant::now();
+                // a prepared analyzer counts its prepare's time too
+                let (r, extra) = match prepared.next_if(|(p, _)| *p == i) {
+                    Some((_, Some((p, d)))) => (analyzer.apply(program, p), d),
+                    _ => (analyzer.analyze(program), std::time::Duration::ZERO),
+                };
+                results.push((analyzer.name(), t.elapsed() + extra, r));
+            }
         }
         results
+    }
+
+    /// The pipeline cut into runs of consecutive analyzers, each with
+    /// the split analyzers ([`Analyzer::prepare_reads`]) that prepare at
+    /// its start: those that no analyzer of the run before them writes
+    /// any of the state they read of. A split analyzer that one does is
+    /// where the next run starts.
+    fn windows(&self) -> Vec<Window> {
+        let mut windows = Vec::new();
+        let mut current = Window { analyzers: 0..0, prepared: Vec::new() };
+        let mut written = State::NONE;
+        for (i, analyzer) in self.analyzers.iter().enumerate() {
+            if let Some(reads) = analyzer.prepare_reads() {
+                if reads.intersects(written) {
+                    let next = Window { analyzers: i..i, prepared: Vec::new() };
+                    windows.push(std::mem::replace(&mut current, next));
+                    written = State::NONE;
+                }
+                current.prepared.push(i);
+            }
+            current.analyzers.end = i + 1;
+            written = written | analyzer.writes();
+        }
+        windows.push(current);
+        windows
     }
 
     /// Walk the priority-sorted analyzer list and report any

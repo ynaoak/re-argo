@@ -50,41 +50,26 @@ impl Analyzer for EntropyAnalyzer {
     fn provides(&self) -> &'static [&'static str] {
         &["entropy"]
     }
+    fn start_early(&self, program: &mut Program) {
+        // the sections' bytes are fixed for the run
+        let samples = section_samples(program);
+        crate::analyzer::Early::<EntropyAnalyzer, Measured>::start(program, move || measure(samples));
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let sections: Vec<(String, u64, u64)> = program
-            .info
-            .sections
-            .iter()
-            .filter(|s| s.address != 0 && s.size > 0)
-            .map(|s| (s.name.clone(), s.address, s.size))
-            .collect();
+        let (per_section, overall_hist, overall_total) =
+            match crate::analyzer::Early::<EntropyAnalyzer, Measured>::take(program) {
+                Some(measured) => measured,
+                None => measure(section_samples(program)),
+            };
 
-        let mut overall_hist = [0u64; 256];
-        let mut overall_total: u64 = 0;
         let mut packed_tags: Vec<(u64, f64)> = Vec::new();
-
-        for (name, addr, size) in &sections {
-            // Cap per section so a single huge resource section
-            // can't dominate runtime. A 1 MiB sample is more than
-            // enough to characterise the section's distribution.
-            let sample_len = (*size).min(1_024 * 1_024) as usize;
-            let mut buf = vec![0u8; sample_len];
-            if program.info.memory.read_bytes(*addr, &mut buf).is_err() {
-                continue;
-            }
-            let entropy = shannon_entropy(&buf);
-
-            for &b in &buf {
-                overall_hist[b as usize] += 1;
-            }
-            overall_total += buf.len() as u64;
-
+        for (name, addr, entropy) in per_section {
             program
                 .metadata
                 .set_property(format!("entropy_{}", name), format!("{:.3}", entropy));
 
             if entropy >= ENTROPY_PACKED_THRESHOLD {
-                packed_tags.push((*addr, entropy));
+                packed_tags.push((addr, entropy));
             }
         }
 
@@ -112,6 +97,47 @@ impl Analyzer for EntropyAnalyzer {
             instructions_decoded: 0,
         })
     }
+}
+
+/// Each section's name, address and entropy, in section order, and the
+/// byte histogram and size of all of them together.
+type Measured = (Vec<(String, u64, f64)>, [u64; 256], u64);
+
+/// The name, address and first MiB (the sample measured) of each
+/// section with an address and a size whose bytes can be read, in
+/// section order.
+fn section_samples(program: &Program) -> Vec<(String, u64, Vec<u8>)> {
+    program
+        .info
+        .sections
+        .iter()
+        .filter(|s| s.address != 0 && s.size > 0)
+        .filter_map(|s| {
+            // Cap per section so a single huge resource section
+            // can't dominate runtime. A 1 MiB sample is more than
+            // enough to characterise the section's distribution.
+            let mut buf = vec![0u8; s.size.min(1_024 * 1_024) as usize];
+            program.info.memory.read_bytes(s.address, &mut buf).ok()?;
+            Some((s.name.clone(), s.address, buf))
+        })
+        .collect()
+}
+
+fn measure(samples: Vec<(String, u64, Vec<u8>)>) -> Measured {
+    let mut overall_hist = [0u64; 256];
+    let mut overall_total: u64 = 0;
+    let per_section = samples
+        .into_iter()
+        .map(|(name, addr, buf)| {
+            let entropy = shannon_entropy(&buf);
+            for &b in &buf {
+                overall_hist[b as usize] += 1;
+            }
+            overall_total += buf.len() as u64;
+            (name, addr, entropy)
+        })
+        .collect();
+    (per_section, overall_hist, overall_total)
 }
 
 /// Shannon entropy of a byte slice in bits/byte (0.0–8.0). Empty

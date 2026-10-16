@@ -27,11 +27,14 @@ use std::collections::BTreeMap;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct FormatVarargsAnalyzer;
 
 impl Analyzer for FormatVarargsAnalyzer {
+    fn writes(&self) -> State {
+        State::COMMENTS.union(State::METADATA).union(State::CACHE)
+    }
     fn name(&self) -> &str {
         "Format Varargs"
     }

@@ -39,7 +39,7 @@ use reargo_arch::FlowType;
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct WrapperFunctionAnalyzer;
 
@@ -55,7 +55,19 @@ impl Analyzer for WrapperFunctionAnalyzer {
         // we print is the best-resolved version.
         795
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE)
+    }
+    fn writes(&self) -> State {
+        State::METADATA.union(State::COMMENTS)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The wrappers and the one function each calls (named in
+    /// `apply`).
+    fn prepare(&self, program: &Program) -> Prepared {
         struct FuncSnap<'a> {
             entry: u64,
             body: &'a reargo_core::address::AddressSet,
@@ -73,15 +85,7 @@ impl Analyzer for WrapperFunctionAnalyzer {
             })
             .collect();
 
-        let name_at = |program: &Program, addr: u64| -> Option<String> {
-            program
-                .symbol_table
-                .primary_at(addr)
-                .map(|s| s.name.clone())
-                .or_else(|| program.listing.get_function(addr).map(|f| f.name.clone()))
-        };
-
-        let mut flagged: Vec<(u64, String)> = Vec::new();
+        let mut wrappers: Vec<(u64, u64)> = Vec::new();
         for snap in &snaps {
             if snap.is_thunk {
                 continue;
@@ -108,11 +112,23 @@ impl Analyzer for WrapperFunctionAnalyzer {
             }
 
             let target = *snap.call_targets.iter().next().unwrap();
-            let Some(target_name) = name_at(program, target) else {
-                continue;
-            };
-            flagged.push((snap.entry, target_name));
+            wrappers.push((snap.entry, target));
         }
+        Box::new(wrappers)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let wrappers: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
+        let name_at = |program: &Program, addr: u64| -> Option<String> {
+            program
+                .symbol_table
+                .primary_at(addr)
+                .map(|s| s.name.clone())
+                .or_else(|| program.listing.get_function(addr).map(|f| f.name.clone()))
+        };
+        let flagged: Vec<(u64, String)> = wrappers
+            .into_iter()
+            .filter_map(|(entry, target)| Some((entry, name_at(program, target)?)))
+            .collect();
 
         let mut emitted = 0usize;
         for (entry, target_name) in &flagged {
