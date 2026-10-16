@@ -286,7 +286,7 @@ pub fn decompile_function_with_options(
 ) -> Result<DecompileResult, String> {
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
-    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
     decompile_function_inner(
         lifter,
         program,
@@ -356,7 +356,7 @@ pub fn decompile_function_with_maps(
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
 ) -> Result<DecompileResult, String> {
-    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
     decompile_function_inner(
         lifter,
         program,
@@ -488,10 +488,14 @@ fn keep_fde_body(lifted: Vec<LiftedInstruction>, start: u64, end: u64) -> Vec<Li
         .collect()
 }
 
+/// The address of the `.eh_frame_hdr` table (the function covering an address).
+fn unwind_table(sections: &[reargo_loader::Section]) -> Option<u64> {
+    sections.iter().find(|s| s.name == ".eh_frame_hdr").map(|s| s.address)
+}
+
 /// `[start, start + len)` of the function covering `entry`, from the `.eh_frame_hdr` table.
 fn fde_bounds(memory: &Memory, sections: &[reargo_loader::Section], entry: u64) -> Option<(u64, u64)> {
-    let hdr = sections.iter().find(|s| s.name == ".eh_frame_hdr")?.address;
-    reargo_loader::fde_function(memory, hdr, entry)
+    reargo_loader::fde_function(memory, unwind_table(sections)?, entry)
 }
 
 /// Address of the stub [`rewrite_tail_calls`] makes for a conditional jump out of the code to
@@ -885,7 +889,13 @@ struct RetEvidence {
     stored: bool,
     /// The direct callees whose results it is (WS86).
     callees: Vec<u64>,
+    /// The value is an argument register's value on entry (WS92): `mov rax, rdi; ret`.
+    param: bool,
 }
+
+/// The integer argument registers of the x86-64 conventions (System V and Microsoft):
+/// `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`.
+const ARG_REGISTERS: [u64; 6] = [0x38, 0x30, 0x10, 0x08, 0x80, 0x88];
 
 /// Most callees whose callers [`choose_return_register`] asks about one function's result.
 const MAX_TAIL_CALLEES: usize = 4;
@@ -899,7 +909,10 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
     }
     seen.push(v);
     let vn = &ssa.varnodes[v as usize];
-    let Some(d) = vn.def_op else { return RetEvidence::default() };
+    let Some(d) = vn.def_op else {
+        let param = vn.data.space == reargo_core::address::SpaceId::REGISTER && vn.data.size == 8 && ARG_REGISTERS.contains(&vn.data.offset);
+        return RetEvidence { param, ..RetEvidence::default() };
+    };
     let op = &ssa.ops[d];
     let reg = |x: crate::ssa::VarId| ssa.varnodes[x as usize].data.space == reargo_core::address::SpaceId::REGISTER;
     match op.opcode {
@@ -940,6 +953,12 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
             src.size == vn.data.size && src.offset != vn.data.offset
         } => {
             let e = return_evidence(ssa, op.inputs[0], seen);
+            if e.param {
+                // WS92: the function copied an argument into the return register (`mov rax,
+                // rbx` with `rbx = rdi`: a struct returned in memory returns its hidden
+                // pointer, `return this;`, `memcpy`'s `dst`) — it wrote the result itself
+                return RetEvidence { written: true, addr: op.address, size: vn.data.size, ..RetEvidence::default() };
+            }
             RetEvidence { addr: e.addr.max(op.address), ..e }
         }
         _ => RetEvidence {
@@ -949,6 +968,7 @@ fn return_evidence(ssa: &SsaFunction, v: crate::ssa::VarId, seen: &mut Vec<crate
             call_result: false,
             stored: vn.uses.iter().any(|&u| ssa.ops[u].opcode == OpCode::Store && ssa.ops[u].inputs.get(2) == Some(&v)),
             callees: Vec::new(),
+            param: false,
         },
     }
 }
@@ -1171,7 +1191,7 @@ pub fn decompile_all_with_options(
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
     // one callee-parameter memo for the whole batch
-    let oracle = CalleeParams::new(lifter, &program.info.memory);
+    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
 
     entries
         .par_iter()
@@ -1339,7 +1359,7 @@ fn build_decompile_result(
         let memory = caller_hint.map(|(_, m)| m);
         let cc = caller_hint.and_then(|(l, _)| l.call_convention());
         let arg_regs = [cc.as_ref().and_then(|c| c.args.first().copied()), cc.as_ref().and_then(|c| c.args.get(1).copied())];
-        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle };
+        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle, name: Some(func_name), symbols: Some(symbols) };
         crate::structs::StructView::new(&ssa, &ctx)
     } else {
         crate::structs::StructView::default()
@@ -1986,6 +2006,85 @@ mod tests {
         decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().c_code
     }
 
+    /// WS92: a loop whose header is the function's entry block (GCC -O2, `-fcf-protection=none`):
+    /// `void clear_pairs(int *p, int *end) { do { p[1] = 0; p += 2; } while (p != end); }`.
+    /// The entry is a join of the function's entry and the back edge, so the pointer the
+    /// loop steps gets a phi there and the printed loop advances it.
+    #[test]
+    fn loop_at_the_entry_block_advances_its_pointer() {
+        // 0x1000: mov dword [rdi+4], 0 ; add rdi, 8 ; cmp rdi, rsi ; jne 0x1000 ; ret
+        let code = [0xc7, 0x47, 0x04, 0, 0, 0, 0, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xf7, 0x75, 0xf0, 0xc3];
+        for c in [c_of(&code), c_raw(&code)] {
+            assert!(c.contains("rdi = rdi + 8;"), "{c}");
+            assert!(c.contains("} while (rdi != rsi);"), "{c}");
+            assert!(!c.contains("(rdi + 8) != rsi"), "{c}");
+        }
+        // the Rust output reads the same SSA
+        let lifter = X86Lifter::new_64();
+        let r = decompile(&lifter, &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap();
+        assert!(r.rust_code.contains("rdi = rdi.wrapping_add(8);"), "{}", r.rust_code);
+    }
+
+    /// WS92: BDS 1.26.33.2 0x6608a70 walks a chain of parents (`do { rax = rdi; rdi =
+    /// rdi->field_8->field_1a0; } while (rdi != 0); return rax->field_10;`); the loop at the
+    /// entry used to read the incoming `rdi` on every iteration.
+    #[test]
+    fn bds_parent_chain_walk_at_the_entry_block() {
+        let code = [
+            0x48, 0x89, 0xf8, // 0x1000 mov rax, rdi
+            0x48, 0x8b, 0x4f, 0x08, // mov rcx, [rdi+8]
+            0x48, 0x8b, 0xb9, 0xa0, 0x01, 0x00, 0x00, // mov rdi, [rcx+0x1a0]
+            0x48, 0x85, 0xff, // test rdi, rdi
+            0x75, 0xed, // jne 0x1000
+            0x0f, 0xb6, 0x40, 0x10, // movzx eax, byte [rax+0x10]
+            0xc3,
+        ];
+        let c = c_raw(&code);
+        assert!(c.contains("rdi = *(uint64_t*)(rcx + 0x1a0);") || c.contains("rdi = *(uint64_t*)(*(uint64_t*)(rdi + 8) + 0x1a0);"), "{c}");
+        assert!(c.contains("} while (rdi != 0);"), "{c}");
+        let c = c_of(&code);
+        assert!(c.contains("rdi = rcx->field_1a0;") || c.contains("rdi = rdi->field_8->field_1a0;"), "{c}");
+    }
+
+    /// WS92: a tail call to itself after the epilogue (`jmp f` back to the prologue, BDS
+    /// 0x3e12f20) is a loop at the entry block too; the stack pointer is the same on both
+    /// edges into it, so the frame slots stay named.
+    #[test]
+    fn loop_at_the_entry_block_through_the_prologue_keeps_the_frame() {
+        let code = [
+            0x53, // 0x1000 push rbx
+            0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0x48, 0x89, 0xe6, // mov rsi, rsp
+            0xe8, 0x13, 0x00, 0x00, 0x00, // call 0x1025
+            0x48, 0x8b, 0x7c, 0x24, 0x08, // mov rdi, [rsp+8]
+            0x48, 0x83, 0xc4, 0x10, // add rsp, 0x10
+            0x5b, // pop rbx
+            0x48, 0x8b, 0x3f, // mov rdi, [rdi]
+            0x48, 0x85, 0xff, // test rdi, rdi
+            0x75, 0xdc, // jne 0x1000
+            0xc3, // ret
+            0x48, 0x8b, 0x06, // 0x1025: mov rax, [rsi]
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("local_8 = rbx;") && c.contains("local_10 = rdi;") && c.contains("rdi = local_10;"), "{c}");
+        assert!(c.contains("rax = 0x1025(local_18);") || c.contains("rsi = local_18;"), "{c}");
+        assert!(!c.contains("rsp"), "{c}");
+    }
+
+    /// WS92: `int count_hits(const int *p, const int *end) { int n; do { n = p[1]; p += 2; }
+    /// while (p != end && n == 0); return n; }` — the entry block is the header of a loop with
+    /// two exits.
+    #[test]
+    fn loop_at_the_entry_block_with_two_exits() {
+        // 0x1000: mov eax, [rdi+4] ; add rdi, 8 ; cmp rdi, rsi ; je 0x1010 ; test eax, eax ; je 0x1000 ; ret
+        let code = [0x8b, 0x47, 0x04, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xf7, 0x74, 0x04, 0x85, 0xc0, 0x74, 0xf0, 0xc3];
+        let c = c_of(&code);
+        assert!(c.contains("rdi = rdi + 8;"), "{c}");
+        assert!(c.contains("(rdi != rsi) && (eax == 0)"), "{c}");
+    }
+
     /// WS79: a scalar float computed into `xmm0` last is the return value.
     #[test]
     fn float_return_in_xmm0() {
@@ -2018,6 +2117,30 @@ mod tests {
         ]);
         assert!(c.contains("double f(") || c.contains("float f("), "{c}");
         assert!(c.contains("return xmm0"), "{c}");
+    }
+
+    /// WS92: a function returning a struct in memory returns its hidden pointer (`mov rax,
+    /// rbx` with `rbx = rdi`), even when the last value left in `xmm0` is a float callee's
+    /// result (BDS 0x43fadc0 printed `double …` / `return xmm0;`).
+    #[test]
+    fn struct_returned_in_memory_returns_its_pointer() {
+        let code = [
+            0x53, // 0x1000 push rbx
+            0x48, 0x89, 0xfb, // mov rbx, rdi
+            0x66, 0x0f, 0xef, 0xc0, // pxor xmm0, xmm0
+            0x0f, 0x11, 0x47, 0x08, // movups [rdi+8], xmm0
+            0xe8, 0x0b, 0x00, 0x00, 0x00, // call 0x101c
+            0x48, 0x89, 0xd8, // mov rax, rbx
+            0x5b, // pop rbx
+            0xc3, // ret
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad to 0x101c
+            0xf3, 0x0f, 0x2a, 0xc7, // 0x101c cvtsi2ss xmm0, edi
+            0xc3,
+        ];
+        let c = c_of(&code);
+        assert!(c.contains("uint64_t f("), "{c}");
+        assert!(c.contains("return rax;") || c.contains("return rbx;") || c.contains("return rdi;"), "{c}");
+        assert!(!c.contains("return xmm0"), "{c}");
     }
 
     /// An integer written after the last float write is the return value.

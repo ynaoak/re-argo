@@ -62,22 +62,31 @@ const MAX_DEPTH: u32 = 2;
 /// Callee parameter oracle with a memo shared by every lookup (safe to share
 /// across threads, e.g. by `decompile_all`).
 pub struct CalleeParams<'a> {
-    lifter: &'a dyn PcodeLift,
-    memory: &'a Memory,
-    args: Vec<VarnodeData>,
+    pub(crate) lifter: &'a dyn PcodeLift,
+    pub(crate) memory: &'a Memory,
+    pub(crate) args: Vec<VarnodeData>,
     /// Register class of each argument (index into `class_members`).
     class_of: Vec<usize>,
     /// Arguments of each class, in parameter order.
     class_members: Vec<Vec<usize>>,
     memo: Mutex<FxHashMap<(u64, u32), Option<ParamInfo>>>,
     /// The convention's return registers (`rax`, `xmm0`).
-    returns: Vec<VarnodeData>,
+    pub(crate) returns: Vec<VarnodeData>,
     ret_memo: Mutex<FxHashMap<(u64, u32), ReturnKind>>,
     /// Registers a call may change (the convention's returns and clobbers).
-    caller_saved: Vec<VarnodeData>,
+    pub(crate) caller_saved: Vec<VarnodeData>,
     /// How a callee uses its pointer parameters (WS91), by callee.
     fields_memo: Mutex<FxHashMap<u64, std::sync::Arc<ParamUse>>>,
+    /// The address of `.eh_frame_hdr` (the function covering an address), when known (WS92).
+    pub(crate) unwind_table: Option<u64>,
+    /// The classes of the objects a class's constructors store in its fields (WS92,
+    /// `classfields`), by the class's vtable.
+    pub(crate) class_fields_memo: Mutex<FxHashMap<u64, ClassFields>>,
 }
+
+/// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
+/// `classfields`).
+pub type ClassFields = std::sync::Arc<Vec<(u64, u64)>>;
 
 /// How a function uses its pointer parameters (WS91).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -87,6 +96,10 @@ pub struct ParamUse {
     /// Every `ret` returns the first argument's incoming value: a struct returned in memory
     /// (`rdi` is the result's address, so a method's `this` is the second argument).
     pub returns_first: bool,
+    /// Constants it stores at offset 0 of a parameter, 8 bytes (WS92): the vtable a constructor
+    /// or destructor puts into its `this` (`(arg, value)`; whether a value is a vtable is for
+    /// the caller to check).
+    pub vtable_stores: Vec<(usize, u64)>,
 }
 
 /// A memory access a function makes through one of its parameters (WS91): `*(T*)(param + off)`.
@@ -126,7 +139,16 @@ impl<'a> CalleeParams<'a> {
             ret_memo: Mutex::new(FxHashMap::default()),
             caller_saved: cc.returns.iter().chain(cc.clobbers.iter()).map(|(r, _)| *r).collect(),
             fields_memo: Mutex::new(FxHashMap::default()),
+            unwind_table: None,
+            class_fields_memo: Mutex::new(FxHashMap::default()),
         })
+    }
+
+    /// The same oracle, finding the function that covers an address through the
+    /// `.eh_frame_hdr` table at `hdr` (WS92, `classfields`).
+    pub fn with_unwind_table(mut self, hdr: Option<u64>) -> Self {
+        self.unwind_table = hdr;
+        self
     }
 
     /// The memory the function at `target` accesses through its parameters (WS91): every
@@ -244,6 +266,16 @@ impl<'a> CalleeParams<'a> {
             m.insert((target, depth_left), r);
         }
         r
+    }
+
+    /// The body of the function at `target` as a CFG (up to its returns; `None` when it cannot
+    /// be lifted).
+    pub(crate) fn body_cfg(&self, target: u64) -> Option<ControlFlowGraph> {
+        let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
+        if lifted.is_empty() || lifted[0].address != target {
+            return None;
+        }
+        Some(ControlFlowGraph::build_owned(crate::pipeline::trim_to_return(lifted)))
     }
 
     fn analyze(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
@@ -426,9 +458,9 @@ struct Acc {
 const MAX_FIELD: i64 = 0x10_0000;
 
 /// What a storage location holds: an argument's incoming value plus a delta.
-type Held = FxHashMap<(SpaceId, u64, u32), (usize, i64)>;
+pub(crate) type Held = FxHashMap<(SpaceId, u64, u32), (usize, i64)>;
 
-fn kill(state: &mut Held, out: &VarnodeData) {
+pub(crate) fn kill(state: &mut Held, out: &VarnodeData) {
     state.retain(|&(sp, off, sz), _| !(sp == out.space && off < out.offset + u64::from(out.size) && out.offset < off + u64::from(sz)));
 }
 
@@ -446,15 +478,48 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
     let rpo = crate::dominator::reverse_post_order(cfg);
     let mut found: Vec<ParamAccess> = Vec::new();
     let mut returns: Vec<bool> = Vec::new();
+    let mut vtable_stores: Vec<(usize, u64)> = Vec::new();
     for pass in 0..8 {
         returns.clear();
         let mut changed = false;
         let last = pass == 7;
         for &b in &rpo {
             let Some(mut st) = inn[b].clone() else { continue };
+            // the constants the block wrote into registers (`lea rax, [vtable]`), for the stores
+            let mut consts: FxHashMap<(SpaceId, u64, u32), u64> = FxHashMap::default();
             for insn in &cfg.blocks[b].instructions {
                 for op in &insn.ops {
                     let held = |st: &Held, v: &VarnodeData| st.get(&(v.space, v.offset, v.size)).copied();
+                    if op.opcode == OpCode::Store
+                        && let (Some(a), Some(v)) = (op.inputs.get(1).and_then(|v| held(&st, v)), op.inputs.get(2))
+                        && a.1 == 0
+                        && v.size == 8
+                    {
+                        let k = if v.space == SpaceId::CONST { Some(v.offset) } else { consts.get(&(v.space, v.offset, v.size)).copied() };
+                        if let Some(k) = k
+                            && !vtable_stores.contains(&(a.0, k))
+                        {
+                            vtable_stores.push((a.0, k));
+                        }
+                    }
+                    if let Some(out) = op.output {
+                        let c = match (op.opcode, op.inputs.first()) {
+                            (OpCode::Copy, Some(c)) if out.size == 8 && c.space == SpaceId::CONST => Some(c.offset),
+                            (OpCode::Copy, Some(c)) if out.size == 8 => consts.get(&(c.space, c.offset, c.size)).copied(),
+                            _ => None,
+                        };
+                        // (the lifter's view sync, `eax = SUBPIECE(rax, 0)`, leaves the register it reads)
+                        let view_sync = op.opcode == OpCode::Subpiece && op.inputs.first().is_some_and(|r| r.space == out.space && r.offset == out.offset && r.size > out.size);
+                        if !view_sync {
+                            consts.retain(|r, _| !(r.0 == out.space && r.1 < out.offset + u64::from(out.size) && out.offset < r.1 + u64::from(r.2)));
+                        }
+                        if let Some(c) = c {
+                            consts.insert((out.space, out.offset, out.size), c);
+                        }
+                    }
+                    if matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
+                        consts.clear();
+                    }
                     match op.opcode {
                         OpCode::Load | OpCode::Store => {
                             let size = match op.opcode {
@@ -518,7 +583,7 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
             break;
         }
     }
-    ParamUse { fields: found, returns_first: !returns.is_empty() && returns.iter().all(|&r| r) }
+    ParamUse { fields: found, returns_first: !returns.is_empty() && returns.iter().all(|&r| r), vtable_stores }
 }
 
 /// Group the argument registers into classes (System V: integer, vector) by

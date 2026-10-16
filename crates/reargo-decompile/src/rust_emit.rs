@@ -173,6 +173,17 @@ impl<'a> RustEmitter<'a> {
         crate::emit::is_identifier(&obj).then_some((vc, obj))
     }
 
+    /// `unsafe { &raw mut (*base).field_k }` for a register set to a struct pointer plus a
+    /// field's offset (WS92, as `CEmitter::field_address`).
+    fn field_address(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {
+        if !(op.output.is_some_and(|o| func.varnodes[o as usize].data.space == SpaceId::REGISTER) || self.coalesced.defs.contains_key(&op.index)) {
+            return None;
+        }
+        let (bi, f) = self.structs?.field_address(func, op)?;
+        let base = self.input_expr(func, op, bi);
+        crate::emit::is_identifier(&base).then(|| format!("unsafe {{ &raw mut (*{base}).{} }}", f.name()))
+    }
+
     /// The place `(*base).field_k` of a struct field access (WS91, as `CEmitter::field_access`),
     /// with the field. The base is a variable or another field place.
     fn field_place(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<(String, crate::structs::Field)> {
@@ -571,9 +582,23 @@ impl<'a> RustEmitter<'a> {
             }
             OpCode::Copy => {
                 let dst = out_name?;
+                // a field's address copied to a register (WS92, as in C):
+                // `rdi = unsafe { &raw mut (*rbx).field_98 };`
+                if func.varnodes[op.output? as usize].data.space == SpaceId::REGISTER
+                    && let Some(d) = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[0])).copied()
+                    && let Some(sv) = self.structs
+                    && let Some((bi, f)) = sv.field_address(func, &func.ops[d])
+                {
+                    let base = self.input_expr(func, &func.ops[d], bi);
+                    if crate::emit::is_identifier(&base) {
+                        return Some(format!("{dst} = unsafe {{ &raw mut (*{base}).{} }};", f.name()));
+                    }
+                }
                 let src = self.input_expr(func, op, 0);
                 Some(format!("{} = {};", dst, src))
             }
+            // the address of a struct field (WS92, as in C)
+            OpCode::IntAdd if self.field_address(func, op).is_some() => Some(format!("{} = {};", out_name?, self.field_address(func, op)?)),
             OpCode::IntAdd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);

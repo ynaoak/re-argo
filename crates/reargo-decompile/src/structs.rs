@@ -298,6 +298,10 @@ pub struct Context<'a> {
     pub name_class: Option<String>,
     /// The callees' parameters: the fields a callee accesses through a pointer passed to it.
     pub oracle: Option<&'a crate::callee_params::CalleeParams<'a>>,
+    /// The function's own (mangled) name: its parameter types (WS92).
+    pub name: Option<&'a str>,
+    /// Names by address: the parameter types of the callees with a mangled name (WS92).
+    pub symbols: Option<&'a std::collections::BTreeMap<u64, String>>,
 }
 
 /// A raw access before the layout: op, base node, offset, width, value node (a pointer loaded
@@ -412,6 +416,11 @@ impl StructView {
         // across calls: what a callee accesses through a pointer passed to it, and the classes
         // whose methods take it as `this`
         let mut this_calls: Vec<(u32, u64)> = Vec::new();
+        // (WS92) pointers a callee stores a vtable into: a constructor's / destructor's object
+        let mut constructed: Vec<(u32, u64)> = Vec::new();
+        // (WS92) pointers whose class a mangled signature names: a parameter, or a pointer passed
+        // to a callee with such a name
+        let mut declared: Vec<(u32, String)> = Vec::new();
         if let Some(oracle) = ctx.oracle {
             for op in func.ops.iter().filter(|o| !o.dead && o.opcode == OpCode::Call) {
                 let Some(t) = op.inputs.first().map(|&t| func.varnodes[t as usize].data).filter(|t| t.space == SpaceId::RAM).map(|t| t.offset) else { continue };
@@ -425,13 +434,30 @@ impl StructView {
                     let used: Vec<_> = pu.iter().flat_map(|p| p.fields.iter()).filter(|f| f.arg == ai && f.size <= 16).copied().collect();
                     // (`this` is the second argument of a method returning a struct in memory)
                     let this_arg = usize::from(pu.as_ref().is_some_and(|p| p.returns_first));
-                    if used.is_empty() && !(ai == this_arg && nodes.contains_key(&value_key(func, v))) {
+                    let vtables: Vec<u64> = match ctx.memory {
+                        Some(mem) => pu.iter().flat_map(|p| p.vtable_stores.iter()).filter(|&&(a, k)| a == ai && crate::vcall::is_vtable_point(mem, k)).map(|&(_, k)| k).collect(),
+                        None => Vec::new(),
+                    };
+                    // the callee's mangled signature: the class its parameter points to
+                    let int_index = oracle.args()[..ai].iter().filter(|a| a.size == d.size).count();
+                    let named = ctx
+                        .symbols
+                        .and_then(|s| s.get(&t))
+                        .and_then(|n| signature_classes(n))
+                        .and_then(|cs| int_index.checked_sub(this_arg).and_then(|i| cs.get(i).cloned()))
+                        .flatten();
+                    if used.is_empty() && vtables.is_empty() && named.is_none() && !(ai == this_arg && nodes.contains_key(&value_key(func, v))) {
                         continue;
+                    }
+                    if let Some(c) = named {
+                        let n = node(&mut uf, &mut nodes, value_key(func, v));
+                        declared.push((n, c));
                     }
                     let n = node(&mut uf, &mut nodes, value_key(func, v));
                     if ai == this_arg {
                         this_calls.push((n, t));
                     }
+                    constructed.extend(vtables.into_iter().map(|k| (n, k)));
                     for f in used {
                         raws.push(Raw { op: usize::MAX, base: n, off: f.off, size: f.size, value: None, float: false, add: None, base_input: 0, vptr: false, vtable_store: None, skip: false, callee: Some(t) });
                     }
@@ -442,17 +468,99 @@ impl StructView {
             return StructView::default();
         }
 
-        // copies and phis hold the same pointer
-        for op in func.ops.iter().filter(|o| !o.dead && matches!(o.opcode, OpCode::Copy | OpCode::MultiEqual)) {
-            let Some(out) = op.output else { continue };
-            if func.varnodes[out as usize].data.size != 8 {
-                continue;
+        let mut targets: Vec<u64> = vec![ctx.entry];
+        targets.extend(this_calls.iter().map(|&(_, t)| t));
+        let listing = ctx.memory.map(|m| crate::vcall::vtables_listing(m, &targets)).unwrap_or_default();
+        let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));
+        let this_class: Option<(String, Option<u64>)> = ctx.name_class.clone().map(|c| (c, None)).or_else(|| class_of(ctx.entry).map(|(c, v)| (c, Some(v))));
+        // WS92: the parameters a mangled name types (`Scene::add(Circle*, Shape const&)`: `rsi`
+        // is a `Circle*`, `rdx` a `Shape*`; `this` is `name_class`)
+        if let (Some(classes), Some(oracle)) = (ctx.name.and_then(signature_classes), ctx.oracle) {
+            let sret = usize::from(oracle.param_use(ctx.entry).is_some_and(|p| p.returns_first));
+            let ints: Vec<VarnodeData> = oracle.args().iter().filter(|a| a.size == 8).copied().collect();
+            for (i, c) in classes.iter().enumerate().skip(usize::from(ctx.name_class.is_some())) {
+                let (Some(c), Some(reg)) = (c, ints.get(i + sret)) else { continue };
+                if let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)
+                    && let Some(&n) = nodes.get(&value_key(func, v.id))
+                {
+                    declared.push((n, c.clone()));
+                }
             }
-            let o = node(&mut uf, &mut nodes, value_key(func, out));
+        }
+
+        // WS92: what says a value is of a class, before the values are joined: `this`, a pointer
+        // passed as `this` to a method listed in vtables, a vtable stored into an object here or
+        // by a callee (a constructor called on it)
+        let mut evidence: Vec<(u32, (String, u64))> = Vec::new();
+        if let Some(mem) = ctx.memory {
+            for &(n, t) in &this_calls {
+                if let Some(c) = class_of(t) {
+                    evidence.push((n, c));
+                }
+            }
+            let stored = raws[..local].iter().filter_map(|r| Some((r.base, r.vtable_store?)));
+            for (n, vt) in stored.chain(constructed.iter().copied()) {
+                if let Some(c) = crate::vcall::vtable_class(mem, vt) {
+                    evidence.push((n, (c, vt)));
+                }
+            }
+            let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
+            if let (Some(reg), Some((c, Some(vt)))) = (ctx.arg_regs[usize::from(sret)], &this_class)
+                && let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)
+                && let Some(&n) = nodes.get(&value_key(func, v.id))
+            {
+                evidence.push((n, (c.clone(), *vt)));
+            }
+        }
+        // joining these types would mix two classes neither of which derives from the other
+        let conflict = |uf: &Uf, roots: &[u32]| {
+            let Some(mem) = ctx.memory else { return false };
+            let mut classes: Vec<(String, u64)> = Vec::new();
+            for (n, c) in &evidence {
+                if roots.contains(&uf.find_const(*n)) && !classes.contains(c) {
+                    classes.push(c.clone());
+                }
+            }
+            classes.len() > 1 && crate::vcall::most_derived(mem, &classes).is_none()
+        };
+
+        // copies hold the same pointer; so do the versions a phi joins, unless they are objects
+        // of unrelated classes (a register reused for two objects)
+        // (the nodes first, in the order of the ops: the numbering decides the roots)
+        for op in func.ops.iter().filter(|o| !o.dead && matches!(o.opcode, OpCode::Copy | OpCode::MultiEqual)) {
+            let Some(out) = op.output.filter(|&o| func.varnodes[o as usize].data.size == 8) else { continue };
+            node(&mut uf, &mut nodes, value_key(func, out));
             for &i in &op.inputs {
                 let d = &func.varnodes[i as usize].data;
                 if d.size == 8 && d.space != SpaceId::CONST {
-                    let n = node(&mut uf, &mut nodes, value_key(func, i));
+                    node(&mut uf, &mut nodes, value_key(func, i));
+                }
+            }
+        }
+        for phis in [false, true] {
+            let opcode = if phis { OpCode::MultiEqual } else { OpCode::Copy };
+            for op in func.ops.iter().filter(|o| !o.dead && o.opcode == opcode) {
+                let Some(out) = op.output else { continue };
+                if func.varnodes[out as usize].data.size != 8 {
+                    continue;
+                }
+                let o = node(&mut uf, &mut nodes, value_key(func, out));
+                let ins: Vec<u32> = op
+                    .inputs
+                    .iter()
+                    .filter(|&&i| {
+                        let d = &func.varnodes[i as usize].data;
+                        d.size == 8 && d.space != SpaceId::CONST
+                    })
+                    .map(|&i| node(&mut uf, &mut nodes, value_key(func, i)))
+                    .collect();
+                if phis && !evidence.is_empty() {
+                    let roots: Vec<u32> = ins.iter().chain([&o]).map(|&n| uf.find(n)).collect();
+                    if conflict(&uf, &roots) {
+                        continue;
+                    }
+                }
+                for n in ins {
                     uf.union(o, n);
                 }
             }
@@ -506,7 +614,8 @@ impl StructView {
                 let Some(v) = r.value else { continue };
                 let key = (uf.find(r.base), r.off);
                 match seen.get(&key) {
-                    Some(&w) => changed |= uf.union(v, w),
+                    Some(&w) if evidence.is_empty() || !conflict(&uf, &[uf.find_const(v), uf.find_const(w)]) => changed |= uf.union(v, w),
+                    Some(_) => {}
                     None => {
                         seen.insert(key, v);
                     }
@@ -543,17 +652,63 @@ impl StructView {
 
         // classes: of `this` (its name, or the vtables listing the function), and of a pointer
         // passed as `this` to a method listed in vtables (the most derived of those classes)
-        let mut targets: Vec<u64> = vec![ctx.entry];
-        targets.extend(this_calls.iter().map(|&(_, t)| t));
-        let listing = ctx.memory.map(|m| crate::vcall::vtables_listing(m, &targets)).unwrap_or_default();
-        let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));
-        let this_class: Option<(String, Option<u64>)> = ctx.name_class.clone().map(|c| (c, None)).or_else(|| class_of(ctx.entry).map(|(c, v)| (c, Some(v))));
         let mut root_classes: FxHashMap<u32, Vec<(String, u64)>> = FxHashMap::default();
+        let mut add_class = |root: u32, c: (String, u64)| {
+            let e = root_classes.entry(root).or_default();
+            if !e.contains(&c) {
+                e.push(c);
+            }
+        };
         for &(n, t) in &this_calls {
             if let Some(c) = class_of(t) {
-                let e = root_classes.entry(uf.find(n)).or_default();
-                if !e.contains(&c) {
-                    e.push(c);
+                add_class(uf.find(n), c);
+            }
+        }
+        // WS92: the vtables stored into an object, here or by a callee (a constructor called on
+        // it): of the class it is (with a base class's constructor or an inlined one, the most
+        // derived of them)
+        if let Some(mem) = ctx.memory {
+            let stored = raws[..local].iter().filter(|r| !r.skip).filter_map(|r| Some((r.base, r.vtable_store?)));
+            for (n, vt) in stored.chain(constructed.iter().copied()) {
+                if let Some(c) = crate::vcall::vtable_class(mem, vt) {
+                    add_class(uf.find(n), (c, vt));
+                }
+            }
+        }
+        let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
+        let this_root = ctx.arg_regs[usize::from(sret)].and_then(|reg| {
+            let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
+            nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
+        });
+        // WS92: the object a virtual call is made on, loaded from a field of an object of a known
+        // class: of the class the constructors of that class store there (`classfields`)
+        if let (Some(oracle), Some(mem)) = (ctx.oracle, ctx.memory)
+            && !vcall_raw.is_empty()
+        {
+            let objects: FxHashSet<u32> = vcall_raw.iter().map(|&(_, ri, _)| uf.find(raws[ri].base)).collect();
+            for _ in 0..2 {
+                let mut added = false;
+                for r in raws[..local].iter().filter(|r| !r.skip && !r.vptr && r.size == 8 && func.ops[r.op].opcode == OpCode::Load) {
+                    let Some(v) = r.value else { continue };
+                    let obj = uf.find(v);
+                    if !objects.contains(&obj) || root_classes.contains_key(&obj) || Some(obj) == this_root {
+                        continue;
+                    }
+                    let base = uf.find(r.base);
+                    let vt = match (Some(base) == this_root, &this_class) {
+                        (true, Some((_, Some(vt)))) => Some(*vt),
+                        _ => root_classes.get(&base).and_then(|cs| crate::vcall::most_derived(mem, cs)).map(|c| c.1),
+                    };
+                    let Some(vt) = vt else { continue };
+                    if let Some(&(_, ovt)) = oracle.class_fields(vt).iter().find(|f| f.0 == r.off)
+                        && let Some(c) = crate::vcall::vtable_class(mem, ovt)
+                    {
+                        root_classes.entry(obj).or_default().push((c, ovt));
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
                 }
             }
         }
@@ -569,16 +724,18 @@ impl StructView {
             }
         }
         // `this` of a known class is a struct too
-        let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
-        let this_root = ctx.arg_regs[usize::from(sret)].and_then(|reg| {
-            let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
-            nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
-        });
         if let (Some(r), Some(_)) = (this_root, &this_class)
             && is_base.contains(&r)
             && !struct_roots.contains(&r)
         {
             struct_roots.push(r);
+        }
+        // and a pointer a signature names the class of, when it is dereferenced
+        let declared_roots: Vec<(u32, String)> = declared.iter().map(|(n, c)| (uf.find(*n), c.clone())).collect();
+        for (r, _) in &declared_roots {
+            if is_base.contains(r) && !struct_roots.contains(r) {
+                struct_roots.push(*r);
+            }
         }
         // and a pointer a method of a known class takes as `this`
         for &r in root_classes.keys() {
@@ -669,9 +826,7 @@ impl StructView {
                 && let Some((name, vt)) = crate::vcall::most_derived(mem, classes)
             {
                 defs[d].class = Some(name);
-                if defs[d].vtable.is_none() {
-                    defs[d].vtable = Some(vt);
-                }
+                defs[d].vtable = Some(vt);
             }
         }
         if let Some(mem) = ctx.memory {
@@ -679,6 +834,14 @@ impl StructView {
                 if let Some(v) = d.vtable {
                     d.class = crate::vcall::vtable_class(mem, v);
                 }
+            }
+        }
+        for (r, c) in &declared_roots {
+            if let Some(&d) = def_of_root.get(r)
+                && defs[d].class.is_none()
+            {
+                defs[d].class = Some(c.clone());
+                defs[d].class_from_symbol = true;
             }
         }
         // names: the class, else `struct_N` by first access; one struct per class name
@@ -914,6 +1077,91 @@ pub fn demangle_symbol(s: &str) -> Option<String> {
     cpp_demangle::Symbol::new(s.as_bytes()).ok()?.demangle(&cpp_demangle::DemangleOptions::default()).ok()
 }
 
+/// The classes the integer / pointer parameters of a function point to, from its mangled name
+/// (WS92), in register order — `this` first for a method (taken to be no static member),
+/// `None` for one that is no class pointer or reference (an `int`, a `char*`, a pointer to a
+/// pointer). `_ZN5Scene3addEP6CircleRK5Shape` (`Scene::add(Circle*, Shape const&)`) ->
+/// `[Scene, Circle, Shape]`. A float parameter takes no integer register; the list ends before
+/// a parameter passed by value that is no scalar (a class or an enum: where it goes is not
+/// known) or `...`. `None` when the name does not demangle.
+pub fn signature_classes(name: &str) -> Option<Vec<Option<String>>> {
+    let demangled = demangle_symbol(name)?;
+    let s = demangled.as_str();
+    // the top-level parameter list
+    let mut depth = 0i32;
+    let mut open = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            '(' if depth == 0 && !s[i..].starts_with("(anonymous namespace)") => {
+                open = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let mut params: Vec<&str> = Vec::new();
+    let (mut depth, mut start, mut close) = (0i32, open + 1, None);
+    for (i, c) in s[open + 1..].char_indices().map(|(i, c)| (i + open + 1, c)) {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            ')' if depth == 0 => {
+                close = Some(i);
+                break;
+            }
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                params.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let last = s[start..close].trim();
+    if !last.is_empty() {
+        params.push(last);
+    }
+    let mut out: Vec<Option<String>> = Vec::new();
+    if let Some(c) = method_class(name) {
+        out.push(Some(c));
+    }
+    const INTS: &[&str] = &[
+        "bool", "char", "signed char", "unsigned char", "short", "unsigned short", "int", "unsigned int", "long", "unsigned long", "long long",
+        "unsigned long long", "wchar_t", "char8_t", "char16_t", "char32_t", "__int128", "unsigned __int128", "std::nullptr_t", "decltype(nullptr)",
+    ];
+    const FLOATS: &[&str] = &["float", "double"];
+    for p in params {
+        let p = p.strip_suffix(" const").unwrap_or(p);
+        if p == "void" || p.is_empty() {
+            continue;
+        }
+        if p == "..." || p == "long double" {
+            break;
+        }
+        if p.contains('(') {
+            out.push(None); // a pointer to a function
+            continue;
+        }
+        let pointee = p.strip_suffix("&&").or_else(|| p.strip_suffix('&')).or_else(|| p.strip_suffix('*'));
+        match pointee {
+            Some(t) => {
+                let t = t.trim_end();
+                let t = t.strip_suffix(" const").unwrap_or(t).trim();
+                let t = t.strip_prefix("const ").unwrap_or(t);
+                let class = !(t.ends_with('*') || t.ends_with('&') || t == "void" || INTS.contains(&t) || FLOATS.contains(&t) || t == "long double");
+                out.push(class.then(|| t.to_string()));
+            }
+            None if INTS.contains(&p) => out.push(None),
+            None if FLOATS.contains(&p) => {}
+            None => break,
+        }
+    }
+    Some(out)
+}
+
 /// The class of a method from its (mangled or demangled) name: `_ZN5Class6methodEv` /
 /// `Class::method()` -> `Class`, `_ZNK2ns5Class3getEv` -> `ns::Class`. `None` for a free
 /// function, a name without a scope, or a function-local entity.
@@ -1058,6 +1306,21 @@ mod tests {
         code[0x1000..0x1007].copy_from_slice(&[0x48, 0x8b, 0x06, 0x48, 0x03, 0x07, 0xc3]);
         let r = c_of(&code);
         assert!(r.c_code.contains("rdi = &rdi->field_10;"), "{}", r.c_code);
+        // WS92: the Rust output too
+        assert!(r.rust_code.contains("rdi = unsafe { &raw mut (*rdi).field_10 };"), "{}", r.rust_code);
+    }
+
+    /// WS92: a field's address copied from another register prints as one in Rust too.
+    #[test]
+    fn a_members_address_in_another_register_in_rust() {
+        // mov rbx, rdi ; mov dword [rbx+0x98], 0 ; lea rdi, [rbx+0x98] ; call 0x2000 ; ret
+        let mut code = vec![0x48, 0x89, 0xfb, 0xc7, 0x83, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0xbb, 0x98, 0x00, 0x00, 0x00, 0xe8, 0xe7, 0x0f, 0x00, 0x00, 0xc3];
+        code.resize(0x1100, 0xcc);
+        // 0x2000: mov eax, [rdi] ; ret
+        code[0x1000..0x1003].copy_from_slice(&[0x8b, 0x07, 0xc3]);
+        let r = c_of(&code);
+        assert!(r.c_code.contains("rdi = &rbx->field_98;"), "{}", r.c_code);
+        assert!(r.rust_code.contains("rdi = unsafe { &raw mut (*rbx).field_98 };"), "{}", r.rust_code);
     }
 
     #[test]
@@ -1177,6 +1440,137 @@ mod tests {
         assert!(r.recovered_structs[0].starts_with("struct Shape {"), "{:?}", r.recovered_structs);
         assert!(r.recovered_structs[0].contains("field_8; // +0x8 (used by 0x1100)"), "{:?}", r.recovered_structs);
         assert!(r.c_code.contains("rdi->vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+    }
+
+    /// WS92: an object a callee stores a vtable into (its constructor) is of that class, so a
+    /// virtual call on it names the slot's function.
+    #[test]
+    fn an_object_a_constructor_was_called_on_has_its_class() {
+        // push rbx ; mov rbx, rdi ; mov rdi, rbx ; call 0x1080 (the constructor) ; mov rax, [rbx] ;
+        // mov rdi, rbx ; call [rax+8] ; pop rbx ; ret
+        let mut f = vec![0x53, 0x48, 0x89, 0xfb, 0x48, 0x89, 0xdf, 0xe8, 0x74, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x50, 0x08, 0x5b, 0xc3];
+        f.resize(0x80, 0xcc);
+        // 0x1080: lea rax, [0x2010] ; mov [rdi], rax ; ret
+        f.extend_from_slice(&[0x48, 0x8d, 0x05, 0x89, 0x0f, 0x00, 0x00, 0x48, 0x89, 0x07, 0xc3]);
+        let r = decompile(&X86Lifter::new_64(), &shape(&f, &[0xc3]), 0x1000, "f", 100).unwrap();
+        assert!(r.c_code.contains("rdi->vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.recovered_structs.iter().any(|d| d.starts_with("struct Shape {  // class from RTTI, vtable 0x2010")), "{:?}", r.recovered_structs);
+    }
+
+    /// Two classes: `Shape` (vtable 0x2010: 0x1100, 0x1200; type_info 0x2030 -> `5Shape`) and
+    /// `Holder` (vtable 0x2050: 0x1300, 0x1310; type_info 0x2070 -> `6Holder`). `Holder`'s
+    /// constructor at 0x1000 stores a new object at `this + 8` and calls `Shape`'s constructor
+    /// (0x1080) on it; `Holder::m` (0x1300) makes a virtual call on `this->field_8`.
+    fn holder() -> Memory {
+        holder_with(&[])
+    }
+
+    /// [`holder`] with more code (`(offset in .text, bytes)`; .text is 0x1000..0x1600).
+    fn holder_with(extra: &[(usize, &[u8])]) -> Memory {
+        let mut t = vec![0xccu8; 0x600];
+        let mut put = |at: usize, b: &[u8]| t[at..at + b.len()].copy_from_slice(b);
+        put(0x000, &[
+            0x53, 0x48, 0x89, 0xfb, // push rbx ; mov rbx, rdi
+            0x48, 0x8d, 0x05, 0x45, 0x10, 0x00, 0x00, // lea rax, [0x2050]
+            0x48, 0x89, 0x03, // mov [rbx], rax
+            0xbf, 0x10, 0x00, 0x00, 0x00, // mov edi, 0x10
+            0xe8, 0xe8, 0x03, 0x00, 0x00, // call 0x1400 (operator new)
+            0x48, 0x89, 0x43, 0x08, // mov [rbx+8], rax
+            0x48, 0x89, 0xc7, // mov rdi, rax
+            0xe8, 0x5c, 0x00, 0x00, 0x00, // call 0x1080 (Shape's constructor)
+            0x5b, 0xc3, // pop rbx ; ret
+        ]);
+        put(0x080, &[0x48, 0x8d, 0x05, 0x89, 0x0f, 0x00, 0x00, 0x48, 0x89, 0x07, 0xc3]);
+        put(0x100, &[0xc3]);
+        put(0x200, &[0x8b, 0x47, 0x04, 0xc3]);
+        // 0x1300: mov rdi, [rdi+8] ; mov rax, [rdi] ; call [rax+8] ; ret
+        put(0x300, &[0x48, 0x8b, 0x7f, 0x08, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x08, 0xc3]);
+        put(0x310, &[0xc3]);
+        put(0x400, &[0x31, 0xc0, 0xc3]);
+        for (at, b) in extra {
+            put(*at, b);
+        }
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        mem.add_block(block(".text", 0x1000, t, MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.add_block(block(".data.rel.ro", 0x2000, vec![0; 0x80], MemoryFlags::READ | MemoryFlags::WRITE));
+        mem.add_block(block(".rodata", 0x3000, [&b"5Shape"[..], &[0; 10], b"6Holder\0"].concat(), MemoryFlags::READ));
+        let rela: Vec<u8> = [
+            (0x2008u64, 8u64, 0x2030u64),
+            (0x2010, 8, 0x1100),
+            (0x2018, 8, 0x1200),
+            (0x2038, 8, 0x3000),
+            (0x2048, 8, 0x2070),
+            (0x2050, 8, 0x1300),
+            (0x2058, 8, 0x1310),
+            (0x2078, 8, 0x3010),
+        ]
+        .iter()
+        .flat_map(|&(o, i, a)| [o.to_le_bytes(), i.to_le_bytes(), a.to_le_bytes()].concat())
+        .collect();
+        mem.set_dynamic_relocations(Arc::from(rela));
+        mem
+    }
+
+    /// WS92: an object loaded from a field of an object of a known class is of the class that
+    /// class's constructor stores there, so a virtual call on it names the slot's function.
+    #[test]
+    fn a_field_object_has_the_class_its_owners_constructor_stores() {
+        let r = decompile(&X86Lifter::new_64(), &holder(), 0x1300, "m", 100).unwrap();
+        assert!(r.c_code.contains("(struct Holder* rdi)"), "{}", r.c_code);
+        assert!(r.c_code.contains("vfn_1();  // vfn[1] (vtable+0x8) = Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.recovered_structs.iter().any(|d| d.contains("struct Shape* field_8; // +0x8")), "{:?}", r.recovered_structs);
+    }
+
+    /// WS92: a phi joining objects of two unrelated classes does not merge their types: the
+    /// virtual calls on each before the join keep their class (the one on the joined value is
+    /// unresolved).
+    #[test]
+    fn a_phi_of_two_classes_keeps_each_class_before_the_join() {
+        // 0x1500: push rbx ; test esi, esi ; je L1 ; rbx = new ; Shape::Shape(rbx) ; rbx->vfn_1() ;
+        // jmp L2 ; L1: rbx = new ; Holder::Holder(rbx) ; rbx->vfn_1() ; L2: rbx->vfn_0() ; pop rbx ; ret
+        let f = [
+            0x53, 0x85, 0xf6, 0x74, 0x1b, 0xe8, 0xf6, 0xfe, 0xff, 0xff, 0x48, 0x89, 0xc3, 0x48, 0x89, 0xc7, 0xe8, 0x6b, 0xfb, 0xff, 0xff, 0x48, 0x8b, 0x03,
+            0x48, 0x89, 0xdf, 0xff, 0x50, 0x08, 0xeb, 0x19, 0xe8, 0xdb, 0xfe, 0xff, 0xff, 0x48, 0x89, 0xc3, 0x48, 0x89, 0xc7, 0xe8, 0xd0, 0xfa, 0xff, 0xff,
+            0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x50, 0x08, 0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x10, 0x5b, 0xc3,
+        ];
+        let r = decompile(&X86Lifter::new_64(), &holder_with(&[(0x500, &f)]), 0x1500, "f", 100).unwrap();
+        assert!(r.c_code.contains("= Shape::method_at_1200"), "{}", r.c_code);
+        assert!(r.c_code.contains("= Holder::method_at_1310"), "{}", r.c_code);
+    }
+
+    /// WS92: the parameter types of a mangled name.
+    #[test]
+    fn signature_classes_from_mangled_names() {
+        let c = |n: &str| signature_classes(n).unwrap().into_iter().map(|c| c.unwrap_or_default()).collect::<Vec<_>>();
+        assert_eq!(c("_ZN5Scene3addEP6CircleRK5Shape"), ["Scene", "Circle", "Shape"]);
+        // `this`, a `std::vector<int> const&`, a `char**` (no class), a `double` (no integer
+        // register), a `Baz*`
+        assert_eq!(c("_ZNK3Foo3barERKSt6vectorIiSaIiEEPPcdP3Baz"), ["Foo", "std::vector<int, std::allocator<int> >", "", "Baz"]);
+        assert_eq!(c("_Z4drawP6Circle"), ["Circle"]);
+        // a class by value: where it goes is not known, the list ends
+        assert_eq!(c("_Z4fill5ShapeP6Circle"), Vec::<String>::new());
+        assert_eq!(c("_Z1fiP6Circle"), ["", "Circle"]);
+        assert!(signature_classes("FUN_401000").is_none());
+    }
+
+    /// WS92: a mangled function name types its parameters; a pointer passed to a callee with a
+    /// mangled name gets the class of that parameter.
+    #[test]
+    fn mangled_signatures_type_parameters_and_arguments() {
+        // _ZN5Scene3addEP6CircleRK5Shape: mov eax, [rsi+8] ; add eax, [rdx+0x10] ; mov [rdi+4], eax ; ret
+        let code = [0x8b, 0x46, 0x08, 0x03, 0x42, 0x10, 0x89, 0x47, 0x04, 0xc3];
+        let r = crate::pipeline::decompile_with_symbols(&X86Lifter::new_64(), &text(&code), 0x1000, "_ZN5Scene3addEP6CircleRK5Shape", 100, &Default::default()).unwrap();
+        assert!(r.c_code.contains("(struct Scene* rdi, struct Circle* rsi, struct Shape* rdx)"), "{}", r.c_code);
+        assert!(r.recovered_structs.iter().any(|d| d.starts_with("struct Circle {  // class from the symbol")), "{:?}", r.recovered_structs);
+        // f: push rbx ; mov rbx, rsi ; mov eax, [rsi+8] ; mov [rdi+4], eax ; mov rdi, rbx ;
+        // call 0x1100 (_Z4drawP6Circle) ; mov eax, [rbx+0xc] ; pop rbx ; ret
+        let mut f = vec![0x53, 0x48, 0x89, 0xf3, 0x8b, 0x46, 0x08, 0x89, 0x47, 0x04, 0x48, 0x89, 0xdf, 0xe8, 0xee, 0x00, 0x00, 0x00, 0x8b, 0x43, 0x0c, 0x5b, 0xc3];
+        f.resize(0x100, 0xcc);
+        f.extend_from_slice(&[0x8b, 0x47, 0x08, 0xc3]);
+        let symbols = std::collections::BTreeMap::from([(0x1100u64, "_Z4drawP6Circle".to_string())]);
+        let r = crate::pipeline::decompile_with_symbols(&X86Lifter::new_64(), &text(&f), 0x1000, "f", 100, &symbols).unwrap();
+        assert!(r.c_code.contains("struct Circle* rsi"), "{}", r.c_code);
+        assert!(r.c_code.contains("rbx->field_c"), "{}", r.c_code);
     }
 
     #[test]
