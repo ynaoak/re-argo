@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RefType {
     UnconditionalCall,
     ConditionalCall,
@@ -58,7 +58,7 @@ impl std::fmt::Display for RefType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Reference {
     pub from: u64,
     pub to: u64,
@@ -85,7 +85,7 @@ pub struct JumpMark {
     len: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceManager {
     // Address-ordered so `all_refs()` yields references in the same
     // order on every run (a `HashMap` made it depend on the hash seed).
@@ -97,18 +97,25 @@ pub struct ReferenceManager {
     // never removed).
     jumps: Vec<Reference>,
     // Identifies this manager, so a mark taken on another one (a
-    // manager that replaced it) is never read against this log.
+    // manager that replaced it) is never read against this log. Not
+    // persisted: a manager read back from the on-disk analysis cache
+    // gets a fresh id, like any new manager.
+    #[serde(skip, default = "next_manager_id")]
     id: u64,
+}
+
+fn next_manager_id() -> u64 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for ReferenceManager {
     fn default() -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
             refs_from: BTreeMap::new(),
             refs_to: BTreeMap::new(),
             jumps: Vec::new(),
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_manager_id(),
         }
     }
 }

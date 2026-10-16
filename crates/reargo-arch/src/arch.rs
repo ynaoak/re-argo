@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 
 use crate::error::DisasmError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FlowType {
     Fall,
     UnconditionalJump,
@@ -110,6 +110,55 @@ impl DecodedInstruction {
             self.flow_type,
             FlowType::UnconditionalJump | FlowType::IndirectJump
         )
+    }
+}
+
+/// The serialised form of a [`DecodedInstruction`] (the on-disk analysis
+/// cache): an x86 instruction whose text is formatted lazily stores only
+/// its bitness — the text is formatted again from `bytes` on first use,
+/// exactly as after decoding — any other its text.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DecodedInstructionRepr {
+    address: u64,
+    length: u32,
+    bytes: SmallVec<[u8; 16]>,
+    flow_type: FlowType,
+    branch_target: Option<u64>,
+    lazy_x86_bitness: u8,
+    text: Option<(String, String)>,
+}
+
+impl serde::Serialize for DecodedInstruction {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let lazy = self.text.lazy_x86_bitness;
+        DecodedInstructionRepr {
+            address: self.address,
+            length: self.length,
+            bytes: self.bytes.clone(),
+            flow_type: self.flow_type,
+            branch_target: self.branch_target,
+            lazy_x86_bitness: lazy,
+            text: (lazy == 0).then(|| self.text().clone()),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DecodedInstruction {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let r = DecodedInstructionRepr::deserialize(d)?;
+        let cell = std::sync::OnceLock::new();
+        if let Some(text) = r.text {
+            let _ = cell.set(text);
+        }
+        Ok(Self {
+            address: r.address,
+            length: r.length,
+            bytes: r.bytes,
+            flow_type: r.flow_type,
+            branch_target: r.branch_target,
+            text: DisasmText { cell, lazy_x86_bitness: r.lazy_x86_bitness },
+        })
     }
 }
 

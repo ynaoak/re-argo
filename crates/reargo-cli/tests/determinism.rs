@@ -160,7 +160,10 @@ fn export_is_deterministic_across_processes() {
     let mut outputs = Vec::new();
     for i in 0..4 {
         let out = std::env::temp_dir().join(format!("det_xproc.{i}.json"));
+        // Every run must analyse: the on-disk cache would hand runs 1..
+        // the results of run 0.
         let st = Command::new(exe)
+            .env("REARGO_NO_CACHE", "1")
             .arg("export")
             .arg(&bin)
             .arg("-o")

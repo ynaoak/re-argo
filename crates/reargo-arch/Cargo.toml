@@ -14,7 +14,8 @@ arm = ["dep:capstone"]
 reargo-core = { workspace = true }
 reargo-loader = { workspace = true }
 thiserror = { workspace = true }
-smallvec = { workspace = true }
+smallvec = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
 iced-x86 = { workspace = true, optional = true }
 capstone = { workspace = true, optional = true }
 quick-xml = { workspace = true }

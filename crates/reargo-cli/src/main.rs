@@ -1,3 +1,4 @@
+mod cache;
 mod carve;
 mod mcp;
 mod symbol_import;
@@ -25,6 +26,11 @@ struct Cli {
     /// Decode ARM code in Thumb (T16/T32) mode instead of A32
     #[arg(long, global = true)]
     thumb: bool,
+    /// Bypass the on-disk analysis cache: run the analyzer pipeline
+    /// and neither read nor write cached results (also
+    /// `REARGO_NO_CACHE=1`)
+    #[arg(long, global = true)]
+    no_cache: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -886,6 +892,9 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.no_cache {
+        cache::disable();
+    }
     match cli.command {
         Commands::Info { file } => cmd_info(&file),
         Commands::Sections { file } => cmd_sections(&file),
@@ -1540,18 +1549,68 @@ fn make_lifter(info: &reargo_loader::BinaryInfo, force_thumb: bool) -> Option<Bo
     create_lifter(info.arch, info.bits, info.endian, force_thumb)
 }
 
+/// How [`analyze_program`] uses the on-disk analysis cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheUse {
+    /// Read the cached results when they are valid, else analyse and
+    /// store them.
+    ReadWrite,
+    /// Always run the pipeline, then store its results (`analyze`).
+    Refresh,
+}
+
 fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
+    analyze_program(path, true, CacheUse::ReadWrite)
+}
+
+/// The analysed program for `path`: the binary loaded, the analyzer
+/// pipeline's results — read back from the on-disk cache (see
+/// `cache.rs`) when it holds them for this exact binary and build, else
+/// computed and stored — and then the user-override sidecar applied.
+/// `verbose` prints the per-analyzer lines (or the cache notice) and the
+/// override summary on stderr.
+fn analyze_program(path: &Path, verbose: bool, cache_use: CacheUse) -> Result<Program, Box<dyn std::error::Error>> {
     let mut program = Program::from_binary(path)?;
-    let manager = AnalysisManager::new();
-    let results = manager.run_all(&mut program);
-    for r in &results {
-        match r {
-            Ok(r) => eprintln!(
-                "[{}] {} functions, {} refs, {} instructions",
-                r.analyzer_name, r.functions_found, r.references_found, r.instructions_decoded
-            ),
-            Err(e) => eprintln!("[ERROR] {}", e),
+    let entry = cache::entry_for(path);
+    let hit = cache_use == CacheUse::ReadWrite
+        && entry.as_ref().is_some_and(|e| cache::load(e, &mut program));
+    if hit {
+        if verbose && let Some(e) = &entry {
+            eprintln!(
+                "[cache] analysis results loaded from {} (--no-cache re-runs the pipeline)",
+                e.file().display()
+            );
         }
+    } else {
+        let manager = AnalysisManager::new();
+        let results = manager.run_all(&mut program);
+        if verbose {
+            for r in &results {
+                match r {
+                    Ok(r) => eprintln!(
+                        "[{}] {} functions, {} refs, {} instructions",
+                        r.analyzer_name, r.functions_found, r.references_found, r.instructions_decoded
+                    ),
+                    Err(e) => eprintln!("[ERROR] {}", e),
+                }
+            }
+        }
+        // Cached before the overrides: they are applied below on every
+        // run, so editing the sidecar never needs a new analysis.
+        if let Some(e) = &entry
+            && let Err(err) = cache::store(e, &program)
+        {
+            eprintln!("[cache] WARNING: could not store the analysis results: {err}");
+        }
+    }
+
+    if !verbose {
+        if let Ok(overrides) = reargo_program::OverrideSet::load_for_binary(path)
+            && !overrides.is_empty()
+        {
+            overrides.apply(&mut program);
+        }
+        return Ok(program);
     }
 
     // Apply the user-override sidecar (`<binary>.gra.json`) LAST, so
@@ -1576,7 +1635,9 @@ fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
 }
 
 fn cmd_analyze(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let program = analyze_binary(path)?;
+    // Always runs the pipeline (its per-analyzer lines are the point),
+    // and refreshes the cache for the commands that follow.
+    let program = analyze_program(path, true, CacheUse::Refresh)?;
     println!("\nAnalysis complete: {}", path.display());
     println!("  Functions:    {}", program.listing.function_count());
     println!("  Instructions: {}", program.listing.instruction_count());
@@ -5581,16 +5642,8 @@ fn cmd_triage(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// on stderr — the `triage` command is meant to be a clean
 /// one-screen report.
 fn analyze_binary_quiet(path: &Path) -> Result<reargo_program::Program, Box<dyn std::error::Error>> {
-    let mut program = reargo_program::Program::from_binary(path)?;
-    let manager = reargo_analysis::AnalysisManager::new();
-    let _ = manager.run_all(&mut program);
-    // Apply overrides silently too.
-    if let Ok(overrides) = reargo_program::OverrideSet::load_for_binary(path)
-        && !overrides.is_empty()
-    {
-        overrides.apply(&mut program);
-    }
-    Ok(program)
+    // Overrides are applied silently too.
+    analyze_program(path, false, CacheUse::ReadWrite)
 }
 
 fn find_file_offset(info: &reargo_loader::BinaryInfo, address: u64, data: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {

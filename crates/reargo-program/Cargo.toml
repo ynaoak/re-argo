@@ -14,4 +14,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+bincode = { workspace = true }
+smallvec = { workspace = true }
 reargo-lift = { workspace = true }

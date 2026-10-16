@@ -108,7 +108,7 @@ pub struct Tag {
     pub auto: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TagManager {
     /// Address-scope tags: (address, [tags]).
     by_address: BTreeMap<u64, Vec<Tag>>,

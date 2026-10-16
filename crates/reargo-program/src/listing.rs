@@ -4,7 +4,7 @@ use reargo_arch::DecodedInstruction;
 
 use crate::function::Function;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Listing {
     instructions: BTreeMap<u64, DecodedInstruction>,
     functions: BTreeMap<u64, Function>,

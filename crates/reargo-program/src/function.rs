@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use reargo_core::address::AddressSet;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StackVariable {
     pub offset: i64,
     pub size: u32,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StackFrame {
     pub local_size: u64,
     pub variables: BTreeMap<i64, StackVariable>,
@@ -39,7 +39,7 @@ impl StackFrame {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function {
     pub entry_point: u64,
     pub name: String,

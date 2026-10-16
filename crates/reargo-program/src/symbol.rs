@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SymbolType {
     Function,
     Label,
@@ -9,7 +9,7 @@ pub enum SymbolType {
     ExternalData,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SourceType {
     Imported,
     Analysis,
@@ -17,7 +17,7 @@ pub enum SourceType {
     Default,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub address: u64,
@@ -42,7 +42,7 @@ impl std::fmt::Display for Symbol {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SymbolTable {
     /// Address-ordered so `iter()` / `function_symbols()` visit symbols
     /// in the same order on every run (a `HashMap` here made the

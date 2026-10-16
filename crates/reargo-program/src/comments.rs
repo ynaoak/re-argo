@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CommentType {
     Eol,
     Pre,
@@ -16,7 +16,7 @@ pub struct Comment {
     pub text: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CommentManager {
     comments: BTreeMap<(u64, CommentType), String>,
 }
