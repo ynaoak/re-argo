@@ -44,12 +44,11 @@
 use std::collections::BTreeSet;
 
 use rayon::prelude::*;
-use reargo_core::pcode::OpCode;
 use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
-use crate::callsite::{walk_function_with, CallSite, ParamSummaries};
-use crate::func_lift::{function_jobs, in_extent, owns};
+use crate::callsite::{walk_function_shaped, CallSite, ParamSummaries};
+use crate::func_lift::{function_jobs, owns};
 
 /// One function's results.
 pub(crate) struct FunctionResults {
@@ -294,21 +293,31 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         Some(jumps) => jumps.external_entries(program, insns),
         None => crate::func_lift::external_entries(program, insns),
     };
-    let walk = walk_function_with(program, entry, insns, &ParamSummaries::default(), &external);
-    // The walk asks who owns each call instruction.
-    let mut addrs: BTreeSet<u64> = insns
+    // What the walk and the blocks need of each instruction, read once.
+    let shape = crate::blockflow::LiftShape::of(insns);
+    // Who owns each call instruction, asked once: the walk, the blocks
+    // the flows keep and the check of a cached result all ask.
+    let calls: Vec<(u64, bool)> = shape
+        .has_call
         .iter()
-        .map(std::borrow::Borrow::borrow)
-        .filter(|i| i.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd)))
-        .map(|i| i.address)
+        .zip(&shape.addrs)
+        .filter(|(call, _)| **call)
+        .map(|(_, &a)| (a, owns(program, entry, a)))
         .collect();
+    let owns_call = |a: u64| match calls.binary_search_by_key(&a, |c| c.0) {
+        Ok(k) => calls[k].1,
+        Err(_) => owns(program, entry, a),
+    };
+    let walk = walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call);
+    // The walk asks who owns each call instruction.
+    let mut addrs: BTreeSet<u64> = calls.iter().map(|c| c.0).collect();
     let snapshots = with_snapshots.then(|| {
-        // both flows walk the same blocks
-        let mut blocks = crate::blockflow::Cfg::build(insns, &external, |a| in_extent(program, entry, a));
+        // both flows walk the same blocks (`in_extent` with the next
+        // entry looked up once)
+        let mut blocks =
+            crate::blockflow::Cfg::build_shaped(&shape, &external, |a| a >= entry && next_entry.is_none_or(|n| a < n));
         // only the snapshots of the calls the function owns are kept
-        blocks.keep_calls(insns, |i| {
-            i.ops.iter().any(|op| matches!(op.opcode, OpCode::Call | OpCode::CallInd)) && owns(program, entry, i.address)
-        });
+        blocks.keep_calls_at(insns.len(), |i| shape.has_call[i] && owns_call(shape.addrs[i]));
         let mut cfg = crate::cfg_const::function_snapshots_cfg(&blocks, insns);
         let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, insns);
         addrs.extend(cfg.iter().map(|(a, _)| *a));
@@ -331,7 +340,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         external: external.into_iter().collect(),
         reusable,
         next_entry,
-        owned: addrs.into_iter().map(|a| (a, owns(program, entry, a))).collect(),
+        owned: addrs.into_iter().map(|a| (a, owns_call(a))).collect(),
     }
 }
 

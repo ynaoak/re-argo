@@ -25,6 +25,7 @@ rustc-hash = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
 zstd = { workspace = true }
+mimalloc = { workspace = true }
 
 [dev-dependencies]
 reargo-sleigh = { workspace = true }

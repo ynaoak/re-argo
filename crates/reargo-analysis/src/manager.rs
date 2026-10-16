@@ -191,6 +191,9 @@ impl AnalysisManager {
         &self,
         program: &mut Program,
     ) -> Vec<(&str, std::time::Duration, Result<AnalysisResult, AnalysisError>)> {
+        for analyzer in &self.analyzers {
+            analyzer.start_early(program);
+        }
         let mut results = Vec::with_capacity(self.analyzers.len());
         for analyzer in &self.analyzers {
             let t = std::time::Instant::now();

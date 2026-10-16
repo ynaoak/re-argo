@@ -179,7 +179,14 @@ struct CacheEntry {
     x87: bool,
     /// It reads a PF it does not write first ([`reads_outside_pf`]).
     reads_pf: bool,
+    /// Index in `lifted` of the instruction right after it, once a range
+    /// has stepped there ([`NO_NEXT`] until then): a range follows these
+    /// links instead of looking each address up in `map`.
+    next: u32,
 }
+
+/// [`CacheEntry::next`] not known yet.
+const NO_NEXT: u32 = u32::MAX;
 
 impl LiftCache {
     pub fn new() -> Self {
@@ -247,21 +254,40 @@ impl X86Lifter {
         let mut addr = start;
         let mut x87 = false;
         let mut reads_pf = false;
+        // the entry of the previous instruction of the range
+        let mut prev: Option<u32> = None;
         for _ in 0..count {
-            let i = match cache.map.get(&addr) {
-                Some(&i) => i,
+            let linked = prev.and_then(|p| match &cache.lifted[p as usize] {
+                Some(e) if e.next != NO_NEXT => Some(e.next),
+                _ => None,
+            });
+            let i = match linked {
+                Some(i) => i,
                 None => {
-                    let entry = fast.lift_instruction(memory, addr).ok().map(|insn| CacheEntry {
-                        x87: insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87),
-                        reads_pf: reads_outside_pf(&insn),
-                        insn,
-                    });
-                    let i = u32::try_from(cache.lifted.len()).expect("lift cache index");
-                    cache.lifted.push(entry);
-                    cache.map.insert(addr, i);
+                    let i = match cache.map.get(&addr) {
+                        Some(&i) => i,
+                        None => {
+                            let entry = fast.lift_instruction(memory, addr).ok().map(|insn| CacheEntry {
+                                x87: insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87),
+                                reads_pf: reads_outside_pf(&insn),
+                                insn,
+                                next: NO_NEXT,
+                            });
+                            let i = u32::try_from(cache.lifted.len()).expect("lift cache index");
+                            cache.lifted.push(entry);
+                            cache.map.insert(addr, i);
+                            i
+                        }
+                    };
+                    if let Some(p) = prev
+                        && let Some(e) = &mut cache.lifted[p as usize]
+                    {
+                        e.next = i;
+                    }
                     i
                 }
             };
+            prev = Some(i);
             let Some(e) = &cache.lifted[i as usize] else { break };
             // The x87 pass rewrites nothing in a range without an x87
             // instruction, so such a range lifts as the cache has it.

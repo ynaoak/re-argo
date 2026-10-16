@@ -5,6 +5,12 @@ mod symbol_import;
 
 use std::path::{Path, PathBuf};
 
+// The analysis allocates and frees many small objects (lifted
+// instructions, P-code ops, per-function maps) from several threads;
+// mimalloc serves them markedly faster than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{Parser, Subcommand};
 use reargo_analysis::{AnalysisManager, CallGraph};
 use reargo_analysis::strings::{find_strings, is_data_section};
