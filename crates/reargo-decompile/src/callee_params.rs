@@ -96,6 +96,9 @@ pub struct CalleeParams<'a> {
     hint_memo: Mutex<FxHashMap<u64, Option<crate::callers::ReturnHint>>>,
     /// The control flow of the instructions the no-return searches read (x86).
     flow_cache: Option<crate::noreturn::FlowCache>,
+    /// The RELATIVE relocations' slots by value, and the vtables of each function.
+    reloc_slots: std::sync::OnceLock<Option<FxHashMap<u64, Vec<u64>>>>,
+    vtables_memo: Mutex<FxHashMap<u64, Vec<u64>>>,
 }
 
 /// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
@@ -165,6 +168,8 @@ impl<'a> CalleeParams<'a> {
             call_index: None,
             hint_memo: Mutex::new(FxHashMap::default()),
             flow_cache: lifter.as_x86().map(|_| crate::noreturn::FlowCache::new()),
+            reloc_slots: std::sync::OnceLock::new(),
+            vtables_memo: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -173,6 +178,34 @@ impl<'a> CalleeParams<'a> {
     pub fn with_call_index(mut self) -> Self {
         self.call_index = crate::callers::CallIndex::build(self.memory);
         self
+    }
+
+    /// [`crate::vcall::this_vtables`]`(memory, f)`, memoised, from an index of the relocations
+    /// built once.
+    pub(crate) fn this_vtables(&self, f: u64) -> Vec<u64> {
+        let Some(slots) = self.reloc_slots.get_or_init(|| crate::vcall::relative_slots(self.memory)) else {
+            return crate::vcall::this_vtables(self.memory, f);
+        };
+        if let Some(v) = self.vtables_memo.lock().ok().and_then(|m| m.get(&f).cloned()) {
+            return v;
+        }
+        let v = crate::vcall::this_vtables_indexed(self.memory, slots, f);
+        if let Ok(mut m) = self.vtables_memo.lock() {
+            m.insert(f, v.clone());
+        }
+        v
+    }
+
+    /// [`crate::vcall::vtables_listing`]`(memory, targets)` through [`Self::this_vtables`].
+    pub(crate) fn vtables_listing(&self, targets: &[u64]) -> FxHashMap<u64, Vec<u64>> {
+        let mut out = FxHashMap::default();
+        for &f in targets {
+            let v = self.this_vtables(f);
+            if !v.is_empty() {
+                out.insert(f, v);
+            }
+        }
+        out
     }
 
     /// The control-flow cache the no-return searches of this oracle's batch share.

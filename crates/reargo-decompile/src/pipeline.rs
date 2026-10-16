@@ -152,7 +152,10 @@ impl<'a> ThisVcalls<'a> {
             return None;
         }
         let this_reg = *lifter.call_convention()?.args.first()?;
-        let vtables = crate::vcall::this_vtables(memory, entry);
+        let vtables = match oracle {
+            Some(o) if std::ptr::eq(o.memory, memory) => o.this_vtables(entry),
+            _ => crate::vcall::this_vtables(memory, entry),
+        };
         (!vtables.is_empty()).then_some(Self { memory, vtables, this_reg, oracle })
     }
 }

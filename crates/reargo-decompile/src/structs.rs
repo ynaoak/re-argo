@@ -472,7 +472,11 @@ impl StructView {
 
         let mut targets: Vec<u64> = vec![ctx.entry];
         targets.extend(this_calls.iter().map(|&(_, t)| t));
-        let listing = ctx.memory.map(|m| crate::vcall::vtables_listing(m, &targets)).unwrap_or_default();
+        let listing = match (ctx.memory, ctx.oracle) {
+            (Some(m), Some(o)) if std::ptr::eq(m, o.memory) => o.vtables_listing(&targets),
+            (Some(m), _) => crate::vcall::vtables_listing(m, &targets),
+            (None, _) => FxHashMap::default(),
+        };
         let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));
         let sret = ctx.oracle.and_then(|o| o.param_use(ctx.entry)).is_some_and(|p| p.returns_first);
         // WS93: the classes the callers pass (the whole-binary index): `this` when neither the
