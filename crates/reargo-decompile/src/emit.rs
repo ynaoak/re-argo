@@ -36,7 +36,39 @@ fn empty_u64_map() -> &'static BTreeMap<u64, String> {
     M.get_or_init(BTreeMap::new)
 }
 
+/// The ops of each block, in op order (an emitter's block scans were a pass over every op of
+/// the function per block).
+#[derive(Default)]
+pub(crate) struct BlockOps {
+    /// The ops these are of (their address and count).
+    ops: usize,
+    n_ops: usize,
+    by_block: Vec<std::sync::Arc<[u32]>>,
+}
+
+impl BlockOps {
+    pub(crate) fn new(func: &SsaFunction) -> Self {
+        let mut by_block: Vec<Vec<u32>> = Vec::new();
+        for (i, op) in func.ops.iter().enumerate() {
+            if op.block >= by_block.len() {
+                by_block.resize_with(op.block + 1, Vec::new);
+            }
+            by_block[op.block].push(i as u32);
+        }
+        Self { ops: func.ops.as_ptr() as usize, n_ops: func.ops.len(), by_block: by_block.into_iter().map(Into::into).collect() }
+    }
+
+    /// The positions in `func.ops` of the ops of `block`, in order.
+    pub(crate) fn of(&self, func: &SsaFunction, block: usize) -> std::sync::Arc<[u32]> {
+        if self.ops == func.ops.as_ptr() as usize && self.n_ops == func.ops.len() {
+            return self.by_block.get(block).cloned().unwrap_or_else(|| std::sync::Arc::from(Vec::new()));
+        }
+        func.ops.iter().enumerate().filter(|(_, o)| o.block == block).map(|(i, _)| i as u32).collect::<Vec<_>>().into()
+    }
+}
+
 pub struct CEmitter<'a> {
+    block_ops: BlockOps,
     indent: usize,
     output: String,
     symbol_names: &'a BTreeMap<u64, String>,
@@ -126,6 +158,7 @@ impl Default for CEmitter<'static> {
 impl CEmitter<'static> {
     pub fn new() -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names: empty_u64_map(),
@@ -170,6 +203,7 @@ impl<'a> CEmitter<'a> {
         string_literals: &'a BTreeMap<u64, String>,
     ) -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names,
@@ -235,6 +269,7 @@ impl<'a> CEmitter<'a> {
         func: &SsaFunction,
         structured: &StructuredBlock,
     ) -> String {
+        self.block_ops = BlockOps::new(func);
         self.output.clear();
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
@@ -551,7 +586,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             // (a folded op only feeds the branch, which prints nothing here)
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
@@ -564,7 +600,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
@@ -1509,7 +1546,7 @@ impl<'a> CEmitter<'a> {
     /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83), or the
     /// register the index was copied from when that still holds it (WS84).
     fn switch_index(&self, func: &SsaFunction, block_id: usize) -> String {
-        let Some(op) = func.ops.iter().rev().find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd) else {
+        let Some(op) = self.block_ops.of(func, block_id).iter().rev().map(|&k| &func.ops[k as usize]).find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd) else {
             return "cond".into();
         };
         match switch_index_source(func, op) {
@@ -1519,7 +1556,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
-        for op in func.ops.iter().rev() {
+        for &k in self.block_ops.of(func, block_id).iter().rev() {
+            let op = &func.ops[k as usize];
             if op.block != block_id || op.dead {
                 continue;
             }
