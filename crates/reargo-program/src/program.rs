@@ -56,6 +56,9 @@ pub struct Program {
     /// crypto`, `summary`, JSON export). Populated by `TagAnalyzer`
     /// which re-categorises the existing analyzer output stream.
     pub tags: crate::tags::TagManager,
+    /// In-memory results analyzers share with later analyzers (see
+    /// [`crate::analysis_cache`]). Not exported.
+    pub analysis_cache: crate::analysis_cache::AnalysisCache,
 }
 
 impl Program {
@@ -109,6 +112,7 @@ impl Program {
             metadata: ProgramMetadata::default(),
             call_renderings: std::collections::BTreeMap::new(),
             tags: crate::tags::TagManager::new(),
+            analysis_cache: crate::analysis_cache::AnalysisCache::new(),
         })
     }
 

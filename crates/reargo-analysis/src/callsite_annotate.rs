@@ -27,16 +27,8 @@ use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
-use crate::callsite::{
-    resolve_call_sites_iterative_from, walk_function_with, FunctionWalk, ParamSummaries,
-};
-use crate::func_lift::{function_jobs, lift_function};
+use crate::callsite::{resolve_call_sites_iterative_from, FunctionWalk};
 use crate::signatures::{FunctionSignature, SignatureDatabase};
-use rayon::prelude::*;
-
-/// What the shared lift of one function yields: its round-0 call-site
-/// walk, its `cfg_const` snapshots and its VSA snapshots.
-type FunctionResults = (FunctionWalk, crate::cfg_const::CallSnapshots, crate::vsa::CallSnapshots);
 
 pub struct CallSiteAnnotator;
 
@@ -70,38 +62,20 @@ impl Analyzer for CallSiteAnnotator {
         }
 
         let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
-        // One parallel pass lifts each function once and runs on that
-        // lift the three per-function analyses below (round 0 of the
-        // call-site resolver, the CFG constant tracker and VSA); the
-        // lift is dropped as soon as they are done, so memory stays at
-        // one lift per worker thread. Results are merged in listing
-        // order, as the sequential passes did.
-        let empty = ParamSummaries::default();
-        let per_func: Vec<FunctionResults> = function_jobs(program)
-            .par_iter()
-            .map(|&(entry, max_insns)| {
-                let Some(insns) = lift_function(&*lifter, program, entry, max_insns) else {
-                    let walk = FunctionWalk { entry, max_insns, sites: None };
-                    return (walk, Vec::new(), Vec::new());
-                };
-                let external = crate::func_lift::external_entries(program, &insns);
-                let sites = Some(walk_function_with(program, entry, &insns, &empty, &external));
-                (
-                    FunctionWalk { entry, max_insns, sites },
-                    crate::cfg_const::function_snapshots_with(program, entry, &insns, &external),
-                    crate::vsa::function_snapshots_with(program, entry, &insns, &external),
-                )
-            })
-            .collect();
-        let mut round0 = Vec::with_capacity(per_func.len());
+        // Each function's round-0 call-site walk, CFG constant tracker
+        // and VSA snapshots, from one lift per function (dropped as soon
+        // as they are done), merged in listing order. The walks are left
+        // on the program for Format Varargs (780).
+        let mut shared = crate::shared_lift::compute(&*lifter, program, true);
+        let mut round0 = Vec::with_capacity(shared.funcs.len());
         let mut cfg_constants = crate::cfg_const::CallConstants::new();
         let mut vsa_constants = crate::vsa::VsaResult::new();
-        for (walk, cfg_snaps, vsa_snaps) in per_func {
-            round0.push(walk);
+        for f in shared.funcs.iter_mut() {
+            round0.push(FunctionWalk { entry: f.entry, max_insns: f.max_insns, sites: f.walk.take() });
+            let (cfg_snaps, vsa_snaps) = f.snapshots.take().unwrap_or_default();
             crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
             crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
         }
-
         // Iterative inter-procedural resolver: a function whose
         // parameter has a *single* observed value across all
         // observed call sites is treated as a compile-time constant
@@ -110,7 +84,11 @@ impl Analyzer for CallSiteAnnotator {
         //   register_parser(my_parser) -> list_add(my_parser) -> …
         // 4 rounds is enough for everything we've measured.
         let mut sites = resolve_call_sites_iterative_from(&*lifter, program, &round0, 4)?;
-        drop(round0);
+        // Give the walks back for Format Varargs (780).
+        for (f, w) in shared.funcs.iter_mut().zip(round0) {
+            f.walk = w.sites;
+        }
+        crate::shared_lift::store(program, shared);
 
         // Layer multi-block CFG-aware constant propagation on top:
         // anywhere the iterative resolver came back with `?` for an
