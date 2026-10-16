@@ -197,7 +197,23 @@ pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<De
     // batches, then append their hits in the fixed XOR → ADD → ROL,
     // ascending-key order with the same per-pass cap check as a serial
     // run (which stops at the first pass that overflows the cap; a
-    // batch past that point is not started).
+    // batch past that point is not started). The passes of a batch
+    // read the buffer together, so it is read from memory about once
+    // per batch.
+    //
+    // The count of source bytes that are not printable, by prefix: the
+    // conservative check of every run of every pass in O(1).
+    let nonprintable = (opts.require_nonprintable_source && u32::try_from(buf.len()).is_ok()).then(|| {
+        let mut prefix = Vec::with_capacity(buf.len() + 1);
+        let mut count = 0u32;
+        prefix.push(0);
+        for &b in buf {
+            count += u32::from(!is_printable(b));
+            prefix.push(count);
+        }
+        prefix
+    });
+    let nonprintable = nonprintable.as_deref();
     let mut methods: Vec<DecodeMethod> = Vec::new();
     if opts.try_xor {
         methods.extend((1u8..=255).map(DecodeMethod::Xor));
@@ -211,22 +227,26 @@ pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<De
     let batch = rayon::current_num_threads().max(1) * 2;
     let mut hits: Vec<DecodedString> = Vec::new();
     for group in methods.chunks(batch) {
-        let per_method: Vec<Vec<DecodedString>> = group
-            .par_iter()
-            .map(|&method| {
-                let mut out = Vec::new();
-                match method {
-                    DecodeMethod::Xor(key) => scan_with(buf, base_addr, opts, &mut out, |b| b ^ key, method),
-                    DecodeMethod::Add(key) => {
-                        scan_with(buf, base_addr, opts, &mut out, |b| b.wrapping_add(key), method)
-                    }
-                    DecodeMethod::Rol(r) => {
-                        scan_with(buf, base_addr, opts, &mut out, |b| b.rotate_left(r as u32), method)
-                    }
+        let pass = |&method: &DecodeMethod| {
+            let mut out = Vec::new();
+            match method {
+                DecodeMethod::Xor(key) => {
+                    scan_prefixed(buf, nonprintable, base_addr, opts, &mut out, |b| b ^ key, method)
                 }
-                out
-            })
-            .collect();
+                DecodeMethod::Add(key) => {
+                    scan_prefixed(buf, nonprintable, base_addr, opts, &mut out, |b| b.wrapping_add(key), method)
+                }
+                DecodeMethod::Rol(r) => {
+                    scan_prefixed(buf, nonprintable, base_addr, opts, &mut out, |b| b.rotate_left(r as u32), method)
+                }
+            }
+            out
+        };
+        let per_method: Vec<Vec<DecodedString>> = if buf.len() < 4096 {
+            group.iter().map(pass).collect()
+        } else {
+            group.par_iter().map(pass).collect()
+        };
         for found in per_method {
             hits.extend(found);
             if hits.len() > opts.max_per_section {
@@ -262,8 +282,24 @@ pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<De
     by_addr.into_values().collect()
 }
 
+#[cfg(test)]
 fn scan_with(
     buf: &[u8],
+    base_addr: u64,
+    opts: &FlossOptions,
+    out: &mut Vec<DecodedString>,
+    decode: impl Fn(u8) -> u8,
+    method: DecodeMethod,
+) {
+    scan_prefixed(buf, None, base_addr, opts, out, decode, method)
+}
+
+/// One pass; `nonprintable`, when given, is the count of the source
+/// bytes that are not printable by prefix (`nonprintable[k]` for
+/// `buf[..k]`).
+fn scan_prefixed(
+    buf: &[u8],
+    nonprintable: Option<&[u32]>,
     base_addr: u64,
     opts: &FlossOptions,
     out: &mut Vec<DecodedString>,
@@ -283,6 +319,8 @@ fn scan_with(
     // test its last byte first and, when it is printable, look back
     // for the last non-printable one — the next run cannot start
     // before it. Most windows fail on the first byte tested.
+    // the decoded bytes of a run, reused from run to run
+    let mut decoded: Vec<u8> = Vec::new();
     let mut i = 0;
     while i + m <= n {
         if m > 0 {
@@ -296,6 +334,13 @@ fn scan_with(
             }
         }
         let mut j = i + m;
+        // 16 bytes at a time while they all decode printable (the
+        // test vectorises), then byte by byte
+        while let Some(chunk) = buf.get(j..j + 16)
+            && chunk.iter().fold(true, |all, &b| all & is_printable(decode(b)))
+        {
+            j += 16;
+        }
         while j < n && printable[buf[j] as usize] {
             j += 1;
         }
@@ -307,14 +352,18 @@ fn scan_with(
             // the original is already mostly printable, the XOR
             // brute-force is just emitting alphabet-soup noise.
             if opts.require_nonprintable_source {
-                let np = buf[i..j].iter().filter(|b| !is_printable(**b)).count();
+                let np = match nonprintable {
+                    Some(p) => (p[j] - p[i]) as usize,
+                    None => buf[i..j].iter().filter(|b| !is_printable(**b)).count(),
+                };
                 if np * 2 < run_len {
                     i = j;
                     continue;
                 }
             }
-            let decoded_bytes: Vec<u8> = buf[i..j].iter().map(|b| decode(*b)).collect();
-            if let Ok(s) = std::str::from_utf8(&decoded_bytes)
+            decoded.clear();
+            decoded.extend(buf[i..j].iter().map(|b| decode(*b)));
+            if let Ok(s) = std::str::from_utf8(&decoded)
                 && passes_filter(s)
             {
                 out.push(DecodedString {
@@ -380,19 +429,34 @@ fn passes_filter(s: &str) -> bool {
     if !had_word {
         return false;
     }
-    let alnum = s.bytes().filter(|b| b.is_ascii_alphanumeric()).count();
-    if alnum * 5 < s.len() * 3 {
-        // < 60% alnum → mostly punctuation, skip.
+    // < 60% alnum → mostly punctuation, skip (`alnum * 5 < len * 3`,
+    // counted until the answer is known)
+    let need = s.len() * 3;
+    let mut alnum = 0usize;
+    for (k, b) in bytes.iter().enumerate() {
+        if alnum * 5 >= need {
+            break;
+        }
+        if (alnum + (bytes.len() - k)) * 5 < need {
+            return false;
+        }
+        alnum += usize::from(b.is_ascii_alphanumeric());
+    }
+    if alnum * 5 < need {
         return false;
     }
     // Distinct-character variety check — rejects strings with too
     // few unique characters (mostly punctuation noise).
-    let mut seen = [false; 256];
-    for b in s.bytes() {
-        seen[b as usize] = true;
-    }
-    let distinct = seen.iter().filter(|&&x| x).count();
     let min_distinct = if s.len() >= 16 { 6 } else { 4 };
+    // counted until there are enough
+    let mut seen = [false; 256];
+    let mut distinct = 0usize;
+    for b in s.bytes() {
+        if distinct >= min_distinct {
+            break;
+        }
+        distinct += usize::from(!std::mem::replace(&mut seen[b as usize], true));
+    }
     if distinct < min_distinct {
         return false;
     }
@@ -406,17 +470,28 @@ fn passes_filter(s: &str) -> bool {
         if bytes.len() < period * 2 {
             break;
         }
-        let mut matches = 0usize;
-        let total = bytes.len() - period;
-        for k in 0..total {
-            if bytes[k] == bytes[k + period] {
-                matches += 1;
-            }
-        }
         // If ≥ 60% of bytes match the byte `period` away, treat
         // as periodic garbage. Real strings have low periodicity
-        // for these small periods.
-        if matches * 100 / total >= 60 {
+        // for these small periods. (`matches * 100 / total >= 60`,
+        // that is `matches * 100 >= total * 60`, counted until the
+        // answer is known.)
+        let total = bytes.len() - period;
+        let need = total * 60;
+        let mut matches = 0usize;
+        let mut k = 0;
+        while k < total {
+            if matches * 100 >= need {
+                return false;
+            }
+            if (matches + (total - k)) * 100 < need {
+                break;
+            }
+            // 64 comparisons at a time between the checks
+            let end = (k + 64).min(total);
+            matches += bytes[k..end].iter().zip(&bytes[k + period..end + period]).filter(|(a, b)| a == b).count();
+            k = end;
+        }
+        if matches * 100 >= need {
             return false;
         }
     }
@@ -473,6 +548,74 @@ mod tests {
         assert!(out.iter().all(|d| !d.plaintext.is_empty()));
     }
 
+    /// `passes_filter` before its counts stopped early.
+    fn passes_filter_reference(s: &str) -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        let first = s.as_bytes()[0];
+        if s.bytes().all(|b| b == first) {
+            return false;
+        }
+        let bytes = s.as_bytes();
+        let had_word = bytes.windows(3).any(|w| {
+            let (a, b, c) = (w[0].to_ascii_lowercase(), w[1].to_ascii_lowercase(), w[2].to_ascii_lowercase());
+            a.is_ascii_alphabetic() && b.is_ascii_alphabetic() && c.is_ascii_alphabetic() && a != b && b != c && a != c
+        });
+        if !had_word {
+            return false;
+        }
+        let alnum = s.bytes().filter(|b| b.is_ascii_alphanumeric()).count();
+        if alnum * 5 < s.len() * 3 {
+            return false;
+        }
+        let mut seen = [false; 256];
+        for b in s.bytes() {
+            seen[b as usize] = true;
+        }
+        let distinct = seen.iter().filter(|&&x| x).count();
+        if distinct < if s.len() >= 16 { 6 } else { 4 } {
+            return false;
+        }
+        for period in 2..=8 {
+            if bytes.len() < period * 2 {
+                break;
+            }
+            let total = bytes.len() - period;
+            let matches = (0..total).filter(|&k| bytes[k] == bytes[k + period]).count();
+            if matches * 100 / total >= 60 {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn filter_matches_reference() {
+        let mut state = 0x0bad_cafe_dead_beefu64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let alphabets: [&[u8]; 4] = [b"abcdefghijKLMNOP0123", b"ab12", b"a.-_ /:b", b"xyzXYZ!@#$%^&*()09"];
+        let mut passed = 0;
+        for round in 0..20000 {
+            let alphabet = alphabets[round % alphabets.len()];
+            let len = (next() % 300) as usize;
+            let period = 1 + (next() % 10) as usize;
+            let block: Vec<u8> = (0..period).map(|_| alphabet[(next() as usize) % alphabet.len()]).collect();
+            // a periodic string with some bytes changed
+            let noise = next() % 100;
+            let bytes: Vec<u8> = (0..len)
+                .map(|k| if next() % 100 < noise { alphabet[(next() as usize) % alphabet.len()] } else { block[k % period] })
+                .collect();
+            let s = std::str::from_utf8(&bytes).expect("ascii");
+            assert_eq!(passes_filter(s), passes_filter_reference(s), "{s:?}");
+            passed += usize::from(passes_filter(s));
+        }
+        assert!(passed > 100, "some strings should pass ({passed})");
+    }
+
     #[test]
     fn skip_scan_matches_naive_scan() {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -496,6 +639,15 @@ mod tests {
                     scan_with(&buf, 0x1000, &opts, &mut fast, |b| b ^ key, DecodeMethod::Xor(key));
                     scan_naive(&buf, &opts, &mut slow, |b| b ^ key, DecodeMethod::Xor(key));
                     assert_eq!(fast, slow, "round {round} m {m} strict {strict} key {key:#x}");
+                    let prefix: Vec<u32> = std::iter::once(0)
+                        .chain(buf.iter().scan(0u32, |c, &b| {
+                            *c += u32::from(!is_printable(b));
+                            Some(*c)
+                        }))
+                        .collect();
+                    let mut prefixed = Vec::new();
+                    scan_prefixed(&buf, Some(&prefix), 0x1000, &opts, &mut prefixed, |b| b ^ key, DecodeMethod::Xor(key));
+                    assert_eq!(prefixed, slow, "round {round} m {m} strict {strict} key {key:#x}");
                     hits += fast.len();
                 }
             }
