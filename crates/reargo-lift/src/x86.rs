@@ -187,6 +187,9 @@ pub struct LiftCache {
     shape: Vec<crate::lift::InsnShape>,
     /// Instructions the last [`Self::trim`] kept.
     kept: usize,
+    /// The lifts with the integer PF, of the ranges that need it
+    /// ([`X86Lifter::lift_range_from_cache`]), made when first needed.
+    parity: Option<Box<LiftCache>>,
 }
 
 /// The x87 pass may rewrite the instruction.
@@ -263,6 +266,9 @@ impl LiftCache {
             self.retain_from(start);
             self.kept = self.lifted.len();
         }
+        if let Some(p) = &mut self.parity {
+            p.trim(start, at);
+        }
     }
 
     /// Forget every address below `start`: a pass lifting ranges in
@@ -314,11 +320,11 @@ impl LiftCache {
         idxs.iter().map(|&i| self.lifted[i as usize].as_ref().expect("lifted")).collect()
     }
 
-    /// The index of `addr`, lifting it (with `fast`, decoding through
-    /// `block`) when not cached.
+    /// The index of `addr`, lifting it (with `lifter`, decoding through
+    /// `block`) when not cached: a cache holds the lifts of one lifter.
     fn index_of<'m>(
         &mut self,
-        fast: &X86Lifter,
+        lifter: &X86Lifter,
         memory: &'m Memory,
         addr: u64,
         block: &mut Option<BlockDecoder<'m>>,
@@ -329,7 +335,8 @@ impl LiftCache {
         if self.lifted.len() == self.lifted.capacity() {
             self.reserve(self.lifted.len());
         }
-        let lifted = fast.decode_in_block(memory, addr, block).and_then(|insn| fast.lift_decoded(insn, addr, None)).ok();
+        let lifted =
+            lifter.decode_in_block(memory, addr, block).and_then(|insn| lifter.lift_decoded(insn, addr, None)).ok();
         let (flags, len, shape) = match &lifted {
             Some(insn) => {
                 let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
@@ -397,19 +404,57 @@ impl X86Lifter {
         cache: &'c mut LiftCache,
     ) -> CachedRange<'c> {
         match self.walk_cached(memory, start, count, cache) {
-            Some(idxs) => {
+            Ok(idxs) => {
                 let cache: &'c LiftCache = cache;
                 CachedRange::Cached(cache.insns(&idxs))
             }
-            None => CachedRange::Owned(self.lift_range(memory, start, count).unwrap_or_default()),
+            Err(idxs) => CachedRange::Owned(self.lift_range_from_cache(memory, start, count, &idxs, cache)),
         }
+    }
+
+    /// `lift_range(memory, start, count)` for a range whose instructions
+    /// are the cache's `idxs` (as [`Self::walk_cached`] walked them) but
+    /// must be lifted as a whole (an x87 instruction, or the integer PF
+    /// needed): the lifts of the instructions alone are taken from the
+    /// cache (the PF ones from its parity cache) instead of decoding and
+    /// lifting them again, then finished as `lift_range` finishes them.
+    fn lift_range_from_cache(
+        &self,
+        memory: &Memory,
+        start: u64,
+        count: usize,
+        idxs: &[u32],
+        cache: &mut LiftCache,
+    ) -> Vec<LiftedInstruction> {
+        let fast_lifter = X86Lifter { is_64: self.is_64, parity: false };
+        let mut fast: Vec<LiftedInstruction> =
+            idxs.iter().map(|&i| cache.lifted[i as usize].clone().expect("lifted")).collect();
+        fast_lifter.lift_x87_range(memory, &mut fast);
+        if !(self.parity && needs_integer_parity(&fast)) {
+            return fast;
+        }
+        // `lift(self)` of `lift_range`: each instruction lifted alone with
+        // the PF (up to the first that fails), then the x87 pass
+        let parity = cache.parity.get_or_insert_with(Default::default);
+        let mut block = None;
+        let mut out = Vec::with_capacity(fast.len());
+        let mut addr = start;
+        for _ in 0..count {
+            let i = parity.index_of(self, memory, addr, &mut block);
+            let Some(l) = &parity.lifted[i as usize] else { break };
+            addr += u64::from(l.length);
+            out.push(l.clone());
+        }
+        self.lift_x87_range(memory, &mut out);
+        out
     }
 
     /// The cache indices of `lift_range(memory, start, count)` when every
     /// instruction of it is lifted alone, lifting into `cache` what it
-    /// lacks; `None` when the range must be lifted afresh as a whole (an
-    /// x87 instruction, or a PF reader needing the integer PF).
-    fn walk_cached(&self, memory: &Memory, start: u64, count: usize, cache: &mut LiftCache) -> Option<Vec<u32>> {
+    /// lacks; `Err` with them when the range must be lifted as a whole
+    /// (an x87 instruction, or a PF reader needing the integer PF:
+    /// [`Self::lift_range_from_cache`]).
+    fn walk_cached(&self, memory: &Memory, start: u64, count: usize, cache: &mut LiftCache) -> Result<Vec<u32>, Vec<u32>> {
         let fast = X86Lifter { is_64: self.is_64, parity: false };
         let mut idxs: Vec<u32> = Vec::with_capacity(count.min(4096));
         let mut addr = start;
@@ -440,16 +485,16 @@ impl X86Lifter {
         // The x87 pass rewrites nothing in a range without an x87
         // instruction, so such a range lifts as the cache has it.
         if any & X87 != 0 {
-            return None;
+            return Err(idxs);
         }
         // `needs_integer_parity`, its per-instruction test read from the cache
         if self.parity && any & READS_PF != 0 {
             let insns = cache.insns(&idxs);
             if parity_needed(&insns, |k| cache.flags[idxs[k] as usize] & READS_PF != 0) {
-                return None;
+                return Err(idxs);
             }
         }
-        Some(idxs)
+        Ok(idxs)
     }
 
     /// `g(k, insns, shapes)` for the `k`-th of `budgets`, `insns` being
@@ -474,7 +519,7 @@ impl X86Lifter {
         mut g: impl FnMut(usize, &[&LiftedInstruction], Option<&[crate::lift::InsnShape]>) -> R,
     ) -> Vec<R> {
         let max = budgets.iter().copied().max().unwrap_or(0);
-        if let Some(idxs) = self.walk_cached(memory, start, max, cache) {
+        if let Ok(idxs) = self.walk_cached(memory, start, max, cache) {
             let insns = cache.insns(&idxs);
             let shapes: Option<Vec<crate::lift::InsnShape>> =
                 with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
@@ -491,13 +536,13 @@ impl X86Lifter {
             .iter()
             .enumerate()
             .map(|(k, &b)| match self.walk_cached(memory, start, b, cache) {
-                Some(idxs) => {
+                Ok(idxs) => {
                     let shapes: Option<Vec<crate::lift::InsnShape>> =
                         with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
                     g(k, &cache.insns(&idxs), shapes.as_deref())
                 }
-                None => {
-                    let insns = self.lift_range(memory, start, b).unwrap_or_default();
+                Err(idxs) => {
+                    let insns = self.lift_range_from_cache(memory, start, b, &idxs, cache);
                     g(k, &insns.iter().collect::<Vec<_>>(), None)
                 }
             })
@@ -556,12 +601,6 @@ impl X86Lifter {
             return lifted;
         }
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        // Most instructions lift to a handful of ops plus their flags:
-        // room for 8 up front instead of growing 4 -> 8 (a larger
-        // first allocation measured slower).
-        let mut ops: Vec<PcodeOp> = Vec::with_capacity(8);
-        let mut seq_base: u32 = 0;
-        let ps = self.ptr_size();
 
         // SSE / scalar-float instructions are lifted to FLOAT_* p-code so the
         // SSA/dataflow passes can track noise/biome math (the BDS world-gen is
@@ -573,6 +612,11 @@ impl X86Lifter {
         if let Some(lifted) = self.lift_bits(insn, address) {
             return lifted;
         }
+        // The ops are built in a reused buffer ([`scratch::take`]); the
+        // lift keeps an exact copy ([`scratch::finish`]).
+        let mut ops: Vec<PcodeOp> = scratch::take();
+        let mut seq_base: u32 = 0;
+        let ps = self.ptr_size();
 
         match insn.mnemonic() {
             Nop | Endbr64 | Endbr32 => {}
@@ -1497,7 +1541,7 @@ impl X86Lifter {
     ) -> Result<Vec<PcodeOp>, LiftError> {
         use iced_x86::Mnemonic::*;
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut ops: Vec<PcodeOp> = scratch::take();
         let mut sb: u32 = 0;
 
         // Scalar element width for this mnemonic group (sd=8, ss=4, packed=16).
@@ -2531,8 +2575,10 @@ impl PcodeLift for X86Lifter {
         let lift = |lifter: &X86Lifter| {
             let mut results = Vec::with_capacity(count);
             let mut addr = start;
+            // decoded through one decoder over the block, as a range walk does
+            let mut block = None;
             for _ in 0..count {
-                match lifter.lift_instruction(memory, addr) {
+                match lifter.decode_in_block(memory, addr, &mut block).and_then(|insn| lifter.lift_decoded(insn, addr, None)) {
                     Ok(lifted) => {
                         addr += lifted.length as u64;
                         results.push(lifted);
@@ -2652,11 +2698,8 @@ impl X86Lifter {
         address: u64,
         x87: Option<X87Ctx>,
     ) -> Result<LiftedInstruction, LiftError> {
-        let mut pcode_ops = self.lift_iced(&insn, address, x87)?;
-        if self.is_64 {
-            pcode_ops = zero_extend_gpr32_writes(pcode_ops);
-        }
-        pcode_ops = sync_xmm_views(pcode_ops, xmm_write_zeroes_upper(&insn));
+        let pcode_ops = self.lift_iced(&insn, address, x87)?;
+        let pcode_ops = self.finish_ops(pcode_ops, &insn);
 
         Ok(LiftedInstruction {
             address,
@@ -2664,6 +2707,33 @@ impl X86Lifter {
             mnemonic: crate::lift::InsnText::x86_lazy(insn),
             ops: pcode_ops,
         })
+    }
+
+    /// The ops `lift_iced` built, with the register views kept coherent
+    /// ([`zero_extend_gpr32_writes`], [`sync_xmm_views`]), in a vector of
+    /// exactly their number: the lift holds no spare room, and the ops are
+    /// moved once where only the GPR views are added.
+    fn finish_ops(&self, mut ops: Vec<PcodeOp>, insn: &iced_x86::Instruction) -> Vec<PcodeOp> {
+        let xmm = needs_xmm_views(&ops);
+        if self.is_64 && touches_gpr(&ops) {
+            let extra: usize = ops.iter().map(gpr_extra).sum();
+            if extra == 0 {
+                for (i, op) in ops.iter_mut().enumerate() {
+                    op.seq.order = i as u32;
+                }
+            } else {
+                let out = if xmm { scratch::take() } else { Vec::with_capacity(ops.len() + extra) };
+                let out = zero_extend_gpr32_writes(&mut ops, out);
+                scratch::give(std::mem::replace(&mut ops, out));
+                if !xmm {
+                    return ops;
+                }
+            }
+        }
+        if xmm {
+            ops = sync_xmm_views(ops, xmm_write_zeroes_upper(insn));
+        }
+        scratch::finish(ops)
     }
 
     /// WS89: lift the x87 instructions of a range lifted from a function's entry again with the
@@ -2677,12 +2747,22 @@ impl X86Lifter {
         if !lifted.iter().any(|l| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87)) {
             return;
         }
-        if !lifted.iter().any(|l| l.mnemonic.starts_with('f')) {
+        // (the texts of the x87 ones first: they are the ones that start
+        // with `f`, and each text is formatted when first read)
+        let maybe_x87 = |l: &LiftedInstruction| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+        if !lifted.iter().filter(|l| maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
+            && !lifted.iter().filter(|l| !maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
+        {
             return;
         }
+        // the instruction a lift was made from is the one decoded at its
+        // address again
         let decoded: Vec<Option<iced_x86::Instruction>> = lifted
             .iter()
             .map(|l| {
+                if let Some(insn) = l.mnemonic.x86_instruction() {
+                    return Some(*insn);
+                }
                 let mut buf = [0u8; 15];
                 let n = memory.read_instruction_bytes(l.address, &mut buf);
                 let mut d = iced_x86::Decoder::with_ip(if self.is_64 { 64 } else { 32 }, &buf[..n], l.address, iced_x86::DecoderOptions::NONE);
@@ -2941,21 +3021,119 @@ fn parity_needed<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L], reads_
     false
 }
 
-fn zero_extend_gpr32_writes(ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
-    let gpr = |v: &VarnodeData| {
-        (v.space == REG_SPACE && v.offset < 0xC0 && v.offset.is_multiple_of(8) && matches!(v.size, 1 | 2 | 4 | 8))
-            .then_some(*v)
-    };
-    // ah/ch/dh/bh: byte 1 of rax..rbx (WS84)
-    let high = |v: &VarnodeData| v.space == REG_SPACE && v.offset < 0x20 && v.offset % 8 == 1 && v.size == 1;
-    if !ops.iter().any(|o| {
-        o.output.as_ref().is_some_and(|v| gpr(v).is_some() || high(v)) || o.inputs.iter().any(high)
-    }) {
-        return ops;
+/// Reused buffers the ops of one instruction are built in, per thread:
+/// a lift keeps only an exact-sized copy of its ops, so the buffers'
+/// room (and the post-passes' second buffer) is allocated once rather
+/// than for every instruction — a kept lift held about twice its ops'
+/// size in spare capacity before.
+mod scratch {
+    use super::PcodeOp;
+    use std::cell::Cell;
+
+    thread_local! {
+        static A: Cell<Vec<PcodeOp>> = const { Cell::new(Vec::new()) };
+        static B: Cell<Vec<PcodeOp>> = const { Cell::new(Vec::new()) };
     }
-    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 4);
+
+    /// An empty buffer.
+    pub(super) fn take() -> Vec<PcodeOp> {
+        let v = A.take();
+        if v.capacity() != 0 {
+            return v;
+        }
+        let v = B.take();
+        if v.capacity() != 0 { v } else { Vec::with_capacity(16) }
+    }
+
+    /// Return a buffer for reuse (two are kept per thread).
+    pub(super) fn give(mut ops: Vec<PcodeOp>) {
+        if ops.capacity() == 0 || ops.capacity() > 256 {
+            return;
+        }
+        ops.clear();
+        let old = A.replace(ops);
+        if old.capacity() != 0 {
+            B.set(old);
+        }
+    }
+
+    /// The ops of `ops` in a vector of exactly their size, the buffer
+    /// returned for reuse.
+    pub(super) fn finish(mut ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
+        let mut exact: Vec<PcodeOp> = Vec::with_capacity(ops.len());
+        exact.append(&mut ops);
+        give(ops);
+        exact
+    }
+}
+
+/// A GPR view [`zero_extend_gpr32_writes`] keeps.
+fn gpr_view(v: &VarnodeData) -> bool {
+    v.space == REG_SPACE && v.offset < 0xC0 && v.offset.is_multiple_of(8) && matches!(v.size, 1 | 2 | 4 | 8)
+}
+
+/// `ah`/`ch`/`dh`/`bh`: byte 1 of rax..rbx (WS84).
+fn high_byte(v: &VarnodeData) -> bool {
+    v.space == REG_SPACE && v.offset < 0x20 && v.offset % 8 == 1 && v.size == 1
+}
+
+/// Whether [`zero_extend_gpr32_writes`] rewrites `ops` (renumbering them
+/// at least).
+fn touches_gpr(ops: &[PcodeOp]) -> bool {
+    ops.iter().any(|o| o.output.as_ref().is_some_and(|v| gpr_view(v) || high_byte(v)) || o.inputs.iter().any(high_byte))
+}
+
+/// The ops [`zero_extend_gpr32_writes`] adds around `op`.
+fn gpr_extra(op: &PcodeOp) -> usize {
+    let mut reads = 0;
+    let mut last: Option<VarnodeData> = None;
+    for v in op.inputs.iter().filter(|v| high_byte(v)) {
+        if last != Some(*v) {
+            reads += 1;
+        }
+        last = Some(*v);
+    }
+    let Some(w) = op.output else { return reads };
+    if high_byte(&w) {
+        return reads + 4;
+    }
+    if !gpr_view(&w) {
+        return reads;
+    }
+    let is_rsp = w.offset == 0x20;
+    reads
+        + match w.size {
+            8 if !is_rsp => 3,
+            8 => 0,
+            4 => 1 + if is_rsp { 0 } else { 2 },
+            _ if !is_rsp => 4,
+            _ => 0,
+        }
+}
+
+/// Whether [`sync_xmm_views`] rewrites `ops`.
+fn needs_xmm_views(ops: &[PcodeOp]) -> bool {
+    ops.iter().any(|o| o.output.as_ref().and_then(xmm_view).is_some())
+}
+
+/// The XMM register a 4 / 8 / 16-byte view of it starts.
+fn xmm_view(v: &VarnodeData) -> Option<u64> {
+    let end = XMM_BASE + 16 * 0x10;
+    (v.space == REG_SPACE
+        && v.offset >= XMM_BASE
+        && v.offset < end
+        && (v.offset - XMM_BASE).is_multiple_of(0x10)
+        && matches!(v.size, 4 | 8 | 16))
+        .then_some(v.offset)
+}
+
+/// The ops of `ops` (drained) with the GPR views kept coherent, in `out`
+/// (empty; [`touches_gpr`] holds for `ops`).
+fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>) -> Vec<PcodeOp> {
+    let gpr = |v: &VarnodeData| gpr_view(v).then_some(*v);
+    let high = high_byte;
     let mut tmp = 0x7e00u64;
-    for op in ops {
+    for op in ops.drain(..) {
         let at = op.seq.addr;
         let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
             opcode,
@@ -3052,21 +3230,11 @@ fn xmm_write_zeroes_upper(insn: &iced_x86::Instruction) -> bool {
 /// 4/8-byte write the wider views are rebuilt with PIECE(old_high, new_low),
 /// or ZEXT for the forms that clear the upper bits.
 fn sync_xmm_views(ops: Vec<PcodeOp>, zero_upper: bool) -> Vec<PcodeOp> {
-    let xmm_of = |v: &VarnodeData| -> Option<u64> {
-        let end = XMM_BASE + 16 * 0x10;
-        (v.space == REG_SPACE
-            && v.offset >= XMM_BASE
-            && v.offset < end
-            && (v.offset - XMM_BASE).is_multiple_of(0x10)
-            && matches!(v.size, 4 | 8 | 16))
-            .then_some(v.offset)
-    };
-    if !ops.iter().any(|o| o.output.as_ref().and_then(xmm_of).is_some()) {
-        return ops;
-    }
-    let mut out: Vec<PcodeOp> = Vec::with_capacity(ops.len() + 4);
+    let xmm_of = xmm_view;
+    let mut ops = ops;
+    let mut out: Vec<PcodeOp> = scratch::take();
     let mut tmp = 0x7f00u64;
-    for op in ops {
+    for op in ops.drain(..) {
         let w = op.output.filter(|v| xmm_of(v).is_some());
         let at = op.seq.addr;
         out.push(op);
@@ -3110,6 +3278,7 @@ fn sync_xmm_views(ops: Vec<PcodeOp>, zero_upper: bool) -> Vec<PcodeOp> {
             }
         }
     }
+    scratch::give(ops);
     for (i, op) in out.iter_mut().enumerate() {
         op.seq.order = i as u32;
     }

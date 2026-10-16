@@ -9,7 +9,58 @@ use std::path::{Path, PathBuf};
 // instructions, P-code ops, per-function maps) from several threads;
 // mimalloc serves them markedly faster than the system allocator.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: Mimalloc = Mimalloc;
+
+/// mimalloc, its plain `mi_malloc` for the layouts it aligns anyway:
+/// every block is aligned to the word size, so an alignment up to 8
+/// needs no aligned allocation (`mimalloc::MiMalloc` asks for one every
+/// time, a slower path whenever the size class has no free block at
+/// hand). Larger alignments go to `MiMalloc`.
+struct Mimalloc;
+
+/// The alignment of every block mimalloc returns.
+const MI_WORD_ALIGN: usize = 8;
+
+unsafe impl std::alloc::GlobalAlloc for Mimalloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.align() <= MI_WORD_ALIGN {
+            // SAFETY: mimalloc's malloc, freed by `dealloc` (mi_free)
+            unsafe { libmimalloc_sys::mi_malloc(layout.size()).cast() }
+        } else {
+            // SAFETY: forwarded
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.align() <= MI_WORD_ALIGN {
+            // SAFETY: as `alloc`
+            unsafe { libmimalloc_sys::mi_zalloc(layout.size()).cast() }
+        } else {
+            // SAFETY: forwarded
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: forwarded (mi_free for every block)
+        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if layout.align() <= MI_WORD_ALIGN {
+            // SAFETY: `ptr` is a mimalloc block
+            unsafe { libmimalloc_sys::mi_realloc(ptr.cast(), new_size).cast() }
+        } else {
+            // SAFETY: forwarded
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        }
+    }
+}
 
 use clap::{Parser, Subcommand};
 use reargo_analysis::{AnalysisManager, CallGraph};
