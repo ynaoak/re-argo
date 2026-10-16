@@ -77,12 +77,40 @@ impl std::fmt::Display for Reference {
     }
 }
 
-#[derive(Debug, Default)]
+/// A point in a [`ReferenceManager`]'s log of jump references (see
+/// [`ReferenceManager::jump_mark`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JumpMark {
+    manager: u64,
+    len: usize,
+}
+
+#[derive(Debug)]
 pub struct ReferenceManager {
     // Address-ordered so `all_refs()` yields references in the same
     // order on every run (a `HashMap` made it depend on the hash seed).
     refs_from: BTreeMap<u64, Vec<Reference>>,
     refs_to: BTreeMap<u64, Vec<Reference>>,
+    // Every jump reference (`RefType::is_jump`), in the order added:
+    // lets a cache of per-function results tell which code gained a
+    // jump into it since a mark (references are only ever added,
+    // never removed).
+    jumps: Vec<Reference>,
+    // Identifies this manager, so a mark taken on another one (a
+    // manager that replaced it) is never read against this log.
+    id: u64,
+}
+
+impl Default for ReferenceManager {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            refs_from: BTreeMap::new(),
+            refs_to: BTreeMap::new(),
+            jumps: Vec::new(),
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 impl ReferenceManager {
@@ -91,6 +119,9 @@ impl ReferenceManager {
     }
 
     pub fn add(&mut self, reference: Reference) {
+        if reference.ref_type.is_jump() {
+            self.jumps.push(reference);
+        }
         self.refs_from
             .entry(reference.from)
             .or_default()
@@ -99,6 +130,22 @@ impl ReferenceManager {
             .entry(reference.to)
             .or_default()
             .push(reference);
+    }
+
+    /// A mark for [`Self::jump_targets_since`]: the number of jump
+    /// references (`RefType::is_jump`) added so far.
+    pub fn jump_mark(&self) -> JumpMark {
+        JumpMark { manager: self.id, len: self.jumps.len() }
+    }
+
+    /// The jump references added since `mark`, in the order added
+    /// (with repeats); `None` when `mark` was not taken on this
+    /// manager.
+    pub fn jumps_since(&self, mark: JumpMark) -> Option<&[Reference]> {
+        if mark.manager != self.id {
+            return None;
+        }
+        self.jumps.get(mark.len..)
     }
 
     pub fn get_refs_from(&self, address: u64) -> &[Reference] {
@@ -152,5 +199,16 @@ mod tests {
         assert_eq!(mgr.get_refs_to(0x2000).len(), 2);
         assert_eq!(mgr.call_refs_to(0x2000).len(), 2);
         assert!(mgr.get_refs_from(0x1004)[0].ref_type.is_jump());
+        let mark = mgr.jump_mark();
+        assert_eq!(mgr.jumps_since(mark), Some(&[][..]));
+        mgr.add(Reference::new(0x100c, 0x4000, RefType::IndirectJump));
+        mgr.add(Reference::new(0x1010, 0x5000, RefType::DataRead));
+        assert_eq!(
+            mgr.jumps_since(mark),
+            Some(&[Reference::new(0x100c, 0x4000, RefType::IndirectJump)][..])
+        );
+        // a mark of another manager is not read against this one
+        let other = ReferenceManager::new();
+        assert_eq!(other.jumps_since(mark), None);
     }
 }

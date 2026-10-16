@@ -78,6 +78,7 @@ pub mod rtti;
 pub mod runtime_fp;
 pub mod scc;
 pub mod section_anomaly;
+pub mod shared_lift;
 pub mod signatures;
 pub mod thunk;
 pub mod tls;

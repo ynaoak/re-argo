@@ -49,7 +49,7 @@ const X86_64_SYSV_ARG_REGS: [(u64, &str); 6] = [
 ];
 
 /// One value resolved (or attempted) at a call site.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedArg {
     /// Register offset in REGISTER space.
     pub reg_offset: u64,
@@ -61,7 +61,7 @@ pub struct ResolvedArg {
 }
 
 /// One Call site with its resolved argument set.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
     /// Address of the Call instruction.
     pub call_site: u64,
@@ -224,7 +224,7 @@ fn resolve_inner(
 
 /// Keep each call site once, in listing order: the first function to
 /// own a site keeps it.
-fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<CallSite> {
+pub(crate) fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<CallSite> {
     let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     let mut out: Vec<CallSite> = Vec::new();
     for site in per_func.flatten() {

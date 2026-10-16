@@ -86,9 +86,23 @@ pub(crate) fn function_snapshots_with(
     if insns.is_empty() {
         return Vec::new();
     }
-    let mut snaps = propagate_with(insns, external, |a| in_extent(program, entry, a));
+    let mut snaps = function_snapshots_unowned(program, entry, insns, external);
     snaps.retain(|(addr, _)| owns(program, entry, *addr));
     snaps
+}
+
+/// [`function_snapshots_with`] before it drops the call sites the
+/// function at `entry` does not own.
+pub(crate) fn function_snapshots_unowned(
+    program: &Program,
+    entry: u64,
+    insns: &[LiftedInstruction],
+    external: &BTreeSet<u64>,
+) -> CallSnapshots {
+    if insns.is_empty() {
+        return Vec::new();
+    }
+    propagate_with(insns, external, |a| in_extent(program, entry, a))
 }
 
 /// Fold one function's call snapshots into the program-wide map.

@@ -54,6 +54,7 @@ pub(crate) mod helpers {
             metadata: reargo_program::metadata::ProgramMetadata::default(),
             call_renderings: std::collections::BTreeMap::new(),
             tags: reargo_program::tags::TagManager::new(),
+            analysis_cache: reargo_program::analysis_cache::AnalysisCache::new(),
         }
     }
 
@@ -116,6 +117,7 @@ pub(crate) mod helpers {
             metadata: reargo_program::metadata::ProgramMetadata::default(),
             call_renderings: std::collections::BTreeMap::new(),
             tags: reargo_program::tags::TagManager::new(),
+            analysis_cache: reargo_program::analysis_cache::AnalysisCache::new(),
         }
     }
 }
