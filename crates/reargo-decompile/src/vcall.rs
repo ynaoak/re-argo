@@ -63,6 +63,12 @@ pub fn pointer_at(memory: &Memory, addr: u64) -> Option<u64> {
     memory.read_u64(addr).ok().filter(|&v| v != 0)
 }
 
+/// Whether `addr` is in a GOT (WS94: a shared library's slots bound to its own functions /
+/// `type_info`s are pointers too, but no vtable).
+fn in_got(memory: &Memory, addr: u64) -> bool {
+    memory.find_block(addr).is_some_and(|b| b.name.starts_with(".got"))
+}
+
 pub(crate) fn is_code(memory: &Memory, addr: u64) -> bool {
     memory.find_block(addr).is_some_and(|b| b.flags.contains(MemoryFlags::EXECUTE))
 }
@@ -214,7 +220,8 @@ fn address_points(memory: &Memory, slots: &[u64]) -> Vec<u64> {
         }
         let type_info = pointer_at(memory, p - 8);
         let offset_to_top = memory.read_u64(p - 16).ok().map(|v| v as i64);
-        let looks_like_vtable = type_info.is_some_and(|t| memory.find_block(t).is_some() && !is_code(memory, t))
+        let looks_like_vtable = !in_got(memory, p)
+            && type_info.is_some_and(|t| memory.find_block(t).is_some() && !is_code(memory, t))
             && offset_to_top.is_some_and(|o| (-0x10_0000..=0).contains(&o));
         if looks_like_vtable && !points.contains(&p) {
             points.push(p);
@@ -230,6 +237,7 @@ fn address_points(memory: &Memory, slots: &[u64]) -> Vec<u64> {
 /// `type_info` pointer (data, not code) and an offset-to-top of 0 or a small negative number.
 pub fn is_vtable_point(memory: &Memory, p: u64) -> bool {
     p >= 16
+        && !in_got(memory, p)
         && pointer_at(memory, p).is_some_and(|f| is_code(memory, f))
         && pointer_at(memory, p - 8).is_some_and(|t| memory.find_block(t).is_some() && !is_code(memory, t))
         && memory.read_u64(p - 16).is_ok_and(|o| (-0x10_0000..=0).contains(&(o as i64)))

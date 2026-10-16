@@ -897,10 +897,12 @@ fn join(h: &Hierarchy, a: u32, b: u32) -> u32 {
 fn pointer_words(mem: &Memory) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     if let Some(t) = mem.dynamic_relocations() {
+        // (not the GOT: a slot bound to a function is no reference to it in data)
+        let got: Vec<(u64, u64)> = mem.blocks().filter(|b| b.name.starts_with(".got")).map(|b| (b.start, b.start + b.size)).collect();
         for e in t.chunks_exact(24) {
             let w = |k: usize| u64::from_le_bytes(e[k * 8..k * 8 + 8].try_into().expect("8 bytes"));
             let ty = w(1) & 0xffff_ffff;
-            if ty == 8 || ty == 1027 {
+            if (ty == 8 || ty == 1027) && !got.iter().any(|&(s, e)| (s..e).contains(&w(0))) {
                 out.push((w(0), w(2)));
             }
         }
@@ -1652,6 +1654,28 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     idx
 }
 
+/// The functions of the image the PLT stubs jump to (WS94): a shared library calls its own
+/// exported functions through its PLT (`jmp [rip + slot]`, the GOT slot bound to the
+/// function); stub address -> function.
+pub fn plt_targets(mem: &Memory) -> FxHashMap<u64, u64> {
+    let mut out = FxHashMap::default();
+    for b in mem.blocks().filter(|b| b.name.starts_with(".plt") && b.flags.contains(MemoryFlags::EXECUTE)) {
+        let Some(data) = &b.data else { continue };
+        let mut dec = Decoder::with_ip(64, data, b.start, DecoderOptions::NONE);
+        while dec.can_decode() {
+            let i = dec.decode();
+            if i.mnemonic() != Mnemonic::Jmp || i.op_count() != 1 || i.op0_kind() != OpKind::Memory || i.memory_base() != Register::RIP {
+                continue;
+            }
+            let Some(f) = crate::vcall::pointer_at(mem, i.ip_rel_memory_address()) else { continue };
+            if crate::vcall::is_code(mem, f) && mem.find_block(f).is_some_and(|t| !t.name.starts_with(".plt")) {
+                out.insert(b.start + (i.ip() - b.start) / 16 * 16, f);
+            }
+        }
+    }
+    out
+}
+
 /// The index of the functions `[start, start + len)` of `mem`; `external` are the functions
 /// another module may call (exported).
 pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIndex {
@@ -1660,7 +1684,21 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIn
     let mut fs: Vec<(u64, u64)> = functions.to_vec();
     fs.sort_unstable();
     fs.dedup_by_key(|f| f.0);
-    let sums: Vec<Summary> = fs.par_iter().map(|&(s, l)| summarize(mem, s, l, &u.vt_points)).collect();
+    let mut sums: Vec<Summary> = fs.par_iter().map(|&(s, l)| summarize(mem, s, l, &u.vt_points)).collect();
+    // (a call through the image's own PLT is a call to the function)
+    let plt = plt_targets(mem);
+    if !plt.is_empty() {
+        let through = |a: &mut u64| {
+            if let Some(&f) = plt.get(a) {
+                *a = f;
+            }
+        };
+        for s in &mut sums {
+            s.call_targets.iter_mut().for_each(through);
+            s.refs.iter_mut().for_each(through);
+            s.top_args.iter_mut().for_each(|t| through(&mut t.0));
+        }
+    }
     let t1 = std::time::Instant::now();
     let starts: Vec<u64> = fs.iter().map(|f| f.0).collect();
     let mut idx = solve(&u, &starts, &sums, &external.iter().copied().collect(), MAX_ROUNDS);
@@ -1671,7 +1709,7 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIn
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 9;
+const INDEX_VERSION: u8 = 10;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -2001,6 +2039,26 @@ mod tests {
         mem.add_block(MemoryBlock { name: ".data.rel.ro".into(), start: 0x2000, size: d.len() as u64, flags: MemoryFlags::READ, data: Some(Arc::from(d.as_slice())) });
         assert_eq!(crate::vcall::type_info_bases(&mem, 0x2000), [0x2100]);
         assert_eq!(crate::vcall::type_info_bases(&mem, 0x2100), Vec::<u64>::new());
+    }
+
+    /// WS94: a shared library calls its own exported functions through its PLT: the stub's GOT
+    /// slot is bound to the function, so the stub stands for it; the slot is no reference to
+    /// the function in data (its address is not taken).
+    #[test]
+    fn a_plt_stub_bound_to_a_function_of_the_image_stands_for_it() {
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        let block = |name: &str, start: u64, data: Vec<u8>, flags: MemoryFlags| MemoryBlock { name: name.into(), start, size: data.len() as u64, flags, data: Some(Arc::from(data.as_slice())) };
+        mem.add_block(block(".text", 0x1000, vec![0xc3; 0x200], MemoryFlags::READ | MemoryFlags::EXECUTE));
+        // 0x1500: endbr64 ; bnd jmp [rip + 0x1af5] (0x3000) ; nop    0x1510: the same to 0x3008
+        let mut plt = vec![0xf3, 0x0f, 0x1e, 0xfa, 0xf2, 0xff, 0x25, 0xf5, 0x1a, 0x00, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00];
+        plt.extend([0xf3, 0x0f, 0x1e, 0xfa, 0xf2, 0xff, 0x25, 0xed, 0x1a, 0x00, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00]);
+        mem.add_block(block(".plt.sec", 0x1500, plt, MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.add_block(block(".got", 0x3000, vec![0; 0x10], MemoryFlags::READ | MemoryFlags::WRITE));
+        // the slot 0x3000 is bound to 0x1100 (the image's own function); 0x3008 to an import
+        mem.set_dynamic_relocations(Arc::from([0x3000u64.to_le_bytes(), 8u64.to_le_bytes(), 0x1100u64.to_le_bytes()].concat().as_slice()));
+        let m = plt_targets(&mem);
+        assert_eq!(m.into_iter().collect::<Vec<_>>(), [(0x1500, 0x1100)]);
+        assert!(!universe(&mem).taken.contains(&0x1100));
     }
 
     /// The join of two classes is their nearest common base.
