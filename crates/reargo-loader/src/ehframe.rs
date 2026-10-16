@@ -305,6 +305,38 @@ pub fn fde_function(mem: &crate::memory::Memory, hdr: u64, addr: u64) -> Option<
     (addr >= start && addr < start + len).then_some((start, len))
 }
 
+/// Every function of the `.eh_frame_hdr` table at `hdr`, as `(start, len)` in address order
+/// (WS93: the function ranges of a whole binary, for an interprocedural index). Entries whose
+/// FDE does not parse are left out; empty when the table is unsupported.
+pub fn fde_functions(mem: &crate::memory::Memory, hdr: u64) -> Vec<(u64, u64)> {
+    let img = mem;
+    let header = || -> Option<(u64, u64)> {
+        if img.u8(hdr)? != 1 {
+            return None;
+        }
+        let (ptr_enc, cnt_enc, tab_enc) = (img.u8(hdr + 1)?, img.u8(hdr + 2)?, img.u8(hdr + 3)?);
+        if cnt_enc == DW_EH_PE_OMIT || tab_enc != 0x3b {
+            return None;
+        }
+        let mut p = hdr + 4;
+        img.encoded(&mut p, ptr_enc, hdr)?;
+        let count = img.encoded(&mut p, cnt_enc, hdr)?;
+        Some((p, count))
+    };
+    let Some((table, count)) = header() else { return Vec::new() };
+    let mut out = Vec::with_capacity(count.min(1 << 24) as usize);
+    for i in 0..count {
+        let Some(off) = img.u32(table + 8 * i + 4) else { break };
+        let fde = hdr.wrapping_add(off as i32 as i64 as u64);
+        if let Some((start, len)) = fde_range(img, fde)
+            && len > 0
+        {
+            out.push((start, len));
+        }
+    }
+    out
+}
+
 /// The call-site table of the LSDA (`.gcc_except_table`) of the function whose FDE covers
 /// `addr`, read from loaded memory; `hdr` is the address of `.eh_frame_hdr`. `None` when
 /// the function has no LSDA or its encodings are unsupported.
@@ -526,6 +558,22 @@ mod tests {
         assert_eq!(fde_function(&mem, 0x200, 0x1010), Some((0x1000, 0x40)));
         assert_eq!(fde_function(&mem, 0x200, 0x1040), Some((0x1040, 0x20)));
         assert_eq!(fde_function(&mem, 0x200, 0x1060), None);
+    }
+
+    /// WS93: every FDE of the table, in order.
+    #[test]
+    fn lists_every_fde_in_memory() {
+        let elf = synthetic_elf();
+        let mut mem = crate::memory::Memory::new(reargo_core::address::SpaceId(1), reargo_core::address::Endian::Little);
+        mem.add_block(crate::memory::MemoryBlock {
+            name: "all".into(),
+            start: 0,
+            size: elf.len() as u64,
+            flags: crate::memory::MemoryFlags::READ,
+            data: Some(std::sync::Arc::from(elf.as_slice())),
+        });
+        assert_eq!(fde_functions(&mem, 0x200), vec![(0x1000, 0x40), (0x1040, 0x20)]);
+        assert_eq!(fde_functions(&mem, 0x100), Vec::<(u64, u64)>::new(), "not a table");
     }
 
     #[test]
