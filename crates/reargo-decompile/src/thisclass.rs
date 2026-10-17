@@ -76,6 +76,9 @@ pub enum Src {
     Ld(u32),
     /// the stack (the offset is from the stack pointer on entry)
     Stack,
+    /// (WS95) an object a callee's effects name (`Summary::objs[i]`: of a vtable's class, or of
+    /// a function's return class)
+    Obj(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,9 +89,96 @@ enum Val {
     /// (a stack slot only) the object here was first given to call `c` as argument `j` since
     /// the slot was last written: its constructor, when that callee is one
     Made(u32, u8),
+    /// (WS95) a pointer into the buffer `source` points into, at an offset not known (an
+    /// indexed address, a pointer plus a register, or stepped through it in a loop): an element
+    /// of an array / a vector
+    Elem(Src),
 }
 
-/// A stack object, by the call it was first given to and the argument: `(call, argument)`.
+/// The offset of an element of a buffer (WS95; see `Val::Elem`) in the loads, field stores,
+/// vtable stores and clobbers of a summary: `(src, ELEM)` is an element of the buffer `src`
+/// points into; a stored value `(src, ELEM)` is a pointer into it.
+pub const ELEM: i32 = i32::MIN;
+
+/// What a call to an import does with the memory its pointer arguments reach (WS95).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImportKind {
+    /// nothing a pointer's class depends on (`free`, `strlen`, `pthread_mutex_lock`, …)
+    Pure,
+    /// copies the elements of the buffer its second argument points into into the buffer its
+    /// first argument points into (`memcpy`, `memmove`)
+    Copy,
+    /// its result is a buffer holding the elements of the buffer its first argument points into
+    Realloc,
+    /// fills the buffer its first argument points into (nothing when it fills with 0)
+    Memset,
+    /// writes data (no pointers of a class) into the buffers its pointer arguments point into
+    /// (`read`, `snprintf`, `strcpy`, …)
+    WritesArgs,
+    /// anything (another module's function, a callback): the memory its pointer arguments
+    /// reach may get anything
+    Escape,
+}
+
+/// The kind of an import, by its name (WS95): `Escape` when not known.
+pub fn import_kind(name: &str) -> ImportKind {
+    let name = name.trim_end_matches("@plt");
+    let name = name.split('@').next().unwrap_or(name);
+    match name {
+        "memcpy" | "memmove" | "__memcpy_chk" | "__memmove_chk" | "mempcpy" | "wmemcpy" | "wmemmove" => ImportKind::Copy,
+        "realloc" | "reallocarray" => ImportKind::Realloc,
+        "memset" | "__memset_chk" | "wmemset" | "bzero" | "explicit_bzero" => ImportKind::Memset,
+        // (they call back user code with a user pointer, or do anything)
+        "pthread_once" | "pthread_create" | "__cxa_atexit" | "__cxa_thread_atexit_impl" | "atexit" | "qsort" | "bsearch" | "syscall" | "dl_iterate_phdr" => ImportKind::Escape,
+        _ if PURE_IMPORTS.contains(&name) || name.starts_with("_Unwind_") || name.starts_with("pthread_") || name.starts_with("__cxa_") || name.starts_with("sched_") => ImportKind::Pure,
+        _ if WRITING_IMPORTS.contains(&name) || is_math(name) => ImportKind::WritesArgs,
+        _ => ImportKind::Escape,
+    }
+}
+
+/// libm-style names (`sqrtf`, `ldexpl`, …) and the compiler's arithmetic helpers: no pointers,
+/// or an out-parameter of numbers.
+fn is_math(name: &str) -> bool {
+    const MATH: &[&str] = &[
+        "sqrt", "cbrt", "pow", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh",
+        "tanh", "fmod", "modf", "frexp", "ldexp", "floor", "ceil", "round", "trunc", "lround", "llround", "lrint", "llrint", "rint", "nearbyint", "hypot",
+        "nextafter", "nan", "fabs", "fmin", "fmax", "remainder", "copysign", "sincos",
+    ];
+    let base = name.strip_suffix('f').or_else(|| name.strip_suffix('l')).filter(|b| MATH.contains(b)).unwrap_or(name);
+    MATH.contains(&base) || ["__float", "__fix", "__udiv", "__div", "__umod", "__mod"].iter().any(|p| name.starts_with(p))
+}
+
+/// Imports that write nothing a pointer's class depends on into user memory.
+const PURE_IMPORTS: &[&str] = &[
+    "free", "malloc", "calloc", "aligned_alloc", "posix_memalign", "malloc_usable_size", "strlen", "strnlen", "wcslen", "strcmp", "strncmp", "strcasecmp",
+    "strncasecmp", "memcmp", "bcmp", "wmemcmp", "memchr", "memrchr", "wmemchr", "strchr", "strrchr", "strstr", "strspn", "strcspn", "strpbrk", "strcoll_l",
+    "wcscoll_l", "strdup", "abort", "exit", "_exit", "_Exit", "__assert_fail", "__stack_chk_fail", "__errno_location", "fwrite", "fputs", "fputc", "fputwc",
+    "fprintf", "printf", "vfprintf", "fflush", "fflush_unlocked", "fclose", "fseek", "fseeko", "fseeko64", "ftell", "ftello", "setbuf", "setvbuf", "ferror",
+    "feof", "clearerr", "fileno", "flockfile", "funlockfile", "__overflow", "close", "write", "send", "sendto", "sendmsg", "socket", "setsockopt", "bind",
+    "listen", "connect", "shutdown", "epoll_ctl", "epoll_create", "epoll_create1", "timerfd_create", "timerfd_settime", "eventfd", "getenv", "secure_getenv",
+    "sysconf", "getpagesize", "getpid", "geteuid", "time", "clock", "rand", "srand", "nanosleep", "usleep", "sleep", "pause", "mmap", "munmap", "dlopen",
+    "dlerror", "dlclose", "dlsym", "access", "rename", "remove", "unlink", "mkdir", "rmdir", "chmod", "fchmod", "utime", "opendir", "closedir", "readdir",
+    "readdir64", "lseek", "lseek64", "fopen", "fopen64", "fdopen", "getc", "ungetc", "getwc", "ungetwc", "freeaddrinfo", "gai_strerror", "gethostbyname",
+    "if_nametoindex", "freeifaddrs", "fnmatch", "localeconv", "newlocale", "uselocale", "freelocale", "setlocale", "catopen", "catgets", "catclose", "btowc",
+    "wctob", "__ctype_get_mb_cur_max", "__ctype_b_loc", "__ctype_toupper_loc", "__ctype_tolower_loc", "toupper_l", "tolower_l", "towupper_l", "towlower_l",
+    "iswspace_l", "iswprint_l", "iswblank_l", "iswcntrl_l", "iswupper_l", "iswlower_l", "iswalpha_l", "iswdigit_l", "iswpunct_l", "iswxdigit_l", "isspace",
+    "tolower", "toupper", "atoi", "atol", "strerror", "inet_ntoa", "backtrace_symbols", "shmget", "shmat", "shmdt", "setrlimit", "fcntl", "fcntl64", "ftruncate",
+    "ioctl", "__register_atfork", "__xpg_basename", "signal", "open", "open64", "kill", "raise", "getentropy",
+];
+
+/// Imports that write data (no pointers of a class) into the buffers their arguments point into.
+const WRITING_IMPORTS: &[&str] = &[
+    "read", "recv", "recvfrom", "recvmsg", "fread", "fgets", "snprintf", "sprintf", "vsnprintf", "vsprintf", "swprintf", "vasprintf", "asprintf", "strcpy",
+    "strncpy", "strcat", "strncat", "stpcpy", "strerror_r", "__xpg_strerror_r", "strftime", "strftime_l", "strxfrm_l", "wcsxfrm_l", "mbsrtowcs", "mbsnrtowcs",
+    "wcsnrtombs", "wcrtomb", "mbrtowc", "mbtowc", "__isoc99_sscanf", "__isoc99_vsscanf", "sscanf", "strtol", "strtoul", "strtoll", "strtoull", "strtof",
+    "strtod", "strtold", "wcstol", "wcstoul", "wcstoll", "wcstoull", "wcstof", "wcstod", "wcstold", "strtoll_l", "strtoull_l", "strtof_l", "strtod_l",
+    "strtold_l", "clock_gettime", "gettimeofday", "localtime_r", "gmtime_r", "mktime", "uname", "sysinfo", "statvfs", "stat", "stat64", "fstat", "fstat64",
+    "lstat", "realpath", "readlink", "getaddrinfo", "getnameinfo", "gethostname", "getsockname", "getpeername", "getsockopt", "getifaddrs", "if_indextoname",
+    "inet_pton", "inet_ntop", "accept", "accept4", "select", "poll", "epoll_wait", "pipe", "socketpair", "backtrace", "sigaction", "sigemptyset", "sigaddset",
+    "sigfillset", "sigprocmask", "getpwuid_r", "ldiv", "div", "getrandom",
+];
+
+// A stack object, by the call it was first given to and the argument: `(call, argument)`.
 pub type Instance = (u32, u8);
 
 /// What says the class of a stack object passed to a call, at that call (WS93): the vtable
@@ -107,6 +197,8 @@ pub enum StackEv {
 pub enum FieldVal {
     Ptr(Src, i32),
     Obj(StackEv),
+    /// (WS95) a pointer into the buffer `source` points into
+    Elem(Src),
 }
 
 /// Most bytes past a stack object's address whose slots are recorded as its fields at a call.
@@ -136,9 +228,24 @@ pub struct Summary {
     /// `field_stores` names (a stack address, a value not followed, a constant other than 0
     /// and a vtable, a narrower or wider store)
     pub field_clobbers: Vec<(Src, i32, i32)>,
+    /// `(source, offset, size)`: the clobbers that write no pointer at all (WS95: a store
+    /// narrower than 8 bytes, a number, arithmetic on memory) — they make a field's class unknown
+    pub field_numbers: Vec<(Src, i32, i32)>,
     /// `(call, argument, k, value)`: the 8 bytes at `+k` of a stack object passed to a call,
     /// at that call (WS94: the fields of the objects callers pass)
     pub stack_fields: Vec<(u32, u8, i32, FieldVal)>,
+    /// `(call, argument, source)`: a pointer into the buffer `source` points into passed to a
+    /// call (WS95; it is also in `top_args`: no pointer of a class)
+    pub elem_args: Vec<(u32, u8, Src)>,
+    /// `(destination, source)`: the elements of the buffer `source` points into are copied into
+    /// the buffer `destination` points into (`memcpy`, `realloc`; WS95)
+    pub buf_copies: Vec<(Src, Src)>,
+    /// the buffers an import writes data into (`read(fd, p, n)`: the one `p` points into; WS95)
+    pub buf_writes: Vec<Src>,
+    /// `(source, offset)`: a pointer `source + offset` given to unknown code (an import not known,
+    /// an indirect call — not the object of a virtual call; WS95): the buffer it points into
+    /// and the buffer the pointer at `source + offset` points into may get anything
+    pub buf_escapes: Vec<(Src, i32)>,
     /// the pointers returned in `rax`
     pub rets: Vec<(Src, i32)>,
     /// a `ret` returns something else
@@ -147,6 +254,8 @@ pub struct Summary {
     pub loads: Vec<(Src, i32)>,
     /// addresses taken in code (`lea r, [rip + x]`, `mov r, imm`)
     pub refs: Vec<u64>,
+    /// the objects `Src::Obj(i)` names (WS95: brought in by the callees' effects)
+    pub objs: Vec<crate::effects::ObjRef>,
 }
 
 impl Summary {
@@ -187,8 +296,15 @@ impl St {
         let mut changed = false;
         for (a, b) in self.r.iter_mut().zip(o.r.iter()) {
             if *a != *b && *a != Val::Unk {
-                *a = Val::Unk;
-                changed = true;
+                // (two pointers into one buffer: an element of it)
+                let m = match (*a, *b) {
+                    (Val::Ptr(x, _) | Val::Elem(x), Val::Ptr(y, _) | Val::Elem(y)) if x == y && x != Src::Stack => Val::Elem(x),
+                    _ => Val::Unk,
+                };
+                if *a != m {
+                    *a = m;
+                    changed = true;
+                }
             }
         }
         let before = self.slots.clone();
@@ -201,7 +317,19 @@ impl St {
                 s.1 = Val::Made(pair.0 .0, pair.0 .1);
                 true
             }
-            (x, y) => x == y && o.slots.iter().any(|t| t.0 == s.0),
+            (x, y) => {
+                if !o.slots.iter().any(|t| t.0 == s.0) {
+                    return false;
+                }
+                match (x, y) {
+                    _ if x == y => true,
+                    (Val::Ptr(a, _) | Val::Elem(a), Val::Ptr(b, _) | Val::Elem(b)) if a == b && a != Src::Stack => {
+                        s.1 = Val::Elem(a);
+                        true
+                    }
+                    _ => false,
+                }
+            }
         });
         changed | (self.slots != before)
     }
@@ -240,6 +368,7 @@ fn add(v: Val, k: i64) -> Val {
     match v {
         Val::Ptr(s, o) => i32::try_from(i64::from(o) + k).map_or(Val::Unk, |o| Val::Ptr(s, o)),
         Val::Const(c) => Val::Const(c.wrapping_add(k as u64)),
+        Val::Elem(s) => Val::Elem(s),
         Val::Unk | Val::Made(..) => Val::Unk,
     }
 }
@@ -247,6 +376,7 @@ fn add(v: Val, k: i64) -> Val {
 /// The interpretation of one function's instructions (see [`summarize`]).
 struct Interp<'a> {
     vt_points: &'a FxHashSet<u64>,
+    env: &'a Env<'a>,
     loads: FxHashMap<(Src, i32), u32>,
     out: Summary,
     info: InstructionInfoFactory,
@@ -256,10 +386,20 @@ struct Interp<'a> {
 
 impl Interp<'_> {
     fn addr(&self, st: &St, i: &Instruction) -> Val {
-        if matches!(i.segment_prefix(), Register::FS | Register::GS) || i.memory_index() != Register::None {
+        if matches!(i.segment_prefix(), Register::FS | Register::GS) {
             return Val::Unk;
         }
         let base = i.memory_base();
+        if i.memory_index() != Register::None {
+            // (WS95: an indexed address into a buffer is an element of it; the pointer may be the
+            // index register, scaled by 1)
+            let reg = |r: Register| gpr(r).filter(|_| r.is_gpr64()).map(|g| st.r[g]);
+            let index = (i.memory_index_scale() == 1).then(|| reg(i.memory_index())).flatten();
+            return match (reg(base), index) {
+                (Some(Val::Ptr(s, _) | Val::Elem(s)), _) | (_, Some(Val::Ptr(s, _) | Val::Elem(s))) if s != Src::Stack => Val::Elem(s),
+                _ => Val::Unk,
+            };
+        }
         if base == Register::RIP {
             return Val::Const(i.ip_rel_memory_address());
         }
@@ -274,6 +414,10 @@ impl Interp<'_> {
     }
 
     fn load(&mut self, st: &St, a: Val) -> Val {
+        let a = match a {
+            Val::Elem(src) => Val::Ptr(src, ELEM),
+            a => a,
+        };
         match a {
             Val::Ptr(Src::Stack, s) => st.slot(s),
             Val::Ptr(src, k) => {
@@ -293,6 +437,10 @@ impl Interp<'_> {
     }
 
     fn store(&mut self, st: &mut St, a: Val, size: u32, v: Val, emit: bool) {
+        let a = match a {
+            Val::Elem(src) => Val::Ptr(src, ELEM),
+            a => a,
+        };
         match a {
             Val::Ptr(Src::Stack, s) => {
                 if emit
@@ -313,8 +461,16 @@ impl Interp<'_> {
             Val::Ptr(src, k) if emit => match v {
                 Val::Const(c) if size == 8 && self.vt_points.contains(&c) => self.out.vt_stores.push((src, k, c)),
                 Val::Ptr(vs, vo) if size == 8 && vs != Src::Stack => self.out.field_stores.push((src, k, vs, vo)),
+                // (WS95: a pointer into a buffer)
+                Val::Elem(vs) if size == 8 => self.out.field_stores.push((src, k, vs, ELEM)),
                 Val::Const(0) if size == 8 => {}
-                _ => self.out.field_clobbers.push((src, k, size.max(1) as i32)),
+                _ => {
+                    self.out.field_clobbers.push((src, k, size.max(1) as i32));
+                    // (WS95: no pointer at all: a narrower store, a number)
+                    if size < 8 || matches!(v, Val::Const(_)) {
+                        self.out.field_numbers.push((src, k, size.max(1) as i32));
+                    }
+                }
             },
             _ => {}
         }
@@ -357,6 +513,7 @@ impl Interp<'_> {
                             let fv = match v {
                                 Val::Ptr(Src::Stack, s2) => self.stack_ev(st, s2).map(FieldVal::Obj),
                                 Val::Ptr(src, o) => Some(FieldVal::Ptr(src, o)),
+                                Val::Elem(src) => Some(FieldVal::Elem(src)),
                                 _ => None,
                             };
                             if let Some(fv) = fv {
@@ -366,12 +523,94 @@ impl Interp<'_> {
                     }
                 }
                 Val::Const(0) => {}
-                _ => mask |= 1 << j,
+                v => {
+                    mask |= 1 << j;
+                    if let Val::Elem(s) = v {
+                        self.out.elem_args.push((id, j as u8, s));
+                    }
+                }
             }
         }
         if target != 0 && mask != 0 {
             self.out.top_args.push((target, mask));
         }
+    }
+
+    /// What call `id` to `target` (0: indirect, through `i`) does to the buffers its pointer
+    /// arguments reach (WS95): a function of the binary's says it in its own summary (composed
+    /// later); an import by its kind; unknown code may write anything there.
+    fn call_effects(&mut self, st: &St, id: u32, target: u64, i: &Instruction) {
+        let kind = if target != 0 {
+            match self.env.imports.get(&target) {
+                Some(&k) => k,
+                None if self.env.functions.is_none_or(|f| f.binary_search(&target).is_ok()) => return,
+                None => ImportKind::Escape,
+            }
+        } else {
+            ImportKind::Escape
+        };
+        let ptr = |j: usize| match st.r[ARG_REGS[j]] {
+            Val::Ptr(s, k) if s != Src::Stack => Some((s, k)),
+            Val::Elem(s) => Some((s, ELEM)),
+            _ => None,
+        };
+        match kind {
+            ImportKind::Pure => {}
+            ImportKind::Copy => match (ptr(0), ptr(1)) {
+                (Some(d), Some(s)) => self.out.buf_copies.push((d.0, s.0)),
+                (Some(d), None) => self.out.buf_writes.push(d.0),
+                _ => {}
+            },
+            ImportKind::Realloc => {
+                if let Some(s) = ptr(0) {
+                    self.out.buf_copies.push((Src::Ret(id), s.0));
+                }
+            }
+            ImportKind::Memset => {
+                if st.r[ARG_REGS[1]] != Val::Const(0)
+                    && let Some(d) = ptr(0)
+                {
+                    self.out.buf_writes.push(d.0);
+                }
+            }
+            ImportKind::WritesArgs => {
+                for j in 0..6 {
+                    if let Some(p) = ptr(j) {
+                        self.out.buf_writes.push(p.0);
+                    }
+                }
+            }
+            ImportKind::Escape => {
+                // (the object of a virtual call: its class's methods say what they do to it)
+                let receiver = target == 0 && self.virtual_receiver(st, i);
+                for j in usize::from(receiver)..6 {
+                    if let Some(p) = ptr(j) {
+                        self.out.buf_escapes.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the indirect call `i` calls a slot of the vtable of the object in `rdi`
+    /// (`call [vt + k]` / `call r` with `r = [vt + k]`, `vt = [rdi]`).
+    fn virtual_receiver(&self, st: &St, i: &Instruction) -> bool {
+        let slot = match i.op0_kind() {
+            OpKind::Memory => match self.addr(st, i) {
+                Val::Ptr(Src::Ld(vt), _) => Some(vt),
+                _ => None,
+            },
+            OpKind::Register => match gpr(i.op0_register()).map(|g| st.r[g]) {
+                Some(Val::Ptr(Src::Ld(f), 0)) => match self.out.loads.get(f as usize) {
+                    Some(&(Src::Ld(vt), _)) => Some(vt),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(vt) = slot else { return false };
+        matches!(self.out.loads.get(vt as usize), Some(&(obj, 0)) if st.r[ARG_REGS[0]] == Val::Ptr(obj, 0))
     }
 
     /// One instruction; `call_id` names a call / tail jump, `outside` says a branch leaves
@@ -446,6 +685,20 @@ impl Interp<'_> {
                     st.r[g] = if i.op0_register().size() >= 4 { Val::Const(0) } else { Val::Unk };
                 }
             }
+            // (WS95) a pointer plus / minus a number in a register: a pointer into its buffer
+            Mnemonic::Add | Mnemonic::Sub if i.op_count() == 2 && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register && reg64(i.op0_register()) && reg64(i.op1_register()) => {
+                let (d, s) = (gpr(i.op0_register()).expect("gpr64"), gpr(i.op1_register()).expect("gpr64"));
+                let into = |v: Val| match v {
+                    Val::Ptr(x, _) | Val::Elem(x) if x != Src::Stack => Some(x),
+                    _ => None,
+                };
+                let number = |v: Val| matches!(v, Val::Unk | Val::Const(_));
+                st.r[d] = match (st.r[d], st.r[s]) {
+                    (a, b) if number(b) && into(a).is_some() => Val::Elem(into(a).expect("pointer")),
+                    (a, b) if i.mnemonic() == Mnemonic::Add && number(a) && into(b).is_some() => Val::Elem(into(b).expect("pointer")),
+                    _ => Val::Unk,
+                };
+            }
             Mnemonic::Push if i.op_count() == 1 => {
                 let v = match i.op0_kind() {
                     OpKind::Register if reg64(i.op0_register()) => gpr(i.op0_register()).map_or(Val::Unk, |g| st.r[g]),
@@ -478,6 +731,7 @@ impl Interp<'_> {
                 let target = if i.op0_kind() == OpKind::NearBranch64 { i.near_branch64() } else { 0 };
                 if emit && id != u32::MAX {
                     self.call_args(st, id, target);
+                    self.call_effects(st, id, target, i);
                 }
                 // a stack object passed to the call may be written by it; it stays the object it
                 // was (its vtable pointer, the call it was first given to), else this call made it
@@ -532,6 +786,7 @@ impl Interp<'_> {
                         // a tail call
                         if let Some(id) = call_id {
                             self.call_args(st, id, i.near_branch64());
+                            self.call_effects(st, id, i.near_branch64(), i);
                         }
                     }
                 }
@@ -564,7 +819,24 @@ impl Interp<'_> {
         if writes_memory {
             match addr {
                 Val::Ptr(Src::Stack, s) => st.store_slot(s, i.memory_size().size().max(8) as u32, Val::Unk),
-                Val::Ptr(src, k) if emit => self.out.field_clobbers.push((src, k, i.memory_size().size().max(1) as i32)),
+                Val::Ptr(_, _) | Val::Elem(_) if emit => {
+                    let (src, k) = match addr {
+                        Val::Ptr(src, k) => (src, k),
+                        Val::Elem(src) => (src, ELEM),
+                        _ => unreachable!(),
+                    };
+                    let n = i.memory_size().size().max(1);
+                    self.out.field_clobbers.push((src, k, n as i32));
+                    // (WS95: arithmetic on memory, a narrower write: no pointer; a wide copy,
+                    // `cmpxchg`, `movq` may be pointers)
+                    let arith = matches!(
+                        i.mnemonic(),
+                        Mnemonic::Add | Mnemonic::Sub | Mnemonic::Inc | Mnemonic::Dec | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Not | Mnemonic::Neg | Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Adc | Mnemonic::Sbb | Mnemonic::Xadd | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc | Mnemonic::Rol | Mnemonic::Ror
+                    );
+                    if n < 8 || (n == 8 && arith) {
+                        self.out.field_numbers.push((src, k, n as i32));
+                    }
+                }
                 // a string store through `rdi` into the frame (`rep stosq`): the slots are not known
                 _ if !has_mem && matches!(st.r[7], Val::Ptr(Src::Stack, _)) => st.slots.clear(),
                 _ => {}
@@ -576,6 +848,23 @@ impl Interp<'_> {
 /// The summary of the function at `[start, start + len)` (x86-64); `vt_points` are the vtable
 /// address points of the binary.
 pub fn summarize(mem: &Memory, start: u64, len: u64, vt_points: &FxHashSet<u64>) -> Summary {
+    summarize_in(mem, start, len, &Env { vt_points, imports: &FxHashMap::default(), functions: None })
+}
+
+/// What a summary knows of the binary around the function (WS95).
+pub struct Env<'a> {
+    /// the vtable address points of the binary
+    pub vt_points: &'a FxHashSet<u64>,
+    /// the PLT stubs of the imports, by what they do
+    pub imports: &'a FxHashMap<u64, ImportKind>,
+    /// the functions of the binary (sorted); a direct call elsewhere is unknown code (`None`:
+    /// every direct call is to a function of the binary)
+    pub functions: Option<&'a [u64]>,
+}
+
+/// [`summarize`] in `env`.
+pub fn summarize_in(mem: &Memory, start: u64, len: u64, env: &Env) -> Summary {
+    let vt_points = env.vt_points;
     let Some(block) = mem.find_block(start) else { return Summary::default() };
     let Some(data) = block.data.as_ref() else { return Summary::default() };
     let from = (start - block.start) as usize;
@@ -678,7 +967,7 @@ pub fn summarize(mem: &Memory, start: u64, len: u64, vt_points: &FxHashSet<u64>)
         s
     };
 
-    let mut it = Interp { vt_points, loads: FxHashMap::default(), out: Summary::default(), info: InstructionInfoFactory::new(), fallback: None };
+    let mut it = Interp { vt_points, env, loads: FxHashMap::default(), out: Summary::default(), info: InstructionInfoFactory::new(), fallback: None };
     let mut states: Vec<Option<St>> = vec![None; nb];
     states[0] = Some(St::entry());
     let mut work: Vec<usize> = vec![0];
@@ -795,6 +1084,9 @@ pub struct ThisIndex {
     /// `(function, parameter, k)` -> the class of the pointer at `+k` of the object every caller
     /// passes as that parameter (WS94)
     pub param_fields: FxHashMap<(u64, u8, i32), u32>,
+    /// `(container class, begin offset)` -> the class of the pointers in the buffer (an array /
+    /// a vector) whose begin pointer is at that offset of the class (class + 2; WS95)
+    pub elements: FxHashMap<(u32, i32), u32>,
     pub stats: IndexStats,
 }
 
@@ -809,6 +1101,8 @@ pub struct IndexStats {
     pub seeded_this: u64,
     pub summarize_ms: u64,
     pub solve_ms: u64,
+    /// WS95: composing the effect summaries
+    pub compose_ms: u64,
 }
 
 impl ThisIndex {
@@ -847,6 +1141,16 @@ impl ThisIndex {
         (l >= 2).then(|| self.vt(l - 2)).flatten()
     }
 
+    /// The class (primary vtable) of the pointers in the buffer whose begin pointer is at offset
+    /// `off` of objects of the class whose primary vtable is `vt` (WS95): the join of what the
+    /// functions of that class and of its bases store into it.
+    pub fn element_class(&self, vt: u64, off: i64) -> Option<u64> {
+        let c = self.class_of_vtable(vt)?;
+        let off = i32::try_from(off).ok()?;
+        let l = lookup(&self.hierarchy, &self.elements, c, off);
+        (l >= 2).then(|| self.vt(l - 2)).flatten()
+    }
+
     /// The fields and member objects of known class of the class whose primary vtable is `vt`
     /// (its own and its bases'): `(offset, class vtable, member)` by offset.
     pub fn class_fields(&self, vt: u64) -> Vec<(i32, u64, bool)> {
@@ -862,6 +1166,24 @@ impl ThisIndex {
             .filter_map(|(off, m)| {
                 let l = lookup(&self.hierarchy, if m { &self.members } else { &self.fields }, c, off);
                 Some((off, self.vt((l >= 2).then(|| l - 2)?)?, m))
+            })
+            .collect()
+    }
+
+    /// The element classes of the class whose primary vtable is `vt` (its own and its bases'):
+    /// `(begin offset, element class vtable)` by offset (WS95).
+    pub fn class_elements(&self, vt: u64) -> Vec<(i32, u64)> {
+        let Some(c) = self.class_of_vtable(vt) else { return Vec::new() };
+        let mut offs: Vec<i32> = std::iter::once(c)
+            .chain(self.hierarchy.bases[c as usize].iter().copied())
+            .flat_map(|k| self.elements.keys().filter(move |f| f.0 == k).map(|f| f.1))
+            .collect();
+        offs.sort_unstable();
+        offs.dedup();
+        offs.into_iter()
+            .filter_map(|off| {
+                let l = lookup(&self.hierarchy, &self.elements, c, off);
+                Some((off, self.vt((l >= 2).then(|| l - 2)?)?))
             })
             .collect()
     }
@@ -1027,6 +1349,8 @@ pub fn universe(mem: &Memory) -> Universe {
 /// The classes known in a round, to evaluate the values of one function.
 struct Ctx<'a> {
     h: &'a Hierarchy,
+    /// primary vtable -> class
+    primary: &'a FxHashMap<u64, u32>,
     starts: &'a [u64],
     sums: &'a [Summary],
     evidence: &'a [FxHashMap<(Src, i32), u32>],
@@ -1035,6 +1359,8 @@ struct Ctx<'a> {
     r: &'a [u32],
     fields: &'a FxHashMap<(u32, i32), u32>,
     members: &'a FxHashMap<(u32, i32), u32>,
+    /// WS95: `(container class, begin offset)` -> the element class
+    elements: &'a FxHashMap<(u32, i32), u32>,
     /// WS94: the parameters whose callers are not all known
     fixed: &'a [[bool; 6]],
     /// WS94: `(function, parameter, k)` -> the class of the pointer at `+k` of what the callers
@@ -1067,6 +1393,10 @@ impl Ctx<'_> {
                 None => TOP,
             }),
             Src::Ld(l) => ev.get(&(src, 0)).copied().unwrap_or(ld[l as usize]),
+            Src::Obj(i) => match self.sums[k].objs[i as usize] {
+                crate::effects::ObjRef::Vtable(vt) => self.primary.get(&vt).map_or(TOP, |&c| cls(c)),
+                crate::effects::ObjRef::RetOf(f) => self.fidx(f).map_or(TOP, |t| self.r[t]),
+            },
         }
     }
 
@@ -1080,7 +1410,8 @@ impl Ctx<'_> {
 
     /// The class of the object at `src + off` (a member object when `off` is not 0).
     fn value(&self, k: usize, src: Src, off: i32, ld: &[u32]) -> u32 {
-        if src == Src::Stack {
+        // (a pointer into a buffer, WS95: no object of a class)
+        if src == Src::Stack || off == ELEM {
             return TOP;
         }
         let b = self.base(k, src, ld);
@@ -1093,12 +1424,47 @@ impl Ctx<'_> {
         }
     }
 
+    /// The container class and begin offset of the buffer the pointer loaded by `loads[b]` of
+    /// `k` points into (WS95): `loads[b] = (bs, bf)`, the begin pointer at `bf` (>= 0) of the
+    /// object `bs` points to; or a vector's end pointer (`*end = x; end += 8`: begin 8 before).
+    fn buffer(&self, k: usize, b: u32, ld: &[u32]) -> Option<(u32, i32)> {
+        let s = &self.sums[k];
+        let &(bs, bf) = s.loads.get(b as usize)?;
+        if bf == ELEM {
+            return None;
+        }
+        let begin = if bf >= 0 {
+            bf
+        } else {
+            return None;
+        };
+        // (a vector's end pointer stored back one element on: the begin pointer is 8 before)
+        let off = if begin >= 8 && s.field_stores.contains(&(bs, begin, Src::Ld(b), 8)) { begin - 8 } else { begin };
+        let c = self.base(k, bs, ld);
+        (c >= 2).then_some((c - 2, off))
+    }
+
     /// The classes of the values function `k` loads (a field's class by its container's).
     fn loads(&self, k: usize) -> Vec<u32> {
         let s = &self.sums[k];
         let mut ld = vec![BOT; s.loads.len()];
         for l in 0..s.loads.len() {
             let (src, off) = s.loads[l];
+            if off == ELEM {
+                // WS95: an element of the buffer whose begin pointer is `src` (`Ld(b)`, the
+                // pointer at `bs + bf` of a container of a known class)
+                ld[l] = match src {
+                    Src::Ld(b) => match self.buffer(k, b, &ld) {
+                        Some((c, bf)) => match lookup(self.h, self.elements, c, bf) {
+                            BOT => TOP,
+                            v => v,
+                        },
+                        None => TOP,
+                    },
+                    _ => TOP,
+                };
+                continue;
+            }
             let c = self.base(k, src, &ld);
             ld[l] = if c >= 2 {
                 match lookup(self.h, self.fields, c - 2, off) {
@@ -1134,7 +1500,11 @@ impl Ctx<'_> {
     /// write it.
     fn own_stores(&self, k: usize, src: Src, off: i32, ld: &[u32]) -> u32 {
         let s = &self.sums[k];
-        if s.field_clobbers.iter().any(|&(a, o, n)| a == src && o < off.saturating_add(8) && o.saturating_add(n) > off) {
+        if s.field_clobbers.iter().any(|&(a, o, n)| a == src && (o == ELEM || (o < off.saturating_add(8) && o.saturating_add(n) > off))) {
+            return TOP;
+        }
+        // (a pointer stored at an offset not known may be stored there)
+        if self.stores[k].contains_key(&(src, ELEM)) {
             return TOP;
         }
         let mut v = BOT;
@@ -1210,7 +1580,7 @@ const MAX_DEMAND: usize = 64;
 
 /// What one function contributes in a round: `(callee, parameter, class)`, its return class,
 /// field classes and member classes by `(container class, offset)`.
-type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>);
+type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>, Vec<(u32, i32, i32)>, Vec<((u32, i32), u32)>);
 
 /// The propagation over the summaries of the functions `starts` (address order); `external`
 /// functions (exported) may be called with anything.
@@ -1381,7 +1751,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 .iter()
                 .filter_map(|&(c, j, k, v)| match v {
                     FieldVal::Obj(e) => Some(((c, j, k), class_of_ev(e))),
-                    FieldVal::Ptr(..) => None,
+                    FieldVal::Ptr(..) | FieldVal::Elem(_) => None,
                 })
                 .collect();
             let out: StackClasses = (passed, pointed);
@@ -1482,7 +1852,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 .iter()
                 .filter_map(|&(c, j, k, v)| match v {
                     FieldVal::Ptr(vs, vo) => Some(((c, j, k), (vs, vo))),
-                    FieldVal::Obj(_) => None,
+                    FieldVal::Obj(_) | FieldVal::Elem(_) => None,
                 })
                 .collect();
             (st, sp)
@@ -1493,6 +1863,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     let mut r = vec![BOT; n];
     let mut fields: FxHashMap<(u32, i32), u32> = FxHashMap::default();
     let mut members: FxHashMap<(u32, i32), u32> = FxHashMap::default();
+    let mut elements: FxHashMap<(u32, i32), u32> = FxHashMap::default();
     let mut rounds = 0;
     let mut converged = false;
     while rounds < max_rounds {
@@ -1502,7 +1873,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             .into_par_iter()
             .map(|k| {
                 let s = &sums[k];
-                let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
+                let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, elements: &elements, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
                 let ld = cx.loads(k);
                 let value = |src: Src, off: i32, ld: &[u32]| cx.value(k, src, off, ld);
                 let base = |src: Src, ld: &[u32]| cx.base(k, src, ld);
@@ -1535,6 +1906,32 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         fs.push(((b - 2, off), value(vs, vo, &ld)));
                     }
                 }
+                // (WS95: bytes written with something else — here or by a callee — make the
+                // fields they overlap unknown)
+                let mut cl = Vec::new();
+                for &(src, off, n) in s.field_numbers.iter().filter(|f| f.1 > 0) {
+                    let b = base(src, &ld);
+                    if b >= 2 {
+                        cl.push((b - 2, off, n));
+                    }
+                }
+                // WS95: the elements of the buffers of containers of a known class
+                let mut es = Vec::new();
+                for &(src, _, vs, vo) in s.field_stores.iter().filter(|f| f.1 == ELEM) {
+                    if let Src::Ld(b) = src
+                        && let Some(key) = cx.buffer(k, b, &ld)
+                    {
+                        es.push((key, value(vs, vo, &ld)));
+                    }
+                }
+                let clobbers = s.field_numbers.iter().map(|f| (f.0, f.1)).chain(s.buf_writes.iter().map(|&w| (w, ELEM))).chain(s.buf_escapes.iter().copied());
+                for (src, _off) in clobbers.filter(|f| f.1 == ELEM) {
+                    if let Src::Ld(b) = src
+                        && let Some(key) = cx.buffer(k, b, &ld)
+                    {
+                        es.push((key, TOP));
+                    }
+                }
                 let mut ms = Vec::new();
                 for &(src, off, vt) in &s.vt_stores {
                     if off <= 0 || src == Src::Stack {
@@ -1547,7 +1944,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         ms.push(((b - 2, off), cls(c)));
                     }
                 }
-                (contrib, ret, fs, ms, pfs)
+                (contrib, ret, fs, ms, pfs, cl, es)
             })
             .collect();
         let mut np = init.clone();
@@ -1555,7 +1952,16 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
         let mut nf: FxHashMap<(u32, i32), u32> = FxHashMap::default();
         let mut nm: FxHashMap<(u32, i32), u32> = FxHashMap::default();
         let mut npf = pf_init.clone();
-        for (k, (contrib, ret, fs, ms, pfs)) in per.into_iter().enumerate() {
+        let mut clobbered: FxHashMap<u32, Vec<(i32, i32)>> = FxHashMap::default();
+        let mut ne: FxHashMap<(u32, i32), u32> = FxHashMap::default();
+        for (k, (contrib, ret, fs, ms, pfs, cl, es)) in per.into_iter().enumerate() {
+            for (key, v) in es {
+                let e = ne.entry(key).or_insert(BOT);
+                *e = join(h, *e, v);
+            }
+            for (c, off, n) in cl {
+                clobbered.entry(c).or_default().push((off, n));
+            }
             for (x, v) in pfs {
                 let e = &mut npf[x as usize];
                 *e = join(h, *e, v);
@@ -1574,7 +1980,25 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 *e = join(h, *e, v);
             }
         }
-        let same = np == p && nr == r && nf == fields && nm == members && npf == pf;
+        // (also where the class itself stores nothing: a derived class's field of a base)
+        for (&c, rs) in &clobbered {
+            for &(o, n) in rs {
+                let mut a = o & !7;
+                while a < o.saturating_add(n) && a - (o & !7) < 0x80 {
+                    nf.insert((c, a), TOP);
+                    a += 8;
+                }
+            }
+        }
+        for ((c, off), v) in nf.iter_mut() {
+            if let Some(rs) = clobbered.get(c)
+                && rs.iter().any(|&(o, n)| o < off.saturating_add(8) && o.saturating_add(n) > *off)
+            {
+                *v = TOP;
+            }
+        }
+        let same = np == p && nr == r && nf == fields && nm == members && npf == pf && ne == elements;
+        elements = ne;
         pf = npf;
         p = np;
         r = nr;
@@ -1588,7 +2012,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
 
     // (development: `REARGO_THIS_EXPLAIN=0x…,0x…` prints why `this` of those functions is what it is)
     if let Some(list) = std::env::var_os("REARGO_THIS_EXPLAIN") {
-        let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
+        let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, elements: &elements, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
         let show = |v: u32| match v {
             BOT => "nothing".to_string(),
             TOP => "unknown".to_string(),
@@ -1648,6 +2072,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     }
     idx.fields = fields.into_iter().filter(|e| e.1 >= 2).collect();
     idx.members = members.into_iter().filter(|e| e.1 >= 2).collect();
+    idx.elements = elements.into_iter().filter(|e| e.1 >= 2).collect();
     idx.param_fields = pf_keys.iter().zip(&pf).filter(|e| *e.1 >= 2).map(|(&(f, j, k), &v)| ((starts[f as usize], j, k), v - 2)).collect();
     let seeded_this = (0..n).filter(|&k| seed[k][usize::from(sums[k].returns_first())] >= 2).count() as u64;
     idx.stats = IndexStats { functions: n as u64, classes: h.vtables.len() as u64, rounds: rounds as u64, converged, seeded_this, ..Default::default() };
@@ -1679,14 +2104,25 @@ pub fn plt_targets(mem: &Memory) -> FxHashMap<u64, u64> {
 /// The index of the functions `[start, start + len)` of `mem`; `external` are the functions
 /// another module may call (exported).
 pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIndex {
+    build_with(mem, functions, external, &[])
+}
+
+/// [`build`], `imports` naming the PLT stubs of the imports (`(stub, symbol)`, WS95: what a call
+/// to one does to the memory its arguments reach; a direct call to an address that is neither a
+/// function nor a stub named there is unknown code).
+pub fn build_with(mem: &Memory, functions: &[(u64, u64)], external: &[u64], imports: &[(u64, String)]) -> ThisIndex {
     let t0 = std::time::Instant::now();
     let u = universe(mem);
     let mut fs: Vec<(u64, u64)> = functions.to_vec();
     fs.sort_unstable();
     fs.dedup_by_key(|f| f.0);
-    let mut sums: Vec<Summary> = fs.par_iter().map(|&(s, l)| summarize(mem, s, l, &u.vt_points)).collect();
     // (a call through the image's own PLT is a call to the function)
     let plt = plt_targets(mem);
+    let mut known: Vec<u64> = fs.iter().map(|f| f.0).chain(plt.keys().copied()).collect();
+    known.sort_unstable();
+    let kinds: FxHashMap<u64, ImportKind> = imports.iter().filter(|i| !plt.contains_key(&i.0)).map(|(a, n)| (*a, import_kind(n))).collect();
+    let env = Env { vt_points: &u.vt_points, imports: &kinds, functions: (!imports.is_empty()).then_some(known.as_slice()) };
+    let mut sums: Vec<Summary> = fs.par_iter().map(|&(s, l)| summarize_in(mem, s, l, &env)).collect();
     if !plt.is_empty() {
         let through = |a: &mut u64| {
             if let Some(&f) = plt.get(a) {
@@ -1699,17 +2135,42 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIn
             s.top_args.iter_mut().for_each(|t| through(&mut t.0));
         }
     }
-    let t1 = std::time::Instant::now();
     let starts: Vec<u64> = fs.iter().map(|f| f.0).collect();
+    // WS95: the callees' effects, composed bottom-up (not those on a parameter whose class a
+    // vtable listing the function or a vtable it stores there gives)
+    let export: Vec<u8> = starts
+        .par_iter()
+        .zip(&sums)
+        .map(|(f, s)| {
+            let mut m = 0x3fu8;
+            if u.listing.contains_key(f) {
+                m &= !(1 << u8::from(s.returns_first()));
+            }
+            for &(d, off, vt) in &s.vt_stores {
+                if let (Src::Arg(i), 0) = (d, off)
+                    && u.primary.contains_key(&vt)
+                {
+                    m &= !(1 << i);
+                }
+            }
+            m
+        })
+        .collect();
+    let t_sum = std::time::Instant::now();
+    // (development: `REARGO_NO_EFFECTS=1` leaves them out, to compare)
+    let sums = if std::env::var_os("REARGO_NO_EFFECTS").is_some() { sums } else { crate::effects::compose(&starts, sums, &export) };
+    let compose_ms = t_sum.elapsed().as_millis() as u64;
+    let t1 = std::time::Instant::now();
     let mut idx = solve(&u, &starts, &sums, &external.iter().copied().collect(), MAX_ROUNDS);
-    idx.stats.summarize_ms = (t1 - t0).as_millis() as u64;
+    idx.stats.summarize_ms = (t1 - t0).as_millis() as u64 - compose_ms;
+    idx.stats.compose_ms = compose_ms;
     idx.stats.solve_ms = t1.elapsed().as_millis() as u64;
     idx
 }
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 10;
+const INDEX_VERSION: u8 = 11;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -1722,7 +2183,7 @@ impl ThisIndex {
         b.push(INDEX_VERSION);
         u64_(&mut b, key);
         let s = &self.stats;
-        for v in [s.functions, s.classes, s.rounds, u64::from(s.converged), s.summarize_ms, s.solve_ms, s.seeded_this] {
+        for v in [s.functions, s.classes, s.rounds, u64::from(s.converged), s.summarize_ms, s.solve_ms, s.seeded_this, s.compose_ms] {
             u64_(&mut b, v);
         }
         u32_(&mut b, self.hierarchy.vtables.len() as u32);
@@ -1749,7 +2210,7 @@ impl ThisIndex {
             u64_(&mut b, *f);
             u32_(&mut b, *c);
         }
-        for map in [&self.fields, &self.members] {
+        for map in [&self.fields, &self.members, &self.elements] {
             let mut m: Vec<_> = map.iter().collect();
             m.sort_unstable();
             u32_(&mut b, m.len() as u32);
@@ -1792,11 +2253,11 @@ impl ThisIndex {
             return None;
         }
         let mut idx = ThisIndex::default();
-        let mut st = [0u64; 7];
+        let mut st = [0u64; 8];
         for v in st.iter_mut() {
             *v = r.u64()?;
         }
-        idx.stats = IndexStats { functions: st[0], classes: st[1], rounds: st[2], converged: st[3] != 0, summarize_ms: st[4], solve_ms: st[5], seeded_this: st[6] };
+        idx.stats = IndexStats { functions: st[0], classes: st[1], rounds: st[2], converged: st[3] != 0, summarize_ms: st[4], solve_ms: st[5], seeded_this: st[6], compose_ms: st[7] };
         let n = r.u32()? as usize;
         for _ in 0..n {
             idx.hierarchy.vtables.push(r.u64()?);
@@ -1819,14 +2280,14 @@ impl ThisIndex {
             let f = r.u64()?;
             idx.rets.insert(f, r.u32()?);
         }
-        for m in 0..2 {
+        for m in 0..3 {
             for _ in 0..r.u32()? {
                 let (c, off, v) = (r.u32()?, r.u32()? as i32, r.u32()?);
-                if m == 0 {
-                    idx.fields.insert((c, off), v);
-                } else {
-                    idx.members.insert((c, off), v);
-                }
+                match m {
+                    0 => idx.fields.insert((c, off), v),
+                    1 => idx.members.insert((c, off), v),
+                    _ => idx.elements.insert((c, off), v),
+                };
             }
         }
         for _ in 0..r.u32()? {
@@ -1886,8 +2347,11 @@ pub fn load_or_build(binary: &std::path::Path, mem: &Memory, hdr: Option<u64>, r
     if functions.is_empty() {
         return None;
     }
-    let external = std::fs::read(binary).map(|d| reargo_loader::elf_exported_functions(&d)).unwrap_or_default();
-    let idx = build(mem, &functions, &external);
+    let data = std::fs::read(binary).unwrap_or_default();
+    let external = reargo_loader::elf_exported_functions(&data);
+    let imports = reargo_loader::elf_import_stubs(&data);
+    drop(data);
+    let idx = build_with(mem, &functions, &external, &imports);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
@@ -1951,6 +2415,65 @@ mod tests {
         assert_eq!(s.stack_fields, [(0, 0, 8, FieldVal::Ptr(Src::Arg(1), 0))]);
         assert_eq!(s.field_stores, [(Src::Arg(0), 0x10, Src::Arg(1), 0)]);
         assert_eq!(s.field_clobbers, [(Src::Arg(0), 0x18, 4)]);
+    }
+
+    /// WS95: a pointer stepped through a buffer in a loop, or indexed, points to its elements:
+    /// what is loaded / stored through it is keyed `(buffer pointer, ELEM)`.
+    #[test]
+    fn a_summary_keys_the_elements_of_a_buffer() {
+        let code = [
+            0x48, 0x8b, 0x47, 0x08, // mov rax, [rdi+8] (the begin pointer)
+            0x48, 0x8b, 0x57, 0x10, // mov rdx, [rdi+0x10]
+            0x48, 0x8b, 0x08, // L: mov rcx, [rax]
+            0x48, 0x89, 0x4e, 0x08, // mov [rsi+8], rcx
+            0x48, 0x83, 0xc0, 0x08, // add rax, 8
+            0x48, 0x39, 0xd0, // cmp rax, rdx
+            0x75, 0xf0, // jne L
+            0x4c, 0x8b, 0x47, 0x08, // mov r8, [rdi+8]
+            0x49, 0x89, 0x34, 0xc8, // mov [r8+rcx*8], rsi
+            0xc3,
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        let begin = s.loads.iter().position(|&l| l == (Src::Arg(0), 8)).expect("begin load") as u32;
+        let elem = s.loads.iter().position(|&l| l == (Src::Ld(begin), ELEM));
+        assert!(elem.is_some(), "{:?}", s.loads);
+        assert!(s.field_stores.contains(&(Src::Ld(begin), ELEM, Src::Arg(1), 0)), "{:?}", s.field_stores);
+        assert!(s.field_stores.contains(&(Src::Arg(1), 8, Src::Ld(elem.expect("elem") as u32), 0)), "{:?}", s.field_stores);
+    }
+
+    /// WS95: an import copying memory copies the elements of one buffer into another; unknown
+    /// code given a pointer may write anything where it reaches (the object of a virtual call
+    /// excepted: its class's methods say what they do).
+    #[test]
+    fn a_summary_records_what_calls_may_do_to_buffers() {
+        let code = [
+            0x53, // push rbx
+            0x48, 0x89, 0xfb, // mov rbx, rdi
+            0x48, 0x8b, 0x7f, 0x08, // mov rdi, [rdi+8]
+            0x48, 0x8b, 0x76, 0x10, // mov rsi, [rsi+0x10]
+            0xe8, 0xef, 0x00, 0x00, 0x00, // call 0x1100 (memcpy)
+            0x48, 0x8d, 0x7b, 0x20, // lea rdi, [rbx+0x20]
+            0xe8, 0xe6, 0x01, 0x00, 0x00, // call 0x1200 (an import not known)
+            0x48, 0x89, 0xdf, // mov rdi, rbx
+            0x48, 0x8b, 0x03, // mov rax, [rbx]
+            0xff, 0x50, 0x10, // call [rax+0x10] (virtual: on this)
+            0x48, 0x89, 0xdf, // mov rdi, rbx
+            0x48, 0x8d, 0x73, 0x30, // lea rsi, [rbx+0x30]
+            0x48, 0x8b, 0x03, // mov rax, [rbx]
+            0xff, 0x50, 0x18, // call [rax+0x18] (rsi given to it)
+            0x5b, 0xc3, // pop rbx ; ret
+        ];
+        let imports: FxHashMap<u64, ImportKind> = [(0x1100, import_kind("memcpy@plt")), (0x1200, import_kind("frobnicate"))].into_iter().collect();
+        let vts = FxHashSet::default();
+        let s = summarize_in(&text(&code), 0x1000, code.len() as u64, &Env { vt_points: &vts, imports: &imports, functions: Some(&[0x1000]) });
+        assert_eq!(s.loads[..2], [(Src::Arg(0), 8), (Src::Arg(1), 0x10)]);
+        assert_eq!(s.buf_copies, [(Src::Ld(0), Src::Ld(1))]);
+        assert_eq!(s.buf_escapes, [(Src::Arg(0), 0x20), (Src::Arg(0), 0x30)]);
+        assert!(s.buf_writes.is_empty());
+        assert_eq!(import_kind("strlen"), ImportKind::Pure);
+        assert_eq!(import_kind("snprintf"), ImportKind::WritesArgs);
+        assert_eq!(import_kind("sqrtf"), ImportKind::WritesArgs);
+        assert_eq!(import_kind("pthread_once"), ImportKind::Escape);
     }
 
     /// A spilled `this` comes back from its stack slot; two values joined at a branch are no
@@ -2086,6 +2609,7 @@ mod tests {
         idx.fields.insert((0, 8), cls(1));
         idx.members.insert((1, 0x10), cls(0));
         idx.param_fields.insert((0x1000, 1, 0x18), 1);
+        idx.elements.insert((0, 0x20), cls(0));
         idx.stats.rounds = 3;
         let b = idx.to_bytes(42);
         assert_eq!(ThisIndex::from_bytes(&b, 42), Some(idx.clone()));
@@ -2096,6 +2620,8 @@ mod tests {
         assert_eq!(idx.ret_class(0x1100), Some(0x10));
         assert_eq!(idx.param_field_class(0x1000, 1, 0x18), Some(0x20));
         assert_eq!(idx.param_field_class(0x1000, 0, 0x18), None);
+        assert_eq!(idx.element_class(0x10, 0x20), Some(0x10));
+        assert_eq!(idx.element_class(0x20, 0x20), Some(0x10), "an element buffer of a base class");
         // a field of a base class is a field of the derived class
         assert_eq!(idx.field_class(0x20, 8), Some(0x20));
         assert_eq!(idx.field_class(0x10, 0x10), None);
