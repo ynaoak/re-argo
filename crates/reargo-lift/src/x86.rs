@@ -365,8 +365,10 @@ pub struct InsnFacts {
     base: u64,
     end: u64,
     pages: Vec<std::sync::OnceLock<Box<[std::sync::atomic::AtomicU16]>>>,
-    /// [`Span`]s by start address, in pages like `pages` ([`X86Lifter::plain_walk`]).
-    spans: Vec<std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>>>,
+    /// [`Span`]s by start address ([`X86Lifter::plain_walk`]), in pages like `pages`: a few
+    /// per [`SPAN_BYTES`] region, each `(offset in the region + 1) << 32 | span` (walks that
+    /// agree on where the instructions are start their spans at the same addresses).
+    spans: Vec<std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>>,
 }
 
 /// The instructions of a walk from an address to the next [`SPAN_BYTES`] boundary (those
@@ -381,6 +383,8 @@ pub struct InsnFacts {
 struct Span(u32);
 
 const SPAN_BYTES: u64 = 256;
+/// Spans kept per region (a span starting elsewhere in a full region is computed each time).
+const SPAN_SLOTS: usize = 2;
 const SPAN_KNOWN: u32 = 1 << 31;
 const SPAN_STOP: u32 = 1 << 30;
 const SPAN_FAIL_CLEAR: u32 = 1 << 29;
@@ -454,14 +458,17 @@ impl InsnFacts {
         Some(self.pages.get(k)?.get()?)
     }
 
-    /// The span cell of `addr`, `None` outside the table.
-    fn span_cell(&self, addr: u64) -> Option<&std::sync::atomic::AtomicU32> {
+    /// The span slots of the region `addr` is in and its key there, `None` outside the table.
+    fn span_slots(&self, addr: u64) -> Option<(&[std::sync::atomic::AtomicU64], u64)> {
         if addr < self.base || addr >= self.end {
             return None;
         }
         let k = ((addr >> FACT_PAGE_BITS) - (self.base >> FACT_PAGE_BITS)) as usize;
-        let page = self.spans.get(k)?.get_or_init(|| (0..1usize << FACT_PAGE_BITS).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
-        page.get((addr & ((1u64 << FACT_PAGE_BITS) - 1)) as usize)
+        let regions = 1usize << (FACT_PAGE_BITS - SPAN_BYTES.trailing_zeros());
+        let page = self.spans.get(k)?.get_or_init(|| (0..regions * SPAN_SLOTS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
+        let in_page = (addr & ((1u64 << FACT_PAGE_BITS) - 1)) as usize;
+        let r = in_page / SPAN_BYTES as usize;
+        Some((&page[r * SPAN_SLOTS..(r + 1) * SPAN_SLOTS], (addr % SPAN_BYTES + 1) << 32))
     }
 
     /// The cells of the page `addr` is in (pages are aligned to their size), `None` outside
@@ -640,11 +647,13 @@ impl X86Lifter {
     /// The span starting at `addr` (computed and kept when not known yet).
     fn span<'m>(&self, memory: &'m Memory, addr: u64, facts: &InsnFacts, block: &mut Option<BlockDecoder<'m>>) -> Span {
         use std::sync::atomic::Ordering;
-        let Some(cell) = facts.span_cell(addr) else { return Span(SPAN_KNOWN | SPAN_STOP) };
+        let Some((slots, key)) = facts.span_slots(addr) else { return Span(SPAN_KNOWN | SPAN_STOP) };
         // (acquire / release: the facts of its instructions are known to whoever reads it)
-        let v = cell.load(Ordering::Acquire);
-        if v & SPAN_KNOWN != 0 {
-            return Span(v);
+        for slot in slots {
+            let v = slot.load(Ordering::Acquire);
+            if v & !0xffff_ffff == key {
+                return Span(v as u32);
+            }
         }
         let boundary = (addr | (SPAN_BYTES - 1)) + 1;
         let (mut at, mut n) = (addr, 0u32);
@@ -687,7 +696,13 @@ impl X86Lifter {
                 Some(false) => {}
             }
         }
-        cell.store(v, Ordering::Release);
+        for slot in slots {
+            match slot.compare_exchange(0, key | u64::from(v), Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(other) if other & !0xffff_ffff == key => break,
+                Err(_) => {}
+            }
+        }
         Span(v)
     }
 
