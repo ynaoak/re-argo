@@ -344,10 +344,14 @@ impl<'a> RustEmitter<'a> {
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
                 // an arm whose blocks print nothing (all their ops folded away) needs no `if`
-                let then_text = self.render_nested(func, then_body);
-                if !then_text.is_empty() {
-                    linef!(self, "if {} {{", self.condition_text(func, *condition_block, *negated));
-                    self.output.push_str(&then_text);
+                // (the arm is printed in place after its header, which goes when it is empty)
+                let mark = self.output.len();
+                linef!(self, "if {} {{", self.condition_text(func, *condition_block, *negated));
+                let start = self.output.len();
+                self.emit_nested(func, then_body);
+                if self.output.len() == start {
+                    self.output.truncate(mark);
+                } else {
                     self.line("}");
                 }
             }
@@ -357,23 +361,30 @@ impl<'a> RustEmitter<'a> {
                 else_body,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                let then_text = self.render_nested(func, then_body);
-                let else_text = self.render_nested(func, else_body);
-                match (then_text.is_empty(), else_text.is_empty()) {
-                    (true, true) => {}
-                    (false, true) | (true, false) => {
-                        let negated = then_text.is_empty();
-                        linef!(self, "if {} {{", self.condition_text(func, *condition_block, negated));
-                        self.output.push_str(if negated { &else_text } else { &then_text });
+                // (printed in place: `if (c) { then } else { else }`, then the parts of an empty
+                // arm removed; the condition does not depend on what the arms print)
+                let mark = self.output.len();
+                linef!(self, "if {} {{", self.condition_text(func, *condition_block, false));
+                let then_start = self.output.len();
+                self.emit_nested(func, then_body);
+                let then_end = self.output.len();
+                self.line("} else {");
+                let else_start = self.output.len();
+                self.emit_nested(func, else_body);
+                match (then_end == then_start, self.output.len() == else_start) {
+                    (true, true) => self.output.truncate(mark),
+                    (false, true) => {
+                        self.output.truncate(then_end);
                         self.line("}");
                     }
-                    (false, false) => {
-                        linef!(self, "if {} {{", self.condition_text(func, *condition_block, false));
-                        self.output.push_str(&then_text);
-                        self.line("} else {");
-                        self.output.push_str(&else_text);
+                    (true, false) => {
+                        let mut header = "    ".repeat(self.indent);
+                        let _ = write!(header, "if {} {{", self.condition_text(func, *condition_block, true));
+                        header.push('\n');
+                        self.output.replace_range(mark..else_start, &header);
                         self.line("}");
                     }
+                    (false, false) => self.line("}"),
                 }
             }
             StructuredBlock::WhileLoop {
@@ -1241,13 +1252,11 @@ impl<'a> RustEmitter<'a> {
         varnode_name(vn)
     }
 
-    /// Print `body` one level deeper and hand the text back instead of keeping it.
-    fn render_nested(&mut self, func: &SsaFunction, body: &StructuredBlock) -> String {
-        let mark = self.output.len();
+    /// Print `body` one level deeper.
+    fn emit_nested(&mut self, func: &SsaFunction, body: &StructuredBlock) {
         self.indent += 1;
         self.emit_block(func, body);
         self.indent -= 1;
-        self.output.split_off(mark)
     }
 
     fn condition_text(&self, func: &SsaFunction, block_id: usize, negated: bool) -> String {
