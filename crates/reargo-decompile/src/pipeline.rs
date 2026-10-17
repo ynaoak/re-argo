@@ -935,7 +935,7 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
     let all_defs: u128 = group.iter().fold(0, |a, &m| a | m);
     // (a quick no for most registers read and written — temporaries, flags: below 0x200 the
     // tracked offsets / 8 as bits, above it their range)
-    let exact_low = bit_of.keys().all(|&(o, _)| o >= 0x200 || o % 8 == 0);
+    let exact_low = bit_of.keys().all(|&(o, _)| o >= 0x200 || o.is_multiple_of(8));
     let low: u64 = bit_of.keys().filter(|&&(o, _)| o < 0x200).fold(0, |m, &(o, _)| m | 1 << (o / 8));
     let (high_lo, high_hi) = bit_of.keys().filter(|&&(o, _)| o >= 0x200).fold((u64::MAX, 0), |(l, h), &(o, _)| (l.min(o), h.max(o + 1)));
     let bit = |v: &reargo_core::pcode::VarnodeData| -> u128 {
@@ -944,7 +944,7 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         }
         if exact_low {
             let o = v.offset;
-            let maybe = if o < 0x200 { o % 8 == 0 && low >> (o / 8) & 1 != 0 } else { o >= high_lo && o < high_hi };
+            let maybe = if o < 0x200 { o.is_multiple_of(8) && low >> (o / 8) & 1 != 0 } else { o >= high_lo && o < high_hi };
             if !maybe {
                 return 0;
             }
