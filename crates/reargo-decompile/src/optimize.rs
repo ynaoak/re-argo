@@ -529,6 +529,14 @@ fn resolve_redirect(
 /// redirect map via `resolve_redirect` so cascading eliminations
 /// (the result of one CSE feeding into another) still fire.
 pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
+    cse_with_hits(func).0
+}
+
+/// [`common_subexpression_elimination`], with how many ops matched an earlier one's key (each
+/// removed or kept): with none, the pass changed nothing and finds nothing again until an op's
+/// opcode or inputs change.
+fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
+    let mut hits = 0;
     use smallvec::SmallVec;
     let mut eliminated = 0;
     // Pre-size both hash maps. Without this they started at zero
@@ -662,6 +670,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         // (one lookup: the earlier value, or the slot this one takes)
         let slot = match seen.entry(key) {
             std::collections::hash_map::Entry::Occupied(o) => {
+                hits += 1;
                 let existing = *o.get();
                 if !feeds_phi(func)
                     && name_still_holds(existing)
@@ -741,7 +750,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         }
     }
 
-    eliminated
+    (eliminated, hits)
 }
 
 pub fn strength_reduction(func: &mut SsaFunction) -> usize {
@@ -1186,6 +1195,15 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
     let mut stats = OptimizationStats::default();
     prune_call_args(func);
 
+    // A pass that found nothing to do, run again before any other pass changed what it reads,
+    // finds nothing again and changes nothing: it is not run. What each one reads: the fold
+    // (constant folding, algebra, strength) an op's opcode and input varnodes; copy
+    // propagation the copies of constants and their readers' inputs (and their `uses`, which
+    // it already pruned); CSE the keys of the live pure ops (with no two alike, `hits` is 0).
+    // Dead code elimination only kills ops: a dead op is passed over by all three, and fewer
+    // live ops give no more matches. It runs every round (killing in another order can kill
+    // more).
+    let (mut fold_quiet, mut copies_quiet, mut cse_quiet) = (false, false, false);
     for _ in 0..10 {
         // Three passes (constant_fold, algebraic_simplification,
         // strength_reduction) are fused into a single walk. See
@@ -1200,9 +1218,19 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
         // The fused variant has been removed; this comment is the
         // only record so the next person reaching for the same
         // optimisation doesn't re-do it without knowing the result.
-        let (cf, alg, sr) = const_alg_strength(func);
-        let cp = copy_propagation(func);
-        let cse = common_subexpression_elimination(func);
+        let (cf, alg, sr) = if fold_quiet { (0, 0, 0) } else { const_alg_strength(func) };
+        let folded = cf + alg + sr > 0;
+        fold_quiet = !folded;
+        copies_quiet &= !folded;
+        cse_quiet &= !folded;
+        let cp = if copies_quiet { 0 } else { copy_propagation(func) };
+        copies_quiet = cp == 0;
+        fold_quiet &= cp == 0;
+        cse_quiet &= cp == 0;
+        let (cse, hits) = if cse_quiet { (0, 0) } else { cse_with_hits(func) };
+        cse_quiet = hits == 0;
+        fold_quiet &= cse == 0;
+        copies_quiet &= cse == 0;
         let dce = dead_code_elimination(func);
         stats.constants_folded += cf;
         stats.copies_propagated += cp;
