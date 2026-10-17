@@ -171,7 +171,7 @@ fn return_tail(cfg: &ControlFlowGraph, code: &ControlFlowGraph, start: BlockId) 
     let mut b = start;
     loop {
         let block = &code.blocks[b];
-        insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
+        insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue(i)).count();
         calls += block
             .instructions
             .iter()
@@ -440,7 +440,7 @@ impl<'a> Structurer<'a> {
             }
         }
         let block = &self.code.blocks[b];
-        let insns = block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
+        let insns = block.instructions.iter().filter(|i| !crate::cfg::is_epilogue(i)).count();
         let calls = block
             .instructions
             .iter()

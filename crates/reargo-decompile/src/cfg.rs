@@ -48,9 +48,24 @@ pub fn is_trap(insn: &LiftedInstruction) -> bool {
     }
 }
 
+/// A `pop` (its text: `pop reg`; the decoded instruction answers for the others without
+/// formatting the text).
+pub fn is_pop(insn: &LiftedInstruction) -> bool {
+    insn.mnemonic.x86_instruction().is_none_or(|i| i.mnemonic() == iced_x86::Mnemonic::Pop) && insn.mnemonic.starts_with("pop ")
+}
+
 /// An instruction of a function epilogue that only restores the caller's frame: `pop reg`,
 /// `add rsp, n`, `leave`, `lea rsp, [...]`, `mov rsp, rbp`, `ret`, `vzeroupper` (WS80). Its
 /// effect (the stack pointer, callee-saved registers) is not part of what the C code does.
+pub fn is_epilogue(insn: &LiftedInstruction) -> bool {
+    use iced_x86::Mnemonic::*;
+    // (only those mnemonics' texts start so: the decoded instruction answers for the others
+    // without formatting the text)
+    let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), Pop | Add | Lea | Mov | Ret | Retf | Leave | Vzeroupper));
+    may_be && is_epilogue_insn(&insn.mnemonic)
+}
+
+/// [`is_epilogue`] of an instruction's text.
 pub fn is_epilogue_insn(mnemonic: &str) -> bool {
     let m = mnemonic.trim();
     m.starts_with("pop ")
