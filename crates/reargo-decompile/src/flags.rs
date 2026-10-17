@@ -574,9 +574,11 @@ pub(crate) fn is_flag_storage(d: &reargo_core::pcode::VarnodeData) -> bool {
 
 /// The name of a flag [`name_flag_webs`] named (`lt_3`), by its register offset.
 pub(crate) fn named_flag(offset: u64) -> Option<String> {
+    // (`{kind}_{n}`, without the formatting machinery: printed for every flag operand)
+    const PREFIXES: [&str; FLAG_KINDS.len()] = ["lt_", "le_", "eq_", "ne_", "neg_", "carry_", "ovf_", "cond_"];
     let k = offset.checked_sub(NAMED_FLAG_BASE)?;
-    let kind = FLAG_KINDS.get((k >> 16) as usize)?;
-    Some(format!("{kind}_{}", k & 0xffff))
+    let prefix = PREFIXES.get((k >> 16) as usize)?;
+    Some(crate::emit::name_num(prefix, k & 0xffff))
 }
 
 /// WS90: each flag value the output may name becomes a boolean of its own. A machine flag is
@@ -737,6 +739,13 @@ pub(crate) fn renumber_named_flags(text: &mut String, func: &SsaFunction) {
     let mut pos = 0;
     while let Some(off) = text[pos..].find('_') {
         let under = pos + off;
+        // (a flag name's `_` is followed by a digit: the first `_` of any other word is passed
+        // over at once — a later one of the word decides the same, the word is split at its
+        // first `_`)
+        if !bytes.get(under + 1).is_some_and(u8::is_ascii_digit) {
+            pos = under + 1;
+            continue;
+        }
         let mut start = under;
         while start > 0 && ident(bytes[start - 1]) {
             start -= 1;

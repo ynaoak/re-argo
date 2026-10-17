@@ -23,6 +23,22 @@ macro_rules! linef {
     }};
 }
 
+/// `format!` of string pieces only (`{}` of `String` / `&str`), built at its final length:
+/// `cat!(dst, " = ", a, ";")`.
+macro_rules! cat {
+    ($($e:expr),+ $(,)?) => {
+        match [$(::core::convert::AsRef::<str>::as_ref(&$e)),+] {
+            parts => {
+                let mut s = String::with_capacity(parts.iter().map(|p| p.len()).sum::<usize>());
+                for p in parts {
+                    s.push_str(p);
+                }
+                s
+            }
+        }
+    };
+}
+
 use crate::ssa::SsaFunction;
 use crate::structure::StructuredBlock;
 
@@ -326,7 +342,7 @@ impl<'a> CEmitter<'a> {
         if let Some(sv) = self.structs {
             for (ty, name) in sig.params.iter_mut() {
                 if let Some(d) = sv.param_def(func, name, &|r| reg_name(r.offset, r.size)) {
-                    *ty = format!("struct {}*", sv.defs[d].name);
+                    *ty = cat!("struct ", sv.defs[d].name, "*");
                 }
             }
         }
@@ -347,7 +363,7 @@ impl<'a> CEmitter<'a> {
         if !self.cas.is_empty() {
             self.output = crate::cas::fold_into_conditions(
                 &self.output,
-                &|n| if n.starts_with("var_") { format!("uint8_t {n};") } else { format!("bool {n};") },
+                &|n| if n.starts_with("var_") { cat!("uint8_t ", n, ";") } else { cat!("bool ", n, ";") },
                 crate::cas::C_FORMS,
             );
         }
@@ -374,7 +390,7 @@ impl<'a> CEmitter<'a> {
                 let key = (vn.data.offset, vn.data.size);
                 if declared.insert(key) {
                     let type_name = match (self.structs, typed.get(&vn.data.offset)) {
-                        (Some(sv), Some(&d)) if vn.data.size == 8 => format!("struct {}*", sv.defs[d].name),
+                        (Some(sv), Some(&d)) if vn.data.size == 8 => cat!("struct ", sv.defs[d].name, "*"),
                         _ if crate::flags::named_flag(vn.data.offset).is_some() => "bool".to_string(),
                         _ => size_to_type(vn.data.size).to_string(),
                     };
@@ -679,7 +695,7 @@ impl<'a> CEmitter<'a> {
             OpCode::MultiEqual => None,
             OpCode::Copy if self.swaps.contains_key(&op.index) => {
                 let (a, b) = self.swaps[&op.index];
-                Some(format!("swap({}, {});", varnode_name(&func.varnodes[a as usize]), varnode_name(&func.varnodes[b as usize])))
+                Some(cat!("swap(", varnode_name(&func.varnodes[a as usize]), ", ", varnode_name(&func.varnodes[b as usize]), ");"))
             }
             // a stack address by its slot (WS87): `rdi = &local_48;`
             OpCode::Copy | OpCode::IntAdd | OpCode::IntSub
@@ -688,7 +704,7 @@ impl<'a> CEmitter<'a> {
                     !(d.space == SpaceId::REGISTER && d.offset == 0x20)
                 }) && op.output.and_then(|o| self.frame.address(func, o, false)).is_some() =>
             {
-                Some(format!("{} = {};", out_name?, self.frame.address(func, op.output?, false)?))
+                Some(cat!(out_name?, " = ", self.frame.address(func, op.output?, false)?, ";"))
             }
             OpCode::Copy => {
                 let dst = out_name?;
@@ -704,22 +720,22 @@ impl<'a> CEmitter<'a> {
                 {
                     let base = self.input_expr(func, &func.ops[d], bi);
                     if is_identifier(&base) {
-                        return Some(format!("{dst} = &{base}->{};", f.name()));
+                        return Some(cat!(dst, " = &", base, "->", f.name(), ";"));
                     }
                 }
                 let src = self.input_expr(func, op, 0);
-                Some(format!("{} = {};", dst, src))
+                Some(cat!(dst, " = ", src, ";"))
             }
             // the address of a struct field (WS91): `rdi = &rbx->field_98;`
             OpCode::IntAdd if self.field_address(func, op).is_some() => {
-                Some(format!("{} = {};", out_name?, self.field_address(func, op)?))
+                Some(cat!(out_name?, " = ", self.field_address(func, op)?, ";"))
             }
             OpCode::IntAdd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 // `x + 0xfffffffffffffffa` is `x - 6` (WS83)
                 if let Some(k) = op.inputs.get(1).and_then(|&v| negative_constant(&func.varnodes[v as usize].data)) {
-                    return Some(format!("{} = {} - {};", dst, a, small_hex(k)));
+                    return Some(cat!(dst, " = ", a, " - ", small_hex(k), ";"));
                 }
                 let b = self.input_expr(func, op, 1);
                 // WS90: `0xffffffffffffffff + x` (`adc rdx, -1` after a `cmp`) is `x - 1` (at 32 / 64
@@ -727,9 +743,9 @@ impl<'a> CEmitter<'a> {
                 if let Some(k) = self.wide_negative(func, op, 0)
                     && func.varnodes[op.inputs[1] as usize].data.space != SpaceId::CONST
                 {
-                    return Some(format!("{} = {} - {};", dst, b, small_hex(k)));
+                    return Some(cat!(dst, " = ", b, " - ", small_hex(k), ";"));
                 }
-                Some(format!("{} = {} + {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " + ", b, ";"))
             }
             OpCode::IntSub => {
                 let dst = out_name?;
@@ -739,77 +755,77 @@ impl<'a> CEmitter<'a> {
                 // WS90: `x - 0` (`sbb al, 0`) is `x`, `0 - x` (`sbb eax, eax` after it is folded) `-x`,
                 // and `x - 0xffffffffffffffff` (`sbb rdx, -1`) `x + 1` at 32 / 64 bits
                 if c(1).space == SpaceId::CONST && c(1).offset == 0 {
-                    return Some(format!("{} = {};", dst, a));
+                    return Some(cat!(dst, " = ", a, ";"));
                 }
                 if c(0).space == SpaceId::CONST && c(0).offset == 0 && c(1).space != SpaceId::CONST {
-                    return Some(format!("{} = -{};", dst, if crate::condition::is_atomic(&b) || is_deref(&b) { b } else { format!("({b})") }));
+                    return Some(cat!(dst, " = -", if crate::condition::is_atomic(&b) || is_deref(&b) { b } else { format!("({b})") }, ";"));
                 }
                 if let Some(k) = self.wide_negative(func, op, 1) {
-                    return Some(format!("{} = {} + {};", dst, a, small_hex(k)));
+                    return Some(cat!(dst, " = ", a, " + ", small_hex(k), ";"));
                 }
-                Some(format!("{} = {} - {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " - ", b, ";"))
             }
             OpCode::IntMult => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} * {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " * ", b, ";"))
             }
             OpCode::IntAnd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 if op.inputs.len() == 2 && op.inputs[0] == op.inputs[1] {
                     // `test r, r`: `r & r` is `r`
-                    return Some(format!("{} = {};", dst, a));
+                    return Some(cat!(dst, " = ", a, ";"));
                 }
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} & {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " & ", b, ";"))
             }
             OpCode::IntOr => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} | {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " | ", b, ";"))
             }
             OpCode::IntXor => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} ^ {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " ^ ", b, ";"))
             }
             OpCode::IntLeft => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} << {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " << ", b, ";"))
             }
             OpCode::IntRight => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} >> {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " >> ", b, ";"))
             }
             OpCode::IntNegate => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = ~{};", dst, a))
+                Some(cat!(dst, " = ~", a, ";"))
             }
             OpCode::Int2Comp => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = -{};", dst, a))
+                Some(cat!(dst, " = -", a, ";"))
             }
             OpCode::IntEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} == {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " == ", b, ";"))
             }
             OpCode::IntNotEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} != {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " != ", b, ";"))
             }
             OpCode::IntSLess => {
                 let dst = out_name?;
@@ -820,7 +836,7 @@ impl<'a> CEmitter<'a> {
                 // 64-bit operands to 32 bits).
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
                 let w = func.varnodes[op.inputs[0] as usize].data.size;
-                Some(format!("{} = {} < {};", dst, signed_operand(ty, w, &a), signed_operand(ty, w, &b)))
+                Some(cat!(dst, " = ", signed_operand(ty, w, &a), " < ", signed_operand(ty, w, &b), ";"))
             }
             OpCode::IntSLessEqual => {
                 let dst = out_name?;
@@ -828,19 +844,19 @@ impl<'a> CEmitter<'a> {
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
                 let w = func.varnodes[op.inputs[0] as usize].data.size;
-                Some(format!("{} = {} <= {};", dst, signed_operand(ty, w, &a), signed_operand(ty, w, &b)))
+                Some(cat!(dst, " = ", signed_operand(ty, w, &a), " <= ", signed_operand(ty, w, &b), ";"))
             }
             OpCode::IntLess => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} < {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " < ", b, ";"))
             }
             OpCode::IntLessEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} <= {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " <= ", b, ";"))
             }
             OpCode::IntSRight => {
                 // Signed shift requires casting the LHS to the size-matched
@@ -849,149 +865,149 @@ impl<'a> CEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({}){} >> {};", dst, ty, a, b))
+                Some(cat!(dst, " = (", ty, ")", a, " >> ", b, ";"))
             }
             OpCode::IntDiv => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} / {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " / ", b, ";"))
             }
             OpCode::IntSDiv => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({}){} / ({}){};", dst, ty, a, ty, b))
+                Some(cat!(dst, " = (", ty, ")", a, " / (", ty, ")", b, ";"))
             }
             OpCode::IntRem => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} % {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " % ", b, ";"))
             }
             OpCode::IntSRem => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(format!("{} = ({}){} % ({}){};", dst, ty, a, ty, b))
+                Some(cat!(dst, " = (", ty, ")", a, " % (", ty, ")", b, ";"))
             }
             OpCode::FloatAdd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} + {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " + ", b, ";"))
             }
             OpCode::FloatSub => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} - {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " - ", b, ";"))
             }
             OpCode::FloatMult => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} * {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " * ", b, ";"))
             }
             OpCode::FloatDiv => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} / {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " / ", b, ";"))
             }
             OpCode::FloatNeg => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = -{};", dst, a))
+                Some(cat!(dst, " = -", a, ";"))
             }
             OpCode::FloatAbs => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = fabs({});", dst, a))
+                Some(cat!(dst, " = fabs(", a, ");"))
             }
             OpCode::FloatNan => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = isnan({});", dst, a))
+                Some(cat!(dst, " = isnan(", a, ");"))
             }
             OpCode::FloatSqrt => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = sqrt({});", dst, a))
+                Some(cat!(dst, " = sqrt(", a, ");"))
             }
             OpCode::FloatEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} == {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " == ", b, ";"))
             }
             OpCode::FloatNotEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} != {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " != ", b, ";"))
             }
             OpCode::FloatLess => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} < {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " < ", b, ";"))
             }
             OpCode::FloatLessEqual => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} <= {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " <= ", b, ";"))
             }
             OpCode::FloatInt2Float => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
                 let ty = float_type(out_size);
-                Some(format!("{} = ({}){};", dst, ty, a))
+                Some(cat!(dst, " = (", ty, ")", a, ";"))
             }
             OpCode::FloatFloat2Float => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
                 let ty = float_type(out_size);
-                Some(format!("{} = ({}){};", dst, ty, a))
+                Some(cat!(dst, " = (", ty, ")", a, ";"))
             }
             OpCode::FloatTrunc => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
                 let ty = size_to_signed_type(out_size);
-                Some(format!("{} = ({}){};", dst, ty, a))
+                Some(cat!(dst, " = (", ty, ")", a, ";"))
             }
             OpCode::FloatFloor => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = floor({});", dst, a))
+                Some(cat!(dst, " = floor(", a, ");"))
             }
             OpCode::FloatCeil => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = ceil({});", dst, a))
+                Some(cat!(dst, " = ceil(", a, ");"))
             }
             OpCode::FloatRound => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = round({});", dst, a))
+                Some(cat!(dst, " = round(", a, ");"))
             }
             OpCode::BoolAnd => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} && {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " && ", b, ";"))
             }
             OpCode::BoolOr => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
-                Some(format!("{} = {} || {};", dst, a, b))
+                Some(cat!(dst, " = ", a, " || ", b, ";"))
             }
             OpCode::BoolXor => {
                 let dst = out_name?;
@@ -1003,27 +1019,27 @@ impl<'a> CEmitter<'a> {
                     d.space == SpaceId::CONST && d.offset == 0
                 });
                 match (zero(0), zero(1)) {
-                    (false, true) => return Some(format!("{dst} = {};", strip_outer_parens(&a))),
-                    (true, false) => return Some(format!("{dst} = {};", strip_outer_parens(&b))),
+                    (false, true) => return Some(cat!(dst, " = ", strip_outer_parens(&a), ";")),
+                    (true, false) => return Some(cat!(dst, " = ", strip_outer_parens(&b), ";")),
                     _ => {}
                 }
-                Some(format!("{} = !{} != !{};", dst, a, b))
+                Some(cat!(dst, " = !", a, " != !", b, ";"))
             }
             OpCode::BoolNegate => {
                 let dst = out_name?;
                 // a `setcc` whose condition folded (WS87): the negation is the text
                 if let Some(e) = self.select_conds.get(&op.index) {
-                    return Some(format!("{dst} = {};", strip_outer_parens(e)));
+                    return Some(cat!(dst, " = ", strip_outer_parens(e), ";"));
                 }
                 let a = self.input_expr(func, op, 0);
-                Some(format!("{} = !{};", dst, a))
+                Some(cat!(dst, " = !", a, ";"))
             }
             // `popcnt` / `lzcnt` (WS84)
             OpCode::PopCount | OpCode::LzCount if !op.inputs.is_empty() => {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let f = if op.opcode == OpCode::PopCount { "popcount" } else { "lzcount" };
-                Some(format!("{dst} = {f}({a});"))
+                Some(cat!(dst, " = ", f, "(", a, ");"))
             }
             // `cmovcc` (WS83, `select`)
             OpCode::Select if op.inputs.len() == 3 => {
@@ -1040,7 +1056,7 @@ impl<'a> CEmitter<'a> {
                     }
                 };
                 let (a, b) = (arm(1), arm(2));
-                Some(format!("{} = {} ? {} : {};", dst, c, a, b))
+                Some(cat!(dst, " = ", c, " ? ", a, " : ", b, ";"))
             }
             OpCode::IntZExt => {
                 let dst = out_name?;
@@ -1060,13 +1076,13 @@ impl<'a> CEmitter<'a> {
                     )
                 });
                 if boolean && crate::condition::is_atomic(&a) {
-                    return Some(format!("{} = ({}){};", dst, dst_ty, a));
+                    return Some(cat!(dst, " = (", dst_ty, ")", a, ";"));
                 }
                 let a = match self.c_int_type(func, op.inputs[0], &a) {
-                    Some((w, false)) if w == src => return Some(format!("{} = ({}){};", dst, dst_ty, drop_widening_casts(&a))),
+                    Some((w, false)) if w == src => return Some(cat!(dst, " = (", dst_ty, ")", drop_widening_casts(&a), ";")),
                     _ => a,
                 };
-                Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
+                Some(cat!(dst, " = (", dst_ty, ")(", src_ty, ")", a, ";"))
             }
             OpCode::Piece if op.inputs.len() >= 2 => {
                 // PIECE(hi, lo): concatenation, `lo` in the low bytes (the
@@ -1077,14 +1093,14 @@ impl<'a> CEmitter<'a> {
                 match view_merge(func, op) {
                     Some(ViewMerge::Keep { view }) => {
                         let lo = self.input_expr(func, op, 1);
-                        return (lo != view).then(|| format!("{view} = {lo};"));
+                        return (lo != view).then(|| cat!(view, " = ", lo, ";"));
                     }
                     Some(ViewMerge::Const(c)) => {
                         let lo = self.input_expr(func, op, 1);
                         let ty = size_to_type(func.varnodes[op.output.unwrap() as usize].data.size);
                         let shifted = c << (8 * func.varnodes[op.inputs[1] as usize].data.size);
                         return Some(if c == 0 {
-                            format!("{dst} = ({ty}){lo};")
+                            cat!(dst, " = (", ty, ")", lo, ";")
                         } else {
                             format!("{dst} = 0x{shifted:x} | ({ty}){lo};")
                         });
@@ -1117,14 +1133,14 @@ impl<'a> CEmitter<'a> {
                         && let Some((k, false)) = text_int_type(y)
                         && k <= dst_size
                     {
-                        return Some(if k == dst_size { format!("{dst} = {y};") } else { format!("{dst} = ({dst_ty}){y};") });
+                        return Some(if k == dst_size { cat!(dst, " = ", y, ";") } else { cat!(dst, " = (", dst_ty, ")", y, ";") });
                     }
-                    Some(format!("{} = ({}){};", dst, dst_ty, a))
+                    Some(cat!(dst, " = (", dst_ty, ")", a, ";"))
                 } else if k.space == SpaceId::CONST {
                     Some(format!("{} = ({})({} >> {});", dst, dst_ty, a, k.offset * 8))
                 } else {
                     let kexpr = self.input_expr(func, op, 1);
-                    Some(format!("{} = ({})({} >> ({} * 8));", dst, dst_ty, a, kexpr))
+                    Some(cat!(dst, " = (", dst_ty, ")(", a, " >> (", kexpr, " * 8));"))
                 }
             }
             OpCode::IntSExt => {
@@ -1135,36 +1151,36 @@ impl<'a> CEmitter<'a> {
                 let dst_ty = size_to_signed_type(func.varnodes[op.output.unwrap() as usize].data.size);
                 // WS90: not when the operand is already that signed type
                 if self.c_int_type(func, op.inputs[0], &a) == Some((src, true)) {
-                    return Some(format!("{} = ({}){};", dst, dst_ty, a));
+                    return Some(cat!(dst, " = (", dst_ty, ")", a, ";"));
                 }
-                Some(format!("{} = ({})({}){};", dst, dst_ty, src_ty, a))
+                Some(cat!(dst, " = (", dst_ty, ")(", src_ty, ")", a, ";"))
             }
             OpCode::Load => {
                 let dst = out_name?;
                 let out_size = op.output.map(|id| func.varnodes[id as usize].data.size).unwrap_or(8);
                 // a stack slot by name (WS87)
                 if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, out_size, false, false)) {
-                    return Some(format!("{dst} = {slot};"));
+                    return Some(cat!(dst, " = ", slot, ";"));
                 }
                 // a struct field (WS91)
                 if let Some(f) = self.field_access(func, op, false) {
-                    return Some(format!("{dst} = {f};"));
+                    return Some(cat!(dst, " = ", f, ";"));
                 }
                 let addr = self.input_expr(func, op, 1);
-                Some(format!("{} = *({}*){};", dst, size_to_type(out_size), addr))
+                Some(cat!(dst, " = *(", size_to_type(out_size), "*)", addr, ";"))
             }
             OpCode::Store if self.cas.contains_key(&op.index) => {
                 let c = &self.cas[&op.index];
                 let ptr = match self.frame.access(func, op.block, c.addr, c.size, true, false) {
-                    Some(slot) if !slot.starts_with('*') => format!("&{slot}"),
-                    _ => format!("({}*){}", size_to_type(c.size), self.input_expr(func, op, 1)),
+                    Some(slot) if !slot.starts_with('*') => cat!("&", slot),
+                    _ => cat!("(", size_to_type(c.size), "*)", self.input_expr(func, op, 1)),
                 };
                 let sel = func.varnodes[op.inputs[2] as usize].def_op?;
                 let call = crate::cas::call_text(&ptr, &varnode_name(&func.varnodes[c.expected as usize]), &self.input_expr(func, &func.ops[sel], 1));
                 Some(match c.flag {
-                    Some(f) if c.branch => format!("{} = {call};{}", varnode_name(&func.varnodes[f as usize]), crate::cas::FOLDABLE),
-                    Some(f) => format!("{} = {call};", varnode_name(&func.varnodes[f as usize])),
-                    None => format!("{call};"),
+                    Some(f) if c.branch => format!("{} = {};{}", varnode_name(&func.varnodes[f as usize]), call, crate::cas::FOLDABLE),
+                    Some(f) => cat!(varnode_name(&func.varnodes[f as usize]), " = ", call, ";"),
+                    None => cat!(call, ";"),
                 })
             }
             OpCode::Store => {
@@ -1175,7 +1191,7 @@ impl<'a> CEmitter<'a> {
                     8
                 };
                 if let Some(slot) = op.inputs.get(1).and_then(|&a| self.frame.access(func, op.block, a, size, true, false)) {
-                    return Some(format!("{slot} = {val};"));
+                    return Some(cat!(slot, " = ", val, ";"));
                 }
                 if let Some(f) = self.field_access(func, op, true) {
                     // (a constructor's vtable store names the class)
@@ -1186,12 +1202,12 @@ impl<'a> CEmitter<'a> {
                         (d.fields[a.field].kind == crate::structs::FieldKind::VPtr && k.space == SpaceId::CONST && d.vtable == Some(k.offset)).then(|| d.class.clone())?
                     });
                     return Some(match class {
-                        Some(c) => format!("{f} = {val};  // vtable of {c}"),
-                        None => format!("{f} = {val};"),
+                        Some(c) => cat!(f, " = ", val, ";  // vtable of ", c),
+                        None => cat!(f, " = ", val, ";"),
                     });
                 }
                 let addr = self.input_expr(func, op, 1);
-                Some(format!("*({}*){} = {};", size_to_type(size), addr, val))
+                Some(cat!("*(", size_to_type(size), "*)", addr, " = ", val, ";"))
             }
             OpCode::Call => {
                 // CallSiteAnnotator may have stashed a fully
@@ -1200,12 +1216,12 @@ impl<'a> CEmitter<'a> {
                 // use it; otherwise fall back to the bare
                 // `<callee>@plt()` stub from the symbol table.
                 let assign = call_result(func, op)
-                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .map(|v| cat!(varnode_name(&func.varnodes[v as usize]), " = "))
                     .unwrap_or_default();
                 if let Some(renderings) = self.call_renderings
                     && let Some(rendering) = renderings.get(&op.address)
                 {
-                    return Some(format!("{assign}{};", rendering));
+                    return Some(cat!(assign, rendering, ";"));
                 }
                 let target_expr = self.input_expr(func, op, 0);
                 let call_name = if let Some(target_vn) = op.inputs.first() {
@@ -1218,7 +1234,7 @@ impl<'a> CEmitter<'a> {
                     target_expr
                 };
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
-                Some(format!("{assign}{}({});", call_name, args.join(", ")))
+                Some(cat!(assign, call_name, "(", args.join(", "), ");"))
             }
             OpCode::Indirect => {
                 // a call's return register, or a caller-saved register it clobbers
@@ -1229,11 +1245,11 @@ impl<'a> CEmitter<'a> {
                     d.space == reargo_core::address::SpaceId::CONST && d.offset == crate::pipeline::CLOBBER_MARK
                 });
                 if clobber {
-                    Some(format!("{} = __clobbered;  // by {}", dst, self.input_expr(func, op, 0)))
+                    Some(cat!(dst, " = __clobbered;  // by ", self.input_expr(func, op, 0)))
                 } else if is_merged_call_result(func, op) {
                     None // printed as `dst = call(…)`
                 } else {
-                    Some(format!("{} = __ret;  // of {}", dst, self.input_expr(func, op, 0)))
+                    Some(cat!(dst, " = __ret;  // of ", self.input_expr(func, op, 0)))
                 }
             }
             OpCode::CallInd => {
@@ -1251,7 +1267,7 @@ impl<'a> CEmitter<'a> {
                     .unwrap_or_default();
                 let args: Vec<String> = (1..op.inputs.len()).map(|i| self.input_expr(func, op, i)).collect();
                 let assign = call_result(func, op)
-                    .map(|v| format!("{} = ", varnode_name(&func.varnodes[v as usize])))
+                    .map(|v| cat!(varnode_name(&func.varnodes[v as usize]), " = "))
                     .unwrap_or_default();
                 // WS79: an implementation of the slot, from the vtable of a class the function
                 // is a method of
@@ -1266,19 +1282,19 @@ impl<'a> CEmitter<'a> {
                         }
                         (None, None) => format!("  // vfn[{n}] (vtable+0x{:x})", n * 8),
                     };
-                    return Some(format!("{assign}{obj}->vfn_{n}({});{ann}", args[1..].join(", ")));
+                    return Some(format!("{}{}->vfn_{}({});{}", assign, obj, n, args[1..].join(", "), ann));
                 }
                 let ann = match func.vcall_targets.get(&op.address) {
                     Some(t) => {
                         let name = self.symbol_names.get(t).cloned().unwrap_or_else(|| format!("0x{t:x}"));
-                        if ann.is_empty() { format!("  // e.g. {name}") } else { format!("{ann} e.g. {name}") }
+                        if ann.is_empty() { cat!("  // e.g. ", name) } else { cat!(ann, " e.g. ", name) }
                     }
                     None => ann,
                 };
-                Some(format!("{assign}(*{})({});{}", target, args.join(", "), ann))
+                Some(cat!(assign, "(*", target, ")(", args.join(", "), ");", ann))
             }
             OpCode::Return => match return_value(func, op) {
-                Some(i) => Some(format!("return {};", self.input_expr(func, op, i))),
+                Some(i) => Some(cat!("return ", self.input_expr(func, op, i), ";")),
                 None => Some("return;".into()),
             },
             OpCode::Branch => None,
@@ -1291,7 +1307,7 @@ impl<'a> CEmitter<'a> {
                     .and_then(|&t| self.vcall_vtable_offset(func, t))
                     .map(|off| format!("  // vfn[{}] (vtable+0x{:x})", off / 8, off))
                     .unwrap_or_else(|| "  // indirect jump".into());
-                Some(format!("goto *{};{}", self.input_expr(func, op, 0), ann))
+                Some(cat!("goto *", self.input_expr(func, op, 0), ";", ann))
             }
             OpCode::CallOther => {
                 // The lifter tags CallOther via its first const input: 3 = int3
@@ -1315,10 +1331,10 @@ impl<'a> CEmitter<'a> {
                     let args: Vec<String> = (1..op.inputs.len())
                         .map(|i| self.input_expr(func, op, i))
                         .collect();
-                    let call = format!("{}({})", name, args.join(", "));
+                    let call = cat!(name, "(", args.join(", "), ")");
                     match out_name {
-                        Some(dst) => Some(format!("{} = {};", dst, call)),
-                        None => Some(format!("{};", call)),
+                        Some(dst) => Some(cat!(dst, " = ", call, ";")),
+                        None => Some(cat!(call, ";")),
                     }
                 } else {
                     Some("__unmodeled_insn();  // machine op not yet lifted (dataflow intact)".into())
@@ -1339,13 +1355,13 @@ impl<'a> CEmitter<'a> {
                 // else, and every signed operand, is cast to the operation's width)
                 let arg = |i: usize| {
                     let e = self.input_expr(func, op, i);
-                    if unsigned && is_identifier(&e) { e } else { format!("({}){}", ty, if crate::condition::is_atomic(&e) { e } else { format!("({e})") }) }
+                    if unsigned && is_identifier(&e) { e } else { cat!("(", ty, ")", if crate::condition::is_atomic(&e) { e } else { format!("({e})") }) }
                 };
-                Some(format!("{} = {}({}, {}, ({})0);", dst, builtin, arg(0), arg(1), ty))
+                Some(cat!(dst, " = ", builtin, "(", arg(0), ", ", arg(1), ", (", ty, ")0);"))
             }
             _ => {
                 let dst = out_name.unwrap_or_else(|| "???".into());
-                Some(format!("{} = {}(...);", dst, op.opcode.name()))
+                Some(cat!(dst, " = ", op.opcode.name(), "(...);"))
             }
         }
     }
@@ -1371,13 +1387,13 @@ impl<'a> CEmitter<'a> {
             return None;
         }
         let f = &sv.defs[a.def].fields[a.field];
-        let m = format!("{base}->{}", f.name());
+        let m = cat!(base, "->", f.name());
         Some(if a.size == f.size {
             m
         } else if store || f.kind != crate::structs::FieldKind::Int {
-            format!("*({}*)&{m}", size_to_type(a.size))
+            cat!("*(", size_to_type(a.size), "*)&", m)
         } else {
-            format!("({}){m}", size_to_type(a.size))
+            cat!("(", size_to_type(a.size), ")", m)
         })
     }
 
@@ -1389,7 +1405,7 @@ impl<'a> CEmitter<'a> {
         }
         let (bi, f) = self.structs?.field_address(func, op)?;
         let base = self.input_expr(func, op, bi);
-        is_identifier(&base).then(|| format!("&{base}->{}", f.name()))
+        is_identifier(&base).then(|| cat!("&", base, "->", f.name()))
     }
 
     /// A virtual call printed as `obj->vfn_n(…)` (WS91): the object's text, the slot number and
@@ -1467,7 +1483,7 @@ impl<'a> CEmitter<'a> {
     fn inline_text(&self, func: &SsaFunction, d: usize) -> Option<String> {
         let op = &func.ops[d];
         let line = self.emit_op(func, op)?;
-        let prefix = format!("{} = ", varnode_name(&func.varnodes[op.output? as usize]));
+        let prefix = cat!(varnode_name(&func.varnodes[op.output? as usize]), " = ");
         line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)
     }
 
@@ -1494,7 +1510,7 @@ impl<'a> CEmitter<'a> {
                 || (op.opcode == OpCode::CallInd && idx > 0);
             // (a cast of a struct field, `(uint16_t)p->field_8`, is unary like a dereference: WS91)
             let unary_field = int_cast(&rhs).is_some_and(|(_, _, x)| crate::condition::is_member(x));
-            return if whole || crate::condition::is_atomic(&rhs) || is_deref(&rhs) || unary_field { rhs } else { format!("({rhs})") };
+            return if whole || crate::condition::is_atomic(&rhs) || is_deref(&rhs) || unary_field { rhs } else { cat!("(", rhs, ")") };
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
             return e;
@@ -1503,7 +1519,7 @@ impl<'a> CEmitter<'a> {
             && op.opcode == OpCode::Select
             && let Some(e) = self.select_conds.get(&op.index)
         {
-            return if crate::condition::is_atomic(e) { e.clone() } else { format!("({e})") };
+            return if crate::condition::is_atomic(e) { e.clone() } else { cat!("(", e, ")") };
         }
         let vn = &func.varnodes[op.inputs[idx] as usize];
         // a constant a float op reads is the bits of a float (WS83: constants now reach their
@@ -1791,7 +1807,7 @@ pub(crate) fn negate_condition(cond: String, negated: bool) -> String {
         return cond;
     }
     if cond.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return format!("!{cond}");
+        return cat!("!", cond);
     }
     if let Some(rest) = cond.strip_prefix('!')
         && crate::condition::is_atomic(rest)
@@ -1801,7 +1817,7 @@ pub(crate) fn negate_condition(cond: String, negated: bool) -> String {
     if let Some(flipped) = flip_equality(&cond) {
         return flipped;
     }
-    format!("!({cond})")
+    cat!("!(", cond, ")")
 }
 
 /// `(x)` -> `x` when the parentheses enclose the whole expression.
@@ -1836,7 +1852,7 @@ fn flip_equality(s: &str) -> Option<String> {
     }
     let (at, op) = found?;
     let flipped = if op == " == " { " != " } else { " == " };
-    Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
+    Some(cat!(&s[..at], flipped, &s[at + op.len()..]))
 }
 
 /// The opposite of an integer comparison printed as `a OP b` (WS81): `<` <-> `>=`, `<=` <-> `>`,
@@ -1877,7 +1893,7 @@ pub(crate) fn flip_comparison(s: &str) -> Option<String> {
         " <= " => " > ",
         _ => " <= ",
     };
-    Some(format!("{}{}{}", &s[..at], flipped, &s[at + op.len()..]))
+    Some(cat!(&s[..at], flipped, &s[at + op.len()..]))
 }
 
 struct FunctionSignature {
@@ -1936,14 +1952,14 @@ fn leading_block(block: &StructuredBlock) -> Option<usize> {
 impl FunctionSignature {
     fn to_c_declaration(&self, name: &str) -> String {
         if self.params.is_empty() {
-            format!("{} {}(void)", self.return_type, name)
+            cat!(self.return_type, " ", name, "(void)")
         } else {
             let params: Vec<String> = self
                 .params
                 .iter()
-                .map(|(ty, nm)| format!("{} {}", ty, nm))
+                .map(|(ty, nm)| cat!(ty, " ", nm))
                 .collect();
-            format!("{} {}({})", self.return_type, name, params.join(", "))
+            cat!(self.return_type, " ", name, "(", params.join(", "), ")")
         }
     }
 }
@@ -2112,7 +2128,7 @@ pub(crate) fn name_hex(prefix: &str, v: u64) -> String {
     s
 }
 
-/// `format!("{prefix}{v}{suffix}")`.
+/// `cat!(prefix, v, suffix)`.
 pub(crate) fn name_num_suffix(prefix: &str, v: u64, suffix: &str) -> String {
     let mut buf = [0u8; 20];
     let mut at = buf.len();
@@ -2132,15 +2148,20 @@ pub(crate) fn name_num_suffix(prefix: &str, v: u64, suffix: &str) -> String {
     s
 }
 
-/// `format!("{prefix}{v}")`.
+/// `cat!(prefix, v)`.
 pub(crate) fn name_num(prefix: &str, v: u64) -> String {
     name_num_suffix(prefix, v, "")
 }
 
 fn reg_name(offset: u64, size: u32) -> String {
+    // a flag value named by what it computes (WS90, `flags::name_flag_webs`)
+    if size == 1
+        && offset >= crate::flags::NAMED_FLAG_BASE
+        && let Some(n) = crate::flags::named_flag(offset)
+    {
+        return n;
+    }
     match (offset, size) {
-        // a flag value named by what it computes (WS90, `flags::name_flag_webs`)
-        (off, 1) if off >= crate::flags::NAMED_FLAG_BASE && crate::flags::named_flag(off).is_some() => crate::flags::named_flag(off).unwrap_or_default(),
         (0x00, 8) => "rax".into(),
         (0x00, 4) => "eax".into(),
         (0x00, 2) => "ax".into(),
@@ -2257,8 +2278,8 @@ fn signed_operand(ty: &str, w: u32, text: &str) -> String {
         return text.to_string();
     }
     match int_cast(strip_outer_parens(text)) {
-        Some((cw, _, y)) if cw == w => format!("({ty}){y}"),
-        _ => format!("({ty}){text}"),
+        Some((cw, _, y)) if cw == w => cat!("(", ty, ")", y),
+        _ => cat!("(", ty, ")", text),
     }
 }
 
@@ -2273,7 +2294,7 @@ pub(crate) fn drop_widening_casts(s: &str) -> String {
     match text_int_type(&inner) {
         // (uintW)(uintK)y with K <= W: the outer cast changes nothing
         Some((k, false)) if k <= w => inner,
-        _ => format!("({}){}", size_to_type(w), inner),
+        _ => cat!("(", size_to_type(w), ")", inner),
     }
 }
 
@@ -2555,7 +2576,7 @@ pub(crate) fn float_literal(bits: u64, size: u32) -> Option<String> {
     if !t.contains(['.', 'e']) {
         t.push_str(".0");
     }
-    Some(format!("{t}{suffix}"))
+    Some(cat!(t, suffix))
 }
 
 /// `k` when `v` is the constant `-k` of its width, `k` small (below 2^31): an addition of it
@@ -2588,8 +2609,8 @@ mod tests {
     fn names_match_the_formatting_machinery() {
         for v in [0u64, 1, 9, 10, 15, 16, 255, 0x1000, 0xdead_beef, u64::MAX, 1 << 63, 0x0123_4567_89ab_cdef] {
             assert_eq!(name_hex("tmp_", v), format!("tmp_{v:x}"));
-            assert_eq!(name_num("old_", v), format!("old_{v}"));
-            assert_eq!(name_num_suffix("r", v, "d"), format!("r{v}d"));
+            assert_eq!(name_num("old_", v), cat!("old_", v));
+            assert_eq!(name_num_suffix("r", v, "d"), cat!("r", v, "d"));
         }
     }
 
