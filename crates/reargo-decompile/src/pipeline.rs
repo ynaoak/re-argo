@@ -1602,7 +1602,7 @@ pub(crate) fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<Lifted
         .collect()
 }
 
-fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructions: &[I]) -> Vec<bool> {
+pub(crate) fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructions: &[I]) -> Vec<bool> {
     use rustc_hash::FxHashMap;
 
     if instructions.is_empty() {

@@ -438,20 +438,20 @@ impl<'a> CalleeParams<'a> {
         {
             return Some(s);
         }
-        let lifted = match (self.lifter.as_x86(), self.range_cache.as_ref().and_then(|c| c.lock().ok())) {
-            // (`lift_range` from the lifts of the range's instructions alone)
-            (Some(x86), Some(mut cache)) => match x86.lift_range_cached(self.memory, target, MAX_INSNS, &mut cache) {
-                reargo_lift::x86::CachedRange::Cached(v) => v.into_iter().cloned().collect(),
-                reargo_lift::x86::CachedRange::Owned(v) => v,
-            },
-            _ => self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?,
+        let (insns, len, first, last) = match (self.lifter.as_x86(), self.range_cache.as_ref().and_then(|c| c.lock().ok())) {
+            // (`trim_to_return(lift_range(…))` from the lifts of the range's instructions alone,
+            // cloning those the trim keeps)
+            (Some(x86), Some(mut cache)) => x86.lift_range_cached_kept(self.memory, target, MAX_INSNS, &mut cache, &mut |all| crate::pipeline::reachability(all)),
+            _ => {
+                let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
+                let (len, first, last) = (lifted.len(), lifted.first().map(|i| i.address), lifted.last().map(|i| i.address));
+                (crate::pipeline::trim_to_return(lifted), len, first, last)
+            }
         };
-        if lifted.is_empty() || lifted[0].address != target {
+        if len == 0 || first != Some(target) {
             return None;
         }
-        let last = lifted.last().map(|i| i.address);
-        let hit_limit = lifted.len() >= MAX_INSNS;
-        let insns = crate::pipeline::trim_to_return(lifted);
+        let hit_limit = len >= MAX_INSNS;
         // the body runs past the lift limit (its last lifted instruction is live)
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))

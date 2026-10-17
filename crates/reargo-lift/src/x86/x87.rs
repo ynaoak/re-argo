@@ -457,11 +457,11 @@ fn exit_of(insn: &LiftedInstruction) -> Exit {
 /// Does the callee of the call at `i` return a `long double`? It does when the code after the
 /// call (straight on, through unconditional jumps, until the next call or return) reads a value
 /// below an empty stack — the `fstp` that stores or drops the result.
-fn returns_ld(i: usize, lifted: &[LiftedInstruction], decoded: &[Option<Instruction>], index: &HashMap<u64, usize>) -> bool {
+fn returns_ld<L: std::borrow::Borrow<LiftedInstruction>>(i: usize, lifted: &[L], decoded: &[Option<Instruction>], index: &HashMap<u64, usize>) -> bool {
     let mut depth: i32 = 0;
     let mut at = i + 1;
     for _ in 0..64 {
-        let Some(insn) = lifted.get(at) else { return false };
+        let Some(insn) = lifted.get(at).map(|l| l.borrow()) else { return false };
         if let Some(Some(d)) = decoded.get(at) {
             match kind(d) {
                 Kind::Stack { needs, pops, pushes } => {
@@ -496,12 +496,12 @@ fn mem_key(insn: &Instruction) -> Option<(Register, Register, u32, u64)> {
 /// code before it — a `fnstcw [m]` (the rounding then), or a register built from such a saved
 /// word (or a constant) with `or` / `and` masks (`movzx eax, word [s]; or eax, 0xc00;
 /// mov [m], ax` = toward zero).
-fn fldcw_rc(i: usize, lifted: &[LiftedInstruction], decoded: &[Option<Instruction>], state: &[St]) -> Option<u8> {
+fn fldcw_rc<L: std::borrow::Borrow<LiftedInstruction>>(i: usize, lifted: &[L], decoded: &[Option<Instruction>], state: &[St]) -> Option<u8> {
     let key = mem_key(decoded[i].as_ref()?)?;
     let straight = |j: usize| {
         j + 1 < lifted.len()
-            && lifted[j].address + u64::from(lifted[j].length) == lifted[j + 1].address
-            && matches!(exit_of(&lifted[j]), Exit::Next)
+            && lifted[j].borrow().address + u64::from(lifted[j].borrow().length) == lifted[j + 1].borrow().address
+            && matches!(exit_of(lifted[j].borrow()), Exit::Next)
     };
     let rc_at = |j: usize| match state[j] {
         St::Known(c) => c.rc,
@@ -590,13 +590,13 @@ fn fldcw_rc(i: usize, lifted: &[LiftedInstruction], decoded: &[Option<Instructio
 /// be empty at a call) and leaves one value when its callee returns a `long double`
 /// ([`returns_ld`]). Code no jump reaches (the cases of a jump table, landing pads) starts at
 /// the depth of the last indirect jump before it, else empty.
-pub(crate) fn flow(lifted: &[LiftedInstruction], decoded: &[Option<Instruction>]) -> Flow {
+pub(crate) fn flow<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L], decoded: &[Option<Instruction>]) -> Flow {
     let n = lifted.len();
-    let index: HashMap<u64, usize> = lifted.iter().enumerate().map(|(i, l)| (l.address, i)).collect();
+    let index: HashMap<u64, usize> = lifted.iter().enumerate().map(|(i, l)| (l.borrow().address, i)).collect();
     let mut state = vec![St::Unset; n];
     let mut call_result = vec![None; n];
     let nearest = |depth| St::Known(X87Ctx { depth, rc: Some(0) });
-    let exits: Vec<Exit> = lifted.iter().map(exit_of).collect();
+    let exits: Vec<Exit> = lifted.iter().map(|l| exit_of(l.borrow())).collect();
     // the last indirect jump before each instruction
     let mut last_indirect = Vec::with_capacity(n);
     let mut last = None;
@@ -648,7 +648,7 @@ pub(crate) fn flow(lifted: &[LiftedInstruction], decoded: &[Option<Instruction>]
                 },
                 other => other,
             };
-            let next = (i + 1 < n && lifted[i].address + u64::from(lifted[i].length) == lifted[i + 1].address).then_some(i + 1);
+            let next = (i + 1 < n && lifted[i].borrow().address + u64::from(lifted[i].borrow().length) == lifted[i + 1].borrow().address).then_some(i + 1);
             let succ: [Option<usize>; 2] = match exits[i] {
                 Exit::Next | Exit::Call => [next, None],
                 Exit::Jump(t) => [index.get(&t).copied(), None],

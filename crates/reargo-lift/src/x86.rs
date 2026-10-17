@@ -236,6 +236,40 @@ impl<'m> BlockDecoder<'m> {
     }
 }
 
+/// A change [`X86Lifter::lift_x87_range`] makes to one instruction of a range.
+enum X87Change {
+    /// An x87 instruction lifted again with the stack depth before it.
+    Relift(LiftedInstruction),
+    /// A call whose callee leaves a `long double` in slot `call`, a `ret` returning slot `ret`.
+    Stack { call: Option<u8>, ret: Option<u8> },
+}
+
+impl X87Change {
+    fn apply(self, l: &mut LiftedInstruction) {
+        match self {
+            X87Change::Relift(again) => *l = again,
+            X87Change::Stack { call, ret } => {
+                if let Some(k) = call
+                    && let Some(call) = l.ops.iter().find(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd))
+                {
+                    let op = PcodeOp {
+                        opcode: OpCode::Indirect,
+                        seq: SeqNum::new(call.seq.addr, l.ops.len() as u32),
+                        output: Some(x87::slot(k)),
+                        inputs: SmallVec::from_slice(&call.inputs[..1]),
+                    };
+                    l.ops.push(op);
+                }
+                if let Some(slot) = ret {
+                    for op in l.ops.iter_mut().filter(|o| o.opcode == OpCode::Return && o.inputs.len() == 1) {
+                        op.inputs.push(x87::slot(slot));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The decoder of the block the last instruction [`X86Lifter::lift_alone_with`] decoded is
 /// in, for the next one.
 #[derive(Default)]
@@ -865,6 +899,74 @@ impl X86Lifter {
             }
             Err(idxs) => CachedRange::Owned(self.lift_range_from_cache(memory, start, count, &idxs, cache)),
         }
+    }
+
+    /// The instructions of `lift_range(memory, start, count)` that `keep` keeps (given all of
+    /// them in order, it says which), with how many the range has and its first and last
+    /// addresses: through `cache` as [`Self::lift_range_cached`], cloning only the
+    /// instructions kept (and changing only those of an x87 range).
+    pub fn lift_range_cached_kept(
+        &self,
+        memory: &Memory,
+        start: u64,
+        count: usize,
+        cache: &mut LiftCache,
+        keep: &mut dyn FnMut(&[&LiftedInstruction]) -> Vec<bool>,
+    ) -> (Vec<LiftedInstruction>, usize, Option<u64>, Option<u64>) {
+        let ends = |all: &[&LiftedInstruction]| (all.len(), all.first().map(|i| i.address), all.last().map(|i| i.address));
+        let pick = |all: &[&LiftedInstruction], kept: &[bool]| -> Vec<LiftedInstruction> {
+            all.iter().zip(kept).filter(|(_, k)| **k).map(|(i, _)| (*i).clone()).collect()
+        };
+        let idxs = match self.walk_cached(memory, start, count, cache) {
+            Ok(idxs) => {
+                let all = cache.insns(&idxs);
+                let kept = keep(&all);
+                let (n, first, last) = ends(&all);
+                return (pick(&all, &kept), n, first, last);
+            }
+            Err(idxs) => idxs,
+        };
+        // `lift_range_from_cache`: the lifts alone, changed by the x87 pass; with the integer
+        // PF lifted again (below)
+        let fast_lifter = X86Lifter { is_64: self.is_64, parity: false };
+        {
+            let fast: Vec<&LiftedInstruction> = cache.insns(&idxs);
+            let mut changed: Vec<Option<LiftedInstruction>> = Vec::new();
+            if let Some(changes) = fast_lifter.x87_changes(memory, &fast) {
+                changed.resize_with(fast.len(), || None);
+                for (i, c) in changes {
+                    changed[i] = Some(match c {
+                        X87Change::Relift(again) => again,
+                        stack => {
+                            let mut l = fast[i].clone();
+                            stack.apply(&mut l);
+                            l
+                        }
+                    });
+                }
+            }
+            let post: Vec<&LiftedInstruction> = fast.iter().enumerate().map(|(i, &f)| changed.get(i).and_then(Option::as_ref).unwrap_or(f)).collect();
+            if !(self.parity && needs_integer_parity(&post)) {
+                let kept = keep(&post);
+                let (n, first, last) = ends(&post);
+                drop(post);
+                let out = (0..n)
+                    .filter(|&i| kept[i])
+                    .map(|i| match changed.get_mut(i).and_then(Option::take) {
+                        Some(owned) => owned,
+                        None => fast[i].clone(),
+                    })
+                    .collect();
+                return (out, n, first, last);
+            }
+        }
+        // (the integer PF needed: lifted again with it, as `lift_range_from_cache` does)
+        let all = self.lift_range_from_cache(memory, start, count, &idxs, cache);
+        let refs: Vec<&LiftedInstruction> = all.iter().collect();
+        let kept = keep(&refs);
+        let (n, first, last) = ends(&refs);
+        let out = all.into_iter().zip(kept).filter(|(_, k)| *k).map(|(i, _)| i).collect();
+        (out, n, first, last)
     }
 
     /// `lift_range(memory, start, count)` for a range whose instructions
@@ -3200,25 +3302,34 @@ impl X86Lifter {
     /// slot it leaves (`INDIRECT(target)`, like the convention's return registers), and a `ret`
     /// with a value on the stack returns it (a further input of its RETURN).
     fn lift_x87_range(&self, memory: &Memory, lifted: &mut [LiftedInstruction]) {
+        let Some(changes) = self.x87_changes(memory, lifted) else { return };
+        for (i, c) in changes {
+            c.apply(&mut lifted[i]);
+        }
+    }
+
+    /// What [`Self::lift_x87_range`] changes in `lifted`, by index (`None`: nothing).
+    fn x87_changes<L: std::borrow::Borrow<LiftedInstruction>>(&self, memory: &Memory, lifted: &[L]) -> Option<Vec<(usize, X87Change)>> {
         // Only a range with an x87 instruction (checked on the decoded
         // instructions first: formatting the text costs more) and an
         // instruction whose text starts with `f` is rewritten.
-        if !lifted.iter().any(|l| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87)) {
-            return;
+        if !lifted.iter().any(|l| l.borrow().mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87)) {
+            return None;
         }
         // (the texts of the x87 ones first: they are the ones that start
         // with `f`, and each text is formatted when first read)
         let maybe_x87 = |l: &LiftedInstruction| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
-        if !lifted.iter().filter(|l| maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
-            && !lifted.iter().filter(|l| !maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
+        if !lifted.iter().map(|l| l.borrow()).filter(|l| maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
+            && !lifted.iter().map(|l| l.borrow()).filter(|l| !maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
         {
-            return;
+            return None;
         }
         // the instruction a lift was made from is the one decoded at its
         // address again
         let decoded: Vec<Option<iced_x86::Instruction>> = lifted
             .iter()
             .map(|l| {
+                let l = l.borrow();
                 if let Some(insn) = l.mnemonic.x86_instruction() {
                     return Some(*insn);
                 }
@@ -3230,34 +3341,26 @@ impl X86Lifter {
             })
             .collect();
         if !decoded.iter().flatten().any(|d| x87::kind(d) != x87::Kind::NotX87) {
-            return;
+            return None;
         }
         let flow = x87::flow(lifted, &decoded);
-        for (i, l) in lifted.iter_mut().enumerate() {
+        let mut changes = Vec::new();
+        for (i, l) in lifted.iter().enumerate() {
+            let l = l.borrow();
             let Some(d) = &decoded[i] else { continue };
             if x87::kind(d) != x87::Kind::NotX87 {
                 if let Ok((again, _)) = self.lift_one(memory, l.address, flow.ctx[i]) {
-                    *l = again;
+                    changes.push((i, X87Change::Relift(again)));
                 }
                 continue;
             }
-            if let Some(k) = flow.call_result[i]
-                && let Some(call) = l.ops.iter().find(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd))
-            {
-                let op = PcodeOp {
-                    opcode: OpCode::Indirect,
-                    seq: SeqNum::new(call.seq.addr, l.ops.len() as u32),
-                    output: Some(x87::slot(k)),
-                    inputs: SmallVec::from_slice(&call.inputs[..1]),
-                };
-                l.ops.push(op);
-            }
-            if let Some(c) = flow.ctx[i].filter(|c| c.depth > 0) {
-                for op in l.ops.iter_mut().filter(|o| o.opcode == OpCode::Return && o.inputs.len() == 1) {
-                    op.inputs.push(x87::slot(c.depth - 1));
-                }
+            let call = flow.call_result[i].filter(|_| l.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
+            let ret = flow.ctx[i].filter(|c| c.depth > 0).map(|c| c.depth - 1);
+            if call.is_some() || ret.is_some() {
+                changes.push((i, X87Change::Stack { call, ret }));
             }
         }
+        Some(changes)
     }
 }
 
