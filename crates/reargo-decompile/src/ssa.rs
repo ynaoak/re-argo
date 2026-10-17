@@ -45,6 +45,37 @@ pub struct SsaOp {
 const PHANTOM: VarId = VarId::MAX - 1;
 const PHANTOM_MIN: VarId = 1 << 31;
 
+/// The renaming stacks of [`SsaFunction::build_ssa`], one per slot, in one list.
+struct ScopeStacks {
+    /// Per slot, its top entry ([`NO_ENTRY`] when empty).
+    top: Vec<u32>,
+    /// `(value, slot, the slot's entry below)`.
+    entries: Vec<(VarId, u32, u32)>,
+}
+
+const NO_ENTRY: u32 = u32::MAX;
+
+impl ScopeStacks {
+    fn push(&mut self, k: u32, v: VarId) {
+        let below = self.top[k as usize];
+        self.top[k as usize] = self.entries.len() as u32;
+        self.entries.push((v, k, below));
+    }
+
+    fn last(&self, k: u32) -> Option<&VarId> {
+        let t = self.top[k as usize];
+        (t != NO_ENTRY).then(|| &self.entries[t as usize].0)
+    }
+
+    /// Pop the entries pushed after the list had `len` (the last ones).
+    fn pop_to(&mut self, len: u32) {
+        while self.entries.len() > len as usize {
+            let (_, k, below) = self.entries.pop().expect("an entry");
+            self.top[k as usize] = below;
+        }
+    }
+}
+
 /// Per slot (dense id) of [`SsaFunction::build_ssa`]: how many versions it has, and its
 /// incoming value (`VarId::MAX` until read).
 struct Slots {
@@ -192,6 +223,8 @@ impl SsaFunction {
         let mut kid_start = vec![0usize; n];
         // (the constants read and the values written: a varnode each)
         let (mut n_consts, mut n_outputs) = (0usize, 0usize);
+        // (the calls' register inputs: those reading a definition left out get a value each)
+        let mut n_call_reads = 0usize;
         let mut intern = |k: Key| -> u32 {
             *slot_of.entry(k).or_insert_with(|| {
                 slots.push(k);
@@ -201,6 +234,9 @@ impl SsaFunction {
         for (b, block) in cfg.blocks.iter().enumerate() {
             kid_start[b] = kids.len();
             for op in block.instructions.iter().flat_map(|i| i.ops.iter()) {
+                if matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
+                    n_call_reads += op.inputs.len();
+                }
                 for inp in &op.inputs {
                     kids.push(if inp.space == SpaceId::CONST {
                         n_consts += 1;
@@ -407,7 +443,7 @@ impl SsaFunction {
         let n_phis: usize = phis.iter().map(Vec::len).sum();
         let new_values = n_consts + n_outputs + n_phis;
         self.ops.reserve(total_ops + n_phis + total_ops / 16 + 8);
-        self.varnodes.reserve(new_values + n_slots + new_values / 16 + 16);
+        self.varnodes.reserve(new_values + n_slots + new_values / 16 + 16 + if any_phantom { n_call_reads } else { 0 });
 
         // 3. lay the ops out in linear block order (phis first); renaming fills them in
         let mut block_start = vec![0usize; n];
@@ -453,14 +489,17 @@ impl SsaFunction {
         // per slot: the version count, the incoming value (`incoming_var`), the stack of
         // the versions in scope
         let mut vars = Slots { versions: vec![0; n_slots], incoming: vec![VarId::MAX; n_slots] };
-        let mut stacks: Vec<Vec<VarId>> = vec![Vec::new(); n_slots];
+        // (the stacks as one list of `(value, slot, the slot's entry below)`, its top per slot:
+        // a block's entries are the last ones while it is in scope)
+        let mut stacks = ScopeStacks { top: vec![NO_ENTRY; n_slots], entries: Vec::with_capacity(n_outputs + n_phis + 16) };
         let mut visited = vec![false; n];
         let mut roots: Vec<usize> = Vec::new();
         if n > 0 {
             roots.push(cfg.entry_block);
         }
         roots.extend((0..n).filter(|&b| b != cfg.entry_block && idom[b].is_none_or(|d| d == b)));
-        let mut pushed_by: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // (the length of the stacks' list when each block on the walk was entered)
+        let mut entered: Vec<u32> = vec![0; n];
         // (the phantom phis' operands set so far, per block and predecessor: only the first
         // sets one)
         self.phantom_phis = phantom_phis.iter().map(Vec::len).sum();
@@ -470,15 +509,14 @@ impl SsaFunction {
             let mut dfs: Vec<(usize, bool)> = vec![(root, false)];
             while let Some((b, exiting)) = dfs.pop() {
                 if exiting {
-                    for k in pushed_by[b].drain(..) {
-                        stacks[k as usize].pop();
-                    }
+                    stacks.pop_to(entered[b]);
                     continue;
                 }
                 if visited[b] {
                     continue;
                 }
                 visited[b] = true;
+                entered[b] = stacks.entries.len() as u32;
                 dfs.push((b, true));
                 let block = &cfg.blocks[b];
                 let mut idx = block_start[b];
@@ -496,8 +534,7 @@ impl SsaFunction {
                             self.incoming_var(&mut vars, k, &vn);
                         }
                         vars.versions[k as usize] += 1;
-                        stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
-                        pushed_by[b].push(k);
+                        stacks.push(k, PHANTOM - vars.versions[k as usize]);
                         ghost_regs |= 1u128 << phantom_reg[k as usize];
                         continue;
                     }
@@ -511,8 +548,7 @@ impl SsaFunction {
                     let out = self.new_version_var(&mut vars, k, &vn);
                     self.varnodes[out as usize].def_op = Some(idx);
                     self.ops[idx].output = Some(out);
-                    stacks[k as usize].push(out);
-                    pushed_by[b].push(k);
+                    stacks.push(k, out);
                     idx += 1;
                 }
                 if ghost_regs != 0 {
@@ -529,7 +565,7 @@ impl SsaFunction {
                             let id = if k == NO_SLOT {
                                 self.const_var(inp)
                             } else {
-                                match stacks[k as usize].last() {
+                                match stacks.last(k) {
                                     // (never read: the values left out are those nothing reads)
                                     Some(&id) if id >= PHANTOM_MIN => self.phantom_var(*inp, PHANTOM - id),
                                     Some(&id) => id,
@@ -546,8 +582,7 @@ impl SsaFunction {
                             let id = self.new_version_var(&mut vars, k, &out);
                             self.varnodes[id as usize].def_op = Some(idx);
                             self.ops[idx].output = Some(id);
-                            stacks[k as usize].push(id);
-                            pushed_by[b].push(k);
+                            stacks.push(k, id);
                         }
                         idx += 1;
                         let left_out = phantoms_at(insn, pcode_op, &mut seen_call);
@@ -555,8 +590,7 @@ impl SsaFunction {
                             // the definitions left out after the call, numbered
                             let k = reg_slot[r];
                             vars.versions[k as usize] += 1;
-                            stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
-                            pushed_by[b].push(k);
+                            stacks.push(k, PHANTOM - vars.versions[k as usize]);
                         }
                         if left_out != 0 {
                             self.phantom_writes.push((4 * idx, left_out));
@@ -573,7 +607,7 @@ impl SsaFunction {
                         let n_preds = cfg.blocks[s].predecessors.len();
                         for (g, &k) in phantom_phis[s].iter().enumerate() {
                             let filled = &mut phantom_filled[s][g * n_preds + j];
-                            if !std::mem::replace(filled, true) && stacks[k as usize].is_empty() {
+                            if !std::mem::replace(filled, true) && stacks.last(k).is_none() {
                                 self.incoming_var(&mut vars, k, &slot_vn(k));
                             }
                         }
@@ -582,7 +616,7 @@ impl SsaFunction {
                             if self.ops[phi_idx].inputs[j] != VarId::MAX {
                                 continue;
                             }
-                            let id = match stacks[k as usize].last() {
+                            let id = match stacks.last(k) {
                                 // (a phi reached from a value left out is read by nothing either)
                                 Some(&id) if id >= PHANTOM_MIN => self.phantom_var(slot_vn(k), PHANTOM - id),
                                 Some(&id) => id,

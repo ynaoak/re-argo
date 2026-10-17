@@ -469,7 +469,8 @@ impl<'a> CalleeParams<'a> {
         // (the walk's instructions follow each other: the one after any but the last is in it)
         let last = walk.last();
         let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
-        let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
+        // (room for the whole walk: the instructions are large, and growing moved them)
+        let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::with_capacity(walk.len());
         let mut stack = vec![target as usize];
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
         while let Some(a) = stack.pop() {
