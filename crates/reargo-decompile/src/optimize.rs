@@ -556,16 +556,25 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     // version, so a use may only be redirected to an earlier value whose slot
     // has not been written since: `tmp_600 = rsp + 0xc; ...; tmp_600 = rsp + 4;
     // ...; load [rsp + 0xc]` printed the last load as `*(tmp_600)` = rsp + 4.
-    // (about one slot per four ops: sized once rather than grown op by op)
-    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), u32> =
-        rustc_hash::FxHashMap::with_capacity_and_hasher(func.ops.len() / 4 + 16, Default::default());
-    let record = |func: &SsaFunction, i: usize, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), u32>| {
-        if let Some(o) = func.ops[i].output
-            && !func.ops[i].dead
-        {
-            let vn = &func.varnodes[o as usize];
-            latest.insert((vn.data.space.0, vn.data.offset, vn.data.size), vn.version);
+    // The version a slot holds before op `i`: that of the last live op before it writing the
+    // slot (0 when none). Asked only of the slots of the duplicates found: each one's writers
+    // are scanned forward as the loop goes (`(scanned up to, version)`). (An op before `i`
+    // keeps its dead flag from here on: only the op visited dies.)
+    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32)> = Default::default();
+    let version_before = |func: &SsaFunction, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32)>, slot: (u32, u64, u32), i: usize| {
+        let e = latest.entry(slot).or_insert((0, 0));
+        for op in &func.ops[e.0.min(i)..i] {
+            if let Some(o) = op.output
+                && !op.dead
+            {
+                let vn = &func.varnodes[o as usize];
+                if (vn.data.space.0, vn.data.offset, vn.data.size) == slot {
+                    e.1 = vn.version;
+                }
+            }
         }
+        e.0 = e.0.max(i);
+        e.1
     };
     // WS84: ... and still holds it at every reader of the removed value, not only where the
     // duplicate is (`rax = rdi + 12; rbx = rdi + 12; rax = 5; rcx = rbx + 1` read `rax` for
@@ -625,7 +634,6 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         }
         let opcode = func.ops[i].opcode;
         if !is_cse_pure(opcode) || func.ops[i].inputs.is_empty() {
-            record(func, i, &mut latest);
             continue;
         }
         let Some(out_id) = func.ops[i].output else { continue };
@@ -645,8 +653,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         // A value a phi reads keeps its own name (the phi prints as nothing).
         let feeds_phi =
             |func: &SsaFunction| func.varnodes[out_id as usize].uses.iter().any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
-        let name_still_holds =
-            |k: ValueKey| latest.get(&(k.0, k.1, k.2)).copied().unwrap_or(0) == k.3;
+        let mut name_still_holds = |k: ValueKey| version_before(func, &mut latest, (k.0, k.1, k.2), i) == k.3;
         // (one lookup: the earlier value, or the slot this one takes)
         let slot = match seen.entry(key) {
             std::collections::hash_map::Entry::Occupied(o) => {
@@ -665,7 +672,6 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             std::collections::hash_map::Entry::Vacant(v) => v.insert(out_key),
         };
         *slot = out_key;
-        record(func, i, &mut latest);
     }
 
     // Apply all redirects in a single pass over the varnode arena.
