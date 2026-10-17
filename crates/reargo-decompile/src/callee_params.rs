@@ -580,7 +580,8 @@ impl<'a> CalleeParams<'a> {
         // an argument setup)
         let mut window = 0u32;
         for insn in &cfg.blocks[b].instructions {
-            let zeroed = zero_idiom_operands(insn);
+            // (found when an input is first asked about)
+            let mut zeroed = None;
             for op in &insn.ops {
                 match op.opcode {
                     OpCode::Call | OpCode::CallInd => {
@@ -614,9 +615,12 @@ impl<'a> CalleeParams<'a> {
                     }
                     _ => {}
                 }
-                if let Some(a) = acc.as_deref_mut() {
+                // (a read adds the arguments neither defined nor read yet: none once all are)
+                if let Some(a) = acc.as_deref_mut()
+                    && defined | a.reads != all
+                {
                     for (k, inp) in op.inputs.iter().enumerate() {
-                        if inp.space == SpaceId::CONST || zeroed.contains(inp) {
+                        if inp.space == SpaceId::CONST || zeroed.get_or_insert_with(|| zero_idiom_operands(insn)).contains(inp) {
                             continue;
                         }
                         let (lo, hi) = read_range(op, k, inp);
