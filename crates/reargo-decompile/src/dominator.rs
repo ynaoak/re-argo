@@ -175,7 +175,8 @@ pub fn dominates(idom: &[Option<BlockId>], a: BlockId, mut b: BlockId) -> bool {
 /// slot for the value a φ at the entry would receive from the caller.
 pub fn compute_dominance_frontier(cfg: &ControlFlowGraph, idom: &[Option<BlockId>]) -> Vec<Vec<BlockId>> {
     let n = cfg.blocks.len();
-    let mut df_sets: Vec<std::collections::BTreeSet<BlockId>> = vec![std::collections::BTreeSet::new(); n];
+    // (collected, then sorted and deduplicated)
+    let mut df_sets: Vec<Vec<BlockId>> = vec![Vec::new(); n];
 
     for b in 0..n {
         if b == cfg.entry_block {
@@ -189,7 +190,7 @@ pub fn compute_dominance_frontier(cfg: &ControlFlowGraph, idom: &[Option<BlockId
         for p in preds {
             let mut runner = p;
             while runner != stop {
-                df_sets[runner].insert(b);
+                df_sets[runner].push(b);
                 match idom[runner] {
                     Some(up) if up != runner => runner = up,
                     _ => break, // reached the entry
@@ -197,7 +198,11 @@ pub fn compute_dominance_frontier(cfg: &ControlFlowGraph, idom: &[Option<BlockId
             }
         }
     }
-    df_sets.into_iter().map(|s| s.into_iter().collect()).collect()
+    for s in &mut df_sets {
+        s.sort_unstable();
+        s.dedup();
+    }
+    df_sets
 }
 
 /// Immediate post-dominators over the blocks reachable from the entry, computed as the
