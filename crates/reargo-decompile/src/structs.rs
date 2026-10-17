@@ -98,6 +98,20 @@ pub struct Field {
     pub kind: FieldKind,
     /// Only a callee accesses it (through the pointer passed to it): that callee.
     pub from: Option<u64>,
+    /// (WS96) A pointer of a vector of pointers to objects of a class (the `this` index's
+    /// element classes): `std::vector<T*>`'s begin, end or capacity pointer.
+    pub vector: Option<VectorField>,
+}
+
+/// (WS96) A field that is one of the three pointers of a vector (`{begin, end, capacity}`) whose
+/// elements are pointers to objects of the class `elem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorField {
+    pub elem: String,
+    /// 0: begin, 1: end, 2: capacity
+    pub role: u8,
+    /// the begin pointer's offset
+    pub begin: u64,
 }
 
 impl Field {
@@ -125,6 +139,9 @@ pub struct StructDef {
 
 impl StructDef {
     fn field_type(&self, f: &Field, defs: &[StructDef]) -> String {
+        if let Some(v) = &f.vector {
+            return format!("struct {}**", v.elem);
+        }
         match f.kind {
             FieldKind::VPtr => "void**".into(),
             FieldKind::Ptr(Some(i)) => format!("struct {}*", defs[i].name),
@@ -154,9 +171,10 @@ impl StructDef {
             if f.off > at {
                 out.push_str(&format!("    uint8_t _gap_{at:x}[0x{:x}];\n", f.off - at));
             }
+            let vector = f.vector.as_ref().map(vector_note).unwrap_or_default();
             match f.from {
-                Some(c) => out.push_str(&format!("    {} {}; // +0x{:x} (used by 0x{c:x})\n", self.field_type(f, defs), f.name(), f.off)),
-                None => out.push_str(&format!("    {} {}; // +0x{:x}\n", self.field_type(f, defs), f.name(), f.off)),
+                Some(c) => out.push_str(&format!("    {} {}; // +0x{:x}{vector} (used by 0x{c:x})\n", self.field_type(f, defs), f.name(), f.off)),
+                None => out.push_str(&format!("    {} {}; // +0x{:x}{vector}\n", self.field_type(f, defs), f.name(), f.off)),
             }
             at = f.off + u64::from(f.size);
         }
@@ -178,6 +196,7 @@ impl StructDef {
                 out.push_str(&format!("    _gap_{at:x}: [u8; 0x{:x}],\n", f.off - at));
             }
             let ty = match f.kind {
+                _ if f.vector.is_some() => format!("*mut *mut {}", rust_ident(&f.vector.as_ref().expect("vector").elem)),
                 FieldKind::VPtr => "*const *const u8".to_string(),
                 FieldKind::Ptr(Some(i)) => format!("*mut {}", rust_ident(&defs[i].name)),
                 FieldKind::Ptr(None) => "*mut u8".into(),
@@ -185,11 +204,21 @@ impl StructDef {
                 FieldKind::Float if f.size == 8 => "f64".into(),
                 _ => crate::rust_emit::size_to_rust_type(f.size).into(),
             };
-            out.push_str(&format!("    {}: {ty}, // +0x{:x}\n", f.name(), f.off));
+            out.push_str(&format!("    {}: {ty}, // +0x{:x}{}\n", f.name(), f.off, f.vector.as_ref().map(vector_note).unwrap_or_default()));
             at = f.off + u64::from(f.size);
         }
         out.push('}');
         out
+    }
+}
+
+/// The comment of a vector's field (WS96): ` std::vector<T*> begin (end +0x28, capacity +0x30)`,
+/// ` end of the std::vector<T*> at +0x20`.
+fn vector_note(v: &VectorField) -> String {
+    match v.role {
+        0 => format!(" std::vector<{}*> begin (end +0x{:x}, capacity +0x{:x})", v.elem, v.begin + 8, v.begin + 16),
+        1 => format!(" end of the std::vector<{}*> at +0x{:x}", v.elem, v.begin),
+        _ => format!(" capacity of the std::vector<{}*> at +0x{:x}", v.elem, v.begin),
     }
 }
 
@@ -803,6 +832,33 @@ impl StructView {
                     break;
                 }
             }
+            // WS96: an object loaded from an element at an address computed from a container's
+            // begin / end pointer — indexed (`begin[i]`, `*(begin + (i << 3))`) or before it
+            // (`end[-1]`) —, a virtual call made on it: the container's element class
+            if let Some(ix) = ctx.this_index {
+                for &(_, ri, _) in &vcall_raw {
+                    let obj = uf.find(raws[ri].base);
+                    if root_classes.contains_key(&obj) || Some(obj) == this_root {
+                        continue;
+                    }
+                    let Some(&ovar) = func.ops[raws[ri].op].inputs.get(1) else { continue };
+                    let Some(load) = def_of(strip_copies(func, ovar)).filter(|o| o.opcode == OpCode::Load && o.inputs.len() == 2) else { continue };
+                    let Some(add) = def_of(strip_copies(func, load.inputs[1])).filter(|o| o.opcode == OpCode::IntAdd && o.inputs.len() == 2) else { continue };
+                    let found = add.inputs.iter().filter(|&&b| !konst(b)).find_map(|&b| {
+                        let n = *nodes.get(&value_key(func, strip_copies(func, b)))?;
+                        let &(cbase, boff) = loaded_from.get(&uf.find_const(n))?;
+                        let cvt = match (Some(cbase) == this_root, &this_class) {
+                            (true, Some((_, Some(vt)))) => Some(*vt),
+                            _ => root_classes.get(&cbase).and_then(|cs| crate::vcall::most_derived(mem, cs)).map(|c| c.1),
+                        }?;
+                        let evt = ix.element_class(cvt, boff as i64)?;
+                        Some((crate::vcall::vtable_class(mem, evt)?, evt))
+                    });
+                    if let Some(c) = found {
+                        root_classes.entry(obj).or_default().push(c);
+                    }
+                }
+            }
         }
 
         // the types that are structs: an access past offset 0, or a vtable pointer
@@ -888,7 +944,7 @@ impl StructView {
                 } else {
                     FieldKind::Int
                 };
-                fields.push(Field { off: o, size: s, kind, from });
+                fields.push(Field { off: o, size: s, kind, from, vector: None });
             }
             for &i in list.iter().filter(|&&i| raws[i].callee.is_none()) {
                 let r = &raws[i];
@@ -934,6 +990,28 @@ impl StructView {
             {
                 defs[d].class = Some(c.clone());
                 defs[d].class_from_symbol = true;
+            }
+        }
+        // WS96: the fields of a class that are a vector's pointers (the index's element classes)
+        if let (Some(ix), Some(mem)) = (ctx.this_index, ctx.memory) {
+            for d in defs.iter_mut() {
+                let Some(vt) = d.vtable else { continue };
+                let roles: Vec<(u64, VectorField)> = d
+                    .fields
+                    .iter()
+                    .filter(|f| f.size == 8 && f.kind != FieldKind::VPtr)
+                    .flat_map(|f| (0..3u8).map(move |role| (f.off, role)))
+                    .filter_map(|(off, role)| {
+                        let begin = off.checked_sub(8 * u64::from(role))?;
+                        let evt = ix.vector_element(vt, begin as i64)?;
+                        Some((off, VectorField { elem: crate::vcall::vtable_class(mem, evt)?, role, begin }))
+                    })
+                    .collect();
+                for (off, v) in roles {
+                    if let Some(f) = d.fields.iter_mut().find(|f| f.off == off && f.vector.is_none()) {
+                        f.vector = Some(v);
+                    }
+                }
             }
         }
         // names: the class, else `struct_N` by first access; one struct per class name
@@ -1636,6 +1714,45 @@ mod tests {
         decompile_with_options(&X86Lifter::new_64(), mem, entry, "f", 100, &Default::default(), &opts).unwrap()
     }
 
+    /// WS96: `Holder` has a vector of `Shape*` at +0x20 (the index's element class): a virtual
+    /// call on `this->field_20[i]` or on `this->field_28[-1]` (the end pointer) names the slot,
+    /// and the struct prints the three pointers as the vector's.
+    #[test]
+    fn a_virtual_call_on_a_vector_element_has_the_element_class() {
+        let m = [
+            0x53, // push rbx
+            0x48, 0x89, 0xfb, // mov rbx, rdi
+            0x48, 0x8b, 0x47, 0x20, // mov rax, [rdi+0x20]
+            0x48, 0x8b, 0x3c, 0xc8, // mov rdi, [rax+rcx*8]
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x08, // call [rax+8]
+            0x48, 0x8b, 0x43, 0x28, // mov rax, [rbx+0x28]
+            0x48, 0x8b, 0x78, 0xf8, // mov rdi, [rax-8]
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x50, 0x08, // call [rax+8]
+            0x48, 0x8b, 0x43, 0x30, // mov rax, [rbx+0x30]
+            0x5b, 0xc3, // pop rbx ; ret
+        ];
+        let mem = holder_with(&[(0x310, &m)]);
+        let fs = [(0x1000, 0x26), (0x1080, 0xb), (0x1100, 1), (0x1200, 4), (0x1300, 0xb), (0x1310, m.len() as u64), (0x1400, 3)];
+        let mut idx = crate::thisclass::build(&mem, &fs, &[]);
+        let class = |vt: u64| idx.hierarchy.vtables.iter().position(|&v| v == vt).expect("class") as u32;
+        let (holder, shape) = (class(0x2050), class(0x2010));
+        let opts = |idx: crate::thisclass::ThisIndex| DecompileOptions { structs: true, this_index: Some(Arc::new(idx)), ..Default::default() };
+        let r = decompile_with_options(&X86Lifter::new_64(), &mem, 0x1310, "f", 100, &Default::default(), &opts(idx.clone())).unwrap();
+        assert!(!r.c_code.contains("= Shape::"), "no element class yet: {}", r.c_code);
+        for off in [0x20, 0x28, 0x30] {
+            idx.elements.insert((holder, off), shape + 2);
+        }
+        idx.vectors = vec![(holder, 0x20)];
+        let r = decompile_with_options(&X86Lifter::new_64(), &mem, 0x1310, "f", 100, &Default::default(), &opts(idx)).unwrap();
+        assert_eq!(r.c_code.matches("// vfn[1] (vtable+0x8) = Shape::method_at_1200").count(), 2, "{}", r.c_code);
+        let d = r.recovered_structs.iter().find(|d| d.starts_with("struct Holder {")).expect("Holder");
+        assert!(d.contains("struct Shape** field_20; // +0x20 std::vector<Shape*> begin (end +0x28, capacity +0x30)"), "{d}");
+        assert!(d.contains("struct Shape** field_28; // +0x28 end of the std::vector<Shape*> at +0x20"), "{d}");
+        assert!(d.contains("struct Shape** field_30; // +0x30 capacity of the std::vector<Shape*> at +0x20"), "{d}");
+    }
+
     /// WS93: `this` of a non-virtual method has the class its callers pass (here `Holder`'s
     /// virtual method passes its own `this`), so a virtual call on a field of it names the slot.
     #[test]
@@ -1826,7 +1943,7 @@ mod tests {
 
     #[test]
     fn class_structs_merge_over_functions() {
-        let a = vec![StructDef { name: "Shape".into(), class: Some("Shape".into()), vtable: Some(0x2010), stride: None, class_from_symbol: false, fields: vec![Field { off: 8, size: 4, kind: FieldKind::Int, from: None }] }];
+        let a = vec![StructDef { name: "Shape".into(), class: Some("Shape".into()), vtable: Some(0x2010), stride: None, class_from_symbol: false, fields: vec![Field { off: 8, size: 4, kind: FieldKind::Int, from: None, vector: None }] }];
         let b = vec![
             StructDef {
                 name: "Shape".into(),
@@ -1834,7 +1951,7 @@ mod tests {
                 vtable: None,
                 stride: None,
                 class_from_symbol: false,
-                fields: vec![Field { off: 8, size: 8, kind: FieldKind::Int, from: None }, Field { off: 0x10, size: 8, kind: FieldKind::Ptr(Some(1)), from: None }],
+                fields: vec![Field { off: 8, size: 8, kind: FieldKind::Int, from: None, vector: None }, Field { off: 0x10, size: 8, kind: FieldKind::Ptr(Some(1)), from: None, vector: None }],
             },
             StructDef { name: "struct_1".into(), class: None, vtable: None, stride: None, class_from_symbol: false, fields: vec![] },
         ];
@@ -1866,9 +1983,9 @@ mod tests {
                 stride: None,
                 class_from_symbol: false,
                 fields: vec![
-                    Field { off: 0, size: 8, kind: FieldKind::VPtr, from: None },
-                    Field { off: 0x10, size: 4, kind: FieldKind::Float, from: None },
-                    Field { off: 0x18, size: 8, kind: FieldKind::Ptr(Some(0)), from: None },
+                    Field { off: 0, size: 8, kind: FieldKind::VPtr, from: None, vector: None },
+                    Field { off: 0x10, size: 4, kind: FieldKind::Float, from: None, vector: None },
+                    Field { off: 0x18, size: 8, kind: FieldKind::Ptr(Some(0)), from: None, vector: None },
                 ],
             },
         ];
