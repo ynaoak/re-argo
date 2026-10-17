@@ -84,6 +84,53 @@ pub fn direct_call_sites(memory: &Memory, target: u64, cap: usize) -> Vec<u64> {
     out
 }
 
+/// Every `call rel32` (`E8`) of the executable blocks by its target, in the order
+/// [`direct_call_sites`] finds them: one scan for all the lookups of a batch.
+pub struct CallIndex {
+    sites: rustc_hash::FxHashMap<u64, Vec<u64>>,
+    /// The executable blocks' span.
+    lo: u64,
+    hi: u64,
+}
+
+impl CallIndex {
+    /// `None` when the executable blocks span 1 GiB or more (`direct_call_sites` skips the runs
+    /// of sites too far for a `rel32`, which this index does not model; it answers only for
+    /// targets less than 1 GiB away from the blocks, where no run is skipped).
+    pub fn build(memory: &Memory) -> Option<Self> {
+        let exec = || memory.blocks().filter(|b| b.flags.contains(MemoryFlags::EXECUTE));
+        let lo = exec().map(|b| b.start).min()?;
+        let hi = exec().map(|b| b.start.saturating_add(b.data.as_ref().map_or(0, |d| d.len() as u64))).max()?;
+        if hi.saturating_sub(lo) >= 1 << 30 {
+            return None;
+        }
+        let mut sites: rustc_hash::FxHashMap<u64, Vec<u64>> = rustc_hash::FxHashMap::default();
+        for block in exec() {
+            let Some(data) = block.data.as_ref() else { continue };
+            if data.len() < 5 {
+                continue;
+            }
+            let last = data.len() - 4; // sites k < last
+            for k in memchr::memchr_iter(0xe8, &data[..last]) {
+                let r = i32::from_le_bytes([data[k + 1], data[k + 2], data[k + 3], data[k + 4]]);
+                let at = block.start + k as u64;
+                let target = (at as i64).wrapping_add(5).wrapping_add(r as i64) as u64;
+                sites.entry(target).or_default().push(at);
+            }
+        }
+        Some(Self { sites, lo, hi })
+    }
+
+    /// [`direct_call_sites`]`(memory, target, cap)`, `None` for a target 1 GiB or more away
+    /// from the executable blocks.
+    pub fn sites(&self, target: u64, cap: usize) -> Option<Vec<u64>> {
+        if target < self.lo.saturating_sub(1 << 30) || target >= self.hi.saturating_add(1 << 30) {
+            return None;
+        }
+        Some(self.sites.get(&target).map_or_else(Vec::new, |v| v[..v.len().min(cap)].to_vec()))
+    }
+}
+
 /// The verdict of one call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Site {
@@ -161,13 +208,23 @@ fn site_verdict(lifter: &dyn PcodeLift, memory: &Memory, site: u64, rax: &Varnod
 /// that register and none the other, `Void` when every caller that decides ignores it.
 /// `None` without callers, a calling convention, or a consistent answer.
 pub fn return_hint(lifter: &dyn PcodeLift, memory: &Memory, target: u64) -> Option<ReturnHint> {
+    return_hint_at(lifter, memory, direct_call_sites(memory, target, MAX_SITES))
+}
+
+/// [`return_hint`] with the call sites read from `index`.
+pub fn return_hint_indexed(lifter: &dyn PcodeLift, memory: &Memory, target: u64, index: &CallIndex) -> Option<ReturnHint> {
+    let sites = index.sites(target, MAX_SITES).unwrap_or_else(|| direct_call_sites(memory, target, MAX_SITES));
+    return_hint_at(lifter, memory, sites)
+}
+
+fn return_hint_at(lifter: &dyn PcodeLift, memory: &Memory, sites: Vec<u64>) -> Option<ReturnHint> {
     let cc = lifter.call_convention()?;
     let (rax, xmm0) = match cc.returns.as_slice() {
         [(r, _), (x, _), ..] => (*r, *x),
         _ => return None,
     };
     let (mut int, mut float, mut void, mut size, mut ld) = (0, 0, 0, 0, 0);
-    for site in direct_call_sites(memory, target, MAX_SITES) {
+    for site in sites {
         match site_verdict(lifter, memory, site, &rax, &xmm0) {
             Site::Int => int += 1,
             Site::Float(s) => {
@@ -212,5 +269,10 @@ mod tests {
         });
         assert_eq!(direct_call_sites(&mem, 0x1010, 8), vec![0x1000, 0x100a]);
         assert_eq!(direct_call_sites(&mem, 0x1010, 1), vec![0x1000]);
+        let index = CallIndex::build(&mem).unwrap();
+        assert_eq!(index.sites(0x1010, 8), Some(vec![0x1000, 0x100a]));
+        assert_eq!(index.sites(0x1010, 1), Some(vec![0x1000]));
+        assert_eq!(index.sites(0x1011, 8), Some(direct_call_sites(&mem, 0x1011, 8)));
+        assert_eq!(index.sites(0x1_0000_0000_0000, 8), None);
     }
 }

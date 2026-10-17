@@ -212,7 +212,9 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
     use OpCode::*;
     let block_start = block_starts(func);
     let mut memo: FxHashMap<ValueKey, Option<Found>> = FxHashMap::default();
-    let readers = crate::condition::Readers::new(func);
+    // (the readers before any rewrite: built at the first op that combines flags, which comes
+    // before the first rewrite; most functions have none)
+    let mut readers: Option<crate::condition::Readers> = None;
     let mut saved = 0u64;
     let mut rewritten = 0;
     // the outermost combination first (it comes last): `ZF || SF != OF` becomes one `a <= b`
@@ -239,6 +241,7 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
         if !combines {
             continue;
         }
+        let readers = &*readers.get_or_insert_with(|| crate::condition::Readers::new(func));
         let Some((Rel::Cmp(cmp, a, b), anchors)) = relation(func, out, 0, &mut memo) else { continue };
         let holds = |func: &SsaFunction, v: VarId| operands_hold(func, &block_start, &anchors, i, &[v]);
         let (mut a, mut b) = (a, b);
@@ -258,7 +261,7 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
             // `dec dword [m]; jle`: the operand is overwritten by the result. Keep its value
             // under a new name, set where the flags were computed (WS82): the overflow flag's
             // op, which nothing else will read
-            match (save, saving_slot(func, &readers, &anchors, i, a, b)) {
+            match (save, saving_slot(func, readers, &anchors, i, a, b)) {
                 (None, Some(o)) => {
                     save = Some((o, v));
                 }
@@ -282,7 +285,7 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
         func.ops[i].inputs = smallvec::smallvec![a, b];
         for v in old {
             if !func.ops[i].inputs.contains(&v) {
-                func.varnodes[v as usize].uses.retain(|&u| u != i);
+                func.varnodes[v as usize].uses.retain(|&mut u| u != i);
             }
         }
         for v in [a, b] {
@@ -310,7 +313,6 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
 /// `a s< b` and the join reads their phi.
 fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
     use OpCode::*;
-    let readers = crate::condition::Readers::new(func);
     let def = |func: &SsaFunction, v: VarId| func.varnodes[v as usize].def_op.filter(|&d| !func.ops[d].dead);
     // does (`sf`, `of`) hold the sign and overflow flags of one `a - b` (through phis that join
     // them edge by edge)? Collects the overflow values (leaves and phis) on the way.
@@ -373,6 +375,8 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
     if xors.is_empty() {
         return 0;
     }
+    // (nothing changed the function above)
+    let readers = crate::condition::Readers::new(func);
     // the overflow values to turn into comparisons: each read only by phis of the set and by
     // those `SF != OF` (a value read otherwise — `jo`, a phi with another input — drops out,
     // and with it every xor and phi reaching it)
@@ -443,7 +447,7 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
                 let Some(inputs) = sign.map(|s| s.inputs.clone()) else { continue };
                 let old = std::mem::replace(&mut func.ops[o].inputs, inputs.clone());
                 for v in old {
-                    func.varnodes[v as usize].uses.retain(|&u| u != o);
+                    func.varnodes[v as usize].uses.retain(|&mut u| u != o);
                 }
                 for v in inputs {
                     func.varnodes[v as usize].uses.push(o);
@@ -461,7 +465,7 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
         let inputs = func.ops[*x].inputs.clone();
         for &i in &inputs {
             if i != *of {
-                func.varnodes[i as usize].uses.retain(|&u| u != *x);
+                func.varnodes[i as usize].uses.retain(|&mut u| u != *x);
             }
         }
         func.ops[*x].opcode = Copy;
@@ -541,11 +545,11 @@ fn save_value(func: &mut SsaFunction, o: OpIdx, v: VarId, n: u64) -> VarId {
         data: reargo_core::pcode::VarnodeData::new(SpaceId::UNIQUE, SAVED_BASE + n * 0x10, size),
         version: 1,
         def_op: Some(o),
-        uses: Vec::new(),
+        uses: crate::ssa::UseVec::new(),
     });
     let old_inputs = func.ops[o].inputs.clone();
     for x in old_inputs {
-        func.varnodes[x as usize].uses.retain(|&u| u != o);
+        func.varnodes[x as usize].uses.retain(|&mut u| u != o);
     }
     if let Some(of) = func.ops[o].output {
         func.varnodes[of as usize].def_op = None;
@@ -623,9 +627,11 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
             continue;
         }
         let Some(out) = op.output else { continue };
-        let Some(&o) = index.get(&value_key(func, out)) else { continue };
+        // (only the machine flags are indexed)
+        let indexed = |v: VarId| if machine(&func.varnodes[v as usize].data) { index.get(&value_key(func, v)) } else { None };
+        let Some(&o) = indexed(out) else { continue };
         for &i in &op.inputs {
-            match index.get(&value_key(func, i)) {
+            match indexed(i) {
                 Some(&x) => {
                     let (a, b) = (find(&mut parent, o), find(&mut parent, x));
                     parent[a] = b;
@@ -642,6 +648,7 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
     let mut def_of: Vec<Option<OpIdx>> = vec![None; keys.len()];
     for v in 0..func.varnodes.len() {
         if let Some(d) = func.varnodes[v].def_op
+            && machine(&func.varnodes[v].data)
             && let Some(&n) = index.get(&value_key(func, v as VarId))
         {
             def_of[n].get_or_insert(d);
@@ -703,52 +710,68 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
 
 /// Make the numbers of the named flags dense in `text` (WS90): per kind, in the order the text
 /// first names them (`lt_4`, `lt_9` -> `lt_0`, `lt_1`); a folded flag the output never names
-/// leaves no gap.
-pub(crate) fn renumber_named_flags(text: &str, func: &SsaFunction) -> String {
+/// leaves no gap. (In place: a text naming no flag is left as it is.)
+pub(crate) fn renumber_named_flags(text: &mut String, func: &SsaFunction) {
     let named: rustc_hash::FxHashSet<u64> = func
         .varnodes
         .iter()
-        .filter(|v| v.data.space == SpaceId::REGISTER && v.data.offset >= NAMED_FLAG_BASE && named_flag(v.data.offset).is_some())
+        .filter(|v| {
+            v.data.space == SpaceId::REGISTER
+                && v.data.offset.checked_sub(NAMED_FLAG_BASE).is_some_and(|k| ((k >> 16) as usize) < FLAG_KINDS.len())
+        })
         .map(|v| v.data.offset - NAMED_FLAG_BASE)
         .collect();
     if named.is_empty() {
-        return text.to_string();
+        return;
     }
+    use std::fmt::Write as _;
     let bytes = text.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    // (the first letters of the kinds: a word starting otherwise names no flag)
+    let starts = |c: u8| FLAG_KINDS.iter().any(|k| k.as_bytes()[0] == c);
     let mut map: FxHashMap<(usize, u64), u64> = FxHashMap::default();
     let mut next = [0u64; FLAG_KINDS.len()];
     let mut out = String::with_capacity(text.len());
-    let mut i = 0;
     let mut copied = 0;
-    while i < bytes.len() {
-        if ident(bytes[i]) && (i == 0 || !ident(bytes[i - 1])) {
-            let start = i;
-            while i < bytes.len() && ident(bytes[i]) {
-                i += 1;
-            }
-            let word = &text[start..i];
-            if let Some((kind, num)) = word.split_once('_')
-                && let Some(k) = FLAG_KINDS.iter().position(|&p| p == kind)
-                && !num.is_empty()
-                && num.bytes().all(|c| c.is_ascii_digit())
-                && let Ok(n) = num.parse::<u64>()
-                && named.contains(&(((k as u64) << 16) + n))
-            {
-                let m = *map.entry((k, n)).or_insert_with(|| {
-                    next[k] += 1;
-                    next[k] - 1
-                });
-                out.push_str(&text[copied..start]);
-                out.push_str(&format!("{kind}_{m}"));
-                copied = i;
-            }
+    // each word holding a `_` (a flag name holds one): from the `_`, back to its start and on
+    // to its end
+    let mut pos = 0;
+    while let Some(off) = text[pos..].find('_') {
+        let under = pos + off;
+        let mut start = under;
+        while start > 0 && ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut i = under + 1;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        pos = i;
+        if start == under || !starts(bytes[start]) {
             continue;
         }
-        i += 1;
+        let word = &text[start..i];
+        if let Some((kind, num)) = word.split_once('_')
+            && let Some(k) = FLAG_KINDS.iter().position(|&p| p == kind)
+            && !num.is_empty()
+            && num.bytes().all(|c| c.is_ascii_digit())
+            && let Ok(n) = num.parse::<u64>()
+            && named.contains(&(((k as u64) << 16) + n))
+        {
+            let m = *map.entry((k, n)).or_insert_with(|| {
+                next[k] += 1;
+                next[k] - 1
+            });
+            out.push_str(&text[copied..start]);
+            let _ = write!(out, "{kind}_{m}");
+            copied = i;
+        }
+    }
+    if copied == 0 {
+        return;
     }
     out.push_str(&text[copied..]);
-    out
+    *text = out;
 }
 
 #[cfg(test)]

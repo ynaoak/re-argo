@@ -27,7 +27,7 @@ use reargo_program::comments::CommentType;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct StringXrefAnnotator;
 
@@ -45,7 +45,17 @@ impl Analyzer for StringXrefAnnotator {
         // coexist on the same instruction.
         760
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::REFERENCES.union(State::CODE))
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // Snapshot the (from, to) pairs once so we don't hold an
         // immutable borrow on `program.references` while writing
         // comments.
@@ -61,25 +71,26 @@ impl Analyzer for StringXrefAnnotator {
         // previews are read in parallel (pure reads of the image) and
         // applied in edge order: the first edge of a site with no
         // comment yet sets it.
-        let previews: Vec<(u64, String)> = {
-            let program = &*program;
-            edges
-                .par_iter()
-                .filter_map(|&(from, to)| {
-                    program.listing.get_instruction(from)?;
-                    let preview = read_c_string(program, to)?;
-                    let trimmed = truncate_preview(&preview, 48);
-                    Some((from, format!("\"{}\"", escape(&trimmed))))
-                })
-                .collect()
-        };
+        let previews: Vec<(u64, String)> = edges
+            .par_iter()
+            .filter_map(|&(from, to)| {
+                // (most targets are no string: tested first, it saves
+                // the instruction lookup)
+                let preview = read_c_string(program, to)?;
+                program.listing.get_instruction(from)?;
+                let trimmed = truncate_preview(&preview, 48);
+                Some((from, format!("\"{}\"", escape(&trimmed))))
+            })
+            .collect();
+        Box::new(previews)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let previews: Vec<(u64, String)> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for (from, text) in previews {
-            if program.comments.get(from, CommentType::Eol).is_some() {
-                continue;
+            if program.comments.set_if_absent(from, CommentType::Eol, text) {
+                emitted += 1;
             }
-            program.comments.set(from, CommentType::Eol, text);
-            emitted += 1;
         }
 
         Ok(AnalysisResult {

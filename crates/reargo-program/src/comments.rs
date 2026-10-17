@@ -26,8 +26,31 @@ impl CommentManager {
         Self::default()
     }
 
+    /// The comment map, for the on-disk analysis cache.
+    pub fn cache_parts(&self) -> &BTreeMap<(u64, CommentType), String> {
+        &self.comments
+    }
+
+    /// A manager of the map [`Self::cache_parts`] returned.
+    pub fn from_cache_parts(comments: BTreeMap<(u64, CommentType), String>) -> Self {
+        Self { comments }
+    }
+
     pub fn set(&mut self, address: u64, comment_type: CommentType, text: impl Into<String>) {
         self.comments.insert((address, comment_type), text.into());
+    }
+
+    /// Set the comment unless one of this type is there already (as
+    /// `get(..).is_none()` then `set`, with one lookup). Returns whether
+    /// it was set.
+    pub fn set_if_absent(&mut self, address: u64, comment_type: CommentType, text: impl Into<String>) -> bool {
+        match self.comments.entry((address, comment_type)) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(text.into());
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        }
     }
 
     pub fn get(&self, address: u64, comment_type: CommentType) -> Option<&str> {

@@ -22,7 +22,7 @@
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct TlsVariableAnalyzer;
 
@@ -38,14 +38,19 @@ impl Analyzer for TlsVariableAnalyzer {
         // double-annotated as a generic TLS read.
         725
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(Vec::<(u64, String)>::new());
         }
 
         let candidates: Vec<(u64, String)> = program
@@ -54,13 +59,15 @@ impl Analyzer for TlsVariableAnalyzer {
             .filter_map(|i| classify(&i.bytes).map(|c| (i.address, c)))
             .collect();
 
+        Box::new(candidates)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let candidates: Vec<(u64, String)> = crate::analyzer::prepared(prepared);
         let mut emitted = 0usize;
         for (addr, note) in candidates {
-            if program.comments.get(addr, CommentType::Eol).is_some() {
-                continue;
+            if program.comments.set_if_absent(addr, CommentType::Eol, note) {
+                emitted += 1;
             }
-            program.comments.set(addr, CommentType::Eol, note);
-            emitted += 1;
         }
 
         Ok(AnalysisResult {

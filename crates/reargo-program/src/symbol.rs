@@ -52,9 +52,26 @@ pub struct SymbolTable {
     by_name: HashMap<String, Vec<u64>>,
 }
 
+/// A [`SymbolTable`]'s symbols by address.
+pub type SymbolsByAddress = BTreeMap<u64, Vec<Symbol>>;
+/// A [`SymbolTable`]'s addresses by name.
+pub type SymbolsByName = HashMap<String, Vec<u64>>;
+/// The parts of a [`SymbolTable`] (the on-disk analysis cache).
+pub type SymbolTableParts = (SymbolsByAddress, SymbolsByName);
+
 impl SymbolTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The by-address and by-name maps, for the on-disk analysis cache.
+    pub fn cache_parts(&self) -> (&SymbolsByAddress, &SymbolsByName) {
+        (&self.by_address, &self.by_name)
+    }
+
+    /// A table of the maps [`Self::cache_parts`] returned.
+    pub fn from_cache_parts((by_address, by_name): SymbolTableParts) -> Self {
+        Self { by_address, by_name }
     }
 
     pub fn add(&mut self, symbol: Symbol) {

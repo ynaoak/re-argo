@@ -171,10 +171,43 @@ pub fn value_key(func: &SsaFunction, v: VarId) -> ValueKey {
 }
 
 /// The live ops reading each value (by [`ValueKey`], so every name of a value counts).
-pub struct Readers(FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>>);
+#[derive(Clone)]
+pub struct Readers(std::sync::Arc<FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>>>);
+
+thread_local! {
+    /// The readers of the functions a [`FrozenReaders`] holds on this thread (by address).
+    static FROZEN: std::cell::RefCell<Vec<(usize, Readers)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// While alive, [`Readers::new`] of `func` hands out the readers computed once: the guard
+/// borrows `func`, so nothing can change it meanwhile (the struct view, the structurer and
+/// the emitters each looked the readers up again).
+pub struct FrozenReaders<'a>(std::marker::PhantomData<&'a SsaFunction>);
+
+impl<'a> FrozenReaders<'a> {
+    pub fn new(func: &'a SsaFunction) -> Self {
+        let r = Readers::build(func);
+        FROZEN.with(|f| f.borrow_mut().push((func as *const SsaFunction as usize, r)));
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for FrozenReaders<'_> {
+    fn drop(&mut self) {
+        FROZEN.with(|f| f.borrow_mut().pop());
+    }
+}
 
 impl Readers {
     pub fn new(func: &SsaFunction) -> Self {
+        let at = func as *const SsaFunction as usize;
+        if let Some(r) = FROZEN.with(|f| f.borrow().iter().rev().find(|(p, _)| *p == at).map(|(_, r)| r.clone())) {
+            return r;
+        }
+        Self::build(func)
+    }
+
+    fn build(func: &SsaFunction) -> Self {
         let mut m: FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>> = FxHashMap::default();
         for op in func.ops.iter().filter(|o| !o.dead) {
             for &i in &op.inputs {
@@ -187,7 +220,7 @@ impl Readers {
                 }
             }
         }
-        Readers(m)
+        Readers(std::sync::Arc::new(m))
     }
 
     /// The live ops reading `v`.

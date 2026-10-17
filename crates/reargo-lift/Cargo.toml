@@ -16,3 +16,4 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 reargo-emulator = { workspace = true }
+mimalloc = { workspace = true }

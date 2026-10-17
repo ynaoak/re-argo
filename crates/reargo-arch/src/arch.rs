@@ -31,7 +31,10 @@ pub struct DecodedInstruction {
 
 #[derive(Clone)]
 struct DisasmText {
-    cell: std::sync::OnceLock<(String, String)>,
+    // Boxed: most instructions never have their text formatted, and an
+    // instruction is kept per address of the listing (a few hundred
+    // thousand on a large binary): 8 bytes instead of 48 inline.
+    cell: std::sync::OnceLock<Box<(String, String)>>,
     /// The x86 bitness to decode `bytes` with when the text is formatted
     /// lazily; 0 when the text was given.
     #[cfg_attr(not(feature = "x86"), allow(dead_code))]
@@ -50,7 +53,7 @@ impl DecodedInstruction {
         branch_target: Option<u64>,
     ) -> Self {
         let cell = std::sync::OnceLock::new();
-        let _ = cell.set((mnemonic, operands));
+        let _ = cell.set(Box::new((mnemonic, operands)));
         Self { address, length, bytes, flow_type, branch_target, text: DisasmText { cell, lazy_x86_bitness: 0 } }
     }
 
@@ -73,9 +76,9 @@ impl DecodedInstruction {
         self.text.cell.get_or_init(|| {
             #[cfg(feature = "x86")]
             if self.text.lazy_x86_bitness != 0 {
-                return crate::x86::format_text(&self.bytes, self.address, self.text.lazy_x86_bitness as u32);
+                return Box::new(crate::x86::format_text(&self.bytes, self.address, self.text.lazy_x86_bitness as u32));
             }
-            (String::new(), String::new())
+            Box::new((String::new(), String::new()))
         })
     }
 
@@ -87,6 +90,33 @@ impl DecodedInstruction {
     /// The operands, `, `-separated.
     pub fn operands(&self) -> &str {
         &self.text().1
+    }
+
+    /// The instruction's text as the on-disk analysis cache stores it:
+    /// the x86 bitness to format it with lazily (0 when the text was
+    /// given), and the given text. An x86 text formatted on first use is
+    /// not stored: it is formatted again from `bytes` after loading.
+    pub fn cache_text(&self) -> (u8, Option<&(String, String)>) {
+        let lazy = self.text.lazy_x86_bitness;
+        (lazy, (lazy == 0).then(|| self.text()))
+    }
+
+    /// An instruction of the parts [`Self::cache_text`] and the public
+    /// fields hold (the on-disk analysis cache).
+    pub fn from_cache_parts(
+        address: u64,
+        length: u32,
+        bytes: SmallVec<[u8; 16]>,
+        flow_type: FlowType,
+        branch_target: Option<u64>,
+        lazy_x86_bitness: u8,
+        text: Option<(String, String)>,
+    ) -> Self {
+        let cell = std::sync::OnceLock::new();
+        if let Some(text) = text {
+            let _ = cell.set(Box::new(text));
+        }
+        Self { address, length, bytes, flow_type, branch_target, text: DisasmText { cell, lazy_x86_bitness } }
     }
 
     pub fn end_address(&self) -> u64 {
@@ -130,7 +160,7 @@ struct DecodedInstructionRepr {
 
 impl serde::Serialize for DecodedInstruction {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let lazy = self.text.lazy_x86_bitness;
+        let (lazy, text) = self.cache_text();
         DecodedInstructionRepr {
             address: self.address,
             length: self.length,
@@ -138,7 +168,7 @@ impl serde::Serialize for DecodedInstruction {
             flow_type: self.flow_type,
             branch_target: self.branch_target,
             lazy_x86_bitness: lazy,
-            text: (lazy == 0).then(|| self.text().clone()),
+            text: text.cloned(),
         }
         .serialize(s)
     }
@@ -147,18 +177,15 @@ impl serde::Serialize for DecodedInstruction {
 impl<'de> serde::Deserialize<'de> for DecodedInstruction {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let r = DecodedInstructionRepr::deserialize(d)?;
-        let cell = std::sync::OnceLock::new();
-        if let Some(text) = r.text {
-            let _ = cell.set(text);
-        }
-        Ok(Self {
-            address: r.address,
-            length: r.length,
-            bytes: r.bytes,
-            flow_type: r.flow_type,
-            branch_target: r.branch_target,
-            text: DisasmText { cell, lazy_x86_bitness: r.lazy_x86_bitness },
-        })
+        Ok(Self::from_cache_parts(
+            r.address,
+            r.length,
+            r.bytes,
+            r.flow_type,
+            r.branch_target,
+            r.lazy_x86_bitness,
+            r.text,
+        ))
     }
 }
 
@@ -325,5 +352,17 @@ pub fn create_architecture_with_options(
         #[cfg(feature = "arm")]
         reargo_loader::Architecture::Sparc => Ok(Box::new(crate::sparc::SparcArch::new(false)?)),
         other => Err(DisasmError::UnsupportedArch(format!("{}", other))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listing keeps one per instruction (hundreds of thousands): the
+    /// text is boxed so the struct stays small.
+    #[test]
+    fn decoded_instruction_stays_small() {
+        assert!(std::mem::size_of::<DecodedInstruction>() <= 80, "{}", std::mem::size_of::<DecodedInstruction>());
     }
 }

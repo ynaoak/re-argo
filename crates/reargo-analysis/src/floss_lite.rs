@@ -35,7 +35,7 @@ use reargo_loader::SectionFlags;
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Early};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Early, State};
 
 pub const DEFAULT_MIN_LENGTH: usize = 8;
 pub const MAX_KEYS_PER_BYTE: usize = 256;
@@ -70,6 +70,9 @@ impl DecodeMethod {
 pub struct FlossLiteAnalyzer;
 
 impl Analyzer for FlossLiteAnalyzer {
+    fn writes(&self) -> State {
+        State::TAGS.union(State::METADATA)
+    }
     fn name(&self) -> &str {
         "FLOSS-lite"
     }

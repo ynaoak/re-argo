@@ -2,7 +2,7 @@ use reargo_program::function::Function;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct PatternFunctionAnalyzer;
 
@@ -34,6 +34,9 @@ fn is_boundary_byte(b: u8) -> bool {
 }
 
 impl Analyzer for PatternFunctionAnalyzer {
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::FUNCTIONS)
+    }
     fn name(&self) -> &str {
         "Pattern Function"
     }
@@ -167,6 +170,9 @@ impl Analyzer for PatternFunctionAnalyzer {
 pub struct StructLayoutAnalyzer;
 
 impl Analyzer for StructLayoutAnalyzer {
+    fn writes(&self) -> State {
+        State::NONE
+    }
     fn name(&self) -> &str {
         "Struct Layout"
     }

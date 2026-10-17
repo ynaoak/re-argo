@@ -16,13 +16,17 @@ pub type OpIdx = usize;
 /// joins).
 pub type InputVec = SmallVec<[VarId; 3]>;
 
+/// The ops reading a value: most values have one or two readers, kept inline (the same 24
+/// bytes as a `Vec`, without its allocation).
+pub type UseVec = SmallVec<[OpIdx; 2]>;
+
 #[derive(Debug, Clone)]
 pub struct SsaVarnode {
     pub id: VarId,
     pub data: VarnodeData,
     pub version: u32,
     pub def_op: Option<OpIdx>,
-    pub uses: Vec<OpIdx>,
+    pub uses: UseVec,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +40,13 @@ pub struct SsaOp {
     pub dead: bool,
 }
 
+/// Per slot (dense id) of [`SsaFunction::build_ssa`]: how many versions it has, and its
+/// incoming value (`VarId::MAX` until read).
+struct Slots {
+    versions: Vec<u32>,
+    incoming: Vec<VarId>,
+}
+
 #[derive(Debug)]
 pub struct SsaFunction {
     pub name: String,
@@ -44,22 +55,6 @@ pub struct SsaFunction {
     pub ops: Vec<SsaOp>,
     pub cfg: ControlFlowGraph,
     next_var_id: VarId,
-    /// FxHashMap rather than BTreeMap: keys are integer triples and
-    /// every read/write of a register or RAM slot in `build_ssa` hits
-    /// these maps, so a constant-time hash (FxHash specialises well on
-    /// integer-only keys) beats BTreeMap's per-step comparison for
-    /// any function with more than a handful of distinct slots.
-    var_versions: FxHashMap<(u32, u64, u32), u32>,
-    /// Canonical varnode id for the *current* version of each
-    /// (space, offset, size). Set by `create_new_version` whenever a
-    /// register/RAM slot is rewritten, and read by `get_or_create_var`
-    /// so every read of the same SSA value shares a single SsaVarnode
-    /// entry. Without this, every read minted a fresh varnode and the
-    /// def's `uses` list was never populated — DCE then dropped any
-    /// op whose output was actually live (because uses had been pushed
-    /// onto the unrelated read-side varnodes), and copy_propagation
-    /// couldn't match `*inp == out_id` because the ids never coincided.
-    current_var: FxHashMap<(u32, u64, u32), VarId>,
     /// Calls carry the calling convention's argument registers as inputs
     /// `1..` (added by the pipeline); `optimize::prune_call_args` trims them
     /// to the ones actually set up for the call.
@@ -81,19 +76,6 @@ pub struct SsaFunction {
 
 impl SsaFunction {
     pub fn from_cfg(name: String, entry: u64, cfg: ControlFlowGraph) -> Self {
-        // Pre-size the FxHashMaps used by get_or_create_var /
-        // create_new_version. Each distinct (space, offset, size) slot
-        // gets one entry, which for x86/ARM bodies is closer to N/4
-        // than N. Reserving up-front kills the rehash cycle that
-        // would otherwise fire during build_ssa.
-        let approx_slots = cfg
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .map(|i| i.ops.len())
-            .sum::<usize>()
-            / 4
-            + 16;
         let mut func = Self {
             name,
             entry,
@@ -101,8 +83,6 @@ impl SsaFunction {
             ops: Vec::new(),
             cfg,
             next_var_id: 0,
-            var_versions: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
-            current_var: FxHashMap::with_capacity_and_hasher(approx_slots, Default::default()),
             implicit_call_args: false,
             call_params: FxHashMap::default(),
             signature_params: None,
@@ -139,7 +119,7 @@ impl SsaFunction {
 
         // Temporarily move the CFG out of `self` so the inner loop can
         // hold an immutable borrow of `cfg.blocks` *and* call the
-        // `&mut self` helpers (get_or_create_var / create_new_version)
+        // `&mut self` helpers (new_version_var / incoming_var)
         // at the same time. Without this the borrow checker forced an
         // intermediate `all_ops: Vec<tuple>` snapshot, which on a
         // ~1000-op function cost ~100KB of allocation and a per-op
@@ -169,21 +149,57 @@ impl SsaFunction {
         let n = cfg.blocks.len();
         self.ops.reserve(total_ops / 8);
 
-        // 1. global names (read before written in some block) and their def blocks
-        let mut globals: rustc_hash::FxHashSet<Key> = Default::default();
-        let mut defsites: FxHashMap<Key, Vec<usize>> = Default::default();
+        // 0. the slots (space, offset, size) as dense ids, and the slot of each non-constant
+        // input / output in op order (`kids`, from `kid_start[b]` for block `b`)
+        const NO_SLOT: u32 = u32::MAX;
+        let mut slot_of: FxHashMap<Key, u32> = FxHashMap::with_capacity_and_hasher(total_ops / 4 + 16, Default::default());
+        let mut slots: Vec<Key> = Vec::new();
+        let mut kids: Vec<u32> = Vec::with_capacity(total_ops * 3);
+        let mut kid_start = vec![0usize; n];
+        let mut intern = |k: Key| -> u32 {
+            *slot_of.entry(k).or_insert_with(|| {
+                slots.push(k);
+                (slots.len() - 1) as u32
+            })
+        };
         for (b, block) in cfg.blocks.iter().enumerate() {
-            let mut killed: rustc_hash::FxHashSet<Key> = Default::default();
+            kid_start[b] = kids.len();
             for op in block.instructions.iter().flat_map(|i| i.ops.iter()) {
                 for inp in &op.inputs {
-                    if inp.space != SpaceId::CONST && !killed.contains(&key_of(inp)) {
-                        globals.insert(key_of(inp));
-                    }
+                    kids.push(if inp.space == SpaceId::CONST { NO_SLOT } else { intern(key_of(inp)) });
                 }
                 if let Some(out) = op.output {
-                    let k = key_of(&out);
-                    if killed.insert(k) {
-                        defsites.entry(k).or_default().push(b);
+                    kids.push(intern(key_of(&out)));
+                }
+            }
+        }
+        let n_slots = slots.len();
+        let slot_vn = |k: u32| {
+            let (sp, off, sz) = slots[k as usize];
+            VarnodeData::new(SpaceId(sp), off, sz)
+        };
+
+        // 1. global names (read before written in some block) and their def blocks
+        let mut global = vec![false; n_slots];
+        let mut defsites: Vec<Vec<usize>> = vec![Vec::new(); n_slots];
+        // the block (+ 1) that last wrote each slot
+        let mut killed_in = vec![0usize; n_slots];
+        for (b, block) in cfg.blocks.iter().enumerate() {
+            let mut at = kid_start[b];
+            for op in block.instructions.iter().flat_map(|i| i.ops.iter()) {
+                for _ in &op.inputs {
+                    let k = kids[at];
+                    at += 1;
+                    if k != NO_SLOT && killed_in[k as usize] != b + 1 {
+                        global[k as usize] = true;
+                    }
+                }
+                if op.output.is_some() {
+                    let k = kids[at] as usize;
+                    at += 1;
+                    if killed_in[k] != b + 1 {
+                        killed_in[k] = b + 1;
+                        defsites[k].push(b);
                     }
                 }
             }
@@ -222,24 +238,31 @@ impl SsaFunction {
                 }
             }
         }
-        let mut phis: Vec<Vec<Key>> = vec![Vec::new(); n];
-        let mut keys: Vec<Key> = globals.iter().copied().collect();
-        keys.sort_unstable(); // deterministic phi order
+        let mut phis: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut keys: Vec<u32> = (0..n_slots as u32).filter(|&k| global[k as usize]).collect();
+        keys.sort_unstable_by_key(|&k| slots[k as usize]); // deterministic phi order
+        // (per block, the key (+ 1) that put a phi there / queued it last)
+        let mut has_phi = vec![0u32; n];
+        let mut queued = vec![0u32; n];
+        let mut work: Vec<usize> = Vec::new();
         for k in keys {
-            let Some(sites) = defsites.get(&k) else { continue };
-            let mut has_phi = vec![false; n];
-            let mut queued = vec![false; n];
-            let mut work: Vec<usize> = sites.clone();
+            let sites = &defsites[k as usize];
+            if sites.is_empty() {
+                continue;
+            }
+            let mark = k + 1;
+            work.clear();
+            work.extend_from_slice(sites);
             for &b in sites {
-                queued[b] = true;
+                queued[b] = mark;
             }
             while let Some(b) = work.pop() {
                 for &f in &df[b] {
-                    if !has_phi[f] {
-                        has_phi[f] = true;
+                    if has_phi[f] != mark {
+                        has_phi[f] = mark;
                         phis[f].push(k);
-                        if !queued[f] {
-                            queued[f] = true;
+                        if queued[f] != mark {
+                            queued[f] = mark;
                             work.push(f);
                         }
                     }
@@ -288,23 +311,24 @@ impl SsaFunction {
                 children[d].push(b);
             }
         }
-        let mut stacks: FxHashMap<Key, Vec<VarId>> = Default::default();
+        // per slot: the version count, the incoming value (`incoming_var`), the stack of
+        // the versions in scope
+        let mut vars = Slots { versions: vec![0; n_slots], incoming: vec![VarId::MAX; n_slots] };
+        let mut stacks: Vec<Vec<VarId>> = vec![Vec::new(); n_slots];
         let mut visited = vec![false; n];
         let mut roots: Vec<usize> = Vec::new();
         if n > 0 {
             roots.push(cfg.entry_block);
         }
         roots.extend((0..n).filter(|&b| b != cfg.entry_block && idom[b].is_none_or(|d| d == b)));
-        let mut pushed_by: Vec<Vec<Key>> = vec![Vec::new(); n];
+        let mut pushed_by: Vec<Vec<u32>> = vec![Vec::new(); n];
         for root in roots {
             // explicit DFS; on exit pop the names the block pushed
             let mut dfs: Vec<(usize, bool)> = vec![(root, false)];
             while let Some((b, exiting)) = dfs.pop() {
                 if exiting {
                     for k in pushed_by[b].drain(..) {
-                        if let Some(st) = stacks.get_mut(&k) {
-                            st.pop();
-                        }
+                        stacks[k as usize].pop();
                     }
                     continue;
                 }
@@ -316,43 +340,47 @@ impl SsaFunction {
                 let block = &cfg.blocks[b];
                 let mut idx = block_start[b];
                 for &k in &phis[b] {
-                    let vn = VarnodeData::new(SpaceId(k.0), k.1, k.2);
+                    let vn = slot_vn(k);
                     if entry_is_join && b == cfg.entry_block {
                         // the value on entry (read before any version is pushed)
-                        let incoming = self.get_or_create_var(&vn);
+                        let incoming = self.incoming_var(&mut vars, k, &vn);
                         self.varnodes[incoming as usize].uses.push(idx);
                         *self.ops[idx].inputs.last_mut().expect("the entry input") = incoming;
                     }
-                    let out = self.new_version_var(&vn);
+                    let out = self.new_version_var(&mut vars, k, &vn);
                     self.varnodes[out as usize].def_op = Some(idx);
                     self.ops[idx].output = Some(out);
-                    stacks.entry(k).or_default().push(out);
+                    stacks[k as usize].push(out);
                     pushed_by[b].push(k);
                     idx += 1;
                 }
+                let mut at = kid_start[b];
                 for insn in &block.instructions {
                     for pcode_op in &insn.ops {
                         let mut input_ids: InputVec = InputVec::with_capacity(pcode_op.inputs.len());
                         for inp in &pcode_op.inputs {
-                            let top = if inp.space == SpaceId::CONST {
-                                None
+                            let k = kids[at];
+                            at += 1;
+                            let id = if k == NO_SLOT {
+                                self.const_var(inp)
                             } else {
-                                stacks.get(&key_of(inp)).and_then(|st| st.last().copied())
-                            };
-                            let id = match top {
-                                Some(id) => id,
-                                None => self.get_or_create_var(inp),
+                                match stacks[k as usize].last() {
+                                    Some(&id) => id,
+                                    None => self.incoming_var(&mut vars, k, inp),
+                                }
                             };
                             self.varnodes[id as usize].uses.push(idx);
                             input_ids.push(id);
                         }
                         self.ops[idx].inputs = input_ids;
                         if let Some(out) = pcode_op.output {
-                            let id = self.new_version_var(&out);
+                            let k = kids[at];
+                            at += 1;
+                            let id = self.new_version_var(&mut vars, k, &out);
                             self.varnodes[id as usize].def_op = Some(idx);
                             self.ops[idx].output = Some(id);
-                            stacks.entry(key_of(&out)).or_default().push(id);
-                            pushed_by[b].push(key_of(&out));
+                            stacks[k as usize].push(id);
+                            pushed_by[b].push(k);
                         }
                         idx += 1;
                     }
@@ -368,10 +396,9 @@ impl SsaFunction {
                             if self.ops[phi_idx].inputs[j] != VarId::MAX {
                                 continue;
                             }
-                            let top = stacks.get(&k).and_then(|st| st.last().copied());
-                            let id = match top {
-                                Some(id) => id,
-                                None => self.get_or_create_var(&VarnodeData::new(SpaceId(k.0), k.1, k.2)),
+                            let id = match stacks[k as usize].last() {
+                                Some(&id) => id,
+                                None => self.incoming_var(&mut vars, k, &slot_vn(k)),
                             };
                             self.varnodes[id as usize].uses.push(phi_idx);
                             self.ops[phi_idx].inputs[j] = id;
@@ -389,7 +416,7 @@ impl SsaFunction {
                 let phi_idx = block_start[b] + pi;
                 for j in 0..self.ops[phi_idx].inputs.len() {
                     if self.ops[phi_idx].inputs[j] == VarId::MAX {
-                        let id = self.get_or_create_var(&VarnodeData::new(SpaceId(k.0), k.1, k.2));
+                        let id = self.incoming_var(&mut vars, k, &slot_vn(k));
                         self.varnodes[id as usize].uses.push(phi_idx);
                         self.ops[phi_idx].inputs[j] = id;
                     }
@@ -400,63 +427,37 @@ impl SsaFunction {
         self.cfg = cfg;
     }
 
-    /// A fresh version of a register / RAM / unique slot (its def is set by the caller).
-    fn new_version_var(&mut self, vn: &VarnodeData) -> VarId {
-        let key = (vn.space.0, vn.offset, vn.size);
-        let version = self.var_versions.entry(key).or_insert(0);
+    /// A fresh version of the register / RAM / unique slot `k` (its def is set by the caller).
+    fn new_version_var(&mut self, vars: &mut Slots, k: u32, vn: &VarnodeData) -> VarId {
+        let version = &mut vars.versions[k as usize];
         *version += 1;
         let cur_version = *version;
-        let id = self.next_var_id;
-        self.next_var_id += 1;
-        self.varnodes.push(SsaVarnode {
-            id,
-            data: *vn,
-            version: cur_version,
-            def_op: None,
-            uses: Vec::new(),
-        });
+        self.push_var(*vn, cur_version)
+    }
+
+    /// A constant: fresh per use (each literal in the P-code is its own occurrence, and
+    /// downstream passes compare constants by data, not by `VarId`).
+    fn const_var(&mut self, vn: &VarnodeData) -> VarId {
+        self.push_var(*vn, 0)
+    }
+
+    /// The value of slot `k` read where no version of it is in scope: the canonical
+    /// "incoming" varnode of the slot (a parameter, a callee-saved register on entry, …) with
+    /// no defining op, created at the first such read (every later one shares it).
+    fn incoming_var(&mut self, vars: &mut Slots, k: u32, vn: &VarnodeData) -> VarId {
+        let existing = vars.incoming[k as usize];
+        if existing != VarId::MAX {
+            return existing;
+        }
+        let id = self.push_var(*vn, vars.versions[k as usize]);
+        vars.incoming[k as usize] = id;
         id
     }
 
-    fn get_or_create_var(&mut self, vn: &VarnodeData) -> VarId {
-        let key = (vn.space.0, vn.offset, vn.size);
-        if vn.space == reargo_core::address::SpaceId::CONST {
-            // Constants stay fresh-per-use: each literal in the P-code
-            // is its own occurrence, and downstream passes compare
-            // constants by data, not by VarId.
-            let id = self.next_var_id;
-            self.next_var_id += 1;
-            self.varnodes.push(SsaVarnode {
-                id,
-                data: *vn,
-                version: 0,
-                def_op: None,
-                uses: Vec::new(),
-            });
-            return id;
-        }
-        // For register/RAM/UNIQUE slots: reuse the canonical varnode for
-        // the current version so every read points at the same entry as
-        // the corresponding def. Without this, def_op was set on one
-        // SsaVarnode and uses landed on a different one, breaking
-        // def-use entirely.
-        if let Some(&existing) = self.current_var.get(&key) {
-            return existing;
-        }
-        // First reference to this slot in the function — model it as a
-        // version-0 "incoming" value (function parameter, callee-saved
-        // register on entry, etc.) with no defining op.
-        let version = self.var_versions.get(&key).copied().unwrap_or(0);
+    fn push_var(&mut self, data: VarnodeData, version: u32) -> VarId {
         let id = self.next_var_id;
         self.next_var_id += 1;
-        self.varnodes.push(SsaVarnode {
-            id,
-            data: *vn,
-            version,
-            def_op: None,
-            uses: Vec::new(),
-        });
-        self.current_var.insert(key, id);
+        self.varnodes.push(SsaVarnode { id, data, version, def_op: None, uses: UseVec::new() });
         id
     }
 

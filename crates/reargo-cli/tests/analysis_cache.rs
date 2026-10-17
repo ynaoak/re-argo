@@ -128,7 +128,12 @@ fn second_run_reads_the_cache_and_prints_the_same() {
     }
 
     // A damaged cache file is ignored (and rewritten).
-    let file = std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap().path();
+    // (the analysis entry: `decompile` also caches its `this-index` here)
+    let file = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "rac"))
+        .expect("an analysis cache entry");
     let mut bytes = std::fs::read(&file).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff;
@@ -239,9 +244,12 @@ fn analyze_always_runs_the_pipeline_and_no_cache_env_bypasses() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Offset of the payload in a cache file (magic 16 + format 4 + key 32 +
-/// length 8 + BLAKE3 32).
-const HEADER_LEN: usize = 92;
+/// Offset of the first section in a cache file: magic 16 + format 4 +
+/// key 32 + pre-key 32 + section count 4, 28 bytes per section, BLAKE3 32.
+fn header_len(file: &[u8]) -> usize {
+    let count = u32::from_le_bytes(file[84..88].try_into().unwrap()) as usize;
+    88 + 28 * count + 32
+}
 
 fn cache_files(cache: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(cache)
@@ -254,7 +262,7 @@ fn cache_files(cache: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn payload_is_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
+fn sections_are_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
     let Some((dir, bin)) = setup("zstd") else {
         eprintln!("analysis cache test skipped: no gcc available");
         return;
@@ -264,7 +272,8 @@ fn payload_is_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
     let (cold, _) = export(&cache, &bin, &out, false);
     let file = cache_files(&cache).pop().expect("cache file");
     let bytes = std::fs::read(&file).unwrap();
-    assert_eq!(&bytes[HEADER_LEN..HEADER_LEN + 4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd frame magic");
+    let head = header_len(&bytes);
+    assert_eq!(&bytes[head..head + 4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd frame magic");
     // The compressed round trip hits and matches.
     let (warm, warm_err) = export(&cache, &bin, &out, false);
     assert!(warm_err.contains(HIT) && warm == cold);
@@ -274,7 +283,7 @@ fn payload_is_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
     for damage in 0..2 {
         let mut b = bytes.clone();
         if damage == 0 {
-            let mid = HEADER_LEN + (b.len() - HEADER_LEN) / 2;
+            let mid = head + (b.len() - head) / 2;
             b[mid] ^= 0x55;
         } else {
             b.truncate(b.len() - 7);
@@ -347,5 +356,77 @@ fn size_cap_evicts_the_least_recently_used_entry_but_keeps_the_newest() {
     // An unparsable cap falls back to the default and evicts nothing.
     run(&bin2, Some("lots"));
     assert!(cache_files(&cache).len() >= 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stored pre-key (all zeros: none) of the one cache file in `cache`.
+fn stored_prekey(cache: &Path) -> Vec<u8> {
+    let file = cache_files(cache).pop().expect("cache file");
+    std::fs::read(&file).unwrap()[52..84].to_vec()
+}
+
+#[cfg(unix)]
+#[test]
+fn stat_pre_key_hits_settled_files_and_any_rewrite_misses() {
+    let Some((dir, bin)) = setup("prekey") else {
+        eprintln!("analysis cache test skipped: no gcc available");
+        return;
+    };
+    let cache = dir.join("cache");
+    let out = dir.join("out.json");
+    let (cold, _) = export(&cache, &bin, &out, false);
+    // Just compiled: its stat cannot stand for its bytes yet.
+    assert!(stored_prekey(&cache).iter().all(|&b| b == 0), "no pre-key for a fresh binary");
+    let (warm, warm_err) = export(&cache, &bin, &out, false);
+    assert!(warm_err.contains(HIT) && warm == cold, "the full key hits");
+
+    // Settled (older than the racy window): the next full-key hit stores
+    // the pre-key, and later loads hit through it.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    let (warm, warm_err) = export(&cache, &bin, &out, false);
+    assert!(warm_err.contains(HIT) && warm == cold);
+    let prekey = stored_prekey(&cache);
+    assert!(prekey.iter().any(|&b| b != 0), "pre-key stored once the files settled");
+    let (warm, warm_err) = export(&cache, &bin, &out, false);
+    assert!(warm_err.contains(HIT) && warm == cold, "the pre-key hits");
+
+    // The same size, a byte flipped in place, the old mtime put back: the
+    // ctime changed, so the pre-key misses and the full key decides.
+    let meta = std::fs::metadata(&bin).unwrap();
+    let mut bytes = std::fs::read(&bin).unwrap();
+    let at = bytes.len() - 1;
+    bytes[at] ^= 0xff;
+    std::fs::write(&bin, &bytes).unwrap();
+    std::fs::OpenOptions::new().append(true).open(&bin).unwrap().set_modified(meta.modified().unwrap()).unwrap();
+    let (changed, changed_err) = export(&cache, &bin, &out, false);
+    assert!(!changed_err.contains(HIT), "a rewritten binary must miss");
+    let (fresh, _) = export(&cache, &bin, &out, true);
+    assert!(changed == fresh);
+
+    // A modified copy moved over the binary (a new inode) misses too.
+    let (_, rehit_err) = export(&cache, &bin, &out, false);
+    assert!(rehit_err.contains(HIT));
+    let copy = dir.join("prog.copy");
+    std::fs::copy(&bin, &copy).unwrap();
+    let mut bytes = std::fs::read(&copy).unwrap();
+    bytes[at] ^= 0x0f;
+    std::fs::write(&copy, &bytes).unwrap();
+    std::fs::rename(&copy, &bin).unwrap();
+    let (moved, moved_err) = export(&cache, &bin, &out, false);
+    assert!(!moved_err.contains(HIT), "a binary replaced by a modified copy must miss");
+    let (fresh, _) = export(&cache, &bin, &out, true);
+    assert!(moved == fresh);
+
+    // The sidecar is read in full by the pre-key too.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    export(&cache, &bin, &out, false);
+    let (_, hit_err) = export(&cache, &bin, &out, false);
+    assert!(hit_err.contains(HIT) && stored_prekey(&cache).iter().any(|&b| b != 0));
+    let main = main_address(&cache, &bin);
+    re_argo(&cache, &["annotate"], &bin, &["--rename", &format!("{main}=renamed_after_settling")]);
+    let (renamed, renamed_err) = export(&cache, &bin, &out, false);
+    assert!(!renamed_err.contains(HIT), "an edited sidecar must not hit the old entry");
+    assert!(renamed.contains("renamed_after_settling"));
+
     let _ = std::fs::remove_dir_all(&dir);
 }

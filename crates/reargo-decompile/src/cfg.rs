@@ -40,7 +40,12 @@ pub fn is_trap(insn: &LiftedInstruction) -> bool {
                 c.space == reargo_core::address::SpaceId::CONST
                     && (c.offset == 3 || c.offset == reargo_core::pcode::intrinsic::NORETURN)
             })
-    }) || matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
+    }) || {
+        // (the text's first word is `ud2` / `hlt` only for those instructions: the decoded
+        // one answers without formatting the text)
+        let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt));
+        may_be && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
+    }
 }
 
 /// An instruction of a function epilogue that only restores the caller's frame: `pop reg`,
@@ -58,8 +63,8 @@ pub fn is_epilogue_insn(mnemonic: &str) -> bool {
 }
 
 fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
-    let mut leaders: BTreeSet<u64> = BTreeSet::new();
-    leaders.insert(instructions[0].address);
+    // (collected, then sorted and deduplicated)
+    let mut leaders: Vec<u64> = vec![instructions[0].address];
     for insn in instructions {
         let has_branch = insn.ops.iter().any(|op| {
             matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd)
@@ -71,15 +76,17 @@ fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
                     && let Some(target_vn) = op.inputs.first()
                     && target_vn.space == reargo_core::address::SpaceId::RAM
                 {
-                    leaders.insert(target_vn.offset);
+                    leaders.push(target_vn.offset);
                 }
                 leaders.extend(switch_targets(op));
             }
             let fall = insn.address + insn.length as u64;
-            leaders.insert(fall);
+            leaders.push(fall);
         }
     }
-    leaders.into_iter().collect()
+    leaders.sort_unstable();
+    leaders.dedup();
+    leaders
 }
 
 fn finalize_cfg(

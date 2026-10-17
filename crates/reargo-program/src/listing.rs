@@ -4,9 +4,12 @@ use reargo_arch::DecodedInstruction;
 
 use crate::function::Function;
 
+/// A listing's instructions by address.
+pub type InstructionMap = BTreeMap<u64, Box<DecodedInstruction>>;
+
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Listing {
-    instructions: BTreeMap<u64, DecodedInstruction>,
+    instructions: BTreeMap<u64, Box<DecodedInstruction>>,
     functions: BTreeMap<u64, Function>,
 }
 
@@ -15,8 +18,20 @@ impl Listing {
         Self::default()
     }
 
+    /// The instruction and function maps, for the on-disk analysis cache
+    /// (which stores them in chunks and rebuilds them with
+    /// [`Self::from_cache_parts`]).
+    pub fn cache_parts(&self) -> (&InstructionMap, &BTreeMap<u64, Function>) {
+        (&self.instructions, &self.functions)
+    }
+
+    /// A listing of the maps [`Self::cache_parts`] returned.
+    pub fn from_cache_parts(instructions: InstructionMap, functions: BTreeMap<u64, Function>) -> Self {
+        Self { instructions, functions }
+    }
+
     pub fn add_instruction(&mut self, insn: DecodedInstruction) {
-        self.instructions.insert(insn.address, insn);
+        self.instructions.insert(insn.address, Box::new(insn));
     }
 
     /// The instruction at `address`: the one listed, else `decode()`'s,
@@ -27,13 +42,13 @@ impl Listing {
         decode: impl FnOnce() -> Option<DecodedInstruction>,
     ) -> Option<&DecodedInstruction> {
         match self.instructions.entry(address) {
-            std::collections::btree_map::Entry::Occupied(e) => Some(e.into_mut()),
-            std::collections::btree_map::Entry::Vacant(e) => Some(e.insert(decode()?)),
+            std::collections::btree_map::Entry::Occupied(e) => Some(&**e.into_mut()),
+            std::collections::btree_map::Entry::Vacant(e) => Some(&**e.insert(Box::new(decode()?))),
         }
     }
 
     pub fn get_instruction(&self, address: u64) -> Option<&DecodedInstruction> {
-        self.instructions.get(&address)
+        self.instructions.get(&address).map(|b| &**b)
     }
 
     pub fn has_instruction(&self, address: u64) -> bool {
@@ -41,7 +56,7 @@ impl Listing {
     }
 
     pub fn instructions(&self) -> impl Iterator<Item = &DecodedInstruction> {
-        self.instructions.values()
+        self.instructions.values().map(|b| &**b)
     }
 
     pub fn instructions_in_range(
@@ -49,7 +64,7 @@ impl Listing {
         start: u64,
         end: u64,
     ) -> impl DoubleEndedIterator<Item = &DecodedInstruction> {
-        self.instructions.range(start..end).map(|(_, v)| v)
+        self.instructions.range(start..end).map(|(_, v)| &**v)
     }
 
     /// Calls `f(first, insn)` for the instructions of every range of

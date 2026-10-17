@@ -27,6 +27,7 @@ fn empty_u64_map() -> &'static BTreeMap<u64, String> {
 }
 
 pub struct RustEmitter<'a> {
+    block_ops: crate::emit::BlockOps,
     indent: usize,
     output: String,
     symbol_names: &'a BTreeMap<u64, String>,
@@ -57,7 +58,9 @@ pub struct RustEmitter<'a> {
     /// `emit::select_conditions`).
     select_conds: rustc_hash::FxHashMap<usize, String>,
     /// The stack slots by name (WS88, `frame`, as in C).
-    frame: crate::frame::Frame,
+    frame: std::borrow::Cow<'a, crate::frame::Frame>,
+    /// The frame computed by the caller ([`Self::with_frame`]).
+    given_frame: Option<&'a crate::frame::Frame>,
     /// Temporaries printed as the register they are copied to (WS88, as in C).
     coalesced: crate::emit::Coalesced,
     /// `lock cmpxchg` as one compare-and-swap, by its store (WS89, as in C)
@@ -80,6 +83,7 @@ impl Default for RustEmitter<'static> {
 impl RustEmitter<'static> {
     pub fn new() -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names: empty_u64_map(),
@@ -94,6 +98,7 @@ impl RustEmitter<'static> {
             inlined: Default::default(),
             select_conds: Default::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -111,6 +116,7 @@ impl<'a> RustEmitter<'a> {
         string_literals: &'a BTreeMap<u64, String>,
     ) -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names,
@@ -125,6 +131,7 @@ impl<'a> RustEmitter<'a> {
             inlined: Default::default(),
             select_conds: Default::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -155,6 +162,13 @@ impl<'a> RustEmitter<'a> {
     }
 
     /// Print struct fields and virtual calls from `view` (WS91, as in C).
+    /// The function's stack frame (`Frame::new(func, &|_| true)` of the function emitted),
+    /// computed once by the caller.
+    pub(crate) fn with_frame(mut self, frame: &'a crate::frame::Frame) -> Self {
+        self.given_frame = Some(frame);
+        self
+    }
+
     pub fn with_structs(mut self, view: &'a crate::structs::StructView) -> Self {
         self.structs = Some(view);
         self
@@ -214,10 +228,14 @@ impl<'a> RustEmitter<'a> {
         func: &SsaFunction,
         structured: &StructuredBlock,
     ) -> String {
+        self.block_ops = crate::emit::BlockOps::new(func);
         self.output.clear();
         self.noise = crate::emit::epilogue_noise(func);
         // WS88: the stack slots by name; the stack pointer updates only they read go (as in C)
-        self.frame = crate::frame::Frame::new(func, &|_| true);
+        self.frame = match self.given_frame {
+            Some(f) => std::borrow::Cow::Borrowed(f),
+            None => std::borrow::Cow::Owned(crate::frame::Frame::new(func, &|_| true)),
+        };
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
         // WS89: `lock cmpxchg` as one statement at its store (as in C)
@@ -270,8 +288,8 @@ impl<'a> RustEmitter<'a> {
         if !self.cas.is_empty() {
             self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("let mut {n}: u8;"), crate::cas::RUST_FORMS);
         }
-        self.output = crate::flags::renumber_named_flags(&self.output, func);
-        self.output.clone()
+        crate::flags::renumber_named_flags(&mut self.output, func);
+        std::mem::take(&mut self.output)
     }
 
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
@@ -450,10 +468,12 @@ impl<'a> RustEmitter<'a> {
                 default,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                let index = func
-                    .ops
+                let index = self
+                    .block_ops
+                    .of(func, *condition_block)
                     .iter()
                     .rev()
+                    .map(|&k| &func.ops[k as usize])
                     .find(|op| op.block == *condition_block && !op.dead && op.opcode == OpCode::BranchInd)
                     .map_or_else(|| self.get_branch_condition(func, *condition_block), |op| self.input_expr(func, op, 0));
                 linef!(self, "match {} {{", index);
@@ -506,7 +526,8 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             // (a folded op only feeds the branch, which prints nothing here)
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
@@ -540,7 +561,8 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
@@ -1254,7 +1276,8 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
-        for op in func.ops.iter().rev() {
+        for &k in self.block_ops.of(func, block_id).iter().rev() {
+            let op = &func.ops[k as usize];
             if op.block != block_id || op.dead {
                 continue;
             }

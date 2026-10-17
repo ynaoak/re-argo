@@ -28,7 +28,7 @@ use reargo_program::comments::CommentType;
 use rayon::prelude::*;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct LoopAnalyzer;
 
@@ -46,7 +46,17 @@ impl Analyzer for LoopAnalyzer {
         // branch back).
         785
     }
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::CODE)
+    }
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // (branch_addr, target_addr, function_entry) — emitted in
         // two passes so we can also write the header annotation
         // without re-iterating.
@@ -94,22 +104,12 @@ impl Analyzer for LoopAnalyzer {
                 edges
             })
             .collect();
-        drop(funcs);
-
-        let mut header_set: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
-        let mut emitted = 0usize;
-
-        for (branch, target, _entry) in &back_edges {
-            if program.comments.get(*branch, CommentType::Post).is_none() {
-                program.comments.set(
-                    *branch,
-                    CommentType::Post,
-                    format!("loop back-edge -> 0x{:x}", target),
-                );
-                emitted += 1;
-            }
-            header_set.insert((*target, *branch));
-        }
+        // The comments, formatted here (each is set only where its slot
+        // is still free when applied).
+        let posts: Vec<(u64, String)> =
+            back_edges.iter().map(|(branch, target, _)| (*branch, format!("loop back-edge -> 0x{:x}", target))).collect();
+        let header_set: std::collections::BTreeSet<(u64, u64)> =
+            back_edges.iter().map(|(branch, target, _)| (*target, *branch)).collect();
 
         // Group headers; if multiple back-edges land on the same
         // header (rare — irreducible loops), enumerate them.
@@ -117,19 +117,34 @@ impl Analyzer for LoopAnalyzer {
         for (target, branch) in &header_set {
             by_header.entry(*target).or_default().push(*branch);
         }
-        for (target, branches) in by_header {
-            if program.comments.get(target, CommentType::Plate).is_some() {
-                continue;
+        let plates: Vec<(u64, String)> = by_header
+            .into_iter()
+            .map(|(target, branches)| {
+                let text = if branches.len() == 1 {
+                    format!("loop header (back-edge from 0x{:x})", branches[0])
+                } else {
+                    let formatted: Vec<String> =
+                        branches.iter().map(|b| format!("0x{:x}", b)).collect();
+                    format!("loop header (back-edges from {})", formatted.join(", "))
+                };
+                (target, text)
+            })
+            .collect();
+        Box::new((posts, plates))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        type Comments = Vec<(u64, String)>;
+        let (posts, plates): (Comments, Comments) = crate::analyzer::prepared(prepared);
+        let mut emitted = 0usize;
+        for (branch, text) in posts {
+            if program.comments.set_if_absent(branch, CommentType::Post, text) {
+                emitted += 1;
             }
-            let text = if branches.len() == 1 {
-                format!("loop header (back-edge from 0x{:x})", branches[0])
-            } else {
-                let formatted: Vec<String> =
-                    branches.iter().map(|b| format!("0x{:x}", b)).collect();
-                format!("loop header (back-edges from {})", formatted.join(", "))
-            };
-            program.comments.set(target, CommentType::Plate, text);
-            emitted += 1;
+        }
+        for (target, text) in plates {
+            if program.comments.set_if_absent(target, CommentType::Plate, text) {
+                emitted += 1;
+            }
         }
 
         Ok(AnalysisResult {

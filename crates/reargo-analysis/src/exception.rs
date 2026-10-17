@@ -25,11 +25,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct ExceptionFlowAnalyzer;
 
 impl Analyzer for ExceptionFlowAnalyzer {
+    fn writes(&self) -> State {
+        State::COMMENTS
+    }
     fn name(&self) -> &str {
         "Exception Flow"
     }

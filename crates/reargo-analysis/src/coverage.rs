@@ -1,11 +1,14 @@
 // Code coverage analysis.
 
 use reargo_program::Program;
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct CoverageAnalyzer;
 
 impl Analyzer for CoverageAnalyzer {
+    fn writes(&self) -> State {
+        State::NONE
+    }
     fn name(&self) -> &str { "Coverage" }
     fn description(&self) -> &str { "Computes analysis coverage statistics" }
     fn priority(&self) -> u32 { 999 }

@@ -90,6 +90,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures",
+ "rayon-core",
 ]
 
 [[package]]
@@ -605,7 +606,9 @@ dependencies = [
  "bincode",
  "blake3",
  "clap",
+ "libmimalloc-sys",
  "mimalloc",
+ "rayon",
  "reargo-analysis",
  "reargo-arch",
  "reargo-core",
@@ -619,6 +622,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "smallvec",
  "zstd",
 ]
 
@@ -677,6 +681,7 @@ version = "0.1.0"
 dependencies = [
  "capstone",
  "iced-x86",
+ "mimalloc",
  "reargo-core",
  "reargo-emulator",
  "reargo-loader",

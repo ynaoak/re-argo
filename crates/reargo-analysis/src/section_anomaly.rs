@@ -28,11 +28,14 @@ use reargo_loader::{BinaryFormat, SectionFlags};
 use reargo_program::tags::TagKind;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 pub struct SectionAnomalyAnalyzer;
 
 impl Analyzer for SectionAnomalyAnalyzer {
+    fn writes(&self) -> State {
+        State::TAGS.union(State::METADATA)
+    }
     fn name(&self) -> &str {
         "Section Anomaly"
     }

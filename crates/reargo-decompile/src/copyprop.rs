@@ -63,7 +63,7 @@ pub fn propagate_register_copies(func: &mut SsaFunction) -> usize {
         func.ops[d].output = Some(r);
         func.varnodes[r as usize].def_op = Some(d);
         func.varnodes[t as usize].def_op = None;
-        func.varnodes[t as usize].uses.retain(|&u| u != c);
+        func.varnodes[t as usize].uses.retain(|&mut u| u != c);
         func.ops[c].dead = true;
         merged += 1;
     }

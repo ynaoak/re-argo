@@ -10,7 +10,58 @@ use std::path::{Path, PathBuf};
 // instructions, P-code ops, per-function maps) from several threads;
 // mimalloc serves them markedly faster than the system allocator.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: Mimalloc = Mimalloc;
+
+/// mimalloc, its plain `mi_malloc` for the layouts it aligns anyway:
+/// every block is aligned to the word size, so an alignment up to 8
+/// needs no aligned allocation (`mimalloc::MiMalloc` asks for one every
+/// time, a slower path whenever the size class has no free block at
+/// hand). Larger alignments go to `MiMalloc`.
+struct Mimalloc;
+
+/// The alignment of every block mimalloc returns.
+const MI_WORD_ALIGN: usize = 8;
+
+unsafe impl std::alloc::GlobalAlloc for Mimalloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.align() <= MI_WORD_ALIGN {
+            // SAFETY: mimalloc's malloc, freed by `dealloc` (mi_free)
+            unsafe { libmimalloc_sys::mi_malloc(layout.size()).cast() }
+        } else {
+            // SAFETY: forwarded
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.align() <= MI_WORD_ALIGN {
+            // SAFETY: as `alloc`
+            unsafe { libmimalloc_sys::mi_zalloc(layout.size()).cast() }
+        } else {
+            // SAFETY: forwarded
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: forwarded (mi_free for every block)
+        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if layout.align() <= MI_WORD_ALIGN {
+            // SAFETY: `ptr` is a mimalloc block
+            unsafe { libmimalloc_sys::mi_realloc(ptr.cast(), new_size).cast() }
+        } else {
+            // SAFETY: forwarded
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        }
+    }
+}
 
 use clap::{Parser, Subcommand};
 use reargo_analysis::{AnalysisManager, CallGraph};
@@ -934,6 +985,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.no_cache {
         cache::disable();
     }
+    // A one-shot command drops its analysed program(s) right before the
+    // process exits: leave them to the exit instead of freeing millions
+    // of small objects (tens of ms on a large binary). Not for the
+    // commands that run on, analysing again and again.
+    let long_running = matches!(
+        cli.command,
+        Commands::Mcp { .. }
+            | Commands::Script { .. }
+            | Commands::Debug { .. }
+            | Commands::Gdbserver { .. }
+            | Commands::Iterate { .. }
+    );
+    if !long_running {
+        reargo_program::program::leak_on_drop();
+    }
     match cli.command {
         Commands::Info { file } => cmd_info(&file),
         Commands::Sections { file } => cmd_sections(&file),
@@ -1611,10 +1677,18 @@ fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
 /// `verbose` prints the per-analyzer lines (or the cache notice) and the
 /// override summary on stderr.
 fn analyze_program(path: &Path, verbose: bool, cache_use: CacheUse) -> Result<Program, Box<dyn std::error::Error>> {
-    let mut program = Program::from_binary(path)?;
     let entry = cache::entry_for(path);
-    let hit = cache_use == CacheUse::ReadWrite
-        && entry.as_ref().is_some_and(|e| cache::load(e, &mut program));
+    // The cached results do not depend on the loaded binary: read them
+    // while it loads.
+    let (program, cached) = rayon::join(
+        || Program::from_binary(path),
+        || entry.as_ref().filter(|_| cache_use == CacheUse::ReadWrite).and_then(cache::read),
+    );
+    let mut program = program?;
+    let hit = cached.is_some();
+    if let Some(state) = cached {
+        program.restore_analysis_state(state);
+    }
     if hit {
         if verbose && let Some(e) = &entry {
             eprintln!(
@@ -2807,7 +2881,8 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
 
     let entry = address.unwrap_or(program.entry_point());
 
-    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index) };
+    let emit = reargo_decompile::pipeline::Emit { c: !show_ssa && !show_rust, rust: !show_ssa && show_rust, ssa: show_ssa };
+    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index), emit };
     let result = reargo_decompile::decompile_function_with_options(lifter.as_ref(), &program, entry, &opts)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -2874,7 +2949,8 @@ fn cmd_decompile_all(
         std::fs::create_dir_all(dir)?;
     }
 
-    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index) };
+    let emit = reargo_decompile::pipeline::Emit { c: true, rust: show_rust, ssa: false };
+    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index), emit };
     let results = reargo_decompile::decompile_all_with_options(lifter.as_ref(), &program, &opts);
 
     // WS91: the structs of C++ classes once, merged over every function (the anonymous ones are
@@ -3877,9 +3953,14 @@ fn cmd_semantic_diff(
     // Decompile both sides up-front so the diff loop can hash from
     // cached SSA without re-running the pipeline per call.
     eprintln!("Decompiling {}...", path_a.display());
-    let res_a = reargo_decompile::decompile_all(lifter_a.as_ref(), &prog_a);
+    // only the C text is hashed
+    let c_only = reargo_decompile::DecompileOptions {
+        emit: reargo_decompile::pipeline::Emit { c: true, rust: false, ssa: false },
+        ..Default::default()
+    };
+    let res_a = reargo_decompile::decompile_all_with_options(lifter_a.as_ref(), &prog_a, &c_only);
     eprintln!("Decompiling {}...", path_b.display());
-    let res_b = reargo_decompile::decompile_all(lifter_b.as_ref(), &prog_b);
+    let res_b = reargo_decompile::decompile_all_with_options(lifter_b.as_ref(), &prog_b, &c_only);
 
     // Build (addr, name) lists and the hash-callback closures from
     // the cached results.
@@ -4691,7 +4772,7 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         println!("functions        {}", s.functions);
         println!("classes          {}", s.classes);
         println!("rounds           {} ({})", s.rounds, if s.converged { "converged" } else { "budget reached" });
-        println!("build            summaries {} ms, propagation {} ms", s.summarize_ms, s.solve_ms);
+        println!("build            summaries {} ms, effects {} ms, propagation {} ms", s.summarize_ms, s.compose_ms, s.solve_ms);
         println!("this from vtables {}", s.seeded_this);
         println!("this from callers {}", idx.count_known(0));
         for i in 1..6 {
@@ -4700,6 +4781,9 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         println!("return classes   {}", idx.rets.len());
         println!("field classes    {}", idx.fields.len());
         println!("member classes   {}", idx.members.len());
+        let pf_fns: std::collections::BTreeSet<u64> = idx.param_fields.keys().map(|k| k.0).collect();
+        println!("param fields     {} (in {} functions)", idx.param_fields.len(), pf_fns.len());
+        println!("element classes  {}", idx.elements.len());
     }
     for &a in addresses {
         println!("0x{a:x}");
@@ -4711,9 +4795,18 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         if let Some(vt) = idx.ret_class(a) {
             println!("  returns: {}", class(Some(vt)));
         }
-        // a class's vtable: the classes of its fields and members (its own and its bases')
+        let mut pf: Vec<_> = idx.param_fields.keys().filter(|k| k.0 == a).collect();
+        pf.sort_unstable();
+        for &(_, i, k) in pf {
+            println!("  param {i} +0x{k:x}: {}", class(idx.param_field_class(a, usize::from(i), i64::from(k))));
+        }
+        // a class's vtable: the classes of its fields, members and buffer elements (its own
+        // and its bases')
         for (off, vt, member) in idx.class_fields(a) {
             println!("  {} +0x{off:x}: {}", if member { "member" } else { "field" }, class(Some(vt)));
+        }
+        for (off, vt) in idx.class_elements(a) {
+            println!("  element +0x{off:x}: {}", class(Some(vt)));
         }
     }
     Ok(())
@@ -5235,7 +5328,11 @@ fn cmd_script(path: &Path, script_path: &Path, thumb: bool) -> Result<(), Box<dy
             "decompile" => {
                 if let Some(lifter) = make_lifter(&info, thumb) {
                     let addr = parse_hex(args).unwrap_or(info.entry_point);
-                    match reargo_decompile::decompile_function(lifter.as_ref(), &program, addr) {
+                    let c_only = reargo_decompile::DecompileOptions {
+                        emit: reargo_decompile::pipeline::Emit { c: true, rust: false, ssa: false },
+                        ..Default::default()
+                    };
+                    match reargo_decompile::decompile_function_with_options(lifter.as_ref(), &program, addr, &c_only) {
                         Ok(result) => print!("{}", result.c_code),
                         Err(e) => eprintln!("decompile error: {}", e),
                     }

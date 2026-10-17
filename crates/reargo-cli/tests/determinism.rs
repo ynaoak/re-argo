@@ -87,9 +87,12 @@ fn compile(name: &str) -> Option<PathBuf> {
 /// Everything the pipeline produces, in the order the program model
 /// yields it (that order must be deterministic too).
 fn analysis_dump(path: &Path) -> String {
+    analysis_dump_with(path, reargo_analysis::AnalysisManager::new())
+}
+
+fn analysis_dump_with(path: &Path, manager: reargo_analysis::AnalysisManager) -> String {
     use std::fmt::Write;
     let mut program = reargo_program::Program::from_binary(path).expect("load");
-    let manager = reargo_analysis::AnalysisManager::new();
     let _ = manager.run_all(&mut program);
     let mut out = String::new();
     for f in program.listing.functions() {
@@ -146,6 +149,28 @@ fn analysis_is_deterministic_in_process() {
             first == again,
             "analysis differs between runs: {}",
             first_difference(&first, &again)
+        );
+    }
+}
+
+/// The pipeline overlaps analyzers (prepares ahead, at the same time):
+/// what it gives must be what running each analyzer alone in order
+/// gives. Checked on the compiled program and, when present, on
+/// `/usr/bin/ls` (more code, more of every analyzer's work).
+#[test]
+fn overlapped_pipeline_matches_serial() {
+    let mut bins: Vec<PathBuf> = compile("det_overlap").into_iter().collect();
+    if Path::new("/usr/bin/ls").exists() {
+        bins.push(PathBuf::from("/usr/bin/ls"));
+    }
+    for bin in bins {
+        let overlapped = analysis_dump(&bin);
+        let serial = analysis_dump_with(&bin, reargo_analysis::AnalysisManager::new().without_overlap());
+        assert!(
+            overlapped == serial,
+            "{}: overlapped analysis differs from the serial one: {}",
+            bin.display(),
+            first_difference(&overlapped, &serial)
         );
     }
 }

@@ -4,7 +4,7 @@ use reargo_lift::PcodeLift;
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
 const RSP_OFFSET: u64 = 0x20;
 const RBP_OFFSET: u64 = 0x28;
@@ -12,6 +12,9 @@ const RBP_OFFSET: u64 = 0x28;
 pub struct StackFrameAnalyzer;
 
 impl Analyzer for StackFrameAnalyzer {
+    fn writes(&self) -> State {
+        State::FUNC_OTHER.union(State::CACHE)
+    }
     fn name(&self) -> &str {
         "Stack Frame"
     }

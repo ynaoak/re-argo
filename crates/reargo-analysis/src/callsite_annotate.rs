@@ -26,7 +26,7 @@ use reargo_program::comments::CommentType;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 use crate::callsite::{resolve_call_sites_iterative_from, FunctionWalk};
 use crate::signatures::{FunctionSignature, SignatureDatabase};
 
@@ -51,83 +51,142 @@ impl Analyzer for CallSiteAnnotator {
         &["functions", "signatures"]
     }
 
+    fn prepare_reads(&self) -> Option<State> {
+        // all of it, so it always starts a run
+        Some(State::ALL)
+    }
+    fn writes(&self) -> State {
+        State::SYMBOLS.union(State::COMMENTS).union(State::CALL_RENDERINGS).union(State::CACHE)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// The call sites resolved, from the per-function results computed
+    /// afresh — when the analysis cache holds none to reuse (else
+    /// `apply` computes them, reusing those).
+    fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(Step::NotX86);
         }
-
-        let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
-        // Each function's round-0 call-site walk, CFG constant tracker
-        // and VSA snapshots, from one lift per function (dropped as soon
-        // as they are done), merged in listing order. The walks are left
-        // on the program for Format Varargs (780).
-        let mut shared = crate::shared_lift::compute(program, true);
+        if crate::shared_lift::has_stored(program) {
+            return Box::new(Step::Later);
+        }
+        let shared = crate::shared_lift::compute_from(program, None, true);
+        Box::new(Step::Resolved(resolve(program, shared)))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let (mut shared, sites) = match crate::analyzer::prepared::<Step>(prepared) {
+            Step::NotX86 => {
+                return Ok(AnalysisResult {
+                    analyzer_name: self.name().into(),
+                    functions_found: 0,
+                    references_found: 0,
+                    instructions_decoded: 0,
+                });
+            }
+            Step::Later => {
+                let shared = crate::shared_lift::compute(program, true);
+                resolve(program, shared)
+            }
+            Step::Resolved(resolved) => resolved,
+        };
         crate::shared_lift::store_ahead(program, &mut shared);
-        let mut round0 = Vec::with_capacity(shared.funcs.len());
-        let mut cfg_constants = crate::cfg_const::CallConstants::new();
-        let mut vsa_constants = crate::vsa::VsaResult::new();
-        for f in shared.funcs.iter_mut() {
-            round0.push(FunctionWalk { entry: f.entry, max_insns: f.max_insns, sites: f.walk.take() });
-            let (cfg_snaps, vsa_snaps) = f.snapshots.take().unwrap_or_default();
-            crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
-            crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
-        }
-        // Iterative inter-procedural resolver: a function whose
-        // parameter has a *single* observed value across all
-        // observed call sites is treated as a compile-time constant
-        // inside that function. Round-by-round propagation pushes
-        // constants through callback chains like
-        //   register_parser(my_parser) -> list_add(my_parser) -> …
-        // 4 rounds is enough for everything we've measured.
-        let mut sites = resolve_call_sites_iterative_from(&*lifter, program, &round0, 4)?;
-        // Give the walks back for Format Varargs (780).
-        for (f, w) in shared.funcs.iter_mut().zip(round0) {
-            f.walk = w.sites;
-        }
+        let sites = sites?;
         crate::shared_lift::store(program, shared);
+        self.annotate(program, sites)
+    }
+}
 
-        // Layer multi-block CFG-aware constant propagation on top:
-        // anywhere the iterative resolver came back with `?` for an
-        // arg register, ask the CFG tracker (`cfg_constants`) whether
-        // it can pin a value by joining predecessor states. This is
-        // the "format string set in one block, used in the next"
-        // pattern that the linear resolver misses.
-        //
-        // VSA (`vsa_constants`) runs on the same lifted P-code stream
-        // but tracks abstract value sets / ranges instead of point
-        // constants. When the iterative + cfg_const passes both gave
-        // `?`, ask VSA whether the value's still pinned (single set /
-        // degenerate range), which catches arguments built from a
-        // conditional join with two equal-valued predecessors that the
-        // point tracker can't represent.
-        for site in sites.iter_mut() {
-            let snap = cfg_constants.get(&site.call_site);
-            let vsa_snap = vsa_constants.get(&site.call_site);
-            for arg in site.args.iter_mut() {
-                if arg.value.is_some() {
-                    continue;
-                }
-                if let Some(snap) = snap
-                    && let Some(v) = snap.get(&arg.reg_offset)
-                {
-                    arg.value = Some(*v);
-                    continue;
-                }
-                if let Some(vs) = vsa_snap
-                    && let Some(av) = vs.get(&arg.reg_offset)
-                    && let Some(v) = av.as_single()
-                {
-                    arg.value = Some(v);
-                }
+/// What [`CallSiteAnnotator::prepare`] found.
+enum Step {
+    NotX86,
+    /// To compute at the analyzer's place: the analysis cache holds
+    /// results to reuse (taking them changes it).
+    Later,
+    /// The per-function results (the walks given back) and the call
+    /// sites resolved.
+    Resolved((crate::shared_lift::SharedLift, Result<Vec<crate::callsite::CallSite>, AnalysisError>)),
+}
+
+/// The call sites of the program resolved from the per-function results
+/// `shared` (whose walks are given back), with their unknown arguments
+/// filled from the CFG constant tracker and VSA snapshots.
+fn resolve(
+    program: &Program,
+    mut shared: crate::shared_lift::SharedLift,
+) -> (crate::shared_lift::SharedLift, Result<Vec<crate::callsite::CallSite>, AnalysisError>) {
+    let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
+    // Each function's round-0 call-site walk, CFG constant tracker
+    // and VSA snapshots, from one lift per function (dropped as soon
+    // as they are done), merged in listing order. The walks are left
+    // on the program for Format Varargs (780).
+    let mut round0 = Vec::with_capacity(shared.funcs.len());
+    let mut cfg_constants = crate::cfg_const::CallConstants::new();
+    let mut vsa_constants = crate::vsa::VsaResult::new();
+    for f in shared.funcs.iter_mut() {
+        round0.push(FunctionWalk { entry: f.entry, max_insns: f.max_insns, sites: f.walk.take() });
+        let (cfg_snaps, vsa_snaps) = f.snapshots.take().unwrap_or_default();
+        crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
+        crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
+    }
+    // Iterative inter-procedural resolver: a function whose
+    // parameter has a *single* observed value across all
+    // observed call sites is treated as a compile-time constant
+    // inside that function. Round-by-round propagation pushes
+    // constants through callback chains like
+    //   register_parser(my_parser) -> list_add(my_parser) -> …
+    // 4 rounds is enough for everything we've measured.
+    let mut sites = match resolve_call_sites_iterative_from(&*lifter, program, &round0, 4) {
+        Ok(sites) => sites,
+        Err(e) => return (shared, Err(e)),
+    };
+    // Give the walks back for Format Varargs (780).
+    for (f, w) in shared.funcs.iter_mut().zip(round0) {
+        f.walk = w.sites;
+    }
+
+    // Layer multi-block CFG-aware constant propagation on top:
+    // anywhere the iterative resolver came back with `?` for an
+    // arg register, ask the CFG tracker (`cfg_constants`) whether
+    // it can pin a value by joining predecessor states. This is
+    // the "format string set in one block, used in the next"
+    // pattern that the linear resolver misses.
+    //
+    // VSA (`vsa_constants`) runs on the same lifted P-code stream
+    // but tracks abstract value sets / ranges instead of point
+    // constants. When the iterative + cfg_const passes both gave
+    // `?`, ask VSA whether the value's still pinned (single set /
+    // degenerate range), which catches arguments built from a
+    // conditional join with two equal-valued predecessors that the
+    // point tracker can't represent.
+    for site in sites.iter_mut() {
+        let snap = cfg_constants.get(&site.call_site);
+        let vsa_snap = vsa_constants.get(&site.call_site);
+        for arg in site.args.iter_mut() {
+            if arg.value.is_some() {
+                continue;
+            }
+            if let Some(snap) = snap
+                && let Some(v) = snap.get(&arg.reg_offset)
+            {
+                arg.value = Some(*v);
+                continue;
+            }
+            if let Some(vs) = vsa_snap
+                && let Some(av) = vs.get(&arg.reg_offset)
+                && let Some(v) = av.as_single()
+            {
+                arg.value = Some(v);
             }
         }
-        let sites = sites;
+    }
+    (shared, Ok(sites))
+}
 
+impl CallSiteAnnotator {
+    /// The comments and renderings of the call sites `sites`.
+    fn annotate(&self, program: &mut Program, sites: Vec<crate::callsite::CallSite>) -> Result<AnalysisResult, AnalysisError> {
         use std::sync::OnceLock;
         static DB: OnceLock<SignatureDatabase> = OnceLock::new();
         let db = DB.get_or_init(SignatureDatabase::new);

@@ -2,7 +2,7 @@ use reargo_program::reference::{RefType, Reference};
 use reargo_program::Program;
 use rayon::prelude::*;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct DataReferenceAnalyzer;
 
@@ -19,7 +19,17 @@ impl Analyzer for DataReferenceAnalyzer {
         500
     }
 
+    fn prepare_reads(&self) -> Option<State> {
+        Some(State::INSNS)
+    }
+    fn writes(&self) -> State {
+        State::REFERENCES
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         let valid_ranges: Vec<(u64, u64)> = program
             .info
             .sections
@@ -59,21 +69,16 @@ impl Analyzer for DataReferenceAnalyzer {
             .collect();
         drop(instructions);
 
+        Box::new(candidates)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let candidates: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
         // Phase 2: apply serially, deduplicating against existing refs.
         let mut refs_found = 0;
         for (addr, val) in candidates {
-            if program
-                .references
-                .get_refs_from(addr)
-                .iter()
-                .any(|r| r.to == val)
-            {
-                continue;
+            if program.references.add_unless(Reference::new(addr, val, RefType::DataRead), |r| r.to == val) {
+                refs_found += 1;
             }
-            program
-                .references
-                .add(Reference::new(addr, val, RefType::DataRead));
-            refs_found += 1;
         }
 
         Ok(AnalysisResult {

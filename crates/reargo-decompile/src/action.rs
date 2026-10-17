@@ -129,7 +129,7 @@ impl Rule for RuleXorSelfZero {
                     data: reargo_core::pcode::VarnodeData::new(SpaceId::CONST, 0, size),
                     version: 0,
                     def_op: None,
-                    uses: vec![op_idx],
+                    uses: smallvec::smallvec![op_idx],
                 });
                 func.ops[op_idx].opcode = OpCode::Copy;
                 func.ops[op_idx].inputs = smallvec::smallvec![const_id];

@@ -36,7 +36,39 @@ fn empty_u64_map() -> &'static BTreeMap<u64, String> {
     M.get_or_init(BTreeMap::new)
 }
 
+/// The ops of each block, in op order (an emitter's block scans were a pass over every op of
+/// the function per block).
+#[derive(Default)]
+pub(crate) struct BlockOps {
+    /// The ops these are of (their address and count).
+    ops: usize,
+    n_ops: usize,
+    by_block: Vec<std::sync::Arc<[u32]>>,
+}
+
+impl BlockOps {
+    pub(crate) fn new(func: &SsaFunction) -> Self {
+        let mut by_block: Vec<Vec<u32>> = Vec::new();
+        for (i, op) in func.ops.iter().enumerate() {
+            if op.block >= by_block.len() {
+                by_block.resize_with(op.block + 1, Vec::new);
+            }
+            by_block[op.block].push(i as u32);
+        }
+        Self { ops: func.ops.as_ptr() as usize, n_ops: func.ops.len(), by_block: by_block.into_iter().map(Into::into).collect() }
+    }
+
+    /// The positions in `func.ops` of the ops of `block`, in order.
+    pub(crate) fn of(&self, func: &SsaFunction, block: usize) -> std::sync::Arc<[u32]> {
+        if self.ops == func.ops.as_ptr() as usize && self.n_ops == func.ops.len() {
+            return self.by_block.get(block).cloned().unwrap_or_else(|| std::sync::Arc::from(Vec::new()));
+        }
+        func.ops.iter().enumerate().filter(|(_, o)| o.block == block).map(|(i, _)| i as u32).collect::<Vec<_>>().into()
+    }
+}
+
 pub struct CEmitter<'a> {
+    block_ops: BlockOps,
     indent: usize,
     output: String,
     symbol_names: &'a BTreeMap<u64, String>,
@@ -60,7 +92,7 @@ pub struct CEmitter<'a> {
     inliner: crate::condition::Inliner,
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
-    emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    emitted: std::cell::RefCell<rustc_hash::FxHashSet<u64>>,
     /// Blocks some `goto` jumps to: each gets a `label_<addr>:` line where its code starts
     /// (otherwise the `goto` names a label that is never printed).
     goto_targets: std::collections::BTreeSet<usize>,
@@ -78,7 +110,9 @@ pub struct CEmitter<'a> {
     /// reads folds them there too). Their definitions are in `folded`.
     inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
     /// The stack slots by name (WS87, `frame`).
-    frame: crate::frame::Frame,
+    frame: std::borrow::Cow<'a, crate::frame::Frame>,
+    /// The frame computed by the caller ([`Self::with_frame`]).
+    given_frame: Option<&'a crate::frame::Frame>,
     /// A temporary printed as the register it is copied to (WS88, `inline::coalesced`).
     coalesced: Coalesced,
     /// `lock cmpxchg` printed as one compare-and-swap, by its store (WS89, `cas::find`).
@@ -126,6 +160,7 @@ impl Default for CEmitter<'static> {
 impl CEmitter<'static> {
     pub fn new() -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names: empty_u64_map(),
@@ -136,11 +171,12 @@ impl CEmitter<'static> {
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
             inlined: Default::default(),
-            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -170,6 +206,7 @@ impl<'a> CEmitter<'a> {
         string_literals: &'a BTreeMap<u64, String>,
     ) -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names,
@@ -180,11 +217,12 @@ impl<'a> CEmitter<'a> {
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
             inlined: Default::default(),
-            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -219,6 +257,13 @@ impl<'a> CEmitter<'a> {
     }
 
     /// Print struct fields and virtual calls from `view` (WS91).
+    /// The function's stack frame (`Frame::new(func, &|_| true)` of the function emitted),
+    /// computed once by the caller.
+    pub(crate) fn with_frame(mut self, frame: &'a crate::frame::Frame) -> Self {
+        self.given_frame = Some(frame);
+        self
+    }
+
     pub fn with_structs(mut self, view: &'a crate::structs::StructView) -> Self {
         self.structs = Some(view);
         self
@@ -235,12 +280,16 @@ impl<'a> CEmitter<'a> {
         func: &SsaFunction,
         structured: &StructuredBlock,
     ) -> String {
+        self.block_ops = BlockOps::new(func);
         self.output.clear();
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
         // WS87: the stack slots by name; the stack pointer updates only they read go
-        self.frame = crate::frame::Frame::new(func, &|_| true);
+        self.frame = match self.given_frame {
+            Some(f) => std::borrow::Cow::Borrowed(f),
+            None => std::borrow::Cow::Owned(crate::frame::Frame::new(func, &|_| true)),
+        };
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
         // WS89: `lock cmpxchg` as one statement at its store
@@ -302,8 +351,8 @@ impl<'a> CEmitter<'a> {
                 crate::cas::C_FORMS,
             );
         }
-        self.output = crate::flags::renumber_named_flags(&self.output, func);
-        self.output.clone()
+        crate::flags::renumber_named_flags(&mut self.output, func);
+        std::mem::take(&mut self.output)
     }
 
     fn emit_var_declarations(&mut self, func: &SsaFunction, params: &std::collections::BTreeSet<&str>) {
@@ -551,7 +600,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             // (a folded op only feeds the branch, which prints nothing here)
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
@@ -564,7 +614,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
@@ -1509,7 +1560,7 @@ impl<'a> CEmitter<'a> {
     /// The value a jump table's `switch` tests: what its `BRANCHIND` reads (WS83), or the
     /// register the index was copied from when that still holds it (WS84).
     fn switch_index(&self, func: &SsaFunction, block_id: usize) -> String {
-        let Some(op) = func.ops.iter().rev().find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd) else {
+        let Some(op) = self.block_ops.of(func, block_id).iter().rev().map(|&k| &func.ops[k as usize]).find(|op| op.block == block_id && !op.dead && op.opcode == OpCode::BranchInd) else {
             return "cond".into();
         };
         match switch_index_source(func, op) {
@@ -1519,7 +1570,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
-        for op in func.ops.iter().rev() {
+        for &k in self.block_ops.of(func, block_id).iter().rev() {
+            let op = &func.ops[k as usize];
             if op.block != block_id || op.dead {
                 continue;
             }
