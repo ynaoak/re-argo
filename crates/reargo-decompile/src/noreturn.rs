@@ -16,8 +16,9 @@
 //!
 //! The search is a 0-1 BFS over the instructions where passing a call costs 1: an exit
 //! reachable with fewer calls is found first, and only the calls in front of it are looked
-//! into. Instructions are lifted as the search reaches them, and results are cached per
-//! function.
+//! into. Instructions are lifted as the search reaches them. A question is answered from
+//! scratch (its search memoises the functions it looks into, nothing is kept from an earlier
+//! question), so the answer depends on the target alone and a batch shares it.
 //!
 //! [`mark_noreturn_calls`] appends a [`NORETURN_MARK`] op to each such call instruction;
 //! [`crate::cfg::is_trap`] treats it like a trap (control does not fall through) and the
@@ -103,12 +104,13 @@ enum Verdict {
     Unsure,
 }
 
-/// "Does this function never return?" with a cache shared by every lookup.
+/// "Does this function never return?"; each question answered by a search from scratch.
 pub struct NoReturn<'a> {
     lifter: &'a dyn PcodeLift,
     memory: &'a Memory,
     symbols: Option<&'a BTreeMap<u64, String>>,
-    /// target -> verdict (and, for `Unsure`, the depth it was computed with)
+    /// target -> verdict (and, for `Unsure`, the depth it was computed with), for the search
+    /// of one question
     memo: Mutex<FxHashMap<u64, (Verdict, u32)>>,
     /// The control flow of each instruction lifted alone, shared by the searches of a batch
     /// (x86; [`FlowCache`]).
@@ -118,14 +120,27 @@ pub struct NoReturn<'a> {
 /// What [`search`] reads of an instruction: its extent and control flow. Shared by every
 /// search of a batch: the same for an instruction lifted alone as lifted in a range (the PF
 /// and the x87 stack a range lift adds change no control flow).
+///
+/// It also keeps the answers of [`NoReturn::is_noreturn`]: each is a pure function of the
+/// target (a search from scratch, see there), so the functions of a batch share them.
 #[derive(Default)]
 pub struct FlowCache {
     shards: Vec<Mutex<FxHashMap<u64, Option<Flow>>>>,
+    /// `(memory, symbols, target)` -> never returns
+    verdicts: Vec<Mutex<FxHashMap<(usize, usize, u64), bool>>>,
 }
 
 impl FlowCache {
     pub fn new() -> Self {
-        Self { shards: (0..64).map(|_| Mutex::new(FxHashMap::default())).collect() }
+        Self {
+            shards: (0..64).map(|_| Mutex::new(FxHashMap::default())).collect(),
+            verdicts: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
+        }
+    }
+
+    fn verdict_shard(&self, target: u64) -> Option<&Mutex<FxHashMap<(usize, usize, u64), bool>>> {
+        let n = self.verdicts.len() as u64;
+        (n > 0).then(|| &self.verdicts[((target ^ (target >> 5)) % n) as usize])
     }
 
     /// The flow of the instruction at `addr` lifted alone (`None` when it cannot be lifted).
@@ -194,8 +209,26 @@ impl<'a> NoReturn<'a> {
     }
 
     /// Does the function at `target` never return?
+    ///
+    /// Each answer is a search from scratch (no memo of an earlier question), so it depends on
+    /// `target` alone and an oracle with a flow cache shares it with the batch.
     pub fn is_noreturn(&self, target: u64) -> bool {
-        self.verdict(target, MAX_DEPTH, &mut Vec::new()) == Verdict::NoReturn
+        if self.named(target) {
+            return true;
+        }
+        let key = (std::ptr::from_ref(self.memory) as usize, self.symbols.map_or(0, |s| std::ptr::from_ref(s) as usize), target);
+        let shard = self.flow.and_then(|(_, cache)| cache.verdict_shard(target));
+        if let Some(&v) = shard.and_then(|m| m.lock().ok()).as_ref().and_then(|m| m.get(&key)) {
+            return v;
+        }
+        if let Ok(mut m) = self.memo.lock() {
+            m.clear();
+        }
+        let v = self.verdict(target, MAX_DEPTH, &mut Vec::new()) == Verdict::NoReturn;
+        if let Some(mut m) = shard.and_then(|m| m.lock().ok()) {
+            m.insert(key, v);
+        }
+        v
     }
 
     fn named(&self, target: u64) -> bool {
