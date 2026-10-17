@@ -161,8 +161,8 @@ fn finalize_cfg(
         }
     }
     for i in 0..block_count {
-        let succs: Vec<BlockId> = blocks[i].successors.clone();
-        for s in succs {
+        for k in 0..blocks[i].successors.len() {
+            let s = blocks[i].successors[k];
             if !blocks[s].predecessors.contains(&i) {
                 blocks[s].predecessors.push(i);
             }
@@ -293,6 +293,58 @@ impl ControlFlowGraph {
         if instructions.is_empty() {
             return empty_cfg();
         }
+        if !instructions.windows(2).all(|w| w[0].address <= w[1].address) {
+            // (out of address order: the run of a leader is not one stretch)
+            return Self::build_inner_owned(instructions);
+        }
+        let leader_vec = compute_leaders(&instructions);
+        let entry_addr = instructions[0].address;
+
+        // each leader's run: the instructions skipped before it and those it takes (the walk
+        // below, on the addresses first, so each block's vector is allocated once)
+        let mut runs: Vec<(usize, usize)> = Vec::with_capacity(leader_vec.len());
+        let mut at = 0;
+        for (idx, &leader_addr) in leader_vec.iter().enumerate() {
+            let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u64::MAX);
+            let from = at;
+            while at < instructions.len() && instructions[at].address < leader_addr {
+                at += 1;
+            }
+            let skip = at - from;
+            while at < instructions.len() && instructions[at].address < next_leader {
+                at += 1;
+            }
+            runs.push((skip, at - from - skip));
+        }
+
+        let mut blocks = Vec::with_capacity(leader_vec.len());
+        let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
+        let mut iter = instructions.into_iter();
+
+        for (&leader_addr, &(skip, take)) in leader_vec.iter().zip(&runs) {
+            if skip > 0 {
+                iter.nth(skip - 1);
+            }
+            // Move out of the iterator -- no clone.
+            let block_insns: Vec<LiftedInstruction> = iter.by_ref().take(take).collect();
+            if block_insns.is_empty() {
+                continue;
+            }
+            let block_id = blocks.len();
+            addr_to_block.insert(leader_addr, block_id);
+            blocks.push(BasicBlock {
+                id: block_id,
+                start_addr: leader_addr,
+                instructions: block_insns,
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+            });
+        }
+        finalize_cfg(blocks, addr_to_block, entry_addr)
+    }
+
+    /// [`Self::build_owned`] of instructions in any order.
+    fn build_inner_owned(instructions: Vec<LiftedInstruction>) -> Self {
         let leader_vec = compute_leaders(&instructions);
         let entry_addr = instructions[0].address;
 
