@@ -411,6 +411,8 @@ pub struct PlainWalk<'f> {
     len: usize,
     /// The range needs the integer PF ([`X86Lifter::plain_walk`]'s `pf_relift`).
     pub needs_pf: bool,
+    /// The addresses from each checkpoint up to the next, listed when first asked about
+    expanded: Vec<std::cell::OnceCell<Option<Box<[u64]>>>>,
 }
 
 const FACT_PAGE_BITS: u32 = 12;
@@ -474,7 +476,12 @@ impl InsnFacts {
     }
 }
 
-impl PlainWalk<'_> {
+impl<'f> PlainWalk<'f> {
+    fn new(facts: &'f InsnFacts, checkpoints: Vec<(u64, u32)>, len: usize, needs_pf: bool) -> Self {
+        let expanded = (0..checkpoints.len()).map(|_| std::cell::OnceCell::new()).collect();
+        Self { facts, checkpoints, len, needs_pf, expanded }
+    }
+
     /// How many instructions the walk has.
     pub fn len(&self) -> usize {
         self.len
@@ -492,12 +499,22 @@ impl PlainWalk<'_> {
     /// The position of the instruction at `addr` in the walk, if it is one of its.
     pub fn index_of(&self, addr: u64) -> Option<usize> {
         let k = self.checkpoints.partition_point(|&(a, _)| a <= addr).checked_sub(1)?;
-        let (mut at, i) = self.checkpoints[k];
-        let mut i = i as usize;
+        let first = self.checkpoints[k].1 as usize;
+        let addrs = self.expanded[k].get_or_init(|| self.expand(k)).as_deref()?;
+        addrs.binary_search(&addr).ok().map(|i| first + i)
+    }
+
+    /// The addresses of the walk from checkpoint `k` up to the next one (`None` when a length is
+    /// not known, which a walk does not leave).
+    fn expand(&self, k: usize) -> Option<Box<[u64]>> {
+        let (mut at, first) = self.checkpoints[k];
+        let end = self.checkpoints.get(k + 1).map_or(self.len, |&(_, i)| i as usize);
+        let mut out = Vec::with_capacity(end - first as usize);
         // (the cells of the page being stepped through)
         let mut page: &[std::sync::atomic::AtomicU16] = &[];
         let mut page_base = 0u64;
-        while i < self.len && at < addr {
+        for _ in first as usize..end {
+            out.push(at);
             if at.wrapping_sub(page_base) >= page.len() as u64 {
                 page = self.facts.page_unchecked(at)?;
                 page_base = at & !((1u64 << FACT_PAGE_BITS) - 1);
@@ -507,9 +524,8 @@ impl PlainWalk<'_> {
                 return None;
             }
             at += u64::from(f & 0xf);
-            i += 1;
         }
-        (i < self.len && at == addr).then_some(i)
+        Some(out.into_boxed_slice())
     }
 
     /// The walk's last address.
@@ -721,7 +737,7 @@ impl X86Lifter {
                 }
                 let f = self.fill(memory, addr, &page[(addr - page_base) as usize], &mut block);
                 if f & FACT_FAILED != 0 {
-                    return Some(PlainWalk { facts, checkpoints, len: idx, needs_pf });
+                    return Some(PlainWalk::new(facts, checkpoints, idx, needs_pf));
                 }
                 if f & FACT_X87 != 0 {
                     return None;
@@ -743,7 +759,7 @@ impl X86Lifter {
                 addr += u64::from(f & 0xf);
             }
         }
-        Some(PlainWalk { facts, checkpoints, len: idx, needs_pf })
+        Some(PlainWalk::new(facts, checkpoints, idx, needs_pf))
     }
 
     pub fn plain_range(&self, memory: &Memory, start: u64, count: usize, facts: &InsnFacts) -> Option<Vec<u64>> {

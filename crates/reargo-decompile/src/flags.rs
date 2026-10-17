@@ -703,19 +703,25 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
 
 /// Make the numbers of the named flags dense in `text` (WS90): per kind, in the order the text
 /// first names them (`lt_4`, `lt_9` -> `lt_0`, `lt_1`); a folded flag the output never names
-/// leaves no gap.
-pub(crate) fn renumber_named_flags(text: &str, func: &SsaFunction) -> String {
+/// leaves no gap. (In place: a text naming no flag is left as it is.)
+pub(crate) fn renumber_named_flags(text: &mut String, func: &SsaFunction) {
     let named: rustc_hash::FxHashSet<u64> = func
         .varnodes
         .iter()
-        .filter(|v| v.data.space == SpaceId::REGISTER && v.data.offset >= NAMED_FLAG_BASE && named_flag(v.data.offset).is_some())
+        .filter(|v| {
+            v.data.space == SpaceId::REGISTER
+                && v.data.offset.checked_sub(NAMED_FLAG_BASE).is_some_and(|k| ((k >> 16) as usize) < FLAG_KINDS.len())
+        })
         .map(|v| v.data.offset - NAMED_FLAG_BASE)
         .collect();
     if named.is_empty() {
-        return text.to_string();
+        return;
     }
+    use std::fmt::Write as _;
     let bytes = text.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    // (the first letters of the kinds: a word starting otherwise names no flag)
+    let starts = |c: u8| FLAG_KINDS.iter().any(|k| k.as_bytes()[0] == c);
     let mut map: FxHashMap<(usize, u64), u64> = FxHashMap::default();
     let mut next = [0u64; FLAG_KINDS.len()];
     let mut out = String::with_capacity(text.len());
@@ -726,6 +732,9 @@ pub(crate) fn renumber_named_flags(text: &str, func: &SsaFunction) -> String {
             let start = i;
             while i < bytes.len() && ident(bytes[i]) {
                 i += 1;
+            }
+            if !starts(bytes[start]) {
+                continue;
             }
             let word = &text[start..i];
             if let Some((kind, num)) = word.split_once('_')
@@ -740,15 +749,18 @@ pub(crate) fn renumber_named_flags(text: &str, func: &SsaFunction) -> String {
                     next[k] - 1
                 });
                 out.push_str(&text[copied..start]);
-                out.push_str(&format!("{kind}_{m}"));
+                let _ = write!(out, "{kind}_{m}");
                 copied = i;
             }
             continue;
         }
         i += 1;
     }
+    if copied == 0 {
+        return;
+    }
     out.push_str(&text[copied..]);
-    out
+    *text = out;
 }
 
 #[cfg(test)]

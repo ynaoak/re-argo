@@ -274,8 +274,8 @@ impl<'a> RustEmitter<'a> {
         if !self.cas.is_empty() {
             self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("let mut {n}: u8;"), crate::cas::RUST_FORMS);
         }
-        self.output = crate::flags::renumber_named_flags(&self.output, func);
-        self.output.clone()
+        crate::flags::renumber_named_flags(&mut self.output, func);
+        std::mem::take(&mut self.output)
     }
 
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
