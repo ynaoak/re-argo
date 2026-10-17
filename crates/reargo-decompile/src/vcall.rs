@@ -171,6 +171,26 @@ pub fn this_vtables(memory: &Memory, entry: u64) -> Vec<u64> {
     vtables_listing(memory, &[entry]).remove(&entry).unwrap_or_default()
 }
 
+/// The slots of the RELATIVE relocations by their value (the addend), in relocation order:
+/// what [`vtables_listing`] collects for its targets, for all of them at once (`None` without
+/// a dynamic relocation table).
+pub fn relative_slots(memory: &Memory) -> Option<FxHashMap<u64, Vec<u64>>> {
+    let data = memory.dynamic_relocations()?;
+    let mut slots: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    for e in data.chunks_exact(RELA_SIZE as usize) {
+        let word = |i: usize| u64::from_le_bytes(e[i * 8..i * 8 + 8].try_into().unwrap());
+        if is_relative(word(1)) {
+            slots.entry(word(2)).or_default().push(word(0));
+        }
+    }
+    Some(slots)
+}
+
+/// [`this_vtables`]`(memory, f)` from the slots [`relative_slots`] indexed.
+pub fn this_vtables_indexed(memory: &Memory, slots: &FxHashMap<u64, Vec<u64>>, f: u64) -> Vec<u64> {
+    slots.get(&f).map_or_else(Vec::new, |s| address_points(memory, s))
+}
+
 /// [`this_vtables`] of several functions in one pass over the relocations (WS91).
 pub fn vtables_listing(memory: &Memory, targets: &[u64]) -> FxHashMap<u64, Vec<u64>> {
     let wanted: FxHashSet<u64> = targets.iter().copied().collect();

@@ -40,7 +40,12 @@ pub fn is_trap(insn: &LiftedInstruction) -> bool {
                 c.space == reargo_core::address::SpaceId::CONST
                     && (c.offset == 3 || c.offset == reargo_core::pcode::intrinsic::NORETURN)
             })
-    }) || matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
+    }) || {
+        // (the text's first word is `ud2` / `hlt` only for those instructions: the decoded
+        // one answers without formatting the text)
+        let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt));
+        may_be && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
+    }
 }
 
 /// An instruction of a function epilogue that only restores the caller's frame: `pop reg`,

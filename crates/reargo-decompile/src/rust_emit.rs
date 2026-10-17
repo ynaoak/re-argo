@@ -27,6 +27,7 @@ fn empty_u64_map() -> &'static BTreeMap<u64, String> {
 }
 
 pub struct RustEmitter<'a> {
+    block_ops: crate::emit::BlockOps,
     indent: usize,
     output: String,
     symbol_names: &'a BTreeMap<u64, String>,
@@ -80,6 +81,7 @@ impl Default for RustEmitter<'static> {
 impl RustEmitter<'static> {
     pub fn new() -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names: empty_u64_map(),
@@ -111,6 +113,7 @@ impl<'a> RustEmitter<'a> {
         string_literals: &'a BTreeMap<u64, String>,
     ) -> Self {
         Self {
+            block_ops: Default::default(),
             indent: 0,
             output: String::new(),
             symbol_names,
@@ -214,6 +217,7 @@ impl<'a> RustEmitter<'a> {
         func: &SsaFunction,
         structured: &StructuredBlock,
     ) -> String {
+        self.block_ops = crate::emit::BlockOps::new(func);
         self.output.clear();
         self.noise = crate::emit::epilogue_noise(func);
         // WS88: the stack slots by name; the stack pointer updates only they read go (as in C)
@@ -450,10 +454,12 @@ impl<'a> RustEmitter<'a> {
                 default,
             } => {
                 self.emit_basic_block_no_branch(func, *condition_block);
-                let index = func
-                    .ops
+                let index = self
+                    .block_ops
+                    .of(func, *condition_block)
                     .iter()
                     .rev()
+                    .map(|&k| &func.ops[k as usize])
                     .find(|op| op.block == *condition_block && !op.dead && op.opcode == OpCode::BranchInd)
                     .map_or_else(|| self.get_branch_condition(func, *condition_block), |op| self.input_expr(func, op, 0));
                 linef!(self, "match {} {{", index);
@@ -506,7 +512,8 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn emit_basic_block(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             // (a folded op only feeds the branch, which prints nothing here)
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
@@ -540,7 +547,8 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
-        for op in &func.ops {
+        for &k in self.block_ops.of(func, block_id).iter() {
+            let op = &func.ops[k as usize];
             if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
                 continue;
             }
@@ -1254,7 +1262,8 @@ impl<'a> RustEmitter<'a> {
     }
 
     fn get_branch_condition(&self, func: &SsaFunction, block_id: usize) -> String {
-        for op in func.ops.iter().rev() {
+        for &k in self.block_ops.of(func, block_id).iter().rev() {
+            let op = &func.ops[k as usize];
             if op.block != block_id || op.dead {
                 continue;
             }

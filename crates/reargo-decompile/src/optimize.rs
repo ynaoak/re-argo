@@ -535,7 +535,8 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     // The key includes the output size: ZEXT(x:4)->8 and ZEXT(x:4)->16 have
     // identical opcode+inputs but are different values; merging them
     // redirected a 16-byte XMM use to the 8-byte view.
-    let mut seen: rustc_hash::FxHashMap<(usize, &'static str, u32, InKeys), ValueKey> =
+    // (the opcode itself: its names are distinct)
+    let mut seen: rustc_hash::FxHashMap<(usize, OpCode, u32, InKeys), ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx, Default::default());
     let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx / 2, Default::default());
@@ -556,25 +557,33 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     // WS84: ... and still holds it at every reader of the removed value, not only where the
     // duplicate is (`rax = rdi + 12; rbx = rdi + 12; rax = 5; rcx = rbx + 1` read `rax` for
     // `rbx`). The readers of each value, and how many live ops write each slot.
-    let mut readers: rustc_hash::FxHashMap<ValueKey, SmallVec<[usize; 4]>> = Default::default();
-    let mut writers: rustc_hash::FxHashMap<(u32, u64, u32), u32> = Default::default();
-    for (k, op) in func.ops.iter().enumerate() {
-        if op.dead {
-            continue;
+    // (built when a duplicate is first found: no op has died in this pass yet then, and most
+    // passes find none)
+    type Readers = rustc_hash::FxHashMap<ValueKey, SmallVec<[usize; 4]>>;
+    type Writers = rustc_hash::FxHashMap<(u32, u64, u32), u32>;
+    let build = |func: &SsaFunction| -> (Readers, Writers) {
+        let mut readers: Readers = Default::default();
+        let mut writers: Writers = Default::default();
+        for (k, op) in func.ops.iter().enumerate() {
+            if op.dead {
+                continue;
+            }
+            for &v in &op.inputs {
+                readers.entry(value_key(func, v)).or_default().push(k);
+            }
+            if let Some(o) = op.output {
+                let d = &func.varnodes[o as usize].data;
+                *writers.entry((d.space.0, d.offset, d.size)).or_default() += 1;
+            }
         }
-        for &v in &op.inputs {
-            readers.entry(value_key(func, v)).or_default().push(k);
-        }
-        if let Some(o) = op.output {
-            let d = &func.varnodes[o as usize].data;
-            *writers.entry((d.space.0, d.offset, d.size)).or_default() += 1;
-        }
-    }
+        (readers, writers)
+    };
+    let mut maps: Option<(Readers, Writers)> = None;
     // the slot of `existing` is not written after op `i` before any reader of `dup`: a reader
     // later in the block is checked op by op; one elsewhere (another block, or back around a
     // loop) needs `existing` to be the slot's only definition (the block runs it, then the
     // duplicate, without leaving)
-    let holds_at_readers = |func: &SsaFunction, i: usize, dup: ValueKey, existing: ValueKey| {
+    let holds_at_readers = |func: &SsaFunction, (readers, writers): &(Readers, Writers), i: usize, dup: ValueKey, existing: ValueKey| {
         let slot = (existing.0, existing.1, existing.2);
         let writes_slot = |o: &crate::ssa::SsaOp| {
             !o.dead
@@ -617,7 +626,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             in_keys.sort();
         }
         let out_size = func.varnodes[out_id as usize].data.size;
-        let key = (func.ops[i].block, opcode.name(), out_size, in_keys);
+        let key = (func.ops[i].block, opcode, out_size, in_keys);
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
         // A value a phi reads keeps its own name (the phi prints as nothing).
@@ -630,7 +639,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         if let Some(&existing) = seen.get(&key)
             && !feeds_phi
             && name_still_holds(existing)
-            && holds_at_readers(func, i, value_key(func, out_id), existing)
+            && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
         {
             redirects.insert(out_key, existing);
             func.ops[i].dead = true;

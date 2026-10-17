@@ -357,6 +357,55 @@ impl LiftCache {
     }
 }
 
+/// What a range walk needs of each address's lift alone without the integer PF, shared by
+/// threads ([`X86Lifter::plain_range`]): the length and flags, computed once per address.
+///
+/// Covers the executable memory blocks, in pages allocated when first used.
+pub struct InsnFacts {
+    base: u64,
+    end: u64,
+    pages: Vec<std::sync::OnceLock<Box<[std::sync::atomic::AtomicU16]>>>,
+}
+
+const FACT_PAGE_BITS: u32 = 12;
+/// The cell is filled.
+const FACT_KNOWN: u16 = 1 << 15;
+const FACT_FAILED: u16 = 1 << 4;
+const FACT_X87: u16 = 1 << 5;
+const FACT_READS_PF: u16 = 1 << 6;
+/// It writes PF.
+const FACT_WRITES_PF: u16 = 1 << 7;
+/// It transfers control or writes another flag (ends `parity_needed`'s look back).
+const FACT_STOPS: u16 = 1 << 8;
+
+impl InsnFacts {
+    /// An empty table over the executable blocks of `memory`.
+    pub fn new(memory: &Memory) -> Self {
+        let exec = memory.blocks().filter(|b| b.flags.contains(reargo_loader::memory::MemoryFlags::EXECUTE));
+        let (mut base, mut end) = (u64::MAX, 0u64);
+        for b in exec {
+            base = base.min(b.start);
+            end = end.max(b.start.saturating_add(b.size));
+        }
+        if base >= end {
+            return Self { base: 0, end: 0, pages: Vec::new() };
+        }
+        let n = ((end - 1) >> FACT_PAGE_BITS) as usize - (base >> FACT_PAGE_BITS) as usize + 1;
+        Self { base, end, pages: (0..n).map(|_| std::sync::OnceLock::new()).collect() }
+    }
+
+    /// The cells of the page `addr` is in (pages are aligned to their size), `None` outside
+    /// the table.
+    fn page(&self, addr: u64) -> Option<&[std::sync::atomic::AtomicU16]> {
+        if addr < self.base || addr >= self.end {
+            return None;
+        }
+        let k = ((addr >> FACT_PAGE_BITS) - (self.base >> FACT_PAGE_BITS)) as usize;
+        let page = self.pages.get(k)?.get_or_init(|| (0..1usize << FACT_PAGE_BITS).map(|_| std::sync::atomic::AtomicU16::new(0)).collect());
+        Some(page)
+    }
+}
+
 /// A range lifted by [`X86Lifter::lift_range_cached`].
 pub enum CachedRange<'c> {
     /// Every instruction lifted alone, borrowed from the cache.
@@ -396,6 +445,80 @@ impl X86Lifter {
     pub fn without_parity(self) -> Self {
         Self { parity: false, ..self }
     }
+    /// The instruction at `addr` lifted alone as the first pass of [`PcodeLift::lift_range`]
+    /// lifts it (without the integer PF).
+    pub fn lift_alone(&self, memory: &Memory, addr: u64) -> Result<LiftedInstruction, LiftError> {
+        let fast = X86Lifter { is_64: self.is_64, parity: false };
+        fast.decode_in_block(memory, addr, &mut None).and_then(|insn| fast.lift_decoded(insn, addr, None))
+    }
+
+    /// The addresses of `lift_range(memory, start, count)` when it is exactly the lifts of
+    /// those addresses alone ([`Self::lift_alone`]: no x87 instruction, no integer PF needed),
+    /// read from (and filling) `facts`; `None` when the range must be lifted as a whole or
+    /// leaves the table.
+    pub fn plain_range(&self, memory: &Memory, start: u64, count: usize, facts: &InsnFacts) -> Option<Vec<u64>> {
+        use std::sync::atomic::Ordering;
+        let fast = X86Lifter { is_64: self.is_64, parity: false };
+        let mut addrs: Vec<u64> = Vec::with_capacity(count.min(4096));
+        let mut addr = start;
+        let mut block = None;
+        // the page of cells `addr` is in (`page_base` its first address)
+        let mut page: &[std::sync::atomic::AtomicU16] = &[];
+        let mut page_base = 0u64;
+        // `parity_needed`, forward: whether the PF an instruction reads was written after the
+        // last instruction that ends its look back (the instructions of a walk are contiguous)
+        let check_pf = self.parity;
+        let mut pf_written = false;
+        for _ in 0..count {
+            let off = addr.wrapping_sub(page_base);
+            if off >= page.len() as u64 {
+                page = facts.page(addr)?;
+                page_base = addr & !((1u64 << FACT_PAGE_BITS) - 1);
+            }
+            let cell = &page[(addr - page_base) as usize];
+            let mut f = cell.load(Ordering::Relaxed);
+            if f & FACT_KNOWN == 0 {
+                f = FACT_KNOWN
+                    | match fast.decode_in_block(memory, addr, &mut block).and_then(|insn| fast.lift_decoded(insn, addr, None)) {
+                        Ok(insn) => {
+                            let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
+                            let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
+                            let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+                            let control = insn.ops.iter().any(|o| {
+                                matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Call | OpCode::CallInd | OpCode::Return)
+                            });
+                            let len = u16::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
+                            len | if x87 { FACT_X87 } else { 0 }
+                                | if reads_outside_pf(&insn) { FACT_READS_PF } else { 0 }
+                                | if insn.ops.iter().any(|o| o.output.as_ref().is_some_and(pf)) { FACT_WRITES_PF } else { 0 }
+                                | if control || insn.ops.iter().any(|o| o.output.as_ref().is_some_and(flag)) { FACT_STOPS } else { 0 }
+                        }
+                        Err(_) => FACT_FAILED,
+                    };
+                cell.store(f, Ordering::Relaxed);
+            }
+            if f & FACT_FAILED != 0 {
+                break;
+            }
+            if f & FACT_X87 != 0 {
+                return None;
+            }
+            if check_pf {
+                if f & FACT_READS_PF != 0 && !pf_written {
+                    return None;
+                }
+                if f & FACT_WRITES_PF != 0 {
+                    pf_written = true;
+                } else if f & FACT_STOPS != 0 {
+                    pf_written = false;
+                }
+            }
+            addrs.push(addr);
+            addr += u64::from(f & 0xf);
+        }
+        Some(addrs)
+    }
+
     pub fn lift_range_cached<'c>(
         &self,
         memory: &Memory,
@@ -2569,6 +2692,10 @@ impl X86Lifter {
 }
 
 impl PcodeLift for X86Lifter {
+    fn as_x86(&self) -> Option<&X86Lifter> {
+        Some(self)
+    }
+
     /// The trait's contiguous lift without the integer PF; again with it when a PF reader
     /// in the range reads a PF no float compare set ([`needs_integer_parity`]).
     fn lift_range(&self, memory: &Memory, start: u64, count: usize) -> Result<Vec<LiftedInstruction>, LiftError> {
@@ -4260,6 +4387,48 @@ mod tests {
                 let cached = lifter.lift_range_cached(&mem, 0x1000 + start, count, &mut prefix_cache).insns().iter().map(|i| (*i).clone()).collect::<Vec<_>>();
                 assert_eq!(text(&cached.iter().collect::<Vec<_>>()), text(&fresh.iter().collect::<Vec<_>>()), "retained start +{start:#x} count {count}");
             }
+        }
+    }
+
+    /// `plain_range` answers only when `lift_range` is the lifts of its addresses alone, and
+    /// then exactly: integer PF readers and x87 code make it give up, a float compare's PF
+    /// reader does not.
+    #[test]
+    fn plain_range_equals_range_lift() {
+        let code: &[u8] = &[
+            0x48, 0x89, 0xc3, // mov rbx, rax
+            0x0f, 0x2e, 0xc1, // ucomiss xmm0, xmm1
+            0x75, 0x02, // jne +2
+            0x7a, 0x00, // jp +0 (reads the float compare's PF)
+            0x01, 0xd8, // add eax, ebx
+            0x83, 0xf8, 0x00, // cmp eax, 0
+            0x7a, 0x00, // jp +0 (reads the integer PF)
+            0x48, 0x83, 0xc4, 0x08, // add rsp, 8
+            0xd9, 0x07, // fld dword [rdi]
+            0xde, 0xc1, // faddp st(1), st
+            0xc3, // ret
+        ];
+        let mem = make_memory(code, 0x1000);
+        let text = |v: &[LiftedInstruction]| format!("{:?}", v.iter().map(|i| (i.address, i.length, &i.ops)).collect::<Vec<_>>());
+        for lifter in [X86Lifter::new_64(), X86Lifter::new_64().without_parity()] {
+            let facts = InsnFacts::new(&mem);
+            let mut answered = 0;
+            for start in 0..code.len() as u64 {
+                for count in [1, 2, 3, 5, 8, 40] {
+                    let fresh = lifter.lift_range(&mem, 0x1000 + start, count).unwrap();
+                    let Some(addrs) = lifter.plain_range(&mem, 0x1000 + start, count, &facts) else { continue };
+                    answered += 1;
+                    let alone: Vec<LiftedInstruction> = addrs.iter().map(|&a| lifter.lift_alone(&mem, a).unwrap()).collect();
+                    assert_eq!(text(&alone), text(&fresh), "start +{start:#x} count {count}");
+                }
+            }
+            assert!(answered > 0);
+            // the float compare's PF reader is no reason to give up
+            assert!(lifter.plain_range(&mem, 0x1000, 5, &facts).is_some());
+            // the integer PF reader is, unless the lifter computes no PF
+            assert_eq!(lifter.plain_range(&mem, 0x1000, 7, &facts).is_none(), lifter.parity);
+            // x87 code is
+            assert!(lifter.plain_range(&mem, 0x1000 + 0x11, 3, &facts).is_none());
         }
     }
 

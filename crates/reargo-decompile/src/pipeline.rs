@@ -1,7 +1,6 @@
 use reargo_lift::{LiftedInstruction, PcodeLift};
 use reargo_loader::Memory;
 use reargo_program::Program;
-use rayon::prelude::*;
 
 use crate::callee_params::{CalleeParams, ParamInfo};
 use crate::cfg::ControlFlowGraph;
@@ -32,11 +31,28 @@ pub struct DecompileOptions {
     pub structs: bool,
     /// The classes of the parameters inferred from the callers (WS93, [`crate::thisclass`]).
     pub this_index: Option<std::sync::Arc<crate::thisclass::ThisIndex>>,
+    /// Which texts the result carries: [`DecompileResult::c_code`] (with `recovered_structs`),
+    /// `rust_code` (with `rust_structs`) and `ssa_dump`; a text not asked for is left empty.
+    pub emit: Emit,
+}
+
+/// The texts a decompile renders ([`DecompileOptions::emit`]); all by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Emit {
+    pub c: bool,
+    pub rust: bool,
+    pub ssa: bool,
+}
+
+impl Default for Emit {
+    fn default() -> Self {
+        Self { c: true, rust: true, ssa: true }
+    }
 }
 
 impl Default for DecompileOptions {
     fn default() -> Self {
-        Self { structs: true, this_index: None }
+        Self { structs: true, this_index: None, emit: Emit::default() }
     }
 }
 
@@ -101,7 +117,10 @@ pub fn decompile_with_options(
     let call_returns = callee_return_map(&trimmed, oracle.as_ref(), &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&trimmed));
     let mut trimmed = trimmed;
-    long_double_tail_returns(&mut trimmed, &call_returns, &mut || crate::callers::return_hint(lifter, memory, entry));
+    long_double_tail_returns(&mut trimmed, &call_returns, &mut || match oracle.as_ref() {
+        Some(o) => o.return_hint(entry),
+        None => crate::callers::return_hint(lifter, memory, entry),
+    });
     let terminated = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
@@ -132,7 +151,10 @@ impl<'a> ThisVcalls<'a> {
             return None;
         }
         let this_reg = *lifter.call_convention()?.args.first()?;
-        let vtables = crate::vcall::this_vtables(memory, entry);
+        let vtables = match oracle {
+            Some(o) if std::ptr::eq(o.memory, memory) => o.this_vtables(entry),
+            _ => crate::vcall::this_vtables(memory, entry),
+        };
         (!vtables.is_empty()).then_some(Self { memory, vtables, this_reg, oracle })
     }
 }
@@ -405,22 +427,35 @@ fn decompile_function_inner(
         })
         .unwrap_or(500);
 
-    let mut lifted = lifter
-        .lift_range(&program.info.memory, func_entry, max_insns)
-        .map_err(|e| e.to_string())?;
-
-    if lifted.is_empty() {
-        return Err(format!("no instructions at 0x{:x}", func_entry));
-    }
     // WS83: the function ends where its FDE does. Lifted further, a tail `jmp` into the next
     // function was followed into that function's code (0x39f04e0 printed 0x39f0520's loop);
     // dropped, the `jmp` leaves the code and becomes a tail call
-    if let Some((start, len)) = fde_bounds(&program.info.memory, &program.info.sections, func_entry) {
-        lifted = keep_fde_body(lifted, start, start + len);
-    }
+    let fde = fde_bounds(&program.info.memory, &program.info.sections, func_entry);
+    // (only the instructions kept are lifted, when the range allows)
+    let kept = fde.and_then(|(start, len)| oracle?.lift_fde_body(func_entry, max_insns, start, start + len));
+    let mut lifted = match kept {
+        Some((any, kept)) => {
+            if !any {
+                return Err(format!("no instructions at 0x{:x}", func_entry));
+            }
+            kept
+        }
+        None => {
+            let mut lifted = lifter
+                .lift_range(&program.info.memory, func_entry, max_insns)
+                .map_err(|e| e.to_string())?;
+            if lifted.is_empty() {
+                return Err(format!("no instructions at 0x{:x}", func_entry));
+            }
+            if let Some((start, len)) = fde {
+                lifted = keep_fde_body(lifted, start, start + len);
+            }
+            lifted
+        }
+    };
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
-    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols));
+    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()));
     crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
     // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
     let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);
@@ -444,7 +479,10 @@ fn decompile_function_inner(
     let call_returns = callee_return_map(&terminated, oracle, &imports);
     let symbols = &with_thunk_names(symbols, imports.thunk_names(&terminated));
     let mut terminated = terminated;
-    long_double_tail_returns(&mut terminated, &call_returns, &mut || crate::callers::return_hint(lifter, &program.info.memory, func_entry));
+    long_double_tail_returns(&mut terminated, &call_returns, &mut || match oracle {
+        Some(o) => o.return_hint(func_entry),
+        None => crate::callers::return_hint(lifter, &program.info.memory, func_entry),
+    });
     let terminated = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
     // WS82: the exception landing pads, printed after the body
@@ -1193,25 +1231,41 @@ pub fn decompile_all_with_options(
     let (symbols, string_literals) = build_program_maps(program);
     let annotations = build_annotations(program);
     // one callee-parameter memo for the whole batch
-    let oracle = CalleeParams::new(lifter, &program.info.memory).map(|o| o.with_unwind_table(unwind_table(&program.info.sections)));
+    let oracle = CalleeParams::new(lifter, &program.info.memory)
+        .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index());
 
+    // Largest first, each worker taking the next function when it is done: the big
+    // functions do not end up last on one thread (the results keep the listing order).
+    let size = |e: u64| program.listing.get_function(e).map_or(0, |f| f.body.ranges().map(|r| r.size).sum::<u64>());
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(size(entries[i])));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<DecompileResult, String>>>> =
+        (0..entries.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    rayon::broadcast(|_| loop {
+        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(&i) = order.get(k) else { break };
+        let r = decompile_function_inner(
+            lifter,
+            program,
+            entries[i],
+            &symbols,
+            &string_literals,
+            Some(&annotations),
+            Some(&program.call_renderings),
+            oracle.as_ref(),
+            opts,
+        );
+        if let Ok(mut s) = slots[i].lock() {
+            *s = Some(r);
+        }
+    });
     entries
-        .par_iter()
-        .map(|&entry| {
-            (
-                entry,
-                decompile_function_inner(
-                    lifter,
-                    program,
-                    entry,
-                    &symbols,
-                    &string_literals,
-                    Some(&annotations),
-                    Some(&program.call_renderings),
-                    oracle.as_ref(),
-                    opts,
-                ),
-            )
+        .into_iter()
+        .zip(slots)
+        .map(|(e, s)| {
+            let r = s.into_inner().ok().flatten().unwrap_or_else(|| Err(format!("not decompiled: 0x{e:x}")));
+            (e, r)
         })
         .collect()
 }
@@ -1312,7 +1366,12 @@ fn build_decompile_result(
             .iter()
             .any(|o| matches!(o.opcode, reargo_core::pcode::OpCode::Call | reargo_core::pcode::OpCode::CallInd) && o.inputs.len() > 1);
 
-    let mut hint = |f: u64| caller_hint.and_then(|(lifter, memory)| crate::callers::return_hint(lifter, memory, f));
+    let mut hint = |f: u64| {
+        caller_hint.and_then(|(lifter, memory)| match oracle {
+            Some(o) if std::ptr::eq(o.memory, memory) => o.return_hint(f),
+            _ => crate::callers::return_hint(lifter, memory, f),
+        })
+    };
     ssa.return_float = choose_return_register(&mut ssa, entry, &mut hint);
     settle_unknown_returns(&mut ssa);
     let mut opt_stats = run_optimization_passes(&mut ssa);
@@ -1346,7 +1405,9 @@ fn build_decompile_result(
     // The dump's purpose is to show the SSA used by the C/Rust
     // emitter (which also runs against the optimized form), so the
     // post-opt view is also the more useful debug output.
-    let ssa_dump = ssa.display_ssa();
+    let ssa_dump = if opts.emit.ssa { ssa.display_ssa() } else { String::new() };
+    // (the SSA does not change any more: its readers are computed once for what follows)
+    let _frozen = crate::condition::FrozenReaders::new(&ssa);
 
     // Run type inference / structurer / emitters sequentially.
     //
@@ -1366,8 +1427,8 @@ fn build_decompile_result(
     } else {
         crate::structs::StructView::default()
     };
-    let recovered_structs = view.c_definitions();
-    let rust_structs = view.rust_definitions();
+    let recovered_structs = if opts.emit.c { view.c_definitions() } else { Vec::new() };
+    let rust_structs = if opts.emit.rust { view.rust_definitions() } else { Vec::new() };
 
     // `if (a) goto X; if (b) goto X;` -> `if (a || b) goto X;` (on a copy of the CFG)
     let short = crate::condition::merge_short_circuits(&ssa);
@@ -1392,7 +1453,7 @@ fn build_decompile_result(
     if opts.structs {
         c_emitter = c_emitter.with_structs(&view);
     }
-    let c_code = c_emitter.emit_function(&ssa, &structured);
+    let c_code = if opts.emit.c { c_emitter.emit_function(&ssa, &structured) } else { String::new() };
 
     let mut rust_emitter = RustEmitter::with_maps(symbols, string_literals);
     if let Some(ann) = annotations {
@@ -1407,7 +1468,7 @@ fn build_decompile_result(
     if opts.structs {
         rust_emitter = rust_emitter.with_structs(&view);
     }
-    let rust_code = rust_emitter.emit_function(&ssa, &structured);
+    let rust_code = if opts.emit.rust { rust_emitter.emit_function(&ssa, &structured) } else { String::new() };
 
     Ok(DecompileResult {
         c_code,
@@ -1530,9 +1591,8 @@ pub(crate) fn trim_to_return(instructions: Vec<LiftedInstruction>) -> Vec<Lifted
         .collect()
 }
 
-fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
+fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructions: &[I]) -> Vec<bool> {
     use rustc_hash::FxHashMap;
-    use reargo_core::pcode::OpCode;
 
     if instructions.is_empty() {
         return Vec::new();
@@ -1542,7 +1602,7 @@ fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
     let addr_to_idx: FxHashMap<u64, usize> = instructions
         .iter()
         .enumerate()
-        .map(|(idx, insn)| (insn.address, idx))
+        .map(|(idx, insn)| (insn.borrow().address, idx))
         .collect();
 
     let mut visited = vec![false; n];
@@ -1553,51 +1613,56 @@ fn reachability(instructions: &[LiftedInstruction]) -> Vec<bool> {
             continue;
         }
         visited[idx] = true;
-        let insn = &instructions[idx];
-
-        let mut has_unconditional_transfer = false;
-        let mut has_return_or_indjmp = false;
-        for op in &insn.ops {
-            match op.opcode {
-                OpCode::Branch => {
-                    has_unconditional_transfer = true;
-                    if let Some(tgt) = op.inputs.first()
-                        && tgt.space == reargo_core::address::SpaceId::RAM
-                        && let Some(&t_idx) = addr_to_idx.get(&tgt.offset)
-                    {
-                        stack.push(t_idx);
-                    }
-                }
-                OpCode::CBranch => {
-                    if let Some(tgt) = op.inputs.first()
-                        && tgt.space == reargo_core::address::SpaceId::RAM
-                        && let Some(&t_idx) = addr_to_idx.get(&tgt.offset)
-                    {
-                        stack.push(t_idx);
-                    }
-                }
-                OpCode::Return | OpCode::BranchInd => {
-                    has_return_or_indjmp = true;
-                    // a recovered jump table's cases (WS83, `switch`)
-                    for t in op.inputs.iter().skip(1).filter(|t| op.opcode == OpCode::BranchInd && t.space == reargo_core::address::SpaceId::RAM) {
-                        if let Some(&t_idx) = addr_to_idx.get(&t.offset) {
-                            stack.push(t_idx);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if !has_return_or_indjmp && !has_unconditional_transfer && !crate::cfg::is_trap(insn) {
-            let fall = insn.address + insn.length as u64;
-            if let Some(&f_idx) = addr_to_idx.get(&fall) {
-                stack.push(f_idx);
-            }
-        }
+        reach_successors(instructions[idx].borrow(), |a| addr_to_idx.get(&a).copied(), &mut stack);
     }
 
     visited
+}
+
+/// Push onto `stack` the indices (`idx_of`) of the instructions [`reachability`] reaches from
+/// `insn`.
+pub(crate) fn reach_successors(insn: &LiftedInstruction, idx_of: impl Fn(u64) -> Option<usize>, stack: &mut Vec<usize>) {
+    use reargo_core::pcode::OpCode;
+    let mut has_unconditional_transfer = false;
+    let mut has_return_or_indjmp = false;
+    for op in &insn.ops {
+        match op.opcode {
+            OpCode::Branch => {
+                has_unconditional_transfer = true;
+                if let Some(tgt) = op.inputs.first()
+                    && tgt.space == reargo_core::address::SpaceId::RAM
+                    && let Some(t_idx) = idx_of(tgt.offset)
+                {
+                    stack.push(t_idx);
+                }
+            }
+            OpCode::CBranch => {
+                if let Some(tgt) = op.inputs.first()
+                    && tgt.space == reargo_core::address::SpaceId::RAM
+                    && let Some(t_idx) = idx_of(tgt.offset)
+                {
+                    stack.push(t_idx);
+                }
+            }
+            OpCode::Return | OpCode::BranchInd => {
+                has_return_or_indjmp = true;
+                // a recovered jump table's cases (WS83, `switch`)
+                for t in op.inputs.iter().skip(1).filter(|t| op.opcode == OpCode::BranchInd && t.space == reargo_core::address::SpaceId::RAM) {
+                    if let Some(t_idx) = idx_of(t.offset) {
+                        stack.push(t_idx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !has_return_or_indjmp && !has_unconditional_transfer && !crate::cfg::is_trap(insn) {
+        let fall = insn.address + insn.length as u64;
+        if let Some(f_idx) = idx_of(fall) {
+            stack.push(f_idx);
+        }
+    }
 }
 
 #[cfg(test)]

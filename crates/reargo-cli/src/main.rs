@@ -2850,7 +2850,8 @@ fn cmd_decompile(path: &Path, address: Option<u64>, show_ssa: bool, show_rust: b
 
     let entry = address.unwrap_or(program.entry_point());
 
-    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index) };
+    let emit = reargo_decompile::pipeline::Emit { c: !show_ssa && !show_rust, rust: !show_ssa && show_rust, ssa: show_ssa };
+    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index), emit };
     let result = reargo_decompile::decompile_function_with_options(lifter.as_ref(), &program, entry, &opts)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -2917,7 +2918,8 @@ fn cmd_decompile_all(
         std::fs::create_dir_all(dir)?;
     }
 
-    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index) };
+    let emit = reargo_decompile::pipeline::Emit { c: true, rust: show_rust, ssa: false };
+    let opts = reargo_decompile::DecompileOptions { structs, this_index: this_index(path, &program, structs && use_index), emit };
     let results = reargo_decompile::decompile_all_with_options(lifter.as_ref(), &program, &opts);
 
     // WS91: the structs of C++ classes once, merged over every function (the anonymous ones are
@@ -3920,9 +3922,14 @@ fn cmd_semantic_diff(
     // Decompile both sides up-front so the diff loop can hash from
     // cached SSA without re-running the pipeline per call.
     eprintln!("Decompiling {}...", path_a.display());
-    let res_a = reargo_decompile::decompile_all(lifter_a.as_ref(), &prog_a);
+    // only the C text is hashed
+    let c_only = reargo_decompile::DecompileOptions {
+        emit: reargo_decompile::pipeline::Emit { c: true, rust: false, ssa: false },
+        ..Default::default()
+    };
+    let res_a = reargo_decompile::decompile_all_with_options(lifter_a.as_ref(), &prog_a, &c_only);
     eprintln!("Decompiling {}...", path_b.display());
-    let res_b = reargo_decompile::decompile_all(lifter_b.as_ref(), &prog_b);
+    let res_b = reargo_decompile::decompile_all_with_options(lifter_b.as_ref(), &prog_b, &c_only);
 
     // Build (addr, name) lists and the hash-callback closures from
     // the cached results.
@@ -5278,7 +5285,11 @@ fn cmd_script(path: &Path, script_path: &Path, thumb: bool) -> Result<(), Box<dy
             "decompile" => {
                 if let Some(lifter) = make_lifter(&info, thumb) {
                     let addr = parse_hex(args).unwrap_or(info.entry_point);
-                    match reargo_decompile::decompile_function(lifter.as_ref(), &program, addr) {
+                    let c_only = reargo_decompile::DecompileOptions {
+                        emit: reargo_decompile::pipeline::Emit { c: true, rust: false, ssa: false },
+                        ..Default::default()
+                    };
+                    match reargo_decompile::decompile_function_with_options(lifter.as_ref(), &program, addr, &c_only) {
                         Ok(result) => print!("{}", result.c_code),
                         Err(e) => eprintln!("decompile error: {}", e),
                     }
