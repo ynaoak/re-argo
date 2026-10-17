@@ -1,7 +1,6 @@
 use reargo_lift::{LiftedInstruction, PcodeLift};
 use reargo_loader::Memory;
 use reargo_program::Program;
-use rayon::prelude::*;
 
 use crate::callee_params::{CalleeParams, ParamInfo};
 use crate::cfg::ControlFlowGraph;
@@ -1235,23 +1234,38 @@ pub fn decompile_all_with_options(
     let oracle = CalleeParams::new(lifter, &program.info.memory)
         .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index());
 
+    // Largest first, each worker taking the next function when it is done: the big
+    // functions do not end up last on one thread (the results keep the listing order).
+    let size = |e: u64| program.listing.get_function(e).map_or(0, |f| f.body.ranges().map(|r| r.size).sum::<u64>());
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(size(entries[i])));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<DecompileResult, String>>>> =
+        (0..entries.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    rayon::broadcast(|_| loop {
+        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(&i) = order.get(k) else { break };
+        let r = decompile_function_inner(
+            lifter,
+            program,
+            entries[i],
+            &symbols,
+            &string_literals,
+            Some(&annotations),
+            Some(&program.call_renderings),
+            oracle.as_ref(),
+            opts,
+        );
+        if let Ok(mut s) = slots[i].lock() {
+            *s = Some(r);
+        }
+    });
     entries
-        .par_iter()
-        .map(|&entry| {
-            (
-                entry,
-                decompile_function_inner(
-                    lifter,
-                    program,
-                    entry,
-                    &symbols,
-                    &string_literals,
-                    Some(&annotations),
-                    Some(&program.call_renderings),
-                    oracle.as_ref(),
-                    opts,
-                ),
-            )
+        .into_iter()
+        .zip(slots)
+        .map(|(e, s)| {
+            let r = s.into_inner().ok().flatten().unwrap_or_else(|| Err(format!("not decompiled: 0x{e:x}")));
+            (e, r)
         })
         .collect()
 }
