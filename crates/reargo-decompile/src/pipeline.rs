@@ -749,10 +749,11 @@ fn long_double_tail_returns(
 }
 
 ///
-/// A clobber no path from the call reads (each of the register's views written again first,
-/// or never read) is left out: it would only be removed as dead code, after costing every
-/// pass on the way. The second result counts the ops left out, the third the full registers
-/// left out after each call (for the SSA to number their versions as if they were there).
+/// The clobbers of a register the code itself never reads or writes are left out where nothing
+/// can read them ([`live_clobbers`]): they would only be removed as dead code, after costing
+/// every pass on the way (a call's 23 clobbers and their views are 77 ops). The second result
+/// counts the ops left out, the third the argument registers left out after each call (for the
+/// SSA to number their versions as if they were there).
 fn apply_call_convention(
     mut instructions: Vec<LiftedInstruction>,
     lifter: &dyn PcodeLift,
@@ -876,9 +877,11 @@ fn apply_call_convention(
 /// register only when some path from right after the call reads it before writing it again
 /// (a later call reading its arguments; an indirect jump reads everything). The paths follow
 /// the instructions' jumps, falling through everywhere but after a `ret` and a direct `jmp`
-/// (more paths than the CFG has, never fewer). The values left out are never read, and the
-/// versions of a register only calls touch are never printed, so the result is the same.
-/// Every bit is set when there are more than 128 tracked variables.
+/// (more paths than the CFG has, never fewer). The values left out are never read, no
+/// statement of the code writes those registers (the passes look for writes between two
+/// values of a register), and the SSA numbers their versions as if they were there
+/// ([`crate::ssa::PhantomDefs`]), so the result is the same. Every bit is set when there are
+/// more than 128 tracked variables.
 fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConvention) -> Vec<(u128, u128)> {
     use reargo_core::address::SpaceId;
     use reargo_core::pcode::OpCode;
