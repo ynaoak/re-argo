@@ -93,7 +93,7 @@ fn slot_range(k: i64, size: u32) -> bool {
     (k < 0 && k.checked_add(i64::from(size)).is_some_and(|e| e <= 0)) || k >= ARGS
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Frame {
     /// value -> its offset from the entry `rsp` (by value: CSE leaves several names of one)
     offsets: FxHashMap<ValueKey, i64>,

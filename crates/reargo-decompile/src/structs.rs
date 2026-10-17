@@ -344,7 +344,12 @@ pub(crate) fn strip_copies(func: &SsaFunction, mut v: VarId) -> VarId {
 
 impl StructView {
     pub fn new(func: &SsaFunction, ctx: &Context<'_>) -> Self {
-        let frame = crate::frame::Frame::new(func, &|_| true);
+        Self::with_frame(func, ctx, &crate::frame::Frame::new(func, &|_| true))
+    }
+
+    /// [`Self::new`] with the function's stack frame (`Frame::new(func, &|_| true)`) computed
+    /// by the caller.
+    pub(crate) fn with_frame(func: &SsaFunction, ctx: &Context<'_>, frame: &crate::frame::Frame) -> Self {
         let readers = crate::condition::Readers::new(func);
         let mut uf = Uf::default();
         let mut nodes: FxHashMap<ValueKey, u32> = FxHashMap::default();

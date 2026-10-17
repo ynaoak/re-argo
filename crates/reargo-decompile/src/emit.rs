@@ -110,7 +110,9 @@ pub struct CEmitter<'a> {
     /// reads folds them there too). Their definitions are in `folded`.
     inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
     /// The stack slots by name (WS87, `frame`).
-    frame: crate::frame::Frame,
+    frame: std::borrow::Cow<'a, crate::frame::Frame>,
+    /// The frame computed by the caller ([`Self::with_frame`]).
+    given_frame: Option<&'a crate::frame::Frame>,
     /// A temporary printed as the register it is copied to (WS88, `inline::coalesced`).
     coalesced: Coalesced,
     /// `lock cmpxchg` printed as one compare-and-swap, by its store (WS89, `cas::find`).
@@ -174,6 +176,7 @@ impl CEmitter<'static> {
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -219,6 +222,7 @@ impl<'a> CEmitter<'a> {
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -253,6 +257,13 @@ impl<'a> CEmitter<'a> {
     }
 
     /// Print struct fields and virtual calls from `view` (WS91).
+    /// The function's stack frame (`Frame::new(func, &|_| true)` of the function emitted),
+    /// computed once by the caller.
+    pub(crate) fn with_frame(mut self, frame: &'a crate::frame::Frame) -> Self {
+        self.given_frame = Some(frame);
+        self
+    }
+
     pub fn with_structs(mut self, view: &'a crate::structs::StructView) -> Self {
         self.structs = Some(view);
         self
@@ -275,7 +286,10 @@ impl<'a> CEmitter<'a> {
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
         // WS87: the stack slots by name; the stack pointer updates only they read go
-        self.frame = crate::frame::Frame::new(func, &|_| true);
+        self.frame = match self.given_frame {
+            Some(f) => std::borrow::Cow::Borrowed(f),
+            None => std::borrow::Cow::Owned(crate::frame::Frame::new(func, &|_| true)),
+        };
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
         // WS89: `lock cmpxchg` as one statement at its store
