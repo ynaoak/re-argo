@@ -68,9 +68,9 @@ impl Slot {
     /// The C declaration (`uint64_t local_30`, `uint8_t local_48[0x18]`, `uint8_t arg_8[]`).
     pub fn c_declaration(&self) -> String {
         match (self.array, self.size) {
-            (true, 0) => format!("uint8_t {}[]", self.name()),
+            (true, 0) => cat!("uint8_t ", self.name(), "[]"),
             (true, n) => format!("uint8_t {}[0x{n:x}]", self.name()),
-            (false, n) => format!("{} {}", crate::emit::size_to_type(n), self.name()),
+            (false, n) => cat!(crate::emit::size_to_type(n), " ", self.name()),
         }
     }
 
@@ -376,14 +376,14 @@ impl Frame {
         let whole = !s.array && d == 0;
         Some(match (whole, size.cmp(&s.size), rust) {
             (true, std::cmp::Ordering::Equal, _) => s.name(),
-            (true, std::cmp::Ordering::Less, false) if as_lvalue => format!("*({}*)&{}", crate::emit::size_to_type(size), s.name()),
-            (true, std::cmp::Ordering::Less, false) => format!("({}){}", crate::emit::size_to_type(size), s.name()),
-            (true, std::cmp::Ordering::Less, true) if !as_lvalue => format!("({} as {})", s.name(), crate::rust_emit::size_to_rust_type(size)),
+            (true, std::cmp::Ordering::Less, false) if as_lvalue => cat!("*(", crate::emit::size_to_type(size), "*)&", s.name()),
+            (true, std::cmp::Ordering::Less, false) => cat!("(", crate::emit::size_to_type(size), ")", s.name()),
+            (true, std::cmp::Ordering::Less, true) if !as_lvalue => cat!("(", s.name(), " as ", crate::rust_emit::size_to_rust_type(size), ")"),
             // elsewhere: through the slot's address
-            (_, _, false) => format!("*({}*){}", crate::emit::size_to_type(size), self.address_text(s, d, true, false)),
+            (_, _, false) => cat!("*(", crate::emit::size_to_type(size), "*)", self.address_text(s, d, true, false)),
             (_, _, true) => {
                 let ptr = if as_lvalue { "*mut" } else { "*const" };
-                format!("*({} as {ptr} {})", self.address_text(s, d, true, true), crate::rust_emit::size_to_rust_type(size))
+                cat!("*(", self.address_text(s, d, true, true), " as ", ptr, " ", crate::rust_emit::size_to_rust_type(size), ")")
             }
         })
     }
@@ -395,8 +395,8 @@ impl Frame {
         if rust {
             let base = match (s.array, s.size) {
                 (true, 0) => s.name(),
-                (true, _) => format!("{}.as_mut_ptr()", s.name()),
-                (false, _) => format!("&raw mut {}", s.name()),
+                (true, _) => cat!(s.name(), ".as_mut_ptr()"),
+                (false, _) => cat!("&raw mut ", s.name()),
             };
             // (`&raw mut x as *mut u32` casts the reference: no parentheses needed)
             return match (d, s.array) {
@@ -405,7 +405,7 @@ impl Frame {
                 (_, false) => format!("({base} as *mut u8).add(0x{d:x})"),
             };
         }
-        let base = if s.array { s.name() } else { format!("&{}", s.name()) };
+        let base = if s.array { s.name() } else { cat!("&", s.name()) };
         match (d, operand) {
             (0, _) => base,
             (_, false) => format!("(uint8_t*){base} + 0x{d:x}"),

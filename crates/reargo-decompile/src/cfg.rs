@@ -13,7 +13,7 @@ fn empty_cfg() -> ControlFlowGraph {
             predecessors: Vec::new(),
         }],
         entry_block: 0,
-        addr_to_block: BTreeMap::new(),
+        addr_to_block: AddrIndex::default(),
         switches: BTreeMap::new(),
     }
 }
@@ -117,7 +117,7 @@ fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
 
 fn finalize_cfg(
     mut blocks: Vec<BasicBlock>,
-    addr_to_block: BTreeMap<u64, BlockId>,
+    addr_to_block: AddrIndex,
     entry_addr: u64,
 ) -> ControlFlowGraph {
     let block_count = blocks.len();
@@ -198,6 +198,23 @@ pub struct SwitchInfo {
 
 pub type BlockId = usize;
 
+/// The block starting at each address: `(address, block)` in increasing address order (the
+/// CFG makes its blocks in that order), looked up by binary search.
+#[derive(Debug, Clone, Default)]
+pub struct AddrIndex(Vec<(u64, BlockId)>);
+
+impl AddrIndex {
+    /// Adds the block at `addr`, above every address added so far.
+    fn insert(&mut self, addr: u64, id: BlockId) {
+        debug_assert!(self.0.last().is_none_or(|&(a, _)| a < addr), "addresses in increasing order");
+        self.0.push((addr, id));
+    }
+
+    pub fn get(&self, addr: &u64) -> Option<&BlockId> {
+        self.0.binary_search_by_key(addr, |&(a, _)| a).ok().map(|i| &self.0[i].1)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
     pub id: BlockId,
@@ -256,7 +273,7 @@ impl BasicBlock {
 pub struct ControlFlowGraph {
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
-    addr_to_block: BTreeMap<u64, BlockId>,
+    addr_to_block: AddrIndex,
     /// Blocks ending in a recovered jump table (WS83, [`ControlFlowGraph::attach_switches`]).
     pub switches: BTreeMap<BlockId, SwitchInfo>,
 }
@@ -329,7 +346,7 @@ impl ControlFlowGraph {
         }
 
         let mut blocks = Vec::with_capacity(leader_vec.len());
-        let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
+        let mut addr_to_block = AddrIndex::default();
         let mut iter = instructions.into_iter();
 
         for (&leader_addr, &(skip, take)) in leader_vec.iter().zip(&runs) {
@@ -360,7 +377,7 @@ impl ControlFlowGraph {
         let entry_addr = instructions[0].address;
 
         let mut blocks = Vec::new();
-        let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
+        let mut addr_to_block = AddrIndex::default();
         let mut iter = instructions.into_iter().peekable();
 
         for (idx, &leader_addr) in leader_vec.iter().enumerate() {
@@ -402,7 +419,7 @@ impl ControlFlowGraph {
         }
         let leader_vec = compute_leaders(instructions);
         let mut blocks = Vec::new();
-        let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
+        let mut addr_to_block = AddrIndex::default();
         let mut insn_iter = instructions.iter().peekable();
         for (idx, &leader_addr) in leader_vec.iter().enumerate() {
             let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u64::MAX);

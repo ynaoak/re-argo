@@ -127,7 +127,7 @@ impl StructDef {
     fn field_type(&self, f: &Field, defs: &[StructDef]) -> String {
         match f.kind {
             FieldKind::VPtr => "void**".into(),
-            FieldKind::Ptr(Some(i)) => format!("struct {}*", defs[i].name),
+            FieldKind::Ptr(Some(i)) => cat!("struct ", defs[i].name, "*"),
             FieldKind::Ptr(None) => "void*".into(),
             FieldKind::Float => crate::emit::float_type(f.size).into(),
             FieldKind::Int => crate::emit::size_to_type(f.size).into(),
@@ -136,7 +136,7 @@ impl StructDef {
 
     /// The C definition, with the gaps between fields as byte arrays (so the offsets hold).
     pub fn c_definition(&self, defs: &[StructDef]) -> String {
-        let mut out = format!("struct {} {{", self.name);
+        let mut out = cat!("struct ", self.name, " {");
         match (&self.class, self.vtable) {
             (Some(_), Some(v)) if !self.class_from_symbol => out.push_str(&format!("  // class from RTTI, vtable 0x{v:x}")),
             (Some(_), Some(v)) => out.push_str(&format!("  // class from the symbol, vtable 0x{v:x}")),
@@ -167,7 +167,7 @@ impl StructDef {
     /// The Rust definition (`#[repr(C)]`, gaps as byte arrays).
     pub fn rust_definition(&self, defs: &[StructDef]) -> String {
         let mut out = "#[repr(C)]\n".to_string();
-        out.push_str(&format!("struct {} {{", rust_ident(&self.name)));
+        out.push_str(&cat!("struct ", rust_ident(&self.name), " {"));
         if let Some(v) = self.vtable {
             out.push_str(&format!("  // vtable 0x{v:x}"));
         }
@@ -179,7 +179,7 @@ impl StructDef {
             }
             let ty = match f.kind {
                 FieldKind::VPtr => "*const *const u8".to_string(),
-                FieldKind::Ptr(Some(i)) => format!("*mut {}", rust_ident(&defs[i].name)),
+                FieldKind::Ptr(Some(i)) => cat!("*mut ", rust_ident(&defs[i].name)),
                 FieldKind::Ptr(None) => "*mut u8".into(),
                 FieldKind::Float if f.size == 4 => "f32".into(),
                 FieldKind::Float if f.size == 8 => "f64".into(),
@@ -840,7 +840,7 @@ impl StructView {
 
         // the layout of each struct
         let mut defs: Vec<StructDef> = (0..struct_roots.len())
-            .map(|i| StructDef { name: format!("struct_{i}"), class: None, vtable: None, fields: Vec::new(), stride: stride.get(&struct_roots[i]).copied(), class_from_symbol: false })
+            .map(|i| StructDef { name: format!("struct_{}", i), class: None, vtable: None, fields: Vec::new(), stride: stride.get(&struct_roots[i]).copied(), class_from_symbol: false })
             .collect();
         let mut by_def: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
         for (i, r) in raws.iter().enumerate().filter(|(_, r)| !r.skip) {
@@ -944,7 +944,7 @@ impl StructView {
                 Some(c) => {
                     let n = taken.entry(c.clone()).or_insert(0);
                     *n += 1;
-                    if *n == 1 { c.clone() } else { format!("{c}_{}", *n - 1) }
+                    if *n == 1 { c.clone() } else { format!("{}_{}", c, *n - 1) }
                 }
                 None => {
                     anon += 1;

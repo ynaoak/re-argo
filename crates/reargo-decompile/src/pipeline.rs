@@ -121,10 +121,10 @@ pub fn decompile_with_options(
         Some(o) => o.return_hint(entry),
         None => crate::callers::return_hint(lifter, memory, entry),
     });
-    let terminated = apply_call_convention(trimmed, lifter, &call_returns);
+    let (terminated, omitted, phantoms) = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts, oracle.as_ref())
+    build_decompile_result(terminated, (omitted, &phantoms), func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts, oracle.as_ref())
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -483,13 +483,14 @@ fn decompile_function_inner(
         Some(o) => o.return_hint(func_entry),
         None => crate::callers::return_hint(lifter, &program.info.memory, func_entry),
     });
-    let terminated = apply_call_convention(terminated, lifter, &call_returns);
+    let (terminated, omitted, phantoms) = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
     // WS82: the exception landing pads, printed after the body
     let handlers = crate::exception::handlers(&program.info.memory, &program.info.sections, symbols, func_entry);
 
     build_decompile_result(
         terminated,
+        (omitted, &phantoms),
         &func_name,
         func_entry,
         symbols,
@@ -747,15 +748,24 @@ fn long_double_tail_returns(
     }
 }
 
+///
+/// The clobbers of a register the code itself never reads or writes are left out where nothing
+/// can read them ([`live_clobbers`]): they would only be removed as dead code, after costing
+/// every pass on the way (a call's 23 clobbers and their views are 77 ops). The second result
+/// counts the ops left out, the third the argument registers left out after each call (for the
+/// SSA to number their versions as if they were there).
 fn apply_call_convention(
     mut instructions: Vec<LiftedInstruction>,
     lifter: &dyn PcodeLift,
     call_returns: &rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind>,
-) -> Vec<LiftedInstruction> {
+) -> (Vec<LiftedInstruction>, usize, crate::ssa::PhantomDefs) {
     use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
     let Some(cc) = lifter.call_convention() else {
-        return instructions;
+        return (instructions, 0, crate::ssa::PhantomDefs::default());
     };
+    let mut phantoms = crate::ssa::PhantomDefs { regs: cc.args.iter().take(32).copied().collect(), ..Default::default() };
+    // (the bit in `phantoms.regs` of each clobber that is an argument)
+    let phantom_bit: Vec<u32> = cc.clobbers.iter().map(|(full, _)| phantoms.regs.iter().position(|a| a == full).map_or(0, |i| 1 << i)).collect();
     // WS77: a `ret` lifts to `RETURN(target)` — the popped return address, not the value. Give
     // it the convention's return registers (`rax`, then `xmm0`) as further inputs so the value
     // reaching the `ret` is live and the emitter can print it (`emit::return_value`);
@@ -767,7 +777,10 @@ fn apply_call_convention(
             }
         }
     }
-    for insn in &mut instructions {
+    // the clobbers each call defines (`live_clobbers`)
+    let needed = live_clobbers(&instructions, &cc);
+    let mut omitted = 0usize;
+    for (k, insn) in instructions.iter_mut().enumerate() {
         let Some(pos) = insn
             .ops
             .iter()
@@ -775,6 +788,8 @@ fn apply_call_convention(
         else {
             continue;
         };
+        let need = needed[k];
+        let mut phantom_mask = 0u32;
         let insn_addr = insn.address;
         // WS89: the lifter found the callee returning a `long double` (the code after the call
         // pops it): `INDIRECT(target)` of an x87 slot after the call; rax / xmm0 are clobbered
@@ -784,10 +799,18 @@ fn apply_call_convention(
         let call = &mut insn.ops[pos];
         let at = call.seq;
         let target = call.inputs.first().copied();
-        for a in &cc.args {
-            call.inputs.push(*a);
-        }
-        let mut after: Vec<PcodeOp> = Vec::new();
+        call.inputs.extend(cc.args.iter().copied());
+        // (the definitions go between the call and the ops after it, built in place)
+        let tail = insn.ops.split_off(pos + 1);
+        let n_defs: usize = cc.returns.iter().map(|(_, views)| 1 + views.len()).sum::<usize>()
+            + cc.clobbers
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| need.0 & (1u128 << j) != 0)
+                .map(|(j, (_, views))| 1 + if need.1 & (1u128 << j) != 0 { views.len() } else { 0 })
+                .sum::<usize>();
+        insn.ops.reserve(n_defs + tail.len());
+        let after = &mut insn.ops;
         // returns: `INDIRECT(target)`; clobbers: `INDIRECT(target, 1)` (WS76: a caller-saved
         // register read after a call no longer shows the value it had before the call)
         let clobber_mark = VarnodeData::new(reargo_core::address::SpaceId::CONST, CLOBBER_MARK, 1);
@@ -801,9 +824,21 @@ fn apply_call_convention(
         let defs = cc
             .returns
             .iter()
+            .map(|(full, views)| (full, views.as_slice()))
             .enumerate()
             .map(|(i, r)| (r, !returned(i)))
-            .chain(cc.clobbers.iter().map(|r| (r, true)));
+            .chain(cc.clobbers.iter().enumerate().filter_map(|(j, (full, all_views))| {
+                // (the views only with the full register: they read it)
+                let with_full = need.0 & (1u128 << j) != 0;
+                let views: &[u32] = if with_full && need.1 & (1u128 << j) != 0 { all_views } else { &[] };
+                omitted += usize::from(!with_full) + all_views.len() - views.len();
+                // (only an argument register has versions to number: nothing else reads one
+                // the code does not touch)
+                if !with_full {
+                    phantom_mask |= phantom_bit[j];
+                }
+                with_full.then_some(((full, views), true))
+            }));
         for ((full, views), clobber) in defs {
             let mut inputs = smallvec::SmallVec::new();
             match target {
@@ -824,14 +859,178 @@ fn apply_call_convention(
                 });
             }
         }
-        let tail = insn.ops.split_off(pos + 1);
-        insn.ops.extend(after);
         insn.ops.extend(tail);
+        if phantom_mask != 0 {
+            phantoms.at.insert(insn_addr, phantom_mask);
+        }
         for (i, op) in insn.ops.iter_mut().enumerate() {
             op.seq.order = i as u32;
         }
     }
-    instructions
+    (instructions, omitted, phantoms)
+}
+
+/// For each instruction holding a call, which clobbers of `cc` to define after it (bit `j`:
+/// `cc.clobbers[j]`): `.0` the full registers, `.1` their views. A register the code reads or
+/// writes itself (any view) gets all of them, as before. One only the calls touch (the
+/// convention's arguments each call reads) gets no views (nothing reads them), and its full
+/// register only when some path from right after the call reads it before writing it again
+/// (a later call reading its arguments; an indirect jump reads everything). The paths follow
+/// the instructions' jumps, falling through everywhere but after a `ret` and a direct `jmp`
+/// (more paths than the CFG has, never fewer). The values left out are never read, no
+/// statement of the code writes those registers (the passes look for writes between two
+/// values of a register), and the SSA numbers their versions as if they were there
+/// ([`crate::ssa::PhantomDefs`]), so the result is the same. Every bit is set when there are
+/// more than 128 tracked variables.
+fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConvention) -> Vec<(u128, u128)> {
+    use reargo_core::address::SpaceId;
+    use reargo_core::pcode::OpCode;
+    let n = instructions.len();
+    let first_call = |i: &LiftedInstruction| i.ops.iter().position(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd));
+    if cc.clobbers.len() > 128 || n == 0 || !instructions.iter().any(|i| first_call(i).is_some()) {
+        return vec![(u128::MAX, u128::MAX); n];
+    }
+    // the bit of each tracked variable (a clobber or one of its views) and each clobber's bits
+    let mut bit_of: rustc_hash::FxHashMap<(u64, u32), u32> = rustc_hash::FxHashMap::default();
+    let mut group = Vec::with_capacity(cc.clobbers.len());
+    for (full, views) in &cc.clobbers {
+        let mut m = 0u128;
+        for size in std::iter::once(full.size).chain(views.iter().copied()) {
+            let next = bit_of.len() as u32;
+            let b = *bit_of.entry((full.offset, size)).or_insert(next);
+            if b >= 128 {
+                return vec![(u128::MAX, u128::MAX); n];
+            }
+            m |= 1u128 << b;
+        }
+        if full.space != SpaceId::REGISTER {
+            return vec![(u128::MAX, u128::MAX); n];
+        }
+        group.push(m);
+    }
+    let all_defs: u128 = group.iter().fold(0, |a, &m| a | m);
+    let bit = |v: &reargo_core::pcode::VarnodeData| -> u128 {
+        if v.space != SpaceId::REGISTER {
+            return 0;
+        }
+        bit_of.get(&(v.offset, v.size)).map_or(0, |&b| 1u128 << b)
+    };
+    let args: u128 = cc.args.iter().fold(0, |a, v| a | bit(v));
+    // (gen, kill) of ops in reverse order, starting from `(g, k)`
+    let transfer = |ops: &[reargo_core::pcode::PcodeOp], (mut g, mut k): (u128, u128)| {
+        for op in ops.iter().rev() {
+            if let Some(out) = &op.output {
+                let b = bit(out);
+                g &= !b;
+                k |= b;
+            }
+            for i in &op.inputs {
+                g |= bit(i);
+            }
+        }
+        (g, k)
+    };
+    // the registers the code itself reads or writes (any view): all their clobbers are made
+    // (a write after an omitted clobber would follow the earlier value with nothing in
+    // between, which the optimisations treat differently: a reload of the same constant is
+    // merged into it)
+    let touched = instructions
+        .iter()
+        .flat_map(|i| i.ops.iter())
+        .fold(0u128, |a, o| o.inputs.iter().chain(o.output.as_ref()).fold(a, |a, v| a | bit(v)));
+    let kept: u128 = group.iter().enumerate().fold(0, |a, (j, &m)| if m & touched != 0 { a | (1u128 << j) } else { a });
+    if group.iter().all(|&m| m & touched != 0) {
+        return vec![(u128::MAX, u128::MAX); n];
+    }
+    // (the full register's bit of each clobber)
+    let full_bit: Vec<u128> = cc.clobbers.iter().map(|(full, _)| bit(full)).collect();
+    // per instruction: its (gen, kill), and for a call the (gen, kill) of the ops after it
+    let mut gen_kill = Vec::with_capacity(n);
+    let mut after_call: Vec<Option<(u128, u128)>> = vec![None; n];
+    for (k, insn) in instructions.iter().enumerate() {
+        match first_call(insn) {
+            Some(pos) => {
+                let tail = transfer(&insn.ops[pos + 1..], (0, 0));
+                after_call[k] = Some(tail);
+                // the clobbers (and the returns, not tracked) are written right after the call,
+                // which reads the arguments
+                let (g, kl) = tail;
+                let (g, kl) = (g & !all_defs, kl | all_defs);
+                let mut g = g;
+                for i in &insn.ops[pos].inputs {
+                    g |= bit(i);
+                }
+                gen_kill.push(transfer(&insn.ops[..pos], (g | args, kl)));
+            }
+            None => gen_kill.push(transfer(&insn.ops, (0, 0))),
+        }
+    }
+    // the successors (more than the CFG has, never fewer); `None`: everything is read
+    let index: rustc_hash::FxHashMap<u64, usize> = instructions.iter().enumerate().map(|(k, i)| (i.address, k)).collect();
+    let mut succs: Vec<smallvec::SmallVec<[usize; 2]>> = Vec::with_capacity(n);
+    let mut reads_all = vec![false; n];
+    for (k, insn) in instructions.iter().enumerate() {
+        let mut out: smallvec::SmallVec<[usize; 2]> = smallvec::SmallVec::new();
+        let mut fall = true;
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Return => fall = false,
+                OpCode::BranchInd => reads_all[k] = true,
+                OpCode::Branch | OpCode::CBranch => {
+                    if let Some(t) = op.inputs.first().filter(|t| t.space == SpaceId::RAM) {
+                        if op.opcode == OpCode::Branch {
+                            fall = false;
+                        }
+                        if let Some(&s) = index.get(&t.offset) {
+                            out.push(s);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if fall && let Some(&s) = index.get(&(insn.address + u64::from(insn.length))) {
+            out.push(s);
+        }
+        succs.push(out);
+    }
+    let mut preds: Vec<smallvec::SmallVec<[usize; 2]>> = vec![smallvec::SmallVec::new(); n];
+    for (k, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            preds[s].push(k);
+        }
+    }
+    // live on exit of each instruction, to a fixpoint (backwards, from the last one)
+    let mut live_out = vec![0u128; n];
+    let live_in = |k: usize, out: u128| gen_kill[k].0 | (out & !gen_kill[k].1);
+    let mut queued = vec![true; n];
+    let mut work: Vec<usize> = (0..n).collect();
+    while let Some(k) = work.pop() {
+        queued[k] = false;
+        let out = if reads_all[k] { u128::MAX } else { succs[k].iter().fold(0, |a, &s| a | live_in(s, live_out[s])) };
+        if out != live_out[k] {
+            let changed_in = live_in(k, out) != live_in(k, live_out[k]);
+            live_out[k] = out;
+            if changed_in {
+                for &p in &preds[k] {
+                    if !queued[p] {
+                        queued[p] = true;
+                        work.push(p);
+                    }
+                }
+            }
+        }
+    }
+    (0..n)
+        .map(|k| match after_call[k] {
+            Some((g, kl)) => {
+                let live = g | (live_out[k] & !kl);
+                let full = full_bit.iter().enumerate().fold(kept, |a, (j, &m)| if live & m != 0 { a | (1u128 << j) } else { a });
+                (full, kept)
+            }
+            None => (0, 0),
+        })
+        .collect()
 }
 
 /// Is `v` read by something other than a call it is handed to as an (implicit) argument?
@@ -1324,6 +1523,9 @@ pub fn analyze_taint(
 #[allow(clippy::too_many_arguments)]
 fn build_decompile_result(
     instructions: Vec<LiftedInstruction>,
+    // ops `apply_call_convention` left out (counted in the statistics as if made), and the
+    // registers whose versions they would have numbered
+    (omitted_ops, phantoms): (usize, &crate::ssa::PhantomDefs),
     func_name: &str,
     entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
@@ -1345,13 +1547,13 @@ fn build_decompile_result(
 
     // Collect summary metrics *before* moving `instructions` into the
     // CFG, since `build_owned` consumes them.
-    let total_pcode: usize = instructions.iter().map(|i| i.ops.len()).sum();
+    let total_pcode: usize = instructions.iter().map(|i| i.ops.len()).sum::<usize>() + omitted_ops;
     let instructions_lifted = instructions.len();
     let mut cfg = ControlFlowGraph::build_owned(instructions);
     cfg.attach_switches(switches);
     let block_count = cfg.block_count();
 
-    let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
+    let mut ssa = SsaFunction::from_cfg_with_phantoms(func_name.to_string(), entry, cfg, phantoms);
     ssa.call_params = call_params;
     if let Some(v) = &vcalls {
         crate::vcall::resolve_this_vcalls(&mut ssa, v.memory, &v.vtables, &v.this_reg, v.oracle);
@@ -1375,6 +1577,8 @@ fn build_decompile_result(
     ssa.return_float = choose_return_register(&mut ssa, entry, &mut hint);
     settle_unknown_returns(&mut ssa);
     let mut opt_stats = run_optimization_passes(&mut ssa);
+    // (the clobbers left out would have been removed as dead code)
+    opt_stats.dead_ops_removed += omitted_ops + ssa.phantom_phis;
     // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
     // WS83: `cmovcc`'s branch-free mask becomes `dst = c ? src : dst` (after the flags: `c`
     // may be a flag combination they rewrote into a comparison)
@@ -3271,11 +3475,12 @@ mod tests {
         ];
         let mem = make_memory(&code, 0x1000);
         let lifted = lifter.lift_range(&mem, 0x1000, 100).unwrap();
-        let terminated = apply_call_convention(lifted, &lifter, &rustc_hash::FxHashMap::default());
+        let (terminated, omitted, phantoms) = apply_call_convention(lifted, &lifter, &rustc_hash::FxHashMap::default());
         let empty = std::collections::BTreeMap::new();
         let handlers = [(0x1013, "cleanup".to_string())];
         let r = build_decompile_result(
             terminated,
+            (omitted, &phantoms),
             "f",
             0x1000,
             &empty,

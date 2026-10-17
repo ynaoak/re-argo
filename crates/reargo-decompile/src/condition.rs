@@ -64,7 +64,7 @@ impl Cond {
                     .iter()
                     .map(|c| {
                         let s = c.render(false, leaf);
-                        if is_atomic(&s) { s } else { format!("({s})") }
+                        if is_atomic(&s) { s } else { cat!("(", s, ")") }
                     })
                     .collect();
                 parts.join(op)
@@ -672,7 +672,7 @@ fn is_const(func: &SsaFunction, v: VarId) -> bool {
 /// operand put on the right: `!(0.0f < x)` reads `!(x > 0.0f)`.
 fn negated_float_compare(func: &SsaFunction, cmp: OpCode, a: VarId, b: VarId, rhs: &str, swapped: Option<String>) -> String {
     let ordered = not_nan(func, a, 0) && not_nan(func, b, 0);
-    let mirror = |s: &str, from: &str, to: &str| s.rsplit_once(from).map(|(l, r)| format!("{l}{to}{r}"));
+    let mirror = |s: &str, from: &str, to: &str| s.rsplit_once(from).map(|(l, r)| cat!(l, to, r));
     let text = match cmp {
         OpCode::FloatEqual => mirror(rhs, " == ", " != "),
         OpCode::FloatNotEqual => mirror(rhs, " != ", " == "),
@@ -683,13 +683,13 @@ fn negated_float_compare(func: &SsaFunction, cmp: OpCode, a: VarId, b: VarId, rh
             match (ordered, constant_left) {
                 (true, false) => mirror(rhs, op, ord),
                 (true, true) => swapped.as_deref().and_then(|s| mirror(s, op, ord_rev)),
-                (false, true) => swapped.as_deref().and_then(|s| mirror(s, op, rev)).map(|t| format!("!({t})")),
+                (false, true) => swapped.as_deref().and_then(|s| mirror(s, op, rev)).map(|t| cat!("!(", t, ")")),
                 (false, false) => None,
             }
         }
         _ => None,
     };
-    text.unwrap_or_else(|| format!("!({rhs})"))
+    text.unwrap_or_else(|| cat!("!(", rhs, ")"))
 }
 
 /// A condition folded into one expression.
@@ -744,7 +744,7 @@ impl Inliner {
         let s = exprs.get(&value_key(func, v))?;
         // (WS90: a dereference or an integer cast is a unary expression too: `(int32_t)*(uint32_t*)rsp`,
         // `(uint32_t)*(uint8_t*)(rax + 4) ^ 0x47`)
-        Some(if is_atomic(s) || crate::emit::is_unary(s) { s.clone() } else { format!("({s})") })
+        Some(if is_atomic(s) || crate::emit::is_unary(s) { s.clone() } else { cat!("(", s, ")") })
     }
 
     fn parts(&self, func: &SsaFunction) -> (&Vec<Vec<OpIdx>>, &Readers) {
@@ -855,7 +855,7 @@ impl Inliner {
                         address: op.address,
                         dead: false,
                     };
-                    let prefix = format!("{} = ", name(out));
+                    let prefix = cat!(name(out), " = ");
                     let rhs_of = |x: VarId, y: VarId| {
                         let f = crate::ssa::SsaOp { inputs: smallvec::smallvec![x, y], ..fake.clone() };
                         emit(&f).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string))
@@ -888,7 +888,7 @@ impl Inliner {
                 ok = false;
                 break;
             };
-            let prefix = format!("{} = ", name(out));
+            let prefix = cat!(name(out), " = ");
             match line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')) {
                 // (a value read twice is printed twice: keep the expression readable)
                 Some(rhs) if max_len.is_none_or(|m| rhs.len() <= m) => {
@@ -941,7 +941,7 @@ impl Inliner {
         }
         // an op printed in another shape: keep the statements, as a statement expression
         let lines: Vec<String> = body.iter().filter_map(|&o| emit(&func.ops[o])).collect();
-        Folded::plain(format!("({{ {} {}; }})", lines.join(" "), name(cv)))
+        Folded::plain(cat!("({ ", lines.join(" "), " ", name(cv), "; })"))
     }
 }
 

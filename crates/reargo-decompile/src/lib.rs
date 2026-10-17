@@ -1,3 +1,19 @@
+/// `format!` of string pieces only (`{}` of `String` / `&str`), built at its final length:
+/// `cat!(dst, " = ", a, ";")`.
+macro_rules! cat {
+    ($($e:expr),+ $(,)?) => {
+        match [$(::core::convert::AsRef::<str>::as_ref(&$e)),+] {
+            parts => {
+                let mut s = String::with_capacity(parts.iter().map(|p| p.len()).sum::<usize>());
+                for p in parts {
+                    s.push_str(p);
+                }
+                s
+            }
+        }
+    };
+}
+
 pub mod action;
 pub mod callee_params;
 pub mod callers;
