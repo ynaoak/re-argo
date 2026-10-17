@@ -92,7 +92,7 @@ pub struct CEmitter<'a> {
     inliner: crate::condition::Inliner,
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
-    emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    emitted: std::cell::RefCell<rustc_hash::FxHashSet<u64>>,
     /// Blocks some `goto` jumps to: each gets a `label_<addr>:` line where its code starts
     /// (otherwise the `goto` names a label that is never printed).
     goto_targets: std::collections::BTreeSet<usize>,
@@ -171,7 +171,7 @@ impl CEmitter<'static> {
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
             inlined: Default::default(),
-            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
@@ -217,7 +217,7 @@ impl<'a> CEmitter<'a> {
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
             inlined: Default::default(),
-            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),

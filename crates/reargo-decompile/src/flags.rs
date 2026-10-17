@@ -212,7 +212,9 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
     use OpCode::*;
     let block_start = block_starts(func);
     let mut memo: FxHashMap<ValueKey, Option<Found>> = FxHashMap::default();
-    let readers = crate::condition::Readers::new(func);
+    // (the readers before any rewrite: built at the first op that combines flags, which comes
+    // before the first rewrite; most functions have none)
+    let mut readers: Option<crate::condition::Readers> = None;
     let mut saved = 0u64;
     let mut rewritten = 0;
     // the outermost combination first (it comes last): `ZF || SF != OF` becomes one `a <= b`
@@ -239,6 +241,7 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
         if !combines {
             continue;
         }
+        let readers = &*readers.get_or_insert_with(|| crate::condition::Readers::new(func));
         let Some((Rel::Cmp(cmp, a, b), anchors)) = relation(func, out, 0, &mut memo) else { continue };
         let holds = |func: &SsaFunction, v: VarId| operands_hold(func, &block_start, &anchors, i, &[v]);
         let (mut a, mut b) = (a, b);
@@ -258,7 +261,7 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
             // `dec dword [m]; jle`: the operand is overwritten by the result. Keep its value
             // under a new name, set where the flags were computed (WS82): the overflow flag's
             // op, which nothing else will read
-            match (save, saving_slot(func, &readers, &anchors, i, a, b)) {
+            match (save, saving_slot(func, readers, &anchors, i, a, b)) {
                 (None, Some(o)) => {
                     save = Some((o, v));
                 }
@@ -310,7 +313,6 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
 /// `a s< b` and the join reads their phi.
 fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
     use OpCode::*;
-    let readers = crate::condition::Readers::new(func);
     let def = |func: &SsaFunction, v: VarId| func.varnodes[v as usize].def_op.filter(|&d| !func.ops[d].dead);
     // does (`sf`, `of`) hold the sign and overflow flags of one `a - b` (through phis that join
     // them edge by edge)? Collects the overflow values (leaves and phis) on the way.
@@ -373,6 +375,8 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
     if xors.is_empty() {
         return 0;
     }
+    // (nothing changed the function above)
+    let readers = crate::condition::Readers::new(func);
     // the overflow values to turn into comparisons: each read only by phis of the set and by
     // those `SF != OF` (a value read otherwise — `jo`, a phi with another input — drops out,
     // and with it every xor and phi reaching it)
@@ -623,9 +627,11 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
             continue;
         }
         let Some(out) = op.output else { continue };
-        let Some(&o) = index.get(&value_key(func, out)) else { continue };
+        // (only the machine flags are indexed)
+        let indexed = |v: VarId| if machine(&func.varnodes[v as usize].data) { index.get(&value_key(func, v)) } else { None };
+        let Some(&o) = indexed(out) else { continue };
         for &i in &op.inputs {
-            match index.get(&value_key(func, i)) {
+            match indexed(i) {
                 Some(&x) => {
                     let (a, b) = (find(&mut parent, o), find(&mut parent, x));
                     parent[a] = b;
@@ -642,6 +648,7 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
     let mut def_of: Vec<Option<OpIdx>> = vec![None; keys.len()];
     for v in 0..func.varnodes.len() {
         if let Some(d) = func.varnodes[v].def_op
+            && machine(&func.varnodes[v].data)
             && let Some(&n) = index.get(&value_key(func, v as VarId))
         {
             def_of[n].get_or_insert(d);
