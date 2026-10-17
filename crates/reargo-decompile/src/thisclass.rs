@@ -1296,8 +1296,12 @@ pub struct ThisIndex {
     /// passes as that parameter (WS94)
     pub param_fields: FxHashMap<(u64, u8, i32), u32>,
     /// `(container class, begin offset)` -> the class of the pointers in the buffer (an array /
-    /// a vector) whose begin pointer is at that offset of the class (class + 2; WS95)
+    /// a vector) whose begin pointer is at that offset of the class (class + 2; WS95); WS96: also
+    /// the end and capacity fields of a vector
     pub elements: FxHashMap<(u32, i32), u32>,
+    /// (WS96) `(container class, offset)`: the begin fields of `{begin, end, capacity}` triples
+    /// (vectors) with an element class, sorted
+    pub vectors: Vec<(u32, i32)>,
     pub stats: IndexStats,
 }
 
@@ -1363,6 +1367,16 @@ impl ThisIndex {
         let off = i32::try_from(off).ok()?;
         let l = lookup(&self.hierarchy, &self.elements, c, off);
         (l >= 2).then(|| self.vt(l - 2)).flatten()
+    }
+
+    /// (WS96) The element class of the vector whose begin pointer is at offset `off` of objects
+    /// of the class whose primary vtable is `vt` (its own or a base's `{begin, end, capacity}`
+    /// triple with an element class).
+    pub fn vector_element(&self, vt: u64, off: i64) -> Option<u64> {
+        let c = self.class_of_vtable(vt)?;
+        let o = i32::try_from(off).ok()?;
+        let mut cs = std::iter::once(c).chain(self.hierarchy.bases[c as usize].iter().copied());
+        cs.any(|k| self.vectors.binary_search(&(k, o)).is_ok()).then(|| self.element_class(vt, off)).flatten()
     }
 
     /// The fields and member objects of known class of the class whose primary vtable is `vt`
@@ -1657,24 +1671,95 @@ impl Ctx<'_> {
         }
     }
 
-    /// The container class and begin offset of the buffer the pointer loaded by `loads[b]` of
-    /// `k` points into (WS95): `loads[b] = (bs, bf)`, the begin pointer at `bf` (>= 0) of the
-    /// object `bs` points to; or a vector's end pointer (`*end = x; end += 8`: begin 8 before).
-    fn buffer(&self, k: usize, b: u32, ld: &[u32]) -> Option<(u32, i32)> {
-        let s = &self.sums[k];
-        let &(bs, bf) = s.loads.get(b as usize)?;
-        if bf == ELEM {
+    /// The container field whose buffer the pointer `src` of `k` points into (WS95, WS96): a
+    /// pointer loaded from a field (`loads[b] = (bs, bf)`, `bf > 0`) of an object of a known
+    /// class: `(class, bf)`.
+    fn buffer(&self, k: usize, src: Src, ld: &[u32]) -> Option<(u32, i32)> {
+        let Src::Ld(b) = src else { return None };
+        let &(bs, bf) = self.sums[k].loads.get(b as usize)?;
+        if bf == ELEM || bf <= 0 {
             return None;
         }
-        let begin = if bf >= 0 {
-            bf
-        } else {
-            return None;
+        let c = match bs {
+            Src::Ld(l) if l as usize >= ld.len() => TOP,
+            _ => self.base(k, bs, ld),
         };
-        // (a vector's end pointer stored back one element on: the begin pointer is 8 before)
-        let off = if begin >= 8 && s.field_stores.contains(&(bs, begin, Src::Ld(b), 8)) { begin - 8 } else { begin };
-        let c = self.base(k, bs, ld);
-        (c >= 2).then_some((c - 2, off))
+        (c >= 2).then(|| (c - 2, bf))
+    }
+
+    /// (WS96) `src` of `k` is fresh memory (an allocator's result).
+    fn fresh(&self, k: usize, src: Src) -> bool {
+        let s = &self.sums[k];
+        match src {
+            Src::Ret(c) => s.fresh.binary_search(&c).is_ok(),
+            Src::Obj(i) => matches!(s.objs.get(i as usize), Some(crate::effects::ObjRef::Fresh(_))),
+            _ => false,
+        }
+    }
+
+    /// (WS96) What function `k` contributes to the element classes: `(container field, value,
+    /// re-pointed)` — the values stored into a container field's buffer (unknown for a clobber /
+    /// write / escape of it, the elements of another buffer copied into it), and what a field is
+    /// re-pointed to (another container field's buffer: its elements; fresh memory: nothing, its
+    /// facts were moved to the field's buffer; anything else: unknown, `re-pointed`) — and the
+    /// `{begin, end, capacity}` triples by their begin field.
+    fn element_facts(&self, k: usize, ld: &[u32], elements: &FxHashMap<(u32, i32), u32>) -> ElementFacts {
+        let s = &self.sums[k];
+        let mut es: Vec<((u32, i32), u32, u8)> = Vec::new();
+        let elem = |key: (u32, i32)| lookup(self.h, elements, key.0, key.1);
+        // the contents
+        for &(b, _, vs, vo) in &s.field_stores {
+            if let Some(key) = self.buffer(k, b, ld) {
+                es.push((key, self.value(k, vs, vo, ld), if matches!(vs, Src::Arg(_)) { EF_ARG } else { EF_VALUE }));
+            }
+        }
+        let unknown = s.field_clobbers.iter().map(|c| c.0).chain(s.vt_stores.iter().map(|v| v.0)).chain(s.buf_writes.iter().copied()).chain(s.buf_escapes.iter().map(|e| e.0));
+        for b in unknown {
+            if let Some(key) = self.buffer(k, b, ld) {
+                es.push((key, TOP, EF_UNKNOWN));
+            }
+        }
+        for &(x, y) in &s.buf_copies {
+            if let Some(key) = self.buffer(k, x, ld)
+                && !self.fresh(k, y)
+            {
+                es.push((key, self.buffer(k, y, ld).map_or(TOP, elem), EF_COPY));
+            }
+        }
+        // the fields re-pointed (`&obj->field` given to unknown code: anything)
+        let field = |d: Src, o: i32| -> Option<(u32, i32)> {
+            if d == Src::Stack || o <= 0 || o == ELEM {
+                return None;
+            }
+            let c = self.base(k, d, ld);
+            (c >= 2).then(|| (c - 2, o))
+        };
+        for &(d, o) in &s.buf_escapes {
+            if let Some(key) = field(d, o) {
+                es.push((key, TOP, EF_ESCAPE));
+            }
+        }
+        for &(d, o, vs, _) in &s.field_stores {
+            if let Some(key) = field(d, o)
+                && !self.fresh(k, vs)
+            {
+                match self.buffer(k, vs, ld) {
+                    Some(from) => es.push((key, elem(from), EF_COPY)),
+                    None => es.push((key, TOP, EF_REPOINT)),
+                }
+            }
+        }
+        for &(d, o, n) in &s.field_clobbers {
+            let mut a = o & !7;
+            while o != ELEM && a < o.saturating_add(n) && a - (o & !7) < 0x80 {
+                if let Some(key) = field(d, a) {
+                    es.push((key, TOP, EF_REPOINT_CLOBBER));
+                }
+                a += 8;
+            }
+        }
+        let tr = s.triples.iter().filter_map(|&(d, o)| field(d, o)).collect();
+        (es, tr)
     }
 
     /// The classes of the values function `k` loads (a field's class by its container's).
@@ -1686,15 +1771,12 @@ impl Ctx<'_> {
             if off == ELEM {
                 // WS95: an element of the buffer whose begin pointer is `src` (`Ld(b)`, the
                 // pointer at `bs + bf` of a container of a known class)
-                ld[l] = match src {
-                    Src::Ld(b) => match self.buffer(k, b, &ld) {
-                        Some((c, bf)) => match lookup(self.h, self.elements, c, bf) {
-                            BOT => TOP,
-                            v => v,
-                        },
-                        None => TOP,
+                ld[l] = match self.buffer(k, src, &ld[..l]) {
+                    Some((c, bf)) => match lookup(self.h, self.elements, c, bf) {
+                        BOT => TOP,
+                        v => v,
                     },
-                    _ => TOP,
+                    None => TOP,
                 };
                 continue;
             }
@@ -1813,7 +1895,94 @@ const MAX_DEMAND: usize = 64;
 
 /// What one function contributes in a round: `(callee, parameter, class)`, its return class,
 /// field classes and member classes by `(container class, offset)`.
-type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>, Vec<(u32, i32, i32)>, Vec<((u32, i32), u32)>);
+type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>, Vec<(u32, i32, i32)>, ElementFacts);
+/// `(container class, offset)` -> a lattice value.
+type FieldMap = FxHashMap<(u32, i32), u32>;
+/// WS96: what a function contributes to the element classes (see `Ctx::element_facts`).
+type ElementFacts = (Vec<((u32, i32), u32, u8)>, Vec<(u32, i32)>);
+/// What an element fact is (`ElementFacts`): a value stored into the buffer (a parameter's, or
+/// another), something unknown written there, a copy, `&obj->field` given to unknown code, the
+/// field re-pointed by a store / a clobber (the last two: ignored for an end / capacity field).
+const EF_ARG: u8 = 0;
+const EF_VALUE: u8 = 1;
+const EF_UNKNOWN: u8 = 2;
+const EF_COPY: u8 = 3;
+const EF_ESCAPE: u8 = 4;
+const EF_REPOINT: u8 = 5;
+const EF_REPOINT_CLOBBER: u8 = 6;
+
+/// (WS96) The element classes of a round from the functions' facts: the three fields of a
+/// `{begin, end, capacity}` triple are one buffer (an unknown pointer stored into its end or
+/// capacity field is ignored: they point into the begin's buffer, the container's invariant;
+/// one stored into its begin field is not); per buffer the join of what is stored into it.
+/// Every field of a buffer gets its class; also the triples' begin fields, sorted.
+fn element_classes(h: &Hierarchy, facts: Vec<((u32, i32), u32, u8)>, mut triples: Vec<(u32, i32)>) -> (FieldMap, Vec<(u32, i32)>) {
+    triples.sort_unstable();
+    triples.dedup();
+    let mut parent: FxHashMap<(u32, i32), (u32, i32)> = FxHashMap::default();
+    fn find(parent: &FxHashMap<(u32, i32), (u32, i32)>, mut x: (u32, i32)) -> (u32, i32) {
+        while let Some(&p) = parent.get(&x) {
+            if p == x {
+                break;
+            }
+            x = p;
+        }
+        x
+    }
+    let mut inner: FxHashSet<(u32, i32)> = FxHashSet::default();
+    for &(c, o) in &triples {
+        for d in [8, 16] {
+            let (a, b) = (find(&parent, (c, o)), find(&parent, (c, o + d)));
+            if a != b {
+                parent.insert(a.max(b), a.min(b));
+            }
+            inner.insert((c, o + d));
+        }
+    }
+    let mut out: FxHashMap<(u32, i32), u32> = FxHashMap::default();
+    let stats = std::env::var_os("REARGO_ELEM_STATS").is_some();
+    let mut why: FxHashMap<(u32, i32), u8> = FxHashMap::default();
+    for (key, v, kind) in facts {
+        if kind >= EF_REPOINT && inner.contains(&key) {
+            continue;
+        }
+        let root = find(&parent, key);
+        if stats && v == TOP {
+            *why.entry(root).or_default() |= 1 << kind;
+        }
+        let e = out.entry(root).or_insert(BOT);
+        *e = join(h, *e, v);
+    }
+    // (only the buffers of triples: a pointer field that is no container's — an object's, whose
+    // fields its own methods write — has no elements)
+    let mut res: FxHashMap<(u32, i32), u32> = FxHashMap::default();
+    for &m in parent.keys().chain(triples.iter()) {
+        if let Some(&v) = out.get(&find(&parent, m)) {
+            res.insert(m, v);
+        }
+    }
+    if std::env::var_os("REARGO_ELEM_STATS").is_some() {
+        let roots: FxHashSet<(u32, i32)> = triples.iter().map(|&t| find(&parent, t)).collect();
+        let (mut known, mut unknown, mut nothing) = (0, 0, 0);
+        for r in &roots {
+            match out.get(r).copied().unwrap_or(BOT) {
+                BOT => nothing += 1,
+                TOP => unknown += 1,
+                _ => known += 1,
+            }
+        }
+        let mut by = [0usize; 7];
+        for r in &roots {
+            for (b, n) in by.iter_mut().enumerate() {
+                if why.get(r).is_some_and(|w| w & (1 << b) != 0) {
+                    *n += 1;
+                }
+            }
+        }
+        eprintln!("[elem-stats] buffers {} (class {known}, unknown {unknown}, nothing {nothing}); unknown from: param value {}, other value {}, unknown write {}, copy {}, field escape {}, re-pointed {}, re-pointed by a clobber {}", roots.len(), by[0], by[1], by[2], by[3], by[4], by[5], by[6]);
+    }
+    (res, triples)
+}
 
 /// The propagation over the summaries of the functions `starts` (address order); `external`
 /// functions (exported) may be called with anything.
@@ -2097,6 +2266,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     let mut fields: FxHashMap<(u32, i32), u32> = FxHashMap::default();
     let mut members: FxHashMap<(u32, i32), u32> = FxHashMap::default();
     let mut elements: FxHashMap<(u32, i32), u32> = FxHashMap::default();
+    let mut vectors: Vec<(u32, i32)> = Vec::new();
     let mut rounds = 0;
     let mut converged = false;
     while rounds < max_rounds {
@@ -2148,23 +2318,8 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         cl.push((b - 2, off, n));
                     }
                 }
-                // WS95: the elements of the buffers of containers of a known class
-                let mut es = Vec::new();
-                for &(src, _, vs, vo) in s.field_stores.iter().filter(|f| f.1 == ELEM) {
-                    if let Src::Ld(b) = src
-                        && let Some(key) = cx.buffer(k, b, &ld)
-                    {
-                        es.push((key, value(vs, vo, &ld)));
-                    }
-                }
-                let clobbers = s.field_numbers.iter().map(|f| (f.0, f.1)).chain(s.buf_writes.iter().map(|&w| (w, ELEM))).chain(s.buf_escapes.iter().copied());
-                for (src, _off) in clobbers.filter(|f| f.1 == ELEM) {
-                    if let Src::Ld(b) = src
-                        && let Some(key) = cx.buffer(k, b, &ld)
-                    {
-                        es.push((key, TOP));
-                    }
-                }
+                // WS95 / WS96: the elements of the buffers of containers of a known class
+                let es = cx.element_facts(k, &ld, &elements);
                 let mut ms = Vec::new();
                 for &(src, off, vt) in &s.vt_stores {
                     if off <= 0 || src == Src::Stack {
@@ -2186,12 +2341,11 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
         let mut nm: FxHashMap<(u32, i32), u32> = FxHashMap::default();
         let mut npf = pf_init.clone();
         let mut clobbered: FxHashMap<u32, Vec<(i32, i32)>> = FxHashMap::default();
-        let mut ne: FxHashMap<(u32, i32), u32> = FxHashMap::default();
-        for (k, (contrib, ret, fs, ms, pfs, cl, es)) in per.into_iter().enumerate() {
-            for (key, v) in es {
-                let e = ne.entry(key).or_insert(BOT);
-                *e = join(h, *e, v);
-            }
+        let mut element_facts: Vec<((u32, i32), u32, u8)> = Vec::new();
+        let mut triples: Vec<(u32, i32)> = Vec::new();
+        for (k, (contrib, ret, fs, ms, pfs, cl, (es, tr))) in per.into_iter().enumerate() {
+            element_facts.extend(es);
+            triples.extend(tr);
             for (c, off, n) in cl {
                 clobbered.entry(c).or_default().push((off, n));
             }
@@ -2230,7 +2384,9 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 *v = TOP;
             }
         }
+        let (ne, nv) = element_classes(h, element_facts, triples);
         let same = np == p && nr == r && nf == fields && nm == members && npf == pf && ne == elements;
+        vectors = nv;
         elements = ne;
         pf = npf;
         p = np;
@@ -2243,8 +2399,30 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
         }
     }
 
+    // (development: `REARGO_ELEM_EXPLAIN=0x<vtable>` prints what the functions contribute to the
+    // element classes of that class's fields)
+    if let Some(vt) = std::env::var_os("REARGO_ELEM_EXPLAIN").and_then(|v| u64::from_str_radix(v.to_string_lossy().trim().trim_start_matches("0x"), 16).ok())
+        && let Some(&c) = u.primary.get(&vt)
+    {
+        let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, elements: &elements, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
+        let lines: Vec<String> = (0..n)
+            .into_par_iter()
+            .flat_map_iter(|k| {
+                let ld = cx.loads(k);
+                let (es, tr) = cx.element_facts(k, &ld, &elements);
+                let mut out: Vec<String> = es.iter().filter(|e| e.0 .0 == c).map(|e| format!("[elem] 0x{:x} +0x{:x} {} {}", starts[k], e.0 .1, match e.1 { BOT => "nothing".to_string(), TOP => "unknown".to_string(), v => format!("vtable 0x{:x}", h.vtables[(v - 2) as usize]) }, ["param value", "value", "unknown write", "copy", "field escape", "re-pointed", "re-pointed by a clobber"][e.2 as usize])).collect();
+                out.extend(tr.iter().filter(|t| t.0 == c).map(|t| format!("[elem] 0x{:x} triple +0x{:x}", starts[k], t.1)));
+                out
+            })
+            .collect();
+        for l in lines {
+            eprintln!("{l}");
+        }
+    }
     // (development: `REARGO_THIS_EXPLAIN=0x…,0x…` prints why `this` of those functions is what it is)
     if let Some(list) = std::env::var_os("REARGO_THIS_EXPLAIN") {
+        // (`REARGO_THIS_EXPLAIN_PARAM=j`: what the callers pass as parameter `j` instead)
+        let explain_param: u8 = std::env::var("REARGO_THIS_EXPLAIN_PARAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, elements: &elements, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
         let show = |v: u32| match v {
             BOT => "nothing".to_string(),
@@ -2257,21 +2435,21 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 continue;
             };
             eprintln!(
-                "[explain] 0x{t:x}: this = {} (fixed {}, listed {}, taken {}, callers {}, a caller passes no pointer {})",
-                show(p[ti][0]),
-                fixed[ti][0],
+                "[explain] 0x{t:x}: param {explain_param} = {} (fixed {}, listed {}, taken {}, callers {}, a caller passes no pointer {})",
+                show(p[ti][explain_param as usize]),
+                fixed[ti][explain_param as usize],
                 u.listing.contains_key(&t),
                 u.taken.contains(&t) || taken[ti] || external.contains(&t),
                 has_callers[ti],
-                static_top[ti] & 1 != 0
+                static_top[ti] & (1 << explain_param) != 0
             );
             for (k, s) in sums.iter().enumerate() {
-                if s.top_args.iter().any(|&(x, m)| x == t && m & 1 != 0) {
+                if s.top_args.iter().any(|&(x, m)| x == t && m & (1 << explain_param) != 0) {
                     eprintln!("[explain]   0x{:x} passes no pointer", starts[k]);
                 }
                 let ld = cx.loads(k);
                 for &(c, j, src, off) in &s.args {
-                    if j == 0 && s.call_targets[c as usize] == t {
+                    if j == explain_param && s.call_targets[c as usize] == t {
                         let detail = match src {
                             Src::Ld(l) => format!("{:?}", s.loads[l as usize]),
                             Src::Stack => {
@@ -2306,6 +2484,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     idx.fields = fields.into_iter().filter(|e| e.1 >= 2).collect();
     idx.members = members.into_iter().filter(|e| e.1 >= 2).collect();
     idx.elements = elements.into_iter().filter(|e| e.1 >= 2).collect();
+    idx.vectors = vectors.into_iter().filter(|v| idx.elements.contains_key(v)).collect();
     idx.param_fields = pf_keys.iter().zip(&pf).filter(|e| *e.1 >= 2).map(|(&(f, j, k), &v)| ((starts[f as usize], j, k), v - 2)).collect();
     let seeded_this = (0..n).filter(|&k| seed[k][usize::from(sums[k].returns_first())] >= 2).count() as u64;
     idx.stats = IndexStats { functions: n as u64, classes: h.vtables.len() as u64, rounds: rounds as u64, converged, seeded_this, ..Default::default() };
@@ -2408,7 +2587,7 @@ pub fn build_with(mem: &Memory, functions: &[(u64, u64)], external: &[u64], impo
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 12;
+const INDEX_VERSION: u8 = 13;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -2466,6 +2645,11 @@ impl ThisIndex {
             b.push(*j);
             u32_(&mut b, *k as u32);
             u32_(&mut b, *v);
+        }
+        u32_(&mut b, self.vectors.len() as u32);
+        for &(c, off) in &self.vectors {
+            u32_(&mut b, c);
+            u32_(&mut b, off as u32);
         }
         b
     }
@@ -2532,6 +2716,9 @@ impl ThisIndex {
             let (f, j) = (r.u64()?, r.take(1)?[0]);
             let (k, v) = (r.u32()? as i32, r.u32()?);
             idx.param_fields.insert((f, j, k), v);
+        }
+        for _ in 0..r.u32()? {
+            idx.vectors.push((r.u32()?, r.u32()? as i32));
         }
         (r.1 == b.len()).then_some(idx)
     }
@@ -2899,6 +3086,71 @@ mod tests {
         assert!(!universe(&mem).taken.contains(&0x1100));
     }
 
+    /// WS96: element classes of a container's vector from what its methods store into its
+    /// buffer (through the begin or the end pointer: one buffer, a triple), the end pointer
+    /// re-pointed to something unknown changing nothing (the container's invariant), the begin
+    /// pointer so re-pointed making the elements unknown, an unknown write into the buffer too;
+    /// a field that is no triple's has none.
+    #[test]
+    fn element_classes_come_from_the_stores_into_a_vector_buffer() {
+        // 0 Holder (0x10) ; 1 Shape (0x20) ; 2 Circle : Shape (0x30)
+        let h = Hierarchy { vtables: vec![0x10, 0x20, 0x30], bases: vec![vec![], vec![], vec![1]] };
+        let primary: FxHashMap<u64, u32> = [(0x10, 0), (0x20, 1), (0x30, 2)].into_iter().collect();
+        let listing: FxHashMap<u64, Vec<u32>> = [0x1000, 0x1100, 0x1200, 0x1300].into_iter().map(|f| (f, vec![0])).collect();
+        let u = Universe { hierarchy: h, vt_points: [0x10, 0x20, 0x30].into_iter().collect(), primary, listing, taken: FxHashSet::default() };
+        // 0x1000: `this->v.push_back(new Circle)` (an out-of-line slow path's effects: an element
+        // store into the begin's buffer, a triple at +0x20, the begin re-pointed to fresh memory)
+        let s0 = Summary {
+            call_targets: vec![0x2000, 0x2100],
+            loads: vec![(Src::Arg(0), 0x20)],
+            vt_stores: vec![(Src::Ret(0), 0, 0x30)],
+            field_stores: vec![(Src::Ld(0), ELEM, Src::Ret(0), 0), (Src::Arg(0), 0x20, Src::Obj(0), 0)],
+            objs: vec![crate::effects::ObjRef::Fresh(0)],
+            triples: vec![(Src::Arg(0), 0x20)],
+            ..Default::default()
+        };
+        // 0x1100: the inline fast path `*end = new Shape; this->end = <unknown>`; a store into a
+        // pointer field +0x60 that is no vector's
+        let s1 = Summary {
+            call_targets: vec![0x2000],
+            loads: vec![(Src::Arg(0), 0x28), (Src::Arg(0), 0x60)],
+            vt_stores: vec![(Src::Ret(0), 0, 0x20)],
+            field_stores: vec![(Src::Ld(0), 0, Src::Ret(0), 0), (Src::Ld(1), 8, Src::Ret(0), 0)],
+            field_clobbers: vec![(Src::Arg(0), 0x28, 8)],
+            ..Default::default()
+        };
+        // 0x1200: a second vector at +0x40: Circles, but its begin re-pointed to an argument's
+        let s2 = Summary {
+            call_targets: vec![0x2000],
+            loads: vec![(Src::Arg(0), 0x40)],
+            vt_stores: vec![(Src::Ret(0), 0, 0x30)],
+            field_stores: vec![(Src::Ld(0), ELEM, Src::Ret(0), 0), (Src::Arg(0), 0x40, Src::Arg(1), 0)],
+            triples: vec![(Src::Arg(0), 0x40)],
+            ..Default::default()
+        };
+        // 0x1300: a third at +0x70, Circles, and a number written into it
+        let s3 = Summary {
+            call_targets: vec![0x2000],
+            loads: vec![(Src::Arg(0), 0x70)],
+            vt_stores: vec![(Src::Ret(0), 0, 0x30)],
+            field_stores: vec![(Src::Ld(0), ELEM, Src::Ret(0), 0)],
+            field_clobbers: vec![(Src::Ld(0), ELEM, 4)],
+            field_numbers: vec![(Src::Ld(0), ELEM, 4)],
+            triples: vec![(Src::Arg(0), 0x70)],
+            ..Default::default()
+        };
+        let starts = [0x1000, 0x1100, 0x1200, 0x1300, 0x2000, 0x2100];
+        let sums = [s0, s1, s2, s3, Summary::default(), Summary::default()];
+        let idx = solve(&u, &starts, &sums, &FxHashSet::default(), MAX_ROUNDS);
+        assert_eq!(idx.element_class(0x10, 0x20), Some(0x20), "Circle and Shape: Shape");
+        assert_eq!(idx.element_class(0x10, 0x28), Some(0x20), "the end field: the same buffer");
+        assert_eq!(idx.element_class(0x10, 0x30), Some(0x20), "the capacity field");
+        assert_eq!(idx.element_class(0x10, 0x40), None, "the begin re-pointed to an unknown buffer");
+        assert_eq!(idx.element_class(0x10, 0x70), None, "a number written into the buffer");
+        assert_eq!(idx.element_class(0x10, 0x60), None, "no vector");
+        assert_eq!(idx.vectors, [(0, 0x20)]);
+    }
+
     /// WS96: a vtable whose first slots hold 0 in the file (an abstract class's destructor,
     /// `__cxa_pure_virtual` bound by an absolute relocation to another module) is a vtable: its
     /// class is known, the slots after the holes are listed.
@@ -2945,7 +3197,9 @@ mod tests {
         idx.members.insert((1, 0x10), cls(0));
         idx.param_fields.insert((0x1000, 1, 0x18), 1);
         idx.elements.insert((0, 0x20), cls(0));
+        idx.vectors.push((0, 0x20));
         idx.stats.rounds = 3;
+        idx.stats.allocators = 2;
         let b = idx.to_bytes(42);
         assert_eq!(ThisIndex::from_bytes(&b, 42), Some(idx.clone()));
         assert_eq!(ThisIndex::from_bytes(&b, 43), None, "another binary");
