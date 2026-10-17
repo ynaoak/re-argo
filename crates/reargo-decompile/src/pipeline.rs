@@ -121,10 +121,10 @@ pub fn decompile_with_options(
         Some(o) => o.return_hint(entry),
         None => crate::callers::return_hint(lifter, memory, entry),
     });
-    let (terminated, omitted) = apply_call_convention(trimmed, lifter, &call_returns);
+    let (terminated, omitted, phantoms) = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, omitted, func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts, oracle.as_ref())
+    build_decompile_result(terminated, (omitted, &phantoms), func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts, oracle.as_ref())
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -483,14 +483,14 @@ fn decompile_function_inner(
         Some(o) => o.return_hint(func_entry),
         None => crate::callers::return_hint(lifter, &program.info.memory, func_entry),
     });
-    let (terminated, omitted) = apply_call_convention(terminated, lifter, &call_returns);
+    let (terminated, omitted, phantoms) = apply_call_convention(terminated, lifter, &call_returns);
     let vcalls = ThisVcalls::new(lifter, &program.info.memory, func_entry, &terminated, oracle);
     // WS82: the exception landing pads, printed after the body
     let handlers = crate::exception::handlers(&program.info.memory, &program.info.sections, symbols, func_entry);
 
     build_decompile_result(
         terminated,
-        omitted,
+        (omitted, &phantoms),
         &func_name,
         func_entry,
         symbols,
@@ -751,16 +751,20 @@ fn long_double_tail_returns(
 ///
 /// A clobber no path from the call reads (each of the register's views written again first,
 /// or never read) is left out: it would only be removed as dead code, after costing every
-/// pass on the way. The second result counts the ops left out.
+/// pass on the way. The second result counts the ops left out, the third the full registers
+/// left out after each call (for the SSA to number their versions as if they were there).
 fn apply_call_convention(
     mut instructions: Vec<LiftedInstruction>,
     lifter: &dyn PcodeLift,
     call_returns: &rustc_hash::FxHashMap<u64, crate::callee_params::ReturnKind>,
-) -> (Vec<LiftedInstruction>, usize) {
+) -> (Vec<LiftedInstruction>, usize, crate::ssa::PhantomDefs) {
     use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
     let Some(cc) = lifter.call_convention() else {
-        return (instructions, 0);
+        return (instructions, 0, crate::ssa::PhantomDefs::default());
     };
+    let mut phantoms = crate::ssa::PhantomDefs { regs: cc.args.iter().take(32).copied().collect(), ..Default::default() };
+    // (the bit in `phantoms.regs` of each clobber that is an argument)
+    let phantom_bit: Vec<u32> = cc.clobbers.iter().map(|(full, _)| phantoms.regs.iter().position(|a| a == full).map_or(0, |i| 1 << i)).collect();
     // WS77: a `ret` lifts to `RETURN(target)` — the popped return address, not the value. Give
     // it the convention's return registers (`rax`, then `xmm0`) as further inputs so the value
     // reaching the `ret` is live and the emitter can print it (`emit::return_value`);
@@ -784,6 +788,7 @@ fn apply_call_convention(
             continue;
         };
         let need = needed[k];
+        let mut phantom_mask = 0u32;
         let insn_addr = insn.address;
         // WS89: the lifter found the callee returning a `long double` (the code after the call
         // pops it): `INDIRECT(target)` of an x87 slot after the call; rax / xmm0 are clobbered
@@ -826,6 +831,11 @@ fn apply_call_convention(
                 let with_full = need.0 & (1u128 << j) != 0;
                 let views: &[u32] = if with_full && need.1 & (1u128 << j) != 0 { all_views } else { &[] };
                 omitted += usize::from(!with_full) + all_views.len() - views.len();
+                // (only an argument register has versions to number: nothing else reads one
+                // the code does not touch)
+                if !with_full {
+                    phantom_mask |= phantom_bit[j];
+                }
                 with_full.then_some(((full, views), true))
             }));
         for ((full, views), clobber) in defs {
@@ -849,11 +859,14 @@ fn apply_call_convention(
             }
         }
         insn.ops.extend(tail);
+        if phantom_mask != 0 {
+            phantoms.at.insert(insn_addr, phantom_mask);
+        }
         for (i, op) in insn.ops.iter_mut().enumerate() {
             op.seq.order = i as u32;
         }
     }
-    (instructions, omitted)
+    (instructions, omitted, phantoms)
 }
 
 /// For each instruction holding a call, which clobbers of `cc` to define after it (bit `j`:
@@ -1507,8 +1520,9 @@ pub fn analyze_taint(
 #[allow(clippy::too_many_arguments)]
 fn build_decompile_result(
     instructions: Vec<LiftedInstruction>,
-    // ops `apply_call_convention` left out (counted in the statistics as if made)
-    omitted_ops: usize,
+    // ops `apply_call_convention` left out (counted in the statistics as if made), and the
+    // registers whose versions they would have numbered
+    (omitted_ops, phantoms): (usize, &crate::ssa::PhantomDefs),
     func_name: &str,
     entry: u64,
     symbols: &std::collections::BTreeMap<u64, String>,
@@ -1536,7 +1550,7 @@ fn build_decompile_result(
     cfg.attach_switches(switches);
     let block_count = cfg.block_count();
 
-    let mut ssa = SsaFunction::from_cfg(func_name.to_string(), entry, cfg);
+    let mut ssa = SsaFunction::from_cfg_with_phantoms(func_name.to_string(), entry, cfg, phantoms);
     ssa.call_params = call_params;
     if let Some(v) = &vcalls {
         crate::vcall::resolve_this_vcalls(&mut ssa, v.memory, &v.vtables, &v.this_reg, v.oracle);
@@ -1561,7 +1575,7 @@ fn build_decompile_result(
     settle_unknown_returns(&mut ssa);
     let mut opt_stats = run_optimization_passes(&mut ssa);
     // (the clobbers left out would have been removed as dead code)
-    opt_stats.dead_ops_removed += omitted_ops;
+    opt_stats.dead_ops_removed += omitted_ops + ssa.phantom_phis;
     // WS82: flags read away from their `cmp` (`cmp; je; jl`) become the comparison
     // WS83: `cmovcc`'s branch-free mask becomes `dst = c ? src : dst` (after the flags: `c`
     // may be a flag combination they rewrote into a comparison)
@@ -3458,12 +3472,12 @@ mod tests {
         ];
         let mem = make_memory(&code, 0x1000);
         let lifted = lifter.lift_range(&mem, 0x1000, 100).unwrap();
-        let (terminated, omitted) = apply_call_convention(lifted, &lifter, &rustc_hash::FxHashMap::default());
+        let (terminated, omitted, phantoms) = apply_call_convention(lifted, &lifter, &rustc_hash::FxHashMap::default());
         let empty = std::collections::BTreeMap::new();
         let handlers = [(0x1013, "cleanup".to_string())];
         let r = build_decompile_result(
             terminated,
-            omitted,
+            (omitted, &phantoms),
             "f",
             0x1000,
             &empty,
