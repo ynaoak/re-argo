@@ -97,7 +97,7 @@ fn try_constant_fold_op(func: &mut SsaFunction, i: usize) -> bool {
         data: reargo_core::pcode::VarnodeData::new(CONST_SPACE, masked, out_size),
         version: 0,
         def_op: None,
-        uses: vec![i],
+        uses: smallvec::smallvec![i],
     });
     func.ops[i].opcode = OpCode::Copy;
     func.ops[i].inputs = smallvec::smallvec![const_id];
@@ -122,7 +122,7 @@ fn try_algebraic_simplify_op(func: &mut SsaFunction, i: usize) -> bool {
             data: reargo_core::pcode::VarnodeData::new(CONST_SPACE, 0, out_size),
             version: 0,
             def_op: None,
-            uses: vec![i],
+            uses: smallvec::smallvec![i],
         });
         func.ops[i].opcode = OpCode::Copy;
         func.ops[i].inputs = smallvec::smallvec![zero_id];
@@ -201,7 +201,7 @@ fn try_strength_reduce_op(func: &mut SsaFunction, i: usize) -> bool {
                         data: reargo_core::pcode::VarnodeData::new(CONST_SPACE, shift_amt, out_size),
                         version: 0,
                         def_op: None,
-                        uses: vec![i],
+                        uses: smallvec::smallvec![i],
                     });
                     let kept = func.ops[i].inputs[other];
                     func.ops[i].opcode = OpCode::IntLeft;
@@ -226,7 +226,7 @@ fn try_strength_reduce_op(func: &mut SsaFunction, i: usize) -> bool {
                 data: reargo_core::pcode::VarnodeData::new(CONST_SPACE, shift_amt, out_size),
                 version: 0,
                 def_op: None,
-                uses: vec![i],
+                uses: smallvec::smallvec![i],
             });
             let dividend = func.ops[i].inputs[0];
             func.ops[i].opcode = OpCode::IntRight;
@@ -446,7 +446,7 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
         // the readers rewritten no longer read the copy (WS83): dead code elimination can
         // drop it once nothing else does
         let ops = &func.ops;
-        func.varnodes[out_id as usize].uses.retain(|&u| ops[u].dead || ops[u].inputs.contains(&out_id));
+        func.varnodes[out_id as usize].uses.retain(|&mut u| ops[u].dead || ops[u].inputs.contains(&out_id));
     }
     propagated
 }
@@ -630,24 +630,29 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
         // A value a phi reads keeps its own name (the phi prints as nothing).
-        let feeds_phi = func.varnodes[out_id as usize]
-            .uses
-            .iter()
-            .any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
+        let feeds_phi =
+            |func: &SsaFunction| func.varnodes[out_id as usize].uses.iter().any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
         let name_still_holds =
             |k: ValueKey| latest.get(&(k.0, k.1, k.2)).copied().unwrap_or(0) == k.3;
-        if let Some(&existing) = seen.get(&key)
-            && !feeds_phi
-            && name_still_holds(existing)
-            && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
-        {
-            redirects.insert(out_key, existing);
-            func.ops[i].dead = true;
-            eliminated += 1;
-        } else {
-            seen.insert(key, out_key);
-            record(func, i, &mut latest);
-        }
+        // (one lookup: the earlier value, or the slot this one takes)
+        let slot = match seen.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => {
+                let existing = *o.get();
+                if !feeds_phi(func)
+                    && name_still_holds(existing)
+                    && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
+                {
+                    redirects.insert(out_key, existing);
+                    func.ops[i].dead = true;
+                    eliminated += 1;
+                    continue;
+                }
+                o.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(v) => v.insert(out_key),
+        };
+        *slot = out_key;
+        record(func, i, &mut latest);
     }
 
     // Apply all redirects in a single pass over the varnode arena.
@@ -727,7 +732,7 @@ pub fn strength_reduction(func: &mut SsaFunction) -> usize {
                             data: reargo_core::pcode::VarnodeData::new(const_space, shift_amt, out_size),
                             version: 0,
                             def_op: None,
-                            uses: vec![i],
+                            uses: smallvec::smallvec![i],
                         });
                         func.ops[i].opcode = OpCode::IntLeft;
                         func.ops[i].inputs = smallvec::smallvec![func.ops[i].inputs[other], shift_id];
@@ -750,7 +755,7 @@ pub fn strength_reduction(func: &mut SsaFunction) -> usize {
                         data: reargo_core::pcode::VarnodeData::new(const_space, shift_amt, out_size),
                         version: 0,
                         def_op: None,
-                        uses: vec![i],
+                        uses: smallvec::smallvec![i],
                     });
                     func.ops[i].opcode = OpCode::IntRight;
                     func.ops[i].inputs = smallvec::smallvec![func.ops[i].inputs[0], shift_id];
@@ -787,7 +792,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                 func.varnodes.push(crate::ssa::SsaVarnode {
                     id: zero_id,
                     data: reargo_core::pcode::VarnodeData::new(const_space, 0, out_size),
-                    version: 0, def_op: None, uses: vec![i],
+                    version: 0, def_op: None, uses: smallvec::smallvec![i],
                 });
                 func.ops[i].opcode = OpCode::Copy;
                 func.ops[i].inputs = smallvec::smallvec![zero_id];
@@ -821,7 +826,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                             func.varnodes.push(crate::ssa::SsaVarnode {
                                 id: zero_id,
                                 data: reargo_core::pcode::VarnodeData::new(const_space, 0, out_size),
-                                version: 0, def_op: None, uses: vec![i],
+                                version: 0, def_op: None, uses: smallvec::smallvec![i],
                             });
                             func.ops[i].opcode = OpCode::Copy;
                             func.ops[i].inputs = smallvec::smallvec![zero_id];
@@ -840,7 +845,7 @@ pub fn algebraic_simplification(func: &mut SsaFunction) -> usize {
                         func.varnodes.push(crate::ssa::SsaVarnode {
                             id: zero_id,
                             data: reargo_core::pcode::VarnodeData::new(const_space, 0, out_size),
-                            version: 0, def_op: None, uses: vec![i],
+                            version: 0, def_op: None, uses: smallvec::smallvec![i],
                         });
                         func.ops[i].opcode = OpCode::Copy;
                         func.ops[i].inputs = smallvec::smallvec![zero_id];

@@ -96,7 +96,7 @@ pub fn recover_selects(func: &mut SsaFunction) -> usize {
         func.ops[i].opcode = OpCode::Select;
         for v in old {
             if !func.ops[i].inputs.contains(&v) {
-                func.varnodes[v as usize].uses.retain(|&u| u != i);
+                func.varnodes[v as usize].uses.retain(|&mut u| u != i);
             }
         }
         for v in [c, src, dst] {

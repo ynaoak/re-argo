@@ -92,7 +92,7 @@ pub struct CEmitter<'a> {
     inliner: crate::condition::Inliner,
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
-    emitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    emitted: std::cell::RefCell<rustc_hash::FxHashSet<u64>>,
     /// Blocks some `goto` jumps to: each gets a `label_<addr>:` line where its code starts
     /// (otherwise the `goto` names a label that is never printed).
     goto_targets: std::collections::BTreeSet<usize>,
@@ -110,7 +110,9 @@ pub struct CEmitter<'a> {
     /// reads folds them there too). Their definitions are in `folded`.
     inlined: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, usize>>,
     /// The stack slots by name (WS87, `frame`).
-    frame: crate::frame::Frame,
+    frame: std::borrow::Cow<'a, crate::frame::Frame>,
+    /// The frame computed by the caller ([`Self::with_frame`]).
+    given_frame: Option<&'a crate::frame::Frame>,
     /// A temporary printed as the register it is copied to (WS88, `inline::coalesced`).
     coalesced: Coalesced,
     /// `lock cmpxchg` printed as one compare-and-swap, by its store (WS89, `cas::find`).
@@ -169,11 +171,12 @@ impl CEmitter<'static> {
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
             inlined: Default::default(),
-            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -214,11 +217,12 @@ impl<'a> CEmitter<'a> {
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
             inlined: Default::default(),
-            emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -253,6 +257,13 @@ impl<'a> CEmitter<'a> {
     }
 
     /// Print struct fields and virtual calls from `view` (WS91).
+    /// The function's stack frame (`Frame::new(func, &|_| true)` of the function emitted),
+    /// computed once by the caller.
+    pub(crate) fn with_frame(mut self, frame: &'a crate::frame::Frame) -> Self {
+        self.given_frame = Some(frame);
+        self
+    }
+
     pub fn with_structs(mut self, view: &'a crate::structs::StructView) -> Self {
         self.structs = Some(view);
         self
@@ -275,7 +286,10 @@ impl<'a> CEmitter<'a> {
         collect_goto_targets(structured, &mut self.goto_targets);
         self.noise = epilogue_noise(func);
         // WS87: the stack slots by name; the stack pointer updates only they read go
-        self.frame = crate::frame::Frame::new(func, &|_| true);
+        self.frame = match self.given_frame {
+            Some(f) => std::borrow::Cow::Borrowed(f),
+            None => std::borrow::Cow::Owned(crate::frame::Frame::new(func, &|_| true)),
+        };
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
         // WS89: `lock cmpxchg` as one statement at its store
@@ -337,8 +351,8 @@ impl<'a> CEmitter<'a> {
                 crate::cas::C_FORMS,
             );
         }
-        self.output = crate::flags::renumber_named_flags(&self.output, func);
-        self.output.clone()
+        crate::flags::renumber_named_flags(&mut self.output, func);
+        std::mem::take(&mut self.output)
     }
 
     fn emit_var_declarations(&mut self, func: &SsaFunction, params: &std::collections::BTreeSet<&str>) {

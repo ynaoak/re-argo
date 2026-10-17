@@ -16,8 +16,9 @@
 //!
 //! The search is a 0-1 BFS over the instructions where passing a call costs 1: an exit
 //! reachable with fewer calls is found first, and only the calls in front of it are looked
-//! into. Instructions are lifted as the search reaches them, and results are cached per
-//! function.
+//! into. Instructions are lifted as the search reaches them. A question is answered from
+//! scratch (its search memoises the functions it looks into, nothing is kept from an earlier
+//! question), so the answer depends on the target alone and a batch shares it.
 //!
 //! [`mark_noreturn_calls`] appends a [`NORETURN_MARK`] op to each such call instruction;
 //! [`crate::cfg::is_trap`] treats it like a trap (control does not fall through) and the
@@ -103,12 +104,13 @@ enum Verdict {
     Unsure,
 }
 
-/// "Does this function never return?" with a cache shared by every lookup.
+/// "Does this function never return?"; each question answered by a search from scratch.
 pub struct NoReturn<'a> {
     lifter: &'a dyn PcodeLift,
     memory: &'a Memory,
     symbols: Option<&'a BTreeMap<u64, String>>,
-    /// target -> verdict (and, for `Unsure`, the depth it was computed with)
+    /// target -> verdict (and, for `Unsure`, the depth it was computed with), for the search
+    /// of one question
     memo: Mutex<FxHashMap<u64, (Verdict, u32)>>,
     /// The control flow of each instruction lifted alone, shared by the searches of a batch
     /// (x86; [`FlowCache`]).
@@ -118,27 +120,132 @@ pub struct NoReturn<'a> {
 /// What [`search`] reads of an instruction: its extent and control flow. Shared by every
 /// search of a batch: the same for an instruction lifted alone as lifted in a range (the PF
 /// and the x87 stack a range lift adds change no control flow).
+///
+/// It also keeps the answers of [`NoReturn::is_noreturn`]: each is a pure function of the
+/// target (a search from scratch, see there), so the functions of a batch share them.
+/// `(memory, symbols, target)` -> the function at `target` never returns.
+type Verdicts = FxHashMap<(usize, usize, u64), bool>;
+
 #[derive(Default)]
 pub struct FlowCache {
-    shards: Vec<Mutex<FxHashMap<u64, Option<Flow>>>>,
+    shards: Vec<Mutex<FlowShard>>,
+    /// the answers of the questions asked, by memory, symbols and target
+    verdicts: Vec<Mutex<Verdicts>>,
 }
 
 impl FlowCache {
     pub fn new() -> Self {
-        Self { shards: (0..64).map(|_| Mutex::new(FxHashMap::default())).collect() }
+        Self {
+            shards: (0..64).map(|_| Mutex::new(FlowShard::default())).collect(),
+            verdicts: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
+        }
     }
 
-    /// The flow of the instruction at `addr` lifted alone (`None` when it cannot be lifted).
-    fn get(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64) -> Option<Flow> {
-        let shard = &self.shards[((addr ^ (addr >> 6)) % self.shards.len() as u64) as usize];
-        if let Some(f) = shard.lock().ok().and_then(|m| m.get(&addr).cloned()) {
-            return f;
+    fn verdict_shard(&self, target: u64) -> Option<&Mutex<Verdicts>> {
+        let n = self.verdicts.len() as u64;
+        (n > 0).then(|| &self.verdicts[((target ^ (target >> 5)) % n) as usize])
+    }
+
+    /// The flows of the instructions from `addr` on, each lifted alone, handed to `each` while
+    /// it returns `true` (up to the first that cannot be lifted). The instructions of one
+    /// 4 KB page share a shard, looked up under one lock.
+    fn run(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64, each: &mut dyn FnMut(&Flow) -> bool) {
+        let shard_of = |a: u64| ((a >> 12) % self.shards.len() as u64) as usize;
+        let mut at = addr;
+        loop {
+            let k = shard_of(at);
+            let Ok(mut m) = self.shards[k].lock() else { return };
+            while shard_of(at) == k {
+                let f = match m.get(at) {
+                    Some(f) => f,
+                    None => {
+                        let f = x86.lift_alone(memory, at).ok().map(|i| Flow::of(&i));
+                        m.insert(at, &f);
+                        f
+                    }
+                };
+                let Some(f) = f else { return };
+                if !each(&f) {
+                    return;
+                }
+                at = f.address + u64::from(f.length);
+            }
         }
-        let f = x86.lift_alone(memory, addr).ok().map(|i| Flow::of(&i));
-        if let Ok(mut m) = shard.lock() {
-            m.insert(addr, f.clone());
+    }
+}
+
+/// The flows of a [`FlowCache`] shard: packed in a `u64` (see [`FlowShard::pack`]), the
+/// others (more events, or two with a target) as they are.
+#[derive(Default)]
+struct FlowShard {
+    packed: FxHashMap<u64, u64>,
+    other: FxHashMap<u64, Option<Flow>>,
+}
+
+/// A packed flow: lifted (else the instruction could not be lifted), the length (bits 0..4),
+/// a trap (bit 4), the event count (bits 5..7), each event's kind (bits 7..9 and 10..12:
+/// exit, jump, conditional jump, call) and whether it has a target (bits 9, 12), and the one
+/// target, relative to the address (bits 32..64).
+const PACKED_LIFTED: u64 = 1 << 15;
+
+impl FlowShard {
+    fn get(&self, addr: u64) -> Option<Option<Flow>> {
+        if let Some(&v) = self.packed.get(&addr) {
+            return Some(Self::unpack(addr, v));
         }
-        f
+        self.other.get(&addr).cloned()
+    }
+
+    fn insert(&mut self, addr: u64, f: &Option<Flow>) {
+        match Self::pack(f) {
+            Some(v) => self.packed.insert(addr, v),
+            None => self.other.insert(addr, f.clone()).map(|_| 0),
+        };
+    }
+
+    fn pack(f: &Option<Flow>) -> Option<u64> {
+        let Some(f) = f else { return Some(0) };
+        if f.length > 15 || f.events.len() > 2 {
+            return None;
+        }
+        let mut v = PACKED_LIFTED | u64::from(f.length) | (u64::from(f.trap) << 4) | ((f.events.len() as u64) << 5);
+        let mut target = None;
+        for (i, ev) in f.events.iter().enumerate() {
+            let (kind, t) = match *ev {
+                Event::Exit => (0u64, None),
+                Event::Branch { uncond: true, target } => (1, target),
+                Event::Branch { uncond: false, target } => (2, target),
+                Event::Call(t) => (3, Some(t)),
+            };
+            v |= kind << (7 + 3 * i);
+            if let Some(t) = t {
+                if target.is_some() {
+                    return None;
+                }
+                target = Some(i32::try_from(t.wrapping_sub(f.address) as i64).ok()?);
+                v |= 1 << (9 + 3 * i);
+            }
+        }
+        Some(v | (u64::from(target.unwrap_or(0) as u32) << 32))
+    }
+
+    fn unpack(addr: u64, v: u64) -> Option<Flow> {
+        if v & PACKED_LIFTED == 0 {
+            return None;
+        }
+        let target = addr.wrapping_add((v >> 32) as u32 as i32 as i64 as u64);
+        let events = (0..((v >> 5) & 3) as usize)
+            .map(|i| {
+                let has = v & (1 << (9 + 3 * i)) != 0;
+                match (v >> (7 + 3 * i)) & 3 {
+                    0 => Event::Exit,
+                    1 => Event::Branch { uncond: true, target: has.then_some(target) },
+                    2 => Event::Branch { uncond: false, target: has.then_some(target) },
+                    _ => Event::Call(target),
+                }
+            })
+            .collect();
+        Some(Flow { address: addr, length: (v & 0xf) as u32, trap: v & (1 << 4) != 0, events })
     }
 }
 
@@ -194,8 +301,26 @@ impl<'a> NoReturn<'a> {
     }
 
     /// Does the function at `target` never return?
+    ///
+    /// Each answer is a search from scratch (no memo of an earlier question), so it depends on
+    /// `target` alone and an oracle with a flow cache shares it with the batch.
     pub fn is_noreturn(&self, target: u64) -> bool {
-        self.verdict(target, MAX_DEPTH, &mut Vec::new()) == Verdict::NoReturn
+        if self.named(target) {
+            return true;
+        }
+        let key = (std::ptr::from_ref(self.memory) as usize, self.symbols.map_or(0, |s| std::ptr::from_ref(s) as usize), target);
+        let shard = self.flow.and_then(|(_, cache)| cache.verdict_shard(target));
+        if let Some(&v) = shard.and_then(|m| m.lock().ok()).as_ref().and_then(|m| m.get(&key)) {
+            return v;
+        }
+        if let Ok(mut m) = self.memo.lock() {
+            m.clear();
+        }
+        let v = self.verdict(target, MAX_DEPTH, &mut Vec::new()) == Verdict::NoReturn;
+        if let Some(mut m) = shard.and_then(|m| m.lock().ok()) {
+            m.insert(key, v);
+        }
+        v
     }
 
     fn named(&self, target: u64) -> bool {
@@ -270,16 +395,16 @@ impl Code<'_> {
             // `lift_range(addr, CHUNK)`'s instructions, one at a time (it stops at the first
             // that cannot be lifted)
             Some((x86, cache)) => {
-                let mut at = addr;
-                for _ in 0..CHUNK {
-                    let Some(f) = cache.get(x86, self.memory, at) else { break };
+                let mut n = 0;
+                cache.run(x86, self.memory, addr, &mut |f| {
                     if self.index.contains_key(&f.address) {
-                        break; // runs into code lifted before
+                        return false; // runs into code lifted before
                     }
-                    at = f.address + u64::from(f.length);
                     self.index.insert(f.address, self.insns.len());
-                    self.insns.push(f);
-                }
+                    self.insns.push(f.clone());
+                    n += 1;
+                    n < CHUNK
+                });
             }
             None => {
                 for insn in self.lifter.lift_range(self.memory, addr, CHUNK).ok()? {
@@ -482,6 +607,40 @@ mod tests {
                 assert_eq!(Flow::of(insn), Flow::of(&alone), "{:#x}", insn.address);
             }
         }
+    }
+
+    /// A packed flow unpacks to the same flow; one that does not fit stays as it is.
+    #[test]
+    fn packed_flows() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x74, 0x02, // je +2
+            0xf3, 0xa4, // rep movsb (a branch inside its p-code)
+            0xe8, 0x10, 0x00, 0x00, 0x00, // call +0x10
+            0xe9, 0x00, 0x01, 0x00, 0x00, // jmp +0x100
+            0xff, 0xe0, // jmp rax
+            0xcc, // int3
+            0x48, 0x89, 0xc3, // mov rbx, rax
+            0xc3, // ret
+        ];
+        let m = mem(&[(0x1000, code)]);
+        let x86 = lifter.as_x86().unwrap();
+        let mut shard = FlowShard::default();
+        let mut at = 0x1000;
+        while at < 0x1000 + code.len() as u64 {
+            let f = x86.lift_alone(&m, at).ok().map(|i| Flow::of(&i));
+            shard.insert(at, &f);
+            assert_eq!(shard.get(at), Some(f.clone()), "{at:#x}");
+            if let Some(p) = FlowShard::pack(&f) {
+                assert_eq!(FlowShard::unpack(at, p), f);
+            }
+            at += u64::from(f.unwrap().length);
+        }
+        assert_eq!(FlowShard::unpack(0x5000, FlowShard::pack(&None).unwrap()), None);
+        let far = Flow { address: 0x9000, length: 5, trap: false, events: SmallVec::from_slice(&[Event::Call(0x1_0000_9000)]) };
+        assert_eq!(FlowShard::pack(&Some(far.clone())), None);
+        shard.insert(0x9000, &Some(far.clone()));
+        assert_eq!(shard.get(0x9000), Some(Some(far)));
     }
 
     #[test]

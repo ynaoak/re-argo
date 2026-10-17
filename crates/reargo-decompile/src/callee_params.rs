@@ -415,8 +415,8 @@ impl<'a> CalleeParams<'a> {
 
     fn summarize(&self, target: u64) -> Option<Summary> {
         if let (Some(x86), Some(facts)) = (self.lifter.as_x86(), &self.facts)
-            && let Some(addrs) = x86.plain_range(self.memory, target, MAX_INSNS, facts)
-            && let Some(s) = self.summarize_plain(x86, target, &addrs)
+            && let Some(walk) = x86.plain_walk(self.memory, target, MAX_INSNS, facts, true)
+            && let Some(s) = self.summarize_plain(x86, target, &walk)
         {
             return Some(s);
         }
@@ -432,30 +432,31 @@ impl<'a> CalleeParams<'a> {
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
     }
 
-    /// [`Self::summarize`] of a range that is the lifts of `addrs` alone
-    /// ([`reargo_lift::x86::X86Lifter::plain_range`]): only the instructions the trim keeps
-    /// are lifted.
-    fn summarize_plain(&self, x86: &reargo_lift::x86::X86Lifter, target: u64, addrs: &[u64]) -> Option<Summary> {
-        if addrs.first() != Some(&target) {
+    /// [`Self::summarize`] of a range that is the lifts of the walk's instructions alone
+    /// ([`reargo_lift::x86::X86Lifter::plain_walk`]; with the integer PF when the walk needs
+    /// it): only the instructions the trim keeps are lifted.
+    fn summarize_plain(&self, x86: &reargo_lift::x86::X86Lifter, target: u64, walk: &reargo_lift::x86::PlainWalk<'_>) -> Option<Summary> {
+        if walk.first() != Some(target) {
             return None;
         }
-        let idx_of = |a: u64| addrs.binary_search(&a).ok();
-        let mut seen = vec![false; addrs.len()];
+        // (the stack holds addresses: those of a walk increase with their index)
+        let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
+        let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
         let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
-        let mut stack = vec![0usize];
-        while let Some(idx) = stack.pop() {
-            if seen[idx] {
+        let mut stack = vec![target as usize];
+        while let Some(a) = stack.pop() {
+            if !seen.insert(a) {
                 continue;
             }
-            seen[idx] = true;
-            let insn = x86.lift_alone(self.memory, addrs[idx]).ok()?;
+            // (the range lift with the integer PF: each instruction lifted alone with it)
+            let insn = if walk.needs_pf { self.lifter.lift_instruction(self.memory, a as u64) } else { x86.lift_alone(self.memory, a as u64) }.ok()?;
             crate::pipeline::reach_successors(&insn, idx_of, &mut stack);
-            lifted.push((idx, insn));
+            lifted.push((a, insn));
         }
-        lifted.sort_unstable_by_key(|(idx, _)| *idx);
+        lifted.sort_unstable_by_key(|(a, _)| *a);
         let insns: Vec<LiftedInstruction> = lifted.into_iter().map(|(_, i)| i).collect();
-        let hit_limit = addrs.len() >= MAX_INSNS;
-        let truncated = hit_limit && insns.last().map(|i| i.address) == addrs.last().copied();
+        let hit_limit = walk.len() >= MAX_INSNS;
+        let truncated = hit_limit && insns.last().map(|i| i.address) == walk.last();
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
     }
 
@@ -469,11 +470,15 @@ impl<'a> CalleeParams<'a> {
         let mut inn: Vec<Option<u32>> = vec![None; n];
         inn[cfg.entry_block] = Some(0);
         let mut acc = Acc { reads: 0, complete: !truncated, calls: Vec::new() };
+        // each block's transfer (`run_block` without `acc`): after a call every argument is
+        // defined, else what it writes is added to what was defined on entry
+        let all = (1u32 << self.args.len()) - 1;
+        let transfer: Vec<Option<u32>> = (0..n).map(|b| self.block_writes(&cfg, b)).collect();
         loop {
             let mut changed = false;
             for &b in &rpo {
                 let Some(state) = inn[b] else { continue };
-                let out = self.run_block(&cfg, b, state, None);
+                let out = transfer[b].map_or(all, |w| state | w);
                 for &s in &cfg.blocks[b].successors {
                     let new = match inn[s] {
                         None => out,
@@ -513,6 +518,23 @@ impl<'a> CalleeParams<'a> {
             reads |= self.inner_call_reads(c.target, c.window, depth_left) & !c.defined;
         }
         Some(ParamInfo { mask: reads, complete: s.complete })
+    }
+
+    /// The argument registers block `b` writes (`None` when it calls: every argument is then
+    /// defined at its end): [`Self::run_block`]'s result is `defined | writes`.
+    fn block_writes(&self, cfg: &ControlFlowGraph, b: usize) -> Option<u32> {
+        let mut w = 0u32;
+        for op in cfg.blocks[b].instructions.iter().flat_map(|i| i.ops.iter()) {
+            match op.opcode {
+                OpCode::Call | OpCode::CallInd => return None,
+                OpCode::Branch | OpCode::BranchInd => continue,
+                _ => {}
+            }
+            if let Some(out) = &op.output {
+                w |= self.covering(out.space, out.offset, out.offset + out.size as u64);
+            }
+        }
+        Some(w)
     }
 
     /// Transfer function of one block; with `acc`, records the reads and the inner calls.

@@ -58,7 +58,9 @@ pub struct RustEmitter<'a> {
     /// `emit::select_conditions`).
     select_conds: rustc_hash::FxHashMap<usize, String>,
     /// The stack slots by name (WS88, `frame`, as in C).
-    frame: crate::frame::Frame,
+    frame: std::borrow::Cow<'a, crate::frame::Frame>,
+    /// The frame computed by the caller ([`Self::with_frame`]).
+    given_frame: Option<&'a crate::frame::Frame>,
     /// Temporaries printed as the register they are copied to (WS88, as in C).
     coalesced: crate::emit::Coalesced,
     /// `lock cmpxchg` as one compare-and-swap, by its store (WS89, as in C)
@@ -96,6 +98,7 @@ impl RustEmitter<'static> {
             inlined: Default::default(),
             select_conds: Default::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -128,6 +131,7 @@ impl<'a> RustEmitter<'a> {
             inlined: Default::default(),
             select_conds: Default::default(),
             frame: Default::default(),
+            given_frame: None,
             coalesced: Default::default(),
             cas: Default::default(),
             cas_hidden: Default::default(),
@@ -158,6 +162,13 @@ impl<'a> RustEmitter<'a> {
     }
 
     /// Print struct fields and virtual calls from `view` (WS91, as in C).
+    /// The function's stack frame (`Frame::new(func, &|_| true)` of the function emitted),
+    /// computed once by the caller.
+    pub(crate) fn with_frame(mut self, frame: &'a crate::frame::Frame) -> Self {
+        self.given_frame = Some(frame);
+        self
+    }
+
     pub fn with_structs(mut self, view: &'a crate::structs::StructView) -> Self {
         self.structs = Some(view);
         self
@@ -221,7 +232,10 @@ impl<'a> RustEmitter<'a> {
         self.output.clear();
         self.noise = crate::emit::epilogue_noise(func);
         // WS88: the stack slots by name; the stack pointer updates only they read go (as in C)
-        self.frame = crate::frame::Frame::new(func, &|_| true);
+        self.frame = match self.given_frame {
+            Some(f) => std::borrow::Cow::Borrowed(f),
+            None => std::borrow::Cow::Owned(crate::frame::Frame::new(func, &|_| true)),
+        };
         let frame_noise = self.frame.hidden(func, &self.noise);
         self.noise.extend(frame_noise);
         // WS89: `lock cmpxchg` as one statement at its store (as in C)
@@ -274,8 +288,8 @@ impl<'a> RustEmitter<'a> {
         if !self.cas.is_empty() {
             self.output = crate::cas::fold_into_conditions(&self.output, &|n| format!("let mut {n}: u8;"), crate::cas::RUST_FORMS);
         }
-        self.output = crate::flags::renumber_named_flags(&self.output, func);
-        self.output.clone()
+        crate::flags::renumber_named_flags(&mut self.output, func);
+        std::mem::take(&mut self.output)
     }
 
     fn emit_var_declarations(&mut self, func: &SsaFunction) {
