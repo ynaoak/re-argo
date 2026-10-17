@@ -125,7 +125,7 @@ pub struct NoReturn<'a> {
 /// target (a search from scratch, see there), so the functions of a batch share them.
 #[derive(Default)]
 pub struct FlowCache {
-    shards: Vec<Mutex<FxHashMap<u64, Option<Flow>>>>,
+    shards: Vec<Mutex<FlowShard>>,
     /// `(memory, symbols, target)` -> never returns
     verdicts: Vec<Mutex<FxHashMap<(usize, usize, u64), bool>>>,
 }
@@ -133,7 +133,7 @@ pub struct FlowCache {
 impl FlowCache {
     pub fn new() -> Self {
         Self {
-            shards: (0..64).map(|_| Mutex::new(FxHashMap::default())).collect(),
+            shards: (0..64).map(|_| Mutex::new(FlowShard::default())).collect(),
             verdicts: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
         }
     }
@@ -153,20 +153,96 @@ impl FlowCache {
             let k = shard_of(at);
             let Ok(mut m) = self.shards[k].lock() else { return };
             while shard_of(at) == k {
-                let f = match m.get(&at) {
+                let f = match m.get(at) {
                     Some(f) => f,
                     None => {
                         let f = x86.lift_alone(memory, at).ok().map(|i| Flow::of(&i));
-                        m.entry(at).or_insert(f)
+                        m.insert(at, &f);
+                        f
                     }
                 };
                 let Some(f) = f else { return };
-                if !each(f) {
+                if !each(&f) {
                     return;
                 }
                 at = f.address + u64::from(f.length);
             }
         }
+    }
+}
+
+/// The flows of a [`FlowCache`] shard: packed in a `u64` (see [`FlowShard::pack`]), the
+/// others (more events, or two with a target) as they are.
+#[derive(Default)]
+struct FlowShard {
+    packed: FxHashMap<u64, u64>,
+    other: FxHashMap<u64, Option<Flow>>,
+}
+
+/// A packed flow: lifted (else the instruction could not be lifted), the length (bits 0..4),
+/// a trap (bit 4), the event count (bits 5..7), each event's kind (bits 7..9 and 10..12:
+/// exit, jump, conditional jump, call) and whether it has a target (bits 9, 12), and the one
+/// target, relative to the address (bits 32..64).
+const PACKED_LIFTED: u64 = 1 << 15;
+
+impl FlowShard {
+    fn get(&self, addr: u64) -> Option<Option<Flow>> {
+        if let Some(&v) = self.packed.get(&addr) {
+            return Some(Self::unpack(addr, v));
+        }
+        self.other.get(&addr).cloned()
+    }
+
+    fn insert(&mut self, addr: u64, f: &Option<Flow>) {
+        match Self::pack(f) {
+            Some(v) => self.packed.insert(addr, v),
+            None => self.other.insert(addr, f.clone()).map(|_| 0),
+        };
+    }
+
+    fn pack(f: &Option<Flow>) -> Option<u64> {
+        let Some(f) = f else { return Some(0) };
+        if f.length > 15 || f.events.len() > 2 {
+            return None;
+        }
+        let mut v = PACKED_LIFTED | u64::from(f.length) | (u64::from(f.trap) << 4) | ((f.events.len() as u64) << 5);
+        let mut target = None;
+        for (i, ev) in f.events.iter().enumerate() {
+            let (kind, t) = match *ev {
+                Event::Exit => (0u64, None),
+                Event::Branch { uncond: true, target } => (1, target),
+                Event::Branch { uncond: false, target } => (2, target),
+                Event::Call(t) => (3, Some(t)),
+            };
+            v |= kind << (7 + 3 * i);
+            if let Some(t) = t {
+                if target.is_some() {
+                    return None;
+                }
+                target = Some(i32::try_from(t.wrapping_sub(f.address) as i64).ok()?);
+                v |= 1 << (9 + 3 * i);
+            }
+        }
+        Some(v | (u64::from(target.unwrap_or(0) as u32) << 32))
+    }
+
+    fn unpack(addr: u64, v: u64) -> Option<Flow> {
+        if v & PACKED_LIFTED == 0 {
+            return None;
+        }
+        let target = addr.wrapping_add((v >> 32) as u32 as i32 as i64 as u64);
+        let events = (0..((v >> 5) & 3) as usize)
+            .map(|i| {
+                let has = v & (1 << (9 + 3 * i)) != 0;
+                match (v >> (7 + 3 * i)) & 3 {
+                    0 => Event::Exit,
+                    1 => Event::Branch { uncond: true, target: has.then_some(target) },
+                    2 => Event::Branch { uncond: false, target: has.then_some(target) },
+                    _ => Event::Call(target),
+                }
+            })
+            .collect();
+        Some(Flow { address: addr, length: (v & 0xf) as u32, trap: v & (1 << 4) != 0, events })
     }
 }
 
@@ -528,6 +604,40 @@ mod tests {
                 assert_eq!(Flow::of(insn), Flow::of(&alone), "{:#x}", insn.address);
             }
         }
+    }
+
+    /// A packed flow unpacks to the same flow; one that does not fit stays as it is.
+    #[test]
+    fn packed_flows() {
+        let lifter = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x74, 0x02, // je +2
+            0xf3, 0xa4, // rep movsb (a branch inside its p-code)
+            0xe8, 0x10, 0x00, 0x00, 0x00, // call +0x10
+            0xe9, 0x00, 0x01, 0x00, 0x00, // jmp +0x100
+            0xff, 0xe0, // jmp rax
+            0xcc, // int3
+            0x48, 0x89, 0xc3, // mov rbx, rax
+            0xc3, // ret
+        ];
+        let m = mem(&[(0x1000, code)]);
+        let x86 = lifter.as_x86().unwrap();
+        let mut shard = FlowShard::default();
+        let mut at = 0x1000;
+        while at < 0x1000 + code.len() as u64 {
+            let f = x86.lift_alone(&m, at).ok().map(|i| Flow::of(&i));
+            shard.insert(at, &f);
+            assert_eq!(shard.get(at), Some(f.clone()), "{at:#x}");
+            if let Some(p) = FlowShard::pack(&f) {
+                assert_eq!(FlowShard::unpack(at, p), f);
+            }
+            at += u64::from(f.unwrap().length);
+        }
+        assert_eq!(FlowShard::unpack(0x5000, FlowShard::pack(&None).unwrap()), None);
+        let far = Flow { address: 0x9000, length: 5, trap: false, events: SmallVec::from_slice(&[Event::Call(0x1_0000_9000)]) };
+        assert_eq!(FlowShard::pack(&Some(far.clone())), None);
+        shard.insert(0x9000, &Some(far.clone()));
+        assert_eq!(shard.get(0x9000), Some(Some(far)));
     }
 
     #[test]
