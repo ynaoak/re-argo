@@ -1467,8 +1467,7 @@ impl<'a> CEmitter<'a> {
     fn inline_text(&self, func: &SsaFunction, d: usize) -> Option<String> {
         let op = &func.ops[d];
         let line = self.emit_op(func, op)?;
-        let prefix = cat!(varnode_name(&func.varnodes[op.output? as usize]), " = ");
-        line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string)
+        crate::condition::assignment_rhs(line, &varnode_name(&func.varnodes[op.output? as usize]))
     }
 
     fn input_expr(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, idx: usize) -> String {
