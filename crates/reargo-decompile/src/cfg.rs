@@ -236,6 +236,28 @@ pub struct ControlFlowGraph {
 }
 
 impl ControlFlowGraph {
+    /// A copy of the blocks' edges, jump tables and addresses without their instructions (the
+    /// short-circuit merging rewires edges only; the instructions stay those of `self`, by
+    /// block id).
+    pub fn clone_edges(&self) -> Self {
+        ControlFlowGraph {
+            blocks: self
+                .blocks
+                .iter()
+                .map(|b| BasicBlock {
+                    id: b.id,
+                    start_addr: b.start_addr,
+                    instructions: Vec::new(),
+                    successors: b.successors.clone(),
+                    predecessors: b.predecessors.clone(),
+                })
+                .collect(),
+            entry_block: self.entry_block,
+            addr_to_block: self.addr_to_block.clone(),
+            switches: self.switches.clone(),
+        }
+    }
+
     pub fn build(instructions: &[LiftedInstruction]) -> Self {
         // Borrow form: clone each instruction into its block. Kept
         // around for tests and other call sites that don't have

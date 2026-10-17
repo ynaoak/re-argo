@@ -347,6 +347,8 @@ fn collect_leaves(
 
 /// The CFG with short-circuit tests merged, and the condition of each merged block.
 pub struct ShortCircuits {
+    /// The function's CFG with the merged tests' edges ([`ControlFlowGraph::clone_edges`]: no
+    /// instructions, those are the function's by block id).
     pub cfg: ControlFlowGraph,
     pub conds: FxHashMap<BlockId, Cond>,
 }
@@ -381,7 +383,7 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
         return None;
     }
 
-    let mut cfg = src.clone();
+    let mut cfg = src.clone_edges();
     thread_empty_blocks(&mut cfg, &empty);
     let mut conds: FxHashMap<BlockId, Cond> = FxHashMap::default();
     let cond_of = |conds: &FxHashMap<BlockId, Cond>, b: BlockId| {

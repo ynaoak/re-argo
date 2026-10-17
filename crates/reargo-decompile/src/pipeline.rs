@@ -8,7 +8,7 @@ use crate::emit::CEmitter;
 use crate::rust_emit::RustEmitter;
 use crate::optimize::{run_optimization_passes, OptimizationStats};
 use crate::ssa::SsaFunction;
-use crate::structure::structure_cfg_with_handlers;
+use crate::structure::structure_cfg_with_handlers_in;
 
 pub struct DecompileResult {
     pub c_code: String,
@@ -1440,7 +1440,7 @@ fn build_decompile_result(
     let cfg = short.as_ref().map_or(&ssa.cfg, |s| &s.cfg);
     let handler_blocks: Vec<(usize, String)> =
         handlers.iter().filter_map(|(a, note)| Some((cfg.block_at(*a).filter(|b| b.start_addr == *a)?.id, note.clone()))).collect();
-    let structured = structure_cfg_with_handlers(cfg, &handler_blocks);
+    let structured = structure_cfg_with_handlers_in(cfg, &ssa.cfg, &handler_blocks);
     // Both emitters borrow the same two maps -- the previous API took
     // owned BTreeMaps and forced four clones per decompile call (two
     // maps * two emitters). The borrow-based `with_maps` API is
