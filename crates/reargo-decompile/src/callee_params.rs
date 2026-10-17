@@ -73,6 +73,10 @@ pub struct CalleeParams<'a> {
     /// argument by offset (for [`Self::covering`]).
     arg_space: Option<SpaceId>,
     arg_offsets: Vec<(u64, u32)>,
+    /// When every argument's offset is a multiple of 8: per 8-byte step `g` up to the last
+    /// argument, the index in `arg_offsets` of the first argument at or above `8 * g` (the
+    /// [`Self::covering`] search of an offset, looked up).
+    first_at: Vec<u8>,
     memo: Mutex<FxHashMap<(u64, u32), Option<ParamInfo>>>,
     /// The convention's return registers (`rax`, `xmm0`).
     pub(crate) returns: Vec<VarnodeData>,
@@ -153,9 +157,16 @@ impl<'a> CalleeParams<'a> {
         let arg_space = cc.args.first().map(|a| a.space).filter(|&sp| cc.args.iter().all(|a| a.space == sp));
         let mut arg_offsets: Vec<(u64, u32)> = cc.args.iter().enumerate().map(|(i, a)| (a.offset, 1u32 << i)).collect();
         arg_offsets.sort_unstable();
+        let first_at = match arg_offsets.last() {
+            Some(&(last, _)) if arg_offsets.iter().all(|&(o, _)| o % 8 == 0) && last < 1 << 16 && arg_offsets.len() < 256 => {
+                (0..=last / 8).map(|g| arg_offsets.partition_point(|&(off, _)| off < 8 * g) as u8).collect()
+            }
+            _ => Vec::new(),
+        };
         Some(Self {
             arg_space,
             arg_offsets,
+            first_at,
             lifter,
             memory,
             args: cc.args,
@@ -656,7 +667,13 @@ impl<'a> CalleeParams<'a> {
             if space != sp {
                 return 0;
             }
-            let from = self.arg_offsets.partition_point(|&(off, _)| off < lo);
+            // (the offsets are multiples of 8: the first at or above `lo` is the first at or
+            // above `lo` rounded up to one)
+            let from = if self.first_at.is_empty() {
+                self.arg_offsets.partition_point(|&(off, _)| off < lo)
+            } else {
+                self.first_at.get(lo.div_ceil(8) as usize).map_or(self.arg_offsets.len(), |&i| usize::from(i))
+            };
             for &(off, bit) in &self.arg_offsets[from..] {
                 if off >= hi {
                     break;
