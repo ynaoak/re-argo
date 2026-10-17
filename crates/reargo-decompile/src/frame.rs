@@ -185,8 +185,13 @@ impl Frame {
             let mut changed = false;
             for op in &func.ops {
                 let Some(out) = op.output else { continue };
+                // (only these ops carry an offset on: the others are passed over before their
+                // result is looked up)
+                if op.dead || !matches!(op.opcode, OpCode::Copy | OpCode::IntAdd | OpCode::IntSub | OpCode::MultiEqual) || func.varnodes[out as usize].data.size != 8 {
+                    continue;
+                }
                 let key = value_key(func, out);
-                if op.dead || func.varnodes[out as usize].data.size != 8 || self.offsets.contains_key(&key) {
+                if self.offsets.contains_key(&key) {
                     continue;
                 }
                 // (a phi's input is read at the end of its predecessor)
