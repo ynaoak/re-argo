@@ -74,42 +74,55 @@ fn overlaps(x: &VarnodeData, w: &VarnodeData) -> bool {
     x.space == w.space && x.offset < w.offset + w.size as u64 && w.offset < x.offset + x.size as u64
 }
 
-/// Evaluate the ops of `insns` symbolically; the value each storage holds at the end.
-fn evaluate(insns: &[LiftedInstruction]) -> FxHashMap<Key, E> {
-    let mut env: FxHashMap<Key, E> = FxHashMap::default();
-    let val = |env: &FxHashMap<Key, E>, v: &VarnodeData| -> E {
-        if v.space == SpaceId::CONST {
-            return E::Const(v.offset);
-        }
-        env.get(&key(v)).cloned().unwrap_or(E::Reg(*v))
-    };
-    for insn in insns {
-        for op in &insn.ops {
-            let Some(out) = op.output else { continue };
-            let i = |k: usize| op.inputs.get(k).map(|v| val(&env, v));
-            let e = match (op.opcode, i(0), i(1)) {
-                (OpCode::Copy, Some(a), _) => a,
-                (OpCode::IntAdd, Some(a), Some(b)) => E::Add(Box::new(a), Box::new(b)),
-                (OpCode::IntMult, Some(a), Some(E::Const(c))) | (OpCode::IntMult, Some(E::Const(c)), Some(a)) => {
-                    E::Mul(Box::new(a), c)
-                }
-                (OpCode::IntLeft, Some(a), Some(E::Const(c))) if c < 8 => E::Mul(Box::new(a), 1 << c),
-                (OpCode::Load, _, Some(addr)) => E::Load(Box::new(addr), out.size),
-                // a constant widened is a constant (`lea edx, [T]` then `add rax, rdx`, WS84)
-                (OpCode::IntZExt, Some(E::Const(c)), _) => E::Const(c),
-                (OpCode::IntSExt, Some(E::Const(c)), _) => {
-                    let bits = op.inputs[0].size.min(8) * 8;
-                    E::Const(if bits >= 64 { c } else { (((c << (64 - bits)) as i64) >> (64 - bits)) as u64 })
-                }
-                (OpCode::IntSExt | OpCode::IntZExt, Some(a), _) => E::Ext(Box::new(a)),
-                _ => E::Other,
-            };
-            // (the x86 lifter writes every view of a register it changes — `mov eax, r13d` also
-            // writes `rax = zext(eax)` and the narrower ones — so each view is tracked apart)
-            env.insert(key(&out), e);
+/// Evaluate the ops of `insns` symbolically: the value `v` holds at the end (each storage
+/// holds what the last op writing it computed from the values before it; `E::Reg` when no op
+/// writes it). Only the ops `v` depends on are evaluated.
+fn evaluate(insns: &[LiftedInstruction], v: &VarnodeData) -> E {
+    value_before(insns, (insns.len(), 0), v)
+}
+
+/// The value `v` holds before the op at `(instruction, op)` of `insns`.
+fn value_before(insns: &[LiftedInstruction], (at, at_op): (usize, usize), v: &VarnodeData) -> E {
+    if v.space == SpaceId::CONST {
+        return E::Const(v.offset);
+    }
+    let k = key(v);
+    for i in (0..insns.len().min(at + 1)).rev() {
+        let ops = &insns[i].ops;
+        let upto = if i == at { at_op } else { ops.len() };
+        for j in (0..upto).rev() {
+            if let Some(out) = ops[j].output
+                && key(&out) == k
+            {
+                return op_value(insns, (i, j));
+            }
         }
     }
-    env
+    E::Reg(*v)
+}
+
+/// The value the op at `(instruction, op)` of `insns` computes.
+fn op_value(insns: &[LiftedInstruction], (i, j): (usize, usize)) -> E {
+    let op = &insns[i].ops[j];
+    let out = op.output.expect("an op writing a storage");
+    let val = |k: usize| op.inputs.get(k).map(|v| value_before(insns, (i, j), v));
+    match (op.opcode, val(0), val(1)) {
+        (OpCode::Copy, Some(a), _) => a,
+        (OpCode::IntAdd, Some(a), Some(b)) => E::Add(Box::new(a), Box::new(b)),
+        (OpCode::IntMult, Some(a), Some(E::Const(c))) | (OpCode::IntMult, Some(E::Const(c)), Some(a)) => E::Mul(Box::new(a), c),
+        (OpCode::IntLeft, Some(a), Some(E::Const(c))) if c < 8 => E::Mul(Box::new(a), 1 << c),
+        (OpCode::Load, _, Some(addr)) => E::Load(Box::new(addr), out.size),
+        // a constant widened is a constant (`lea edx, [T]` then `add rax, rdx`, WS84)
+        (OpCode::IntZExt, Some(E::Const(c)), _) => E::Const(c),
+        (OpCode::IntSExt, Some(E::Const(c)), _) => {
+            let bits = op.inputs[0].size.min(8) * 8;
+            E::Const(if bits >= 64 { c } else { (((c << (64 - bits)) as i64) >> (64 - bits)) as u64 })
+        }
+        (OpCode::IntSExt | OpCode::IntZExt, Some(a), _) => E::Ext(Box::new(a)),
+        // (the x86 lifter writes every view of a register it changes — `mov eax, r13d` also
+        // writes `rax = zext(eax)` and the narrower ones — so each view is tracked apart)
+        _ => E::Other,
+    }
 }
 
 /// `e` with each register the function sets once, to a constant, replaced by that constant (a
@@ -130,9 +143,9 @@ fn with_bases(e: &E, bases: &FxHashMap<u64, u64>) -> E {
 
 /// `e` with the registers of `loose` that are added to something (a table base: `r12 +
 /// rdi*4`, `rdi + r12`) replaced by their constant; an index (under a scale) keeps its name.
-fn with_loose_bases(e: &E, loose: &FxHashMap<u64, u64>) -> E {
+fn with_loose_bases(e: &E, loose: &dyn Fn(u64) -> Option<u64>) -> E {
     let base = |x: &E| match x {
-        E::Reg(r) if r.space == SpaceId::REGISTER && r.size == 8 => loose.get(&r.offset).map_or_else(|| x.clone(), |&c| E::Const(c)),
+        E::Reg(r) if r.space == SpaceId::REGISTER && r.size == 8 => loose(r.offset).map_or_else(|| x.clone(), E::Const),
         x => with_loose_bases(x, loose),
     };
     match e {
@@ -143,36 +156,33 @@ fn with_loose_bases(e: &E, loose: &FxHashMap<u64, u64>) -> E {
     }
 }
 
-/// Instructions looked back for [`nearest_constants`].
+/// Instructions looked back for [`nearest_constant`].
 const MAX_BACK: usize = 4096;
 
-/// For each general register: the constant the closest instruction before `start` (in address
-/// order, `pop`s skipped) that writes it puts there, when that write is a constant.
-fn nearest_constants(insns: &[LiftedInstruction], start: usize) -> FxHashMap<u64, u64> {
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut out = FxHashMap::default();
+/// The constant the closest instruction before `start` (in address order, `pop`s skipped)
+/// that writes the general register at `offset` puts there, when that write is a constant (the
+/// lifter writes the narrow views after the full register: the 8-byte write decides).
+fn nearest_constant(insns: &[LiftedInstruction], start: usize, offset: u64) -> Option<u64> {
+    if offset >= 0xC0 || offset & 7 != 0 {
+        return None;
+    }
     for insn in insns[start.saturating_sub(MAX_BACK)..start].iter().rev() {
-        if insn.mnemonic.starts_with("pop ") {
+        let writes = |op: &reargo_core::pcode::PcodeOp| op.output.is_some_and(|o| o.space == SpaceId::REGISTER && o.offset < 0xC0 && o.offset & !7 == offset);
+        // (only an instruction writing the register is asked whether it is a `pop`: its text
+        // is formatted when first read)
+        if !insn.ops.iter().any(writes) || insn.mnemonic.starts_with("pop ") {
             continue;
         }
-        for op in insn.ops.iter().rev() {
-            let Some(o) = op.output else { continue };
-            if o.space != SpaceId::REGISTER || o.offset >= 0xC0 {
-                continue;
-            }
-            let base = o.offset & !7;
-            if !seen.insert(base) {
-                continue;
-            }
-            // (the lifter writes the narrow views after the full register: take the 8-byte one)
+        for op in insn.ops.iter().rev().filter(|op| writes(op)) {
+            let o = op.output.expect("a write");
             if let (OpCode::Copy, Some(c), 8) = (op.opcode, op.inputs.first().filter(|v| v.space == SpaceId::CONST), o.size) {
-                out.insert(base, c.offset);
-            } else if o.size != 8 {
-                seen.remove(&base);
+                return Some(c.offset);
+            } else if o.size == 8 {
+                return None;
             }
         }
     }
-    out
+    None
 }
 
 /// The general registers the function writes in exactly one instruction, with a constant
@@ -459,15 +469,13 @@ fn recover_one(
         let is_loose = mode > 0;
         (start..=k).find_map(|st| {
         let target = evaluated[st - start].get_or_insert_with(|| {
-            let env = evaluate(&insns[st..=k]);
-            let target = env.get(&key(&target_vn)).cloned().unwrap_or(E::Reg(target_vn));
-            with_bases(&target, bases)
+            with_bases(&evaluate(&insns[st..=k], &target_vn), bases)
         });
         let target = match mode {
             0 => target.clone(),
-            1 => with_loose_bases(target, loose),
+            1 => with_loose_bases(target, &|o| loose.get(&o).copied()),
             // (the constants before this start: the window's own `lea` before it counts)
-            _ => with_loose_bases(target, &nearest_constants(insns, st)),
+            _ => with_loose_bases(target, &|o| nearest_constant(insns, st, o)),
         };
         let (table, relative, index) = dispatch(&target)?;
         // (a byte loaded from a struct field, `movzx eax, byte [rsi+8]`, is no slot table: the
