@@ -161,7 +161,6 @@ impl Analyzer for RttiAnalyzer {
         let hits: Vec<(u64, String)> = chunks
             .par_iter()
             .flat_map_iter(|&(first, last, start)| {
-                let program = &*program;
                 let all_set = &all_set;
                 (0..=(last - first) / ptr_size).filter_map(move |k| {
                     let addr = first + k * ptr_size;
@@ -216,7 +215,6 @@ impl Analyzer for RttiAnalyzer {
         let vtables: Vec<(u64, u64, String)> = chunks
             .par_iter()
             .flat_map_iter(|&(first, last, _)| {
-                let program = &*program;
                 let typeinfos = &typeinfos;
                 let code_set = &code_set;
                 (0..=(last - first) / ptr_size).filter_map(move |k| {
