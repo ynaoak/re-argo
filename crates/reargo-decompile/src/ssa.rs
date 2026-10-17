@@ -124,6 +124,8 @@ pub struct SsaFunction {
     /// The values read of definitions left out (by phis nothing reads), increasing: they have
     /// no defining op, but are no value on entry ([`Self::is_incoming`]).
     pub phantom_vars: Vec<VarId>,
+    /// [`Self::incoming_registers`], made when first asked.
+    incoming_cache: std::sync::OnceLock<Vec<VarId>>,
 }
 
 /// Definitions a pass left out of the P-code because nothing can read them
@@ -163,6 +165,7 @@ impl SsaFunction {
             phantom_writes: Vec::new(),
             phantom_regs: Vec::new(),
             phantom_vars: Vec::new(),
+            incoming_cache: std::sync::OnceLock::new(),
         };
         func.build_ssa(phantoms);
         func
@@ -698,6 +701,22 @@ impl SsaFunction {
     /// left out)?
     pub fn is_incoming(&self, v: &SsaVarnode) -> bool {
         v.def_op.is_none() && self.phantom_vars.binary_search(&v.id).is_err()
+    }
+
+    /// The registers' values on entry ([`Self::is_incoming`]) in arena order, listed when first
+    /// asked: by the passes that read the SSA once it no longer changes (the struct view, the
+    /// emitters).
+    pub fn incoming_registers(&self) -> impl Iterator<Item = &SsaVarnode> {
+        self.incoming_cache
+            .get_or_init(|| {
+                self.varnodes
+                    .iter()
+                    .filter(|v| v.data.space == reargo_core::address::SpaceId::REGISTER && self.is_incoming(v))
+                    .map(|v| v.id)
+                    .collect()
+            })
+            .iter()
+            .map(|&i| &self.varnodes[i as usize])
     }
 
 
