@@ -10,6 +10,7 @@ pub mod copyprop;
 pub mod comments_gen;
 pub mod dataflow;
 pub mod dominator;
+pub mod effects;
 pub mod emit;
 pub mod exception;
 pub mod flags;

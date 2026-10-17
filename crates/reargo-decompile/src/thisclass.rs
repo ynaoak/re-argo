@@ -76,6 +76,9 @@ pub enum Src {
     Ld(u32),
     /// the stack (the offset is from the stack pointer on entry)
     Stack,
+    /// (WS95) an object a callee's effects name (`Summary::objs[i]`: of a vtable's class, or of
+    /// a function's return class)
+    Obj(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -225,6 +228,9 @@ pub struct Summary {
     /// `field_stores` names (a stack address, a value not followed, a constant other than 0
     /// and a vtable, a narrower or wider store)
     pub field_clobbers: Vec<(Src, i32, i32)>,
+    /// `(source, offset, size)`: the clobbers that write no pointer at all (WS95: a store
+    /// narrower than 8 bytes, a number, arithmetic on memory) — they make a field's class unknown
+    pub field_numbers: Vec<(Src, i32, i32)>,
     /// `(call, argument, k, value)`: the 8 bytes at `+k` of a stack object passed to a call,
     /// at that call (WS94: the fields of the objects callers pass)
     pub stack_fields: Vec<(u32, u8, i32, FieldVal)>,
@@ -248,6 +254,8 @@ pub struct Summary {
     pub loads: Vec<(Src, i32)>,
     /// addresses taken in code (`lea r, [rip + x]`, `mov r, imm`)
     pub refs: Vec<u64>,
+    /// the objects `Src::Obj(i)` names (WS95: brought in by the callees' effects)
+    pub objs: Vec<crate::effects::ObjRef>,
 }
 
 impl Summary {
@@ -456,7 +464,13 @@ impl Interp<'_> {
                 // (WS95: a pointer into a buffer)
                 Val::Elem(vs) if size == 8 => self.out.field_stores.push((src, k, vs, ELEM)),
                 Val::Const(0) if size == 8 => {}
-                _ => self.out.field_clobbers.push((src, k, size.max(1) as i32)),
+                _ => {
+                    self.out.field_clobbers.push((src, k, size.max(1) as i32));
+                    // (WS95: no pointer at all: a narrower store, a number)
+                    if size < 8 || matches!(v, Val::Const(_)) {
+                        self.out.field_numbers.push((src, k, size.max(1) as i32));
+                    }
+                }
             },
             _ => {}
         }
@@ -805,8 +819,24 @@ impl Interp<'_> {
         if writes_memory {
             match addr {
                 Val::Ptr(Src::Stack, s) => st.store_slot(s, i.memory_size().size().max(8) as u32, Val::Unk),
-                Val::Ptr(src, k) if emit => self.out.field_clobbers.push((src, k, i.memory_size().size().max(1) as i32)),
-                Val::Elem(src) if emit => self.out.field_clobbers.push((src, ELEM, i.memory_size().size().max(1) as i32)),
+                Val::Ptr(_, _) | Val::Elem(_) if emit => {
+                    let (src, k) = match addr {
+                        Val::Ptr(src, k) => (src, k),
+                        Val::Elem(src) => (src, ELEM),
+                        _ => unreachable!(),
+                    };
+                    let n = i.memory_size().size().max(1);
+                    self.out.field_clobbers.push((src, k, n as i32));
+                    // (WS95: arithmetic on memory, a narrower write: no pointer; a wide copy,
+                    // `cmpxchg`, `movq` may be pointers)
+                    let arith = matches!(
+                        i.mnemonic(),
+                        Mnemonic::Add | Mnemonic::Sub | Mnemonic::Inc | Mnemonic::Dec | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Not | Mnemonic::Neg | Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Adc | Mnemonic::Sbb | Mnemonic::Xadd | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc | Mnemonic::Rol | Mnemonic::Ror
+                    );
+                    if n < 8 || (n == 8 && arith) {
+                        self.out.field_numbers.push((src, k, n as i32));
+                    }
+                }
                 // a string store through `rdi` into the frame (`rep stosq`): the slots are not known
                 _ if !has_mem && matches!(st.r[7], Val::Ptr(Src::Stack, _)) => st.slots.clear(),
                 _ => {}
@@ -1068,6 +1098,8 @@ pub struct IndexStats {
     pub seeded_this: u64,
     pub summarize_ms: u64,
     pub solve_ms: u64,
+    /// WS95: composing the effect summaries
+    pub compose_ms: u64,
 }
 
 impl ThisIndex {
@@ -1286,6 +1318,8 @@ pub fn universe(mem: &Memory) -> Universe {
 /// The classes known in a round, to evaluate the values of one function.
 struct Ctx<'a> {
     h: &'a Hierarchy,
+    /// primary vtable -> class
+    primary: &'a FxHashMap<u64, u32>,
     starts: &'a [u64],
     sums: &'a [Summary],
     evidence: &'a [FxHashMap<(Src, i32), u32>],
@@ -1326,6 +1360,10 @@ impl Ctx<'_> {
                 None => TOP,
             }),
             Src::Ld(l) => ev.get(&(src, 0)).copied().unwrap_or(ld[l as usize]),
+            Src::Obj(i) => match self.sums[k].objs[i as usize] {
+                crate::effects::ObjRef::Vtable(vt) => self.primary.get(&vt).map_or(TOP, |&c| cls(c)),
+                crate::effects::ObjRef::RetOf(f) => self.fidx(f).map_or(TOP, |t| self.r[t]),
+            },
         }
     }
 
@@ -1479,7 +1517,7 @@ const MAX_DEMAND: usize = 64;
 
 /// What one function contributes in a round: `(callee, parameter, class)`, its return class,
 /// field classes and member classes by `(container class, offset)`.
-type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>);
+type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>, Vec<(u32, i32, i32)>);
 
 /// The propagation over the summaries of the functions `starts` (address order); `external`
 /// functions (exported) may be called with anything.
@@ -1771,7 +1809,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             .into_par_iter()
             .map(|k| {
                 let s = &sums[k];
-                let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
+                let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
                 let ld = cx.loads(k);
                 let value = |src: Src, off: i32, ld: &[u32]| cx.value(k, src, off, ld);
                 let base = |src: Src, ld: &[u32]| cx.base(k, src, ld);
@@ -1804,6 +1842,15 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         fs.push(((b - 2, off), value(vs, vo, &ld)));
                     }
                 }
+                // (WS95: bytes written with something else — here or by a callee — make the
+                // fields they overlap unknown)
+                let mut cl = Vec::new();
+                for &(src, off, n) in s.field_numbers.iter().filter(|f| f.1 > 0) {
+                    let b = base(src, &ld);
+                    if b >= 2 {
+                        cl.push((b - 2, off, n));
+                    }
+                }
                 let mut ms = Vec::new();
                 for &(src, off, vt) in &s.vt_stores {
                     if off <= 0 || src == Src::Stack {
@@ -1816,7 +1863,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         ms.push(((b - 2, off), cls(c)));
                     }
                 }
-                (contrib, ret, fs, ms, pfs)
+                (contrib, ret, fs, ms, pfs, cl)
             })
             .collect();
         let mut np = init.clone();
@@ -1824,7 +1871,11 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
         let mut nf: FxHashMap<(u32, i32), u32> = FxHashMap::default();
         let mut nm: FxHashMap<(u32, i32), u32> = FxHashMap::default();
         let mut npf = pf_init.clone();
-        for (k, (contrib, ret, fs, ms, pfs)) in per.into_iter().enumerate() {
+        let mut clobbered: FxHashMap<u32, Vec<(i32, i32)>> = FxHashMap::default();
+        for (k, (contrib, ret, fs, ms, pfs, cl)) in per.into_iter().enumerate() {
+            for (c, off, n) in cl {
+                clobbered.entry(c).or_default().push((off, n));
+            }
             for (x, v) in pfs {
                 let e = &mut npf[x as usize];
                 *e = join(h, *e, v);
@@ -1843,6 +1894,23 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 *e = join(h, *e, v);
             }
         }
+        // (also where the class itself stores nothing: a derived class's field of a base)
+        for (&c, rs) in &clobbered {
+            for &(o, n) in rs {
+                let mut a = o & !7;
+                while a < o.saturating_add(n) && a - (o & !7) < 0x80 {
+                    nf.insert((c, a), TOP);
+                    a += 8;
+                }
+            }
+        }
+        for ((c, off), v) in nf.iter_mut() {
+            if let Some(rs) = clobbered.get(c)
+                && rs.iter().any(|&(o, n)| o < off.saturating_add(8) && o.saturating_add(n) > *off)
+            {
+                *v = TOP;
+            }
+        }
         let same = np == p && nr == r && nf == fields && nm == members && npf == pf;
         pf = npf;
         p = np;
@@ -1857,7 +1925,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
 
     // (development: `REARGO_THIS_EXPLAIN=0x…,0x…` prints why `this` of those functions is what it is)
     if let Some(list) = std::env::var_os("REARGO_THIS_EXPLAIN") {
-        let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
+        let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
         let show = |v: u32| match v {
             BOT => "nothing".to_string(),
             TOP => "unknown".to_string(),
@@ -1979,17 +2047,42 @@ pub fn build_with(mem: &Memory, functions: &[(u64, u64)], external: &[u64], impo
             s.top_args.iter_mut().for_each(|t| through(&mut t.0));
         }
     }
-    let t1 = std::time::Instant::now();
     let starts: Vec<u64> = fs.iter().map(|f| f.0).collect();
+    // WS95: the callees' effects, composed bottom-up (not those on a parameter whose class a
+    // vtable listing the function or a vtable it stores there gives)
+    let export: Vec<u8> = starts
+        .par_iter()
+        .zip(&sums)
+        .map(|(f, s)| {
+            let mut m = 0x3fu8;
+            if u.listing.contains_key(f) {
+                m &= !(1 << u8::from(s.returns_first()));
+            }
+            for &(d, off, vt) in &s.vt_stores {
+                if let (Src::Arg(i), 0) = (d, off)
+                    && u.primary.contains_key(&vt)
+                {
+                    m &= !(1 << i);
+                }
+            }
+            m
+        })
+        .collect();
+    let t_sum = std::time::Instant::now();
+    // (development: `REARGO_NO_EFFECTS=1` leaves them out, to compare)
+    let sums = if std::env::var_os("REARGO_NO_EFFECTS").is_some() { sums } else { crate::effects::compose(&starts, sums, &export) };
+    let compose_ms = t_sum.elapsed().as_millis() as u64;
+    let t1 = std::time::Instant::now();
     let mut idx = solve(&u, &starts, &sums, &external.iter().copied().collect(), MAX_ROUNDS);
-    idx.stats.summarize_ms = (t1 - t0).as_millis() as u64;
+    idx.stats.summarize_ms = (t1 - t0).as_millis() as u64 - compose_ms;
+    idx.stats.compose_ms = compose_ms;
     idx.stats.solve_ms = t1.elapsed().as_millis() as u64;
     idx
 }
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 10;
+const INDEX_VERSION: u8 = 11;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -2002,7 +2095,7 @@ impl ThisIndex {
         b.push(INDEX_VERSION);
         u64_(&mut b, key);
         let s = &self.stats;
-        for v in [s.functions, s.classes, s.rounds, u64::from(s.converged), s.summarize_ms, s.solve_ms, s.seeded_this] {
+        for v in [s.functions, s.classes, s.rounds, u64::from(s.converged), s.summarize_ms, s.solve_ms, s.seeded_this, s.compose_ms] {
             u64_(&mut b, v);
         }
         u32_(&mut b, self.hierarchy.vtables.len() as u32);
@@ -2072,11 +2165,11 @@ impl ThisIndex {
             return None;
         }
         let mut idx = ThisIndex::default();
-        let mut st = [0u64; 7];
+        let mut st = [0u64; 8];
         for v in st.iter_mut() {
             *v = r.u64()?;
         }
-        idx.stats = IndexStats { functions: st[0], classes: st[1], rounds: st[2], converged: st[3] != 0, summarize_ms: st[4], solve_ms: st[5], seeded_this: st[6] };
+        idx.stats = IndexStats { functions: st[0], classes: st[1], rounds: st[2], converged: st[3] != 0, summarize_ms: st[4], solve_ms: st[5], seeded_this: st[6], compose_ms: st[7] };
         let n = r.u32()? as usize;
         for _ in 0..n {
             idx.hierarchy.vtables.push(r.u64()?);

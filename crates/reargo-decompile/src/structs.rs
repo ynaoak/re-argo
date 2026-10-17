@@ -1683,6 +1683,48 @@ mod tests {
         assert!(!r.c_code.contains("= Shape::"), "{}", r.c_code);
     }
 
+    /// WS95: [`holder`] plus `Holder`'s method `0x1310` passing `this` to a helper that writes a
+    /// field of it, which `0x1520` (no caller: anything) calls too — `setter`: `0x1580` stores
+    /// its second argument (`this->field_8`, a `Shape`) at `+0x10`; else `0x15a0` writes a
+    /// number at `+8`.
+    fn callee_writes(setter: bool) -> (Memory, Vec<(u64, u64)>) {
+        let (m, other): ([u8; 9], [u8; 5]) = if setter {
+            // mov rsi, [rdi+8] ; jmp 0x1580        jmp 0x1580
+            ([0x48, 0x8b, 0x77, 0x08, 0xe9, 0x67, 0x02, 0x00, 0x00], [0xe9, 0x5b, 0x00, 0x00, 0x00])
+        } else {
+            // jmp 0x15a0 (+ padding)                jmp 0x15a0
+            ([0xe9, 0x8b, 0x02, 0x00, 0x00, 0xcc, 0xcc, 0xcc, 0xcc], [0xe9, 0x7b, 0x00, 0x00, 0x00])
+        };
+        // 0x1580: mov [rdi+0x10], rsi ; ret      0x15a0: mov dword [rdi+8], 1 ; ret
+        let set = [0x48, 0x89, 0x77, 0x10, 0xc3];
+        let clobber = [0xc7, 0x47, 0x08, 0x01, 0x00, 0x00, 0x00, 0xc3];
+        let extra: Vec<(usize, &[u8])> = vec![(0x310, &m), (0x520, &other), (0x580, &set), (0x5a0, &clobber)];
+        let fs = vec![(0x1000, 0x26), (0x1080, 0xb), (0x1100, 1), (0x1200, 4), (0x1300, 0xb), (0x1310, 9), (0x1400, 3), (0x1520, 5), (0x1580, 5), (0x15a0, 8)];
+        (holder_with(&extra), fs)
+    }
+
+    /// WS95: a field a callee stores into the object a method passes it has the class of what
+    /// that call stores (the callee's own parameter has no class: another caller passes anything).
+    #[test]
+    fn a_field_stored_by_a_callee_has_the_class_of_what_the_call_stores() {
+        let (mem, fs) = callee_writes(true);
+        let idx = crate::thisclass::build(&mem, &fs, &[]);
+        assert_eq!(idx.param_class(0x1580, 0), None, "{idx:?}");
+        assert_eq!(idx.field_class(0x2050, 0x10), Some(0x2010), "{idx:?}");
+    }
+
+    /// WS95: a callee writing a number into a field of the object passed: the field has no
+    /// class any more.
+    #[test]
+    fn a_field_a_callee_writes_a_number_into_has_no_class() {
+        let (mem, fs) = callee_writes(false);
+        let idx = crate::thisclass::build(&mem, &fs, &[]);
+        assert_eq!(idx.field_class(0x2050, 8), None, "{idx:?}");
+        // (without that write it is the constructor's Shape)
+        let (mem, fs) = callee_writes(true);
+        assert_eq!(crate::thisclass::build(&mem, &fs, &[]).field_class(0x2050, 8), Some(0x2010));
+    }
+
     /// WS94: two callers putting objects of unrelated classes there: no class.
     #[test]
     fn callers_putting_unrelated_classes_in_a_field_leave_it_without_class() {

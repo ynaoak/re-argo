@@ -4764,7 +4764,7 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         println!("functions        {}", s.functions);
         println!("classes          {}", s.classes);
         println!("rounds           {} ({})", s.rounds, if s.converged { "converged" } else { "budget reached" });
-        println!("build            summaries {} ms, propagation {} ms", s.summarize_ms, s.solve_ms);
+        println!("build            summaries {} ms, effects {} ms, propagation {} ms", s.summarize_ms, s.compose_ms, s.solve_ms);
         println!("this from vtables {}", s.seeded_this);
         println!("this from callers {}", idx.count_known(0));
         for i in 1..6 {
