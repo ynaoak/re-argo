@@ -30,7 +30,8 @@ pub fn recover_rotates(func: &mut SsaFunction) -> usize {
         if let Some(out) = o.output {
             defs.insert(value_key(func, out), o.index);
         }
-        for &i in &o.inputs {
+        // (a constant's readers are never asked: a value a shift defines is)
+        for &i in o.inputs.iter().filter(|&&i| func.varnodes[i as usize].data.space != reargo_core::address::SpaceId::CONST) {
             *readers.entry(value_key(func, i)).or_default() += 1;
         }
     }

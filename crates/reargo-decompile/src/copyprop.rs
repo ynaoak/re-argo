@@ -21,12 +21,20 @@ fn overlaps(x: &reargo_core::pcode::VarnodeData, w: &reargo_core::pcode::Varnode
 
 /// Merge the copies; returns how many.
 pub fn propagate_register_copies(func: &mut SsaFunction) -> usize {
-    let mut readers: FxHashMap<ValueKey, u32> = FxHashMap::default();
-    for o in func.ops.iter().filter(|o| !o.dead) {
-        for &i in &o.inputs {
-            *readers.entry(value_key(func, i)).or_default() += 1;
+    // how many live ops read each temporary (only a temporary's readers are asked), counted
+    // when first asked: before any merge
+    let count = |func: &SsaFunction| {
+        let mut readers: FxHashMap<ValueKey, u32> = FxHashMap::default();
+        for o in func.ops.iter().filter(|o| !o.dead) {
+            for &i in &o.inputs {
+                if func.varnodes[i as usize].data.space == SpaceId::UNIQUE {
+                    *readers.entry(value_key(func, i)).or_default() += 1;
+                }
+            }
         }
-    }
+        readers
+    };
+    let mut readers: Option<FxHashMap<ValueKey, u32>> = None;
     // the ops of each block in order (op indices grow along a block)
     let mut merged = 0;
     for c in 0..func.ops.len() {
@@ -46,7 +54,7 @@ pub fn propagate_register_copies(func: &mut SsaFunction) -> usize {
             || d >= c
             || dop.output != Some(t)
             || matches!(dop.opcode, OpCode::MultiEqual | OpCode::Indirect | OpCode::Call | OpCode::CallInd | OpCode::CallOther)
-            || readers.get(&value_key(func, t)).copied() != Some(1)
+            || readers.get_or_insert_with(|| count(func)).get(&value_key(func, t)).copied() != Some(1)
         {
             continue;
         }
