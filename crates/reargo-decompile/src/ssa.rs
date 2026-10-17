@@ -81,12 +81,15 @@ pub struct SsaFunction {
     /// made): for the statistics, which count them as removed dead code.
     pub phantom_phis: usize,
     /// Where the left-out definitions and phis would have written their slots, until the first
-    /// dead code elimination (which would have removed them): sorted `(position, slot,
-    /// version)`, a position `4 * i` right before op `i` (a call's left-out definitions sit
-    /// after it), `4 * i + 1` for a phi of the block starting at op `i` (after definitions
-    /// left out at the end of the block before), and a live op `i` at `4 * i + 2`. Common
-    /// subexpression elimination reads them as writes of their slots.
-    pub phantom_writes: Vec<(usize, (u32, u64, u32), u32)>,
+    /// dead code elimination (which would have removed them): `(position, registers)` by
+    /// position, a position `4 * i` right before op `i` (a call's left-out definitions sit
+    /// after it), `4 * i + 1` for the phis of the block starting at op `i` (after definitions
+    /// left out at the end of the block before), and a live op `i` at `4 * i + 2`; bit `r` of
+    /// the registers is the slot `phantom_regs[r]`. Common subexpression elimination reads
+    /// them as writes of their slots.
+    pub phantom_writes: Vec<(usize, u128)>,
+    /// The slots of [`Self::phantom_writes`]' bits.
+    pub phantom_regs: Vec<(u32, u64, u32)>,
     /// The values read of definitions left out (by phis nothing reads), increasing: they have
     /// no defining op, but are no value on entry ([`Self::is_incoming`]).
     pub phantom_vars: Vec<VarId>,
@@ -127,6 +130,7 @@ impl SsaFunction {
             vcall_targets: FxHashMap::default(),
             phantom_phis: 0,
             phantom_writes: Vec::new(),
+            phantom_regs: Vec::new(),
             phantom_vars: Vec::new(),
         };
         func.build_ssa(phantoms);
@@ -481,6 +485,7 @@ impl SsaFunction {
                 // (the phis in slot order, the phantom ones numbered and named but not made)
                 let (real, ghost) = (&phis[b], &phantom_phis[b]);
                 let (mut ri, mut gi) = (0, 0);
+                let mut ghost_regs = 0u128;
                 while ri < real.len() || gi < ghost.len() {
                     let take_real = gi == ghost.len() || (ri < real.len() && slots[real[ri] as usize] < slots[ghost[gi] as usize]);
                     let k = if take_real { real[ri] } else { ghost[gi] };
@@ -493,7 +498,7 @@ impl SsaFunction {
                         vars.versions[k as usize] += 1;
                         stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
                         pushed_by[b].push(k);
-                        self.phantom_writes.push((4 * block_start[b] + 1, slots[k as usize], vars.versions[k as usize]));
+                        ghost_regs |= 1u128 << phantom_reg[k as usize];
                         continue;
                     }
                     ri += 1;
@@ -509,6 +514,9 @@ impl SsaFunction {
                     stacks[k as usize].push(out);
                     pushed_by[b].push(k);
                     idx += 1;
+                }
+                if ghost_regs != 0 {
+                    self.phantom_writes.push((4 * block_start[b] + 1, ghost_regs));
                 }
                 let mut at = kid_start[b];
                 for insn in &block.instructions {
@@ -542,15 +550,16 @@ impl SsaFunction {
                             pushed_by[b].push(k);
                         }
                         idx += 1;
-                        for r in bits(phantoms_at(insn, pcode_op, &mut seen_call)) {
+                        let left_out = phantoms_at(insn, pcode_op, &mut seen_call);
+                        for r in bits(left_out) {
                             // the definitions left out after the call, numbered
-                            {
-                                let k = reg_slot[r];
-                                vars.versions[k as usize] += 1;
-                                stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
-                                pushed_by[b].push(k);
-                                self.phantom_writes.push((4 * idx, slots[k as usize], vars.versions[k as usize]));
-                            }
+                            let k = reg_slot[r];
+                            vars.versions[k as usize] += 1;
+                            stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
+                            pushed_by[b].push(k);
+                        }
+                        if left_out != 0 {
+                            self.phantom_writes.push((4 * idx, left_out));
                         }
                     }
                 }
@@ -603,7 +612,10 @@ impl SsaFunction {
             }
         }
 
-        self.phantom_writes.sort_unstable();
+        if !self.phantom_writes.is_empty() {
+            self.phantom_writes.sort_unstable_by_key(|w| w.0);
+            self.phantom_regs = reg_slot.iter().map(|&k| if k == NO_SLOT { (u32::MAX, 0, 0) } else { slots[k as usize] }).collect();
+        }
         self.cfg = cfg;
     }
 
