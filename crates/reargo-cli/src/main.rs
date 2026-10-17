@@ -978,6 +978,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.no_cache {
         cache::disable();
     }
+    // A one-shot command drops its analysed program(s) right before the
+    // process exits: leave them to the exit instead of freeing millions
+    // of small objects (tens of ms on a large binary). Not for the
+    // commands that run on, analysing again and again.
+    let long_running = matches!(
+        cli.command,
+        Commands::Mcp { .. }
+            | Commands::Script { .. }
+            | Commands::Debug { .. }
+            | Commands::Gdbserver { .. }
+            | Commands::Iterate { .. }
+    );
+    if !long_running {
+        reargo_program::program::leak_on_drop();
+    }
     match cli.command {
         Commands::Info { file } => cmd_info(&file),
         Commands::Sections { file } => cmd_sections(&file),

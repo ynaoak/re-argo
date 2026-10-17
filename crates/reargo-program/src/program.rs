@@ -61,6 +61,32 @@ pub struct Program {
     pub analysis_cache: crate::analysis_cache::AnalysisCache,
 }
 
+static LEAK_ON_DROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on, a dropped [`Program`] leaves its analysis results (the
+/// listing, symbols, references, comments, tags, call renderings)
+/// allocated instead of freeing them one by one: for a process that
+/// drops its programs just before it exits (a one-shot CLI command),
+/// where freeing millions of small objects — many allocated on other
+/// threads — is pure overhead the exit does anyway. Never set it in a
+/// process that analyses program after program.
+pub fn leak_on_drop() {
+    LEAK_ON_DROP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        if LEAK_ON_DROP.load(std::sync::atomic::Ordering::Relaxed) {
+            std::mem::forget(std::mem::take(&mut self.listing));
+            std::mem::forget(std::mem::take(&mut self.symbol_table));
+            std::mem::forget(std::mem::take(&mut self.references));
+            std::mem::forget(std::mem::take(&mut self.comments));
+            std::mem::forget(std::mem::take(&mut self.tags));
+            std::mem::forget(std::mem::take(&mut self.call_renderings));
+        }
+    }
+}
+
 impl Program {
     pub fn from_binary(path: &std::path::Path) -> Result<Self, ProgramError> {
         let info = BinaryLoader::load(path)?;
