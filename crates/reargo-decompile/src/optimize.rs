@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 
 use reargo_core::pcode::OpCode;
 
@@ -306,29 +305,35 @@ fn is_side_effecting(op: OpCode) -> bool {
 /// identical to the fixpoint version.
 pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     let n = func.ops.len();
+    let candidate = |o: &crate::ssa::SsaOp| !o.dead && o.output.is_some() && !is_side_effecting(o.opcode);
+    // The queue starts with every candidate in index order and takes the defining ops of a
+    // dead op's inputs at its end: the candidates are visited in one sweep first (`i`, each
+    // one still queued while the sweep has not reached it), then the ops queued again, in
+    // order (`queue[head..]`, those of them `on_queue`).
     let mut on_queue = vec![false; n];
-    let mut queue: VecDeque<usize> = VecDeque::with_capacity(n);
-
-    for (i, slot) in on_queue.iter_mut().enumerate().take(n) {
-        if func.ops[i].dead {
-            continue;
-        }
-        if func.ops[i].output.is_none() {
-            continue;
-        }
-        if is_side_effecting(func.ops[i].opcode) {
-            continue;
-        }
-        queue.push_back(i);
-        *slot = true;
-    }
-
+    let mut queue: Vec<usize> = Vec::new();
+    let mut head = 0usize;
     let mut removed = 0;
-    while let Some(i) = queue.pop_front() {
-        on_queue[i] = false;
-        if func.ops[i].dead {
-            continue;
-        }
+    let mut sweep = 0usize;
+    loop {
+        let i = if sweep < n {
+            let i = sweep;
+            sweep += 1;
+            if !candidate(&func.ops[i]) {
+                continue;
+            }
+            i
+        } else if head < queue.len() {
+            let i = queue[head];
+            head += 1;
+            on_queue[i] = false;
+            if func.ops[i].dead {
+                continue;
+            }
+            i
+        } else {
+            break;
+        };
 
         let out_id = func.ops[i].output.expect("output checked above");
         let has_live_use = func.varnodes[out_id as usize]
@@ -346,15 +351,15 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
         // The newly-dead op's inputs each just lost a use. Re-queue
         // the defining op of any input that itself is a DCE
         // candidate -- it may now have no live uses either.
-        let inputs = func.ops[i].inputs.clone();
-        for inp_id in inputs {
-            if let Some(def_idx) = func.varnodes[inp_id as usize].def_op
-                && !func.ops[def_idx].dead
-                && func.ops[def_idx].output.is_some()
-                && !is_side_effecting(func.ops[def_idx].opcode)
+        // (a candidate the sweep has not reached yet is still queued)
+        let (ops, varnodes) = (&func.ops, &func.varnodes);
+        for &inp_id in &ops[i].inputs {
+            if let Some(def_idx) = varnodes[inp_id as usize].def_op
+                && candidate(&ops[def_idx])
+                && def_idx < sweep
                 && !on_queue[def_idx]
             {
-                queue.push_back(def_idx);
+                queue.push(def_idx);
                 on_queue[def_idx] = true;
             }
         }

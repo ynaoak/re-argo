@@ -106,16 +106,7 @@ impl SsaFunction {
             .flat_map(|b| b.instructions.iter())
             .map(|i| i.ops.len())
             .sum();
-        self.ops.reserve(total_ops);
-        // Heuristic: ~2 varnodes per op (inputs + output). The actual
-        // ratio on x86_64 bodies is ~1.8 (measured empirically against
-        // a 956-op synthetic, which produced 1711 varnodes); the
-        // previous 3x heuristic over-reserved by ~70% which both
-        // wasted memory and forced the Vec backing into a larger
-        // allocation tier with worse cache behaviour. 2x lands tight
-        // on x86 and still avoids per-op re-growth; if a later
-        // architecture needs more headroom we can raise it again.
-        self.varnodes.reserve(total_ops * 2);
+        // (the arenas are sized once the phis are placed: below)
 
         // Temporarily move the CFG out of `self` so the inner loop can
         // hold an immutable borrow of `cfg.blocks` *and* call the
@@ -147,7 +138,6 @@ impl SsaFunction {
         type Key = (u32, u64, u32);
         let key_of = |vn: &VarnodeData| (vn.space.0, vn.offset, vn.size);
         let n = cfg.blocks.len();
-        self.ops.reserve(total_ops / 8);
 
         // 0. the slots (space, offset, size) as dense ids, and the slot of each non-constant
         // input / output in op order (`kids`, from `kid_start[b]` for block `b`)
@@ -156,6 +146,8 @@ impl SsaFunction {
         let mut slots: Vec<Key> = Vec::new();
         let mut kids: Vec<u32> = Vec::with_capacity(total_ops * 3);
         let mut kid_start = vec![0usize; n];
+        // (the constants read and the values written: a varnode each)
+        let (mut n_consts, mut n_outputs) = (0usize, 0usize);
         let mut intern = |k: Key| -> u32 {
             *slot_of.entry(k).or_insert_with(|| {
                 slots.push(k);
@@ -166,9 +158,15 @@ impl SsaFunction {
             kid_start[b] = kids.len();
             for op in block.instructions.iter().flat_map(|i| i.ops.iter()) {
                 for inp in &op.inputs {
-                    kids.push(if inp.space == SpaceId::CONST { NO_SLOT } else { intern(key_of(inp)) });
+                    kids.push(if inp.space == SpaceId::CONST {
+                        n_consts += 1;
+                        NO_SLOT
+                    } else {
+                        intern(key_of(inp))
+                    });
                 }
                 if let Some(out) = op.output {
+                    n_outputs += 1;
                     kids.push(intern(key_of(&out)));
                 }
             }
@@ -269,6 +267,15 @@ impl SsaFunction {
                 }
             }
         }
+
+        // The arenas, sized once: an op per P-code op and phi; a varnode per constant read,
+        // value written (phis too) and slot read on entry — and some room for the constants
+        // and ops the passes add. (A guess of twice the ops was too small for half the
+        // functions, and each growth copied the whole arena.)
+        let n_phis: usize = phis.iter().map(Vec::len).sum();
+        let new_values = n_consts + n_outputs + n_phis;
+        self.ops.reserve(total_ops + n_phis + total_ops / 16 + 8);
+        self.varnodes.reserve(new_values + n_slots + new_values / 16 + 16);
 
         // 3. lay the ops out in linear block order (phis first); renaming fills them in
         let mut block_start = vec![0usize; n];

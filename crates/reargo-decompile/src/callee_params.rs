@@ -694,10 +694,63 @@ struct Summary {
 const MAX_FIELD: i64 = 0x10_0000;
 
 /// What a storage location holds: an argument's incoming value plus a delta.
-pub(crate) type Held = FxHashMap<(SpaceId, u64, u32), (usize, i64)>;
+pub(crate) type Held = SmallMap<(SpaceId, u64, u32), (usize, i64)>;
 
-pub(crate) fn kill(state: &mut Held, out: &VarnodeData) {
+pub(crate) fn kill<V: Copy>(state: &mut SmallMap<(SpaceId, u64, u32), V>, out: &VarnodeData) {
     state.retain(|&(sp, off, sz), _| !(sp == out.space && off < out.offset + u64::from(out.size) && out.offset < off + u64::from(sz)));
+}
+
+/// A map of few entries, kept sorted by key in a small vector: the data flows over a body's
+/// storage locations hold a handful at a time, where a hash map's table costs more to clone,
+/// scan and compare than the entries themselves. Equal maps hold the same entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SmallMap<K, V>(smallvec::SmallVec<[(K, V); 8]>);
+
+impl<K, V> Default for SmallMap<K, V> {
+    fn default() -> Self {
+        Self(smallvec::SmallVec::new())
+    }
+}
+
+impl<K: Ord + Copy, V: Copy> SmallMap<K, V> {
+    pub(crate) fn get(&self, k: &K) -> Option<&V> {
+        // (a handful of entries: a linear scan beats the binary search's branches)
+        self.0.iter().find(|e| e.0 == *k).map(|e| &e.1)
+    }
+
+    pub(crate) fn insert(&mut self, k: K, v: V) {
+        match self.0.binary_search_by(|e| e.0.cmp(&k)) {
+            Ok(i) => self.0[i].1 = v,
+            Err(i) => self.0.insert(i, (k, v)),
+        }
+    }
+
+    pub(crate) fn remove(&mut self, k: &K) {
+        if let Some(i) = self.0.iter().position(|e| e.0 == *k) {
+            self.0.remove(i);
+        }
+    }
+
+    pub(crate) fn retain(&mut self, mut f: impl FnMut(&K, &V) -> bool) {
+        self.0.retain(|e| f(&e.0, &e.1));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.0.iter().map(|e| (&e.0, &e.1))
+    }
+}
+
+impl<K: Ord + Copy, V: Copy> FromIterator<(K, V)> for SmallMap<K, V> {
+    /// (from entries in key order, as [`SmallMap::iter`] gives them, with distinct keys)
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let v: smallvec::SmallVec<[(K, V); 8]> = iter.into_iter().collect();
+        debug_assert!(v.windows(2).all(|w| w[0].0 < w[1].0));
+        Self(v)
+    }
 }
 
 /// The loads / stores of a body whose address is an argument's incoming value plus a constant
@@ -713,16 +766,25 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
     inn[cfg.entry_block] = Some(entry);
     let rpo = crate::dominator::reverse_post_order(cfg);
     let mut found: Vec<ParamAccess> = Vec::new();
-    let mut returns: Vec<bool> = Vec::new();
     let mut vtable_stores: Vec<(usize, u64)> = Vec::new();
+    // A block whose entry state did not change since it was last run gives the same accesses
+    // (already recorded), `ret`s and states for its successors (already met into theirs, which
+    // only shrank since): it is not run again. Its `ret`s are kept from that run.
+    let mut dirty: Vec<bool> = vec![true; n];
+    let mut block_returns: Vec<smallvec::SmallVec<[bool; 1]>> = vec![smallvec::SmallVec::new(); n];
     for pass in 0..8 {
-        returns.clear();
         let mut changed = false;
         let last = pass == 7;
         for &b in &rpo {
+            if !dirty[b] {
+                continue;
+            }
             let Some(mut st) = inn[b].clone() else { continue };
+            dirty[b] = false;
+            let returns = &mut block_returns[b];
+            returns.clear();
             // the constants the block wrote into registers (`lea rax, [vtable]`), for the stores
-            let mut consts: FxHashMap<(SpaceId, u64, u32), u64> = FxHashMap::default();
+            let mut consts: SmallMap<(SpaceId, u64, u32), u64> = SmallMap::default();
             for insn in &cfg.blocks[b].instructions {
                 for op in &insn.ops {
                     let held = |st: &Held, v: &VarnodeData| st.get(&(v.space, v.offset, v.size)).copied();
@@ -811,6 +873,7 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
                 };
                 if succ != cfg.entry_block && inn[succ].as_ref() != Some(&new) {
                     inn[succ] = Some(new);
+                    dirty[succ] = true;
                     changed = true;
                 }
             }
@@ -819,7 +882,9 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
             break;
         }
     }
-    ParamUse { fields: found, returns_first: !returns.is_empty() && returns.iter().all(|&r| r), vtable_stores }
+    let mut returns = rpo.iter().filter(|&&b| inn[b].is_some()).flat_map(|&b| block_returns[b].iter().copied()).peekable();
+    let returns_first = returns.peek().is_some() && returns.all(|r| r);
+    ParamUse { fields: found, returns_first, vtable_stores }
 }
 
 /// Group the argument registers into classes (System V: integer, vector) by

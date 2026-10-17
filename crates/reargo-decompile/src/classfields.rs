@@ -22,7 +22,7 @@ use reargo_core::pcode::OpCode;
 use reargo_loader::{Memory, MemoryFlags};
 use rustc_hash::FxHashMap;
 
-use crate::callee_params::{kill, CalleeParams, ClassFields, Held};
+use crate::callee_params::{kill, CalleeParams, ClassFields, Held, SmallMap};
 use crate::cfg::ControlFlowGraph;
 
 /// Most code references of a vtable followed (constructors, destructors, other uses).
@@ -154,7 +154,7 @@ fn ctor_facts(cfg: &ControlFlowGraph, cp: &CalleeParams<'_>) -> CtorFacts {
         let mut changed = false;
         for &b in &rpo {
             let Some(mut st) = inn[b].clone() else { continue };
-            let mut consts: FxHashMap<(SpaceId, u64, u32), u64> = FxHashMap::default();
+            let mut consts: SmallMap<(SpaceId, u64, u32), u64> = SmallMap::default();
             for insn in &cfg.blocks[b].instructions {
                 for op in &insn.ops {
                     let held = |st: &Held, v: &reargo_core::pcode::VarnodeData| st.get(&(v.space, v.offset, v.size)).copied();
