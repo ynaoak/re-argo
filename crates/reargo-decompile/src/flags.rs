@@ -725,36 +725,40 @@ pub(crate) fn renumber_named_flags(text: &mut String, func: &SsaFunction) {
     let mut map: FxHashMap<(usize, u64), u64> = FxHashMap::default();
     let mut next = [0u64; FLAG_KINDS.len()];
     let mut out = String::with_capacity(text.len());
-    let mut i = 0;
     let mut copied = 0;
-    while i < bytes.len() {
-        if ident(bytes[i]) && (i == 0 || !ident(bytes[i - 1])) {
-            let start = i;
-            while i < bytes.len() && ident(bytes[i]) {
-                i += 1;
-            }
-            if !starts(bytes[start]) {
-                continue;
-            }
-            let word = &text[start..i];
-            if let Some((kind, num)) = word.split_once('_')
-                && let Some(k) = FLAG_KINDS.iter().position(|&p| p == kind)
-                && !num.is_empty()
-                && num.bytes().all(|c| c.is_ascii_digit())
-                && let Ok(n) = num.parse::<u64>()
-                && named.contains(&(((k as u64) << 16) + n))
-            {
-                let m = *map.entry((k, n)).or_insert_with(|| {
-                    next[k] += 1;
-                    next[k] - 1
-                });
-                out.push_str(&text[copied..start]);
-                let _ = write!(out, "{kind}_{m}");
-                copied = i;
-            }
+    // each word holding a `_` (a flag name holds one): from the `_`, back to its start and on
+    // to its end
+    let mut pos = 0;
+    while let Some(off) = text[pos..].find('_') {
+        let under = pos + off;
+        let mut start = under;
+        while start > 0 && ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut i = under + 1;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        pos = i;
+        if start == under || !starts(bytes[start]) {
             continue;
         }
-        i += 1;
+        let word = &text[start..i];
+        if let Some((kind, num)) = word.split_once('_')
+            && let Some(k) = FLAG_KINDS.iter().position(|&p| p == kind)
+            && !num.is_empty()
+            && num.bytes().all(|c| c.is_ascii_digit())
+            && let Ok(n) = num.parse::<u64>()
+            && named.contains(&(((k as u64) << 16) + n))
+        {
+            let m = *map.entry((k, n)).or_insert_with(|| {
+                next[k] += 1;
+                next[k] - 1
+            });
+            out.push_str(&text[copied..start]);
+            let _ = write!(out, "{kind}_{m}");
+            copied = i;
+        }
     }
     if copied == 0 {
         return;
