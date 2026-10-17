@@ -354,3 +354,15 @@ pub fn create_architecture_with_options(
         other => Err(DisasmError::UnsupportedArch(format!("{}", other))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listing keeps one per instruction (hundreds of thousands): the
+    /// text is boxed so the struct stays small.
+    #[test]
+    fn decoded_instruction_stays_small() {
+        assert!(std::mem::size_of::<DecodedInstruction>() <= 80, "{}", std::mem::size_of::<DecodedInstruction>());
+    }
+}
