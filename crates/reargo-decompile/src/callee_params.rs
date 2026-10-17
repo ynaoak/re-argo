@@ -90,6 +90,11 @@ pub struct CalleeParams<'a> {
     summary_memo: Mutex<FxHashMap<u64, Option<std::sync::Arc<Summary>>>>,
     /// The lengths and flags of the instructions lifted alone, for the range walks (x86).
     facts: Option<reargo_lift::x86::InsnFacts>,
+    /// The lifts of the ranges a walk cannot answer (x87 code, the integer PF), for
+    /// [`reargo_lift::x86::X86Lifter::lift_range_cached`] (x86): the ranges from the entries
+    /// of neighbouring functions and from the addresses `.cold` parts jump back to overlap
+    /// over most of their 3000 instructions.
+    range_cache: Option<Mutex<reargo_lift::x86::LiftCache>>,
     /// The direct call sites by target, when a batch built them ([`Self::with_call_index`]).
     call_index: Option<crate::callers::CallIndex>,
     /// [`crate::callers::return_hint`] by function.
@@ -165,6 +170,7 @@ impl<'a> CalleeParams<'a> {
             class_fields_memo: Mutex::new(FxHashMap::default()),
             summary_memo: Mutex::new(FxHashMap::default()),
             facts: lifter.as_x86().map(|_| reargo_lift::x86::InsnFacts::new(memory)),
+            range_cache: lifter.as_x86().map(|_| Mutex::new(reargo_lift::x86::LiftCache::new())),
             call_index: None,
             hint_memo: Mutex::new(FxHashMap::default()),
             flow_cache: lifter.as_x86().map(|_| crate::noreturn::FlowCache::new()),
@@ -420,7 +426,14 @@ impl<'a> CalleeParams<'a> {
         {
             return Some(s);
         }
-        let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
+        let lifted = match (self.lifter.as_x86(), self.range_cache.as_ref().and_then(|c| c.lock().ok())) {
+            // (`lift_range` from the lifts of the range's instructions alone)
+            (Some(x86), Some(mut cache)) => match x86.lift_range_cached(self.memory, target, MAX_INSNS, &mut cache) {
+                reargo_lift::x86::CachedRange::Cached(v) => v.into_iter().cloned().collect(),
+                reargo_lift::x86::CachedRange::Owned(v) => v,
+            },
+            _ => self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?,
+        };
         if lifted.is_empty() || lifted[0].address != target {
             return None;
         }
