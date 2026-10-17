@@ -409,6 +409,8 @@ pub struct PlainWalk<'f> {
     /// `(address, index)` of instructions of the walk, increasing, the first one its start
     checkpoints: Vec<(u64, u32)>,
     len: usize,
+    /// The range needs the integer PF ([`X86Lifter::plain_walk`]'s `pf_relift`).
+    pub needs_pf: bool,
 }
 
 const FACT_PAGE_BITS: u32 = 12;
@@ -492,8 +494,19 @@ impl PlainWalk<'_> {
         let k = self.checkpoints.partition_point(|&(a, _)| a <= addr).checked_sub(1)?;
         let (mut at, i) = self.checkpoints[k];
         let mut i = i as usize;
+        // (the cells of the page being stepped through)
+        let mut page: &[std::sync::atomic::AtomicU16] = &[];
+        let mut page_base = 0u64;
         while i < self.len && at < addr {
-            at += u64::from(self.length(at)?);
+            if at.wrapping_sub(page_base) >= page.len() as u64 {
+                page = self.facts.page_unchecked(at)?;
+                page_base = at & !((1u64 << FACT_PAGE_BITS) - 1);
+            }
+            let f = page[(at - page_base) as usize].load(std::sync::atomic::Ordering::Relaxed);
+            if f & FACT_KNOWN == 0 {
+                return None;
+            }
+            at += u64::from(f & 0xf);
             i += 1;
         }
         (i < self.len && at == addr).then_some(i)
@@ -665,9 +678,14 @@ impl X86Lifter {
     /// [`Self::plain_range`] as a [`PlainWalk`]: the same instructions (and `None` in the same
     /// cases), stepping over the [`Span`]s other walks found instead of one instruction at a
     /// time.
-    pub fn plain_walk<'f>(&self, memory: &Memory, start: u64, count: usize, facts: &'f InsnFacts) -> Option<PlainWalk<'f>> {
+    ///
+    /// With `pf_relift`, a range that needs the integer PF (and has no x87 instruction) is
+    /// walked too, marked [`PlainWalk::needs_pf`]: `lift_range` is then the lifts of its
+    /// instructions alone *with* the PF ([`PcodeLift::lift_instruction`]).
+    pub fn plain_walk<'f>(&self, memory: &Memory, start: u64, count: usize, facts: &'f InsnFacts, pf_relift: bool) -> Option<PlainWalk<'f>> {
         let mut block = None;
-        let check_pf = self.parity;
+        let mut check_pf = self.parity;
+        let mut needs_pf = false;
         let mut pf_written = false;
         let mut checkpoints = Vec::new();
         let (mut addr, mut idx) = (start, 0usize);
@@ -684,7 +702,11 @@ impl X86Lifter {
             let span = self.span(memory, addr, facts, &mut block);
             if span.0 & SPAN_STOP == 0 && idx + span.count() <= count && span.count() > 0 {
                 if check_pf {
-                    pf_written = span.pf(pf_written)?;
+                    match span.pf(pf_written) {
+                        Some(w) => pf_written = w,
+                        None if pf_relift => (needs_pf, check_pf) = (true, false),
+                        None => return None,
+                    }
                 }
                 idx += span.count();
                 addr += span.bytes();
@@ -699,15 +721,18 @@ impl X86Lifter {
                 }
                 let f = self.fill(memory, addr, &page[(addr - page_base) as usize], &mut block);
                 if f & FACT_FAILED != 0 {
-                    return Some(PlainWalk { facts, checkpoints, len: idx });
+                    return Some(PlainWalk { facts, checkpoints, len: idx, needs_pf });
                 }
                 if f & FACT_X87 != 0 {
                     return None;
                 }
-                if check_pf {
-                    if f & FACT_READS_PF != 0 && !pf_written {
+                if check_pf && f & FACT_READS_PF != 0 && !pf_written {
+                    if !pf_relift {
                         return None;
                     }
+                    (needs_pf, check_pf) = (true, false);
+                }
+                if check_pf {
                     if f & FACT_WRITES_PF != 0 {
                         pf_written = true;
                     } else if f & FACT_STOPS != 0 {
@@ -718,7 +743,7 @@ impl X86Lifter {
                 addr += u64::from(f & 0xf);
             }
         }
-        Some(PlainWalk { facts, checkpoints, len: idx })
+        Some(PlainWalk { facts, checkpoints, len: idx, needs_pf })
     }
 
     pub fn plain_range(&self, memory: &Memory, start: u64, count: usize, facts: &InsnFacts) -> Option<Vec<u64>> {
@@ -4729,7 +4754,7 @@ mod tests {
                 for count in [1, 5, 60, 200, 3000] {
                     let a = 0x1000 + start;
                     let range = lifter.plain_range(&mem, a, count, &facts);
-                    let walk = lifter.plain_walk(&mem, a, count, &walk_facts);
+                    let walk = lifter.plain_walk(&mem, a, count, &walk_facts, false);
                     assert_eq!(range.is_some(), walk.is_some(), "start +{start:#x} count {count}");
                     let (Some(range), Some(walk)) = (range, walk) else { continue };
                     assert_eq!(walk.len(), range.len(), "start +{start:#x} count {count}");
@@ -4740,6 +4765,25 @@ mod tests {
                     }
                 }
             }
+            // with `pf_relift`, a range that needs the integer PF is its instructions lifted
+            // alone with it
+            let relift_facts = InsnFacts::new(&mem);
+            let mut relifted = 0;
+            for start in (0..code.len() as u64).step_by(5) {
+                for count in [3, 60, 3000] {
+                    let a = 0x1000 + start;
+                    let Some(walk) = lifter.plain_walk(&mem, a, count, &relift_facts, true) else { continue };
+                    let range = lifter.lift_range(&mem, a, count).unwrap();
+                    assert_eq!(walk.len(), range.len(), "start +{start:#x} count {count}");
+                    relifted += usize::from(walk.needs_pf);
+                    for (i, insn) in range.iter().enumerate() {
+                        assert_eq!(walk.index_of(insn.address), Some(i));
+                        let alone = if walk.needs_pf { lifter.lift_instruction(&mem, insn.address) } else { lifter.lift_alone(&mem, insn.address) };
+                        assert_eq!(format!("{:?}", alone.unwrap().ops), format!("{:?}", insn.ops), "start +{start:#x} count {count} at {:#x}", insn.address);
+                    }
+                }
+            }
+            assert_eq!(relifted > 0, lifter.parity);
         }
     }
 
