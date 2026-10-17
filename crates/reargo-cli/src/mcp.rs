@@ -433,7 +433,12 @@ fn tool_decompile(server: &Server, args: &Value) -> Result<String, String> {
     let rust = args.get("rust").and_then(|v| v.as_bool()).unwrap_or(false);
     let lifter = crate::make_lifter(&server.program.info, server.thumb)
         .ok_or_else(|| format!("no lifter for {}", server.program.info.arch))?;
-    let res = reargo_decompile::decompile_function(lifter.as_ref(), &server.program, addr)
+    // only the text returned is rendered
+    let opts = reargo_decompile::DecompileOptions {
+        emit: reargo_decompile::pipeline::Emit { c: !rust, rust, ssa: false },
+        ..Default::default()
+    };
+    let res = reargo_decompile::decompile_function_with_options(lifter.as_ref(), &server.program, addr, &opts)
         .map_err(|e| format!("decompile failed: {}", e))?;
     Ok(if rust { res.rust_code } else { res.c_code })
 }

@@ -5285,7 +5285,11 @@ fn cmd_script(path: &Path, script_path: &Path, thumb: bool) -> Result<(), Box<dy
             "decompile" => {
                 if let Some(lifter) = make_lifter(&info, thumb) {
                     let addr = parse_hex(args).unwrap_or(info.entry_point);
-                    match reargo_decompile::decompile_function(lifter.as_ref(), &program, addr) {
+                    let c_only = reargo_decompile::DecompileOptions {
+                        emit: reargo_decompile::pipeline::Emit { c: true, rust: false, ssa: false },
+                        ..Default::default()
+                    };
+                    match reargo_decompile::decompile_function_with_options(lifter.as_ref(), &program, addr, &c_only) {
                         Ok(result) => print!("{}", result.c_code),
                         Err(e) => eprintln!("decompile error: {}", e),
                     }
