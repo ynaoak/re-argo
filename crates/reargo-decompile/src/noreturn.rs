@@ -160,7 +160,7 @@ impl FlowCache {
                 let f = match m.get(at) {
                     Some(f) => f,
                     None => {
-                        let f = x86.lift_alone_with(memory, at, &mut cursor).ok().map(|i| Flow::of(&i));
+                        let f = flow_alone(x86, memory, at, &mut cursor);
                         m.insert(at, &f);
                         f
                     }
@@ -173,6 +173,73 @@ impl FlowCache {
             }
         }
     }
+}
+
+/// What [`flow_alone`] knows of the instructions alike ([`reargo_lift::x86::X86Lifter::alike_key`])
+/// of one it lifted: their flow (its targets those of their own branch), that they cannot
+/// be lifted, or nothing (lifted each time).
+#[derive(Clone)]
+enum AlikeFlow {
+    Flow(Flow),
+    Fails,
+    Lift,
+}
+
+/// [`AlikeFlow`]s a thread keeps at most (emptied when full).
+const FLOW_MEMO_CAP: usize = 1 << 16;
+
+thread_local! {
+    static FLOW_MEMO: std::cell::RefCell<FxHashMap<(bool, iced_x86::Instruction), AlikeFlow>> = std::cell::RefCell::new(FxHashMap::default());
+}
+
+/// The direct branch target of `insn`, if it has one.
+fn near_target(insn: &iced_x86::Instruction) -> Option<u64> {
+    use iced_x86::OpKind;
+    (0..insn.op_count())
+        .any(|i| matches!(insn.op_kind(i), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64))
+        .then(|| insn.near_branch_target())
+}
+
+/// `Flow::of` the lift alone of the instruction at `at` (`None` when it cannot be lifted): an
+/// instruction alike one lifted before (but for its displacement / branch target) has its
+/// flow with its own branch target, when that one's targets were its branch target — the
+/// lift's control flow does not depend on those values.
+fn flow_alone<'m>(x86: &reargo_lift::x86::X86Lifter, memory: &'m Memory, at: u64, cursor: &mut reargo_lift::x86::DecodeCursor<'m>) -> Option<Flow> {
+    let insn = x86.decode_alone_with(memory, at, cursor).ok()?;
+    let key = x86.alike_key(&insn);
+    let near = near_target(&insn);
+    let known = FLOW_MEMO.with(|m| m.borrow().get(&key).cloned());
+    match known {
+        Some(AlikeFlow::Flow(f)) => {
+            let events = f.events.iter().map(|e| match *e {
+                Event::Branch { uncond, target: Some(_) } => Event::Branch { uncond, target: near },
+                Event::Call(_) => Event::Call(near.expect("a call alike one to its branch target")),
+                other => other,
+            });
+            return Some(Flow { address: at, length: insn.len() as u32, trap: f.trap, events: events.collect() });
+        }
+        Some(AlikeFlow::Fails) => return None,
+        Some(AlikeFlow::Lift) | None => {}
+    }
+    let f = x86.lift_decoded_alone(insn, at).ok().map(|i| Flow::of(&i));
+    if known.is_none() {
+        let alike = match &f {
+            None => AlikeFlow::Fails,
+            Some(f) if f.events.iter().all(|e| match *e {
+                Event::Branch { target: Some(t), .. } | Event::Call(t) => near == Some(t),
+                _ => true,
+            }) => AlikeFlow::Flow(f.clone()),
+            Some(_) => AlikeFlow::Lift,
+        };
+        FLOW_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= FLOW_MEMO_CAP {
+                m.clear();
+            }
+            m.insert(key, alike);
+        });
+    }
+    f
 }
 
 /// The flows of a [`FlowCache`] shard: packed in a `u64` (see [`FlowShard::pack`]), the

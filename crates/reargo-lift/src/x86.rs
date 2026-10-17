@@ -653,6 +653,27 @@ impl X86Lifter {
         fast.decode_in_block(memory, addr, &mut cursor.0).and_then(|insn| fast.lift_decoded(insn, addr, None))
     }
 
+    /// The instruction [`Self::lift_alone_with`] lifts at `addr` (decoded through `cursor`).
+    pub fn decode_alone_with<'m>(&self, memory: &'m Memory, addr: u64, cursor: &mut DecodeCursor<'m>) -> Result<iced_x86::Instruction, LiftError> {
+        self.decode_in_block(memory, addr, &mut cursor.0)
+    }
+
+    /// [`Self::lift_alone`] of `insn`, decoded at `addr` ([`Self::decode_alone_with`]).
+    pub fn lift_decoded_alone(&self, insn: iced_x86::Instruction, addr: u64) -> Result<LiftedInstruction, LiftError> {
+        X86Lifter { is_64: self.is_64, parity: false }.lift_decoded(insn, addr, None)
+    }
+
+    /// `insn` without what its lift alone keeps only as a value (its memory displacement or
+    /// branch target): instructions alike so lift to the same ops but for those values.
+    pub fn alike_key(&self, insn: &iced_x86::Instruction) -> (bool, iced_x86::Instruction) {
+        use iced_x86::OpKind;
+        let mut key = *insn;
+        if (0..insn.op_count()).any(|i| matches!(insn.op_kind(i), OpKind::Memory | OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64)) {
+            key.set_memory_displacement64(0);
+        }
+        (self.is_64, key)
+    }
+
     /// The addresses of `lift_range(memory, start, count)` when it is exactly the lifts of
     /// those addresses alone ([`Self::lift_alone`]: no x87 instruction, no integer PF needed),
     /// read from (and filling) `facts`; `None` when the range must be lifted as a whole or
@@ -686,12 +707,8 @@ impl X86Lifter {
     /// operand's displacement or its branch target (none of them is a flag, a control
     /// transfer or a reason to fail), so instructions alike but for those are lifted once.
     fn facts_alike(&self, insn: iced_x86::Instruction, addr: u64) -> u16 {
-        use iced_x86::OpKind;
-        let mut key = insn;
-        if (0..insn.op_count()).any(|i| matches!(insn.op_kind(i), OpKind::Memory | OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64)) {
-            key.set_memory_displacement64(0);
-        }
-        let known = FACT_MEMO.with(|m| m.borrow().get(&(self.is_64, key)).copied());
+        let key = self.alike_key(&insn);
+        let known = FACT_MEMO.with(|m| m.borrow().get(&key).copied());
         let f = match known {
             Some(f) => f,
             None => {
@@ -701,7 +718,7 @@ impl X86Lifter {
                     if m.len() >= FACT_MEMO_CAP {
                         m.clear();
                     }
-                    m.insert((self.is_64, key), f);
+                    m.insert(key, f);
                 });
                 f
             }
