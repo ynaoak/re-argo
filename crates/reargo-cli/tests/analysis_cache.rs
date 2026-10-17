@@ -244,9 +244,12 @@ fn analyze_always_runs_the_pipeline_and_no_cache_env_bypasses() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Offset of the payload in a cache file (magic 16 + format 4 + key 32 +
-/// length 8 + BLAKE3 32).
-const HEADER_LEN: usize = 92;
+/// Offset of the first section in a cache file: magic 16 + format 4 +
+/// key 32 + pre-key 32 + section count 4, 20 bytes per section, BLAKE3 32.
+fn header_len(file: &[u8]) -> usize {
+    let count = u32::from_le_bytes(file[84..88].try_into().unwrap()) as usize;
+    88 + 20 * count + 32
+}
 
 fn cache_files(cache: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(cache)
@@ -259,7 +262,7 @@ fn cache_files(cache: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn payload_is_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
+fn sections_are_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
     let Some((dir, bin)) = setup("zstd") else {
         eprintln!("analysis cache test skipped: no gcc available");
         return;
@@ -269,7 +272,8 @@ fn payload_is_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
     let (cold, _) = export(&cache, &bin, &out, false);
     let file = cache_files(&cache).pop().expect("cache file");
     let bytes = std::fs::read(&file).unwrap();
-    assert_eq!(&bytes[HEADER_LEN..HEADER_LEN + 4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd frame magic");
+    let head = header_len(&bytes);
+    assert_eq!(&bytes[head..head + 4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd frame magic");
     // The compressed round trip hits and matches.
     let (warm, warm_err) = export(&cache, &bin, &out, false);
     assert!(warm_err.contains(HIT) && warm == cold);
@@ -279,7 +283,7 @@ fn payload_is_zstd_compressed_and_damage_is_detected_in_the_stored_bytes() {
     for damage in 0..2 {
         let mut b = bytes.clone();
         if damage == 0 {
-            let mid = HEADER_LEN + (b.len() - HEADER_LEN) / 2;
+            let mid = head + (b.len() - head) / 2;
             b[mid] ^= 0x55;
         } else {
             b.truncate(b.len() - 7);

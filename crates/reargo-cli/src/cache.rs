@@ -21,47 +21,111 @@
 //!   re-runs the pipeline once. The cache holds the results *before* the
 //!   overrides; they are applied after loading, every run, as after a
 //!   fresh analysis.
+//! * **Pre-key** (Unix): hashing the executable and the binary costs tens
+//!   of milliseconds, so the file also stores a second key built the same
+//!   way from each of those files' `stat` (device, inode, size, mtime and
+//!   ctime, to the nanosecond) instead of its bytes; the sidecar's bytes
+//!   are read either way. A load whose pre-key matches skips the content
+//!   hashing. The pre-key is only stored for files whose stat did not
+//!   change while they were hashed and whose times are at least
+//!   [`RACY`] older than the hashing: any later write to such a file
+//!   gives it a newer ctime (which no user can set back), so an equal
+//!   stat means equal bytes. Otherwise (or when the pre-key differs, e.g.
+//!   after a `touch`) the full key decides, and a matching full key
+//!   stores the then-current pre-key in the file's header.
 //! * **Flags**: no command-line flag reaches the pipeline. `--thumb`
 //!   only selects the lifters of `disasm` / `pcode` / `decompile` / …,
 //!   which run after the analysis and are not cached.
 //! * **Off switch**: the global `--no-cache` flag or `REARGO_NO_CACHE=1`.
-//! * **Compression**: the bincode payload is zstd-compressed
-//!   ([`ZSTD_LEVEL`]); the header's length and BLAKE3 cover the stored
-//!   (compressed) bytes, so corruption is caught before decompressing.
+//! * **Layout**: the results are split into sections — the large maps
+//!   (instructions, functions, symbols, references, comments, tags) in
+//!   chunks of [`CHUNK`] entries, the rest in one — each its own bincode
+//!   payload in its own zstd frame ([`ZSTD_LEVEL`], with zstd's content
+//!   checksum), so the sections are encoded, compressed, read,
+//!   decompressed and decoded in parallel, and the maps are rebuilt from
+//!   their sorted entries in one pass.
 //! * **Eviction**: after a write the directory is trimmed to
 //!   `$REARGO_CACHE_MAX_BYTES` (default [`DEFAULT_MAX_BYTES`], `0` =
 //!   unlimited) by deleting the least recently used `.rac` files (mtime,
 //!   refreshed on every hit), never the one just written.
-//! * **Integrity**: a header (magic, format, key, payload length, BLAKE3
-//!   of the stored payload) is checked before the payload is decoded; a file
-//!   that does not pass is ignored and rewritten. Files are written to a
-//!   temporary name and renamed into place, so a reader never sees a
-//!   partial file. A failure to read or write the cache never fails the
-//!   command (a write failure is a warning on stderr).
+//! * **Integrity**: a header (magic, format, key, pre-key, the section
+//!   table, BLAKE3 of the header without the pre-key) is checked before
+//!   anything is decoded, the file's length must be the header's plus the
+//!   sections', each section must decompress (checksum included) to its
+//!   recorded length and decode exactly; a file that does not pass is
+//!   ignored and rewritten. Files are written to a temporary name and
+//!   renamed into place, so a reader never sees a partial file (only the
+//!   pre-key is ever rewritten in place; a torn pre-key just does not
+//!   match). A failure to read or write the cache never fails the command
+//!   (a write failure is a warning on stderr).
 
-use std::io::Read;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use bincode::Options;
-use reargo_program::Program;
-use reargo_program::program::{AnalysisState, AnalysisStateRef};
+use rayon::prelude::*;
+use reargo_arch::DecodedInstruction;
+use reargo_program::comments::{CommentManager, CommentType};
+use reargo_program::metadata::ProgramMetadata;
+use reargo_program::program::AnalysisState;
+use reargo_program::reference::RefList;
+use reargo_program::{Function, Listing, Program, Reference, ReferenceManager, Symbol, SymbolTable, Tag, TagManager};
+use serde::{Deserialize, Serialize};
 
 /// Bump whenever the stored layout changes in a way the executable hash
 /// would not catch on its own (it always changes with the code, so this
 /// is a belt-and-braces version tag).
-pub const CACHE_FORMAT: u32 = 2;
+pub const CACHE_FORMAT: u32 = 3;
 
-/// zstd level of the stored payload.
+/// zstd level of the stored sections.
 pub const ZSTD_LEVEL: i32 = 1;
 
 /// Default cap on the cache directory's total size (2 GiB).
 pub const DEFAULT_MAX_BYTES: u64 = 2 << 30;
 
+/// Entries per section of a chunked map.
+pub const CHUNK: usize = 16384;
+
+/// How much older than the content hashing a file's mtime / ctime must
+/// be for its stat to stand for its bytes (covers coarse filesystem
+/// timestamps, down to FAT's 2 s).
+pub const RACY: Duration = Duration::from_secs(3);
+
 const EXT: &str = "rac";
 
 const MAGIC: &[u8; 16] = b"REARGO-ANACACHE\0";
-const HEADER_LEN: usize = 16 + 4 + 32 + 8 + 32;
+// Header layout: magic | format u32 | key [32] | pre-key [32] |
+// section count u32 | per section (kind u32, raw length u64, stored
+// length u64) | BLAKE3 of all of it but the pre-key.
+const KEY_AT: usize = 20;
+const PREKEY_AT: usize = 52;
+const COUNT_AT: usize = 84;
+const TABLE_AT: usize = 88;
+const TABLE_ENTRY: usize = 4 + 8 + 8;
+const MAX_SECTIONS: usize = 1 << 20;
+/// No section decompresses to more than this (a sanity bound on the
+/// allocation a damaged table could ask for).
+const MAX_RAW: u64 = 1 << 34;
+
+fn header_len(sections: usize) -> usize {
+    TABLE_AT + sections * TABLE_ENTRY + 32
+}
+
+/// Section kinds.
+const K_INSNS: u32 = 0;
+const K_FUNCS: u32 = 1;
+const K_SYM_ADDR: u32 = 2;
+const K_SYM_NAME: u32 = 3;
+const K_REFS_FROM: u32 = 4;
+const K_REFS_TO: u32 = 5;
+const K_COMMENTS: u32 = 6;
+const K_TAGS_ADDR: u32 = 7;
+const K_MISC: u32 = 8;
 
 /// The payload encoding: bincode with variable-length integers (most
 /// addresses and counts are small, so this roughly halves the file
@@ -96,30 +160,128 @@ pub fn cache_dir() -> Option<PathBuf> {
     non_empty("HOME").map(|h| h.join(".cache").join("re-argo"))
 }
 
-/// Where the results for one binary live, and the key they must carry.
+/// A file's identity and times (`stat`), standing for its bytes in the
+/// pre-key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    raw: [u8; 56],
+    /// The later of mtime and ctime, in nanoseconds since the epoch.
+    newest_ns: i128,
+}
+
+#[cfg(unix)]
+fn stamp(path: &Path) -> std::io::Result<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    let fields = [
+        m.dev(),
+        m.ino(),
+        m.size(),
+        m.mtime() as u64,
+        m.mtime_nsec() as u64,
+        m.ctime() as u64,
+        m.ctime_nsec() as u64,
+    ];
+    let mut raw = [0u8; 56];
+    for (i, v) in fields.iter().enumerate() {
+        raw[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let ns = |s: i64, n: i64| s as i128 * 1_000_000_000 + n as i128;
+    let newest_ns = ns(m.mtime(), m.mtime_nsec()).max(ns(m.ctime(), m.ctime_nsec()));
+    Ok(Stamp { raw, newest_ns })
+}
+
+/// No pre-key where ctime is not the inode change time.
+#[cfg(not(unix))]
+fn stamp(_path: &Path) -> std::io::Result<Stamp> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+/// The pre-key and the stamps it was built from.
+struct PreKey {
+    key: [u8; 32],
+    stamps: Vec<(PathBuf, Stamp)>,
+}
+
+/// The full key, and whether the pre-key computed before it stands for
+/// the same bytes (see the module documentation).
+struct FullKey {
+    key: [u8; 32],
+    pre_trusted: bool,
+}
+
+/// Where the results for one binary live, and the keys they must carry.
 pub struct Entry {
     file: PathBuf,
-    key: [u8; 32],
+    path: PathBuf,
+    canonical: PathBuf,
+    exe: PathBuf,
+    pre: Option<PreKey>,
+    full: OnceLock<Option<FullKey>>,
 }
 
 impl Entry {
     pub fn file(&self) -> &Path {
         &self.file
     }
+
+    /// The full key (hashing the files' bytes), computed once; `None`
+    /// (with a warning) when it cannot be.
+    fn full_key(&self) -> Option<&FullKey> {
+        self.full
+            .get_or_init(|| {
+                let start = SystemTime::now();
+                let mut files = Vec::new();
+                let mut h = blake3::Hasher::new();
+                field(&mut h, "kind", b"content");
+                let r = derive_key(&self.path, &self.canonical, &self.exe, &mut h, &mut |h, p| {
+                    hash_file(h, p)?;
+                    files.push(p.to_path_buf());
+                    Ok(())
+                });
+                match r {
+                    Ok(()) => {
+                        let pre_trusted = self.pre.as_ref().is_some_and(|pre| pre_trusted(pre, &files, start));
+                        Some(FullKey { key: *h.finalize().as_bytes(), pre_trusted })
+                    }
+                    Err(e) => {
+                        eprintln!("[cache] WARNING: not using the analysis cache: {e}");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+}
+
+/// Whether `pre` stands for the bytes hashed from `files` starting at
+/// `start`: the same files, each with the same stat now, and times older
+/// than `start` by [`RACY`].
+fn pre_trusted(pre: &PreKey, files: &[PathBuf], start: SystemTime) -> bool {
+    let Ok(start) = start.duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    let limit = start.saturating_sub(RACY).as_nanos() as i128;
+    pre.stamps.len() == files.len()
+        && pre.stamps.iter().zip(files).all(|((p, s), f)| {
+            p == f && s.newest_ns < limit && stamp(p).is_ok_and(|now| now == *s)
+        })
 }
 
 /// The cache entry for `path`, or `None` when the cache is off or the
-/// key cannot be computed (the command then runs uncached).
+/// entry cannot be located (the command then runs uncached).
 pub fn entry_for(path: &Path) -> Option<Entry> {
     if !enabled() {
         return None;
     }
     let dir = cache_dir()?;
-    match compute_key(path) {
-        Ok((key, canonical)) => {
+    let located = std::fs::canonicalize(path).and_then(|c| Ok((c, std::env::current_exe()?)));
+    match located {
+        Ok((canonical, exe)) => {
             let name = blake3::hash(canonical.as_os_str().as_encoded_bytes());
             let file = dir.join(format!("{}.{EXT}", &name.to_hex()[..32]));
-            Some(Entry { file, key })
+            let pre = pre_key(path, &canonical, &exe);
+            Some(Entry { file, path: path.to_path_buf(), canonical, exe, pre, full: OnceLock::new() })
         }
         Err(e) => {
             eprintln!("[cache] WARNING: not using the analysis cache: {e}");
@@ -128,23 +290,33 @@ pub fn entry_for(path: &Path) -> Option<Entry> {
     }
 }
 
+fn pre_key(path: &Path, canonical: &Path, exe: &Path) -> Option<PreKey> {
+    let mut stamps = Vec::new();
+    let mut h = blake3::Hasher::new();
+    field(&mut h, "kind", b"stamp");
+    derive_key(path, canonical, exe, &mut h, &mut |h, p| {
+        let s = stamp(p)?;
+        h.update(&s.raw);
+        stamps.push((p.to_path_buf(), s));
+        Ok(())
+    })
+    .ok()?;
+    Some(PreKey { key: *h.finalize().as_bytes(), stamps })
+}
+
+/// A file's length and bytes, into the key.
 fn hash_file(hasher: &mut blake3::Hasher, path: &Path) -> std::io::Result<()> {
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    hasher.update(&len.to_le_bytes());
-    let mut buf = vec![0u8; 1 << 20];
-    let mut total = 0u64;
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        total += n as u64;
-    }
+    let len = std::fs::metadata(path)?.len();
+    let data = std::fs::read(path)?;
     // A file that changed size while it was read is no stable input.
-    if total != len {
+    if data.len() as u64 != len {
         return Err(std::io::Error::other("file changed while it was hashed"));
+    }
+    hasher.update(&len.to_le_bytes());
+    if data.len() >= 1 << 20 {
+        hasher.update_rayon(&data);
+    } else {
+        hasher.update(&data);
     }
     Ok(())
 }
@@ -155,21 +327,26 @@ fn field(hasher: &mut blake3::Hasher, tag: &str, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn compute_key(path: &Path) -> std::io::Result<([u8; 32], PathBuf)> {
-    let canonical = std::fs::canonicalize(path)?;
-    let mut h = blake3::Hasher::new();
-    field(&mut h, "format", &CACHE_FORMAT.to_le_bytes());
-    field(&mut h, "version", env!("CARGO_PKG_VERSION").as_bytes());
+/// Hash every input of the analysis into `h`: `file` adds a file (its
+/// bytes for the key, its stat for the pre-key).
+fn derive_key(
+    path: &Path,
+    canonical: &Path,
+    exe: &Path,
+    h: &mut blake3::Hasher,
+    file: &mut dyn FnMut(&mut blake3::Hasher, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    field(h, "format", &CACHE_FORMAT.to_le_bytes());
+    field(h, "version", env!("CARGO_PKG_VERSION").as_bytes());
 
-    // The build: the running executable's own bytes, so a rebuild with
-    // any change to an analyzer never reads results of the old code.
-    let exe = std::env::current_exe()?;
+    // The build: the running executable, so a rebuild with any change to
+    // an analyzer never reads results of the old code.
     h.update(b"exe");
-    hash_file(&mut h, &exe)?;
+    file(h, exe)?;
 
-    field(&mut h, "path", canonical.as_os_str().as_encoded_bytes());
+    field(h, "path", canonical.as_os_str().as_encoded_bytes());
     h.update(b"binary");
-    hash_file(&mut h, &canonical)?;
+    file(h, canonical)?;
 
     // The PE Rich-header and Authenticode analyzers read the file named
     // like the binary relative to the working directory
@@ -177,12 +354,12 @@ fn compute_key(path: &Path) -> std::io::Result<([u8; 32], PathBuf)> {
     if let Some(name) = path.file_name() {
         let local = Path::new(name);
         match std::fs::canonicalize(local) {
-            Ok(c) if c == canonical => field(&mut h, "cwd-name", b"same"),
+            Ok(c) if c == canonical => field(h, "cwd-name", b"same"),
             Ok(c) => {
                 h.update(b"cwd-name:other");
-                hash_file(&mut h, &c)?;
+                file(h, &c)?;
             }
-            Err(_) => field(&mut h, "cwd-name", b"absent"),
+            Err(_) => field(h, "cwd-name", b"absent"),
         }
     }
 
@@ -190,40 +367,267 @@ fn compute_key(path: &Path) -> std::io::Result<([u8; 32], PathBuf)> {
     // applied after the pipeline, also after a cache load), but keying on
     // it means no future change can ever pair stale results with an
     // edited sidecar.
-    match std::fs::read(reargo_program::OverrideSet::sidecar_path(&canonical)) {
-        Ok(bytes) => field(&mut h, "sidecar", &bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => field(&mut h, "sidecar", b"\0absent"),
+    match std::fs::read(reargo_program::OverrideSet::sidecar_path(canonical)) {
+        Ok(bytes) => field(h, "sidecar", &bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => field(h, "sidecar", b"\0absent"),
         Err(e) => return Err(e),
     }
     if canonical != path {
         match std::fs::read(reargo_program::OverrideSet::sidecar_path(path)) {
-            Ok(bytes) => field(&mut h, "sidecar-arg", &bytes),
-            Err(_) => field(&mut h, "sidecar-arg", b"\0absent"),
+            Ok(bytes) => field(h, "sidecar-arg", &bytes),
+            Err(_) => field(h, "sidecar-arg", b"\0absent"),
         }
     }
-    Ok((*h.finalize().as_bytes(), canonical))
+    Ok(())
+}
+
+/// One stored section: what it holds, its decoded length, and where its
+/// zstd frame is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Section {
+    kind: u32,
+    raw_len: u64,
+    offset: u64,
+    stored_len: u64,
+}
+
+/// A checked header.
+#[derive(Debug, PartialEq, Eq)]
+struct Header {
+    key: [u8; 32],
+    prekey: [u8; 32],
+    sections: Vec<Section>,
+}
+
+/// BLAKE3 of a header's bytes but the pre-key (rewritten in place).
+fn header_hash(head: &[u8]) -> blake3::Hash {
+    let mut h = blake3::Hasher::new();
+    h.update(&head[..PREKEY_AT]);
+    h.update(&head[COUNT_AT..]);
+    h.finalize()
+}
+
+/// The header of a cache file of `file_len` bytes, read from `r`, when it
+/// is intact and describes exactly the rest of the file.
+fn read_header(r: &mut impl Read, file_len: u64) -> Option<Header> {
+    let mut head = vec![0u8; TABLE_AT];
+    r.read_exact(&mut head).ok()?;
+    if &head[..16] != MAGIC || u32::from_le_bytes(head[16..20].try_into().ok()?) != CACHE_FORMAT {
+        return None;
+    }
+    let count = u32::from_le_bytes(head[COUNT_AT..TABLE_AT].try_into().ok()?) as usize;
+    if count > MAX_SECTIONS || header_len(count) as u64 > file_len {
+        return None;
+    }
+    head.resize(header_len(count), 0);
+    r.read_exact(&mut head[TABLE_AT..]).ok()?;
+    let (body, hash) = head.split_at(header_len(count) - 32);
+    if header_hash(body).as_bytes() != hash {
+        return None;
+    }
+    let mut offset = header_len(count) as u64;
+    let mut sections = Vec::with_capacity(count);
+    for e in body[TABLE_AT..].chunks_exact(TABLE_ENTRY) {
+        let kind = u32::from_le_bytes(e[..4].try_into().ok()?);
+        let raw_len = u64::from_le_bytes(e[4..12].try_into().ok()?);
+        let stored_len = u64::from_le_bytes(e[12..20].try_into().ok()?);
+        if raw_len > MAX_RAW || stored_len > file_len {
+            return None;
+        }
+        sections.push(Section { kind, raw_len, offset, stored_len });
+        offset = offset.checked_add(stored_len)?;
+    }
+    if offset != file_len {
+        return None;
+    }
+    Some(Header {
+        key: head[KEY_AT..PREKEY_AT].try_into().ok()?,
+        prekey: head[PREKEY_AT..COUNT_AT].try_into().ok()?,
+        sections,
+    })
+}
+
+/// Read `buf.len()` bytes at `offset` (positioned: the sections are read
+/// from several threads at once).
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(file, buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_at(_file: &File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// The analysis results outside the large maps (one section).
+#[derive(Serialize)]
+struct MiscRef<'a> {
+    metadata: &'a ProgramMetadata,
+    call_renderings: &'a BTreeMap<u64, String>,
+    jumps: &'a [Reference],
+    tags_by_function: &'a BTreeMap<u64, Vec<Tag>>,
+}
+
+#[derive(Deserialize)]
+struct Misc {
+    metadata: ProgramMetadata,
+    call_renderings: BTreeMap<u64, String>,
+    jumps: Vec<Reference>,
+    tags_by_function: BTreeMap<u64, Vec<Tag>>,
+}
+
+/// One decoded section.
+enum Piece {
+    Insns(Vec<(u64, Box<DecodedInstruction>)>),
+    Funcs(Vec<(u64, Function)>),
+    SymAddr(Vec<(u64, Vec<Symbol>)>),
+    SymName(Vec<(String, Vec<u64>)>),
+    RefsFrom(Vec<(u64, RefList)>),
+    RefsTo(Vec<(u64, RefList)>),
+    Comments(Vec<((u64, CommentType), String)>),
+    TagsAddr(Vec<(u64, Vec<Tag>)>),
+    Misc(Box<Misc>),
+}
+
+fn decode_section(file: &File, s: &Section) -> Option<Piece> {
+    let mut stored = vec![0u8; usize::try_from(s.stored_len).ok()?];
+    read_at(file, &mut stored, s.offset).ok()?;
+    let raw = zstd::bulk::decompress(&stored, usize::try_from(s.raw_len).ok()?).ok()?;
+    drop(stored);
+    if raw.len() as u64 != s.raw_len {
+        return None;
+    }
+    let c = codec();
+    Some(match s.kind {
+        K_INSNS => Piece::Insns(c.deserialize(&raw).ok()?),
+        K_FUNCS => Piece::Funcs(c.deserialize(&raw).ok()?),
+        K_SYM_ADDR => Piece::SymAddr(c.deserialize(&raw).ok()?),
+        K_SYM_NAME => Piece::SymName(c.deserialize(&raw).ok()?),
+        K_REFS_FROM => Piece::RefsFrom(c.deserialize(&raw).ok()?),
+        K_REFS_TO => Piece::RefsTo(c.deserialize(&raw).ok()?),
+        K_COMMENTS => Piece::Comments(c.deserialize(&raw).ok()?),
+        K_TAGS_ADDR => Piece::TagsAddr(c.deserialize(&raw).ok()?),
+        K_MISC => Piece::Misc(Box::new(c.deserialize(&raw).ok()?)),
+        _ => return None,
+    })
+}
+
+/// The map of the entries of `chunks` (stored in key order, so building
+/// it is one linear pass).
+fn sorted_map<K: Ord, V>(chunks: Vec<Vec<(K, V)>>) -> BTreeMap<K, V> {
+    let mut all = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+    for c in chunks {
+        all.extend(c);
+    }
+    all.into_iter().collect()
+}
+
+/// The analysis state of the decoded sections.
+fn assemble(pieces: Vec<Piece>) -> Option<AnalysisState> {
+    let (mut insns, mut funcs, mut sym_addr, mut sym_name) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut refs_from, mut refs_to, mut comments, mut tags_addr) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut misc = None;
+    for p in pieces {
+        match p {
+            Piece::Insns(v) => insns.push(v),
+            Piece::Funcs(v) => funcs.push(v),
+            Piece::SymAddr(v) => sym_addr.push(v),
+            Piece::SymName(v) => sym_name.push(v),
+            Piece::RefsFrom(v) => refs_from.push(v),
+            Piece::RefsTo(v) => refs_to.push(v),
+            Piece::Comments(v) => comments.push(v),
+            Piece::TagsAddr(v) => tags_addr.push(v),
+            Piece::Misc(m) => {
+                if misc.replace(m).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    let misc = *misc?;
+
+    // The maps are independent: build them side by side.
+    let (mut insns_m, mut funcs_m, mut refs_from_m, mut refs_to_m) = (None, None, None, None);
+    let (mut sym_addr_m, mut comments_m, mut tags_addr_m, mut sym_name_m) = (None, None, None, None);
+    rayon::scope(|s| {
+        let (a, b, c, d) = (&mut insns_m, &mut funcs_m, &mut refs_from_m, &mut refs_to_m);
+        s.spawn(move |_| *a = Some(sorted_map(insns)));
+        s.spawn(move |_| *b = Some(sorted_map(funcs)));
+        s.spawn(move |_| *c = Some(sorted_map(refs_from)));
+        s.spawn(move |_| *d = Some(sorted_map(refs_to)));
+        let (e, f, g, h) = (&mut sym_addr_m, &mut comments_m, &mut tags_addr_m, &mut sym_name_m);
+        s.spawn(move |_| *e = Some(sorted_map(sym_addr)));
+        s.spawn(move |_| *f = Some(sorted_map(comments)));
+        s.spawn(move |_| *g = Some(sorted_map(tags_addr)));
+        s.spawn(move |_| *h = Some(sym_name.into_iter().flatten().collect::<HashMap<_, _>>()));
+    });
+    Some(AnalysisState {
+        listing: Listing::from_cache_parts(insns_m?, funcs_m?),
+        symbol_table: SymbolTable::from_cache_parts((sym_addr_m?, sym_name_m?)),
+        references: ReferenceManager::from_cache_parts(refs_from_m?, refs_to_m?, misc.jumps),
+        comments: CommentManager::from_cache_parts(comments_m?),
+        metadata: misc.metadata,
+        call_renderings: misc.call_renderings,
+        tags: TagManager::from_cache_parts(tags_addr_m?, misc.tags_by_function),
+    })
 }
 
 /// Read the stored results for `entry` into `program` (a fresh
 /// `Program::from_binary` of the binary). `false` — and `program`
 /// untouched — when there is no valid entry for this key.
 pub fn load(entry: &Entry, program: &mut Program) -> bool {
-    let Ok(data) = std::fs::read(&entry.file) else {
+    let Ok(mut file) = File::open(&entry.file) else {
         return false;
     };
-    let Some(payload) = check(&data, &entry.key) else {
+    let Some(len) = file.metadata().ok().map(|m| m.len()) else {
         return false;
     };
-    let Ok(raw) = zstd::stream::decode_all(payload) else {
+    let Some(header) = read_header(&mut file, len) else {
         return false;
     };
-    match codec().deserialize::<AnalysisState>(&raw) {
-        Ok(state) => {
-            program.restore_analysis_state(state);
-            touch(&entry.file);
-            true
+    let pre_hit = entry.pre.as_ref().is_some_and(|p| p.key == header.prekey);
+    if !pre_hit {
+        match entry.full_key() {
+            Some(full) if full.key == header.key => {
+                if full.pre_trusted
+                    && let Some(pre) = &entry.pre
+                {
+                    write_prekey(&entry.file, &pre.key);
+                }
+            }
+            _ => return false,
         }
-        Err(_) => false,
+    }
+    let pieces: Option<Vec<Piece>> =
+        header.sections.par_iter().with_max_len(1).map(|s| decode_section(&file, s)).collect();
+    let Some(state) = pieces.and_then(assemble) else {
+        return false;
+    };
+    program.restore_analysis_state(state);
+    touch(&entry.file);
+    true
+}
+
+/// Store `key` as the pre-key of the cache file `path` (best effort).
+fn write_prekey(path: &Path, key: &[u8; 32]) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.seek(std::io::SeekFrom::Start(PREKEY_AT as u64)).and_then(|_| f.write_all(key));
     }
 }
 
@@ -231,7 +635,7 @@ pub fn load(entry: &Entry, program: &mut Program) -> bool {
 /// effort: a read-only cache simply keeps its old times.
 fn touch(file: &Path) {
     if let Ok(f) = std::fs::OpenOptions::new().append(true).open(file) {
-        let _ = f.set_modified(std::time::SystemTime::now());
+        let _ = f.set_modified(SystemTime::now());
     }
 }
 
@@ -250,7 +654,7 @@ fn is_cache_file(path: &Path) -> bool {
         return false;
     }
     let mut magic = [0u8; 16];
-    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == MAGIC
+    File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == MAGIC
 }
 
 /// Delete the least recently used cache files in `dir` until their total
@@ -296,47 +700,109 @@ fn evict(dir: &Path, keep: &Path, cap: u64) -> usize {
     removed
 }
 
-/// The payload of a cache file, when its header is intact and matches
-/// `key`.
-fn check<'a>(data: &'a [u8], key: &[u8; 32]) -> Option<&'a [u8]> {
-    if data.len() < HEADER_LEN || &data[..16] != MAGIC {
-        return None;
+/// An encoder of one section.
+type Job<'a> = (u32, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync + 'a>);
+
+fn encode<T: Serialize + ?Sized>(v: &T) -> Result<Vec<u8>, String> {
+    codec().serialize(v).map_err(|e| format!("encode: {e}"))
+}
+
+/// One section per [`CHUNK`] entries of `items`.
+fn chunk_jobs<'a, T: Serialize + Sync>(jobs: &mut Vec<Job<'a>>, kind: u32, items: &'a [T]) {
+    for c in items.chunks(CHUNK) {
+        jobs.push((kind, Box::new(move || encode(c))));
     }
-    let format = u32::from_le_bytes(data[16..20].try_into().ok()?);
-    if format != CACHE_FORMAT || &data[20..52] != key {
-        return None;
+}
+
+fn compress(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let err = |e: std::io::Error| format!("compress: {e}");
+    let mut c = zstd::bulk::Compressor::new(ZSTD_LEVEL).map_err(err)?;
+    c.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true)).map_err(err)?;
+    c.compress(raw).map_err(err)
+}
+
+/// The cache file's bytes: the header, then each `(kind, raw length,
+/// stored bytes)` section.
+fn file_header(key: &[u8; 32], prekey: &[u8; 32], sections: &[(u32, u64, Vec<u8>)]) -> Vec<u8> {
+    let mut head = Vec::with_capacity(header_len(sections.len()));
+    head.extend_from_slice(MAGIC);
+    head.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
+    head.extend_from_slice(key);
+    head.extend_from_slice(prekey);
+    head.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+    for (kind, raw_len, stored) in sections {
+        head.extend_from_slice(&kind.to_le_bytes());
+        head.extend_from_slice(&raw_len.to_le_bytes());
+        head.extend_from_slice(&(stored.len() as u64).to_le_bytes());
     }
-    let len = u64::from_le_bytes(data[52..60].try_into().ok()?);
-    let payload = &data[HEADER_LEN..];
-    if payload.len() as u64 != len {
-        return None;
-    }
-    if blake3::hash(payload).as_bytes() != &data[60..92] {
-        return None;
-    }
-    Some(payload)
+    let hash = header_hash(&head);
+    head.extend_from_slice(hash.as_bytes());
+    head
 }
 
 /// Store `program`'s analysis results (before the override sidecar is
 /// applied) for `entry`. Errors are for a warning only.
 pub fn store(entry: &Entry, program: &Program) -> Result<(), String> {
-    let state: AnalysisStateRef<'_> = program.analysis_state();
-    let raw = codec().serialize(&state).map_err(|e| format!("encode: {e}"))?;
-    let payload = zstd::stream::encode_all(&raw[..], ZSTD_LEVEL).map_err(|e| format!("compress: {e}"))?;
-    drop(raw);
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
-    out.extend_from_slice(&entry.key);
-    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    out.extend_from_slice(blake3::hash(&payload).as_bytes());
-    out.extend_from_slice(&payload);
-    drop(payload);
+    // No key: the warning is out already, and nothing can be stored.
+    let Some(full) = entry.full_key() else {
+        return Ok(());
+    };
+    let prekey = match &entry.pre {
+        Some(pre) if full.pre_trusted => pre.key,
+        _ => [0u8; 32],
+    };
+    let state = program.analysis_state();
+    let (insns, funcs) = state.listing.cache_parts();
+    let (sym_addr, sym_name) = state.symbol_table.cache_parts();
+    let (refs_from, refs_to, jumps) = state.references.cache_parts();
+    let (tags_addr, tags_func) = state.tags.cache_parts();
+    let insns: Vec<_> = insns.iter().collect();
+    let funcs: Vec<_> = funcs.iter().collect();
+    let sym_addr: Vec<_> = sym_addr.iter().collect();
+    let sym_name: Vec<_> = sym_name.iter().collect();
+    let refs_from: Vec<_> = refs_from.iter().collect();
+    let refs_to: Vec<_> = refs_to.iter().collect();
+    let comments: Vec<_> = state.comments.cache_parts().iter().collect();
+    let tags_addr: Vec<_> = tags_addr.iter().collect();
+    let misc = MiscRef {
+        metadata: state.metadata,
+        call_renderings: state.call_renderings,
+        jumps,
+        tags_by_function: tags_func,
+    };
+
+    let mut jobs: Vec<Job<'_>> = Vec::new();
+    chunk_jobs(&mut jobs, K_INSNS, &insns);
+    chunk_jobs(&mut jobs, K_FUNCS, &funcs);
+    chunk_jobs(&mut jobs, K_SYM_ADDR, &sym_addr);
+    chunk_jobs(&mut jobs, K_SYM_NAME, &sym_name);
+    chunk_jobs(&mut jobs, K_REFS_FROM, &refs_from);
+    chunk_jobs(&mut jobs, K_REFS_TO, &refs_to);
+    chunk_jobs(&mut jobs, K_COMMENTS, &comments);
+    chunk_jobs(&mut jobs, K_TAGS_ADDR, &tags_addr);
+    jobs.push((K_MISC, Box::new(|| encode(&misc))));
+
+    let sections: Vec<(u32, u64, Vec<u8>)> = jobs
+        .par_iter()
+        .with_max_len(1)
+        .map(|(kind, job)| {
+            let raw = job()?;
+            Ok((*kind, raw.len() as u64, compress(&raw)?))
+        })
+        .collect::<Result<_, String>>()?;
+    let head = file_header(&full.key, &prekey, &sections);
 
     let dir = entry.file.parent().ok_or("cache path has no directory")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = entry.file.with_extension(format!("tmp.{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, &out) {
+    let written = File::create(&tmp).and_then(|mut f| {
+        f.write_all(&head)?;
+        for (_, _, stored) in &sections {
+            f.write_all(stored)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("write {}: {e}", tmp.display()));
     }
@@ -353,30 +819,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn check_rejects_damaged_files() {
+    fn header_rejects_damaged_files() {
         let key = [7u8; 32];
-        let payload = b"payload bytes";
-        let mut f = Vec::new();
-        f.extend_from_slice(MAGIC);
-        f.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
-        f.extend_from_slice(&key);
-        f.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        f.extend_from_slice(blake3::hash(payload).as_bytes());
-        f.extend_from_slice(payload);
-        assert_eq!(check(&f, &key), Some(&payload[..]));
-        // Another key.
-        assert_eq!(check(&f, &[8u8; 32]), None);
-        // Truncated.
-        assert_eq!(check(&f[..f.len() - 1], &key), None);
-        assert_eq!(check(&f[..10], &key), None);
-        // A flipped payload byte.
+        let sections = vec![(K_INSNS, 10u64, vec![1u8; 5]), (K_MISC, 3u64, vec![2u8; 4])];
+        let mut f = file_header(&key, &[9u8; 32], &sections);
+        let head_len = f.len();
+        for (_, _, s) in &sections {
+            f.extend_from_slice(s);
+        }
+        let read = |b: &[u8]| read_header(&mut &b[..], b.len() as u64);
+        let h = read(&f).expect("intact header");
+        assert_eq!(h.key, key);
+        assert_eq!(h.prekey, [9u8; 32]);
+        assert_eq!(
+            h.sections,
+            vec![
+                Section { kind: K_INSNS, raw_len: 10, offset: head_len as u64, stored_len: 5 },
+                Section { kind: K_MISC, raw_len: 3, offset: head_len as u64 + 5, stored_len: 4 },
+            ]
+        );
+        // The pre-key is rewritten in place: not covered by the hash.
         let mut g = f.clone();
-        *g.last_mut().unwrap() ^= 1;
-        assert_eq!(check(&g, &key), None);
-        // Another format.
+        g[PREKEY_AT..COUNT_AT].copy_from_slice(&[0u8; 32]);
+        assert_eq!(read(&g).unwrap().prekey, [0u8; 32]);
+        // Truncated, or longer than the sections.
+        assert_eq!(read(&f[..f.len() - 1]), None);
+        assert_eq!(read(&f[..10]), None);
         let mut g = f.clone();
-        g[16] ^= 1;
-        assert_eq!(check(&g, &key), None);
+        g.push(0);
+        assert_eq!(read(&g), None);
+        // Any flipped header byte but the pre-key's: the key, the format,
+        // the table, the hash.
+        for at in [0, 16, KEY_AT + 3, COUNT_AT, TABLE_AT + 5, head_len - 1] {
+            let mut g = f.clone();
+            g[at] ^= 1;
+            assert_eq!(read(&g), None, "flipped byte {at}");
+        }
+    }
+
+    #[test]
+    fn sections_round_trip_and_damage_is_caught() {
+        let raw = encode(&vec![(1u64, "a".to_string()), (2, "b".to_string())]).unwrap();
+        let stored = compress(&raw).unwrap();
+        let dir = std::env::temp_dir().join(format!("reargo-sections-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.bin");
+        let section = Section { kind: K_COMMENTS, raw_len: raw.len() as u64, offset: 0, stored_len: stored.len() as u64 };
+        let decode = |bytes: &[u8], s: &Section| {
+            std::fs::write(&p, bytes).unwrap();
+            decode_section(&File::open(&p).unwrap(), s)
+        };
+        // Wrong type for the bytes: not decodable as comments.
+        assert!(decode(&stored, &section).is_none());
+        let raw = encode(&vec![((1u64, CommentType::Eol), "a".to_string())]).unwrap();
+        let stored = compress(&raw).unwrap();
+        let section = Section { stored_len: stored.len() as u64, raw_len: raw.len() as u64, ..section };
+        assert!(matches!(decode(&stored, &section), Some(Piece::Comments(v)) if v.len() == 1));
+        // Any flipped stored byte (zstd's checksum covers the content), a
+        // wrong recorded length.
+        for at in 0..stored.len() {
+            let mut b = stored.clone();
+            b[at] ^= 0x20;
+            assert!(decode(&b, &section).is_none(), "flipped byte {at}");
+        }
+        let longer = Section { raw_len: section.raw_len + 1, ..section };
+        assert!(decode(&stored, &longer).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn cache_file(dir: &Path, name: &str, size: usize, mtime_secs: u64) -> PathBuf {
@@ -422,6 +931,40 @@ mod tests {
         touch(&p);
         let m = std::fs::metadata(&p).unwrap().modified().unwrap();
         assert!(m > std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_key_follows_the_stat_and_is_trusted_only_for_settled_files() {
+        let dir = std::env::temp_dir().join(format!("reargo-prekey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("bin");
+        std::fs::write(&bin, b"one").unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let canonical = std::fs::canonicalize(&bin).unwrap();
+        let a = pre_key(&bin, &canonical, &exe).unwrap();
+        assert_eq!(a.key, pre_key(&bin, &canonical, &exe).unwrap().key, "deterministic");
+        let files: Vec<PathBuf> = a.stamps.iter().map(|(p, _)| p.clone()).collect();
+        // Just written: too recent to stand for its bytes.
+        assert!(!pre_trusted(&a, &files, SystemTime::now()));
+        // As if hashed long after the last write: trusted.
+        let later = SystemTime::now() + RACY + Duration::from_secs(1);
+        assert!(pre_trusted(&a, &files, later));
+        // Rewritten (same size, even with the old mtime put back): the
+        // stat differs (ctime), so does the pre-key, and the old one is
+        // no longer trusted.
+        let mtime = std::fs::metadata(&bin).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&bin, b"two").unwrap();
+        std::fs::OpenOptions::new().append(true).open(&bin).unwrap().set_modified(mtime).unwrap();
+        let b = pre_key(&bin, &canonical, &exe).unwrap();
+        assert_ne!(a.key, b.key);
+        assert!(!pre_trusted(&a, &files, later));
+        // A sidecar is read in full.
+        std::fs::write(reargo_program::OverrideSet::sidecar_path(&canonical), b"{}").unwrap();
+        assert_ne!(b.key, pre_key(&bin, &canonical, &exe).unwrap().key);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

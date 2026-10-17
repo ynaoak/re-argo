@@ -26,6 +26,16 @@ impl CommentManager {
         Self::default()
     }
 
+    /// The comment map, for the on-disk analysis cache.
+    pub fn cache_parts(&self) -> &BTreeMap<(u64, CommentType), String> {
+        &self.comments
+    }
+
+    /// A manager of the map [`Self::cache_parts`] returned.
+    pub fn from_cache_parts(comments: BTreeMap<(u64, CommentType), String>) -> Self {
+        Self { comments }
+    }
+
     pub fn set(&mut self, address: u64, comment_type: CommentType, text: impl Into<String>) {
         self.comments.insert((address, comment_type), text.into());
     }

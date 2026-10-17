@@ -15,6 +15,21 @@ impl Listing {
         Self::default()
     }
 
+    /// The instruction and function maps, for the on-disk analysis cache
+    /// (which stores them in chunks and rebuilds them with
+    /// [`Self::from_cache_parts`]).
+    pub fn cache_parts(&self) -> (&BTreeMap<u64, Box<DecodedInstruction>>, &BTreeMap<u64, Function>) {
+        (&self.instructions, &self.functions)
+    }
+
+    /// A listing of the maps [`Self::cache_parts`] returned.
+    pub fn from_cache_parts(
+        instructions: BTreeMap<u64, Box<DecodedInstruction>>,
+        functions: BTreeMap<u64, Function>,
+    ) -> Self {
+        Self { instructions, functions }
+    }
+
     pub fn add_instruction(&mut self, insn: DecodedInstruction) {
         self.instructions.insert(insn.address, Box::new(insn));
     }

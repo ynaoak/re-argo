@@ -121,6 +121,17 @@ impl TagManager {
         Self::default()
     }
 
+    /// The address-scope and function-scope maps, for the on-disk
+    /// analysis cache.
+    pub fn cache_parts(&self) -> (&BTreeMap<u64, Vec<Tag>>, &BTreeMap<u64, Vec<Tag>>) {
+        (&self.by_address, &self.by_function)
+    }
+
+    /// A manager of the maps [`Self::cache_parts`] returned.
+    pub fn from_cache_parts(by_address: BTreeMap<u64, Vec<Tag>>, by_function: BTreeMap<u64, Vec<Tag>>) -> Self {
+        Self { by_address, by_function }
+    }
+
     /// Tag an address. The same `(address, kind)` pair is allowed to
     /// appear multiple times — different analyzers may add the same
     /// kind for different reasons (e.g. crypto: AES S-box + crypto:
