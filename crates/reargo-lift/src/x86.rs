@@ -3320,9 +3320,42 @@ impl X86Lifter {
     /// exactly their number: the lift holds no spare room, and the ops are
     /// moved once where only the GPR views are added.
     fn finish_ops(&self, mut ops: Vec<PcodeOp>, insn: &iced_x86::Instruction) -> Vec<PcodeOp> {
-        let xmm = needs_xmm_views(&ops);
-        if self.is_64 && touches_gpr(&ops) {
-            let extra: usize = ops.iter().map(gpr_extra).sum();
+        // (one pass: whether an XMM view is written and the XMM views need syncing, whether a
+        // GPR view is written or a high byte read / written, and how many ops
+        // `zero_extend_gpr32_writes` adds)
+        let (mut xmm, mut touches, mut extra) = (false, false, 0usize);
+        for op in &ops {
+            let mut reads = 0;
+            let mut last: Option<VarnodeData> = None;
+            for v in op.inputs.iter().filter(|v| high_byte(v)) {
+                if last != Some(*v) {
+                    reads += 1;
+                }
+                last = Some(*v);
+            }
+            touches |= reads > 0;
+            extra += reads;
+            let Some(w) = op.output else { continue };
+            if w.space != REG_SPACE {
+                continue;
+            }
+            xmm |= xmm_view(&w).is_some();
+            if high_byte(&w) {
+                touches = true;
+                extra += 4;
+            } else if gpr_view(&w) {
+                touches = true;
+                let is_rsp = w.offset == 0x20;
+                extra += match w.size {
+                    8 if !is_rsp => 3,
+                    8 => 0,
+                    4 => 1 + if is_rsp { 0 } else { 2 },
+                    _ if !is_rsp => 4,
+                    _ => 0,
+                };
+            }
+        }
+        if self.is_64 && touches {
             if extra == 0 {
                 for (i, op) in ops.iter_mut().enumerate() {
                     op.seq.order = i as u32;
@@ -3684,45 +3717,6 @@ fn high_byte(v: &VarnodeData) -> bool {
     v.space == REG_SPACE && v.offset < 0x20 && v.offset % 8 == 1 && v.size == 1
 }
 
-/// Whether [`zero_extend_gpr32_writes`] rewrites `ops` (renumbering them
-/// at least).
-fn touches_gpr(ops: &[PcodeOp]) -> bool {
-    ops.iter().any(|o| o.output.as_ref().is_some_and(|v| gpr_view(v) || high_byte(v)) || o.inputs.iter().any(high_byte))
-}
-
-/// The ops [`zero_extend_gpr32_writes`] adds around `op`.
-fn gpr_extra(op: &PcodeOp) -> usize {
-    let mut reads = 0;
-    let mut last: Option<VarnodeData> = None;
-    for v in op.inputs.iter().filter(|v| high_byte(v)) {
-        if last != Some(*v) {
-            reads += 1;
-        }
-        last = Some(*v);
-    }
-    let Some(w) = op.output else { return reads };
-    if high_byte(&w) {
-        return reads + 4;
-    }
-    if !gpr_view(&w) {
-        return reads;
-    }
-    let is_rsp = w.offset == 0x20;
-    reads
-        + match w.size {
-            8 if !is_rsp => 3,
-            8 => 0,
-            4 => 1 + if is_rsp { 0 } else { 2 },
-            _ if !is_rsp => 4,
-            _ => 0,
-        }
-}
-
-/// Whether [`sync_xmm_views`] rewrites `ops`.
-fn needs_xmm_views(ops: &[PcodeOp]) -> bool {
-    ops.iter().any(|o| o.output.as_ref().and_then(xmm_view).is_some())
-}
-
 /// The XMM register a 4 / 8 / 16-byte view of it starts.
 fn xmm_view(v: &VarnodeData) -> Option<u64> {
     let end = XMM_BASE + 16 * 0x10;
@@ -3735,7 +3729,7 @@ fn xmm_view(v: &VarnodeData) -> Option<u64> {
 }
 
 /// The ops of `ops` (drained) with the GPR views kept coherent, in `out`
-/// (empty; [`touches_gpr`] holds for `ops`).
+/// (empty; `ops` writes a GPR view or reads / writes a high byte).
 fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>) -> Vec<PcodeOp> {
     let gpr = |v: &VarnodeData| gpr_view(v).then_some(*v);
     let high = high_byte;

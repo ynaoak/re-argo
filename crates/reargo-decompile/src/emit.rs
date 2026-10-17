@@ -93,6 +93,8 @@ pub struct CEmitter<'a> {
     /// Track which addresses we've already emitted annotations for,
     /// so multi-op instructions don't repeat the same comment.
     emitted: std::cell::RefCell<rustc_hash::FxHashSet<u64>>,
+    /// The address `emitted` took last.
+    last_annotated: std::cell::Cell<Option<u64>>,
     /// Blocks some `goto` jumps to: each gets a `label_<addr>:` line where its code starts
     /// (otherwise the `goto` names a label that is never printed).
     goto_targets: std::collections::BTreeSet<usize>,
@@ -172,6 +174,7 @@ impl CEmitter<'static> {
             select_conds: Default::default(),
             inlined: Default::default(),
             emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
+            last_annotated: std::cell::Cell::new(None),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
@@ -218,6 +221,7 @@ impl<'a> CEmitter<'a> {
             select_conds: Default::default(),
             inlined: Default::default(),
             emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
+            last_annotated: std::cell::Cell::new(None),
             goto_targets: std::collections::BTreeSet::new(),
             noise: rustc_hash::FxHashSet::default(),
             folded: rustc_hash::FxHashSet::default(),
@@ -651,11 +655,13 @@ impl<'a> CEmitter<'a> {
         let Some(ann) = self.annotations else {
             return;
         };
-        if self.emitted.borrow().contains(&addr) {
+        // (the ops of one instruction follow each other: the last address asked about first)
+        if self.last_annotated.get() == Some(addr) || self.emitted.borrow().contains(&addr) {
             return;
         }
         let Some(lines) = ann.get(&addr) else {
             self.emitted.borrow_mut().insert(addr);
+            self.last_annotated.set(Some(addr));
             return;
         };
         for ln in lines {
@@ -665,6 +671,7 @@ impl<'a> CEmitter<'a> {
             linef!(self, "// {}", cleaned);
         }
         self.emitted.borrow_mut().insert(addr);
+        self.last_annotated.set(Some(addr));
     }
 
     fn emit_op(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {

@@ -121,9 +121,10 @@ pub struct SsaFunction {
     pub phantom_writes: Vec<(usize, u128)>,
     /// The slots of [`Self::phantom_writes`]' bits.
     pub phantom_regs: Vec<(u32, u64, u32)>,
-    /// The values read of definitions left out (by phis nothing reads), increasing: they have
-    /// no defining op, but are no value on entry ([`Self::is_incoming`]).
-    pub phantom_vars: Vec<VarId>,
+    /// The values read of definitions left out (by phis nothing reads, or calls as arguments
+    /// they drop), as bits by id: they have no defining op, but are no value on entry
+    /// ([`Self::is_incoming`]).
+    phantom_vars: Vec<u64>,
     /// [`Self::incoming_registers`], made when first asked.
     incoming_cache: std::sync::OnceLock<Vec<VarId>>,
 }
@@ -228,11 +229,20 @@ impl SsaFunction {
         let (mut n_consts, mut n_outputs) = (0usize, 0usize);
         // (the calls' register inputs: those reading a definition left out get a value each)
         let mut n_call_reads = 0usize;
+        // (the slots asked about recently by a cheap hash of their key, before the map: a
+        // block reads and writes a few registers and temporaries over and over)
+        let mut recent: [(Key, u32); 256] = [((u32::MAX, 0, 0), 0); 256];
         let mut intern = |k: Key| -> u32 {
-            *slot_of.entry(k).or_insert_with(|| {
+            let h = ((k.1 ^ (k.1 >> 8) ^ u64::from(k.2) ^ u64::from(k.0) << 4) & 255) as usize;
+            if recent[h].0 == k {
+                return recent[h].1;
+            }
+            let id = *slot_of.entry(k).or_insert_with(|| {
                 slots.push(k);
                 (slots.len() - 1) as u32
-            })
+            });
+            recent[h] = (k, id);
+            id
         };
         for (b, block) in cfg.blocks.iter().enumerate() {
             kid_start[b] = kids.len();
@@ -693,14 +703,18 @@ impl SsaFunction {
     /// A read of a definition left out ([`PhantomDefs`]).
     fn phantom_var(&mut self, data: VarnodeData, version: u32) -> VarId {
         let id = self.push_var(data, version);
-        self.phantom_vars.push(id);
+        let w = id as usize / 64;
+        if self.phantom_vars.len() <= w {
+            self.phantom_vars.resize(w + 1, 0);
+        }
+        self.phantom_vars[w] |= 1 << (id % 64);
         id
     }
 
     /// Is `v` the value of a slot on entry (no defining op, and not a read of a definition
     /// left out)?
     pub fn is_incoming(&self, v: &SsaVarnode) -> bool {
-        v.def_op.is_none() && self.phantom_vars.binary_search(&v.id).is_err()
+        v.def_op.is_none() && self.phantom_vars.get(v.id as usize / 64).is_none_or(|w| w >> (v.id % 64) & 1 == 0)
     }
 
     /// The registers' values on entry ([`Self::is_incoming`]) in arena order, listed when first
