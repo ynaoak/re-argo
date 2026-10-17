@@ -584,13 +584,18 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     type Readers = rustc_hash::FxHashMap<ValueKey, SmallVec<[usize; 4]>>;
     type Writers = rustc_hash::FxHashMap<(u32, u64, u32), u32>;
     let build = |func: &SsaFunction| -> (Readers, Writers) {
-        let mut readers: Readers = Default::default();
-        let mut writers: Writers = Default::default();
+        // (sized once from the live ops; a constant is never a duplicate's value: not listed)
+        let live = func.ops.iter().filter(|o| !o.dead).count();
+        let mut readers: Readers = rustc_hash::FxHashMap::with_capacity_and_hasher(live, Default::default());
+        let mut writers: Writers = rustc_hash::FxHashMap::with_capacity_and_hasher(live / 2, Default::default());
         for (k, op) in func.ops.iter().enumerate() {
             if op.dead {
                 continue;
             }
             for &v in &op.inputs {
+                if func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST {
+                    continue;
+                }
                 readers.entry(value_key(func, v)).or_default().push(k);
             }
             if let Some(o) = op.output {
