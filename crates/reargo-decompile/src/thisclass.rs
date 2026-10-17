@@ -269,6 +269,9 @@ impl Summary {
 struct St {
     r: [Val; 16],
     slots: SmallVec<[(i32, Val); 8]>,
+    /// (WS96) the vector registers known to hold zero: bit `i` the low 128 bits of `xmm<i>`,
+    /// bit `16 + i` all of `ymm<i>` (a VEX `vxorps` zeroes the whole register)
+    zero: u32,
 }
 
 impl St {
@@ -278,11 +281,11 @@ impl St {
             r[a] = Val::Ptr(Src::Arg(i as u8), 0);
         }
         r[RSP] = Val::Ptr(Src::Stack, 0);
-        St { r, slots: SmallVec::new() }
+        St { r, slots: SmallVec::new(), zero: 0 }
     }
 
     fn unknown() -> St {
-        St { r: [Val::Unk; 16], slots: SmallVec::new() }
+        St { r: [Val::Unk; 16], slots: SmallVec::new(), zero: 0 }
     }
 
     /// `self ∧= o`; whether `self` changed.
@@ -294,6 +297,10 @@ impl St {
     /// the join: the slot keeps the first marker and `aliases` gets the pair.
     fn meet_objects(&mut self, o: &St, aliases: &mut Vec<(Instance, Instance)>) -> bool {
         let mut changed = false;
+        if self.zero & o.zero != self.zero {
+            self.zero &= o.zero;
+            changed = true;
+        }
         for (a, b) in self.r.iter_mut().zip(o.r.iter()) {
             if *a != *b && *a != Val::Unk {
                 // (two pointers into one buffer: an element of it)
@@ -357,6 +364,20 @@ impl St {
             self.slots.push((off, v));
         }
     }
+}
+
+/// The number of a vector register (`xmm`, `ymm`, `zmm` 0..15).
+fn vreg(r: Register) -> Option<usize> {
+    let n = if r.is_xmm() {
+        r as usize - Register::XMM0 as usize
+    } else if r.is_ymm() {
+        r as usize - Register::YMM0 as usize
+    } else if r.is_zmm() {
+        r as usize - Register::ZMM0 as usize
+    } else {
+        return None;
+    };
+    (n < 16).then_some(n)
 }
 
 fn gpr(r: Register) -> Option<usize> {
@@ -765,6 +786,7 @@ impl Interp<'_> {
                 for &c in &CALLER_SAVED {
                     st.r[c] = Val::Unk;
                 }
+                st.zero = 0;
                 st.r[RAX] = if id != u32::MAX { Val::Ptr(Src::Ret(id), 0) } else { Val::Unk };
                 let mut after = st.clone();
                 after.r[RAX] = Val::Unk;
@@ -794,8 +816,51 @@ impl Interp<'_> {
                     let s = st.clone();
                     self.fallback_with(&s);
                 }
+                _ if self.vector_zero(st, i, emit) => {}
                 _ => self.generic(st, i, emit),
             },
+        }
+    }
+
+    /// (WS96) A vector register zeroed (`xorps x, x`, `pxor`, `vxorps x, x, x`) or a zeroed one
+    /// stored (`movups [m], x`: zeros, no pointer — a container's default constructor, `clear`);
+    /// whether `i` was one of those.
+    fn vector_zero(&mut self, st: &mut St, i: &Instruction, emit: bool) -> bool {
+        use Mnemonic as M;
+        match i.mnemonic() {
+            M::Xorps | M::Xorpd | M::Pxor if i.op_count() == 2 && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register && i.op0_register() == i.op1_register() => {
+                let Some(n) = vreg(i.op0_register()) else { return false };
+                st.zero = (st.zero | (1 << n)) & !(1 << (16 + n));
+                true
+            }
+            M::Vxorps | M::Vxorpd | M::Vpxor | M::Vpxord | M::Vpxorq
+                if i.op_count() == 3 && (0..3).all(|k| i.op_kind(k) == OpKind::Register) && i.op1_register() == i.op2_register() && !i.op0_register().is_zmm() =>
+            {
+                let Some(n) = vreg(i.op0_register()) else { return false };
+                st.zero |= (1 << n) | (1 << (16 + n));
+                true
+            }
+            M::Movups | M::Movaps | M::Movupd | M::Movapd | M::Movdqu | M::Movdqa | M::Vmovups | M::Vmovaps | M::Vmovupd | M::Vmovapd | M::Vmovdqu | M::Vmovdqa
+                if i.op_count() == 2 && i.op0_kind() == OpKind::Memory && i.op1_kind() == OpKind::Register =>
+            {
+                let r = i.op1_register();
+                let Some(n) = vreg(r) else { return false };
+                let size = i.memory_size().size() as u32;
+                let zero = match (r.is_xmm(), r.is_ymm()) {
+                    (true, _) => st.zero & (1 << n) != 0 && size == 16,
+                    (_, true) => st.zero & (1 << (16 + n)) != 0 && size == 32,
+                    _ => false,
+                };
+                if !zero {
+                    return false;
+                }
+                let a = self.addr(st, i);
+                for k in 0..size / 8 {
+                    self.store(st, add(a, i64::from(k) * 8), 8, Val::Const(0), emit);
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -806,10 +871,12 @@ impl Interp<'_> {
         let addr = if has_mem { self.addr(st, i) } else { Val::Unk };
         let info = self.info.info(i);
         for u in info.used_registers() {
-            if matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
-                && let Some(g) = gpr(u.register())
-            {
-                st.r[g] = Val::Unk;
+            if matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite) {
+                if let Some(g) = gpr(u.register()) {
+                    st.r[g] = Val::Unk;
+                } else if let Some(n) = vreg(u.register()) {
+                    st.zero &= !((1 << n) | (1 << (16 + n)));
+                }
             }
         }
         let writes_memory = info
@@ -2415,6 +2482,25 @@ mod tests {
         assert_eq!(s.stack_fields, [(0, 0, 8, FieldVal::Ptr(Src::Arg(1), 0))]);
         assert_eq!(s.field_stores, [(Src::Arg(0), 0x10, Src::Arg(1), 0)]);
         assert_eq!(s.field_clobbers, [(Src::Arg(0), 0x18, 4)]);
+    }
+
+    /// WS96: a zeroed vector register stored writes zeros (a container's default constructor),
+    /// not an unknown pointer; one written since (or across a call) is unknown again.
+    #[test]
+    fn a_zeroed_vector_register_stores_no_unknown_pointer() {
+        let code = [
+            0x0f, 0x57, 0xc0, // xorps xmm0, xmm0
+            0x0f, 0x11, 0x47, 0x10, // movups [rdi+0x10], xmm0 (zeros)
+            0xc5, 0xf8, 0x57, 0xc9, // vxorps xmm1, xmm0, xmm1 (no zero idiom: xmm0 ^ xmm1)
+            0x0f, 0x11, 0x4f, 0x20, // movups [rdi+0x20], xmm1 (unknown)
+            0xc5, 0xf0, 0x57, 0xc9, // vxorps xmm1, xmm1, xmm1
+            0xc5, 0xfc, 0x11, 0x4f, 0x30, // vmovups [rdi+0x30], ymm1 (32 zero bytes)
+            0x0f, 0x10, 0x06, // movups xmm0, [rsi]
+            0x0f, 0x11, 0x47, 0x50, // movups [rdi+0x50], xmm0 (a copy)
+            0xc3,
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        assert_eq!(s.field_clobbers, [(Src::Arg(0), 0x20, 16), (Src::Arg(0), 0x50, 16)]);
     }
 
     /// WS95: a pointer stepped through a buffer in a loop, or indexed, points to its elements:
