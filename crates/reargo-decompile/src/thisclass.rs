@@ -1084,6 +1084,9 @@ pub struct ThisIndex {
     /// `(function, parameter, k)` -> the class of the pointer at `+k` of the object every caller
     /// passes as that parameter (WS94)
     pub param_fields: FxHashMap<(u64, u8, i32), u32>,
+    /// `(container class, begin offset)` -> the class of the pointers in the buffer (an array /
+    /// a vector) whose begin pointer is at that offset of the class (class + 2; WS95)
+    pub elements: FxHashMap<(u32, i32), u32>,
     pub stats: IndexStats,
 }
 
@@ -1138,6 +1141,16 @@ impl ThisIndex {
         (l >= 2).then(|| self.vt(l - 2)).flatten()
     }
 
+    /// The class (primary vtable) of the pointers in the buffer whose begin pointer is at offset
+    /// `off` of objects of the class whose primary vtable is `vt` (WS95): the join of what the
+    /// functions of that class and of its bases store into it.
+    pub fn element_class(&self, vt: u64, off: i64) -> Option<u64> {
+        let c = self.class_of_vtable(vt)?;
+        let off = i32::try_from(off).ok()?;
+        let l = lookup(&self.hierarchy, &self.elements, c, off);
+        (l >= 2).then(|| self.vt(l - 2)).flatten()
+    }
+
     /// The fields and member objects of known class of the class whose primary vtable is `vt`
     /// (its own and its bases'): `(offset, class vtable, member)` by offset.
     pub fn class_fields(&self, vt: u64) -> Vec<(i32, u64, bool)> {
@@ -1153,6 +1166,24 @@ impl ThisIndex {
             .filter_map(|(off, m)| {
                 let l = lookup(&self.hierarchy, if m { &self.members } else { &self.fields }, c, off);
                 Some((off, self.vt((l >= 2).then(|| l - 2)?)?, m))
+            })
+            .collect()
+    }
+
+    /// The element classes of the class whose primary vtable is `vt` (its own and its bases'):
+    /// `(begin offset, element class vtable)` by offset (WS95).
+    pub fn class_elements(&self, vt: u64) -> Vec<(i32, u64)> {
+        let Some(c) = self.class_of_vtable(vt) else { return Vec::new() };
+        let mut offs: Vec<i32> = std::iter::once(c)
+            .chain(self.hierarchy.bases[c as usize].iter().copied())
+            .flat_map(|k| self.elements.keys().filter(move |f| f.0 == k).map(|f| f.1))
+            .collect();
+        offs.sort_unstable();
+        offs.dedup();
+        offs.into_iter()
+            .filter_map(|off| {
+                let l = lookup(&self.hierarchy, &self.elements, c, off);
+                Some((off, self.vt((l >= 2).then(|| l - 2)?)?))
             })
             .collect()
     }
@@ -1328,6 +1359,8 @@ struct Ctx<'a> {
     r: &'a [u32],
     fields: &'a FxHashMap<(u32, i32), u32>,
     members: &'a FxHashMap<(u32, i32), u32>,
+    /// WS95: `(container class, begin offset)` -> the element class
+    elements: &'a FxHashMap<(u32, i32), u32>,
     /// WS94: the parameters whose callers are not all known
     fixed: &'a [[bool; 6]],
     /// WS94: `(function, parameter, k)` -> the class of the pointer at `+k` of what the callers
@@ -1391,6 +1424,26 @@ impl Ctx<'_> {
         }
     }
 
+    /// The container class and begin offset of the buffer the pointer loaded by `loads[b]` of
+    /// `k` points into (WS95): `loads[b] = (bs, bf)`, the begin pointer at `bf` (>= 0) of the
+    /// object `bs` points to; or a vector's end pointer (`*end = x; end += 8`: begin 8 before).
+    fn buffer(&self, k: usize, b: u32, ld: &[u32]) -> Option<(u32, i32)> {
+        let s = &self.sums[k];
+        let &(bs, bf) = s.loads.get(b as usize)?;
+        if bf == ELEM {
+            return None;
+        }
+        let begin = if bf >= 0 {
+            bf
+        } else {
+            return None;
+        };
+        // (a vector's end pointer stored back one element on: the begin pointer is 8 before)
+        let off = if begin >= 8 && s.field_stores.contains(&(bs, begin, Src::Ld(b), 8)) { begin - 8 } else { begin };
+        let c = self.base(k, bs, ld);
+        (c >= 2).then_some((c - 2, off))
+    }
+
     /// The classes of the values function `k` loads (a field's class by its container's).
     fn loads(&self, k: usize) -> Vec<u32> {
         let s = &self.sums[k];
@@ -1398,8 +1451,18 @@ impl Ctx<'_> {
         for l in 0..s.loads.len() {
             let (src, off) = s.loads[l];
             if off == ELEM {
-                // (WS95: an element of a buffer)
-                ld[l] = TOP;
+                // WS95: an element of the buffer whose begin pointer is `src` (`Ld(b)`, the
+                // pointer at `bs + bf` of a container of a known class)
+                ld[l] = match src {
+                    Src::Ld(b) => match self.buffer(k, b, &ld) {
+                        Some((c, bf)) => match lookup(self.h, self.elements, c, bf) {
+                            BOT => TOP,
+                            v => v,
+                        },
+                        None => TOP,
+                    },
+                    _ => TOP,
+                };
                 continue;
             }
             let c = self.base(k, src, &ld);
@@ -1517,7 +1580,7 @@ const MAX_DEMAND: usize = 64;
 
 /// What one function contributes in a round: `(callee, parameter, class)`, its return class,
 /// field classes and member classes by `(container class, offset)`.
-type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>, Vec<(u32, i32, i32)>);
+type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>, Vec<(u32, i32, i32)>, Vec<((u32, i32), u32)>);
 
 /// The propagation over the summaries of the functions `starts` (address order); `external`
 /// functions (exported) may be called with anything.
@@ -1800,6 +1863,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     let mut r = vec![BOT; n];
     let mut fields: FxHashMap<(u32, i32), u32> = FxHashMap::default();
     let mut members: FxHashMap<(u32, i32), u32> = FxHashMap::default();
+    let mut elements: FxHashMap<(u32, i32), u32> = FxHashMap::default();
     let mut rounds = 0;
     let mut converged = false;
     while rounds < max_rounds {
@@ -1809,7 +1873,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             .into_par_iter()
             .map(|k| {
                 let s = &sums[k];
-                let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
+                let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, elements: &elements, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
                 let ld = cx.loads(k);
                 let value = |src: Src, off: i32, ld: &[u32]| cx.value(k, src, off, ld);
                 let base = |src: Src, ld: &[u32]| cx.base(k, src, ld);
@@ -1851,6 +1915,23 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         cl.push((b - 2, off, n));
                     }
                 }
+                // WS95: the elements of the buffers of containers of a known class
+                let mut es = Vec::new();
+                for &(src, _, vs, vo) in s.field_stores.iter().filter(|f| f.1 == ELEM) {
+                    if let Src::Ld(b) = src
+                        && let Some(key) = cx.buffer(k, b, &ld)
+                    {
+                        es.push((key, value(vs, vo, &ld)));
+                    }
+                }
+                let clobbers = s.field_numbers.iter().map(|f| (f.0, f.1)).chain(s.buf_writes.iter().map(|&w| (w, ELEM))).chain(s.buf_escapes.iter().copied());
+                for (src, _off) in clobbers.filter(|f| f.1 == ELEM) {
+                    if let Src::Ld(b) = src
+                        && let Some(key) = cx.buffer(k, b, &ld)
+                    {
+                        es.push((key, TOP));
+                    }
+                }
                 let mut ms = Vec::new();
                 for &(src, off, vt) in &s.vt_stores {
                     if off <= 0 || src == Src::Stack {
@@ -1863,7 +1944,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         ms.push(((b - 2, off), cls(c)));
                     }
                 }
-                (contrib, ret, fs, ms, pfs, cl)
+                (contrib, ret, fs, ms, pfs, cl, es)
             })
             .collect();
         let mut np = init.clone();
@@ -1872,7 +1953,12 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
         let mut nm: FxHashMap<(u32, i32), u32> = FxHashMap::default();
         let mut npf = pf_init.clone();
         let mut clobbered: FxHashMap<u32, Vec<(i32, i32)>> = FxHashMap::default();
-        for (k, (contrib, ret, fs, ms, pfs, cl)) in per.into_iter().enumerate() {
+        let mut ne: FxHashMap<(u32, i32), u32> = FxHashMap::default();
+        for (k, (contrib, ret, fs, ms, pfs, cl, es)) in per.into_iter().enumerate() {
+            for (key, v) in es {
+                let e = ne.entry(key).or_insert(BOT);
+                *e = join(h, *e, v);
+            }
             for (c, off, n) in cl {
                 clobbered.entry(c).or_default().push((off, n));
             }
@@ -1911,7 +1997,8 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 *v = TOP;
             }
         }
-        let same = np == p && nr == r && nf == fields && nm == members && npf == pf;
+        let same = np == p && nr == r && nf == fields && nm == members && npf == pf && ne == elements;
+        elements = ne;
         pf = npf;
         p = np;
         r = nr;
@@ -1925,7 +2012,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
 
     // (development: `REARGO_THIS_EXPLAIN=0x…,0x…` prints why `this` of those functions is what it is)
     if let Some(list) = std::env::var_os("REARGO_THIS_EXPLAIN") {
-        let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
+        let cx = Ctx { h, primary: &u.primary, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, elements: &elements, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
         let show = |v: u32| match v {
             BOT => "nothing".to_string(),
             TOP => "unknown".to_string(),
@@ -1985,6 +2072,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     }
     idx.fields = fields.into_iter().filter(|e| e.1 >= 2).collect();
     idx.members = members.into_iter().filter(|e| e.1 >= 2).collect();
+    idx.elements = elements.into_iter().filter(|e| e.1 >= 2).collect();
     idx.param_fields = pf_keys.iter().zip(&pf).filter(|e| *e.1 >= 2).map(|(&(f, j, k), &v)| ((starts[f as usize], j, k), v - 2)).collect();
     let seeded_this = (0..n).filter(|&k| seed[k][usize::from(sums[k].returns_first())] >= 2).count() as u64;
     idx.stats = IndexStats { functions: n as u64, classes: h.vtables.len() as u64, rounds: rounds as u64, converged, seeded_this, ..Default::default() };
@@ -2122,7 +2210,7 @@ impl ThisIndex {
             u64_(&mut b, *f);
             u32_(&mut b, *c);
         }
-        for map in [&self.fields, &self.members] {
+        for map in [&self.fields, &self.members, &self.elements] {
             let mut m: Vec<_> = map.iter().collect();
             m.sort_unstable();
             u32_(&mut b, m.len() as u32);
@@ -2192,14 +2280,14 @@ impl ThisIndex {
             let f = r.u64()?;
             idx.rets.insert(f, r.u32()?);
         }
-        for m in 0..2 {
+        for m in 0..3 {
             for _ in 0..r.u32()? {
                 let (c, off, v) = (r.u32()?, r.u32()? as i32, r.u32()?);
-                if m == 0 {
-                    idx.fields.insert((c, off), v);
-                } else {
-                    idx.members.insert((c, off), v);
-                }
+                match m {
+                    0 => idx.fields.insert((c, off), v),
+                    1 => idx.members.insert((c, off), v),
+                    _ => idx.elements.insert((c, off), v),
+                };
             }
         }
         for _ in 0..r.u32()? {
@@ -2521,6 +2609,7 @@ mod tests {
         idx.fields.insert((0, 8), cls(1));
         idx.members.insert((1, 0x10), cls(0));
         idx.param_fields.insert((0x1000, 1, 0x18), 1);
+        idx.elements.insert((0, 0x20), cls(0));
         idx.stats.rounds = 3;
         let b = idx.to_bytes(42);
         assert_eq!(ThisIndex::from_bytes(&b, 42), Some(idx.clone()));
@@ -2531,6 +2620,8 @@ mod tests {
         assert_eq!(idx.ret_class(0x1100), Some(0x10));
         assert_eq!(idx.param_field_class(0x1000, 1, 0x18), Some(0x20));
         assert_eq!(idx.param_field_class(0x1000, 0, 0x18), None);
+        assert_eq!(idx.element_class(0x10, 0x20), Some(0x10));
+        assert_eq!(idx.element_class(0x20, 0x20), Some(0x10), "an element buffer of a base class");
         // a field of a base class is a field of the derived class
         assert_eq!(idx.field_class(0x20, 8), Some(0x20));
         assert_eq!(idx.field_class(0x10, 0x10), None);

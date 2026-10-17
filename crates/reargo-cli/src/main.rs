@@ -4775,6 +4775,7 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         println!("member classes   {}", idx.members.len());
         let pf_fns: std::collections::BTreeSet<u64> = idx.param_fields.keys().map(|k| k.0).collect();
         println!("param fields     {} (in {} functions)", idx.param_fields.len(), pf_fns.len());
+        println!("element classes  {}", idx.elements.len());
     }
     for &a in addresses {
         println!("0x{a:x}");
@@ -4791,9 +4792,13 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         for &(_, i, k) in pf {
             println!("  param {i} +0x{k:x}: {}", class(idx.param_field_class(a, usize::from(i), i64::from(k))));
         }
-        // a class's vtable: the classes of its fields and members (its own and its bases')
+        // a class's vtable: the classes of its fields, members and buffer elements (its own
+        // and its bases')
         for (off, vt, member) in idx.class_fields(a) {
             println!("  {} +0x{off:x}: {}", if member { "member" } else { "field" }, class(Some(vt)));
+        }
+        for (off, vt) in idx.class_elements(a) {
+            println!("  element +0x{off:x}: {}", class(Some(vt)));
         }
     }
     Ok(())

@@ -744,6 +744,15 @@ impl StructView {
                 })
                 .collect();
             let objects: FxHashSet<u32> = vcall_raw.iter().map(|&(_, ri, _)| uf.find(raws[ri].base)).collect();
+            // WS95: a pointer loaded from a field: `pointer root -> (container root, field offset)`,
+            // so a vcall object loaded through an element pointer (`container->begin[i]`) can be
+            // typed by the container's element class
+            let mut loaded_from: FxHashMap<u32, (u32, u64)> = FxHashMap::default();
+            for r in raws[..local].iter().filter(|r| !r.skip && !r.vptr && r.size == 8 && func.ops[r.op].opcode == OpCode::Load) {
+                if let Some(v) = r.value {
+                    loaded_from.entry(uf.find(v)).or_insert((uf.find(r.base), r.off));
+                }
+            }
             for _ in 0..2 {
                 let mut added = false;
                 for r in raws[..local].iter().filter(|r| !r.skip && !r.vptr && r.size == 8 && func.ops[r.op].opcode == OpCode::Load) {
@@ -763,6 +772,20 @@ impl StructView {
                     let ovt = ovt.or_else(|| {
                         let i = param_roots.iter().find(|p| uf.find_const(p.0) == base)?.1;
                         ctx.this_index?.param_field_class(ctx.entry, i, r.off as i64)
+                    });
+                    // (WS95: an element of a buffer: `obj = container->begin[i]`, the base being
+                    // the begin pointer loaded from the container's `begin` field; only at offset
+                    // 0, an element dereferenced at its start)
+                    let ovt = ovt.or_else(|| {
+                        if r.off != 0 {
+                            return None;
+                        }
+                        let &(cbase, boff) = loaded_from.get(&base)?;
+                        let cvt = match (Some(cbase) == this_root, &this_class) {
+                            (true, Some((_, Some(vt)))) => Some(*vt),
+                            _ => root_classes.get(&cbase).and_then(|cs| crate::vcall::most_derived(mem, cs)).map(|c| c.1),
+                        }?;
+                        ctx.this_index?.element_class(cvt, boff as i64)
                     });
                     if let Some(ovt) = ovt
                         && let Some(c) = crate::vcall::vtable_class(mem, ovt)
