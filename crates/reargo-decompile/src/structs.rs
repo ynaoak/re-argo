@@ -835,7 +835,14 @@ impl StructView {
                 struct_roots.push(r);
             }
         }
-        struct_roots.sort_by_key(|&r| first_use(&raws, &uf, r));
+        // (each root's first use, from one pass over the accesses)
+        let mut first: FxHashMap<u32, usize> = FxHashMap::default();
+        for r in &raws {
+            let u = if r.callee.is_some() { usize::MAX } else { r.op };
+            let e = first.entry(uf.find_const(r.base)).or_insert(usize::MAX);
+            *e = (*e).min(u);
+        }
+        struct_roots.sort_by_key(|r| first.get(r).copied().unwrap_or(usize::MAX));
         let def_of_root: FxHashMap<u32, usize> = struct_roots.iter().enumerate().map(|(i, &r)| (r, i)).collect();
 
         // the layout of each struct
@@ -1145,10 +1152,6 @@ impl StructView {
 
 /// The first op (index) of a local access through a pointer of type `root` (callee accesses
 /// last): the structs are numbered in the order the body first uses them.
-fn first_use(raws: &[Raw], uf: &Uf, root: u32) -> usize {
-    raws.iter().filter(|r| uf.find_const(r.base) == root).map(|r| if r.callee.is_some() { usize::MAX } else { r.op }).min().unwrap_or(usize::MAX)
-}
-
 /// The name of the slot function `target` of a virtual call on an object of class `class`:
 /// its symbol (demangled), else `Class::method_at_<addr>`.
 pub(crate) fn method_name(symbols: &std::collections::BTreeMap<u64, String>, class: Option<&str>, target: u64) -> String {

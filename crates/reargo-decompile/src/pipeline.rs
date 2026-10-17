@@ -933,9 +933,21 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         group.push(m);
     }
     let all_defs: u128 = group.iter().fold(0, |a, &m| a | m);
+    // (a quick no for most registers read and written — temporaries, flags: below 0x200 the
+    // tracked offsets / 8 as bits, above it their range)
+    let exact_low = bit_of.keys().all(|&(o, _)| o >= 0x200 || o % 8 == 0);
+    let low: u64 = bit_of.keys().filter(|&&(o, _)| o < 0x200).fold(0, |m, &(o, _)| m | 1 << (o / 8));
+    let (high_lo, high_hi) = bit_of.keys().filter(|&&(o, _)| o >= 0x200).fold((u64::MAX, 0), |(l, h), &(o, _)| (l.min(o), h.max(o + 1)));
     let bit = |v: &reargo_core::pcode::VarnodeData| -> u128 {
         if v.space != SpaceId::REGISTER {
             return 0;
+        }
+        if exact_low {
+            let o = v.offset;
+            let maybe = if o < 0x200 { o % 8 == 0 && low >> (o / 8) & 1 != 0 } else { o >= high_lo && o < high_hi };
+            if !maybe {
+                return 0;
+            }
         }
         bit_of.get(&(v.offset, v.size)).map_or(0, |&b| 1u128 << b)
     };
@@ -988,7 +1000,11 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         }
     }
     // the successors (more than the CFG has, never fewer); `None`: everything is read
-    let index: rustc_hash::FxHashMap<u64, usize> = instructions.iter().enumerate().map(|(k, i)| (i.address, k)).collect();
+    // (by binary search when the addresses increase)
+    let sorted = instructions.windows(2).all(|w| w[0].address < w[1].address);
+    let index: rustc_hash::FxHashMap<u64, usize> =
+        if sorted { Default::default() } else { instructions.iter().enumerate().map(|(k, i)| (i.address, k)).collect() };
+    let index_of = |a: u64| if sorted { instructions.binary_search_by_key(&a, |i| i.address).ok() } else { index.get(&a).copied() };
     let mut succs: Vec<smallvec::SmallVec<[usize; 2]>> = Vec::with_capacity(n);
     let mut reads_all = vec![false; n];
     for (k, insn) in instructions.iter().enumerate() {
@@ -1003,7 +1019,7 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
                         if op.opcode == OpCode::Branch {
                             fall = false;
                         }
-                        if let Some(&s) = index.get(&t.offset) {
+                        if let Some(s) = index_of(t.offset) {
                             out.push(s);
                         }
                     }
@@ -1011,7 +1027,7 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
                 _ => {}
             }
         }
-        if fall && let Some(&s) = index.get(&(insn.address + u64::from(insn.length))) {
+        if fall && let Some(s) = index_of(insn.address + u64::from(insn.length)) {
             out.push(s);
         }
         succs.push(out);
