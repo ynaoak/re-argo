@@ -392,11 +392,12 @@ impl<'a> CalleeParams<'a> {
         let addrs = x86.plain_range(self.memory, start, count, self.facts.as_ref()?)?;
         let mut out = Vec::new();
         let mut next = hi;
+        let mut cursor = reargo_lift::x86::DecodeCursor::default();
         for &a in &addrs {
             if a >= lo && a < hi {
-                out.push(x86.lift_alone(self.memory, a).ok()?);
+                out.push(x86.lift_alone_with(self.memory, a, &mut cursor).ok()?);
             } else if a == next {
-                let insn = x86.lift_alone(self.memory, a).ok()?;
+                let insn = x86.lift_alone_with(self.memory, a, &mut cursor).ok()?;
                 if insn.mnemonic.trim() == "int3" {
                     next += u64::from(insn.length);
                     out.push(insn);
@@ -457,12 +458,18 @@ impl<'a> CalleeParams<'a> {
         let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
         let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
         let mut stack = vec![target as usize];
+        let mut cursor = reargo_lift::x86::DecodeCursor::default();
         while let Some(a) = stack.pop() {
             if !seen.insert(a) {
                 continue;
             }
             // (the range lift with the integer PF: each instruction lifted alone with it)
-            let insn = if walk.needs_pf { self.lifter.lift_instruction(self.memory, a as u64) } else { x86.lift_alone(self.memory, a as u64) }.ok()?;
+            let insn = if walk.needs_pf {
+                self.lifter.lift_instruction(self.memory, a as u64)
+            } else {
+                x86.lift_alone_with(self.memory, a as u64, &mut cursor)
+            }
+            .ok()?;
             crate::pipeline::reach_successors(&insn, idx_of, &mut stack);
             lifted.push((a, insn));
         }

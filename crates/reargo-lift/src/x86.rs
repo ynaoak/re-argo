@@ -236,6 +236,11 @@ impl<'m> BlockDecoder<'m> {
     }
 }
 
+/// The decoder of the block the last instruction [`X86Lifter::lift_alone_with`] decoded is
+/// in, for the next one.
+#[derive(Default)]
+pub struct DecodeCursor<'m>(Option<BlockDecoder<'m>>);
+
 /// Instructions a [`LiftCache`] makes room for at once.
 const CACHE_RESERVE: usize = 2048;
 
@@ -594,8 +599,14 @@ impl X86Lifter {
     /// The instruction at `addr` lifted alone as the first pass of [`PcodeLift::lift_range`]
     /// lifts it (without the integer PF).
     pub fn lift_alone(&self, memory: &Memory, addr: u64) -> Result<LiftedInstruction, LiftError> {
+        self.lift_alone_with(memory, addr, &mut DecodeCursor::default())
+    }
+
+    /// [`Self::lift_alone`], decoding through `cursor`: a caller lifting many addresses of one
+    /// block sets up its decoder once (the lift is the same).
+    pub fn lift_alone_with<'m>(&self, memory: &'m Memory, addr: u64, cursor: &mut DecodeCursor<'m>) -> Result<LiftedInstruction, LiftError> {
         let fast = X86Lifter { is_64: self.is_64, parity: false };
-        fast.decode_in_block(memory, addr, &mut None).and_then(|insn| fast.lift_decoded(insn, addr, None))
+        fast.decode_in_block(memory, addr, &mut cursor.0).and_then(|insn| fast.lift_decoded(insn, addr, None))
     }
 
     /// The addresses of `lift_range(memory, start, count)` when it is exactly the lifts of
