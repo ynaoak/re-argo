@@ -45,6 +45,37 @@ pub struct SsaOp {
 const PHANTOM: VarId = VarId::MAX - 1;
 const PHANTOM_MIN: VarId = 1 << 31;
 
+/// The renaming stacks of [`SsaFunction::build_ssa`], one per slot, in one list.
+struct ScopeStacks {
+    /// Per slot, its top entry ([`NO_ENTRY`] when empty).
+    top: Vec<u32>,
+    /// `(value, slot, the slot's entry below)`.
+    entries: Vec<(VarId, u32, u32)>,
+}
+
+const NO_ENTRY: u32 = u32::MAX;
+
+impl ScopeStacks {
+    fn push(&mut self, k: u32, v: VarId) {
+        let below = self.top[k as usize];
+        self.top[k as usize] = self.entries.len() as u32;
+        self.entries.push((v, k, below));
+    }
+
+    fn last(&self, k: u32) -> Option<&VarId> {
+        let t = self.top[k as usize];
+        (t != NO_ENTRY).then(|| &self.entries[t as usize].0)
+    }
+
+    /// Pop the entries pushed after the list had `len` (the last ones).
+    fn pop_to(&mut self, len: u32) {
+        while self.entries.len() > len as usize {
+            let (_, k, below) = self.entries.pop().expect("an entry");
+            self.top[k as usize] = below;
+        }
+    }
+}
+
 /// Per slot (dense id) of [`SsaFunction::build_ssa`]: how many versions it has, and its
 /// incoming value (`VarId::MAX` until read).
 struct Slots {
@@ -80,6 +111,22 @@ pub struct SsaFunction {
     /// The phis the left-out definitions would have caused ([`PhantomDefs`]; numbered, not
     /// made): for the statistics, which count them as removed dead code.
     pub phantom_phis: usize,
+    /// Where the left-out definitions and phis would have written their slots, until the first
+    /// dead code elimination (which would have removed them): `(position, registers)` by
+    /// position, a position `4 * i` right before op `i` (a call's left-out definitions sit
+    /// after it), `4 * i + 1` for the phis of the block starting at op `i` (after definitions
+    /// left out at the end of the block before), and a live op `i` at `4 * i + 2`; bit `r` of
+    /// the registers is the slot `phantom_regs[r]`. Common subexpression elimination reads
+    /// them as writes of their slots.
+    pub phantom_writes: Vec<(usize, u128)>,
+    /// The slots of [`Self::phantom_writes`]' bits.
+    pub phantom_regs: Vec<(u32, u64, u32)>,
+    /// The values read of definitions left out (by phis nothing reads, or calls as arguments
+    /// they drop), as bits by id: they have no defining op, but are no value on entry
+    /// ([`Self::is_incoming`]).
+    phantom_vars: Vec<u64>,
+    /// [`Self::incoming_registers`], made when first asked.
+    incoming_cache: std::sync::OnceLock<Vec<VarId>>,
 }
 
 /// Definitions a pass left out of the P-code because nothing can read them
@@ -90,10 +137,10 @@ pub struct SsaFunction {
 /// version that is printed keeps its number.
 #[derive(Debug, Default)]
 pub struct PhantomDefs {
-    /// The registers (at most 32).
+    /// The registers (at most 128).
     pub regs: Vec<VarnodeData>,
     /// By the address of the instruction holding the call: bit `i` = `regs[i]` left out.
-    pub at: FxHashMap<u64, u32>,
+    pub at: FxHashMap<u64, u128>,
 }
 
 impl SsaFunction {
@@ -116,6 +163,10 @@ impl SsaFunction {
             return_float: None,
             vcall_targets: FxHashMap::default(),
             phantom_phis: 0,
+            phantom_writes: Vec::new(),
+            phantom_regs: Vec::new(),
+            phantom_vars: Vec::new(),
+            incoming_cache: std::sync::OnceLock::new(),
         };
         func.build_ssa(phantoms);
         func
@@ -176,15 +227,29 @@ impl SsaFunction {
         let mut kid_start = vec![0usize; n];
         // (the constants read and the values written: a varnode each)
         let (mut n_consts, mut n_outputs) = (0usize, 0usize);
+        // (the calls' register inputs: those reading a definition left out get a value each)
+        let mut n_call_reads = 0usize;
+        // (the slots asked about recently by a cheap hash of their key, before the map: a
+        // block reads and writes a few registers and temporaries over and over)
+        let mut recent: [(Key, u32); 256] = [((u32::MAX, 0, 0), 0); 256];
         let mut intern = |k: Key| -> u32 {
-            *slot_of.entry(k).or_insert_with(|| {
+            let h = ((k.1 ^ (k.1 >> 8) ^ u64::from(k.2) ^ u64::from(k.0) << 4) & 255) as usize;
+            if recent[h].0 == k {
+                return recent[h].1;
+            }
+            let id = *slot_of.entry(k).or_insert_with(|| {
                 slots.push(k);
                 (slots.len() - 1) as u32
-            })
+            });
+            recent[h] = (k, id);
+            id
         };
         for (b, block) in cfg.blocks.iter().enumerate() {
             kid_start[b] = kids.len();
             for op in block.instructions.iter().flat_map(|i| i.ops.iter()) {
+                if matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
+                    n_call_reads += op.inputs.len();
+                }
                 for inp in &op.inputs {
                     kids.push(if inp.space == SpaceId::CONST {
                         n_consts += 1;
@@ -210,16 +275,16 @@ impl SsaFunction {
         // slot of an instruction (`regs` bits), looked up at its first call
         let reg_slot: SmallVec<[u32; 16]> =
             phantoms.regs.iter().map(|v| slot_of.get(&key_of(v)).copied().unwrap_or(NO_SLOT)).collect();
-        let with_slot = reg_slot.iter().enumerate().fold(0u32, |a, (i, &k)| if k != NO_SLOT && i < 32 { a | (1 << i) } else { a });
+        let with_slot = reg_slot.iter().enumerate().fold(0u128, |a, (i, &k)| if k != NO_SLOT && i < 128 { a | (1 << i) } else { a });
         let any_phantom = with_slot != 0 && !phantoms.at.is_empty();
-        let phantoms_at = |insn: &reargo_lift::LiftedInstruction, op: &reargo_core::pcode::PcodeOp, seen_call: &mut bool| -> u32 {
+        let phantoms_at = |insn: &reargo_lift::LiftedInstruction, op: &reargo_core::pcode::PcodeOp, seen_call: &mut bool| -> u128 {
             if !any_phantom || *seen_call || !matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
                 return 0;
             }
             *seen_call = true;
             phantoms.at.get(&insn.address).map_or(0, |&m| m & with_slot)
         };
-        let bits = |mut m: u32| {
+        let bits = |mut m: u128| {
             std::iter::from_fn(move || {
                 (m != 0).then(|| {
                     let i = m.trailing_zeros();
@@ -234,8 +299,11 @@ impl SsaFunction {
         let mut defsites: Vec<Vec<usize>> = vec![Vec::new(); n_slots];
         // the def blocks with the left-out definitions, by register
         let mut phantom_sites: Vec<Vec<usize>> = vec![Vec::new(); if any_phantom { phantoms.regs.len() } else { 0 }];
-        // the block (+ 1) that last wrote each slot
+        // the block (+ 1) that last wrote each slot, and that last listed it as a def site
+        // (real / left out: a block can be both)
         let mut killed_in = vec![0usize; n_slots];
+        let mut real_in = vec![0usize; n_slots];
+        let mut phantom_in = vec![0usize; if any_phantom { n_slots } else { 0 }];
         for (b, block) in cfg.blocks.iter().enumerate() {
             let mut at = kid_start[b];
             for insn in &block.instructions {
@@ -251,15 +319,17 @@ impl SsaFunction {
                     if op.output.is_some() {
                         let k = kids[at] as usize;
                         at += 1;
-                        if killed_in[k] != b + 1 {
-                            killed_in[k] = b + 1;
+                        killed_in[k] = b + 1;
+                        if real_in[k] != b + 1 {
+                            real_in[k] = b + 1;
                             defsites[k].push(b);
                         }
                     }
                     for r in bits(phantoms_at(insn, op, &mut seen_call)) {
                         let k = reg_slot[r] as usize;
-                        if killed_in[k] != b + 1 {
-                            killed_in[k] = b + 1;
+                        killed_in[k] = b + 1;
+                        if phantom_in[k] != b + 1 {
+                            phantom_in[k] = b + 1;
                             phantom_sites[r].push(b);
                         }
                     }
@@ -339,11 +409,20 @@ impl SsaFunction {
         }
         // (the marks of the second placement of a slot with left-out definitions: above all
         // the first ones)
+        // (the register of `phantoms.regs` of each slot, `u8::MAX` for none)
+        let mut phantom_reg = vec![u8::MAX; if any_phantom { n_slots } else { 0 }];
+        if any_phantom {
+            for (r, &k) in reg_slot.iter().enumerate().rev() {
+                if k != NO_SLOT && r < 128 {
+                    phantom_reg[k as usize] = r as u8;
+                }
+            }
+        }
         let mut base_has_phi = vec![0u32; if any_phantom { n } else { 0 }];
         let mut base_queued = base_has_phi.clone();
         for k in keys {
             let extra = if any_phantom {
-                reg_slot.iter().position(|&s| s == k).map(|r| &phantom_sites[r]).filter(|v| !v.is_empty())
+                phantom_reg.get(k as usize).and_then(|&r| phantom_sites.get(r as usize)).filter(|v| !v.is_empty())
             } else {
                 None
             };
@@ -352,14 +431,21 @@ impl SsaFunction {
                 place(&df, &mut work, sites, k + 1, &mut has_phi, &mut queued, |f| phis[f].push(k));
             }
             if let Some(extra) = extra {
-                // every def site, the left-out ones too: the phis not placed above are phantoms
+                // every def site, the left-out ones too
                 let mut all = sites.clone();
                 all.extend(extra.iter().copied().filter(|b| !sites.contains(b)));
-                place(&df, &mut work, &all, k + 1, &mut base_has_phi, &mut base_queued, |f| {
-                    if has_phi[f] != k + 1 {
-                        phantom_phis[f].push(k);
-                    }
-                });
+                if sites.is_empty() {
+                    // (no value of the code's own: the phis are phantoms)
+                    place(&df, &mut work, &all, k + 1, &mut base_has_phi, &mut base_queued, |f| {
+                        if has_phi[f] != k + 1 {
+                            phantom_phis[f].push(k);
+                        }
+                    });
+                } else {
+                    // the phis are made: they may read the code's values, whose readers the
+                    // passes look at before dead code elimination removes them
+                    place(&df, &mut work, &all, k + 1, &mut has_phi, &mut queued, |f| phis[f].push(k));
+                }
             }
         }
 
@@ -370,7 +456,7 @@ impl SsaFunction {
         let n_phis: usize = phis.iter().map(Vec::len).sum();
         let new_values = n_consts + n_outputs + n_phis;
         self.ops.reserve(total_ops + n_phis + total_ops / 16 + 8);
-        self.varnodes.reserve(new_values + n_slots + new_values / 16 + 16);
+        self.varnodes.reserve(new_values + n_slots + new_values / 16 + 16 + if any_phantom { n_call_reads } else { 0 });
 
         // 3. lay the ops out in linear block order (phis first); renaming fills them in
         let mut block_start = vec![0usize; n];
@@ -416,14 +502,17 @@ impl SsaFunction {
         // per slot: the version count, the incoming value (`incoming_var`), the stack of
         // the versions in scope
         let mut vars = Slots { versions: vec![0; n_slots], incoming: vec![VarId::MAX; n_slots] };
-        let mut stacks: Vec<Vec<VarId>> = vec![Vec::new(); n_slots];
+        // (the stacks as one list of `(value, slot, the slot's entry below)`, its top per slot:
+        // a block's entries are the last ones while it is in scope)
+        let mut stacks = ScopeStacks { top: vec![NO_ENTRY; n_slots], entries: Vec::with_capacity(n_outputs + n_phis + 16) };
         let mut visited = vec![false; n];
         let mut roots: Vec<usize> = Vec::new();
         if n > 0 {
             roots.push(cfg.entry_block);
         }
         roots.extend((0..n).filter(|&b| b != cfg.entry_block && idom[b].is_none_or(|d| d == b)));
-        let mut pushed_by: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // (the length of the stacks' list when each block on the walk was entered)
+        let mut entered: Vec<u32> = vec![0; n];
         // (the phantom phis' operands set so far, per block and predecessor: only the first
         // sets one)
         self.phantom_phis = phantom_phis.iter().map(Vec::len).sum();
@@ -433,21 +522,21 @@ impl SsaFunction {
             let mut dfs: Vec<(usize, bool)> = vec![(root, false)];
             while let Some((b, exiting)) = dfs.pop() {
                 if exiting {
-                    for k in pushed_by[b].drain(..) {
-                        stacks[k as usize].pop();
-                    }
+                    stacks.pop_to(entered[b]);
                     continue;
                 }
                 if visited[b] {
                     continue;
                 }
                 visited[b] = true;
+                entered[b] = stacks.entries.len() as u32;
                 dfs.push((b, true));
                 let block = &cfg.blocks[b];
                 let mut idx = block_start[b];
                 // (the phis in slot order, the phantom ones numbered and named but not made)
                 let (real, ghost) = (&phis[b], &phantom_phis[b]);
                 let (mut ri, mut gi) = (0, 0);
+                let mut ghost_regs = 0u128;
                 while ri < real.len() || gi < ghost.len() {
                     let take_real = gi == ghost.len() || (ri < real.len() && slots[real[ri] as usize] < slots[ghost[gi] as usize]);
                     let k = if take_real { real[ri] } else { ghost[gi] };
@@ -458,8 +547,8 @@ impl SsaFunction {
                             self.incoming_var(&mut vars, k, &vn);
                         }
                         vars.versions[k as usize] += 1;
-                        stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
-                        pushed_by[b].push(k);
+                        stacks.push(k, PHANTOM - vars.versions[k as usize]);
+                        ghost_regs |= 1u128 << phantom_reg[k as usize];
                         continue;
                     }
                     ri += 1;
@@ -472,9 +561,11 @@ impl SsaFunction {
                     let out = self.new_version_var(&mut vars, k, &vn);
                     self.varnodes[out as usize].def_op = Some(idx);
                     self.ops[idx].output = Some(out);
-                    stacks[k as usize].push(out);
-                    pushed_by[b].push(k);
+                    stacks.push(k, out);
                     idx += 1;
+                }
+                if ghost_regs != 0 {
+                    self.phantom_writes.push((4 * block_start[b] + 1, ghost_regs));
                 }
                 let mut at = kid_start[b];
                 for insn in &block.instructions {
@@ -487,9 +578,9 @@ impl SsaFunction {
                             let id = if k == NO_SLOT {
                                 self.const_var(inp)
                             } else {
-                                match stacks[k as usize].last() {
+                                match stacks.last(k) {
                                     // (never read: the values left out are those nothing reads)
-                                    Some(&id) if id >= PHANTOM_MIN => self.push_var(*inp, PHANTOM - id),
+                                    Some(&id) if id >= PHANTOM_MIN => self.phantom_var(*inp, PHANTOM - id),
                                     Some(&id) => id,
                                     None => self.incoming_var(&mut vars, k, inp),
                                 }
@@ -504,18 +595,18 @@ impl SsaFunction {
                             let id = self.new_version_var(&mut vars, k, &out);
                             self.varnodes[id as usize].def_op = Some(idx);
                             self.ops[idx].output = Some(id);
-                            stacks[k as usize].push(id);
-                            pushed_by[b].push(k);
+                            stacks.push(k, id);
                         }
                         idx += 1;
-                        for r in bits(phantoms_at(insn, pcode_op, &mut seen_call)) {
+                        let left_out = phantoms_at(insn, pcode_op, &mut seen_call);
+                        for r in bits(left_out) {
                             // the definitions left out after the call, numbered
-                            {
-                                let k = reg_slot[r];
-                                vars.versions[k as usize] += 1;
-                                stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
-                                pushed_by[b].push(k);
-                            }
+                            let k = reg_slot[r];
+                            vars.versions[k as usize] += 1;
+                            stacks.push(k, PHANTOM - vars.versions[k as usize]);
+                        }
+                        if left_out != 0 {
+                            self.phantom_writes.push((4 * idx, left_out));
                         }
                     }
                 }
@@ -529,7 +620,7 @@ impl SsaFunction {
                         let n_preds = cfg.blocks[s].predecessors.len();
                         for (g, &k) in phantom_phis[s].iter().enumerate() {
                             let filled = &mut phantom_filled[s][g * n_preds + j];
-                            if !std::mem::replace(filled, true) && stacks[k as usize].is_empty() {
+                            if !std::mem::replace(filled, true) && stacks.last(k).is_none() {
                                 self.incoming_var(&mut vars, k, &slot_vn(k));
                             }
                         }
@@ -538,9 +629,9 @@ impl SsaFunction {
                             if self.ops[phi_idx].inputs[j] != VarId::MAX {
                                 continue;
                             }
-                            let id = match stacks[k as usize].last() {
+                            let id = match stacks.last(k) {
                                 // (a phi reached from a value left out is read by nothing either)
-                                Some(&id) if id >= PHANTOM_MIN => self.push_var(slot_vn(k), PHANTOM - id),
+                                Some(&id) if id >= PHANTOM_MIN => self.phantom_var(slot_vn(k), PHANTOM - id),
                                 Some(&id) => id,
                                 None => self.incoming_var(&mut vars, k, &slot_vn(k)),
                             };
@@ -568,6 +659,10 @@ impl SsaFunction {
             }
         }
 
+        if !self.phantom_writes.is_empty() {
+            self.phantom_writes.sort_unstable_by_key(|w| w.0);
+            self.phantom_regs = reg_slot.iter().map(|&k| if k == NO_SLOT { (u32::MAX, 0, 0) } else { slots[k as usize] }).collect();
+        }
         self.cfg = cfg;
     }
 
@@ -603,6 +698,39 @@ impl SsaFunction {
         self.next_var_id += 1;
         self.varnodes.push(SsaVarnode { id, data, version, def_op: None, uses: UseVec::new() });
         id
+    }
+
+    /// A read of a definition left out ([`PhantomDefs`]).
+    fn phantom_var(&mut self, data: VarnodeData, version: u32) -> VarId {
+        let id = self.push_var(data, version);
+        let w = id as usize / 64;
+        if self.phantom_vars.len() <= w {
+            self.phantom_vars.resize(w + 1, 0);
+        }
+        self.phantom_vars[w] |= 1 << (id % 64);
+        id
+    }
+
+    /// Is `v` the value of a slot on entry (no defining op, and not a read of a definition
+    /// left out)?
+    pub fn is_incoming(&self, v: &SsaVarnode) -> bool {
+        v.def_op.is_none() && self.phantom_vars.get(v.id as usize / 64).is_none_or(|w| w >> (v.id % 64) & 1 == 0)
+    }
+
+    /// The registers' values on entry ([`Self::is_incoming`]) in arena order, listed when first
+    /// asked: by the passes that read the SSA once it no longer changes (the struct view, the
+    /// emitters).
+    pub fn incoming_registers(&self) -> impl Iterator<Item = &SsaVarnode> {
+        self.incoming_cache
+            .get_or_init(|| {
+                self.varnodes
+                    .iter()
+                    .filter(|v| v.data.space == reargo_core::address::SpaceId::REGISTER && self.is_incoming(v))
+                    .map(|v| v.id)
+                    .collect()
+            })
+            .iter()
+            .map(|&i| &self.varnodes[i as usize])
     }
 
 

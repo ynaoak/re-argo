@@ -468,14 +468,18 @@ impl<'a> CalleeParams<'a> {
         let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
         // (the walk's instructions follow each other: the one after any but the last is in it)
         let last = walk.last();
-        let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
-        let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
+        // (the addresses seen, by their offset from the target: every one is in the walk)
+        let mut seen = vec![0u64; (last.map_or(0, |l| l - target) as usize + 1).div_ceil(64)];
+        // (room for the whole walk: the instructions are large, and growing moved them)
+        let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::with_capacity(walk.len());
         let mut stack = vec![target as usize];
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
         while let Some(a) = stack.pop() {
-            if !seen.insert(a) {
+            let off = a - target as usize;
+            if seen[off / 64] >> (off % 64) & 1 != 0 {
                 continue;
             }
+            seen[off / 64] |= 1 << (off % 64);
             // (the range lift with the integer PF: each instruction lifted alone with it)
             let insn = if walk.needs_pf {
                 self.lifter.lift_instruction(self.memory, a as u64)
@@ -496,10 +500,10 @@ impl<'a> CalleeParams<'a> {
     }
 
     fn summarize_body(&self, cfg: ControlFlowGraph, truncated: bool) -> Summary {
-        let fields = std::sync::Arc::new(param_accesses(&cfg, &self.args, &self.caller_saved, self.returns.first()));
+        let rpo = crate::dominator::reverse_post_order(&cfg);
+        let fields = std::sync::Arc::new(param_accesses(&cfg, &rpo, &self.args, &self.caller_saved, self.returns.first()));
         let ret_sites = self.return_sites(&cfg);
         let n = cfg.blocks.len();
-        let rpo = crate::dominator::reverse_post_order(&cfg);
 
         // must-defined (by low byte) sets at block entry; None = not reached yet
         let mut inn: Vec<Option<u32>> = vec![None; n];
@@ -742,7 +746,11 @@ const MAX_FIELD: i64 = 0x10_0000;
 pub(crate) type Held = SmallMap<(SpaceId, u64, u32), (usize, i64)>;
 
 pub(crate) fn kill<V: Copy>(state: &mut SmallMap<(SpaceId, u64, u32), V>, out: &VarnodeData) {
-    state.retain(|&(sp, off, sz), _| !(sp == out.space && off < out.offset + u64::from(out.size) && out.offset < off + u64::from(sz)));
+    let overlaps = |&(sp, off, sz): &(SpaceId, u64, u32)| sp == out.space && off < out.offset + u64::from(out.size) && out.offset < off + u64::from(sz);
+    // (most writes overlap nothing held: looked for before rebuilding the map)
+    if state.0.iter().any(|e| overlaps(&e.0)) {
+        state.retain(|k, _| !overlaps(k));
+    }
 }
 
 /// A map of few entries, kept sorted by key in a small vector: the data flows over a body's
@@ -801,7 +809,7 @@ impl<K: Ord + Copy, V: Copy> FromIterator<(K, V)> for SmallMap<K, V> {
 /// The loads / stores of a body whose address is an argument's incoming value plus a constant
 /// (WS91): a forward data flow of "holds argument `i` + delta" over copies and constant adds,
 /// meeting at joins where the predecessors agree; a call forgets the registers it may change.
-fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[VarnodeData], ret: Option<&VarnodeData>) -> ParamUse {
+fn param_accesses(cfg: &ControlFlowGraph, rpo: &[usize], args: &[VarnodeData], caller_saved: &[VarnodeData], ret: Option<&VarnodeData>) -> ParamUse {
     let n = cfg.blocks.len();
     let mut inn: Vec<Option<Held>> = vec![None; n];
     let mut entry = Held::default();
@@ -809,7 +817,6 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
         entry.insert((a.space, a.offset, a.size), (i, 0));
     }
     inn[cfg.entry_block] = Some(entry);
-    let rpo = crate::dominator::reverse_post_order(cfg);
     let mut found: Vec<ParamAccess> = Vec::new();
     let mut vtable_stores: Vec<(usize, u64)> = Vec::new();
     // A block whose entry state did not change since it was last run gives the same accesses
@@ -820,7 +827,7 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
     for pass in 0..8 {
         let mut changed = false;
         let last = pass == 7;
-        for &b in &rpo {
+        for &b in rpo {
             if !dirty[b] {
                 continue;
             }
@@ -853,7 +860,7 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
                         };
                         // (the lifter's view sync, `eax = SUBPIECE(rax, 0)`, leaves the register it reads)
                         let view_sync = op.opcode == OpCode::Subpiece && op.inputs.first().is_some_and(|r| r.space == out.space && r.offset == out.offset && r.size > out.size);
-                        if !view_sync {
+                        if !view_sync && !consts.0.is_empty() {
                             consts.retain(|r, _| !(r.0 == out.space && r.1 < out.offset + u64::from(out.size) && out.offset < r.1 + u64::from(r.2)));
                         }
                         if let Some(c) = c {

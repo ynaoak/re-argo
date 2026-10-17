@@ -209,6 +209,10 @@ impl Imports<'_> {
     /// `jmp t` as the first instruction of `target`: `t`.
     fn thunk_target(&self, target: u64) -> Option<u64> {
         let (lifter, memory) = self.code?;
+        // (x86: only a near `jmp` lifts to a lone `BRANCH`, to its target)
+        if let Some(x86) = lifter.as_x86() {
+            return x86.near_jump_target(memory, target);
+        }
         let insn = lifter.lift_instruction(memory, target).ok()?;
         match insn.ops.as_slice() {
             [op] if op.opcode == reargo_core::pcode::OpCode::Branch => {
@@ -763,9 +767,18 @@ fn apply_call_convention(
     let Some(cc) = lifter.call_convention() else {
         return (instructions, 0, crate::ssa::PhantomDefs::default());
     };
-    let mut phantoms = crate::ssa::PhantomDefs { regs: cc.args.iter().take(32).copied().collect(), ..Default::default() };
-    // (the bit in `phantoms.regs` of each clobber that is an argument)
-    let phantom_bit: Vec<u32> = cc.clobbers.iter().map(|(full, _)| phantoms.regs.iter().position(|a| a == full).map_or(0, |i| 1 << i)).collect();
+    // (every clobber and its views, in order: the bits of `phantoms.at`; the SSA numbers the
+    // versions of those the code reads or writes)
+    let mut phantoms = crate::ssa::PhantomDefs::default();
+    // (the bit in `phantoms.regs` of each clobber's full register; its views follow it)
+    let mut phantom_bit: Vec<u32> = Vec::with_capacity(cc.clobbers.len());
+    for (full, views) in &cc.clobbers {
+        phantom_bit.push(phantoms.regs.len() as u32);
+        phantoms.regs.push(*full);
+        phantoms.regs.extend(views.iter().map(|&sz| VarnodeData::new(full.space, full.offset, sz)));
+    }
+    let numbered = phantoms.regs.len() <= 128;
+    let phantom_of = |j: usize, k: usize| 1u128 << (phantom_bit[j] as usize + k);
     // WS77: a `ret` lifts to `RETURN(target)` — the popped return address, not the value. Give
     // it the convention's return registers (`rax`, then `xmm0`) as further inputs so the value
     // reaching the `ret` is live and the emitter can print it (`emit::return_value`);
@@ -778,7 +791,7 @@ fn apply_call_convention(
         }
     }
     // the clobbers each call defines (`live_clobbers`)
-    let needed = live_clobbers(&instructions, &cc);
+    let needed = if numbered { live_clobbers(&instructions, &cc) } else { vec![(u128::MAX, u128::MAX); instructions.len()] };
     let mut omitted = 0usize;
     for (k, insn) in instructions.iter_mut().enumerate() {
         let Some(pos) = insn
@@ -788,8 +801,17 @@ fn apply_call_convention(
         else {
             continue;
         };
-        let need = needed[k];
-        let mut phantom_mask = 0u32;
+        let mut need = needed[k];
+        // (the clobber of the register holding the target is read by the definitions after it,
+        // which read the target: made, with its views)
+        if let Some(t) = insn.ops[pos].inputs.first()
+            && t.space == reargo_core::address::SpaceId::REGISTER
+            && let Some(j) = cc.clobbers.iter().position(|(full, _)| full.offset == t.offset)
+        {
+            need.0 |= 1u128 << j;
+            need.1 |= 1u128 << j;
+        }
+        let mut phantom_mask = 0u128;
         let insn_addr = insn.address;
         // WS89: the lifter found the callee returning a `long double` (the code after the call
         // pops it): `INDIRECT(target)` of an x87 slot after the call; rax / xmm0 are clobbered
@@ -832,10 +854,12 @@ fn apply_call_convention(
                 let with_full = need.0 & (1u128 << j) != 0;
                 let views: &[u32] = if with_full && need.1 & (1u128 << j) != 0 { all_views } else { &[] };
                 omitted += usize::from(!with_full) + all_views.len() - views.len();
-                // (only an argument register has versions to number: nothing else reads one
-                // the code does not touch)
+                // (the definitions left out, numbered by the SSA)
                 if !with_full {
-                    phantom_mask |= phantom_bit[j];
+                    phantom_mask |= phantom_of(j, 0);
+                }
+                for k in views.len()..all_views.len() {
+                    phantom_mask |= phantom_of(j, k + 1);
                 }
                 with_full.then_some(((full, views), true))
             }));
@@ -909,13 +933,24 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         group.push(m);
     }
     let all_defs: u128 = group.iter().fold(0, |a, &m| a | m);
+    // (a quick no for most registers read and written — temporaries, flags: below 0x200 the
+    // tracked offsets / 8 as bits, above it their range)
+    let exact_low = bit_of.keys().all(|&(o, _)| o >= 0x200 || o.is_multiple_of(8));
+    let low: u64 = bit_of.keys().filter(|&&(o, _)| o < 0x200).fold(0, |m, &(o, _)| m | 1 << (o / 8));
+    let (high_lo, high_hi) = bit_of.keys().filter(|&&(o, _)| o >= 0x200).fold((u64::MAX, 0), |(l, h), &(o, _)| (l.min(o), h.max(o + 1)));
     let bit = |v: &reargo_core::pcode::VarnodeData| -> u128 {
         if v.space != SpaceId::REGISTER {
             return 0;
         }
+        if exact_low {
+            let o = v.offset;
+            let maybe = if o < 0x200 { o.is_multiple_of(8) && low >> (o / 8) & 1 != 0 } else { o >= high_lo && o < high_hi };
+            if !maybe {
+                return 0;
+            }
+        }
         bit_of.get(&(v.offset, v.size)).map_or(0, |&b| 1u128 << b)
     };
-    let args: u128 = cc.args.iter().fold(0, |a, v| a | bit(v));
     // (gen, kill) of ops in reverse order, starting from `(g, k)`
     let transfer = |ops: &[reargo_core::pcode::PcodeOp], (mut g, mut k): (u128, u128)| {
         for op in ops.iter().rev() {
@@ -938,10 +973,6 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         .iter()
         .flat_map(|i| i.ops.iter())
         .fold(0u128, |a, o| o.inputs.iter().chain(o.output.as_ref()).fold(a, |a, v| a | bit(v)));
-    let kept: u128 = group.iter().enumerate().fold(0, |a, (j, &m)| if m & touched != 0 { a | (1u128 << j) } else { a });
-    if group.iter().all(|&m| m & touched != 0) {
-        return vec![(u128::MAX, u128::MAX); n];
-    }
     // (the full register's bit of each clobber)
     let full_bit: Vec<u128> = cc.clobbers.iter().map(|(full, _)| bit(full)).collect();
     // per instruction: its (gen, kill), and for a call the (gen, kill) of the ops after it
@@ -960,13 +991,20 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
                 for i in &insn.ops[pos].inputs {
                     g |= bit(i);
                 }
-                gen_kill.push(transfer(&insn.ops[..pos], (g | args, kl)));
+                // (the arguments the convention gives every call are not reads: one holding a
+                // clobber is no argument, `optimize::prune_call_args` drops it — a read of a
+                // value left out too)
+                gen_kill.push(transfer(&insn.ops[..pos], (g, kl)));
             }
             None => gen_kill.push(transfer(&insn.ops, (0, 0))),
         }
     }
     // the successors (more than the CFG has, never fewer); `None`: everything is read
-    let index: rustc_hash::FxHashMap<u64, usize> = instructions.iter().enumerate().map(|(k, i)| (i.address, k)).collect();
+    // (by binary search when the addresses increase)
+    let sorted = instructions.windows(2).all(|w| w[0].address < w[1].address);
+    let index: rustc_hash::FxHashMap<u64, usize> =
+        if sorted { Default::default() } else { instructions.iter().enumerate().map(|(k, i)| (i.address, k)).collect() };
+    let index_of = |a: u64| if sorted { instructions.binary_search_by_key(&a, |i| i.address).ok() } else { index.get(&a).copied() };
     let mut succs: Vec<smallvec::SmallVec<[usize; 2]>> = Vec::with_capacity(n);
     let mut reads_all = vec![false; n];
     for (k, insn) in instructions.iter().enumerate() {
@@ -981,7 +1019,7 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
                         if op.opcode == OpCode::Branch {
                             fall = false;
                         }
-                        if let Some(&s) = index.get(&t.offset) {
+                        if let Some(s) = index_of(t.offset) {
                             out.push(s);
                         }
                     }
@@ -989,7 +1027,7 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
                 _ => {}
             }
         }
-        if fall && let Some(&s) = index.get(&(insn.address + u64::from(insn.length))) {
+        if fall && let Some(s) = index_of(insn.address + u64::from(insn.length)) {
             out.push(s);
         }
         succs.push(out);
@@ -1025,8 +1063,19 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         .map(|k| match after_call[k] {
             Some((g, kl)) => {
                 let live = g | (live_out[k] & !kl);
-                let full = full_bit.iter().enumerate().fold(kept, |a, (j, &m)| if live & m != 0 { a | (1u128 << j) } else { a });
-                (full, kept)
+                let (mut full, mut views) = (0u128, 0u128);
+                for (j, (&m, &fb)) in group.iter().zip(&full_bit).enumerate() {
+                    if m & touched != 0 {
+                        // (all of a touched register's definitions, or none)
+                        if live & m != 0 {
+                            full |= 1u128 << j;
+                            views |= 1u128 << j;
+                        }
+                    } else if live & fb != 0 {
+                        full |= 1u128 << j;
+                    }
+                }
+                (full, views)
             }
             None => (0, 0),
         })
@@ -1732,15 +1781,25 @@ fn trim_to_function_body(
     // Pre-compute body membership; the AddressSet's `contains`
     // walks an interval tree per call, so caching the bool per
     // instruction keeps the inner loop hot.
-    let in_body: Vec<bool> = instructions
-        .iter()
-        .map(|insn| {
-            body_addrs.contains(&reargo_core::address::Address::new(
-                reargo_core::address::SpaceId::RAM,
-                insn.address,
-            )) || insn.address == entry
-        })
-        .collect();
+    let ram = |a: u64| reargo_core::address::Address::new(reargo_core::address::SpaceId::RAM, a);
+    let in_body: Vec<bool> = if instructions.windows(2).all(|w| w[0].address <= w[1].address) {
+        // (in address order: `contains`' last range starting at or before each address, found
+        // by walking the ranges along)
+        let mut ranges = body_addrs.ranges().peekable();
+        let mut last: Option<&reargo_core::address::AddressRange> = None;
+        instructions
+            .iter()
+            .map(|insn| {
+                let key = (reargo_core::address::SpaceId::RAM, insn.address);
+                while let Some(r) = ranges.next_if(|r| (r.start.space, r.start.offset) <= key) {
+                    last = Some(r);
+                }
+                last.is_some_and(|r| r.contains(&ram(insn.address))) || insn.address == entry
+            })
+            .collect()
+    } else {
+        instructions.iter().map(|insn| body_addrs.contains(&ram(insn.address)) || insn.address == entry).collect()
+    };
     let keep: Vec<bool> = in_body
         .iter()
         .zip(reach.iter().copied().chain(std::iter::repeat(false)))
@@ -1814,14 +1873,26 @@ pub(crate) fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructio
     }
 
     let n = instructions.len();
+    let mut visited = vec![false; n];
+    let mut stack = vec![0usize];
+
+    // (in increasing address order, each address is found by binary search)
+    if instructions.windows(2).all(|w| w[0].borrow().address < w[1].borrow().address) {
+        let idx_of = |a: u64| instructions.binary_search_by_key(&a, |i| i.borrow().address).ok();
+        while let Some(idx) = stack.pop() {
+            if visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
+            reach_successors(instructions[idx].borrow(), idx_of, &mut stack);
+        }
+        return visited;
+    }
     let addr_to_idx: FxHashMap<u64, usize> = instructions
         .iter()
         .enumerate()
         .map(|(idx, insn)| (insn.borrow().address, idx))
         .collect();
-
-    let mut visited = vec![false; n];
-    let mut stack = vec![0usize];
 
     while let Some(idx) = stack.pop() {
         if visited[idx] {

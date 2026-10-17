@@ -508,7 +508,7 @@ impl StructView {
                     continue;
                 }
                 if let Some(c) = indexed(ctx.entry, Some(i))
-                    && let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)
+                    && let Some(v) = func.incoming_registers().find(|v| v.data == *reg)
                 {
                     index_classes.push((node(&mut uf, &mut nodes, value_key(func, v.id)), c));
                 }
@@ -529,7 +529,7 @@ impl StructView {
             let ints: Vec<VarnodeData> = oracle.args().iter().filter(|a| a.size == 8).copied().collect();
             for (i, c) in classes.iter().enumerate().skip(usize::from(ctx.name_class.is_some())) {
                 let (Some(c), Some(reg)) = (c, ints.get(i + sret)) else { continue };
-                if let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)
+                if let Some(v) = func.incoming_registers().find(|v| v.data == *reg)
                     && let Some(&n) = nodes.get(&value_key(func, v.id))
                 {
                     declared.push((n, c.clone()));
@@ -555,7 +555,7 @@ impl StructView {
             }
             evidence.extend(index_classes.iter().cloned());
             if let (Some(reg), Some((c, Some(vt)))) = (ctx.arg_regs[usize::from(sret)], &this_class)
-                && let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)
+                && let Some(v) = func.incoming_registers().find(|v| v.data == reg)
                 && let Some(&n) = nodes.get(&value_key(func, v.id))
             {
                 evidence.push((n, (c.clone(), *vt)));
@@ -728,7 +728,7 @@ impl StructView {
             }
         }
         let this_root = ctx.arg_regs[usize::from(sret)].and_then(|reg| {
-            let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
+            let v = func.incoming_registers().find(|v| v.data == reg)?;
             nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
         });
         // WS92: the object a virtual call is made on, loaded from a field of an object of a known
@@ -744,7 +744,7 @@ impl StructView {
                 .take(6)
                 .enumerate()
                 .filter_map(|(i, reg)| {
-                    let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)?;
+                    let v = func.incoming_registers().find(|v| v.data == *reg)?;
                     Some((*nodes.get(&value_key(func, v.id))?, i))
                 })
                 .collect();
@@ -835,7 +835,14 @@ impl StructView {
                 struct_roots.push(r);
             }
         }
-        struct_roots.sort_by_key(|&r| first_use(&raws, &uf, r));
+        // (each root's first use, from one pass over the accesses)
+        let mut first: FxHashMap<u32, usize> = FxHashMap::default();
+        for r in &raws {
+            let u = if r.callee.is_some() { usize::MAX } else { r.op };
+            let e = first.entry(uf.find_const(r.base)).or_insert(usize::MAX);
+            *e = (*e).min(u);
+        }
+        struct_roots.sort_by_key(|r| first.get(r).copied().unwrap_or(usize::MAX));
         let def_of_root: FxHashMap<u32, usize> = struct_roots.iter().enumerate().map(|(i, &r)| (r, i)).collect();
 
         // the layout of each struct
@@ -1009,7 +1016,7 @@ impl StructView {
 
     /// The struct a parameter register named `name` points to on entry.
     pub(crate) fn param_def(&self, func: &SsaFunction, name: &str, reg_name: &dyn Fn(&VarnodeData) -> String) -> Option<usize> {
-        let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data.space == SpaceId::REGISTER && v.data.size == 8 && reg_name(&v.data) == name)?;
+        let v = func.incoming_registers().find(|v| v.data.space == SpaceId::REGISTER && v.data.size == 8 && reg_name(&v.data) == name)?;
         self.def_of_value(func, v.id)
     }
 
@@ -1145,10 +1152,6 @@ impl StructView {
 
 /// The first op (index) of a local access through a pointer of type `root` (callee accesses
 /// last): the structs are numbered in the order the body first uses them.
-fn first_use(raws: &[Raw], uf: &Uf, root: u32) -> usize {
-    raws.iter().filter(|r| uf.find_const(r.base) == root).map(|r| if r.callee.is_some() { usize::MAX } else { r.op }).min().unwrap_or(usize::MAX)
-}
-
 /// The name of the slot function `target` of a virtual call on an object of class `class`:
 /// its symbol (demangled), else `Class::method_at_<addr>`.
 pub(crate) fn method_name(symbols: &std::collections::BTreeMap<u64, String>, class: Option<&str>, target: u64) -> String {

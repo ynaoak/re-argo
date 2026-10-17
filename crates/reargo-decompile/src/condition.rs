@@ -855,10 +855,10 @@ impl Inliner {
                         address: op.address,
                         dead: false,
                     };
-                    let prefix = cat!(name(out), " = ");
+                    let dst = name(out);
                     let rhs_of = |x: VarId, y: VarId| {
                         let f = crate::ssa::SsaOp { inputs: smallvec::smallvec![x, y], ..fake.clone() };
-                        emit(&f).and_then(|l| l.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')).map(str::to_string))
+                        emit(&f).and_then(|l| assignment_rhs(l, &dst))
                     };
                     if let Some(rhs) = rhs_of(a, b) {
                         // (`!(a < b)` is not `a >= b` for a NaN)
@@ -888,11 +888,10 @@ impl Inliner {
                 ok = false;
                 break;
             };
-            let prefix = cat!(name(out), " = ");
-            match line.strip_prefix(&prefix).and_then(|r| r.strip_suffix(';')) {
+            match assignment_rhs(line, &name(out)) {
                 // (a value read twice is printed twice: keep the expression readable)
                 Some(rhs) if max_len.is_none_or(|m| rhs.len() <= m) => {
-                    self.exprs.borrow_mut().insert(key, rhs.to_string());
+                    self.exprs.borrow_mut().insert(key, rhs);
                 }
                 _ => {
                     ok = false;
@@ -943,6 +942,15 @@ impl Inliner {
         let lines: Vec<String> = body.iter().filter_map(|&o| emit(&func.ops[o])).collect();
         Folded::plain(cat!("({ ", lines.join(" "), " ", name(cv), "; })"))
     }
+}
+
+/// The right-hand side of `line` when it is `dst = rhs;` (in `line`'s own buffer).
+pub(crate) fn assignment_rhs(mut line: String, dst: &str) -> Option<String> {
+    let rhs_len = line.strip_prefix(dst)?.strip_prefix(" = ")?.strip_suffix(';')?.len();
+    let start = dst.len() + 3;
+    line.truncate(start + rhs_len);
+    line.drain(..start);
+    Some(line)
 }
 
 #[cfg(test)]
