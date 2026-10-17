@@ -772,7 +772,7 @@ fn apply_call_convention(
             }
         }
     }
-    // the clobbers each call needs (bit `j`: `cc.clobbers[j]`)
+    // the clobbers each call defines (`live_clobbers`)
     let needed = live_clobbers(&instructions, &cc);
     let mut omitted = 0usize;
     for (k, insn) in instructions.iter_mut().enumerate() {
@@ -796,7 +796,13 @@ fn apply_call_convention(
         call.inputs.extend(cc.args.iter().copied());
         // (the definitions go between the call and the ops after it, built in place)
         let tail = insn.ops.split_off(pos + 1);
-        let n_defs: usize = cc.returns.iter().chain(cc.clobbers.iter()).map(|(_, views)| 1 + views.len()).sum();
+        let n_defs: usize = cc.returns.iter().map(|(_, views)| 1 + views.len()).sum::<usize>()
+            + cc.clobbers
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| need.0 & (1u128 << j) != 0)
+                .map(|(j, (_, views))| 1 + if need.1 & (1u128 << j) != 0 { views.len() } else { 0 })
+                .sum::<usize>();
         insn.ops.reserve(n_defs + tail.len());
         let after = &mut insn.ops;
         // returns: `INDIRECT(target)`; clobbers: `INDIRECT(target, 1)` (WS76: a caller-saved
@@ -812,15 +818,16 @@ fn apply_call_convention(
         let defs = cc
             .returns
             .iter()
+            .map(|(full, views)| (full, views.as_slice()))
             .enumerate()
             .map(|(i, r)| (r, !returned(i)))
-            .chain(cc.clobbers.iter().enumerate().filter(|&(j, (_, views))| {
-                let keep = need & (1u128 << j) != 0;
-                if !keep {
-                    omitted += 1 + views.len();
-                }
-                keep
-            }).map(|(_, r)| (r, true)));
+            .chain(cc.clobbers.iter().enumerate().filter_map(|(j, (full, all_views))| {
+                // (the views only with the full register: they read it)
+                let with_full = need.0 & (1u128 << j) != 0;
+                let views: &[u32] = if with_full && need.1 & (1u128 << j) != 0 { all_views } else { &[] };
+                omitted += usize::from(!with_full) + all_views.len() - views.len();
+                with_full.then_some(((full, views), true))
+            }));
         for ((full, views), clobber) in defs {
             let mut inputs = smallvec::SmallVec::new();
             match target {
@@ -849,20 +856,23 @@ fn apply_call_convention(
     (instructions, omitted)
 }
 
-/// For each instruction holding a call, the clobbers of `cc` (bit `j`: `cc.clobbers[j]`, with
-/// its views) to make: those of a register the code writes, and those some path from right
-/// after the call reads before writing again (a register variable — the SSA's: one offset and
-/// size — read by an op, or an argument of a later call: each reads all of `cc.args`). The paths
-/// follow the instructions' jumps, falling through everywhere but after a `ret` and a direct
-/// `jmp` (more paths than the CFG has, never fewer); an indirect jump reads everything.
-/// Every bit is set when there are more than 128 clobbers.
-fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConvention) -> Vec<u128> {
+/// For each instruction holding a call, which clobbers of `cc` to define after it (bit `j`:
+/// `cc.clobbers[j]`): `.0` the full registers, `.1` their views. A register the code reads or
+/// writes itself (any view) gets all of them, as before. One only the calls touch (the
+/// convention's arguments each call reads) gets no views (nothing reads them), and its full
+/// register only when some path from right after the call reads it before writing it again
+/// (a later call reading its arguments; an indirect jump reads everything). The paths follow
+/// the instructions' jumps, falling through everywhere but after a `ret` and a direct `jmp`
+/// (more paths than the CFG has, never fewer). The values left out are never read, and the
+/// versions of a register only calls touch are never printed, so the result is the same.
+/// Every bit is set when there are more than 128 tracked variables.
+fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConvention) -> Vec<(u128, u128)> {
     use reargo_core::address::SpaceId;
     use reargo_core::pcode::OpCode;
     let n = instructions.len();
     let first_call = |i: &LiftedInstruction| i.ops.iter().position(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd));
     if cc.clobbers.len() > 128 || n == 0 || !instructions.iter().any(|i| first_call(i).is_some()) {
-        return vec![u128::MAX; n];
+        return vec![(u128::MAX, u128::MAX); n];
     }
     // the bit of each tracked variable (a clobber or one of its views) and each clobber's bits
     let mut bit_of: rustc_hash::FxHashMap<(u64, u32), u32> = rustc_hash::FxHashMap::default();
@@ -873,12 +883,12 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
             let next = bit_of.len() as u32;
             let b = *bit_of.entry((full.offset, size)).or_insert(next);
             if b >= 128 {
-                return vec![u128::MAX; n];
+                return vec![(u128::MAX, u128::MAX); n];
             }
             m |= 1u128 << b;
         }
         if full.space != SpaceId::REGISTER {
-            return vec![u128::MAX; n];
+            return vec![(u128::MAX, u128::MAX); n];
         }
         group.push(m);
     }
@@ -904,14 +914,20 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         }
         (g, k)
     };
-    // only a register the code itself never writes (any view) is left out: a write of it
-    // after an omitted clobber would follow its earlier value with nothing in between, which
-    // the optimisations treat differently (a reload of the same constant is merged into it)
-    let written = instructions.iter().flat_map(|i| i.ops.iter()).filter_map(|o| o.output.as_ref()).fold(0u128, |a, o| a | bit(o));
-    let kept: u128 = group.iter().enumerate().fold(0, |a, (j, &m)| if m & written != 0 { a | (1u128 << j) } else { a });
-    if group.iter().all(|&m| m & written != 0) {
-        return vec![u128::MAX; n];
+    // the registers the code itself reads or writes (any view): all their clobbers are made
+    // (a write after an omitted clobber would follow the earlier value with nothing in
+    // between, which the optimisations treat differently: a reload of the same constant is
+    // merged into it)
+    let touched = instructions
+        .iter()
+        .flat_map(|i| i.ops.iter())
+        .fold(0u128, |a, o| o.inputs.iter().chain(o.output.as_ref()).fold(a, |a, v| a | bit(v)));
+    let kept: u128 = group.iter().enumerate().fold(0, |a, (j, &m)| if m & touched != 0 { a | (1u128 << j) } else { a });
+    if group.iter().all(|&m| m & touched != 0) {
+        return vec![(u128::MAX, u128::MAX); n];
     }
+    // (the full register's bit of each clobber)
+    let full_bit: Vec<u128> = cc.clobbers.iter().map(|(full, _)| bit(full)).collect();
     // per instruction: its (gen, kill), and for a call the (gen, kill) of the ops after it
     let mut gen_kill = Vec::with_capacity(n);
     let mut after_call: Vec<Option<(u128, u128)>> = vec![None; n];
@@ -993,9 +1009,10 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         .map(|k| match after_call[k] {
             Some((g, kl)) => {
                 let live = g | (live_out[k] & !kl);
-                group.iter().enumerate().fold(kept, |a, (j, &m)| if live & m != 0 { a | (1u128 << j) } else { a })
+                let full = full_bit.iter().enumerate().fold(kept, |a, (j, &m)| if live & m != 0 { a | (1u128 << j) } else { a });
+                (full, kept)
             }
-            None => 0,
+            None => (0, 0),
         })
         .collect()
 }
