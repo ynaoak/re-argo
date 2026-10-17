@@ -123,11 +123,14 @@ pub struct NoReturn<'a> {
 ///
 /// It also keeps the answers of [`NoReturn::is_noreturn`]: each is a pure function of the
 /// target (a search from scratch, see there), so the functions of a batch share them.
+/// `(memory, symbols, target)` -> the function at `target` never returns.
+type Verdicts = FxHashMap<(usize, usize, u64), bool>;
+
 #[derive(Default)]
 pub struct FlowCache {
     shards: Vec<Mutex<FlowShard>>,
-    /// `(memory, symbols, target)` -> never returns
-    verdicts: Vec<Mutex<FxHashMap<(usize, usize, u64), bool>>>,
+    /// the answers of the questions asked, by memory, symbols and target
+    verdicts: Vec<Mutex<Verdicts>>,
 }
 
 impl FlowCache {
@@ -138,7 +141,7 @@ impl FlowCache {
         }
     }
 
-    fn verdict_shard(&self, target: u64) -> Option<&Mutex<FxHashMap<(usize, usize, u64), bool>>> {
+    fn verdict_shard(&self, target: u64) -> Option<&Mutex<Verdicts>> {
         let n = self.verdicts.len() as u64;
         (n > 0).then(|| &self.verdicts[((target ^ (target >> 5)) % n) as usize])
     }
