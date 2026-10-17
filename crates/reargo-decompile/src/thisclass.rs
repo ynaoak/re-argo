@@ -101,6 +101,17 @@ pub enum StackEv {
     Made(u32, u8),
 }
 
+/// What a field of a stack object passed to a call holds at that call (WS94): a pointer
+/// `source + offset`, or the address of another stack object (its evidence).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldVal {
+    Ptr(Src, i32),
+    Obj(StackEv),
+}
+
+/// Most bytes past a stack object's address whose slots are recorded as its fields at a call.
+const MAX_STACK_FIELD: i32 = 0x400;
+
 /// What one function does with pointers (see the module documentation).
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct Summary {
@@ -121,6 +132,13 @@ pub struct Summary {
     pub vt_stores: Vec<(Src, i32, u64)>,
     /// `(source, offset, value source, value offset)`: a pointer stored into a field
     pub field_stores: Vec<(Src, i32, Src, i32)>,
+    /// `(source, offset, size)`: bytes written with something else than a pointer
+    /// `field_stores` names (a stack address, a value not followed, a constant other than 0
+    /// and a vtable, a narrower or wider store)
+    pub field_clobbers: Vec<(Src, i32, i32)>,
+    /// `(call, argument, k, value)`: the 8 bytes at `+k` of a stack object passed to a call,
+    /// at that call (WS94: the fields of the objects callers pass)
+    pub stack_fields: Vec<(u32, u8, i32, FieldVal)>,
     /// the pointers returned in `rax`
     pub rets: Vec<(Src, i32)>,
     /// a `ret` returns something else
@@ -292,10 +310,11 @@ impl Interp<'_> {
                     self.out.vt_stores.push((Src::Stack, s, c));
                 }
             }
-            Val::Ptr(src, k) if emit && size == 8 => match v {
-                Val::Const(c) if self.vt_points.contains(&c) => self.out.vt_stores.push((src, k, c)),
-                Val::Ptr(vs, vo) if vs != Src::Stack => self.out.field_stores.push((src, k, vs, vo)),
-                _ => {}
+            Val::Ptr(src, k) if emit => match v {
+                Val::Const(c) if size == 8 && self.vt_points.contains(&c) => self.out.vt_stores.push((src, k, c)),
+                Val::Ptr(vs, vo) if size == 8 && vs != Src::Stack => self.out.field_stores.push((src, k, vs, vo)),
+                Val::Const(0) if size == 8 => {}
+                _ => self.out.field_clobbers.push((src, k, size.max(1) as i32)),
             },
             _ => {}
         }
@@ -326,10 +345,24 @@ impl Interp<'_> {
             match st.r[a] {
                 Val::Ptr(s, k) => {
                     self.out.args.push((id, j as u8, s, k));
-                    if s == Src::Stack
-                        && let Some(e) = self.stack_ev(st, k)
-                    {
-                        self.out.stack_ev.push((id, j as u8, e));
+                    if s == Src::Stack {
+                        if let Some(e) = self.stack_ev(st, k) {
+                            self.out.stack_ev.push((id, j as u8, e));
+                        }
+                        for &(off, v) in &st.slots {
+                            let f = off.wrapping_sub(k);
+                            if !(0..MAX_STACK_FIELD).contains(&f) {
+                                continue;
+                            }
+                            let fv = match v {
+                                Val::Ptr(Src::Stack, s2) => self.stack_ev(st, s2).map(FieldVal::Obj),
+                                Val::Ptr(src, o) => Some(FieldVal::Ptr(src, o)),
+                                _ => None,
+                            };
+                            if let Some(fv) = fv {
+                                self.out.stack_fields.push((id, j as u8, f, fv));
+                            }
+                        }
                     }
                 }
                 Val::Const(0) => {}
@@ -391,7 +424,7 @@ impl Interp<'_> {
                         let v = if size == 8 { Val::Const(i.immediate(1)) } else { Val::Unk };
                         self.store(st, a, size, v, emit);
                     }
-                    _ => self.generic(st, i),
+                    _ => self.generic(st, i, emit),
                 }
             }
             Mnemonic::Lea => {
@@ -506,14 +539,14 @@ impl Interp<'_> {
                     let s = st.clone();
                     self.fallback_with(&s);
                 }
-                _ => self.generic(st, i),
+                _ => self.generic(st, i, emit),
             },
         }
     }
 
     /// Any other instruction: the registers it writes are unknown, the stack slots it writes
     /// are forgotten.
-    fn generic(&mut self, st: &mut St, i: &Instruction) {
+    fn generic(&mut self, st: &mut St, i: &Instruction, emit: bool) {
         let has_mem = (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Memory);
         let addr = if has_mem { self.addr(st, i) } else { Val::Unk };
         let info = self.info.info(i);
@@ -531,6 +564,7 @@ impl Interp<'_> {
         if writes_memory {
             match addr {
                 Val::Ptr(Src::Stack, s) => st.store_slot(s, i.memory_size().size().max(8) as u32, Val::Unk),
+                Val::Ptr(src, k) if emit => self.out.field_clobbers.push((src, k, i.memory_size().size().max(1) as i32)),
                 // a string store through `rdi` into the frame (`rep stosq`): the slots are not known
                 _ if !has_mem && matches!(st.r[7], Val::Ptr(Src::Stack, _)) => st.slots.clear(),
                 _ => {}
@@ -758,6 +792,9 @@ pub struct ThisIndex {
     pub fields: FxHashMap<(u32, i32), u32>,
     /// `(container class, offset)` -> the class of the member object embedded there (class + 2)
     pub members: FxHashMap<(u32, i32), u32>,
+    /// `(function, parameter, k)` -> the class of the pointer at `+k` of the object every caller
+    /// passes as that parameter (WS94)
+    pub param_fields: FxHashMap<(u64, u8, i32), u32>,
     pub stats: IndexStats,
 }
 
@@ -782,6 +819,13 @@ impl ThisIndex {
     /// The class (primary vtable) of integer parameter `i` of `f`.
     pub fn param_class(&self, f: u64, i: usize) -> Option<u64> {
         self.params.get(&f).and_then(|p| self.vt(*p.get(i)?))
+    }
+
+    /// The class (primary vtable) of the pointer at `+k` of the object the callers of `f` pass
+    /// as integer parameter `i` (WS94: what every caller put there).
+    pub fn param_field_class(&self, f: u64, i: usize, k: i64) -> Option<u64> {
+        let key = (f, u8::try_from(i).ok()?, i32::try_from(k).ok()?);
+        self.param_fields.get(&key).and_then(|&c| self.vt(c))
     }
 
     /// The class (primary vtable) of the pointer `f` returns.
@@ -853,10 +897,12 @@ fn join(h: &Hierarchy, a: u32, b: u32) -> u32 {
 fn pointer_words(mem: &Memory) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     if let Some(t) = mem.dynamic_relocations() {
+        // (not the GOT: a slot bound to a function is no reference to it in data)
+        let got: Vec<(u64, u64)> = mem.blocks().filter(|b| b.name.starts_with(".got")).map(|b| (b.start, b.start + b.size)).collect();
         for e in t.chunks_exact(24) {
             let w = |k: usize| u64::from_le_bytes(e[k * 8..k * 8 + 8].try_into().expect("8 bytes"));
             let ty = w(1) & 0xffff_ffff;
-            if ty == 8 || ty == 1027 {
+            if (ty == 8 || ty == 1027) && !got.iter().any(|&(s, e)| (s..e).contains(&w(0))) {
                 out.push((w(0), w(2)));
             }
         }
@@ -908,26 +954,6 @@ fn vtables(mem: &Memory, words: &[(u64, u64)]) -> Vec<(u64, i64, u64, Vec<u64>)>
     out
 }
 
-/// The direct bases at offset 0 of the class whose `type_info` is at `ti` (not virtual): the
-/// one base of a `__si_class_type_info` (`ti+16`), the bases of a `__vmi_class_type_info` (a
-/// count at `ti+20`, `{base, offset_flags}` pairs from `ti+24`; offset = flags >> 8, bit 0 =
-/// virtual) whose offset is 0. A pointer to the object is a pointer to these bases; a base at
-/// another offset is reached through `this + k`, another value.
-fn zero_offset_bases(mem: &Memory, ti: u64) -> Vec<u64> {
-    let is_ti = |b: u64| crate::vcall::type_info_name(mem, b).is_some();
-    if let Some(b) = crate::vcall::pointer_at(mem, ti + 16).filter(|&b| is_ti(b)) {
-        return vec![b];
-    }
-    let Some(n) = mem.read_u32(ti + 20).ok().filter(|n| (1..=64).contains(n)) else { return Vec::new() };
-    (0..u64::from(n))
-        .filter_map(|i| {
-            let b = crate::vcall::pointer_at(mem, ti + 24 + 16 * i).filter(|&b| is_ti(b))?;
-            let flags = mem.read_u64(ti + 32 + 16 * i).ok()? as i64;
-            (flags & 1 == 0 && flags >> 8 == 0).then_some(b)
-        })
-        .collect()
-}
-
 /// What [`solve`] needs to know about the binary.
 pub struct Universe {
     pub hierarchy: Hierarchy,
@@ -955,11 +981,11 @@ pub fn universe(mem: &Memory) -> Universe {
             tis.push(*ti);
         }
     }
-    let direct: Vec<Vec<u64>> = tis.par_iter().map(|&ti| zero_offset_bases(mem, ti)).collect();
+    let direct: Vec<Vec<u64>> = tis.par_iter().map(|&ti| crate::vcall::type_info_bases(mem, ti)).collect();
     let direct_of: FxHashMap<u64, &Vec<u64>> = tis.iter().copied().zip(direct.iter()).collect();
     for &ti in &tis {
         let mut seen: Vec<u64> = Vec::new();
-        let mut work: Vec<u64> = direct_of.get(&ti).map(|v| v.to_vec()).unwrap_or_else(|| zero_offset_bases(mem, ti));
+        let mut work: Vec<u64> = direct_of.get(&ti).map(|v| v.to_vec()).unwrap_or_else(|| crate::vcall::type_info_bases(mem, ti));
         while let Some(t) = work.pop() {
             if seen.contains(&t) || seen.len() > 64 {
                 continue;
@@ -967,7 +993,7 @@ pub fn universe(mem: &Memory) -> Universe {
             seen.push(t);
             match direct_of.get(&t) {
                 Some(v) => work.extend(v.iter().copied()),
-                None => work.extend(zero_offset_bases(mem, t)),
+                None => work.extend(crate::vcall::type_info_bases(mem, t)),
             }
         }
         hier.bases.push(seen.iter().filter_map(|t| by_ti.get(t).copied()).collect());
@@ -1009,6 +1035,20 @@ struct Ctx<'a> {
     r: &'a [u32],
     fields: &'a FxHashMap<(u32, i32), u32>,
     members: &'a FxHashMap<(u32, i32), u32>,
+    /// WS94: the parameters whose callers are not all known
+    fixed: &'a [[bool; 6]],
+    /// WS94: `(function, parameter, k)` -> the class of the pointer at `+k` of what the callers
+    /// pass (the offsets demanded only)
+    pf: &'a [u32],
+    /// WS94: `(function, parameter, k)` -> its index in `pf`
+    pf_at: &'a FxHashMap<FieldKey, u32>,
+    /// WS94: per function, the pointers it stores into fields: `(source, offset)` -> values
+    stores: &'a [StoresAt],
+    /// WS94: per function, the class of the stack objects whose address a field of a stack
+    /// object passed to a call holds: `(call, argument, k)`
+    stack_objs: &'a [FxHashMap<FieldKey, u32>],
+    /// WS94: per function, the pointers in the fields of the stack objects passed to calls
+    stack_ptrs: &'a [StackPtrs],
 }
 
 impl Ctx<'_> {
@@ -1065,6 +1105,12 @@ impl Ctx<'_> {
                     BOT => TOP,
                     v => v,
                 }
+            } else if let Src::Arg(j) = src
+                && !self.fixed[k][j as usize]
+                && self.pf_at.contains_key(&(k as u32, j, off))
+            {
+                // WS94: a field of an object the callers pass, of the class they all put there
+                self.field_at(k, src, off, &ld[..l])
             } else {
                 c
             };
@@ -1073,9 +1119,98 @@ impl Ctx<'_> {
     }
 }
 
+impl Ctx<'_> {
+    /// The class of the value at `src + off` (`ld`: the classes of the loaded values known so
+    /// far; a later one counts as unknown).
+    fn value_known(&self, k: usize, src: Src, off: i32, ld: &[u32]) -> u32 {
+        match src {
+            Src::Ld(l) if l as usize >= ld.len() => TOP,
+            _ => self.value(k, src, off, ld),
+        }
+    }
+
+    /// What function `k` itself stores at `src + off` (WS94): the join of the pointers it
+    /// stores there, unknown when it writes anything else there; nothing when it does not
+    /// write it.
+    fn own_stores(&self, k: usize, src: Src, off: i32, ld: &[u32]) -> u32 {
+        let s = &self.sums[k];
+        if s.field_clobbers.iter().any(|&(a, o, n)| a == src && o < off.saturating_add(8) && o.saturating_add(n) > off) {
+            return TOP;
+        }
+        let mut v = BOT;
+        for &(vs, vo) in self.stores[k].get(&(src, off)).map(|x| x.as_slice()).unwrap_or(&[]) {
+            v = join(self.h, v, self.value_known(k, vs, vo, ld));
+        }
+        v
+    }
+
+    /// The class of the pointer at `src + off` in function `k` (WS94): what `k` stores there,
+    /// joined with what is there on entry (a parameter's field: what the callers pass; a field
+    /// of an object of a known class: what that class's functions store there).
+    fn field_at(&self, k: usize, src: Src, off: i32, ld: &[u32]) -> u32 {
+        let own = self.own_stores(k, src, off, ld);
+        let before = match src {
+            Src::Stack => TOP,
+            Src::Arg(i) if !self.fixed[k][i as usize] => self.pf_at.get(&(k as u32, i, off)).map_or(TOP, |&x| self.pf[x as usize]),
+            _ => {
+                let b = match src {
+                    Src::Ld(l) if l as usize >= ld.len() => TOP,
+                    _ => self.base(k, src, ld),
+                };
+                if b >= 2 {
+                    match lookup(self.h, self.fields, b - 2, off) {
+                        BOT => TOP,
+                        v => v,
+                    }
+                } else if own != BOT && !matches!(src, Src::Arg(_)) {
+                    // (an object made here, a call's result: what this function puts there)
+                    BOT
+                } else {
+                    b
+                }
+            }
+        };
+        join(self.h, own, before)
+    }
+
+    /// The class of the pointer at `+kk` of argument `j` of call `c` of function `k`, the
+    /// object at `src + off` (WS94).
+    fn arg_field(&self, k: usize, (c, j): (u32, u8), (src, off): (Src, i32), kk: i32, ld: &[u32]) -> u32 {
+        if src != Src::Stack {
+            return match off.checked_add(kk) {
+                Some(o) => self.field_at(k, src, o, ld),
+                None => TOP,
+            };
+        }
+        if let Some(&v) = self.stack_objs[k].get(&(c, j, kk)) {
+            return v;
+        }
+        match self.stack_ptrs[k].get(&(c, j, kk)) {
+            Some(&(vs, vo)) => self.value(k, vs, vo, ld),
+            None => TOP,
+        }
+    }
+}
+
+/// A parameter: `(function index, integer parameter)`.
+type Param = (u32, u8);
+/// A field of a parameter (`(function index, parameter, offset)`), or of an argument of a call
+/// (`(call, argument, offset)`).
+type FieldKey = (u32, u8, i32);
+/// The pointers a function stores into fields: `(source, offset)` -> values.
+type StoresAt = FxHashMap<(Src, i32), SmallVec<[(Src, i32); 1]>>;
+/// Per function: `(call, argument, offset)` -> the pointer in that field of a stack object.
+type StackPtrs = FxHashMap<FieldKey, (Src, i32)>;
+/// Per function: the class of each stack object passed (`(call, argument)`), and of the stack
+/// objects whose address a field of one holds (`(call, argument, offset)`).
+type StackClasses = (FxHashMap<(u32, u8), u32>, FxHashMap<FieldKey, u32>);
+
+/// Most offsets per parameter whose class from the callers is followed (WS94).
+const MAX_DEMAND: usize = 64;
+
 /// What one function contributes in a round: `(callee, parameter, class)`, its return class,
 /// field classes and member classes by `(container class, offset)`.
-type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>);
+type Contributions = (Vec<(u32, u8, u32)>, u32, Vec<((u32, i32), u32)>, Vec<((u32, i32), u32)>, Vec<(u32, u32)>);
 
 /// The propagation over the summaries of the functions `starts` (address order); `external`
 /// functions (exported) may be called with anything.
@@ -1184,7 +1319,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     // the seeds of the calls made on that object — the one first given to call `c` as argument
     // `j` (its constructor, the destructor, the virtual methods called directly) — and of the
     // vtables stored into it (an inlined destructor)
-    let stack: Vec<FxHashMap<(u32, u8), u32>> = sums
+    let (stack, stack_objs): (Vec<_>, Vec<_>) = sums
         .par_iter()
         .map(|s| {
             let seed_of = |c: u32, j: u8| match fidx(s.call_targets[c as usize]) {
@@ -1226,23 +1361,134 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             }
             // (a call given an object with no evidence yet made it: the object is that instance)
             let ev: FxHashMap<(u32, u8), StackEv> = s.stack_ev.iter().map(|&(c, j, e)| ((c, j), e)).collect();
-            s.args
+            let class_of_ev = |e: StackEv| match e {
+                StackEv::Vtable(vt) => class_of_vt(vt).map_or(TOP, cls),
+                StackEv::Made(c2, j2) => {
+                    let mut cs = objects.get(&root(&parent, (c2, j2))).cloned().unwrap_or_default();
+                    cs.extend(seed_of(c2, j2));
+                    if cs.is_empty() { TOP } else { h.most_derived(&cs).map_or(TOP, cls) }
+                }
+            };
+            let passed = s
+                .args
                 .iter()
                 .filter(|a| a.2 == Src::Stack)
-                .map(|&(c, j, _, _)| {
-                    let v = match ev.get(&(c, j)).copied().unwrap_or(StackEv::Made(c, j)) {
-                        StackEv::Vtable(vt) => class_of_vt(vt).map_or(TOP, cls),
-                        StackEv::Made(c2, j2) => {
-                            let mut cs = objects.get(&root(&parent, (c2, j2))).cloned().unwrap_or_default();
-                            cs.extend(seed_of(c2, j2));
-                            if cs.is_empty() { TOP } else { h.most_derived(&cs).map_or(TOP, cls) }
-                        }
-                    };
-                    ((c, j), v)
+                .map(|&(c, j, _, _)| ((c, j), class_of_ev(ev.get(&(c, j)).copied().unwrap_or(StackEv::Made(c, j)))))
+                .collect();
+            // (WS94: the stack objects whose address a field of a stack object passed holds)
+            let pointed = s
+                .stack_fields
+                .iter()
+                .filter_map(|&(c, j, k, v)| match v {
+                    FieldVal::Obj(e) => Some(((c, j, k), class_of_ev(e))),
+                    FieldVal::Ptr(..) => None,
                 })
-                .collect()
+                .collect();
+            let out: StackClasses = (passed, pointed);
+            out
+        })
+        .unzip();
+    // WS94: the fields of its parameters a function loads, or a callee it passes them to
+    // (transitively): the offsets whose class from the callers is followed
+    let mut demand: FxHashMap<Param, SmallVec<[i32; 4]>> = FxHashMap::default();
+    let want = |d: &mut FxHashMap<Param, SmallVec<[i32; 4]>>, key: Param, off: i32| {
+        let e = d.entry(key).or_default();
+        if e.len() < MAX_DEMAND && !e.contains(&off) {
+            e.push(off);
+            return true;
+        }
+        false
+    };
+    for (k, s) in sums.iter().enumerate() {
+        // (a loaded value used as a pointer: passed, returned, stored, dereferenced)
+        let mut used: FxHashSet<u32> = FxHashSet::default();
+        let srcs = s.args.iter().map(|a| a.2).chain(s.loads.iter().map(|l| l.0)).chain(s.rets.iter().map(|r| r.0));
+        for src in srcs.chain(s.field_stores.iter().flat_map(|f| [f.0, f.2])) {
+            if let Src::Ld(l) = src {
+                used.insert(l);
+            }
+        }
+        for (l, &(src, off)) in s.loads.iter().enumerate() {
+            if let Src::Arg(j) = src
+                && off >= 0
+                && !fixed[k][j as usize]
+                && used.contains(&(l as u32))
+            {
+                want(&mut demand, (k as u32, j), off);
+            }
+        }
+    }
+    // (a caller passing its own parameter `i` + `o` as `j` of `t` demands `t`'s offsets + `o`)
+    let fixed_ref = &fixed;
+    let edges: Vec<(Param, FieldKey)> = sums
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(k, s)| {
+            s.args.iter().filter_map(move |&(c, j, src, o)| {
+                let Src::Arg(i) = src else { return None };
+                let t = fidx(s.call_targets[c as usize])?;
+                (!fixed_ref[k][i as usize] && !fixed_ref[t][j as usize]).then_some(((t as u32, j), (k as u32, i, o)))
+            })
         })
         .collect();
+    let mut callers_of: FxHashMap<Param, SmallVec<[FieldKey; 2]>> = FxHashMap::default();
+    for (callee, caller) in edges {
+        callers_of.entry(callee).or_default().push(caller);
+    }
+    let mut work: Vec<(u32, u8)> = demand.keys().copied().collect();
+    while let Some(key) = work.pop() {
+        let Some(cs) = callers_of.get(&key) else { continue };
+        let ks = demand[&key].clone();
+        for &(k, i, o) in cs {
+            let mut grew = false;
+            for &kk in &ks {
+                if let Some(f) = o.checked_add(kk).filter(|f| (0..0x10000).contains(f)) {
+                    grew |= want(&mut demand, (k, i), f);
+                }
+            }
+            if grew {
+                work.push((k, i));
+            }
+        }
+    }
+    // (dense: `pf_at` numbers the offsets, `pf_of` lists them by parameter)
+    let mut pf_init: Vec<u32> = Vec::new();
+    let mut pf_at: FxHashMap<FieldKey, u32> = FxHashMap::default();
+    let mut pf_keys: Vec<FieldKey> = Vec::new();
+    let mut pf_of: FxHashMap<Param, SmallVec<[(i32, u32); 4]>> = FxHashMap::default();
+    let mut dkeys: Vec<_> = demand.keys().copied().collect();
+    dkeys.sort_unstable();
+    for (f, j) in dkeys {
+        // (a caller passing something that is no pointer: nothing is known of its fields)
+        let v = if static_top[f as usize] & (1 << j) != 0 { TOP } else { BOT };
+        for &k in &demand[&(f, j)] {
+            let x = pf_init.len() as u32;
+            pf_init.push(v);
+            pf_at.insert((f, j, k), x);
+            pf_keys.push((f, j, k));
+            pf_of.entry((f, j)).or_default().push((k, x));
+        }
+    }
+    drop(demand);
+    let (stores, stack_ptrs): (Vec<StoresAt>, Vec<StackPtrs>) = sums
+        .par_iter()
+        .map(|s| {
+            let mut st: StoresAt = FxHashMap::default();
+            for &(a, o, vs, vo) in &s.field_stores {
+                st.entry((a, o)).or_default().push((vs, vo));
+            }
+            let sp = s
+                .stack_fields
+                .iter()
+                .filter_map(|&(c, j, k, v)| match v {
+                    FieldVal::Ptr(vs, vo) => Some(((c, j, k), (vs, vo))),
+                    FieldVal::Obj(_) => None,
+                })
+                .collect();
+            (st, sp)
+        })
+        .unzip();
+    let mut pf = pf_init.clone();
     let mut p = init.clone();
     let mut r = vec![BOT; n];
     let mut fields: FxHashMap<(u32, i32), u32> = FxHashMap::default();
@@ -1256,17 +1502,21 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
             .into_par_iter()
             .map(|k| {
                 let s = &sums[k];
-                let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members };
+                let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
                 let ld = cx.loads(k);
                 let value = |src: Src, off: i32, ld: &[u32]| cx.value(k, src, off, ld);
                 let base = |src: Src, ld: &[u32]| cx.base(k, src, ld);
                 let mut contrib = Vec::new();
+                let mut pfs = Vec::new();
                 for &(c, j, src, off) in &s.args {
                     let Some(t) = fidx(s.call_targets[c as usize]) else { continue };
                     if fixed[t][j as usize] {
                         continue;
                     }
                     contrib.push((t as u32, j, cx.arg_value(k, c, j, src, off, &ld)));
+                    for &(kk, x) in pf_of.get(&(t as u32, j)).map(|d| d.as_slice()).unwrap_or(&[]) {
+                        pfs.push((x, cx.arg_field(k, (c, j), (src, off), kk, &ld)));
+                    }
                 }
                 let mut ret = BOT;
                 if s.ret_unknown {
@@ -1297,14 +1547,19 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                         ms.push(((b - 2, off), cls(c)));
                     }
                 }
-                (contrib, ret, fs, ms)
+                (contrib, ret, fs, ms, pfs)
             })
             .collect();
         let mut np = init.clone();
         let mut nr = vec![BOT; n];
         let mut nf: FxHashMap<(u32, i32), u32> = FxHashMap::default();
         let mut nm: FxHashMap<(u32, i32), u32> = FxHashMap::default();
-        for (k, (contrib, ret, fs, ms)) in per.into_iter().enumerate() {
+        let mut npf = pf_init.clone();
+        for (k, (contrib, ret, fs, ms, pfs)) in per.into_iter().enumerate() {
+            for (x, v) in pfs {
+                let e = &mut npf[x as usize];
+                *e = join(h, *e, v);
+            }
             for (t, j, v) in contrib {
                 let e = &mut np[t as usize][j as usize];
                 *e = join(h, *e, v);
@@ -1319,7 +1574,8 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
                 *e = join(h, *e, v);
             }
         }
-        let same = np == p && nr == r && nf == fields && nm == members;
+        let same = np == p && nr == r && nf == fields && nm == members && npf == pf;
+        pf = npf;
         p = np;
         r = nr;
         fields = nf;
@@ -1332,7 +1588,7 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
 
     // (development: `REARGO_THIS_EXPLAIN=0x…,0x…` prints why `this` of those functions is what it is)
     if let Some(list) = std::env::var_os("REARGO_THIS_EXPLAIN") {
-        let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members };
+        let cx = Ctx { h, starts, sums, evidence: &evidence, stack: &stack, p: &p, r: &r, fields: &fields, members: &members, fixed: &fixed, pf: &pf, pf_at: &pf_at, stores: &stores, stack_objs: &stack_objs, stack_ptrs: &stack_ptrs };
         let show = |v: u32| match v {
             BOT => "nothing".to_string(),
             TOP => "unknown".to_string(),
@@ -1392,9 +1648,32 @@ pub fn solve(u: &Universe, starts: &[u64], sums: &[Summary], external: &FxHashSe
     }
     idx.fields = fields.into_iter().filter(|e| e.1 >= 2).collect();
     idx.members = members.into_iter().filter(|e| e.1 >= 2).collect();
+    idx.param_fields = pf_keys.iter().zip(&pf).filter(|e| *e.1 >= 2).map(|(&(f, j, k), &v)| ((starts[f as usize], j, k), v - 2)).collect();
     let seeded_this = (0..n).filter(|&k| seed[k][usize::from(sums[k].returns_first())] >= 2).count() as u64;
     idx.stats = IndexStats { functions: n as u64, classes: h.vtables.len() as u64, rounds: rounds as u64, converged, seeded_this, ..Default::default() };
     idx
+}
+
+/// The functions of the image the PLT stubs jump to (WS94): a shared library calls its own
+/// exported functions through its PLT (`jmp [rip + slot]`, the GOT slot bound to the
+/// function); stub address -> function.
+pub fn plt_targets(mem: &Memory) -> FxHashMap<u64, u64> {
+    let mut out = FxHashMap::default();
+    for b in mem.blocks().filter(|b| b.name.starts_with(".plt") && b.flags.contains(MemoryFlags::EXECUTE)) {
+        let Some(data) = &b.data else { continue };
+        let mut dec = Decoder::with_ip(64, data, b.start, DecoderOptions::NONE);
+        while dec.can_decode() {
+            let i = dec.decode();
+            if i.mnemonic() != Mnemonic::Jmp || i.op_count() != 1 || i.op0_kind() != OpKind::Memory || i.memory_base() != Register::RIP {
+                continue;
+            }
+            let Some(f) = crate::vcall::pointer_at(mem, i.ip_rel_memory_address()) else { continue };
+            if crate::vcall::is_code(mem, f) && mem.find_block(f).is_some_and(|t| !t.name.starts_with(".plt")) {
+                out.insert(b.start + (i.ip() - b.start) / 16 * 16, f);
+            }
+        }
+    }
+    out
 }
 
 /// The index of the functions `[start, start + len)` of `mem`; `external` are the functions
@@ -1405,7 +1684,21 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIn
     let mut fs: Vec<(u64, u64)> = functions.to_vec();
     fs.sort_unstable();
     fs.dedup_by_key(|f| f.0);
-    let sums: Vec<Summary> = fs.par_iter().map(|&(s, l)| summarize(mem, s, l, &u.vt_points)).collect();
+    let mut sums: Vec<Summary> = fs.par_iter().map(|&(s, l)| summarize(mem, s, l, &u.vt_points)).collect();
+    // (a call through the image's own PLT is a call to the function)
+    let plt = plt_targets(mem);
+    if !plt.is_empty() {
+        let through = |a: &mut u64| {
+            if let Some(&f) = plt.get(a) {
+                *a = f;
+            }
+        };
+        for s in &mut sums {
+            s.call_targets.iter_mut().for_each(through);
+            s.refs.iter_mut().for_each(through);
+            s.top_args.iter_mut().for_each(|t| through(&mut t.0));
+        }
+    }
     let t1 = std::time::Instant::now();
     let starts: Vec<u64> = fs.iter().map(|f| f.0).collect();
     let mut idx = solve(&u, &starts, &sums, &external.iter().copied().collect(), MAX_ROUNDS);
@@ -1416,7 +1709,7 @@ pub fn build(mem: &Memory, functions: &[(u64, u64)], external: &[u64]) -> ThisIn
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 8;
+const INDEX_VERSION: u8 = 10;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -1465,6 +1758,15 @@ impl ThisIndex {
                 u32_(&mut b, *off as u32);
                 u32_(&mut b, *v);
             }
+        }
+        let mut pf: Vec<_> = self.param_fields.iter().collect();
+        pf.sort_unstable();
+        u32_(&mut b, pf.len() as u32);
+        for ((f, j, k), v) in pf {
+            u64_(&mut b, *f);
+            b.push(*j);
+            u32_(&mut b, *k as u32);
+            u32_(&mut b, *v);
         }
         b
     }
@@ -1526,6 +1828,11 @@ impl ThisIndex {
                     idx.members.insert((c, off), v);
                 }
             }
+        }
+        for _ in 0..r.u32()? {
+            let (f, j) = (r.u64()?, r.take(1)?[0]);
+            let (k, v) = (r.u32()? as i32, r.u32()?);
+            idx.param_fields.insert((f, j, k), v);
         }
         (r.1 == b.len()).then_some(idx)
     }
@@ -1625,6 +1932,27 @@ mod tests {
         assert!(s.top_args.contains(&(0x1100, 0b11_1110)), "{:?}", s.top_args);
     }
 
+    /// WS94: the pointers in the fields of a stack object passed to a call are recorded at
+    /// that call; a field written with something else than a pointer is a clobber.
+    #[test]
+    fn a_summary_records_the_fields_of_the_stack_objects_passed() {
+        let code = [
+            0x48, 0x83, 0xec, 0x28, // sub rsp, 0x28
+            0x48, 0x89, 0x74, 0x24, 0x10, // mov [rsp+0x10], rsi (the object at rsp+8: +8)
+            0xc7, 0x44, 0x24, 0x18, 0x01, 0x00, 0x00, 0x00, // mov dword [rsp+0x18], 1 (+0x10: no pointer)
+            0x48, 0x89, 0x77, 0x10, // mov [rdi+0x10], rsi
+            0x89, 0x47, 0x18, // mov [rdi+0x18], eax
+            0x48, 0x8d, 0x7c, 0x24, 0x08, // lea rdi, [rsp+8]
+            0xe8, 0xde, 0x00, 0x00, 0x00, // call 0x1100 (next 0x1022)
+            0x48, 0x83, 0xc4, 0x28, // add rsp, 0x28
+            0xc3,
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        assert_eq!(s.stack_fields, [(0, 0, 8, FieldVal::Ptr(Src::Arg(1), 0))]);
+        assert_eq!(s.field_stores, [(Src::Arg(0), 0x10, Src::Arg(1), 0)]);
+        assert_eq!(s.field_clobbers, [(Src::Arg(0), 0x18, 4)]);
+    }
+
     /// A spilled `this` comes back from its stack slot; two values joined at a branch are no
     /// one pointer; a vtable stored into `this` is a constructor's.
     #[test]
@@ -1709,8 +2037,28 @@ mod tests {
         d[0x320..0x323].copy_from_slice(b"2B2");
         let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
         mem.add_block(MemoryBlock { name: ".data.rel.ro".into(), start: 0x2000, size: d.len() as u64, flags: MemoryFlags::READ, data: Some(Arc::from(d.as_slice())) });
-        assert_eq!(zero_offset_bases(&mem, 0x2000), [0x2100]);
-        assert_eq!(zero_offset_bases(&mem, 0x2100), Vec::<u64>::new());
+        assert_eq!(crate::vcall::type_info_bases(&mem, 0x2000), [0x2100]);
+        assert_eq!(crate::vcall::type_info_bases(&mem, 0x2100), Vec::<u64>::new());
+    }
+
+    /// WS94: a shared library calls its own exported functions through its PLT: the stub's GOT
+    /// slot is bound to the function, so the stub stands for it; the slot is no reference to
+    /// the function in data (its address is not taken).
+    #[test]
+    fn a_plt_stub_bound_to_a_function_of_the_image_stands_for_it() {
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        let block = |name: &str, start: u64, data: Vec<u8>, flags: MemoryFlags| MemoryBlock { name: name.into(), start, size: data.len() as u64, flags, data: Some(Arc::from(data.as_slice())) };
+        mem.add_block(block(".text", 0x1000, vec![0xc3; 0x200], MemoryFlags::READ | MemoryFlags::EXECUTE));
+        // 0x1500: endbr64 ; bnd jmp [rip + 0x1af5] (0x3000) ; nop    0x1510: the same to 0x3008
+        let mut plt = vec![0xf3, 0x0f, 0x1e, 0xfa, 0xf2, 0xff, 0x25, 0xf5, 0x1a, 0x00, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00];
+        plt.extend([0xf3, 0x0f, 0x1e, 0xfa, 0xf2, 0xff, 0x25, 0xed, 0x1a, 0x00, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00]);
+        mem.add_block(block(".plt.sec", 0x1500, plt, MemoryFlags::READ | MemoryFlags::EXECUTE));
+        mem.add_block(block(".got", 0x3000, vec![0; 0x10], MemoryFlags::READ | MemoryFlags::WRITE));
+        // the slot 0x3000 is bound to 0x1100 (the image's own function); 0x3008 to an import
+        mem.set_dynamic_relocations(Arc::from([0x3000u64.to_le_bytes(), 8u64.to_le_bytes(), 0x1100u64.to_le_bytes()].concat().as_slice()));
+        let m = plt_targets(&mem);
+        assert_eq!(m.into_iter().collect::<Vec<_>>(), [(0x1500, 0x1100)]);
+        assert!(!universe(&mem).taken.contains(&0x1100));
     }
 
     /// The join of two classes is their nearest common base.
@@ -1737,6 +2085,7 @@ mod tests {
         idx.rets.insert(0x1100, 0);
         idx.fields.insert((0, 8), cls(1));
         idx.members.insert((1, 0x10), cls(0));
+        idx.param_fields.insert((0x1000, 1, 0x18), 1);
         idx.stats.rounds = 3;
         let b = idx.to_bytes(42);
         assert_eq!(ThisIndex::from_bytes(&b, 42), Some(idx.clone()));
@@ -1745,6 +2094,8 @@ mod tests {
         assert_eq!(idx.param_class(0x1000, 0), Some(0x20));
         assert_eq!(idx.param_class(0x1000, 1), None);
         assert_eq!(idx.ret_class(0x1100), Some(0x10));
+        assert_eq!(idx.param_field_class(0x1000, 1, 0x18), Some(0x20));
+        assert_eq!(idx.param_field_class(0x1000, 0, 0x18), None);
         // a field of a base class is a field of the derived class
         assert_eq!(idx.field_class(0x20, 8), Some(0x20));
         assert_eq!(idx.field_class(0x10, 0x10), None);

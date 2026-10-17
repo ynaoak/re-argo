@@ -136,21 +136,121 @@ pub struct BinaryLoader;
 /// does **not** appear in the on-disk bytes (the slot reads as zero; the
 /// value lives in the relocation addend). This lets tools find indirect /
 /// vtable references that a raw byte search or code-operand scan cannot see.
+/// An absolute relocation against a symbol the image defines itself
+/// (`R_X86_64_64` / `R_AARCH64_ABS64`) is such a pointer too (WS94): a shared
+/// library refers to its exported vtables, `type_info`s and functions that way.
+/// Sorted by slot.
 pub fn elf_pointer_relocations(data: &[u8]) -> Vec<(u64, u64)> {
-    const R_X86_64_RELATIVE: u32 = 8;
-    const R_AARCH64_RELATIVE: u32 = 1027;
     let Ok(elf) = goblin::elf::Elf::parse(data) else {
         return Vec::new();
     };
+    local_pointer_relocations(&elf, false)
+}
+
+/// [`elf_pointer_relocations`] of a parsed image; with `got`, also the GOT slots bound to a
+/// symbol the image defines (`GLOB_DAT` / `JUMP_SLOT`: a shared library calling its own
+/// exported function through its PLT).
+fn local_pointer_relocations(elf: &goblin::elf::Elf, got: bool) -> Vec<(u64, u64)> {
+    let relocs = elf.dynrelas.iter().chain(elf.pltrelocs.iter()).map(|r| {
+        let sym = elf.dynsyms.get(r.r_sym).map(|s| (s.st_value, s.st_shndx, goblin::elf::sym::st_type(s.st_info)));
+        (r.r_type, r.r_offset, r.r_addend, sym)
+    });
+    resolve_pointer_relocations(elf.header.e_machine, got, relocs)
+}
+
+/// The pointers relocations write (see [`local_pointer_relocations`]): `(type, slot, addend,
+/// symbol (value, section index, type))` -> `(slot, target)` sorted by slot.
+fn resolve_pointer_relocations(machine: u16, got: bool, relocs: impl Iterator<Item = (u32, u64, Option<i64>, Option<(u64, usize, u8)>)>) -> Vec<(u64, u64)> {
+    const R_X86_64_RELATIVE: u32 = 8;
+    const R_AARCH64_RELATIVE: u32 = 1027;
+    // absolute, then GLOB_DAT, JUMP_SLOT
+    let absolute: &[u32] = match (machine, got) {
+        (goblin::elf::header::EM_X86_64, false) => &[1],
+        (goblin::elf::header::EM_X86_64, true) => &[1, 6, 7],
+        (goblin::elf::header::EM_AARCH64, false) => &[257],
+        (goblin::elf::header::EM_AARCH64, true) => &[257, 1025, 1026],
+        _ => &[],
+    };
     let mut out = Vec::new();
-    for reloc in elf.dynrelas.iter().chain(elf.pltrelocs.iter()) {
-        if (reloc.r_type == R_X86_64_RELATIVE || reloc.r_type == R_AARCH64_RELATIVE)
-            && let Some(addend) = reloc.r_addend
+    for (ty, slot, addend, sym) in relocs {
+        if ty == R_X86_64_RELATIVE || ty == R_AARCH64_RELATIVE {
+            if let Some(a) = addend {
+                out.push((slot, a as u64));
+            }
+        } else if absolute.contains(&ty)
+            && let Some((value, shndx, st_type)) = sym
+            && shndx != 0
+            && value != 0
+            && st_type != goblin::elf::sym::STT_TLS
         {
-            out.push((reloc.r_offset, addend as u64));
+            out.push((slot, value.wrapping_add(addend.unwrap_or(0) as u64)));
         }
     }
+    out.sort_unstable();
+    out.dedup_by_key(|r| r.0);
     out
+}
+
+/// [`local_pointer_relocations`] (with the GOT slots) as the RELA table
+/// `Memory::dynamic_relocations` reads (sorted by slot; `pointer_at` searches it): every entry
+/// relative (`R_X86_64_RELATIVE`, or `R_AARCH64_RELATIVE` for an AArch64 image). Read from the
+/// section's bytes (`raw`) directly: a program has hundreds of thousands of them.
+fn relative_rela_table(elf: &goblin::elf::Elf, raw: &[u8]) -> Arc<[u8]> {
+    let aarch64 = elf.header.e_machine == goblin::elf::header::EM_AARCH64;
+    let relative: u32 = if aarch64 { 1027 } else { 8 };
+    let absolute: &[u32] = match elf.header.e_machine {
+        goblin::elf::header::EM_X86_64 => &[1, 6, 7],
+        goblin::elf::header::EM_AARCH64 => &[257, 1025, 1026],
+        _ => &[],
+    };
+    // a symbol the image defines (not thread-local): its value
+    let own = |sym: usize| {
+        elf.dynsyms
+            .get(sym)
+            .filter(|s| s.st_shndx != 0 && s.st_value != 0 && goblin::elf::sym::st_type(s.st_info) != goblin::elf::sym::STT_TLS)
+            .map(|s| s.st_value)
+    };
+    let plt = elf.pltrelocs.iter().filter(|r| absolute.contains(&r.r_type)).filter_map(|r| Some((r.r_offset, own(r.r_sym)?.wrapping_add(r.r_addend.unwrap_or(0) as u64))));
+    Arc::from(relative_table(raw, relative, absolute, own, plt))
+}
+
+/// [`relative_rela_table`] of the RELA entries `raw`: `own` gives the value of a symbol the
+/// image defines, `plt` the GOT slots of `.rela.plt` bound to one.
+fn relative_table(raw: &[u8], relative: u32, absolute: &[u32], own: impl Fn(usize) -> Option<u64>, plt: impl Iterator<Item = (u64, u64)>) -> Vec<u8> {
+    // the relative entries as they are (in a program, all of them but a few imports, sorted)
+    let word = |e: &[u8], k: usize| u64::from_le_bytes(e[k * 8..k * 8 + 8].try_into().expect("8 bytes"));
+    let mut table: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut extra: Vec<(u64, u64)> = Vec::new();
+    let mut prev = 0u64;
+    let mut sorted = true;
+    for e in raw.chunks_exact(24) {
+        let (slot, info, addend) = (word(e, 0), word(e, 1), word(e, 2));
+        let ty = info as u32;
+        if ty == relative {
+            sorted &= slot > prev || table.is_empty();
+            prev = slot;
+            table.extend_from_slice(e);
+        } else if absolute.contains(&ty)
+            && let Some(v) = own((info >> 32) as usize)
+        {
+            extra.push((slot, v.wrapping_add(addend)));
+        }
+    }
+    extra.extend(plt);
+    if extra.is_empty() && sorted {
+        return table;
+    }
+    let mut all: Vec<(u64, u64)> = table.chunks_exact(24).map(|e| (word(e, 0), word(e, 2))).chain(extra).collect();
+    all.sort_unstable();
+    all.dedup_by_key(|r| r.0);
+    let ty = u64::from(relative).to_le_bytes();
+    table.clear();
+    for (slot, target) in all {
+        table.extend_from_slice(&slot.to_le_bytes());
+        table.extend_from_slice(&ty);
+        table.extend_from_slice(&target.to_le_bytes());
+    }
+    table
 }
 
 /// The functions an ELF exports (WS93): defined `STT_FUNC` / `STT_GNU_IFUNC` dynamic symbols
@@ -280,12 +380,13 @@ impl BinaryLoader {
 
             // the dynamic relocations of a 64-bit image, for reading the pointers a PIE's
             // loader writes (`Memory::dynamic_relocations`)
+            // (WS94: relative, and absolute against a symbol the image defines, sorted)
             if sh.sh_type == goblin::elf::section_header::SHT_RELA
                 && name == ".rela.dyn"
                 && elf.is_64
                 && let Some(table) = data.get(sh.sh_offset as usize..(sh.sh_offset + sh.sh_size) as usize)
             {
-                memory.set_dynamic_relocations(Arc::from(table));
+                memory.set_dynamic_relocations(relative_rela_table(elf, table));
             }
 
             if sh.sh_type == goblin::elf::section_header::SHT_PROGBITS
@@ -821,7 +922,7 @@ impl std::fmt::Display for SymbolKind {
 
 #[cfg(test)]
 mod reloc_tests {
-    use super::{elf_exported_functions, elf_pointer_relocations};
+    use super::{elf_exported_functions, elf_pointer_relocations, relative_table, resolve_pointer_relocations};
 
     /// WS93: no exports in what is no ELF; a BDS-internal function (`REARGO_TEST_BDS`) is none.
     #[test]
@@ -830,6 +931,41 @@ mod reloc_tests {
         let Ok(path) = std::env::var("REARGO_TEST_BDS") else { return };
         let ex = elf_exported_functions(&std::fs::read(path).unwrap());
         assert!(!ex.contains(&0x4bd0820), "{} exports", ex.len());
+    }
+
+    /// WS94: relative relocations, and absolute (and GOT, when asked) ones against a symbol the
+    /// image defines (not an undefined one, not a thread-local one), sorted by slot.
+    #[test]
+    fn pointer_relocations_resolve_the_symbols_the_image_defines() {
+        use goblin::elf::{header::EM_X86_64, sym::{STT_FUNC, STT_OBJECT, STT_TLS}};
+        let relocs = vec![
+            (8u32, 0x3010u64, Some(0x1100i64), None),
+            (1, 0x3000, Some(0x10), Some((0x2000u64, 12usize, STT_OBJECT))), // a vtable + 0x10
+            (1, 0x3008, Some(0), Some((0, 0, STT_FUNC))),                     // an import
+            (7, 0x4000, Some(0), Some((0x1200, 11, STT_FUNC))),               // its own function's GOT slot
+            (6, 0x4008, Some(0), Some((0x80, 13, STT_TLS))),                  // thread-local
+            (5, 0x4010, Some(0), Some((0x1300, 11, STT_FUNC))),               // a copy relocation
+        ];
+        assert_eq!(resolve_pointer_relocations(EM_X86_64, true, relocs.clone().into_iter()), [(0x3000, 0x2010), (0x3010, 0x1100), (0x4000, 0x1200)]);
+        assert_eq!(resolve_pointer_relocations(EM_X86_64, false, relocs.into_iter()), [(0x3000, 0x2010), (0x3010, 0x1100)], "no GOT slots");
+        let relative_only = vec![(8u32, 0x3010u64, Some(0x1100i64), None), (1, 0x3000, Some(0x10), Some((0x2000u64, 12usize, STT_OBJECT)))];
+        assert_eq!(resolve_pointer_relocations(0, true, relative_only.into_iter()), [(0x3010, 0x1100)], "another machine");
+    }
+
+    /// WS94: the table `Memory` reads: relative entries kept as they are when sorted and nothing
+    /// is added; else absolute / GOT entries against the image's own symbols added as relative
+    /// ones, imports dropped, sorted by slot.
+    #[test]
+    fn the_memory_table_is_relative_and_sorted() {
+        let e = |slot: u64, info: u64, addend: u64| [slot.to_le_bytes(), info.to_le_bytes(), addend.to_le_bytes()].concat();
+        let own = |sym: usize| (sym == 3).then_some(0x2000u64);
+        // sorted relative entries and an import: the relative ones as they are
+        let raw = [e(0x3000, 8, 0x1100), e(0x3008, 8, 0x1200), e(0x3010, (2 << 32) | 1, 0)].concat();
+        assert_eq!(relative_table(&raw, 8, &[1, 6, 7], own, std::iter::empty()), [e(0x3000, 8, 0x1100), e(0x3008, 8, 0x1200)].concat());
+        // an absolute entry against the image's own symbol 3 (+0x10), a bound GOT slot, out of order
+        let raw = [e(0x3008, 8, 0x1200), e(0x3000, (3 << 32) | 1, 0x10), e(0x2ff8, 8, 0x1100)].concat();
+        let t = relative_table(&raw, 8, &[1, 6, 7], own, [(0x4000, 0x1300)].into_iter());
+        assert_eq!(t, [e(0x2ff8, 8, 0x1100), e(0x3000, 8, 0x2010), e(0x3008, 8, 0x1200), e(0x4000, 8, 0x1300)].concat());
     }
 
     #[test]

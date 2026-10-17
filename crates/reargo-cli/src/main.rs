@@ -4773,6 +4773,8 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         println!("return classes   {}", idx.rets.len());
         println!("field classes    {}", idx.fields.len());
         println!("member classes   {}", idx.members.len());
+        let pf_fns: std::collections::BTreeSet<u64> = idx.param_fields.keys().map(|k| k.0).collect();
+        println!("param fields     {} (in {} functions)", idx.param_fields.len(), pf_fns.len());
     }
     for &a in addresses {
         println!("0x{a:x}");
@@ -4783,6 +4785,11 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         }
         if let Some(vt) = idx.ret_class(a) {
             println!("  returns: {}", class(Some(vt)));
+        }
+        let mut pf: Vec<_> = idx.param_fields.keys().filter(|k| k.0 == a).collect();
+        pf.sort_unstable();
+        for &(_, i, k) in pf {
+            println!("  param {i} +0x{k:x}: {}", class(idx.param_field_class(a, usize::from(i), i64::from(k))));
         }
         // a class's vtable: the classes of its fields and members (its own and its bases')
         for (off, vt, member) in idx.class_fields(a) {
