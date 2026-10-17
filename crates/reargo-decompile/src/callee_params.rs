@@ -468,15 +468,18 @@ impl<'a> CalleeParams<'a> {
         let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
         // (the walk's instructions follow each other: the one after any but the last is in it)
         let last = walk.last();
-        let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+        // (the addresses seen, by their offset from the target: every one is in the walk)
+        let mut seen = vec![0u64; (last.map_or(0, |l| l - target) as usize + 1).div_ceil(64)];
         // (room for the whole walk: the instructions are large, and growing moved them)
         let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::with_capacity(walk.len());
         let mut stack = vec![target as usize];
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
         while let Some(a) = stack.pop() {
-            if !seen.insert(a) {
+            let off = a - target as usize;
+            if seen[off / 64] >> (off % 64) & 1 != 0 {
                 continue;
             }
+            seen[off / 64] |= 1 << (off % 64);
             // (the range lift with the integer PF: each instruction lifted alone with it)
             let insn = if walk.needs_pf {
                 self.lifter.lift_instruction(self.memory, a as u64)

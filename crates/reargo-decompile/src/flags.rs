@@ -746,6 +746,15 @@ pub(crate) fn renumber_named_flags(text: &mut String, func: &SsaFunction) {
             pos = under + 1;
             continue;
         }
+        // (a flag's word is a kind right before the `_`: any other word is passed over at once —
+        // a later `_` of the word is no flag's either, the word not starting at its kind)
+        let kind_before = FLAG_KINDS.iter().any(|k| {
+            under >= k.len() && &bytes[under - k.len()..under] == k.as_bytes() && (under == k.len() || !ident(bytes[under - k.len() - 1]))
+        });
+        if !kind_before {
+            pos = under + 1;
+            continue;
+        }
         let mut start = under;
         while start > 0 && ident(bytes[start - 1]) {
             start -= 1;

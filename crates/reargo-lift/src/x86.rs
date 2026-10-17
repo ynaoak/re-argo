@@ -3212,6 +3212,16 @@ impl X86Lifter {
         Ok((self.lift_decoded(insn, address, x87)?, insn))
     }
 
+    /// The target of the near `jmp` at `address` (`None` for another instruction): what the
+    /// lone `BRANCH` its lift is reads, without the lift (no other instruction lifts to one).
+    pub fn near_jump_target(&self, memory: &Memory, address: u64) -> Option<u64> {
+        use iced_x86::OpKind;
+        let insn = self.decode_one(memory, address).ok()?;
+        (insn.mnemonic() == iced_x86::Mnemonic::Jmp
+            && matches!(insn.op0_kind(), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64))
+        .then(|| insn.near_branch_target())
+    }
+
     /// The instruction at `address`, decoded from the (up to 15) bytes
     /// [`Memory::read_instruction_bytes`] reads there.
     fn decode_one(&self, memory: &Memory, address: u64) -> Result<iced_x86::Instruction, LiftError> {

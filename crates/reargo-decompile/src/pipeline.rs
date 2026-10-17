@@ -209,6 +209,10 @@ impl Imports<'_> {
     /// `jmp t` as the first instruction of `target`: `t`.
     fn thunk_target(&self, target: u64) -> Option<u64> {
         let (lifter, memory) = self.code?;
+        // (x86: only a near `jmp` lifts to a lone `BRANCH`, to its target)
+        if let Some(x86) = lifter.as_x86() {
+            return x86.near_jump_target(memory, target);
+        }
         let insn = lifter.lift_instruction(memory, target).ok()?;
         match insn.ops.as_slice() {
             [op] if op.opcode == reargo_core::pcode::OpCode::Branch => {
@@ -1761,15 +1765,25 @@ fn trim_to_function_body(
     // Pre-compute body membership; the AddressSet's `contains`
     // walks an interval tree per call, so caching the bool per
     // instruction keeps the inner loop hot.
-    let in_body: Vec<bool> = instructions
-        .iter()
-        .map(|insn| {
-            body_addrs.contains(&reargo_core::address::Address::new(
-                reargo_core::address::SpaceId::RAM,
-                insn.address,
-            )) || insn.address == entry
-        })
-        .collect();
+    let ram = |a: u64| reargo_core::address::Address::new(reargo_core::address::SpaceId::RAM, a);
+    let in_body: Vec<bool> = if instructions.windows(2).all(|w| w[0].address <= w[1].address) {
+        // (in address order: `contains`' last range starting at or before each address, found
+        // by walking the ranges along)
+        let mut ranges = body_addrs.ranges().peekable();
+        let mut last: Option<&reargo_core::address::AddressRange> = None;
+        instructions
+            .iter()
+            .map(|insn| {
+                let key = (reargo_core::address::SpaceId::RAM, insn.address);
+                while let Some(r) = ranges.next_if(|r| (r.start.space, r.start.offset) <= key) {
+                    last = Some(r);
+                }
+                last.is_some_and(|r| r.contains(&ram(insn.address))) || insn.address == entry
+            })
+            .collect()
+    } else {
+        instructions.iter().map(|insn| body_addrs.contains(&ram(insn.address)) || insn.address == entry).collect()
+    };
     let keep: Vec<bool> = in_body
         .iter()
         .zip(reach.iter().copied().chain(std::iter::repeat(false)))
@@ -1843,14 +1857,26 @@ pub(crate) fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructio
     }
 
     let n = instructions.len();
+    let mut visited = vec![false; n];
+    let mut stack = vec![0usize];
+
+    // (in increasing address order, each address is found by binary search)
+    if instructions.windows(2).all(|w| w[0].borrow().address < w[1].borrow().address) {
+        let idx_of = |a: u64| instructions.binary_search_by_key(&a, |i| i.borrow().address).ok();
+        while let Some(idx) = stack.pop() {
+            if visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
+            reach_successors(instructions[idx].borrow(), idx_of, &mut stack);
+        }
+        return visited;
+    }
     let addr_to_idx: FxHashMap<u64, usize> = instructions
         .iter()
         .enumerate()
         .map(|(idx, insn)| (insn.borrow().address, idx))
         .collect();
-
-    let mut visited = vec![false; n];
-    let mut stack = vec![0usize];
 
     while let Some(idx) = stack.pop() {
         if visited[idx] {
