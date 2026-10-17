@@ -4,6 +4,9 @@ use reargo_arch::DecodedInstruction;
 
 use crate::function::Function;
 
+/// A listing's instructions by address.
+pub type InstructionMap = BTreeMap<u64, Box<DecodedInstruction>>;
+
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Listing {
     instructions: BTreeMap<u64, Box<DecodedInstruction>>,
@@ -13,6 +16,18 @@ pub struct Listing {
 impl Listing {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The instruction and function maps, for the on-disk analysis cache
+    /// (which stores them in chunks and rebuilds them with
+    /// [`Self::from_cache_parts`]).
+    pub fn cache_parts(&self) -> (&InstructionMap, &BTreeMap<u64, Function>) {
+        (&self.instructions, &self.functions)
+    }
+
+    /// A listing of the maps [`Self::cache_parts`] returned.
+    pub fn from_cache_parts(instructions: InstructionMap, functions: BTreeMap<u64, Function>) -> Self {
+        Self { instructions, functions }
     }
 
     pub fn add_instruction(&mut self, insn: DecodedInstruction) {

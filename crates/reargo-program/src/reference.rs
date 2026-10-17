@@ -86,7 +86,10 @@ pub struct JumpMark {
 }
 
 /// The references from (or to) one address, in the order added.
-type RefList = smallvec::SmallVec<[Reference; 2]>;
+pub type RefList = smallvec::SmallVec<[Reference; 2]>;
+
+/// References by source (or target) address.
+pub type RefMap = BTreeMap<u64, RefList>;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceManager {
@@ -129,6 +132,18 @@ impl Default for ReferenceManager {
 impl ReferenceManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The from / to maps and the jump log, for the on-disk analysis
+    /// cache.
+    pub fn cache_parts(&self) -> (&RefMap, &RefMap, &[Reference]) {
+        (&self.refs_from, &self.refs_to, &self.jumps)
+    }
+
+    /// A manager of the parts [`Self::cache_parts`] returned, with a fresh
+    /// id (like a manager deserialised whole).
+    pub fn from_cache_parts(refs_from: RefMap, refs_to: RefMap, jumps: Vec<Reference>) -> Self {
+        Self { refs_from, refs_to, jumps, id: next_manager_id() }
     }
 
     pub fn add(&mut self, reference: Reference) {
