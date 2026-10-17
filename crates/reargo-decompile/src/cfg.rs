@@ -34,18 +34,23 @@ fn switch_targets(op: &reargo_core::pcode::PcodeOp) -> impl Iterator<Item = u64>
 /// function — is not taken for part of this one. A call that never returns, marked by
 /// [`crate::noreturn::mark_noreturn_calls`], ends the flow the same way (WS81).
 pub fn is_trap(insn: &LiftedInstruction) -> bool {
-    insn.ops.iter().any(|op| {
-        op.opcode == OpCode::CallOther
-            && op.inputs.first().is_some_and(|c| {
-                c.space == reargo_core::address::SpaceId::CONST
-                    && (c.offset == 3 || c.offset == reargo_core::pcode::intrinsic::NORETURN)
-            })
-    }) || {
-        // (the text's first word is `ud2` / `hlt` only for those instructions: the decoded
-        // one answers without formatting the text)
-        let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt));
-        may_be && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
-    }
+    insn.ops.iter().any(is_trap_op) || is_trap_text(insn)
+}
+
+/// `CALLOTHER` of `int3` or of a call that never returns.
+fn is_trap_op(op: &reargo_core::pcode::PcodeOp) -> bool {
+    op.opcode == OpCode::CallOther
+        && op.inputs.first().is_some_and(|c| {
+            c.space == reargo_core::address::SpaceId::CONST && (c.offset == 3 || c.offset == reargo_core::pcode::intrinsic::NORETURN)
+        })
+}
+
+/// `ud2` / `hlt`.
+fn is_trap_text(insn: &LiftedInstruction) -> bool {
+    // (the text's first word is `ud2` / `hlt` only for those instructions: the decoded
+    // one answers without formatting the text)
+    let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt));
+    may_be && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
 }
 
 /// A `pop` (its text: `pop reg`; the decoded instruction answers for the others without
@@ -81,10 +86,16 @@ fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
     // (collected, then sorted and deduplicated)
     let mut leaders: Vec<u64> = vec![instructions[0].address];
     for insn in instructions {
-        let has_branch = insn.ops.iter().any(|op| {
-            matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd)
-        });
-        let has_return = insn.ops.iter().any(|op| op.opcode == OpCode::Return) || is_trap(insn);
+        // (one walk over the ops for what the three tests read of them)
+        let (mut has_branch, mut ret, mut trap) = (false, false, false);
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Branch | OpCode::CBranch | OpCode::BranchInd => has_branch = true,
+                OpCode::Return => ret = true,
+                _ => trap |= is_trap_op(op),
+            }
+        }
+        let has_return = ret || trap || is_trap_text(insn);
         if has_branch || has_return {
             for op in &insn.ops {
                 if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)

@@ -466,6 +466,8 @@ impl<'a> CalleeParams<'a> {
         }
         // (the stack holds addresses: those of a walk increase with their index)
         let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
+        // (the walk's instructions follow each other: the one after any but the last is in it)
+        let last = walk.last();
         let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
         let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
         let mut stack = vec![target as usize];
@@ -481,13 +483,15 @@ impl<'a> CalleeParams<'a> {
                 x86.lift_alone_with(self.memory, a as u64, &mut cursor)
             }
             .ok()?;
-            crate::pipeline::reach_successors(&insn, idx_of, &mut stack);
+            let fall = insn.address + u64::from(insn.length);
+            let next_in_walk = Some(insn.address) != last;
+            crate::pipeline::reach_successors(&insn, |x| if x == fall && next_in_walk { Some(x as usize) } else { idx_of(x) }, &mut stack);
             lifted.push((a, insn));
         }
         lifted.sort_unstable_by_key(|(a, _)| *a);
         let insns: Vec<LiftedInstruction> = lifted.into_iter().map(|(_, i)| i).collect();
         let hit_limit = walk.len() >= MAX_INSNS;
-        let truncated = hit_limit && insns.last().map(|i| i.address) == walk.last();
+        let truncated = hit_limit && insns.last().map(|i| i.address) == last;
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
     }
 
