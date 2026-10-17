@@ -143,17 +143,30 @@ impl FlowCache {
         (n > 0).then(|| &self.verdicts[((target ^ (target >> 5)) % n) as usize])
     }
 
-    /// The flow of the instruction at `addr` lifted alone (`None` when it cannot be lifted).
-    fn get(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64) -> Option<Flow> {
-        let shard = &self.shards[((addr ^ (addr >> 6)) % self.shards.len() as u64) as usize];
-        if let Some(f) = shard.lock().ok().and_then(|m| m.get(&addr).cloned()) {
-            return f;
+    /// The flows of the instructions from `addr` on, each lifted alone, handed to `each` while
+    /// it returns `true` (up to the first that cannot be lifted). The instructions of one
+    /// 4 KB page share a shard, looked up under one lock.
+    fn run(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64, each: &mut dyn FnMut(&Flow) -> bool) {
+        let shard_of = |a: u64| ((a >> 12) % self.shards.len() as u64) as usize;
+        let mut at = addr;
+        loop {
+            let k = shard_of(at);
+            let Ok(mut m) = self.shards[k].lock() else { return };
+            while shard_of(at) == k {
+                let f = match m.get(&at) {
+                    Some(f) => f,
+                    None => {
+                        let f = x86.lift_alone(memory, at).ok().map(|i| Flow::of(&i));
+                        m.entry(at).or_insert(f)
+                    }
+                };
+                let Some(f) = f else { return };
+                if !each(f) {
+                    return;
+                }
+                at = f.address + u64::from(f.length);
+            }
         }
-        let f = x86.lift_alone(memory, addr).ok().map(|i| Flow::of(&i));
-        if let Ok(mut m) = shard.lock() {
-            m.insert(addr, f.clone());
-        }
-        f
     }
 }
 
@@ -303,16 +316,16 @@ impl Code<'_> {
             // `lift_range(addr, CHUNK)`'s instructions, one at a time (it stops at the first
             // that cannot be lifted)
             Some((x86, cache)) => {
-                let mut at = addr;
-                for _ in 0..CHUNK {
-                    let Some(f) = cache.get(x86, self.memory, at) else { break };
+                let mut n = 0;
+                cache.run(x86, self.memory, addr, &mut |f| {
                     if self.index.contains_key(&f.address) {
-                        break; // runs into code lifted before
+                        return false; // runs into code lifted before
                     }
-                    at = f.address + u64::from(f.length);
                     self.index.insert(f.address, self.insns.len());
-                    self.insns.push(f);
-                }
+                    self.insns.push(f.clone());
+                    n += 1;
+                    n < CHUNK
+                });
             }
             None => {
                 for insn in self.lifter.lift_range(self.memory, addr, CHUNK).ok()? {
