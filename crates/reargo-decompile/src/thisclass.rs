@@ -93,6 +93,9 @@ enum Val {
     /// indexed address, a pointer plus a register, or stepped through it in a loop): an element
     /// of an array / a vector
     Elem(Src),
+    /// (WS96) the pointer loaded from the global at this address (a global object's vtable
+    /// pointer: a call through it is a virtual call on that global object)
+    GlobalVt(u64),
 }
 
 /// The offset of an element of a buffer (WS95; see `Val::Elem`) in the loads, field stores,
@@ -118,6 +121,8 @@ pub enum ImportKind {
     /// anything (another module's function, a callback): the memory its pointer arguments
     /// reach may get anything
     Escape,
+    /// (WS96) returns fresh memory (`malloc`, `operator new`): a buffer holding no element yet
+    Alloc,
 }
 
 /// The kind of an import, by its name (WS95): `Escape` when not known.
@@ -127,6 +132,13 @@ pub fn import_kind(name: &str) -> ImportKind {
     match name {
         "memcpy" | "memmove" | "__memcpy_chk" | "__memmove_chk" | "mempcpy" | "wmemcpy" | "wmemmove" => ImportKind::Copy,
         "realloc" | "reallocarray" => ImportKind::Realloc,
+        // (WS96: operator new / new[], with alignment or nothrow; malloc and friends)
+        "malloc" | "calloc" | "aligned_alloc" | "valloc" | "pvalloc" | "memalign" => ImportKind::Alloc,
+        _ if ["_Znwm", "_Znam", "_Znwj", "_Znaj"].iter().any(|p| name.starts_with(p)) => ImportKind::Alloc,
+        // (libstdc++'s `std::__throw_length_error(const char*)` & co: they throw)
+        _ if name.starts_with("_ZSt") && name.contains("__throw_") => ImportKind::Pure,
+        // (operator delete / delete[]: the memory is dead)
+        _ if ["_ZdlPv", "_ZdaPv"].iter().any(|p| name.starts_with(p)) => ImportKind::Pure,
         "memset" | "__memset_chk" | "wmemset" | "bzero" | "explicit_bzero" => ImportKind::Memset,
         // (they call back user code with a user pointer, or do anything)
         "pthread_once" | "pthread_create" | "__cxa_atexit" | "__cxa_thread_atexit_impl" | "atexit" | "qsort" | "bsearch" | "syscall" | "dl_iterate_phdr" => ImportKind::Escape,
@@ -150,7 +162,7 @@ fn is_math(name: &str) -> bool {
 
 /// Imports that write nothing a pointer's class depends on into user memory.
 const PURE_IMPORTS: &[&str] = &[
-    "free", "malloc", "calloc", "aligned_alloc", "posix_memalign", "malloc_usable_size", "strlen", "strnlen", "wcslen", "strcmp", "strncmp", "strcasecmp",
+    "free", "posix_memalign", "malloc_usable_size", "strlen", "strnlen", "wcslen", "strcmp", "strncmp", "strcasecmp",
     "strncasecmp", "memcmp", "bcmp", "wmemcmp", "memchr", "memrchr", "wmemchr", "strchr", "strrchr", "strstr", "strspn", "strcspn", "strpbrk", "strcoll_l",
     "wcscoll_l", "strdup", "abort", "exit", "_exit", "_Exit", "__assert_fail", "__stack_chk_fail", "__errno_location", "fwrite", "fputs", "fputc", "fputwc",
     "fprintf", "printf", "vfprintf", "fflush", "fflush_unlocked", "fclose", "fseek", "fseeko", "fseeko64", "ftell", "ftello", "setbuf", "setvbuf", "ferror",
@@ -256,6 +268,14 @@ pub struct Summary {
     pub refs: Vec<u64>,
     /// the objects `Src::Obj(i)` names (WS95: brought in by the callees' effects)
     pub objs: Vec<crate::effects::ObjRef>,
+    /// (WS96) the calls whose result is fresh memory (an allocator's: `operator new`), sorted
+    pub fresh: Vec<u32>,
+    /// (WS96) `(call, global, slot, escapes)`: a virtual call on the global object at `global`
+    /// (through its vtable's `slot`); `escapes`: the range of `buf_escapes` it recorded
+    pub global_calls: Vec<(u32, u64, i32, u32, u32)>,
+    /// (WS96) `(source, offset)`: pointers into one buffer stored at `+offset`, `+offset + 8`
+    /// and `+offset + 16` of `source` (a `{begin, end, capacity}` triple: a vector)
+    pub triples: Vec<(Src, i32)>,
 }
 
 impl Summary {
@@ -419,7 +439,7 @@ fn add(v: Val, k: i64) -> Val {
         Val::Ptr(s, o) => i32::try_from(i64::from(o) + k).map_or(Val::Unk, |o| Val::Ptr(s, o)),
         Val::Const(c) => Val::Const(c.wrapping_add(k as u64)),
         Val::Elem(s) => Val::Elem(s),
-        Val::Unk | Val::Made(..) => Val::Unk,
+        Val::Unk | Val::Made(..) | Val::GlobalVt(_) => Val::Unk,
     }
 }
 
@@ -607,7 +627,7 @@ impl Interp<'_> {
             _ => None,
         };
         match kind {
-            ImportKind::Pure => {}
+            ImportKind::Pure | ImportKind::Alloc => {}
             ImportKind::Copy => match (ptr(0), ptr(1)) {
                 (Some(d), Some(s)) => self.out.buf_copies.push((d.0, s.0)),
                 (Some(d), None) => self.out.buf_writes.push(d.0),
@@ -635,10 +655,20 @@ impl Interp<'_> {
             ImportKind::Escape => {
                 // (the object of a virtual call: its class's methods say what they do to it)
                 let receiver = target == 0 && self.virtual_receiver(st, i);
+                let from = self.out.buf_escapes.len() as u32;
                 for j in usize::from(receiver)..6 {
                     if let Some(p) = ptr(j) {
                         self.out.buf_escapes.push(p);
                     }
+                }
+                // (WS96: a virtual call on a global object, `g->vfn(…)`: a global allocator's)
+                if target == 0
+                    && i.op0_kind() == OpKind::Memory
+                    && i.memory_index() == Register::None
+                    && let Val::Const(g) = st.r[ARG_REGS[0]]
+                    && gpr(i.memory_base()).map(|b| st.r[b]) == Some(Val::GlobalVt(g))
+                {
+                    self.out.global_calls.push((id, g, i.memory_displacement64() as i32, from, self.out.buf_escapes.len() as u32));
                 }
             }
         }
@@ -688,8 +718,10 @@ impl Interp<'_> {
                         let d = i.op0_register();
                         if let Some(g) = gpr(d) {
                             st.r[g] = if reg64(d) {
-                                let a = self.addr(st, i);
-                                self.load(st, a)
+                                match self.addr(st, i) {
+                                    Val::Const(a) if i.memory_base() == Register::RIP => Val::GlobalVt(a),
+                                    a => self.load(st, a),
+                                }
                             } else {
                                 Val::Unk
                             };
@@ -1282,6 +1314,9 @@ pub struct IndexStats {
     pub solve_ms: u64,
     /// WS95: composing the effect summaries
     pub compose_ms: u64,
+    /// WS96: the functions of the binary found to allocate / free memory
+    pub allocators: u64,
+    pub deallocators: u64,
 }
 
 impl ThisIndex {
@@ -1593,6 +1628,7 @@ impl Ctx<'_> {
             Src::Obj(i) => match self.sums[k].objs[i as usize] {
                 crate::effects::ObjRef::Vtable(vt) => self.primary.get(&vt).map_or(TOP, |&c| cls(c)),
                 crate::effects::ObjRef::RetOf(f) => self.fidx(f).map_or(TOP, |t| self.r[t]),
+                crate::effects::ObjRef::Fresh(_) => TOP,
             },
         }
     }
@@ -2355,10 +2391,15 @@ pub fn build_with(mem: &Memory, functions: &[(u64, u64)], external: &[u64], impo
         .collect();
     let t_sum = std::time::Instant::now();
     // (development: `REARGO_NO_EFFECTS=1` leaves them out, to compare)
-    let sums = if std::env::var_os("REARGO_NO_EFFECTS").is_some() { sums } else { crate::effects::compose(&starts, sums, &export) };
+    // WS96: the allocators (their results are fresh memory) and deallocators (no effects)
+    let listed = |f: u64| u.listing.contains_key(&f);
+    let mem_fns = crate::effects::memory_functions(&starts, &sums, &listed, &kinds);
+    let sums = if std::env::var_os("REARGO_NO_EFFECTS").is_some() { sums } else { crate::effects::compose(&starts, sums, &export, &mem_fns) };
     let compose_ms = t_sum.elapsed().as_millis() as u64;
     let t1 = std::time::Instant::now();
     let mut idx = solve(&u, &starts, &sums, &external.iter().copied().collect(), MAX_ROUNDS);
+    idx.stats.allocators = mem_fns.alloc.iter().filter(|a| starts.binary_search(a).is_ok()).count() as u64;
+    idx.stats.deallocators = mem_fns.dealloc.len() as u64;
     idx.stats.summarize_ms = (t1 - t0).as_millis() as u64 - compose_ms;
     idx.stats.compose_ms = compose_ms;
     idx.stats.solve_ms = t1.elapsed().as_millis() as u64;
@@ -2367,7 +2408,7 @@ pub fn build_with(mem: &Memory, functions: &[(u64, u64)], external: &[u64], impo
 
 /// The version of the index format and of the analysis behind it (a cached index of another
 /// version is rebuilt).
-const INDEX_VERSION: u8 = 11;
+const INDEX_VERSION: u8 = 12;
 const MAGIC: &[u8; 7] = b"RATHIS\0";
 
 impl ThisIndex {
@@ -2380,7 +2421,7 @@ impl ThisIndex {
         b.push(INDEX_VERSION);
         u64_(&mut b, key);
         let s = &self.stats;
-        for v in [s.functions, s.classes, s.rounds, u64::from(s.converged), s.summarize_ms, s.solve_ms, s.seeded_this, s.compose_ms] {
+        for v in [s.functions, s.classes, s.rounds, u64::from(s.converged), s.summarize_ms, s.solve_ms, s.seeded_this, s.compose_ms, s.allocators, s.deallocators] {
             u64_(&mut b, v);
         }
         u32_(&mut b, self.hierarchy.vtables.len() as u32);
@@ -2450,11 +2491,11 @@ impl ThisIndex {
             return None;
         }
         let mut idx = ThisIndex::default();
-        let mut st = [0u64; 8];
+        let mut st = [0u64; 10];
         for v in st.iter_mut() {
             *v = r.u64()?;
         }
-        idx.stats = IndexStats { functions: st[0], classes: st[1], rounds: st[2], converged: st[3] != 0, summarize_ms: st[4], solve_ms: st[5], seeded_this: st[6], compose_ms: st[7] };
+        idx.stats = IndexStats { functions: st[0], classes: st[1], rounds: st[2], converged: st[3] != 0, summarize_ms: st[4], solve_ms: st[5], seeded_this: st[6], compose_ms: st[7], allocators: st[8], deallocators: st[9] };
         let n = r.u32()? as usize;
         for _ in 0..n {
             idx.hierarchy.vtables.push(r.u64()?);
@@ -2744,6 +2785,10 @@ mod tests {
         assert_eq!(import_kind("snprintf"), ImportKind::WritesArgs);
         assert_eq!(import_kind("sqrtf"), ImportKind::WritesArgs);
         assert_eq!(import_kind("pthread_once"), ImportKind::Escape);
+        assert_eq!(import_kind("_Znwm@plt"), ImportKind::Alloc);
+        assert_eq!(import_kind("malloc"), ImportKind::Alloc);
+        assert_eq!(import_kind("_ZdlPvm"), ImportKind::Pure);
+        assert_eq!(import_kind("_ZSt20__throw_length_errorPKc"), ImportKind::Pure);
     }
 
     /// A spilled `this` comes back from its stack slot; two values joined at a branch are no
