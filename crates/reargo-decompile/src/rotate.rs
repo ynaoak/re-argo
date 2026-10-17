@@ -82,11 +82,11 @@ pub fn recover_rotates(func: &mut SsaFunction) -> usize {
         for d in dead {
             func.ops[d].dead = true;
             for i in func.ops[d].inputs.clone() {
-                func.varnodes[i as usize].uses.retain(|&u| u != d);
+                func.varnodes[i as usize].uses.retain(|&mut u| u != d);
             }
         }
         for i in func.ops[o].inputs.clone() {
-            func.varnodes[i as usize].uses.retain(|&u| u != o);
+            func.varnodes[i as usize].uses.retain(|&mut u| u != o);
         }
         let t = func.varnodes.len() as VarId;
         func.varnodes.push(crate::ssa::SsaVarnode {
@@ -94,7 +94,7 @@ pub fn recover_rotates(func: &mut SsaFunction) -> usize {
             data: VarnodeData::new(SpaceId::CONST, tag, 8),
             version: 0,
             def_op: None,
-            uses: vec![o],
+            uses: smallvec::smallvec![o],
         });
         func.varnodes[x as usize].uses.push(o);
         func.varnodes[n as usize].uses.push(o);

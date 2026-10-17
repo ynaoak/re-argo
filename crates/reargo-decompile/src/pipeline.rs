@@ -901,7 +901,7 @@ fn settle_unknown_returns(ssa: &mut SsaFunction) {
                 data: reargo_core::pcode::VarnodeData::new(reargo_core::address::SpaceId::CONST, value, size),
                 version: 0,
                 def_op: None,
-                uses: vec![i],
+                uses: smallvec::smallvec![i],
             });
             ssa.ops[i].inputs.push(id);
         };

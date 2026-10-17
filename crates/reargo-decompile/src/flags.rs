@@ -282,7 +282,7 @@ pub fn recover_flag_compares(func: &mut SsaFunction) -> usize {
         func.ops[i].inputs = smallvec::smallvec![a, b];
         for v in old {
             if !func.ops[i].inputs.contains(&v) {
-                func.varnodes[v as usize].uses.retain(|&u| u != i);
+                func.varnodes[v as usize].uses.retain(|&mut u| u != i);
             }
         }
         for v in [a, b] {
@@ -443,7 +443,7 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
                 let Some(inputs) = sign.map(|s| s.inputs.clone()) else { continue };
                 let old = std::mem::replace(&mut func.ops[o].inputs, inputs.clone());
                 for v in old {
-                    func.varnodes[v as usize].uses.retain(|&u| u != o);
+                    func.varnodes[v as usize].uses.retain(|&mut u| u != o);
                 }
                 for v in inputs {
                     func.varnodes[v as usize].uses.push(o);
@@ -461,7 +461,7 @@ fn compare_at_the_cmp(func: &mut SsaFunction) -> usize {
         let inputs = func.ops[*x].inputs.clone();
         for &i in &inputs {
             if i != *of {
-                func.varnodes[i as usize].uses.retain(|&u| u != *x);
+                func.varnodes[i as usize].uses.retain(|&mut u| u != *x);
             }
         }
         func.ops[*x].opcode = Copy;
@@ -541,11 +541,11 @@ fn save_value(func: &mut SsaFunction, o: OpIdx, v: VarId, n: u64) -> VarId {
         data: reargo_core::pcode::VarnodeData::new(SpaceId::UNIQUE, SAVED_BASE + n * 0x10, size),
         version: 1,
         def_op: Some(o),
-        uses: Vec::new(),
+        uses: crate::ssa::UseVec::new(),
     });
     let old_inputs = func.ops[o].inputs.clone();
     for x in old_inputs {
-        func.varnodes[x as usize].uses.retain(|&u| u != o);
+        func.varnodes[x as usize].uses.retain(|&mut u| u != o);
     }
     if let Some(of) = func.ops[o].output {
         func.varnodes[of as usize].def_op = None;
