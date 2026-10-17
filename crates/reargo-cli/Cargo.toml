@@ -25,6 +25,7 @@ rustc-hash = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true, features = ["rayon"] }
 rayon = { workspace = true }
+smallvec = { workspace = true }
 zstd = { workspace = true }
 mimalloc = { workspace = true }
 libmimalloc-sys = { workspace = true }
