@@ -69,6 +69,14 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Scan with a YARA ruleset (lite subset)" | `yara <bin> rules.yar` |
 | "Compare two binaries by content similarity (TLSH)" | `tlsh-diff <a> <b>` |
 | "Decode obfuscated strings (XOR / ROL)" | `floss <bin>` |
+| "List the classes in a Java JAR / .class" | `jvm classes <jar> [--filter Foo] [--resources]` |
+| "Show a Java class (header, fields, method signatures)" | `jvm class <jar> a.b.C` |
+| "Disassemble a Java class / method (javap -c style)" | `jvm disasm <jar> a.b.C [--method name]` |
+| "Find string literals in a JAR and the methods that push them" | `jvm strings <jar> --pattern http [--constants]` |
+| "Who references this Java class / method / field?" | `jvm xrefs <jar> a.b.C.name` |
+| "Call tree: what does this Java method call?" | `jvm callees <jar> a.b.C.name --depth 3` |
+| "Reverse call tree: who calls this Java method?" | `jvm callers <jar> a.b.C.name --depth 3` |
+| "Classes extending / implementing a Java class or interface" | `jvm subtypes <jar> a.b.Base` |
 
 ---
 
@@ -93,7 +101,7 @@ Every command that needs the analysed program (`functions`, `decompile`, `xrefs`
 * **Sidecar**: an `annotate` / `iterate --apply` edit changes the key, so the next command re-runs the pipeline once. The cache holds the results *before* the overrides; the sidecar is applied on top on every run, exactly as after a fresh analysis. **Flags**: no flag reaches the pipeline — `--thumb` only selects the lifters of `disasm` / `pcode` / `decompile` / …, which run after it, so it is not in the key.
 * **Bypass**: global `--no-cache` (`re-argo --no-cache functions <bin>`) or `REARGO_NO_CACHE=1` — the pipeline runs and the cache is neither read nor written.
 * **stderr**: a hit prints `[cache] analysis results loaded from <file>` instead of the per-analyzer lines (stdout is unchanged); `triage` stays silent.
-* **Always run the pipeline**: `analyze` (it prints the per-analyzer lines; it also *refreshes* the entry, so `analyze` warms the cache for the commands after it) and `bench` (it measures the pipeline; it neither reads nor writes the cache). `script` keeps its own in-process analysis (uncached). The loader-only commands (`info`, `sections`, `symbols` without `--all`, `disasm`, `pcode`, `xref-scan`, `func-start`, `carve --start`, `classes`, `vtable`, `whatis`, `members`, `strings`, `search`, `hexdump`, `rop`, `embedded`, `floss`, `yara`, …) never ran the pipeline and are unaffected.
+* **Always run the pipeline**: `analyze` (it prints the per-analyzer lines; it also *refreshes* the entry, so `analyze` warms the cache for the commands after it) and `bench` (it measures the pipeline; it neither reads nor writes the cache). `script` keeps its own in-process analysis (uncached). The loader-only commands (`info`, `sections`, `symbols` without `--all`, `disasm`, `pcode`, `xref-scan`, `func-start`, `carve --start`, `classes`, `vtable`, `whatis`, `members`, `strings`, `search`, `hexdump`, `rop`, `embedded`, `floss`, `yara`, every `jvm …` subcommand, …) never ran the pipeline and are unaffected.
 * **What is stored** (`CACHE_FORMAT` 3): the listing (decoded instructions — an x86 instruction without its text, which is formatted again from its bytes on first use, as after decoding — + functions with bodies / frames / signatures), symbol table, references, comments, metadata, call renderings and tags, split into sections: each large map (instructions, functions, symbols by address / name, references from / to, comments, address tags) in chunks of 16384 entries, the rest (metadata, call renderings, the jump log, function tags) in one; each section is its own zstd frame (with zstd's content checksum). Instructions and references use a hand-rolled packed encoding (zigzag-varint address deltas, one-byte enums: decodes several times faster than serde and is ~40 % smaller); the rest is bincode (varint). The header holds magic, format, key, pre-key, the section table (kind, entry count, decoded and stored length) and a BLAKE3 of the header without the pre-key. On load the sections are read (positioned reads), decompressed into per-thread buffers and decoded in parallel (rayon), each map rebuilt from its sorted entries in one pass (the packed chunks decode straight into one presized vector), all while the binary itself loads. A truncated / corrupt / foreign file fails the header check (the file length must equal the header's plus the sections'), a zstd error / checksum mismatch, a length or entry-count mismatch or a decode error, and is ignored and rewritten; files are written to a temporary name and renamed into place; a cache read or write failure never fails the command (a write failure is a `[cache] WARNING` on stderr). Rebuilt on load instead of stored: the binary itself (`info`, memory, `arch`: the loader runs as usual), `data_types` (re-imported from DWARF, as the Type Recovery analyzer does) and the analyzers' in-run scratch `analysis_cache`. Writing is parallel too (encode + compress per section): a cold run is faster than before format 3 (python3.12 1.40 → 1.13 s).
 * **Exit**: a one-shot command leaves its analysed `Program` to the process exit instead of freeing it (`reargo_program::program::leak_on_drop`, set in `main` for every command but `mcp`, `script`, `debug`, `gdbserver` and `iterate`, which analyse again and again): freeing millions of small objects, many allocated on other threads, cost 25–50 ms.
 * Code: `crates/reargo-cli/src/cache.rs` (keys, file format, packed codec), `Program::analysis_state` / `restore_analysis_state` (`crates/reargo-program/src/program.rs`) and the `cache_parts` / `from_cache_parts` of `Listing`, `SymbolTable`, `ReferenceManager`, `CommentManager`, `TagManager`, `DecodedInstruction`; bump `CACHE_FORMAT` when the stored layout changes. Tests: `crates/reargo-cli/tests/analysis_cache.rs` and the unit tests in `cache.rs`.
@@ -171,6 +179,16 @@ ls /tmp/decomp/*.c
 re-argo annotate <bin> --import community_symbols.json
 re-argo functions <bin>                 # names now flow through every subsequent command
 re-argo iterate <bin> --apply           # let the heuristic correction loop finish the job
+```
+
+### Analyse a Java application (JAR)
+
+```bash
+re-argo jvm classes app.jar --filter auth          # find the interesting classes
+re-argo jvm strings app.jar --pattern http         # string literal → "a.b.Cls.method(desc):line @pc N"
+re-argo jvm xrefs app.jar com.example.net.Client.send   # who touches it?
+re-argo jvm callers app.jar com.example.net.Client.send --depth 3   # reverse call tree
+re-argo jvm disasm app.jar com.example.net.Client --method send     # javap -c style bytecode
 ```
 
 ---
@@ -796,6 +814,89 @@ Unsupported syntax (`wide`, `fullword`, regex strings, `for any i in (...)`, imp
 
 Output is one block per matched rule with per-string hit counts and the first N offsets. Useful for malware-family classification using community rulesets that fit the supported subset.
 
+### Java / JVM bytecode
+
+The `jvm` group analyses Java class files. Every subcommand takes a `.jar` / `.zip` / `.class` file (the container is detected by magic bytes, not by extension). These are **loader-only** commands: they parse the class path on every run and never touch the native analyzer pipeline, so they are unaffected by the analysis cache and `--no-cache`. Class names are dotted (`a.b.C`) or internal (`a/b/C`); nested classes use `$` (`a.b.C$Inner`). `--limit` defaults to 200 (0 = unlimited) where present.
+
+#### `jvm classes <FILE> [--filter TEXT] [--resources] [--limit N]`
+
+List the classes in a JAR (or a single `.class`): name, method count, field count, superclass (`(interface)` marker). `--filter` is a case-insensitive substring of the dotted name; `--resources` lists the non-class entries (JSON, images, shaders, …) instead.
+
+```
+Classes in rt.jar: 6 found (19470 total)
+  class                                                            meth  fld  extends
+  java.util.ArrayList                                                50    7  java.util.AbstractList
+```
+
+#### `jvm class <FILE> <CLASS>`
+
+One class: access flags, kind, class-file version (and Java release), superclass, interfaces, source file, generic signature, direct-subtype count, then every field (with `static final` constant values) and every method as a Java-style signature plus its JVM descriptor and code size.
+
+#### `jvm disasm <FILE> <CLASS> [--method NAME]`
+
+`javap -c`-style disassembly: per method `max_stack` / `max_locals` / code size, `// line N` markers from the line-number table, one instruction per row (`pc: mnemonic operand`, constant-pool operands resolved to names), and the exception table. `--method` keeps only methods with that name (all overloads). pc values are **decimal** bytecode offsets, as in `javap`.
+
+```
+  public int size()  [()I]
+    max_stack=1 max_locals=1 code=5 bytes
+    // line 284
+       0: aload_0
+       1: getfield        #2 java/util/ArrayList.size:I
+       4: ireturn
+```
+
+#### `jvm strings <FILE> [--pattern TEXT] [--constants] [--limit N]`
+
+String literals (`ldc`) with the method and line that push each one. `--pattern` is a case-insensitive substring filter; `--constants` additionally lists `static final String` constant fields (`ConstantValue`), which have no `ldc` site.
+
+```
+  "Index: "     com.sun.org.apache.xerces.internal.impl.dv.util.ByteListImpl.get(I)Ljava/lang/Object;:100 @pc 38
+```
+
+#### `jvm xrefs <FILE> <TARGET> [--limit N]`
+
+Every bytecode site that references a class, method or field (invokes, `getfield` / `putfield` / `getstatic` / `putstatic`, `new` / `checkcast` / `instanceof` / `anewarray`, `ldc` class constants). `TARGET` forms:
+
+| Form | Matches |
+|---|---|
+| `a.b.C` | any use of the class |
+| `a.b.C.name` | method or field `name` of that owner, any overload |
+| `a.b.C.name(I)V` | exactly that descriptor (overload) |
+| `*.name` | `name` on any owner |
+
+A spec without `(` is a class target when it names a class in the JAR **or** its last segment starts with an upper-case letter (the Java naming convention, which is how classes outside the JAR — JDK, libraries — are recognised, e.g. `java.io.File`); otherwise the last segment is the member name and the rest the owner (`java.util.List.add` = owner `java.util.List`, member `add`). A constant field with an upper-case name (`a.b.C.FOO`) therefore reads as a class unless the JAR defines no such class and you write `*.FOO`.
+
+```
+References to java.util.ArrayList.grow: 1 found
+  java.util.ArrayList.ensureExplicitCapacity(I)V:241 @pc 22    invokespecial   java.util.ArrayList.grow:(I)V
+```
+
+#### `jvm callees <FILE> <METHOD> [--depth N] [--external]`
+
+Methods called by `METHOD` (`a.b.C.method` or `a.b.C.method(desc)`; all overloads of an unqualified name are printed), as an indented tree. Default `--depth 1` (direct calls only). Calls into classes outside the JAR are hidden unless `--external` is given, and then carry an `[external]` marker and are not expanded. A method already expanded earlier in the tree is marked `[seen]` and not expanded again (recursion guard).
+
+```
+Callees of java.util.ArrayList.add(Ljava/lang/Object;)Z
+  invokespecial   java.util.ArrayList.ensureCapacityInternal(I)V (line 464)
+    invokestatic    java.util.ArrayList.calculateCapacity([Ljava/lang/Object;I)I (line 233)
+```
+
+#### `jvm callers <FILE> <METHOD> [--depth N] [--via-external]`
+
+Reverse call tree: methods that call `METHOD`, one row per calling method in `pkg.Cls.method(desc):line @pc N` form. Virtual dispatch counts: a call whose owner is a supertype or subtype of the target's class is included and marked `[via a.b.Owner]`. Supertypes outside the JAR (`Runnable`, `kotlin.jvm.functions.Function1`, …) are skipped unless `--via-external` — every lambda shares them, so following them lists every caller of every lambda. `[seen]` marks a method already visited in the tree. Default `--depth 1`.
+
+#### `jvm subtypes <FILE> <CLASS>`
+
+Classes extending / implementing `CLASS` (class or interface, transitive), as a tree indented by depth; interfaces carry an `(interface)` marker.
+
+**Output notes (all `jvm` commands)**
+
+* A call/reference **site** prints as `pkg.Cls.method(desc):line @pc N` — the descriptor keeps obfuscated overloads (`a`, `a`, `a`) apart; `:line` is omitted when the class has no line-number table. `N` is the decimal bytecode offset of the instruction, the same number `disasm` and `javap -c` show.
+* Markers: `[external]` (callee outside the JAR, `callees --external`), `[seen]` (already expanded / visited), `[via X]` (`callers`: reached through supertype/subtype `X` of the target's owner).
+* Class entries that fail to parse are skipped with one `warning: N class entries failed to parse` line on stderr; the rest of the JAR is still analysed.
+* Lists stop at `--limit` with `... N more (raise --limit to see them)`.
+
+
 ---
 
 ## Workspace structure
@@ -811,6 +912,7 @@ Output is one block per matched rule with per-string hit counts and the first N 
 | `reargo-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP client+server, syscalls, hooks |
 | `reargo-decompile` | CFG / SSA / dominator / dataflow, 6 optimisation passes (DCE / fold / propagate / strength / algebra / CSE), struct / array type recovery, taint analysis, **annotation pass-through to C/Rust**, **signature-aware call rendering**, SARIF |
 | `reargo-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
+| `reargo-jvm` | Java class-file parser + JAR loader (constant pool, bytecode decoder / `javap -c` formatter, descriptors, cross-reference / call-graph / subtype index); independent of the native pipeline, used by `re-argo jvm …` |
 | `reargo-cli` | ~40 CLI commands (see top of this file) |
 
 ## Architecture decisions

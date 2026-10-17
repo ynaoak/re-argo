@@ -614,6 +614,7 @@ dependencies = [
  "reargo-core",
  "reargo-decompile",
  "reargo-emulator",
+ "reargo-jvm",
  "reargo-lift",
  "reargo-loader",
  "reargo-program",
@@ -661,6 +662,16 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "thiserror",
+]
+
+[[package]]
+name = "reargo-jvm"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "rayon",
+ "rustc-hash",
  "thiserror",
 ]
 

@@ -21,6 +21,7 @@ Originally started as a Rust reimplementation of [NSA Ghidra](https://github.com
 - **Debug info**: DWARF (functions, types, parameters, line numbers, source-file plates), PDB headers / types
 - **SLEIGH runtime**: packed format reader, decision trees, context database, zlib decompression
 - **Binary formats**: ELF, PE (with `.pdata` / TLS callbacks / IAT / `.rsrc` VS_VERSIONINFO / Rich Header), Mach-O (with ObjC classes / methods / ivars / protocols), COFF, raw binary
+- **Java bytecode / JAR**: `re-argo jvm …` reads `.jar` / `.zip` / `.class` directly (no native pipeline): class listing, `javap -c`-style disassembly, string-literal finder, cross-references, caller / callee call trees (virtual-dispatch aware) and subtype trees
 - **Debugger foundation**: GDB RSP protocol (client + server), breakpoints, watchpoints, syscall emulation, state snapshots
 - **MCP integration**: Model Context Protocol over stdio for AI hosts (Claude Code, etc.)
 
@@ -84,6 +85,11 @@ target/release/re-argo yara <binary> rules.yar
 # Compare two binaries by TLSH content-fuzzy hash
 target/release/re-argo tlsh-diff <a> <b>
 
+# Java: list classes, find string literals, trace callers in a JAR
+target/release/re-argo jvm classes app.jar --filter auth
+target/release/re-argo jvm strings app.jar --pattern http
+target/release/re-argo jvm callers app.jar com.example.Client.send --depth 3
+
 # Memory map
 target/release/re-argo memmap <binary>
 
@@ -109,6 +115,7 @@ For the full command surface, every flag, output formats, and multi-command reci
 | Export | `export`, `export-xml` |
 | Emulation | `emulate`, `gdbserver`, `debug` |
 | Capability | `entropy`, `rop` (ROP/JOP/COP), `capa`, `packer`, `embedded`, `vuln`, `ioc`, `yara`, `tlsh-diff`, `floss` |
+| Java / JAR | `jvm classes`, `jvm class`, `jvm disasm`, `jvm strings`, `jvm xrefs`, `jvm callees`, `jvm callers`, `jvm subtypes` |
 | Manual correction | `annotate`, `iterate`, `carve` |
 | Integration | `script`, `mcp`, `patch`, `taint`, `registers` |
 
@@ -124,6 +131,7 @@ re-argo (reargo-cli)
   ├── reargo-arch (6 architectures, .cspec / .pspec)
   ├── reargo-loader (ELF / PE / Mach-O / COFF, DWARF, PDB)
   ├── reargo-emulator (P-code emulation, debugger, GDB RSP)
+  ├── reargo-jvm (Java class files + JARs, bytecode xrefs / call trees)
   └── reargo-core (addresses, P-code IR, data types)
 ```
 
@@ -142,6 +150,7 @@ All Rust crates share the `reargo-*` prefix; the published CLI binary is `re-arg
 | `reargo-emulator` | P-code emulator, debugger, GDB RSP |
 | `reargo-decompile` | SSA, optimisation, structuring, C / Rust output with annotations |
 | `reargo-sleigh` | SLEIGH specification runtime |
+| `reargo-jvm` | Java class-file parser + JAR loader, bytecode disassembler, xref / call-graph / subtype index |
 | `reargo-cli` | The `re-argo` CLI binary (50+ subcommands) |
 
 ## Building

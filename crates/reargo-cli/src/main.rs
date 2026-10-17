@@ -1,5 +1,6 @@
 mod cache;
 mod carve;
+mod jvm;
 mod mcp;
 mod symbol_import;
 
@@ -690,6 +691,12 @@ enum Commands {
         /// Path to the binary file
         file: PathBuf,
     },
+    /// Java class-file / JAR analysis: classes, bytecode, strings,
+    /// cross-references and call trees (loader-only, no pipeline)
+    Jvm {
+        #[command(subcommand)]
+        cmd: jvm::JvmCmd,
+    },
     /// Extract indicators-of-compromise (URLs, IPs, registry keys, …)
     /// from discovered strings.
     ///
@@ -1083,6 +1090,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Packer { file } => cmd_packer(&file),
         Commands::Embedded { file, limit } => cmd_embedded(&file, limit),
         Commands::Vuln { file } => cmd_vuln(&file),
+        Commands::Jvm { cmd } => jvm::run(cmd),
         Commands::Ioc { file, kind } => cmd_ioc(&file, kind.as_deref()),
         Commands::Triage { file } => cmd_triage(&file),
         Commands::TlshDiff { file_a, file_b } => cmd_tlsh_diff(&file_a, &file_b),

@@ -50,6 +50,14 @@ This document is the **AI agent operations reference**. It documents every CLI c
 | "Auto-correct fixpoint loop" | `iterate <bin> --apply --max-rounds 5` |
 | "Run multi-command script" | `script <bin> queries.grs` |
 | "Speak MCP to a host like Claude Code" | `mcp <bin>` |
+| "List the classes in a Java JAR / .class" | `jvm classes <jar> [--filter Foo] [--resources]` |
+| "Show a Java class (header, fields, method signatures)" | `jvm class <jar> a.b.C` |
+| "Disassemble a Java class / method (javap -c style)" | `jvm disasm <jar> a.b.C [--method name]` |
+| "Find string literals in a JAR and the methods that push them" | `jvm strings <jar> --pattern http [--constants]` |
+| "Who references this Java class / method / field?" | `jvm xrefs <jar> a.b.C.name` |
+| "Call tree: what does this Java method call?" | `jvm callees <jar> a.b.C.name --depth 3` |
+| "Reverse call tree: who calls this Java method?" | `jvm callers <jar> a.b.C.name --depth 3` |
+| "Classes extending / implementing a Java class or interface" | `jvm subtypes <jar> a.b.Base` |
 
 ---
 
@@ -135,6 +143,16 @@ ls /tmp/decomp/*.c
 re-argo annotate <bin> --import community_symbols.json
 re-argo functions <bin>                 # names now flow through every subsequent command
 re-argo iterate <bin> --apply           # let the heuristic correction loop finish the job
+```
+
+### Analyse a Java application (JAR)
+
+```bash
+re-argo jvm classes app.jar --filter auth          # find the interesting classes
+re-argo jvm strings app.jar --pattern http         # string literal → "a.b.Cls.method(desc):line @pc N"
+re-argo jvm xrefs app.jar com.example.net.Client.send   # who touches it?
+re-argo jvm callers app.jar com.example.net.Client.send --depth 3   # reverse call tree
+re-argo jvm disasm app.jar com.example.net.Client --method send     # javap -c style bytecode
 ```
 
 ---
@@ -447,6 +465,89 @@ Patch a binary file. Either supply raw `--bytes` (hex, space-separated) or `--as
 
 Mark `N` parameter registers as tainted at function `ADDR` and propagate through SSA to dangerous sinks (libc functions known to mishandle untrusted input). Useful for vulnerability triage.
 
+### Java / JVM bytecode
+
+The `jvm` group analyses Java class files. Every subcommand takes a `.jar` / `.zip` / `.class` file (the container is detected by magic bytes, not by extension). These are **loader-only** commands: they parse the class path on every run and never touch the native analyzer pipeline, so they are unaffected by the analysis cache and `--no-cache`. Class names are dotted (`a.b.C`) or internal (`a/b/C`); nested classes use `$` (`a.b.C$Inner`). `--limit` defaults to 200 (0 = unlimited) where present.
+
+#### `jvm classes <FILE> [--filter TEXT] [--resources] [--limit N]`
+
+List the classes in a JAR (or a single `.class`): name, method count, field count, superclass (`(interface)` marker). `--filter` is a case-insensitive substring of the dotted name; `--resources` lists the non-class entries (JSON, images, shaders, …) instead.
+
+```
+Classes in rt.jar: 6 found (19470 total)
+  class                                                            meth  fld  extends
+  java.util.ArrayList                                                50    7  java.util.AbstractList
+```
+
+#### `jvm class <FILE> <CLASS>`
+
+One class: access flags, kind, class-file version (and Java release), superclass, interfaces, source file, generic signature, direct-subtype count, then every field (with `static final` constant values) and every method as a Java-style signature plus its JVM descriptor and code size.
+
+#### `jvm disasm <FILE> <CLASS> [--method NAME]`
+
+`javap -c`-style disassembly: per method `max_stack` / `max_locals` / code size, `// line N` markers from the line-number table, one instruction per row (`pc: mnemonic operand`, constant-pool operands resolved to names), and the exception table. `--method` keeps only methods with that name (all overloads). pc values are **decimal** bytecode offsets, as in `javap`.
+
+```
+  public int size()  [()I]
+    max_stack=1 max_locals=1 code=5 bytes
+    // line 284
+       0: aload_0
+       1: getfield        #2 java/util/ArrayList.size:I
+       4: ireturn
+```
+
+#### `jvm strings <FILE> [--pattern TEXT] [--constants] [--limit N]`
+
+String literals (`ldc`) with the method and line that push each one. `--pattern` is a case-insensitive substring filter; `--constants` additionally lists `static final String` constant fields (`ConstantValue`), which have no `ldc` site.
+
+```
+  "Index: "     com.sun.org.apache.xerces.internal.impl.dv.util.ByteListImpl.get(I)Ljava/lang/Object;:100 @pc 38
+```
+
+#### `jvm xrefs <FILE> <TARGET> [--limit N]`
+
+Every bytecode site that references a class, method or field (invokes, `getfield` / `putfield` / `getstatic` / `putstatic`, `new` / `checkcast` / `instanceof` / `anewarray`, `ldc` class constants). `TARGET` forms:
+
+| Form | Matches |
+|---|---|
+| `a.b.C` | any use of the class |
+| `a.b.C.name` | method or field `name` of that owner, any overload |
+| `a.b.C.name(I)V` | exactly that descriptor (overload) |
+| `*.name` | `name` on any owner |
+
+A spec without `(` is a class target when it names a class in the JAR **or** its last segment starts with an upper-case letter (the Java naming convention, which is how classes outside the JAR — JDK, libraries — are recognised, e.g. `java.io.File`); otherwise the last segment is the member name and the rest the owner (`java.util.List.add` = owner `java.util.List`, member `add`). A constant field with an upper-case name (`a.b.C.FOO`) therefore reads as a class unless the JAR defines no such class and you write `*.FOO`.
+
+```
+References to java.util.ArrayList.grow: 1 found
+  java.util.ArrayList.ensureExplicitCapacity(I)V:241 @pc 22    invokespecial   java.util.ArrayList.grow:(I)V
+```
+
+#### `jvm callees <FILE> <METHOD> [--depth N] [--external]`
+
+Methods called by `METHOD` (`a.b.C.method` or `a.b.C.method(desc)`; all overloads of an unqualified name are printed), as an indented tree. Default `--depth 1` (direct calls only). Calls into classes outside the JAR are hidden unless `--external` is given, and then carry an `[external]` marker and are not expanded. A method already expanded earlier in the tree is marked `[seen]` and not expanded again (recursion guard).
+
+```
+Callees of java.util.ArrayList.add(Ljava/lang/Object;)Z
+  invokespecial   java.util.ArrayList.ensureCapacityInternal(I)V (line 464)
+    invokestatic    java.util.ArrayList.calculateCapacity([Ljava/lang/Object;I)I (line 233)
+```
+
+#### `jvm callers <FILE> <METHOD> [--depth N] [--via-external]`
+
+Reverse call tree: methods that call `METHOD`, one row per calling method in `pkg.Cls.method(desc):line @pc N` form. Virtual dispatch counts: a call whose owner is a supertype or subtype of the target's class is included and marked `[via a.b.Owner]`. Supertypes outside the JAR (`Runnable`, `kotlin.jvm.functions.Function1`, …) are skipped unless `--via-external` — every lambda shares them, so following them lists every caller of every lambda. `[seen]` marks a method already visited in the tree. Default `--depth 1`.
+
+#### `jvm subtypes <FILE> <CLASS>`
+
+Classes extending / implementing `CLASS` (class or interface, transitive), as a tree indented by depth; interfaces carry an `(interface)` marker.
+
+**Output notes (all `jvm` commands)**
+
+* A call/reference **site** prints as `pkg.Cls.method(desc):line @pc N` — the descriptor keeps obfuscated overloads (`a`, `a`, `a`) apart; `:line` is omitted when the class has no line-number table. `N` is the decimal bytecode offset of the instruction, the same number `disasm` and `javap -c` show.
+* Markers: `[external]` (callee outside the JAR, `callees --external`), `[seen]` (already expanded / visited), `[via X]` (`callers`: reached through supertype/subtype `X` of the target's owner).
+* Class entries that fail to parse are skipped with one `warning: N class entries failed to parse` line on stderr; the rest of the JAR is still analysed.
+* Lists stop at `--limit` with `... N more (raise --limit to see them)`.
+
+
 ---
 
 ## Workspace structure
@@ -462,6 +563,7 @@ Mark `N` parameter registers as tainted at function `ADDR` and propagate through
 | `reargo-emulator` | Full P-code emulator, breakpoints, watchpoints, traces, snapshots, GDB RSP client+server, syscalls, hooks |
 | `reargo-decompile` | CFG / SSA / dominator / dataflow, 6 optimisation passes (DCE / fold / propagate / strength / algebra / CSE), struct / array type recovery, taint analysis, **annotation pass-through to C/Rust**, **signature-aware call rendering**, SARIF |
 | `reargo-sleigh` | SLEIGH runtime: PackedDecode, DecisionNode, ContextDB, .sla zlib decode, ParserWalker |
+| `reargo-jvm` | Java class-file parser + JAR loader (constant pool, bytecode decoder / `javap -c` formatter, descriptors, cross-reference / call-graph / subtype index); independent of the native pipeline, used by `re-argo jvm …` |
 | `reargo-cli` | ~40 CLI commands (see top of this file) |
 
 ## Architecture decisions

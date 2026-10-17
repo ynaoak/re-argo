@@ -62,6 +62,11 @@
       <a href="#rop">rop / embedded</a>
       <a href="#tlsh">tlsh-diff</a>
 
+      <h4>コマンド: Java / JVM</h4>
+      <a href="#jvm">jvm classes / class / disasm</a>
+      <a href="#jvm-xrefs">jvm strings / xrefs</a>
+      <a href="#jvm-calls">jvm callees / callers / subtypes</a>
+
       <h4>コマンド: その他</h4>
       <a href="#data">hexdump / search</a>
       <a href="#diff">diff / semantic-diff</a>
@@ -119,6 +124,10 @@ cargo clippy --workspace --all-targets -- -D warnings</code></pre>
           <tr><td>このバイナリは何をするか（Capa スタイル）</td><td><code>capa &lt;bin&gt;</code></td></tr>
           <tr><td>パックされているか / どのパッカーか</td><td><code>packer &lt;bin&gt;</code></td></tr>
           <tr><td>難読化文字列のデコード（XOR / ROL）</td><td><code>floss &lt;bin&gt;</code></td></tr>
+          <tr><td>Java JAR / .class のクラス一覧</td><td><code>jvm classes &lt;jar&gt; [--filter Foo]</code></td></tr>
+          <tr><td>Java クラスの逆アセンブル（javap -c 形式）</td><td><code>jvm disasm &lt;jar&gt; a.b.C [--method name]</code></td></tr>
+          <tr><td>JAR 内の文字列リテラルとそれを積むメソッド</td><td><code>jvm strings &lt;jar&gt; --pattern http</code></td></tr>
+          <tr><td>Java メソッドの呼び出し元 / 呼び出し先ツリー</td><td><code>jvm callers &lt;jar&gt; a.b.C.name</code> / <code>jvm callees &lt;jar&gt; a.b.C.name</code></td></tr>
           <tr><td>JSON で機械可読出力</td><td><code>export &lt;bin&gt; -o out.json</code></td></tr>
         </tbody>
       </table>
@@ -207,6 +216,17 @@ cargo clippy --workspace --all-targets -- -D warnings</code></pre>
 
       <h3 id="tlsh">tlsh-diff</h3>
       <p><code>tlsh-diff &lt;A&gt; &lt;B&gt;</code> — TLSH（内容ファジーハッシュ）で 2 バイナリを比較。距離 &lt; 30 で同一ファミリの可能性、&lt; 50 で関連、&gt; 100 で無関係。</p>
+
+      <h2 id="jvm">Java / JVM バイトコード</h2>
+      <p><code>jvm</code> グループは <code>.jar</code> / <code>.zip</code> / <code>.class</code>（拡張子ではなくマジックバイトで判定）を直接解析します。<strong>ローダのみ</strong>で動作し、ネイティブ解析パイプラインは走らず、解析キャッシュ（<code>--no-cache</code>）の影響も受けません。クラス名はドット区切り（<code>a.b.C</code>）または内部名（<code>a/b/C</code>）。</p>
+      <h3>jvm classes / class / disasm</h3>
+      <p><code>jvm classes &lt;FILE&gt; [--filter TEXT] [--resources] [--limit N]</code> — クラス一覧（メソッド数 / フィールド数 / 親クラス）。<code>--resources</code> は非クラスのリソースを列挙。<code>jvm class &lt;FILE&gt; &lt;CLASS&gt;</code> — ヘッダ（アクセス / バージョン / 親 / インタフェース）、フィールド、メソッドシグネチャ。<code>jvm disasm &lt;FILE&gt; &lt;CLASS&gt; [--method NAME]</code> — <code>javap -c</code> 形式の逆アセンブル（行番号マーカー + 例外テーブル）。pc は 10 進のバイトコードオフセット。</p>
+
+      <h3 id="jvm-xrefs">jvm strings / xrefs</h3>
+      <p><code>jvm strings &lt;FILE&gt; [--pattern TEXT] [--constants] [--limit N]</code> — 文字列リテラル（<code>ldc</code>）と、それを積むメソッド。<code>--constants</code> は <code>static final String</code> 定数フィールドも列挙。<code>jvm xrefs &lt;FILE&gt; &lt;TARGET&gt; [--limit N]</code> — クラス / メソッド / フィールドの参照元。TARGET: <code>a.b.C</code>（クラスの全使用）, <code>a.b.C.name</code>, <code>a.b.C.name(I)V</code>（オーバーロード指定）, <code>*.name</code>（任意の owner）。JAR 外のクラス（JDK など）は大文字始まりの単純名で判定。サイトは <code>pkg.Cls.method:line @pc N</code> 形式で表示。</p>
+
+      <h3 id="jvm-calls">jvm callees / callers / subtypes</h3>
+      <p><code>jvm callees &lt;FILE&gt; &lt;METHOD&gt; [--depth N] [--external]</code> — 呼び出し先ツリー（既定 depth 1）。JAR 外への呼び出しは <code>--external</code> で表示され <code>[external]</code>、展開済みは <code>[seen]</code>。<code>jvm callers &lt;FILE&gt; &lt;METHOD&gt; [--depth N] [--via-external]</code> — 逆呼び出しツリー。スーパー / サブタイプ経由の仮想呼び出しも含み <code>[via a.b.Owner]</code> と表示（JAR 外のスーパータイプ経由は <code>--via-external</code> 指定時のみ）。<code>jvm subtypes &lt;FILE&gt; &lt;CLASS&gt;</code> — 継承 / 実装しているクラスのツリー。</p>
 
       <!-- ===================== その他 ===================== -->
       <h2 id="data">データ / 検索</h2>
