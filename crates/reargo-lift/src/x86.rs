@@ -459,6 +459,16 @@ pub struct PlainWalk<'f> {
 }
 
 const FACT_PAGE_BITS: u32 = 12;
+
+/// Facts a thread's [`FACT_MEMO`] holds at most (emptied when full).
+const FACT_MEMO_CAP: usize = 1 << 16;
+
+thread_local! {
+    /// [`X86Lifter::facts_alike`]: the facts (without the length) of the instructions lifted,
+    /// by the decoded instruction without its displacement / branch target (and the mode).
+    static FACT_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<(bool, iced_x86::Instruction), u16>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
 /// The cell is filled.
 const FACT_KNOWN: u16 = 1 << 15;
 const FACT_FAILED: u16 = 1 << 4;
@@ -661,11 +671,42 @@ impl X86Lifter {
         if f & FACT_KNOWN != 0 {
             return f;
         }
-        let f = FACT_KNOWN | Self::facts_of(X86Lifter { is_64: self.is_64, parity: false }.decode_in_block(memory, addr, block).and_then(|insn| {
-            X86Lifter { is_64: self.is_64, parity: false }.lift_decoded(insn, addr, None)
-        }));
+        let fast = X86Lifter { is_64: self.is_64, parity: false };
+        let f = FACT_KNOWN
+            | match fast.decode_in_block(memory, addr, block) {
+                Ok(insn) => fast.facts_alike(insn, addr),
+                Err(_) => FACT_FAILED,
+            };
         cell.store(f, Ordering::Relaxed);
         f
+    }
+
+    /// [`Self::facts_of`] the lift alone of `insn` (decoded at `addr`), through this thread's
+    /// [`FACT_MEMO`]: the facts do not depend on where the instruction is, its memory
+    /// operand's displacement or its branch target (none of them is a flag, a control
+    /// transfer or a reason to fail), so instructions alike but for those are lifted once.
+    fn facts_alike(&self, insn: iced_x86::Instruction, addr: u64) -> u16 {
+        use iced_x86::OpKind;
+        let mut key = insn;
+        if (0..insn.op_count()).any(|i| matches!(insn.op_kind(i), OpKind::Memory | OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64)) {
+            key.set_memory_displacement64(0);
+        }
+        let known = FACT_MEMO.with(|m| m.borrow().get(&(self.is_64, key)).copied());
+        let f = match known {
+            Some(f) => f,
+            None => {
+                let f = Self::facts_of(self.lift_decoded(insn, addr, None)) & !0xf;
+                FACT_MEMO.with(|m| {
+                    let mut m = m.borrow_mut();
+                    if m.len() >= FACT_MEMO_CAP {
+                        m.clear();
+                    }
+                    m.insert((self.is_64, key), f);
+                });
+                f
+            }
+        };
+        if f & FACT_FAILED != 0 { f } else { f | u16::try_from(insn.len()).expect("an x86 instruction is at most 15 bytes") }
     }
 
     /// The facts bits of an instruction lifted alone without the integer PF (without
@@ -823,8 +864,6 @@ impl X86Lifter {
     }
 
     pub fn plain_range(&self, memory: &Memory, start: u64, count: usize, facts: &InsnFacts) -> Option<Vec<u64>> {
-        use std::sync::atomic::Ordering;
-        let fast = X86Lifter { is_64: self.is_64, parity: false };
         let mut addrs: Vec<u64> = Vec::with_capacity(count.min(4096));
         let mut addr = start;
         let mut block = None;
@@ -841,28 +880,7 @@ impl X86Lifter {
                 page = facts.page(addr)?;
                 page_base = addr & !((1u64 << FACT_PAGE_BITS) - 1);
             }
-            let cell = &page[(addr - page_base) as usize];
-            let mut f = cell.load(Ordering::Relaxed);
-            if f & FACT_KNOWN == 0 {
-                f = FACT_KNOWN
-                    | match fast.decode_in_block(memory, addr, &mut block).and_then(|insn| fast.lift_decoded(insn, addr, None)) {
-                        Ok(insn) => {
-                            let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
-                            let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
-                            let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
-                            let control = insn.ops.iter().any(|o| {
-                                matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Call | OpCode::CallInd | OpCode::Return)
-                            });
-                            let len = u16::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
-                            len | if x87 { FACT_X87 } else { 0 }
-                                | if reads_outside_pf(&insn) { FACT_READS_PF } else { 0 }
-                                | if insn.ops.iter().any(|o| o.output.as_ref().is_some_and(pf)) { FACT_WRITES_PF } else { 0 }
-                                | if control || insn.ops.iter().any(|o| o.output.as_ref().is_some_and(flag)) { FACT_STOPS } else { 0 }
-                        }
-                        Err(_) => FACT_FAILED,
-                    };
-                cell.store(f, Ordering::Relaxed);
-            }
+            let f = self.fill(memory, addr, &page[(addr - page_base) as usize], &mut block);
             if f & FACT_FAILED != 0 {
                 break;
             }
