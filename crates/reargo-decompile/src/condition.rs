@@ -208,7 +208,9 @@ impl Readers {
     }
 
     fn build(func: &SsaFunction) -> Self {
-        let mut m: FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>> = FxHashMap::default();
+        // (about a value read per live op: sized once, not grown op by op)
+        let live = func.ops.iter().filter(|o| !o.dead).count();
+        let mut m: FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>> = FxHashMap::with_capacity_and_hasher(live + 16, Default::default());
         for op in func.ops.iter().filter(|o| !o.dead) {
             for &i in &op.inputs {
                 if func.varnodes[i as usize].data.space == reargo_core::address::SpaceId::CONST {
@@ -347,6 +349,8 @@ fn collect_leaves(
 
 /// The CFG with short-circuit tests merged, and the condition of each merged block.
 pub struct ShortCircuits {
+    /// The function's CFG with the merged tests' edges ([`ControlFlowGraph::clone_edges`]: no
+    /// instructions, those are the function's by block id).
     pub cfg: ControlFlowGraph,
     pub conds: FxHashMap<BlockId, Cond>,
 }
@@ -381,7 +385,7 @@ pub fn merge_short_circuits(func: &SsaFunction) -> Option<ShortCircuits> {
         return None;
     }
 
-    let mut cfg = src.clone();
+    let mut cfg = src.clone_edges();
     thread_empty_blocks(&mut cfg, &empty);
     let mut conds: FxHashMap<BlockId, Cond> = FxHashMap::default();
     let cond_of = |conds: &FxHashMap<BlockId, Cond>, b: BlockId| {

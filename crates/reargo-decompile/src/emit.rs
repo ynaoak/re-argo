@@ -1956,10 +1956,13 @@ pub(crate) fn epilogue_noise(func: &SsaFunction) -> rustc_hash::FxHashSet<usize>
         if b.is_return() {
             for (k, insn) in b.instructions.iter().rev().enumerate() {
                 // (a tail call's `jmp` ends the block: the frame restore is before it)
-                if k == 0 && insn.mnemonic.trim_start().starts_with("jmp") {
+                if k == 0
+                    && insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Jmp | iced_x86::Mnemonic::Jmpe))
+                    && insn.mnemonic.trim_start().starts_with("jmp")
+                {
                     continue;
                 }
-                if !crate::cfg::is_epilogue_insn(&insn.mnemonic) {
+                if !crate::cfg::is_epilogue(insn) {
                     break;
                 }
                 addrs.insert(insn.address);

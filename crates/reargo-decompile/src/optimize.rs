@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 
 use reargo_core::pcode::OpCode;
 
@@ -306,29 +305,35 @@ fn is_side_effecting(op: OpCode) -> bool {
 /// identical to the fixpoint version.
 pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     let n = func.ops.len();
+    let candidate = |o: &crate::ssa::SsaOp| !o.dead && o.output.is_some() && !is_side_effecting(o.opcode);
+    // The queue starts with every candidate in index order and takes the defining ops of a
+    // dead op's inputs at its end: the candidates are visited in one sweep first (`i`, each
+    // one still queued while the sweep has not reached it), then the ops queued again, in
+    // order (`queue[head..]`, those of them `on_queue`).
     let mut on_queue = vec![false; n];
-    let mut queue: VecDeque<usize> = VecDeque::with_capacity(n);
-
-    for (i, slot) in on_queue.iter_mut().enumerate().take(n) {
-        if func.ops[i].dead {
-            continue;
-        }
-        if func.ops[i].output.is_none() {
-            continue;
-        }
-        if is_side_effecting(func.ops[i].opcode) {
-            continue;
-        }
-        queue.push_back(i);
-        *slot = true;
-    }
-
+    let mut queue: Vec<usize> = Vec::new();
+    let mut head = 0usize;
     let mut removed = 0;
-    while let Some(i) = queue.pop_front() {
-        on_queue[i] = false;
-        if func.ops[i].dead {
-            continue;
-        }
+    let mut sweep = 0usize;
+    loop {
+        let i = if sweep < n {
+            let i = sweep;
+            sweep += 1;
+            if !candidate(&func.ops[i]) {
+                continue;
+            }
+            i
+        } else if head < queue.len() {
+            let i = queue[head];
+            head += 1;
+            on_queue[i] = false;
+            if func.ops[i].dead {
+                continue;
+            }
+            i
+        } else {
+            break;
+        };
 
         let out_id = func.ops[i].output.expect("output checked above");
         let has_live_use = func.varnodes[out_id as usize]
@@ -346,15 +351,15 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
         // The newly-dead op's inputs each just lost a use. Re-queue
         // the defining op of any input that itself is a DCE
         // candidate -- it may now have no live uses either.
-        let inputs = func.ops[i].inputs.clone();
-        for inp_id in inputs {
-            if let Some(def_idx) = func.varnodes[inp_id as usize].def_op
-                && !func.ops[def_idx].dead
-                && func.ops[def_idx].output.is_some()
-                && !is_side_effecting(func.ops[def_idx].opcode)
+        // (a candidate the sweep has not reached yet is still queued)
+        let (ops, varnodes) = (&func.ops, &func.varnodes);
+        for &inp_id in &ops[i].inputs {
+            if let Some(def_idx) = varnodes[inp_id as usize].def_op
+                && candidate(&ops[def_idx])
+                && def_idx < sweep
                 && !on_queue[def_idx]
             {
-                queue.push_back(def_idx);
+                queue.push(def_idx);
                 on_queue[def_idx] = true;
             }
         }
@@ -484,6 +489,12 @@ fn is_commutative(op: OpCode) -> bool {
     )
 }
 
+/// One of 64 bits for a value key: a filter of a few keys that most others miss.
+fn key_bit(k: ValueKey) -> u64 {
+    // (offsets step by 8 / 0x10; the version tells a slot's values apart)
+    1u64 << (((k.1 >> 3) ^ (k.1 >> 9) ^ u64::from(k.3)) & 63)
+}
+
 /// Follow a chain of redirects to the canonical target. Caps the
 /// chain length defensively so a cyclic redirect map (which the CSE
 /// loop is structured not to produce) can't loop forever.
@@ -518,6 +529,14 @@ fn resolve_redirect(
 /// redirect map via `resolve_redirect` so cascading eliminations
 /// (the result of one CSE feeding into another) still fire.
 pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
+    cse_with_hits(func).0
+}
+
+/// [`common_subexpression_elimination`], with how many ops matched an earlier one's key (each
+/// removed or kept): with none, the pass changed nothing and finds nothing again until an op's
+/// opcode or inputs change.
+fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
+    let mut hits = 0;
     use smallvec::SmallVec;
     let mut eliminated = 0;
     // Pre-size both hash maps. Without this they started at zero
@@ -545,14 +564,25 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     // version, so a use may only be redirected to an earlier value whose slot
     // has not been written since: `tmp_600 = rsp + 0xc; ...; tmp_600 = rsp + 4;
     // ...; load [rsp + 0xc]` printed the last load as `*(tmp_600)` = rsp + 4.
-    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), u32> = Default::default();
-    let record = |func: &SsaFunction, i: usize, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), u32>| {
-        if let Some(o) = func.ops[i].output
-            && !func.ops[i].dead
-        {
-            let vn = &func.varnodes[o as usize];
-            latest.insert((vn.data.space.0, vn.data.offset, vn.data.size), vn.version);
+    // The version a slot holds before op `i`: that of the last live op before it writing the
+    // slot (0 when none). Asked only of the slots of the duplicates found: each one's writers
+    // are scanned forward as the loop goes (`(scanned up to, version)`). (An op before `i`
+    // keeps its dead flag from here on: only the op visited dies.)
+    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32)> = Default::default();
+    let version_before = |func: &SsaFunction, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32)>, slot: (u32, u64, u32), i: usize| {
+        let e = latest.entry(slot).or_insert((0, 0));
+        for op in &func.ops[e.0.min(i)..i] {
+            if let Some(o) = op.output
+                && !op.dead
+            {
+                let vn = &func.varnodes[o as usize];
+                if (vn.data.space.0, vn.data.offset, vn.data.size) == slot {
+                    e.1 = vn.version;
+                }
+            }
         }
+        e.0 = e.0.max(i);
+        e.1
     };
     // WS84: ... and still holds it at every reader of the removed value, not only where the
     // duplicate is (`rax = rdi + 12; rbx = rdi + 12; rax = 5; rcx = rbx + 1` read `rax` for
@@ -562,13 +592,18 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     type Readers = rustc_hash::FxHashMap<ValueKey, SmallVec<[usize; 4]>>;
     type Writers = rustc_hash::FxHashMap<(u32, u64, u32), u32>;
     let build = |func: &SsaFunction| -> (Readers, Writers) {
-        let mut readers: Readers = Default::default();
-        let mut writers: Writers = Default::default();
+        // (sized once from the live ops; a constant is never a duplicate's value: not listed)
+        let live = func.ops.iter().filter(|o| !o.dead).count();
+        let mut readers: Readers = rustc_hash::FxHashMap::with_capacity_and_hasher(live, Default::default());
+        let mut writers: Writers = rustc_hash::FxHashMap::with_capacity_and_hasher(live / 2, Default::default());
         for (k, op) in func.ops.iter().enumerate() {
             if op.dead {
                 continue;
             }
             for &v in &op.inputs {
+                if func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST {
+                    continue;
+                }
                 readers.entry(value_key(func, v)).or_default().push(k);
             }
             if let Some(o) = op.output {
@@ -612,7 +647,6 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         }
         let opcode = func.ops[i].opcode;
         if !is_cse_pure(opcode) || func.ops[i].inputs.is_empty() {
-            record(func, i, &mut latest);
             continue;
         }
         let Some(out_id) = func.ops[i].output else { continue };
@@ -632,11 +666,11 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         // A value a phi reads keeps its own name (the phi prints as nothing).
         let feeds_phi =
             |func: &SsaFunction| func.varnodes[out_id as usize].uses.iter().any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
-        let name_still_holds =
-            |k: ValueKey| latest.get(&(k.0, k.1, k.2)).copied().unwrap_or(0) == k.3;
+        let mut name_still_holds = |k: ValueKey| version_before(func, &mut latest, (k.0, k.1, k.2), i) == k.3;
         // (one lookup: the earlier value, or the slot this one takes)
         let slot = match seen.entry(key) {
             std::collections::hash_map::Entry::Occupied(o) => {
+                hits += 1;
                 let existing = *o.get();
                 if !feeds_phi(func)
                     && name_still_holds(existing)
@@ -652,13 +686,21 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             std::collections::hash_map::Entry::Vacant(v) => v.insert(out_key),
         };
         *slot = out_key;
-        record(func, i, &mut latest);
     }
 
     // Apply all redirects in a single pass over the varnode arena.
     if !redirects.is_empty() {
+        // (only a key redirected changes: one of an output, never a constant's; `bloom` has the
+        // bit of each redirected key, so most varnodes are passed over without a lookup)
+        let bloom = redirects.keys().fold(0u64, |m, &k| m | key_bit(k));
         for vn in &mut func.varnodes {
+            if vn.data.space == reargo_core::address::SpaceId::CONST {
+                continue;
+            }
             let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            if bloom & key_bit(key) == 0 {
+                continue;
+            }
             let to = resolve_redirect(&redirects, key);
             if to != key {
                 vn.data = reargo_core::pcode::VarnodeData::new(
@@ -673,19 +715,24 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         // elimination sees no reader of it once its own die (`sete [rsi+0x18]` loads and stores
         // through two copies of the address: the load died, so did the address the store read)
         let targets: rustc_hash::FxHashSet<ValueKey> = redirects.values().map(|&k| resolve_redirect(&redirects, k)).collect();
+        let bloom = targets.iter().fold(0u64, |m, &k| m | key_bit(k));
         let mut defined: rustc_hash::FxHashMap<ValueKey, u32> = Default::default();
         for vn in &func.varnodes {
             // (the removed duplicate's output now carries the kept key too: not that one)
             if vn.def_op.is_some_and(|d| !func.ops[d].dead && func.ops[d].output == Some(vn.id)) {
                 let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-                if targets.contains(&key) {
+                if bloom & key_bit(key) != 0 && targets.contains(&key) {
                     defined.insert(key, vn.id);
                 }
             }
         }
-        for i in 0..func.varnodes.len() {
+        let bloom = defined.keys().fold(0u64, |m, &k| m | key_bit(k));
+        for i in 0..if defined.is_empty() { 0 } else { func.varnodes.len() } {
             let vn = &func.varnodes[i];
             let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            if bloom & key_bit(key) == 0 {
+                continue;
+            }
             if let Some(&d) = defined.get(&key)
                 && d as usize != i
             {
@@ -703,7 +750,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         }
     }
 
-    eliminated
+    (eliminated, hits)
 }
 
 pub fn strength_reduction(func: &mut SsaFunction) -> usize {
@@ -1148,6 +1195,15 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
     let mut stats = OptimizationStats::default();
     prune_call_args(func);
 
+    // A pass that found nothing to do, run again before any other pass changed what it reads,
+    // finds nothing again and changes nothing: it is not run. What each one reads: the fold
+    // (constant folding, algebra, strength) an op's opcode and input varnodes; copy
+    // propagation the copies of constants and their readers' inputs (and their `uses`, which
+    // it already pruned); CSE the keys of the live pure ops (with no two alike, `hits` is 0).
+    // Dead code elimination only kills ops: a dead op is passed over by all three, and fewer
+    // live ops give no more matches. It runs every round (killing in another order can kill
+    // more).
+    let (mut fold_quiet, mut copies_quiet, mut cse_quiet) = (false, false, false);
     for _ in 0..10 {
         // Three passes (constant_fold, algebraic_simplification,
         // strength_reduction) are fused into a single walk. See
@@ -1162,9 +1218,19 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
         // The fused variant has been removed; this comment is the
         // only record so the next person reaching for the same
         // optimisation doesn't re-do it without knowing the result.
-        let (cf, alg, sr) = const_alg_strength(func);
-        let cp = copy_propagation(func);
-        let cse = common_subexpression_elimination(func);
+        let (cf, alg, sr) = if fold_quiet { (0, 0, 0) } else { const_alg_strength(func) };
+        let folded = cf + alg + sr > 0;
+        fold_quiet = !folded;
+        copies_quiet &= !folded;
+        cse_quiet &= !folded;
+        let cp = if copies_quiet { 0 } else { copy_propagation(func) };
+        copies_quiet = cp == 0;
+        fold_quiet &= cp == 0;
+        cse_quiet &= cp == 0;
+        let (cse, hits) = if cse_quiet { (0, 0) } else { cse_with_hits(func) };
+        cse_quiet = hits == 0;
+        fold_quiet &= cse == 0;
+        copies_quiet &= cse == 0;
         let dce = dead_code_elimination(func);
         stats.constants_folded += cf;
         stats.copies_propagated += cp;

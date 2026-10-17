@@ -170,7 +170,7 @@ fn nearest_constant(insns: &[LiftedInstruction], start: usize, offset: u64) -> O
         let writes = |op: &reargo_core::pcode::PcodeOp| op.output.is_some_and(|o| o.space == SpaceId::REGISTER && o.offset < 0xC0 && o.offset & !7 == offset);
         // (only an instruction writing the register is asked whether it is a `pop`: its text
         // is formatted when first read)
-        if !insn.ops.iter().any(writes) || insn.mnemonic.starts_with("pop ") {
+        if !insn.ops.iter().any(writes) || crate::cfg::is_pop(insn) {
             continue;
         }
         for op in insn.ops.iter().rev().filter(|op| writes(op)) {
@@ -199,7 +199,7 @@ fn constant_registers(insns: &[LiftedInstruction]) -> Constants {
     let mut loaded = rustc_hash::FxHashSet::default();
     for insn in insns {
         // (a `pop` restores the caller's value on the way out: no write the dispatch sees, WS85)
-        if insn.mnemonic.starts_with("pop ") {
+        if crate::cfg::is_pop(insn) {
             continue;
         }
         let mut here: Vec<(u64, Option<u64>)> = Vec::new();
@@ -238,7 +238,7 @@ fn constant_registers(insns: &[LiftedInstruction]) -> Constants {
 /// (WS88: the table bases to try for a register that also holds other values).
 fn address_constants(insns: &[LiftedInstruction], memory: &Memory) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
-    for op in insns.iter().filter(|i| !i.mnemonic.starts_with("pop ")).flat_map(|i| i.ops.iter()) {
+    for op in insns.iter().filter(|i| !crate::cfg::is_pop(i)).flat_map(|i| i.ops.iter()) {
         let Some(o) = op.output else { continue };
         if op.opcode != OpCode::Copy || o.space != SpaceId::REGISTER || o.offset >= 0xC0 || o.size != 8 {
             continue;

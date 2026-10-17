@@ -73,6 +73,10 @@ pub struct CalleeParams<'a> {
     /// argument by offset (for [`Self::covering`]).
     arg_space: Option<SpaceId>,
     arg_offsets: Vec<(u64, u32)>,
+    /// When every argument's offset is a multiple of 8: per 8-byte step `g` up to the last
+    /// argument, the index in `arg_offsets` of the first argument at or above `8 * g` (the
+    /// [`Self::covering`] search of an offset, looked up).
+    first_at: Vec<u8>,
     memo: Mutex<FxHashMap<(u64, u32), Option<ParamInfo>>>,
     /// The convention's return registers (`rax`, `xmm0`).
     pub(crate) returns: Vec<VarnodeData>,
@@ -90,6 +94,11 @@ pub struct CalleeParams<'a> {
     summary_memo: Mutex<FxHashMap<u64, Option<std::sync::Arc<Summary>>>>,
     /// The lengths and flags of the instructions lifted alone, for the range walks (x86).
     facts: Option<reargo_lift::x86::InsnFacts>,
+    /// The lifts of the ranges a walk cannot answer (x87 code, the integer PF), for
+    /// [`reargo_lift::x86::X86Lifter::lift_range_cached`] (x86): the ranges from the entries
+    /// of neighbouring functions and from the addresses `.cold` parts jump back to overlap
+    /// over most of their 3000 instructions.
+    range_cache: Option<Mutex<reargo_lift::x86::LiftCache>>,
     /// The direct call sites by target, when a batch built them ([`Self::with_call_index`]).
     call_index: Option<crate::callers::CallIndex>,
     /// [`crate::callers::return_hint`] by function.
@@ -148,9 +157,16 @@ impl<'a> CalleeParams<'a> {
         let arg_space = cc.args.first().map(|a| a.space).filter(|&sp| cc.args.iter().all(|a| a.space == sp));
         let mut arg_offsets: Vec<(u64, u32)> = cc.args.iter().enumerate().map(|(i, a)| (a.offset, 1u32 << i)).collect();
         arg_offsets.sort_unstable();
+        let first_at = match arg_offsets.last() {
+            Some(&(last, _)) if arg_offsets.iter().all(|&(o, _)| o % 8 == 0) && last < 1 << 16 && arg_offsets.len() < 256 => {
+                (0..=last / 8).map(|g| arg_offsets.partition_point(|&(off, _)| off < 8 * g) as u8).collect()
+            }
+            _ => Vec::new(),
+        };
         Some(Self {
             arg_space,
             arg_offsets,
+            first_at,
             lifter,
             memory,
             args: cc.args,
@@ -165,6 +181,7 @@ impl<'a> CalleeParams<'a> {
             class_fields_memo: Mutex::new(FxHashMap::default()),
             summary_memo: Mutex::new(FxHashMap::default()),
             facts: lifter.as_x86().map(|_| reargo_lift::x86::InsnFacts::new(memory)),
+            range_cache: lifter.as_x86().map(|_| Mutex::new(reargo_lift::x86::LiftCache::new())),
             call_index: None,
             hint_memo: Mutex::new(FxHashMap::default()),
             flow_cache: lifter.as_x86().map(|_| crate::noreturn::FlowCache::new()),
@@ -386,11 +403,12 @@ impl<'a> CalleeParams<'a> {
         let addrs = x86.plain_range(self.memory, start, count, self.facts.as_ref()?)?;
         let mut out = Vec::new();
         let mut next = hi;
+        let mut cursor = reargo_lift::x86::DecodeCursor::default();
         for &a in &addrs {
             if a >= lo && a < hi {
-                out.push(x86.lift_alone(self.memory, a).ok()?);
+                out.push(x86.lift_alone_with(self.memory, a, &mut cursor).ok()?);
             } else if a == next {
-                let insn = x86.lift_alone(self.memory, a).ok()?;
+                let insn = x86.lift_alone_with(self.memory, a, &mut cursor).ok()?;
                 if insn.mnemonic.trim() == "int3" {
                     next += u64::from(insn.length);
                     out.push(insn);
@@ -420,13 +438,20 @@ impl<'a> CalleeParams<'a> {
         {
             return Some(s);
         }
-        let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
-        if lifted.is_empty() || lifted[0].address != target {
+        let (insns, len, first, last) = match (self.lifter.as_x86(), self.range_cache.as_ref().and_then(|c| c.lock().ok())) {
+            // (`trim_to_return(lift_range(…))` from the lifts of the range's instructions alone,
+            // cloning those the trim keeps)
+            (Some(x86), Some(mut cache)) => x86.lift_range_cached_kept(self.memory, target, MAX_INSNS, &mut cache, &mut |all| crate::pipeline::reachability(all)),
+            _ => {
+                let lifted = self.lifter.lift_range(self.memory, target, MAX_INSNS).ok()?;
+                let (len, first, last) = (lifted.len(), lifted.first().map(|i| i.address), lifted.last().map(|i| i.address));
+                (crate::pipeline::trim_to_return(lifted), len, first, last)
+            }
+        };
+        if len == 0 || first != Some(target) {
             return None;
         }
-        let last = lifted.last().map(|i| i.address);
-        let hit_limit = lifted.len() >= MAX_INSNS;
-        let insns = crate::pipeline::trim_to_return(lifted);
+        let hit_limit = len >= MAX_INSNS;
         // the body runs past the lift limit (its last lifted instruction is live)
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
@@ -441,22 +466,32 @@ impl<'a> CalleeParams<'a> {
         }
         // (the stack holds addresses: those of a walk increase with their index)
         let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
+        // (the walk's instructions follow each other: the one after any but the last is in it)
+        let last = walk.last();
         let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
         let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
         let mut stack = vec![target as usize];
+        let mut cursor = reargo_lift::x86::DecodeCursor::default();
         while let Some(a) = stack.pop() {
             if !seen.insert(a) {
                 continue;
             }
             // (the range lift with the integer PF: each instruction lifted alone with it)
-            let insn = if walk.needs_pf { self.lifter.lift_instruction(self.memory, a as u64) } else { x86.lift_alone(self.memory, a as u64) }.ok()?;
-            crate::pipeline::reach_successors(&insn, idx_of, &mut stack);
+            let insn = if walk.needs_pf {
+                self.lifter.lift_instruction(self.memory, a as u64)
+            } else {
+                x86.lift_alone_with(self.memory, a as u64, &mut cursor)
+            }
+            .ok()?;
+            let fall = insn.address + u64::from(insn.length);
+            let next_in_walk = Some(insn.address) != last;
+            crate::pipeline::reach_successors(&insn, |x| if x == fall && next_in_walk { Some(x as usize) } else { idx_of(x) }, &mut stack);
             lifted.push((a, insn));
         }
         lifted.sort_unstable_by_key(|(a, _)| *a);
         let insns: Vec<LiftedInstruction> = lifted.into_iter().map(|(_, i)| i).collect();
         let hit_limit = walk.len() >= MAX_INSNS;
-        let truncated = hit_limit && insns.last().map(|i| i.address) == walk.last();
+        let truncated = hit_limit && insns.last().map(|i| i.address) == last;
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
     }
 
@@ -545,7 +580,8 @@ impl<'a> CalleeParams<'a> {
         // an argument setup)
         let mut window = 0u32;
         for insn in &cfg.blocks[b].instructions {
-            let zeroed = zero_idiom_operands(insn);
+            // (found when an input is first asked about)
+            let mut zeroed = None;
             for op in &insn.ops {
                 match op.opcode {
                     OpCode::Call | OpCode::CallInd => {
@@ -579,9 +615,12 @@ impl<'a> CalleeParams<'a> {
                     }
                     _ => {}
                 }
-                if let Some(a) = acc.as_deref_mut() {
+                // (a read adds the arguments neither defined nor read yet: none once all are)
+                if let Some(a) = acc.as_deref_mut()
+                    && defined | a.reads != all
+                {
                     for (k, inp) in op.inputs.iter().enumerate() {
-                        if inp.space == SpaceId::CONST || zeroed.contains(inp) {
+                        if inp.space == SpaceId::CONST || zeroed.get_or_insert_with(|| zero_idiom_operands(insn)).contains(inp) {
                             continue;
                         }
                         let (lo, hi) = read_range(op, k, inp);
@@ -636,7 +675,13 @@ impl<'a> CalleeParams<'a> {
             if space != sp {
                 return 0;
             }
-            let from = self.arg_offsets.partition_point(|&(off, _)| off < lo);
+            // (the offsets are multiples of 8: the first at or above `lo` is the first at or
+            // above `lo` rounded up to one)
+            let from = if self.first_at.is_empty() {
+                self.arg_offsets.partition_point(|&(off, _)| off < lo)
+            } else {
+                self.first_at.get(lo.div_ceil(8) as usize).map_or(self.arg_offsets.len(), |&i| usize::from(i))
+            };
             for &(off, bit) in &self.arg_offsets[from..] {
                 if off >= hi {
                     break;
@@ -694,10 +739,63 @@ struct Summary {
 const MAX_FIELD: i64 = 0x10_0000;
 
 /// What a storage location holds: an argument's incoming value plus a delta.
-pub(crate) type Held = FxHashMap<(SpaceId, u64, u32), (usize, i64)>;
+pub(crate) type Held = SmallMap<(SpaceId, u64, u32), (usize, i64)>;
 
-pub(crate) fn kill(state: &mut Held, out: &VarnodeData) {
+pub(crate) fn kill<V: Copy>(state: &mut SmallMap<(SpaceId, u64, u32), V>, out: &VarnodeData) {
     state.retain(|&(sp, off, sz), _| !(sp == out.space && off < out.offset + u64::from(out.size) && out.offset < off + u64::from(sz)));
+}
+
+/// A map of few entries, kept sorted by key in a small vector: the data flows over a body's
+/// storage locations hold a handful at a time, where a hash map's table costs more to clone,
+/// scan and compare than the entries themselves. Equal maps hold the same entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SmallMap<K, V>(smallvec::SmallVec<[(K, V); 8]>);
+
+impl<K, V> Default for SmallMap<K, V> {
+    fn default() -> Self {
+        Self(smallvec::SmallVec::new())
+    }
+}
+
+impl<K: Ord + Copy, V: Copy> SmallMap<K, V> {
+    pub(crate) fn get(&self, k: &K) -> Option<&V> {
+        // (a handful of entries: a linear scan beats the binary search's branches)
+        self.0.iter().find(|e| e.0 == *k).map(|e| &e.1)
+    }
+
+    pub(crate) fn insert(&mut self, k: K, v: V) {
+        match self.0.binary_search_by(|e| e.0.cmp(&k)) {
+            Ok(i) => self.0[i].1 = v,
+            Err(i) => self.0.insert(i, (k, v)),
+        }
+    }
+
+    pub(crate) fn remove(&mut self, k: &K) {
+        if let Some(i) = self.0.iter().position(|e| e.0 == *k) {
+            self.0.remove(i);
+        }
+    }
+
+    pub(crate) fn retain(&mut self, mut f: impl FnMut(&K, &V) -> bool) {
+        self.0.retain(|e| f(&e.0, &e.1));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.0.iter().map(|e| (&e.0, &e.1))
+    }
+}
+
+impl<K: Ord + Copy, V: Copy> FromIterator<(K, V)> for SmallMap<K, V> {
+    /// (from entries in key order, as [`SmallMap::iter`] gives them, with distinct keys)
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let v: smallvec::SmallVec<[(K, V); 8]> = iter.into_iter().collect();
+        debug_assert!(v.windows(2).all(|w| w[0].0 < w[1].0));
+        Self(v)
+    }
 }
 
 /// The loads / stores of a body whose address is an argument's incoming value plus a constant
@@ -713,16 +811,25 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
     inn[cfg.entry_block] = Some(entry);
     let rpo = crate::dominator::reverse_post_order(cfg);
     let mut found: Vec<ParamAccess> = Vec::new();
-    let mut returns: Vec<bool> = Vec::new();
     let mut vtable_stores: Vec<(usize, u64)> = Vec::new();
+    // A block whose entry state did not change since it was last run gives the same accesses
+    // (already recorded), `ret`s and states for its successors (already met into theirs, which
+    // only shrank since): it is not run again. Its `ret`s are kept from that run.
+    let mut dirty: Vec<bool> = vec![true; n];
+    let mut block_returns: Vec<smallvec::SmallVec<[bool; 1]>> = vec![smallvec::SmallVec::new(); n];
     for pass in 0..8 {
-        returns.clear();
         let mut changed = false;
         let last = pass == 7;
         for &b in &rpo {
+            if !dirty[b] {
+                continue;
+            }
             let Some(mut st) = inn[b].clone() else { continue };
+            dirty[b] = false;
+            let returns = &mut block_returns[b];
+            returns.clear();
             // the constants the block wrote into registers (`lea rax, [vtable]`), for the stores
-            let mut consts: FxHashMap<(SpaceId, u64, u32), u64> = FxHashMap::default();
+            let mut consts: SmallMap<(SpaceId, u64, u32), u64> = SmallMap::default();
             for insn in &cfg.blocks[b].instructions {
                 for op in &insn.ops {
                     let held = |st: &Held, v: &VarnodeData| st.get(&(v.space, v.offset, v.size)).copied();
@@ -811,6 +918,7 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
                 };
                 if succ != cfg.entry_block && inn[succ].as_ref() != Some(&new) {
                     inn[succ] = Some(new);
+                    dirty[succ] = true;
                     changed = true;
                 }
             }
@@ -819,7 +927,9 @@ fn param_accesses(cfg: &ControlFlowGraph, args: &[VarnodeData], caller_saved: &[
             break;
         }
     }
-    ParamUse { fields: found, returns_first: !returns.is_empty() && returns.iter().all(|&r| r), vtable_stores }
+    let mut returns = rpo.iter().filter(|&&b| inn[b].is_some()).flat_map(|&b| block_returns[b].iter().copied()).peekable();
+    let returns_first = returns.peek().is_some() && returns.all(|r| r);
+    ParamUse { fields: found, returns_first, vtable_stores }
 }
 
 /// Group the argument registers into classes (System V: integer, vector) by

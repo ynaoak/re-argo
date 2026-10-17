@@ -152,6 +152,7 @@ impl FlowCache {
     fn run(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64, each: &mut dyn FnMut(&Flow) -> bool) {
         let shard_of = |a: u64| ((a >> 12) % self.shards.len() as u64) as usize;
         let mut at = addr;
+        let mut cursor = reargo_lift::x86::DecodeCursor::default();
         loop {
             let k = shard_of(at);
             let Ok(mut m) = self.shards[k].lock() else { return };
@@ -159,7 +160,7 @@ impl FlowCache {
                 let f = match m.get(at) {
                     Some(f) => f,
                     None => {
-                        let f = x86.lift_alone(memory, at).ok().map(|i| Flow::of(&i));
+                        let f = x86.lift_alone_with(memory, at, &mut cursor).ok().map(|i| Flow::of(&i));
                         m.insert(at, &f);
                         f
                     }

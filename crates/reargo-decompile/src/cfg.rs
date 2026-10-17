@@ -34,23 +34,43 @@ fn switch_targets(op: &reargo_core::pcode::PcodeOp) -> impl Iterator<Item = u64>
 /// function — is not taken for part of this one. A call that never returns, marked by
 /// [`crate::noreturn::mark_noreturn_calls`], ends the flow the same way (WS81).
 pub fn is_trap(insn: &LiftedInstruction) -> bool {
-    insn.ops.iter().any(|op| {
-        op.opcode == OpCode::CallOther
-            && op.inputs.first().is_some_and(|c| {
-                c.space == reargo_core::address::SpaceId::CONST
-                    && (c.offset == 3 || c.offset == reargo_core::pcode::intrinsic::NORETURN)
-            })
-    }) || {
-        // (the text's first word is `ud2` / `hlt` only for those instructions: the decoded
-        // one answers without formatting the text)
-        let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt));
-        may_be && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
-    }
+    insn.ops.iter().any(is_trap_op) || is_trap_text(insn)
+}
+
+/// `CALLOTHER` of `int3` or of a call that never returns.
+fn is_trap_op(op: &reargo_core::pcode::PcodeOp) -> bool {
+    op.opcode == OpCode::CallOther
+        && op.inputs.first().is_some_and(|c| {
+            c.space == reargo_core::address::SpaceId::CONST && (c.offset == 3 || c.offset == reargo_core::pcode::intrinsic::NORETURN)
+        })
+}
+
+/// `ud2` / `hlt`.
+fn is_trap_text(insn: &LiftedInstruction) -> bool {
+    // (the text's first word is `ud2` / `hlt` only for those instructions: the decoded
+    // one answers without formatting the text)
+    let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt));
+    may_be && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
+}
+
+/// A `pop` (its text: `pop reg`; the decoded instruction answers for the others without
+/// formatting the text).
+pub fn is_pop(insn: &LiftedInstruction) -> bool {
+    insn.mnemonic.x86_instruction().is_none_or(|i| i.mnemonic() == iced_x86::Mnemonic::Pop) && insn.mnemonic.starts_with("pop ")
 }
 
 /// An instruction of a function epilogue that only restores the caller's frame: `pop reg`,
 /// `add rsp, n`, `leave`, `lea rsp, [...]`, `mov rsp, rbp`, `ret`, `vzeroupper` (WS80). Its
 /// effect (the stack pointer, callee-saved registers) is not part of what the C code does.
+pub fn is_epilogue(insn: &LiftedInstruction) -> bool {
+    use iced_x86::Mnemonic::*;
+    // (only those mnemonics' texts start so: the decoded instruction answers for the others
+    // without formatting the text)
+    let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), Pop | Add | Lea | Mov | Ret | Retf | Leave | Vzeroupper));
+    may_be && is_epilogue_insn(&insn.mnemonic)
+}
+
+/// [`is_epilogue`] of an instruction's text.
 pub fn is_epilogue_insn(mnemonic: &str) -> bool {
     let m = mnemonic.trim();
     m.starts_with("pop ")
@@ -66,10 +86,16 @@ fn compute_leaders(instructions: &[LiftedInstruction]) -> Vec<u64> {
     // (collected, then sorted and deduplicated)
     let mut leaders: Vec<u64> = vec![instructions[0].address];
     for insn in instructions {
-        let has_branch = insn.ops.iter().any(|op| {
-            matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd)
-        });
-        let has_return = insn.ops.iter().any(|op| op.opcode == OpCode::Return) || is_trap(insn);
+        // (one walk over the ops for what the three tests read of them)
+        let (mut has_branch, mut ret, mut trap) = (false, false, false);
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Branch | OpCode::CBranch | OpCode::BranchInd => has_branch = true,
+                OpCode::Return => ret = true,
+                _ => trap |= is_trap_op(op),
+            }
+        }
+        let has_return = ret || trap || is_trap_text(insn);
         if has_branch || has_return {
             for op in &insn.ops {
                 if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
@@ -146,8 +172,8 @@ fn finalize_cfg(
         }
     }
     for i in 0..block_count {
-        let succs: Vec<BlockId> = blocks[i].successors.clone();
-        for s in succs {
+        for k in 0..blocks[i].successors.len() {
+            let s = blocks[i].successors[k];
             if !blocks[s].predecessors.contains(&i) {
                 blocks[s].predecessors.push(i);
             }
@@ -236,6 +262,28 @@ pub struct ControlFlowGraph {
 }
 
 impl ControlFlowGraph {
+    /// A copy of the blocks' edges, jump tables and addresses without their instructions (the
+    /// short-circuit merging rewires edges only; the instructions stay those of `self`, by
+    /// block id).
+    pub fn clone_edges(&self) -> Self {
+        ControlFlowGraph {
+            blocks: self
+                .blocks
+                .iter()
+                .map(|b| BasicBlock {
+                    id: b.id,
+                    start_addr: b.start_addr,
+                    instructions: Vec::new(),
+                    successors: b.successors.clone(),
+                    predecessors: b.predecessors.clone(),
+                })
+                .collect(),
+            entry_block: self.entry_block,
+            addr_to_block: self.addr_to_block.clone(),
+            switches: self.switches.clone(),
+        }
+    }
+
     pub fn build(instructions: &[LiftedInstruction]) -> Self {
         // Borrow form: clone each instruction into its block. Kept
         // around for tests and other call sites that don't have
@@ -256,6 +304,58 @@ impl ControlFlowGraph {
         if instructions.is_empty() {
             return empty_cfg();
         }
+        if !instructions.windows(2).all(|w| w[0].address <= w[1].address) {
+            // (out of address order: the run of a leader is not one stretch)
+            return Self::build_inner_owned(instructions);
+        }
+        let leader_vec = compute_leaders(&instructions);
+        let entry_addr = instructions[0].address;
+
+        // each leader's run: the instructions skipped before it and those it takes (the walk
+        // below, on the addresses first, so each block's vector is allocated once)
+        let mut runs: Vec<(usize, usize)> = Vec::with_capacity(leader_vec.len());
+        let mut at = 0;
+        for (idx, &leader_addr) in leader_vec.iter().enumerate() {
+            let next_leader = leader_vec.get(idx + 1).copied().unwrap_or(u64::MAX);
+            let from = at;
+            while at < instructions.len() && instructions[at].address < leader_addr {
+                at += 1;
+            }
+            let skip = at - from;
+            while at < instructions.len() && instructions[at].address < next_leader {
+                at += 1;
+            }
+            runs.push((skip, at - from - skip));
+        }
+
+        let mut blocks = Vec::with_capacity(leader_vec.len());
+        let mut addr_to_block: BTreeMap<u64, BlockId> = BTreeMap::new();
+        let mut iter = instructions.into_iter();
+
+        for (&leader_addr, &(skip, take)) in leader_vec.iter().zip(&runs) {
+            if skip > 0 {
+                iter.nth(skip - 1);
+            }
+            // Move out of the iterator -- no clone.
+            let block_insns: Vec<LiftedInstruction> = iter.by_ref().take(take).collect();
+            if block_insns.is_empty() {
+                continue;
+            }
+            let block_id = blocks.len();
+            addr_to_block.insert(leader_addr, block_id);
+            blocks.push(BasicBlock {
+                id: block_id,
+                start_addr: leader_addr,
+                instructions: block_insns,
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+            });
+        }
+        finalize_cfg(blocks, addr_to_block, entry_addr)
+    }
+
+    /// [`Self::build_owned`] of instructions in any order.
+    fn build_inner_owned(instructions: Vec<LiftedInstruction>) -> Self {
         let leader_vec = compute_leaders(&instructions);
         let entry_addr = instructions[0].address;
 

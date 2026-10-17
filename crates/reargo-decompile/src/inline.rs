@@ -126,9 +126,9 @@ pub(crate) fn candidates(
 ) -> Vec<(OpIdx, Vec<OpIdx>)> {
     let readers = crate::condition::Readers::new(func);
     // the last op of each block (a comparison's value is printed up to there)
-    let mut block_end: FxHashMap<usize, OpIdx> = FxHashMap::default();
+    let mut block_end: Vec<Option<OpIdx>> = vec![None; func.ops.iter().map(|o| o.block + 1).max().unwrap_or(0)];
     for o in &func.ops {
-        block_end.insert(o.block, o.index);
+        block_end[o.block] = Some(o.index);
     }
     let mut deps: FxHashMap<ValueKey, Deps> = FxHashMap::default();
     let mut out = Vec::new();
@@ -138,14 +138,18 @@ pub(crate) fn candidates(
         }
         let Some(v) = op.output else { continue };
         let vd = func.varnodes[v as usize].data;
-        // (a call's `INDIRECT`s name its target only to say whose result / clobber they are)
-        let rs: smallvec::SmallVec<[OpIdx; 2]> = readers.of(func, v).iter().copied().filter(|&u| func.ops[u].opcode != OpCode::Indirect).collect();
         // WS90: a flag's integer comparison read only by the extension that turns it into a
         // number (`cmp; sbb rdx, -1`, `adc`): `rdx = (rdx + 1) - (uint64_t)(rdi < 0x1f4);`
-        let counted = crate::flags::is_flag_storage(&vd)
-            && matches!(op.opcode, OpCode::IntEqual | OpCode::IntNotEqual | OpCode::IntLess | OpCode::IntSLess | OpCode::IntLessEqual | OpCode::IntSLessEqual)
-            && matches!(rs.as_slice(), [u] if func.ops[*u].opcode == OpCode::IntZExt);
-        if !counted && (vd.space != SpaceId::UNIQUE || !(pure(op.opcode) || op.opcode == OpCode::Load)) {
+        let compare = crate::flags::is_flag_storage(&vd)
+            && matches!(op.opcode, OpCode::IntEqual | OpCode::IntNotEqual | OpCode::IntLess | OpCode::IntSLess | OpCode::IntLessEqual | OpCode::IntSLessEqual);
+        let temporary = vd.space == SpaceId::UNIQUE && (pure(op.opcode) || op.opcode == OpCode::Load);
+        if !compare && !temporary {
+            continue;
+        }
+        // (a call's `INDIRECT`s name its target only to say whose result / clobber they are)
+        let rs: smallvec::SmallVec<[OpIdx; 2]> = readers.of(func, v).iter().copied().filter(|&u| func.ops[u].opcode != OpCode::Indirect).collect();
+        let counted = compare && matches!(rs.as_slice(), [u] if func.ops[*u].opcode == OpCode::IntZExt);
+        if !counted && !temporary {
             continue;
         }
         if rs.is_empty() || rs.len() > MAX_SHARED {
@@ -194,7 +198,7 @@ pub(crate) fn candidates(
             func.ops[u].output.is_some_and(|w| readers.of(func, w).iter().any(|&r| r > u && func.ops[r].block == func.ops[u].block))
         };
         if rs.iter().any(|&u| comparison(func.ops[u].opcode) && folds_later(u)) {
-            last = last.max(block_end.get(&op.block).map_or(last, |&e| e + 1));
+            last = last.max(block_end[op.block].map_or(last, |e| e + 1));
         }
         let key = value_key(func, v);
         let ok = rs.iter().all(|&u| {

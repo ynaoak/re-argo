@@ -593,18 +593,28 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
     use OpCode::*;
     let machine = |d: &reargo_core::pcode::VarnodeData| d.space == SpaceId::REGISTER && (0x200..0x210).contains(&d.offset);
     // (a wider access over the flags — none is lifted — would have to move with them)
-    if func.varnodes.iter().any(|v| machine(&v.data) && v.data.size != 1) {
-        return;
-    }
+    // the versions of the machine flags (by value key), each varnode's (`usize::MAX`: no flag),
+    // and the definition of each version (any of its varnodes that has one): one walk
     let mut index: FxHashMap<ValueKey, usize> = FxHashMap::default();
     let mut keys: Vec<ValueKey> = Vec::new();
-    for v in 0..func.varnodes.len() {
-        if machine(&func.varnodes[v].data) {
+    let mut version_of: Vec<usize> = vec![usize::MAX; func.varnodes.len()];
+    let mut def_of: Vec<Option<OpIdx>> = Vec::new();
+    for (v, version) in version_of.iter_mut().enumerate() {
+        let vn = &func.varnodes[v];
+        if machine(&vn.data) {
+            if vn.data.size != 1 {
+                return;
+            }
             let k = value_key(func, v as VarId);
-            index.entry(k).or_insert_with(|| {
+            let n = *index.entry(k).or_insert_with(|| {
                 keys.push(k);
+                def_of.push(None);
                 keys.len() - 1
             });
+            *version = n;
+            if let Some(d) = vn.def_op {
+                def_of[n].get_or_insert(d);
+            }
         }
     }
     if keys.is_empty() {
@@ -628,11 +638,11 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
         }
         let Some(out) = op.output else { continue };
         // (only the machine flags are indexed)
-        let indexed = |v: VarId| if machine(&func.varnodes[v as usize].data) { index.get(&value_key(func, v)) } else { None };
-        let Some(&o) = indexed(out) else { continue };
+        let indexed = |v: VarId| Some(version_of[v as usize]).filter(|&n| n != usize::MAX);
+        let Some(o) = indexed(out) else { continue };
         for &i in &op.inputs {
             match indexed(i) {
-                Some(&x) => {
+                Some(x) => {
                     let (a, b) = (find(&mut parent, o), find(&mut parent, x));
                     parent[a] = b;
                 }
@@ -644,16 +654,6 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
         let d = &func.varnodes[v as usize].data;
         d.space == SpaceId::CONST && d.offset == 0
     };
-    // the definition of each version (any of its varnodes that has one)
-    let mut def_of: Vec<Option<OpIdx>> = vec![None; keys.len()];
-    for v in 0..func.varnodes.len() {
-        if let Some(d) = func.varnodes[v].def_op
-            && machine(&func.varnodes[v].data)
-            && let Some(&n) = index.get(&value_key(func, v as VarId))
-        {
-            def_of[n].get_or_insert(d);
-        }
-    }
     for (n, &def) in def_of.iter().enumerate() {
         let r = find(&mut parent, n);
         let Some(d) = def else {
@@ -696,11 +696,10 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
         offset_of.insert(r, NAMED_FLAG_BASE + ((k as u64) << 16) + count[k]);
         count[k] += 1;
     }
-    for v in 0..func.varnodes.len() {
-        if !machine(&func.varnodes[v].data) {
+    for (v, &n) in version_of.iter().enumerate() {
+        if n == usize::MAX {
             continue;
         }
-        let n = index[&value_key(func, v as VarId)];
         let r = find(&mut parent, n);
         if let Some(&off) = offset_of.get(&r) {
             func.varnodes[v].data.offset = off;

@@ -99,10 +99,17 @@ pub fn structure_cfg(cfg: &ControlFlowGraph) -> StructuredBlock {
 /// did not reach (WS82), as a [`StructuredBlock::Handler`] after the body. A jump from a
 /// landing pad back into the body is a `goto`.
 pub fn structure_cfg_with_handlers(cfg: &ControlFlowGraph, handlers: &[(BlockId, String)]) -> StructuredBlock {
+    structure_cfg_with_handlers_in(cfg, cfg, handlers)
+}
+
+/// [`structure_cfg_with_handlers`] of the edges of `cfg` whose blocks' instructions are those
+/// of `insns` (the same blocks by id: `cfg` is `insns` rewired, e.g. its
+/// [`ControlFlowGraph::clone_edges`]).
+pub fn structure_cfg_with_handlers_in(cfg: &ControlFlowGraph, insns: &ControlFlowGraph, handlers: &[(BlockId, String)]) -> StructuredBlock {
     if cfg.blocks.is_empty() {
         return StructuredBlock::Sequence(Vec::new());
     }
-    let mut s = Structurer::new(cfg);
+    let mut s = Structurer::new(cfg, insns);
     let mut items = s.walk(cfg.entry_block, None, false);
     s.print_missing_gotos(&mut items);
     for (b, note) in handlers {
@@ -116,7 +123,7 @@ pub fn structure_cfg_with_handlers(cfg: &ControlFlowGraph, handlers: &[(BlockId,
         items.push(StructuredBlock::Handler { landing_pad: *b, note: note.clone(), body: Box::new(seq(body)) });
     }
     let mut root = seq(items);
-    inline_return_tails(cfg, &mut root);
+    inline_return_tails(cfg, insns, &mut root);
     root
 }
 
@@ -157,14 +164,14 @@ const MAX_COPY_DEPTH: usize = 2;
 /// (`unlock(m); return x;`, `throw_length_error("vector");`). The epilogue's frame restore
 /// (`pop`, `add rsp`, `ret`, see [`crate::cfg::is_epilogue_insn`]) prints nothing and does
 /// not count.
-fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
+fn return_tail(cfg: &ControlFlowGraph, code: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
     use reargo_core::pcode::OpCode;
     let mut chain = Vec::new();
     let (mut insns, mut calls) = (0, 0);
     let mut b = start;
     loop {
-        let block = &cfg.blocks[b];
-        insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
+        let block = &code.blocks[b];
+        insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue(i)).count();
         calls += block
             .instructions
             .iter()
@@ -174,7 +181,7 @@ fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
             return None;
         }
         chain.push(b);
-        match block.successors.as_slice() {
+        match cfg.blocks[b].successors.as_slice() {
             [] => {
                 let ends = block.is_return() || block.instructions.last().is_some_and(crate::cfg::is_trap);
                 return ends.then_some(chain);
@@ -187,19 +194,19 @@ fn return_tail(cfg: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
 
 /// Replace each `goto` to a short return tail by a copy of the tail (`{ …; return x; }`),
 /// the way a compiler's shared epilogue is usually read.
-fn inline_return_tails(cfg: &ControlFlowGraph, node: &mut StructuredBlock) {
+fn inline_return_tails(cfg: &ControlFlowGraph, code: &ControlFlowGraph, node: &mut StructuredBlock) {
     use StructuredBlock::*;
     match node {
         Goto(t) => {
-            if let Some(chain) = return_tail(cfg, *t) {
+            if let Some(chain) = return_tail(cfg, code, *t) {
                 *node = seq(chain.into_iter().map(Basic).collect());
             }
         }
-        Sequence(v) => v.iter_mut().for_each(|x| inline_return_tails(cfg, x)),
-        IfThen { then_body, .. } => inline_return_tails(cfg, then_body),
+        Sequence(v) => v.iter_mut().for_each(|x| inline_return_tails(cfg, code, x)),
+        IfThen { then_body, .. } => inline_return_tails(cfg, code, then_body),
         IfThenElse { then_body, else_body, .. } => {
-            inline_return_tails(cfg, then_body);
-            inline_return_tails(cfg, else_body);
+            inline_return_tails(cfg, code, then_body);
+            inline_return_tails(cfg, code, else_body);
         }
         WhileLoop { body, .. }
         | DoWhileLoop { body, .. }
@@ -207,11 +214,11 @@ fn inline_return_tails(cfg: &ControlFlowGraph, node: &mut StructuredBlock) {
         | ForLoop { body, .. }
         | ShortCircuitAnd { body, .. }
         | ShortCircuitOr { body, .. }
-        | Handler { body, .. } => inline_return_tails(cfg, body),
+        | Handler { body, .. } => inline_return_tails(cfg, code, body),
         Switch { cases, default, .. } => {
-            cases.iter_mut().for_each(|(_, c)| inline_return_tails(cfg, c));
+            cases.iter_mut().for_each(|(_, c)| inline_return_tails(cfg, code, c));
             if let Some(d) = default {
-                inline_return_tails(cfg, d);
+                inline_return_tails(cfg, code, d);
             }
         }
         Basic(_) | Break | Continue => {}
@@ -225,6 +232,8 @@ struct LoopInfo {
 
 struct Structurer<'a> {
     cfg: &'a ControlFlowGraph,
+    /// The blocks' instructions (by block id; `cfg` may hold the edges only).
+    code: &'a ControlFlowGraph,
     ipdom: Vec<Option<BlockId>>,
     pdom: crate::dominator::PostDominators,
     /// header -> loop
@@ -241,7 +250,7 @@ struct Structurer<'a> {
 }
 
 impl<'a> Structurer<'a> {
-    fn new(cfg: &'a ControlFlowGraph) -> Self {
+    fn new(cfg: &'a ControlFlowGraph, code: &'a ControlFlowGraph) -> Self {
         let n = cfg.blocks.len();
         let idom = compute_idom(cfg);
         let pdom = compute_post_dominators(cfg);
@@ -321,6 +330,7 @@ impl<'a> Structurer<'a> {
 
         Structurer {
             cfg,
+            code,
             ipdom: pdom.ipdom.clone(),
             pdom,
             loops,
@@ -425,12 +435,12 @@ impl<'a> Structurer<'a> {
                 Some(_) => return None,
                 None => {}
             }
-            if self.emitted[b] && return_tail(self.cfg, b).is_some() {
+            if self.emitted[b] && return_tail(self.cfg, self.code, b).is_some() {
                 return Some(vec![Goto(b)]);
             }
         }
-        let block = &self.cfg.blocks[b];
-        let insns = block.instructions.iter().filter(|i| !crate::cfg::is_epilogue_insn(&i.mnemonic)).count();
+        let block = &self.code.blocks[b];
+        let insns = block.instructions.iter().filter(|i| !crate::cfg::is_epilogue(i)).count();
         let calls = block
             .instructions
             .iter()
