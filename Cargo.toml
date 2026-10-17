@@ -10,6 +10,7 @@ members = [
     "crates/reargo-emulator",
     "crates/reargo-decompile",
     "crates/reargo-sleigh",
+    "crates/reargo-jvm",
     "crates/reargo-cli",
 ]
 
@@ -29,6 +30,7 @@ reargo-lift = { path = "crates/reargo-lift" }
 reargo-emulator = { path = "crates/reargo-emulator" }
 reargo-decompile = { path = "crates/reargo-decompile" }
 reargo-sleigh = { path = "crates/reargo-sleigh" }
+reargo-jvm = { path = "crates/reargo-jvm" }
 goblin = "0.9"
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }
