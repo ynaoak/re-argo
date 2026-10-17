@@ -491,8 +491,8 @@ fn is_commutative(op: OpCode) -> bool {
 
 /// One of 64 bits for a value key: a filter of a few keys that most others miss.
 fn key_bit(k: ValueKey) -> u64 {
-    let h = (k.1 ^ (k.1 >> 7) ^ u64::from(k.3).wrapping_mul(0x9e37_79b9) ^ u64::from(k.2) << 5 ^ u64::from(k.0) << 11).wrapping_mul(0x2545_f491_4f6c_dd1d);
-    1u64 << (h >> 58)
+    // (offsets step by 8 / 0x10; the version tells a slot's values apart)
+    1u64 << (((k.1 >> 3) ^ (k.1 >> 9) ^ u64::from(k.3)) & 63)
 }
 
 /// Follow a chain of redirects to the canonical target. Caps the
@@ -713,7 +713,7 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
             }
         }
         let bloom = defined.keys().fold(0u64, |m, &k| m | key_bit(k));
-        for i in 0..func.varnodes.len() {
+        for i in 0..if defined.is_empty() { 0 } else { func.varnodes.len() } {
             let vn = &func.varnodes[i];
             let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
             if bloom & key_bit(key) == 0 {
