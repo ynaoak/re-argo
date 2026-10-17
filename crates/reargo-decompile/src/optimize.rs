@@ -489,6 +489,12 @@ fn is_commutative(op: OpCode) -> bool {
     )
 }
 
+/// One of 64 bits for a value key: a filter of a few keys that most others miss.
+fn key_bit(k: ValueKey) -> u64 {
+    let h = (k.1 ^ (k.1 >> 7) ^ u64::from(k.3).wrapping_mul(0x9e37_79b9) ^ u64::from(k.2) << 5 ^ u64::from(k.0) << 11).wrapping_mul(0x2545_f491_4f6c_dd1d);
+    1u64 << (h >> 58)
+}
+
 /// Follow a chain of redirects to the canonical target. Caps the
 /// chain length defensively so a cyclic redirect map (which the CSE
 /// loop is structured not to produce) can't loop forever.
@@ -550,7 +556,9 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
     // version, so a use may only be redirected to an earlier value whose slot
     // has not been written since: `tmp_600 = rsp + 0xc; ...; tmp_600 = rsp + 4;
     // ...; load [rsp + 0xc]` printed the last load as `*(tmp_600)` = rsp + 4.
-    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), u32> = Default::default();
+    // (about one slot per four ops: sized once rather than grown op by op)
+    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), u32> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(func.ops.len() / 4 + 16, Default::default());
     let record = |func: &SsaFunction, i: usize, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), u32>| {
         if let Some(o) = func.ops[i].output
             && !func.ops[i].dead
@@ -662,8 +670,17 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
 
     // Apply all redirects in a single pass over the varnode arena.
     if !redirects.is_empty() {
+        // (only a key redirected changes: one of an output, never a constant's; `bloom` has the
+        // bit of each redirected key, so most varnodes are passed over without a lookup)
+        let bloom = redirects.keys().fold(0u64, |m, &k| m | key_bit(k));
         for vn in &mut func.varnodes {
+            if vn.data.space == reargo_core::address::SpaceId::CONST {
+                continue;
+            }
             let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            if bloom & key_bit(key) == 0 {
+                continue;
+            }
             let to = resolve_redirect(&redirects, key);
             if to != key {
                 vn.data = reargo_core::pcode::VarnodeData::new(
@@ -678,19 +695,24 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         // elimination sees no reader of it once its own die (`sete [rsi+0x18]` loads and stores
         // through two copies of the address: the load died, so did the address the store read)
         let targets: rustc_hash::FxHashSet<ValueKey> = redirects.values().map(|&k| resolve_redirect(&redirects, k)).collect();
+        let bloom = targets.iter().fold(0u64, |m, &k| m | key_bit(k));
         let mut defined: rustc_hash::FxHashMap<ValueKey, u32> = Default::default();
         for vn in &func.varnodes {
             // (the removed duplicate's output now carries the kept key too: not that one)
             if vn.def_op.is_some_and(|d| !func.ops[d].dead && func.ops[d].output == Some(vn.id)) {
                 let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-                if targets.contains(&key) {
+                if bloom & key_bit(key) != 0 && targets.contains(&key) {
                     defined.insert(key, vn.id);
                 }
             }
         }
+        let bloom = defined.keys().fold(0u64, |m, &k| m | key_bit(k));
         for i in 0..func.varnodes.len() {
             let vn = &func.varnodes[i];
             let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            if bloom & key_bit(key) == 0 {
+                continue;
+            }
             if let Some(&d) = defined.get(&key)
                 && d as usize != i
             {
