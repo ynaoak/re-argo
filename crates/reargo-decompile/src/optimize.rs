@@ -630,24 +630,29 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
 
         // A value a phi reads keeps its own name (the phi prints as nothing).
-        let feeds_phi = func.varnodes[out_id as usize]
-            .uses
-            .iter()
-            .any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
+        let feeds_phi =
+            |func: &SsaFunction| func.varnodes[out_id as usize].uses.iter().any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
         let name_still_holds =
             |k: ValueKey| latest.get(&(k.0, k.1, k.2)).copied().unwrap_or(0) == k.3;
-        if let Some(&existing) = seen.get(&key)
-            && !feeds_phi
-            && name_still_holds(existing)
-            && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
-        {
-            redirects.insert(out_key, existing);
-            func.ops[i].dead = true;
-            eliminated += 1;
-        } else {
-            seen.insert(key, out_key);
-            record(func, i, &mut latest);
-        }
+        // (one lookup: the earlier value, or the slot this one takes)
+        let slot = match seen.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => {
+                let existing = *o.get();
+                if !feeds_phi(func)
+                    && name_still_holds(existing)
+                    && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
+                {
+                    redirects.insert(out_key, existing);
+                    func.ops[i].dead = true;
+                    eliminated += 1;
+                    continue;
+                }
+                o.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(v) => v.insert(out_key),
+        };
+        *slot = out_key;
+        record(func, i, &mut latest);
     }
 
     // Apply all redirects in a single pass over the varnode arena.

@@ -318,13 +318,16 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     };
     if found.iter().any(|(_, f)| f.as_ref().is_none_or(|f| f.2.default.is_none())) {
         let cases = cases_of(&found);
-        if let Some(ranges) = crate::ranges::Ranges::new(insns, &cases) {
-            for (k, f) in found.iter_mut() {
-                if f.as_ref().is_none_or(|f| f.2.default.is_none()) {
-                    let k = *k;
-                    let range = |at: usize, r: &VarnodeData| ranges.at_dispatch(insns, at, k, r);
-                    *f = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &range);
-                }
+        // (computed when a dispatch asks: one that is no table never does; without ranges the
+        // dispatches are recovered as without them)
+        let ranges = std::cell::OnceCell::new();
+        for (k, f) in found.iter_mut() {
+            if f.as_ref().is_none_or(|f| f.2.default.is_none()) {
+                let k = *k;
+                let range = |at: usize, r: &VarnodeData| {
+                    ranges.get_or_init(|| crate::ranges::Ranges::new(insns, &cases)).as_ref()?.at_dispatch(insns, at, k, r)
+                };
+                *f = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &range);
             }
         }
     }
@@ -450,17 +453,21 @@ fn recover_one(
     // the bases set once first; then those set to one constant among other writes, then the
     // constant last written before the window in address order (two tables through one
     // register, WS85) — a table found these ways must hold only instructions of the function
+    // (the window's target from each start, with the bases set once: the same for each way)
+    let mut evaluated: Vec<Option<E>> = vec![None; k + 1 - start];
     let found = [0, 1, 2].into_iter().find_map(|mode| {
         let is_loose = mode > 0;
         (start..=k).find_map(|st| {
-        let env = evaluate(&insns[st..=k]);
-        let target = env.get(&key(&target_vn)).cloned().unwrap_or(E::Reg(target_vn));
-        let target = with_bases(&target, bases);
+        let target = evaluated[st - start].get_or_insert_with(|| {
+            let env = evaluate(&insns[st..=k]);
+            let target = env.get(&key(&target_vn)).cloned().unwrap_or(E::Reg(target_vn));
+            with_bases(&target, bases)
+        });
         let target = match mode {
-            0 => target,
-            1 => with_loose_bases(&target, loose),
+            0 => target.clone(),
+            1 => with_loose_bases(target, loose),
             // (the constants before this start: the window's own `lea` before it counts)
-            _ => with_loose_bases(&target, &nearest_constants(insns, st)),
+            _ => with_loose_bases(target, &nearest_constants(insns, st)),
         };
         let (table, relative, index) = dispatch(&target)?;
         // (a byte loaded from a struct field, `movzx eax, byte [rsi+8]`, is no slot table: the
