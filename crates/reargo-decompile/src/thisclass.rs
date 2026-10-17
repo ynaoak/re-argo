@@ -1749,6 +1749,21 @@ impl Ctx<'_> {
                 es.push((key, TOP, EF_ESCAPE));
             }
         }
+        // (WS96: `&obj->field` stored into another object, or into a stack object given to
+        // code not of the binary's (an indirect call): reached from there, not followed)
+        for &(_, _, vs, vo) in &s.field_stores {
+            if let Some(key) = field(vs, vo) {
+                es.push((key, TOP, EF_ESCAPE));
+            }
+        }
+        for &(c, _, _, v) in &s.stack_fields {
+            if let FieldVal::Ptr(vs, vo) = v
+                && self.fidx(s.call_targets[c as usize]).is_none()
+                && let Some(key) = field(vs, vo)
+            {
+                es.push((key, TOP, EF_ESCAPE));
+            }
+        }
         for &(d, o, vs, _) in &s.field_stores {
             if let Some(key) = field(d, o)
                 && !self.fresh(k, vs)
