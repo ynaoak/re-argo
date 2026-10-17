@@ -599,10 +599,10 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
     let mut keys: Vec<ValueKey> = Vec::new();
     let mut version_of: Vec<usize> = vec![usize::MAX; func.varnodes.len()];
     let mut def_of: Vec<Option<OpIdx>> = Vec::new();
-    for v in 0..func.varnodes.len() {
-        let d = &func.varnodes[v].data;
-        if machine(d) {
-            if d.size != 1 {
+    for (v, version) in version_of.iter_mut().enumerate() {
+        let vn = &func.varnodes[v];
+        if machine(&vn.data) {
+            if vn.data.size != 1 {
                 return;
             }
             let k = value_key(func, v as VarId);
@@ -611,8 +611,8 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
                 def_of.push(None);
                 keys.len() - 1
             });
-            version_of[v] = n;
-            if let Some(d) = func.varnodes[v].def_op {
+            *version = n;
+            if let Some(d) = vn.def_op {
                 def_of[n].get_or_insert(d);
             }
         }
@@ -696,8 +696,7 @@ pub fn name_flag_webs(func: &mut SsaFunction) {
         offset_of.insert(r, NAMED_FLAG_BASE + ((k as u64) << 16) + count[k]);
         count[k] += 1;
     }
-    for v in 0..func.varnodes.len() {
-        let n = version_of[v];
+    for (v, &n) in version_of.iter().enumerate() {
         if n == usize::MAX {
             continue;
         }
