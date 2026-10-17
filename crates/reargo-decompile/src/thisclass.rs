@@ -272,6 +272,9 @@ struct St {
     /// (WS96) the vector registers known to hold zero: bit `i` the low 128 bits of `xmm<i>`,
     /// bit `16 + i` all of `ymm<i>` (a VEX `vxorps` zeroes the whole register)
     zero: u32,
+    /// (WS96) `(xmm, low, high)`: the two 8-byte values a vector register holds, copied from
+    /// memory (`movups xmm0, [rsi]`: a 16-byte move of two pointers, a vector's begin / end)
+    pairs: SmallVec<[(u8, Val, Val); 2]>,
 }
 
 impl St {
@@ -281,31 +284,52 @@ impl St {
             r[a] = Val::Ptr(Src::Arg(i as u8), 0);
         }
         r[RSP] = Val::Ptr(Src::Stack, 0);
-        St { r, slots: SmallVec::new(), zero: 0 }
+        St { r, slots: SmallVec::new(), zero: 0, pairs: SmallVec::new() }
     }
 
     fn unknown() -> St {
-        St { r: [Val::Unk; 16], slots: SmallVec::new(), zero: 0 }
+        St { r: [Val::Unk; 16], slots: SmallVec::new(), zero: 0, pairs: SmallVec::new() }
+    }
+
+    /// The vector register `n` holds something not followed.
+    fn vforget(&mut self, n: usize) {
+        self.zero &= !((1 << n) | (1 << (16 + n)));
+        self.pairs.retain(|p| p.0 as usize != n);
     }
 
     /// `self ∧= o`; whether `self` changed.
-    fn meet(&mut self, o: &St) -> bool {
-        self.meet_objects(o, &mut Vec::new())
+    fn meet(&mut self, o: &St, canon: &[u32]) -> bool {
+        self.meet_objects(o, &mut Vec::new(), canon)
     }
 
     /// [`St::meet`]; two objects a slot holds on two paths (two markers) are one object after
     /// the join: the slot keeps the first marker and `aliases` gets the pair.
-    fn meet_objects(&mut self, o: &St, aliases: &mut Vec<(Instance, Instance)>) -> bool {
+    /// `canon[c]`: the first call to the target of call `c` (WS96: the results of two calls to
+    /// one function joined — two `operator new` calls of one reallocation — are the first's).
+    fn meet_objects(&mut self, o: &St, aliases: &mut Vec<(Instance, Instance)>, canon: &[u32]) -> bool {
+        let same_fn = |a: u32, b: u32| canon.get(a as usize).is_some_and(|&x| x != u32::MAX && Some(&x) == canon.get(b as usize));
         let mut changed = false;
         if self.zero & o.zero != self.zero {
             self.zero &= o.zero;
             changed = true;
         }
+        let n = self.pairs.len();
+        self.pairs.retain(|p| o.pairs.contains(p));
+        changed |= self.pairs.len() != n;
         for (a, b) in self.r.iter_mut().zip(o.r.iter()) {
             if *a != *b && *a != Val::Unk {
                 // (two pointers into one buffer: an element of it)
                 let m = match (*a, *b) {
                     (Val::Ptr(x, _) | Val::Elem(x), Val::Ptr(y, _) | Val::Elem(y)) if x == y && x != Src::Stack => Val::Elem(x),
+                    // (WS96: a pointer or null — `n ? operator new(n) : nullptr` — is the pointer)
+                    (Val::Const(0), p @ (Val::Ptr(..) | Val::Elem(_))) | (p @ (Val::Ptr(..) | Val::Elem(_)), Val::Const(0)) => p,
+                    (Val::Ptr(Src::Ret(x), _) | Val::Elem(Src::Ret(x)), Val::Ptr(Src::Ret(y), _) | Val::Elem(Src::Ret(y))) if same_fn(x, y) => {
+                        let c = canon[x as usize];
+                        match (*a, *b) {
+                            (Val::Ptr(_, i), Val::Ptr(_, j)) if i == j => Val::Ptr(Src::Ret(c), i),
+                            _ => Val::Elem(Src::Ret(c)),
+                        }
+                    }
                     _ => Val::Unk,
                 };
                 if *a != m {
@@ -332,6 +356,11 @@ impl St {
                     _ if x == y => true,
                     (Val::Ptr(a, _) | Val::Elem(a), Val::Ptr(b, _) | Val::Elem(b)) if a == b && a != Src::Stack => {
                         s.1 = Val::Elem(a);
+                        true
+                    }
+                    (Val::Ptr(..) | Val::Elem(_), Val::Const(0)) => true,
+                    (Val::Const(0), p @ (Val::Ptr(..) | Val::Elem(_))) => {
+                        s.1 = p;
                         true
                     }
                     _ => false,
@@ -403,6 +432,8 @@ struct Interp<'a> {
     info: InstructionInfoFactory,
     /// states after calls and at indirect jumps (the entry of the blocks no jump reaches)
     fallback: Option<St>,
+    /// (WS96) by call: the first call to its target (`u32::MAX`: an indirect call)
+    canon: Vec<u32>,
 }
 
 impl Interp<'_> {
@@ -500,7 +531,7 @@ impl Interp<'_> {
     fn fallback_with(&mut self, st: &St) {
         match &mut self.fallback {
             Some(f) => {
-                f.meet(st);
+                f.meet(st, &self.canon);
             }
             None => self.fallback = Some(st.clone()),
         }
@@ -631,7 +662,12 @@ impl Interp<'_> {
             _ => None,
         };
         let Some(vt) = slot else { return false };
-        matches!(self.out.loads.get(vt as usize), Some(&(obj, 0)) if st.r[ARG_REGS[0]] == Val::Ptr(obj, 0))
+        // (WS96: also an object in a buffer, `elem->vfn()` through a pointer into it)
+        match self.out.loads.get(vt as usize) {
+            Some(&(obj, 0)) => st.r[ARG_REGS[0]] == Val::Ptr(obj, 0),
+            Some(&(obj, ELEM)) => st.r[ARG_REGS[0]] == Val::Elem(obj),
+            _ => false,
+        }
     }
 
     /// One instruction; `call_id` names a call / tail jump, `outside` says a branch leaves
@@ -750,6 +786,7 @@ impl Interp<'_> {
             Mnemonic::Call => {
                 let id = call_id.unwrap_or(u32::MAX);
                 let target = if i.op0_kind() == OpKind::NearBranch64 { i.near_branch64() } else { 0 };
+                let dest = st.r[ARG_REGS[0]];
                 if emit && id != u32::MAX {
                     self.call_args(st, id, target);
                     self.call_effects(st, id, target, i);
@@ -787,7 +824,16 @@ impl Interp<'_> {
                     st.r[c] = Val::Unk;
                 }
                 st.zero = 0;
+                st.pairs.clear();
                 st.r[RAX] = if id != u32::MAX { Val::Ptr(Src::Ret(id), 0) } else { Val::Unk };
+                // (WS96: `memcpy` / `memmove` / `memset` return their destination — `mempcpy` a
+                // pointer past it: a pointer into its buffer)
+                if matches!(self.env.imports.get(&target), Some(ImportKind::Copy | ImportKind::Memset))
+                    && let Val::Ptr(d, _) | Val::Elem(d) = dest
+                    && d != Src::Stack
+                {
+                    st.r[RAX] = Val::Elem(d);
+                }
                 let mut after = st.clone();
                 after.r[RAX] = Val::Unk;
                 after.r[2] = Val::Unk;
@@ -830,13 +876,15 @@ impl Interp<'_> {
         match i.mnemonic() {
             M::Xorps | M::Xorpd | M::Pxor if i.op_count() == 2 && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register && i.op0_register() == i.op1_register() => {
                 let Some(n) = vreg(i.op0_register()) else { return false };
-                st.zero = (st.zero | (1 << n)) & !(1 << (16 + n));
+                st.vforget(n);
+                st.zero |= 1 << n;
                 true
             }
             M::Vxorps | M::Vxorpd | M::Vpxor | M::Vpxord | M::Vpxorq
                 if i.op_count() == 3 && (0..3).all(|k| i.op_kind(k) == OpKind::Register) && i.op1_register() == i.op2_register() && !i.op0_register().is_zmm() =>
             {
                 let Some(n) = vreg(i.op0_register()) else { return false };
+                st.vforget(n);
                 st.zero |= (1 << n) | (1 << (16 + n));
                 true
             }
@@ -851,12 +899,47 @@ impl Interp<'_> {
                     (_, true) => st.zero & (1 << (16 + n)) != 0 && size == 32,
                     _ => false,
                 };
-                if !zero {
-                    return false;
-                }
                 let a = self.addr(st, i);
-                for k in 0..size / 8 {
-                    self.store(st, add(a, i64::from(k) * 8), 8, Val::Const(0), emit);
+                if zero {
+                    for k in 0..size / 8 {
+                        self.store(st, add(a, i64::from(k) * 8), 8, Val::Const(0), emit);
+                    }
+                    return true;
+                }
+                // (two 8-byte values copied from memory: stored as such)
+                let Some(&(_, lo, hi)) = st.pairs.iter().find(|p| p.0 as usize == n).filter(|_| r.is_xmm() && size == 16) else { return false };
+                self.store(st, a, 8, lo, emit);
+                self.store(st, add(a, 8), 8, hi, emit);
+                true
+            }
+            M::Movups | M::Movaps | M::Movupd | M::Movapd | M::Movdqu | M::Movdqa | M::Lddqu
+                if i.op_count() == 2 && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Memory && i.op0_register().is_xmm() && i.memory_size().size() == 16 =>
+            {
+                let Some(n) = vreg(i.op0_register()) else { return false };
+                let (lo, hi) = match self.addr(st, i) {
+                    Val::Ptr(Src::Stack, k) => (st.slot(k), k.checked_add(8).map_or(Val::Unk, |k| st.slot(k))),
+                    a @ Val::Ptr(..) => (self.load(st, a), self.load(st, add(a, 8))),
+                    a @ Val::Elem(_) => (self.load(st, a), self.load(st, a)),
+                    _ => (Val::Unk, Val::Unk),
+                };
+                st.vforget(n);
+                if lo != Val::Unk || hi != Val::Unk {
+                    st.pairs.push((n as u8, lo, hi));
+                }
+                true
+            }
+            M::Movups | M::Movaps | M::Movupd | M::Movapd | M::Movdqu | M::Movdqa
+                if i.op_count() == 2 && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register && i.op0_register().is_xmm() && i.op1_register().is_xmm() =>
+            {
+                let (Some(d), Some(s)) = (vreg(i.op0_register()), vreg(i.op1_register())) else { return false };
+                let z = st.zero & (1 << s) != 0;
+                let p = st.pairs.iter().find(|p| p.0 as usize == s).copied();
+                st.vforget(d);
+                if z {
+                    st.zero |= 1 << d;
+                }
+                if let Some((_, lo, hi)) = p {
+                    st.pairs.push((d as u8, lo, hi));
                 }
                 true
             }
@@ -875,7 +958,7 @@ impl Interp<'_> {
                 if let Some(g) = gpr(u.register()) {
                     st.r[g] = Val::Unk;
                 } else if let Some(n) = vreg(u.register()) {
-                    st.zero &= !((1 << n) | (1 << (16 + n)));
+                    st.vforget(n);
                 }
             }
         }
@@ -1034,7 +1117,21 @@ pub fn summarize_in(mem: &Memory, start: u64, len: u64, env: &Env) -> Summary {
         s
     };
 
-    let mut it = Interp { vt_points, env, loads: FxHashMap::default(), out: Summary::default(), info: InstructionInfoFactory::new(), fallback: None };
+    let mut first: FxHashMap<u64, u32> = FxHashMap::default();
+    let canon: Vec<u32> = targets.iter().enumerate().map(|(c, &t)| if t == 0 { u32::MAX } else { *first.entry(t).or_insert(c as u32) }).collect();
+    let mut it = Interp { vt_points, env, loads: FxHashMap::default(), out: Summary::default(), info: InstructionInfoFactory::new(), fallback: None, canon: canon.clone() };
+    // (WS96: a block's entry is the meet of its predecessors' current exits — and of its seed:
+    // the entry state, the fallback — recomputed when one changes, so a value a first visit saw
+    // as null and a later one as a pointer is the pointer)
+    let mut preds: Vec<SmallVec<[usize; 2]>> = vec![SmallVec::new(); nb];
+    for b in 0..nb {
+        for s in succs(b) {
+            preds[s].push(b);
+        }
+    }
+    let mut seed: Vec<Option<St>> = vec![None; nb];
+    seed[0] = Some(St::entry());
+    let mut exits: Vec<Option<St>> = vec![None; nb];
     let mut states: Vec<Option<St>> = vec![None; nb];
     states[0] = Some(St::entry());
     let mut work: Vec<usize> = vec![0];
@@ -1052,27 +1149,42 @@ pub fn summarize_in(mem: &Memory, start: u64, len: u64, env: &Env) -> Summary {
             for k in starts[b]..block_end(b) {
                 it.step(&mut st, &insns[k], call_id[k], false, &inside);
             }
+            if exits[b].as_ref() == Some(&st) {
+                continue;
+            }
+            exits[b] = Some(st);
             for s in succs(b) {
-                let changed = match &mut states[s] {
-                    Some(old) => old.meet_objects(&st, &mut it.out.made_alias),
-                    None => {
-                        states[s] = Some(st.clone());
-                        true
+                let mut entry: Option<St> = seed[s].clone();
+                for &p in &preds[s] {
+                    if let Some(x) = &exits[p] {
+                        match &mut entry {
+                            Some(e) => {
+                                e.meet_objects(x, &mut it.out.made_alias, &canon);
+                            }
+                            None => entry = Some(x.clone()),
+                        }
                     }
-                };
-                if changed && !queued[s] {
-                    queued[s] = true;
-                    work.push(s);
+                }
+                if entry != states[s] {
+                    states[s] = entry;
+                    if !queued[s] {
+                        queued[s] = true;
+                        work.push(s);
+                    }
                 }
             }
         }
         // blocks no jump reaches: from the states after calls / at indirect jumps
-        let unreached: Vec<usize> = (0..nb).filter(|&b| states[b].is_none()).collect();
+        // (WS96: not the alignment padding after a `ret` / `jmp` — `nop`s falling into the next
+        // block would join an unknown state into it)
+        let padding = |b: usize| insns[starts[b]..block_end(b)].iter().all(|i| matches!(i.mnemonic(), Mnemonic::Nop | Mnemonic::Int3));
+        let unreached: Vec<usize> = (0..nb).filter(|&b| states[b].is_none() && !padding(b)).collect();
         if unreached.is_empty() {
             break;
         }
         let fb = it.fallback.clone().unwrap_or_else(St::unknown);
         for b in unreached {
+            seed[b] = Some(fb.clone());
             states[b] = Some(fb.clone());
             queued[b] = true;
             work.push(b);
@@ -2500,7 +2612,61 @@ mod tests {
             0xc3,
         ];
         let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
-        assert_eq!(s.field_clobbers, [(Src::Arg(0), 0x20, 16), (Src::Arg(0), 0x50, 16)]);
+        assert_eq!(s.field_clobbers, [(Src::Arg(0), 0x20, 16)]);
+        assert_eq!(s.field_stores, [(Src::Arg(0), 0x50, Src::Ld(0), 0), (Src::Arg(0), 0x58, Src::Ld(1), 0)]);
+    }
+
+    /// WS96: a virtual call on an object in a buffer (`elem->vfn()`, the destructor loop of a
+    /// vector of objects) gives the buffer to that object's own method, not to unknown code.
+    #[test]
+    fn a_virtual_call_on_an_element_is_no_escape_of_its_buffer() {
+        let code = [
+            0x53, // push rbx
+            0x48, 0x8b, 0x5f, 0x08, // mov rbx, [rdi+8]
+            0x48, 0x83, 0xc3, 0x70, // L: add rbx, 0x70
+            0x48, 0x8b, 0x03, // mov rax, [rbx]
+            0x48, 0x89, 0xdf, // mov rdi, rbx
+            0xff, 0x10, // call [rax]
+            0xeb, 0xf2, // jmp L
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        assert!(s.loads.contains(&(Src::Ld(0), ELEM)), "{:?}", s.loads);
+        assert!(s.buf_escapes.is_empty(), "{:?}", s.buf_escapes);
+    }
+
+    /// WS96: a pointer joined with null (`n ? operator new(n) : nullptr`) is the pointer; the
+    /// results of two calls to one function joined are the first's.
+    #[test]
+    fn a_pointer_or_null_is_the_pointer() {
+        let code = [
+            0x48, 0x89, 0xd3, // mov rbx, rdx
+            0x31, 0xc9, // xor ecx, ecx
+            0x48, 0x85, 0xff, // test rdi, rdi
+            0x74, 0x08, // je L
+            0xe8, 0xf1, 0x00, 0x00, 0x00, // call 0x1100 (next 0x100f)
+            0x48, 0x89, 0xc1, // mov rcx, rax
+            0x48, 0x8b, 0x03, // L: mov rax, [rbx]
+            0x48, 0x89, 0x04, 0x31, // mov [rcx+rsi], rax
+            0xc3,
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        assert_eq!(s.field_stores, [(Src::Ret(0), ELEM, Src::Ld(0), 0)], "{:?} {:?} {:?}", s.loads, s.field_clobbers, s.args);
+    }
+
+    /// WS96: a 16-byte move through a vector register copies two 8-byte values (a vector's
+    /// begin / end moved): two pointer stores.
+    #[test]
+    fn a_vector_register_move_copies_two_pointers() {
+        let code = [
+            0x0f, 0x10, 0x46, 0x08, // movups xmm0, [rsi+8]
+            0x0f, 0x28, 0xc8, // movaps xmm1, xmm0
+            0x0f, 0x11, 0x4f, 0x20, // movups [rdi+0x20], xmm1
+            0xc3,
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        assert_eq!(s.loads, [(Src::Arg(1), 8), (Src::Arg(1), 0x10)]);
+        assert_eq!(s.field_stores, [(Src::Arg(0), 0x20, Src::Ld(0), 0), (Src::Arg(0), 0x28, Src::Ld(1), 0)]);
+        assert!(s.field_clobbers.is_empty(), "{:?}", s.field_clobbers);
     }
 
     /// WS95: a pointer stepped through a buffer in a loop, or indexed, points to its elements:
