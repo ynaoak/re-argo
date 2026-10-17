@@ -529,6 +529,16 @@ impl Interp<'_> {
                 {
                     self.out.vt_stores.push((Src::Stack, s, c));
                 }
+                // (WS96: the address of a field kept in the frame — `&this->v` spilled across
+                // calls that may forget the slot — is not followed: given to unknown code)
+                if emit
+                    && size == 8
+                    && let Val::Ptr(vs, vo) = v
+                    && vs != Src::Stack
+                    && vo > 0
+                {
+                    self.out.buf_escapes.push((vs, vo));
+                }
             }
             Val::Ptr(src, k) if emit => match v {
                 Val::Const(c) if size == 8 && self.vt_points.contains(&c) => self.out.vt_stores.push((src, k, c)),
@@ -2878,6 +2888,22 @@ mod tests {
         let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
         assert!(s.loads.contains(&(Src::Ld(0), ELEM)), "{:?}", s.loads);
         assert!(s.buf_escapes.is_empty(), "{:?}", s.buf_escapes);
+    }
+
+    /// WS96: the address of a field spilled to the frame is not followed through it: it is given
+    /// to unknown code (the field's buffer may get anything); `this` itself spilled is not.
+    #[test]
+    fn a_field_address_spilled_to_the_frame_escapes() {
+        let code = [
+            0x48, 0x83, 0xec, 0x18, // sub rsp, 0x18
+            0x48, 0x8d, 0x47, 0x28, // lea rax, [rdi+0x28]
+            0x48, 0x89, 0x04, 0x24, // mov [rsp], rax
+            0x48, 0x89, 0x7c, 0x24, 0x08, // mov [rsp+8], rdi
+            0x48, 0x83, 0xc4, 0x18, // add rsp, 0x18
+            0xc3,
+        ];
+        let s = summarize(&text(&code), 0x1000, code.len() as u64, &FxHashSet::default());
+        assert_eq!(s.buf_escapes, [(Src::Arg(0), 0x28)]);
     }
 
     /// WS96: a pointer joined with null (`n ? operator new(n) : nullptr`) is the pointer; the
