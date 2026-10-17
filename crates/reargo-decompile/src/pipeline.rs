@@ -784,10 +784,12 @@ fn apply_call_convention(
         let call = &mut insn.ops[pos];
         let at = call.seq;
         let target = call.inputs.first().copied();
-        for a in &cc.args {
-            call.inputs.push(*a);
-        }
-        let mut after: Vec<PcodeOp> = Vec::new();
+        call.inputs.extend(cc.args.iter().copied());
+        // (the definitions go between the call and the ops after it, built in place)
+        let tail = insn.ops.split_off(pos + 1);
+        let n_defs: usize = cc.returns.iter().chain(cc.clobbers.iter()).map(|(_, views)| 1 + views.len()).sum();
+        insn.ops.reserve(n_defs + tail.len());
+        let after = &mut insn.ops;
         // returns: `INDIRECT(target)`; clobbers: `INDIRECT(target, 1)` (WS76: a caller-saved
         // register read after a call no longer shows the value it had before the call)
         let clobber_mark = VarnodeData::new(reargo_core::address::SpaceId::CONST, CLOBBER_MARK, 1);
@@ -824,8 +826,6 @@ fn apply_call_convention(
                 });
             }
         }
-        let tail = insn.ops.split_off(pos + 1);
-        insn.ops.extend(after);
         insn.ops.extend(tail);
         for (i, op) in insn.ops.iter_mut().enumerate() {
             op.seq.order = i as u32;

@@ -2081,23 +2081,60 @@ fn infer_signature(func: &SsaFunction) -> FunctionSignature {
 }
 
 fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
+    // (built without the formatting machinery: names are printed for every operand)
     if vn.data.space == SpaceId::CONST {
         if vn.data.offset <= 9 {
-            return format!("{}", vn.data.offset);
+            return name_num("", vn.data.offset);
         }
-        return format!("0x{:x}", vn.data.offset);
+        return name_hex("0x", vn.data.offset);
     }
     if vn.data.space == SpaceId::REGISTER {
         return reg_name(vn.data.offset, vn.data.size);
     }
     if vn.data.space == SpaceId::RAM {
-        return format!("0x{:x}", vn.data.offset);
+        return name_hex("0x", vn.data.offset);
     }
     if vn.data.space == SpaceId::UNIQUE && vn.data.offset >= crate::flags::SAVED_BASE {
         // a compared value kept before the compare's result overwrote it (WS82)
-        return format!("old_{}", (vn.data.offset - crate::flags::SAVED_BASE) / 0x10 + 1);
+        return name_num("old_", (vn.data.offset - crate::flags::SAVED_BASE) / 0x10 + 1);
     }
-    format!("tmp_{:x}", vn.data.offset)
+    name_hex("tmp_", vn.data.offset)
+}
+
+/// `format!("{prefix}{v:x}")`.
+pub(crate) fn name_hex(prefix: &str, v: u64) -> String {
+    let digits = (64 - (v | 1).leading_zeros()).div_ceil(4) as usize;
+    let mut s = String::with_capacity(prefix.len() + digits);
+    s.push_str(prefix);
+    for k in (0..digits).rev() {
+        s.push(char::from(b"0123456789abcdef"[((v >> (4 * k)) & 0xf) as usize]));
+    }
+    s
+}
+
+/// `format!("{prefix}{v}{suffix}")`.
+pub(crate) fn name_num_suffix(prefix: &str, v: u64, suffix: &str) -> String {
+    let mut buf = [0u8; 20];
+    let mut at = buf.len();
+    let mut x = v;
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    let mut s = String::with_capacity(prefix.len() + (buf.len() - at) + suffix.len());
+    s.push_str(prefix);
+    s.push_str(std::str::from_utf8(&buf[at..]).unwrap_or_default());
+    s.push_str(suffix);
+    s
+}
+
+/// `format!("{prefix}{v}")`.
+pub(crate) fn name_num(prefix: &str, v: u64) -> String {
+    name_num_suffix(prefix, v, "")
 }
 
 fn reg_name(offset: u64, size: u32) -> String {
@@ -2148,10 +2185,10 @@ fn reg_name(offset: u64, size: u32) -> String {
         (off, sz) if (0x80..0xC0).contains(&off) && off % 8 == 0 => {
             let n = 8 + (off - 0x80) / 8;
             match sz {
-                8 => format!("r{}", n),
-                4 => format!("r{}d", n),
-                2 => format!("r{}w", n),
-                1 => format!("r{}b", n),
+                8 => name_num("r", n),
+                4 => name_num_suffix("r", n, "d"),
+                2 => name_num_suffix("r", n, "w"),
+                1 => name_num_suffix("r", n, "b"),
                 _ => format!("r{}_{}", n, sz),
             }
         }
@@ -2162,18 +2199,18 @@ fn reg_name(offset: u64, size: u32) -> String {
             // view refresh reads `xmm0_d = (uint32_t)xmm0`, not `xmm0 = xmm0`.
             let n = (off - 0x1200) / 0x10;
             match sz {
-                16 => format!("xmm{}", n),
-                8 => format!("xmm{}_q", n),
-                4 => format!("xmm{}_d", n),
+                16 => name_num("xmm", n),
+                8 => name_num_suffix("xmm", n, "_q"),
+                4 => name_num_suffix("xmm", n, "_d"),
                 _ => format!("xmm{}_{}", n, sz),
             }
         }
         // WS89: the x87 stack slots, named from the bottom of the stack (`st0` = the first value
         // pushed; see `reargo_lift::x86::x87`), the control word and the condition codes
-        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => format!("st{}", (off - 0x1100) / 0x10),
+        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => name_num("st", (off - 0x1100) / 0x10),
         (0x10a0, 2) => "fpucw".into(),
-        (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
-        _ => format!("var_{:x}", offset),
+        (off, 1) if (0x10a8..0x10ac).contains(&off) => name_num("fpu_c", off - 0x10a8),
+        _ => name_hex("var_", offset),
     }
 }
 
@@ -2547,6 +2584,15 @@ mod tests {
 
     /// WS90: an integer cast covering the whole text, and the widening casts below an unsigned
     /// one dropped (each dropped cast is the identity on the value it gets).
+    #[test]
+    fn names_match_the_formatting_machinery() {
+        for v in [0u64, 1, 9, 10, 15, 16, 255, 0x1000, 0xdead_beef, u64::MAX, 1 << 63, 0x0123_4567_89ab_cdef] {
+            assert_eq!(name_hex("tmp_", v), format!("tmp_{v:x}"));
+            assert_eq!(name_num("old_", v), format!("old_{v}"));
+            assert_eq!(name_num_suffix("r", v, "d"), format!("r{v}d"));
+        }
+    }
+
     #[test]
     fn integer_cast_chains() {
         assert_eq!(int_cast("(uint8_t)x"), Some((1, false, "x")));

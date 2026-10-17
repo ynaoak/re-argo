@@ -1387,21 +1387,21 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
 fn varnode_name(vn: &crate::ssa::SsaVarnode) -> String {
     if vn.data.space == SpaceId::CONST {
         if vn.data.offset <= 9 {
-            return format!("{}", vn.data.offset);
+            return crate::emit::name_num("", vn.data.offset);
         }
-        return format!("0x{:x}", vn.data.offset);
+        return crate::emit::name_hex("0x", vn.data.offset);
     }
     if vn.data.space == SpaceId::REGISTER {
         return reg_name(vn.data.offset, vn.data.size);
     }
     if vn.data.space == SpaceId::RAM {
-        return format!("0x{:x}", vn.data.offset);
+        return crate::emit::name_hex("0x", vn.data.offset);
     }
     if vn.data.space == SpaceId::UNIQUE && vn.data.offset >= crate::flags::SAVED_BASE {
         // a compared value kept before the compare's result overwrote it (WS82)
-        return format!("old_{}", (vn.data.offset - crate::flags::SAVED_BASE) / 0x10 + 1);
+        return crate::emit::name_num("old_", (vn.data.offset - crate::flags::SAVED_BASE) / 0x10 + 1);
     }
-    format!("tmp_{:x}", vn.data.offset)
+    crate::emit::name_hex("tmp_", vn.data.offset)
 }
 
 fn reg_name(offset: u64, size: u32) -> String {
@@ -1448,10 +1448,10 @@ fn reg_name(offset: u64, size: u32) -> String {
         (off, sz) if (0x80..0xC0).contains(&off) && off % 8 == 0 => {
             let n = 8 + (off - 0x80) / 8;
             match sz {
-                8 => format!("r{}", n),
-                4 => format!("r{}d", n),
-                2 => format!("r{}w", n),
-                1 => format!("r{}b", n),
+                8 => crate::emit::name_num("r", n),
+                4 => crate::emit::name_num_suffix("r", n, "d"),
+                2 => crate::emit::name_num_suffix("r", n, "w"),
+                1 => crate::emit::name_num_suffix("r", n, "b"),
                 _ => format!("r{}_{}", n, sz),
             }
         }
@@ -1460,17 +1460,17 @@ fn reg_name(offset: u64, size: u32) -> String {
             // view refresh reads `xmm0_d = (uint32_t)xmm0`, not `xmm0 = xmm0`.
             let n = (off - 0x1200) / 0x10;
             match sz {
-                16 => format!("xmm{}", n),
-                8 => format!("xmm{}_q", n),
-                4 => format!("xmm{}_d", n),
+                16 => crate::emit::name_num("xmm", n),
+                8 => crate::emit::name_num_suffix("xmm", n, "_q"),
+                4 => crate::emit::name_num_suffix("xmm", n, "_d"),
                 _ => format!("xmm{}_{}", n, sz),
             }
         }
         // WS89: see `emit::reg_name`
-        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => format!("st{}", (off - 0x1100) / 0x10),
+        (off, 10) if (0x1100..0x1180).contains(&off) && off % 0x10 == 0 => crate::emit::name_num("st", (off - 0x1100) / 0x10),
         (0x10a0, 2) => "fpucw".into(),
-        (off, 1) if (0x10a8..0x10ac).contains(&off) => format!("fpu_c{}", off - 0x10a8),
-        _ => format!("var_{:x}", offset),
+        (off, 1) if (0x10a8..0x10ac).contains(&off) => crate::emit::name_num("fpu_c", off - 0x10a8),
+        _ => crate::emit::name_hex("var_", offset),
     }
 }
 
