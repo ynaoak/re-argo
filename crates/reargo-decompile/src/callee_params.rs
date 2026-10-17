@@ -415,8 +415,8 @@ impl<'a> CalleeParams<'a> {
 
     fn summarize(&self, target: u64) -> Option<Summary> {
         if let (Some(x86), Some(facts)) = (self.lifter.as_x86(), &self.facts)
-            && let Some(addrs) = x86.plain_range(self.memory, target, MAX_INSNS, facts)
-            && let Some(s) = self.summarize_plain(x86, target, &addrs)
+            && let Some(walk) = x86.plain_walk(self.memory, target, MAX_INSNS, facts)
+            && let Some(s) = self.summarize_plain(x86, target, &walk)
         {
             return Some(s);
         }
@@ -432,30 +432,30 @@ impl<'a> CalleeParams<'a> {
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
     }
 
-    /// [`Self::summarize`] of a range that is the lifts of `addrs` alone
-    /// ([`reargo_lift::x86::X86Lifter::plain_range`]): only the instructions the trim keeps
+    /// [`Self::summarize`] of a range that is the lifts of the walk's instructions alone
+    /// ([`reargo_lift::x86::X86Lifter::plain_walk`]): only the instructions the trim keeps
     /// are lifted.
-    fn summarize_plain(&self, x86: &reargo_lift::x86::X86Lifter, target: u64, addrs: &[u64]) -> Option<Summary> {
-        if addrs.first() != Some(&target) {
+    fn summarize_plain(&self, x86: &reargo_lift::x86::X86Lifter, target: u64, walk: &reargo_lift::x86::PlainWalk<'_>) -> Option<Summary> {
+        if walk.first() != Some(target) {
             return None;
         }
-        let idx_of = |a: u64| addrs.binary_search(&a).ok();
-        let mut seen = vec![false; addrs.len()];
+        // (the stack holds addresses: those of a walk increase with their index)
+        let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
+        let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
         let mut lifted: Vec<(usize, LiftedInstruction)> = Vec::new();
-        let mut stack = vec![0usize];
-        while let Some(idx) = stack.pop() {
-            if seen[idx] {
+        let mut stack = vec![target as usize];
+        while let Some(a) = stack.pop() {
+            if !seen.insert(a) {
                 continue;
             }
-            seen[idx] = true;
-            let insn = x86.lift_alone(self.memory, addrs[idx]).ok()?;
+            let insn = x86.lift_alone(self.memory, a as u64).ok()?;
             crate::pipeline::reach_successors(&insn, idx_of, &mut stack);
-            lifted.push((idx, insn));
+            lifted.push((a, insn));
         }
-        lifted.sort_unstable_by_key(|(idx, _)| *idx);
+        lifted.sort_unstable_by_key(|(a, _)| *a);
         let insns: Vec<LiftedInstruction> = lifted.into_iter().map(|(_, i)| i).collect();
-        let hit_limit = addrs.len() >= MAX_INSNS;
-        let truncated = hit_limit && insns.last().map(|i| i.address) == addrs.last().copied();
+        let hit_limit = walk.len() >= MAX_INSNS;
+        let truncated = hit_limit && insns.last().map(|i| i.address) == walk.last();
         Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
     }
 

@@ -365,6 +365,50 @@ pub struct InsnFacts {
     base: u64,
     end: u64,
     pages: Vec<std::sync::OnceLock<Box<[std::sync::atomic::AtomicU16]>>>,
+    /// [`Span`]s by start address, in pages like `pages` ([`X86Lifter::plain_walk`]).
+    spans: Vec<std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>>>,
+}
+
+/// The instructions of a walk from an address to the next [`SPAN_BYTES`] boundary (those
+/// starting below it), summarised for [`X86Lifter::plain_walk`] to step over them at once.
+/// Packed in a `u32`: [`SPAN_KNOWN`], [`SPAN_STOP`] (the walk must go one instruction at a
+/// time: one failed, is x87, or is outside the table), the PF transfer
+/// ([`SPAN_FAIL_CLEAR`] / [`SPAN_FAIL_SET`]: a PF read not written since the last
+/// look-back stop, entering with PF not written / written; [`SPAN_OUT_CLEAR`] /
+/// [`SPAN_OUT_SET`]: PF written at the end), the instruction count (bits 0..9) and the
+/// length in bytes (bits 9..18).
+#[derive(Clone, Copy)]
+struct Span(u32);
+
+const SPAN_BYTES: u64 = 256;
+const SPAN_KNOWN: u32 = 1 << 31;
+const SPAN_STOP: u32 = 1 << 30;
+const SPAN_FAIL_CLEAR: u32 = 1 << 29;
+const SPAN_FAIL_SET: u32 = 1 << 28;
+const SPAN_OUT_CLEAR: u32 = 1 << 27;
+const SPAN_OUT_SET: u32 = 1 << 26;
+
+impl Span {
+    fn count(self) -> usize {
+        (self.0 & 0x1ff) as usize
+    }
+    fn bytes(self) -> u64 {
+        u64::from((self.0 >> 9) & 0x1ff)
+    }
+    /// The PF state after the span entered with `pf_written`, `None` when a PF read fails.
+    fn pf(self, pf_written: bool) -> Option<bool> {
+        let (fail, out) = if pf_written { (SPAN_FAIL_SET, SPAN_OUT_SET) } else { (SPAN_FAIL_CLEAR, SPAN_OUT_CLEAR) };
+        (self.0 & fail == 0).then_some(self.0 & out != 0)
+    }
+}
+
+/// A walk of [`X86Lifter::plain_walk`]: the addresses of `lift_range(start, count)`, kept as
+/// a checkpoint every few hundred bytes.
+pub struct PlainWalk<'f> {
+    facts: &'f InsnFacts,
+    /// `(address, index)` of instructions of the walk, increasing, the first one its start
+    checkpoints: Vec<(u64, u32)>,
+    len: usize,
 }
 
 const FACT_PAGE_BITS: u32 = 12;
@@ -388,10 +432,32 @@ impl InsnFacts {
             end = end.max(b.start.saturating_add(b.size));
         }
         if base >= end {
-            return Self { base: 0, end: 0, pages: Vec::new() };
+            return Self { base: 0, end: 0, pages: Vec::new(), spans: Vec::new() };
         }
         let n = ((end - 1) >> FACT_PAGE_BITS) as usize - (base >> FACT_PAGE_BITS) as usize + 1;
-        Self { base, end, pages: (0..n).map(|_| std::sync::OnceLock::new()).collect() }
+        Self {
+            base,
+            end,
+            pages: (0..n).map(|_| std::sync::OnceLock::new()).collect(),
+            spans: (0..n).map(|_| std::sync::OnceLock::new()).collect(),
+        }
+    }
+
+    /// The cells of the page `addr` is in, also past the table's end (a walk that entered the
+    /// page inside the table goes on in it).
+    fn page_unchecked(&self, addr: u64) -> Option<&[std::sync::atomic::AtomicU16]> {
+        let k = (addr >> FACT_PAGE_BITS).checked_sub(self.base >> FACT_PAGE_BITS)? as usize;
+        Some(self.pages.get(k)?.get()?)
+    }
+
+    /// The span cell of `addr`, `None` outside the table.
+    fn span_cell(&self, addr: u64) -> Option<&std::sync::atomic::AtomicU32> {
+        if addr < self.base || addr >= self.end {
+            return None;
+        }
+        let k = ((addr >> FACT_PAGE_BITS) - (self.base >> FACT_PAGE_BITS)) as usize;
+        let page = self.spans.get(k)?.get_or_init(|| (0..1usize << FACT_PAGE_BITS).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+        page.get((addr & ((1u64 << FACT_PAGE_BITS) - 1)) as usize)
     }
 
     /// The cells of the page `addr` is in (pages are aligned to their size), `None` outside
@@ -403,6 +469,50 @@ impl InsnFacts {
         let k = ((addr >> FACT_PAGE_BITS) - (self.base >> FACT_PAGE_BITS)) as usize;
         let page = self.pages.get(k)?.get_or_init(|| (0..1usize << FACT_PAGE_BITS).map(|_| std::sync::atomic::AtomicU16::new(0)).collect());
         Some(page)
+    }
+}
+
+impl PlainWalk<'_> {
+    /// How many instructions the walk has.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The walk's first address.
+    pub fn first(&self) -> Option<u64> {
+        (self.len > 0).then(|| self.checkpoints[0].0)
+    }
+
+    /// The position of the instruction at `addr` in the walk, if it is one of its.
+    pub fn index_of(&self, addr: u64) -> Option<usize> {
+        let k = self.checkpoints.partition_point(|&(a, _)| a <= addr).checked_sub(1)?;
+        let (mut at, i) = self.checkpoints[k];
+        let mut i = i as usize;
+        while i < self.len && at < addr {
+            at += u64::from(self.length(at)?);
+            i += 1;
+        }
+        (i < self.len && at == addr).then_some(i)
+    }
+
+    /// The walk's last address.
+    pub fn last(&self) -> Option<u64> {
+        let &(mut at, i) = self.checkpoints.last()?;
+        for _ in i as usize + 1..self.len {
+            at += u64::from(self.length(at)?);
+        }
+        (self.len > 0).then_some(at)
+    }
+
+    /// The length of the walked instruction at `addr` (its facts are known).
+    fn length(&self, addr: u64) -> Option<u16> {
+        let page = self.facts.page_unchecked(addr)?;
+        let f = page[(addr & ((1u64 << FACT_PAGE_BITS) - 1)) as usize].load(std::sync::atomic::Ordering::Relaxed);
+        (f & FACT_KNOWN != 0).then_some(f & 0xf)
     }
 }
 
@@ -456,6 +566,161 @@ impl X86Lifter {
     /// those addresses alone ([`Self::lift_alone`]: no x87 instruction, no integer PF needed),
     /// read from (and filling) `facts`; `None` when the range must be lifted as a whole or
     /// leaves the table.
+    /// The facts cell of the instruction at `addr` (filled when not known yet), `None` outside
+    /// the table.
+    fn fact<'m>(&self, memory: &'m Memory, addr: u64, facts: &InsnFacts, block: &mut Option<BlockDecoder<'m>>) -> Option<u16> {
+        let page = facts.page(addr)?;
+        Some(self.fill(memory, addr, &page[(addr & ((1u64 << FACT_PAGE_BITS) - 1)) as usize], block))
+    }
+
+    /// The facts of the instruction at `addr` from its `cell`, filled when not known yet.
+    fn fill<'m>(&self, memory: &'m Memory, addr: u64, cell: &std::sync::atomic::AtomicU16, block: &mut Option<BlockDecoder<'m>>) -> u16 {
+        use std::sync::atomic::Ordering;
+        let f = cell.load(Ordering::Relaxed);
+        if f & FACT_KNOWN != 0 {
+            return f;
+        }
+        let f = FACT_KNOWN | Self::facts_of(X86Lifter { is_64: self.is_64, parity: false }.decode_in_block(memory, addr, block).and_then(|insn| {
+            X86Lifter { is_64: self.is_64, parity: false }.lift_decoded(insn, addr, None)
+        }));
+        cell.store(f, Ordering::Relaxed);
+        f
+    }
+
+    /// The facts bits of an instruction lifted alone without the integer PF (without
+    /// [`FACT_KNOWN`]).
+    fn facts_of(lifted: Result<LiftedInstruction, LiftError>) -> u16 {
+        match lifted {
+            Ok(insn) => {
+                let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
+                let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+                let control = insn.ops.iter().any(|o| {
+                    matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Call | OpCode::CallInd | OpCode::Return)
+                });
+                let len = u16::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
+                len | if x87 { FACT_X87 } else { 0 }
+                    | if reads_outside_pf(&insn) { FACT_READS_PF } else { 0 }
+                    | if insn.ops.iter().any(|o| o.output.as_ref().is_some_and(pf)) { FACT_WRITES_PF } else { 0 }
+                    | if control || insn.ops.iter().any(|o| o.output.as_ref().is_some_and(flag)) { FACT_STOPS } else { 0 }
+            }
+            Err(_) => FACT_FAILED,
+        }
+    }
+
+    /// The span starting at `addr` (computed and kept when not known yet).
+    fn span<'m>(&self, memory: &'m Memory, addr: u64, facts: &InsnFacts, block: &mut Option<BlockDecoder<'m>>) -> Span {
+        use std::sync::atomic::Ordering;
+        let Some(cell) = facts.span_cell(addr) else { return Span(SPAN_KNOWN | SPAN_STOP) };
+        // (acquire / release: the facts of its instructions are known to whoever reads it)
+        let v = cell.load(Ordering::Acquire);
+        if v & SPAN_KNOWN != 0 {
+            return Span(v);
+        }
+        let boundary = (addr | (SPAN_BYTES - 1)) + 1;
+        let (mut at, mut n) = (addr, 0u32);
+        let mut stop = false;
+        // the PF state from each entry state, `None` once a read failed
+        let mut pf = [Some(false), Some(true)];
+        while at < boundary {
+            let Some(f) = self.fact(memory, at, facts, block) else {
+                stop = true;
+                break;
+            };
+            if f & (FACT_FAILED | FACT_X87) != 0 {
+                stop = true;
+                break;
+            }
+            for s in &mut pf {
+                if let Some(w) = *s {
+                    *s = if f & FACT_READS_PF != 0 && !w {
+                        None
+                    } else if f & FACT_WRITES_PF != 0 {
+                        Some(true)
+                    } else if f & FACT_STOPS != 0 {
+                        Some(false)
+                    } else {
+                        Some(w)
+                    };
+                }
+            }
+            n += 1;
+            at += u64::from(f & 0xf);
+        }
+        let mut v = SPAN_KNOWN | n | (u32::try_from(at - addr).expect("a span is short") << 9);
+        if stop {
+            v |= SPAN_STOP;
+        }
+        for (s, fail, out) in [(pf[0], SPAN_FAIL_CLEAR, SPAN_OUT_CLEAR), (pf[1], SPAN_FAIL_SET, SPAN_OUT_SET)] {
+            match s {
+                None => v |= fail,
+                Some(true) => v |= out,
+                Some(false) => {}
+            }
+        }
+        cell.store(v, Ordering::Release);
+        Span(v)
+    }
+
+    /// [`Self::plain_range`] as a [`PlainWalk`]: the same instructions (and `None` in the same
+    /// cases), stepping over the [`Span`]s other walks found instead of one instruction at a
+    /// time.
+    pub fn plain_walk<'f>(&self, memory: &Memory, start: u64, count: usize, facts: &'f InsnFacts) -> Option<PlainWalk<'f>> {
+        let mut block = None;
+        let check_pf = self.parity;
+        let mut pf_written = false;
+        let mut checkpoints = Vec::new();
+        let (mut addr, mut idx) = (start, 0usize);
+        // the page of cells `addr` is in, as `plain_range` keeps it: the table's bounds are
+        // checked where a walk enters a page
+        let mut page: &[std::sync::atomic::AtomicU16] = &[];
+        let mut page_base = 0u64;
+        while idx < count {
+            if addr.wrapping_sub(page_base) >= page.len() as u64 {
+                page = facts.page(addr)?;
+                page_base = addr & !((1u64 << FACT_PAGE_BITS) - 1);
+            }
+            checkpoints.push((addr, u32::try_from(idx).expect("walk index")));
+            let span = self.span(memory, addr, facts, &mut block);
+            if span.0 & SPAN_STOP == 0 && idx + span.count() <= count && span.count() > 0 {
+                if check_pf {
+                    pf_written = span.pf(pf_written)?;
+                }
+                idx += span.count();
+                addr += span.bytes();
+                continue;
+            }
+            // one instruction at a time, to the span's end (as `plain_range` steps)
+            let boundary = (addr | (SPAN_BYTES - 1)) + 1;
+            while idx < count && addr < boundary {
+                if addr.wrapping_sub(page_base) >= page.len() as u64 {
+                    page = facts.page(addr)?;
+                    page_base = addr & !((1u64 << FACT_PAGE_BITS) - 1);
+                }
+                let f = self.fill(memory, addr, &page[(addr - page_base) as usize], &mut block);
+                if f & FACT_FAILED != 0 {
+                    return Some(PlainWalk { facts, checkpoints, len: idx });
+                }
+                if f & FACT_X87 != 0 {
+                    return None;
+                }
+                if check_pf {
+                    if f & FACT_READS_PF != 0 && !pf_written {
+                        return None;
+                    }
+                    if f & FACT_WRITES_PF != 0 {
+                        pf_written = true;
+                    } else if f & FACT_STOPS != 0 {
+                        pf_written = false;
+                    }
+                }
+                idx += 1;
+                addr += u64::from(f & 0xf);
+            }
+        }
+        Some(PlainWalk { facts, checkpoints, len: idx })
+    }
+
     pub fn plain_range(&self, memory: &Memory, start: u64, count: usize, facts: &InsnFacts) -> Option<Vec<u64>> {
         use std::sync::atomic::Ordering;
         let fast = X86Lifter { is_64: self.is_64, parity: false };
@@ -4429,6 +4694,52 @@ mod tests {
             assert_eq!(lifter.plain_range(&mem, 0x1000, 7, &facts).is_none(), lifter.parity);
             // x87 code is
             assert!(lifter.plain_range(&mem, 0x1000 + 0x11, 3, &facts).is_none());
+        }
+    }
+
+    /// `plain_walk` steps over spans other walks found and still answers as `plain_range`:
+    /// the same instructions, `None` in the same cases (integer PF readers, x87 code, the end
+    /// of the code), whichever walks ran before.
+    #[test]
+    fn plain_walk_equals_plain_range() {
+        let pieces: [&[u8]; 6] = [
+            &[0x48, 0x89, 0xc3],                   // mov rbx, rax
+            &[0x83, 0xf8, 0x00, 0x7a, 0x00],       // cmp eax, 0 ; jp +0 (reads the PF it wrote)
+            &[0x01, 0xd8],                         // add eax, ebx
+            &[0x48, 0x83, 0xc4, 0x08],             // add rsp, 8
+            &[0x0f, 0x2e, 0xc1, 0x7a, 0x00],       // ucomiss xmm0, xmm1 ; jp +0
+            &[0x90],                               // nop
+        ];
+        let mut code = Vec::new();
+        let mut k = 7usize;
+        while code.len() < 1400 {
+            k = (k * 31 + 11) % 97;
+            code.extend_from_slice(pieces[k % pieces.len()]);
+            if code.len() > 900 && code.len() < 920 {
+                code.extend_from_slice(&[0x7a, 0x00]); // jp +0 (reads a PF not written: give up)
+            }
+            if code.len() > 1100 && code.len() < 1110 {
+                code.extend_from_slice(&[0xd9, 0x07]); // fld dword [rdi] (x87: give up)
+            }
+        }
+        let mem = make_memory(&code, 0x1000);
+        for lifter in [X86Lifter::new_64(), X86Lifter::new_64().without_parity()] {
+            let (facts, walk_facts) = (InsnFacts::new(&mem), InsnFacts::new(&mem));
+            for start in (0..code.len() as u64).rev().step_by(7).chain(0..40) {
+                for count in [1, 5, 60, 200, 3000] {
+                    let a = 0x1000 + start;
+                    let range = lifter.plain_range(&mem, a, count, &facts);
+                    let walk = lifter.plain_walk(&mem, a, count, &walk_facts);
+                    assert_eq!(range.is_some(), walk.is_some(), "start +{start:#x} count {count}");
+                    let (Some(range), Some(walk)) = (range, walk) else { continue };
+                    assert_eq!(walk.len(), range.len(), "start +{start:#x} count {count}");
+                    assert_eq!(walk.first(), range.first().copied());
+                    assert_eq!(walk.last(), range.last().copied());
+                    for b in a.saturating_sub(2)..range.last().map_or(a, |l| l + 3) {
+                        assert_eq!(walk.index_of(b), range.binary_search(&b).ok(), "start +{start:#x} count {count} at {b:#x}");
+                    }
+                }
+            }
         }
     }
 
