@@ -1669,10 +1669,18 @@ fn analyze_binary(path: &Path) -> Result<Program, Box<dyn std::error::Error>> {
 /// `verbose` prints the per-analyzer lines (or the cache notice) and the
 /// override summary on stderr.
 fn analyze_program(path: &Path, verbose: bool, cache_use: CacheUse) -> Result<Program, Box<dyn std::error::Error>> {
-    let mut program = Program::from_binary(path)?;
     let entry = cache::entry_for(path);
-    let hit = cache_use == CacheUse::ReadWrite
-        && entry.as_ref().is_some_and(|e| cache::load(e, &mut program));
+    // The cached results do not depend on the loaded binary: read them
+    // while it loads.
+    let (program, cached) = rayon::join(
+        || Program::from_binary(path),
+        || entry.as_ref().filter(|_| cache_use == CacheUse::ReadWrite).and_then(cache::read),
+    );
+    let mut program = program?;
+    let hit = cached.is_some();
+    if let Some(state) = cached {
+        program.restore_analysis_state(state);
+    }
     if hit {
         if verbose && let Some(e) = &entry {
             eprintln!(

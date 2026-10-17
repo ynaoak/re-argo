@@ -842,38 +842,29 @@ fn decode_state(file: &File, sections: &[Section]) -> Option<AnalysisState> {
     })
 }
 
-/// Read the stored results for `entry` into `program` (a fresh
-/// `Program::from_binary` of the binary). `false` — and `program`
-/// untouched — when there is no valid entry for this key.
-pub fn load(entry: &Entry, program: &mut Program) -> bool {
-    let Ok(mut file) = File::open(&entry.file) else {
-        return false;
-    };
-    let Some(len) = file.metadata().ok().map(|m| m.len()) else {
-        return false;
-    };
-    let Some(header) = read_header(&mut file, len) else {
-        return false;
-    };
+/// The stored results for `entry`, to put into a fresh
+/// `Program::from_binary` of the binary with
+/// [`Program::restore_analysis_state`] (independent of it: read while
+/// the binary loads). `None` when there is no valid entry for this key.
+pub fn read(entry: &Entry) -> Option<AnalysisState> {
+    let mut file = File::open(&entry.file).ok()?;
+    let len = file.metadata().ok()?.len();
+    let header = read_header(&mut file, len)?;
     let pre_hit = entry.pre.as_ref().is_some_and(|p| p.key == header.prekey);
     if !pre_hit {
-        match entry.full_key() {
-            Some(full) if full.key == header.key => {
-                if full.pre_trusted
-                    && let Some(pre) = &entry.pre
-                {
-                    write_prekey(&entry.file, &pre.key);
-                }
-            }
-            _ => return false,
+        let full = entry.full_key()?;
+        if full.key != header.key {
+            return None;
+        }
+        if full.pre_trusted
+            && let Some(pre) = &entry.pre
+        {
+            write_prekey(&entry.file, &pre.key);
         }
     }
-    let Some(state) = decode_state(&file, &header.sections) else {
-        return false;
-    };
-    program.restore_analysis_state(state);
+    let state = decode_state(&file, &header.sections)?;
     touch(&entry.file);
-    true
+    Some(state)
 }
 
 /// Store `key` as the pre-key of the cache file `path` (best effort).
