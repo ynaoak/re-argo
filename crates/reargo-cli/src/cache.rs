@@ -60,6 +60,7 @@
 //!   (a write failure is a warning on stderr).
 
 use std::collections::{BTreeMap, HashMap};
+use std::mem::MaybeUninit;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -98,13 +99,13 @@ const EXT: &str = "rac";
 
 const MAGIC: &[u8; 16] = b"REARGO-ANACACHE\0";
 // Header layout: magic | format u32 | key [32] | pre-key [32] |
-// section count u32 | per section (kind u32, raw length u64, stored
-// length u64) | BLAKE3 of all of it but the pre-key.
+// section count u32 | per section (kind u32, entries u64, raw length
+// u64, stored length u64) | BLAKE3 of all of it but the pre-key.
 const KEY_AT: usize = 20;
 const PREKEY_AT: usize = 52;
 const COUNT_AT: usize = 84;
 const TABLE_AT: usize = 88;
-const TABLE_ENTRY: usize = 4 + 8 + 8;
+const TABLE_ENTRY: usize = 4 + 8 + 8 + 8;
 const MAX_SECTIONS: usize = 1 << 20;
 /// No section decompresses to more than this (a sanity bound on the
 /// allocation a damaged table could ask for).
@@ -379,11 +380,13 @@ fn derive_key(
     Ok(())
 }
 
-/// One stored section: what it holds, its decoded length, and where its
-/// zstd frame is.
+/// One stored section: what it holds (its kind, and how many map entries
+/// for a chunk of a map), its decoded length, and where its zstd frame
+/// is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Section {
     kind: u32,
+    items: u64,
     raw_len: u64,
     offset: u64,
     stored_len: u64,
@@ -427,12 +430,14 @@ fn read_header(r: &mut impl Read, file_len: u64) -> Option<Header> {
     let mut sections = Vec::with_capacity(count);
     for e in body[TABLE_AT..].chunks_exact(TABLE_ENTRY) {
         let kind = u32::from_le_bytes(e[..4].try_into().ok()?);
-        let raw_len = u64::from_le_bytes(e[4..12].try_into().ok()?);
-        let stored_len = u64::from_le_bytes(e[12..20].try_into().ok()?);
-        if raw_len > MAX_RAW || stored_len > file_len {
+        let items = u64::from_le_bytes(e[4..12].try_into().ok()?);
+        let raw_len = u64::from_le_bytes(e[12..20].try_into().ok()?);
+        let stored_len = u64::from_le_bytes(e[20..28].try_into().ok()?);
+        // Every entry takes at least a byte.
+        if raw_len > MAX_RAW || stored_len > file_len || items > raw_len {
             return None;
         }
-        sections.push(Section { kind, raw_len, offset, stored_len });
+        sections.push(Section { kind, items, raw_len, offset, stored_len });
         offset = offset.checked_add(stored_len)?;
     }
     if offset != file_len {
@@ -496,6 +501,8 @@ struct Misc {
 /// zigzag-varint deltas (an instruction from the end of the one before,
 /// a reference's ends from its map key), enums as one byte.
 mod packed {
+    use std::mem::MaybeUninit;
+
     use reargo_arch::{DecodedInstruction, FlowType};
     use reargo_program::reference::RefList;
     use reargo_program::{RefType, Reference};
@@ -660,12 +667,15 @@ mod packed {
         w.0
     }
 
-    pub fn decode_insns(raw: &[u8]) -> Option<Vec<(u64, Box<DecodedInstruction>)>> {
+    /// Decode a chunk of exactly `out.len()` instructions into `out`
+    /// (`Some` only when every element was written).
+    pub fn decode_insns(raw: &[u8], out: &mut [MaybeUninit<(u64, Box<DecodedInstruction>)>]) -> Option<()> {
         let mut r = Reader::new(raw);
-        let n = r.count(8)?;
-        let mut out = Vec::with_capacity(n);
+        if r.varint()? != out.len() as u64 {
+            return None;
+        }
         let mut prev_end = 0u64;
-        for _ in 0..n {
+        for slot in out.iter_mut() {
             let key = r.delta(prev_end)?;
             let address = r.delta(key)?;
             let length = u32::try_from(r.varint()?).ok()?;
@@ -683,10 +693,10 @@ mod packed {
                 _ => return None,
             };
             let insn = DecodedInstruction::from_cache_parts(address, length, bytes, flow, branch, lazy, text);
-            out.push((key, Box::new(insn)));
+            slot.write((key, Box::new(insn)));
             prev_end = address.wrapping_add(u64::from(length));
         }
-        r.at_end().then_some(out)
+        r.at_end().then_some(())
     }
 
     /// A references map (from / to), in key order.
@@ -707,12 +717,15 @@ mod packed {
         w.0
     }
 
-    pub fn decode_refs(raw: &[u8]) -> Option<Vec<(u64, RefList)>> {
+    /// Decode a chunk of exactly `out.len()` map entries into `out`
+    /// (`Some` only when every element was written).
+    pub fn decode_refs(raw: &[u8], out: &mut [MaybeUninit<(u64, RefList)>]) -> Option<()> {
         let mut r = Reader::new(raw);
-        let n = r.count(2)?;
-        let mut out = Vec::with_capacity(n);
+        if r.varint()? != out.len() as u64 {
+            return None;
+        }
         let mut prev = 0u64;
-        for _ in 0..n {
+        for slot in out.iter_mut() {
             let key = r.delta(prev)?;
             let m = r.count(3)?;
             let mut list = RefList::with_capacity(m);
@@ -722,10 +735,10 @@ mod packed {
                 let ref_type = *REF_TYPES.get(usize::from(r.u8()?))?;
                 list.push(Reference { from, to, ref_type });
             }
-            out.push((key, list));
+            slot.write((key, list));
             prev = key;
         }
-        r.at_end().then_some(out)
+        r.at_end().then_some(())
     }
 }
 
@@ -770,7 +783,10 @@ fn decode_as<T: serde::de::DeserializeOwned>(file: &File, s: &Section) -> Option
 /// The entries of the sections `of` kind, chunk by chunk (decoded in
 /// parallel).
 fn decode_chunks<T: serde::de::DeserializeOwned + Send>(file: &File, of: &[Section]) -> Option<Vec<Vec<T>>> {
-    of.par_iter().with_max_len(1).map(|s| decode_as::<Vec<T>>(file, s)).collect()
+    of.par_iter()
+        .with_max_len(1)
+        .map(|s| decode_as::<Vec<T>>(file, s).filter(|v| v.len() as u64 == s.items))
+        .collect()
 }
 
 /// The map stored in the sections `of` kind (stored in key order, so
@@ -783,15 +799,39 @@ where
     sorted_map(decode_chunks::<(K, V)>(file, of)?)
 }
 
-/// As [`decode_map`], for a map in a [`packed`] encoding.
+/// As [`decode_map`], for a map in a [`packed`] encoding: the chunks are
+/// decoded in parallel straight into their places in one vector of all
+/// the entries (each chunk's entry count is in the section table).
 fn decode_packed_map<K: Ord + Send, V: Send>(
     file: &File,
     of: &[Section],
-    decode: fn(&[u8]) -> Option<Vec<(K, V)>>,
+    decode: fn(&[u8], &mut [MaybeUninit<(K, V)>]) -> Option<()>,
 ) -> Option<BTreeMap<K, V>> {
-    let chunks: Option<Vec<Vec<(K, V)>>> =
-        of.par_iter().with_max_len(1).map(|s| decode_section(file, s, decode)).collect();
-    sorted_map(chunks?)
+    let counts: Vec<usize> = of.iter().map(|s| usize::try_from(s.items).ok()).collect::<Option<_>>()?;
+    let total = counts.iter().try_fold(0usize, |a, &n| a.checked_add(n))?;
+    let mut all: Vec<(K, V)> = Vec::with_capacity(total);
+    let mut slots = Vec::with_capacity(of.len());
+    let mut rest = &mut all.spare_capacity_mut()[..total];
+    for &n in &counts {
+        let (slot, tail) = rest.split_at_mut(n);
+        slots.push(slot);
+        rest = tail;
+    }
+    let decoded = of
+        .par_iter()
+        .zip(slots.into_par_iter())
+        .with_max_len(1)
+        .all(|(s, slot)| decode_section(file, s, |raw| decode(raw, slot)).is_some());
+    if !decoded {
+        // The entries already decoded are leaked, not dropped: a damaged
+        // cache file is rare, and the process goes on uncached.
+        return None;
+    }
+    // SAFETY: the slots partition the first `total` elements of the
+    // spare capacity, and each was fully written: a decoder returns
+    // `Some` only after writing every element of its slot.
+    unsafe { all.set_len(total) };
+    Some(all.into_iter().collect())
 }
 
 fn sorted_map<K: Ord, V>(chunks: Vec<Vec<(K, V)>>) -> Option<BTreeMap<K, V>> {
@@ -943,8 +983,17 @@ fn evict(dir: &Path, keep: &Path, cap: u64) -> usize {
     removed
 }
 
-/// An encoder of one section.
-type Job<'a> = (u32, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync + 'a>);
+/// An encoder of one section: its kind, its number of entries, the
+/// encoder.
+type Job<'a> = (u32, usize, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync + 'a>);
+
+/// An encoded, compressed section.
+struct Stored {
+    kind: u32,
+    items: u64,
+    raw_len: u64,
+    bytes: Vec<u8>,
+}
 
 fn encode<T: Serialize + ?Sized>(v: &T) -> Result<Vec<u8>, String> {
     codec().serialize(v).map_err(|e| format!("encode: {e}"))
@@ -953,14 +1002,14 @@ fn encode<T: Serialize + ?Sized>(v: &T) -> Result<Vec<u8>, String> {
 /// One section per [`CHUNK`] entries of `items`.
 fn chunk_jobs<'a, T: Serialize + Sync>(jobs: &mut Vec<Job<'a>>, kind: u32, items: &'a [T]) {
     for c in items.chunks(CHUNK) {
-        jobs.push((kind, Box::new(move || encode(c))));
+        jobs.push((kind, c.len(), Box::new(move || encode(c))));
     }
 }
 
 /// As [`chunk_jobs`], in a [`packed`] encoding.
 fn packed_jobs<'a, T: Sync>(jobs: &mut Vec<Job<'a>>, kind: u32, items: &'a [T], encode: fn(&[T]) -> Vec<u8>) {
     for c in items.chunks(CHUNK) {
-        jobs.push((kind, Box::new(move || Ok(encode(c)))));
+        jobs.push((kind, c.len(), Box::new(move || Ok(encode(c)))));
     }
 }
 
@@ -971,19 +1020,19 @@ fn compress(raw: &[u8]) -> Result<Vec<u8>, String> {
     c.compress(raw).map_err(err)
 }
 
-/// The cache file's bytes: the header, then each `(kind, raw length,
-/// stored bytes)` section.
-fn file_header(key: &[u8; 32], prekey: &[u8; 32], sections: &[(u32, u64, Vec<u8>)]) -> Vec<u8> {
+/// The header of a cache file of `sections`.
+fn file_header(key: &[u8; 32], prekey: &[u8; 32], sections: &[Stored]) -> Vec<u8> {
     let mut head = Vec::with_capacity(header_len(sections.len()));
     head.extend_from_slice(MAGIC);
     head.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
     head.extend_from_slice(key);
     head.extend_from_slice(prekey);
     head.extend_from_slice(&(sections.len() as u32).to_le_bytes());
-    for (kind, raw_len, stored) in sections {
-        head.extend_from_slice(&kind.to_le_bytes());
-        head.extend_from_slice(&raw_len.to_le_bytes());
-        head.extend_from_slice(&(stored.len() as u64).to_le_bytes());
+    for s in sections {
+        head.extend_from_slice(&s.kind.to_le_bytes());
+        head.extend_from_slice(&s.items.to_le_bytes());
+        head.extend_from_slice(&s.raw_len.to_le_bytes());
+        head.extend_from_slice(&(s.bytes.len() as u64).to_le_bytes());
     }
     let hash = header_hash(&head);
     head.extend_from_slice(hash.as_bytes());
@@ -1030,14 +1079,14 @@ pub fn store(entry: &Entry, program: &Program) -> Result<(), String> {
     packed_jobs(&mut jobs, K_REFS_TO, &refs_to, packed::encode_refs);
     chunk_jobs(&mut jobs, K_COMMENTS, &comments);
     chunk_jobs(&mut jobs, K_TAGS_ADDR, &tags_addr);
-    jobs.push((K_MISC, Box::new(|| encode(&misc))));
+    jobs.push((K_MISC, 1, Box::new(|| encode(&misc))));
 
-    let sections: Vec<(u32, u64, Vec<u8>)> = jobs
+    let sections: Vec<Stored> = jobs
         .par_iter()
         .with_max_len(1)
-        .map(|(kind, job)| {
+        .map(|(kind, items, job)| {
             let raw = job()?;
-            Ok((*kind, raw.len() as u64, compress(&raw)?))
+            Ok(Stored { kind: *kind, items: *items as u64, raw_len: raw.len() as u64, bytes: compress(&raw)? })
         })
         .collect::<Result<_, String>>()?;
     let head = file_header(&full.key, &prekey, &sections);
@@ -1047,8 +1096,8 @@ pub fn store(entry: &Entry, program: &Program) -> Result<(), String> {
     let tmp = entry.file.with_extension(format!("tmp.{}", std::process::id()));
     let written = File::create(&tmp).and_then(|mut f| {
         f.write_all(&head)?;
-        for (_, _, stored) in &sections {
-            f.write_all(stored)?;
+        for s in &sections {
+            f.write_all(&s.bytes)?;
         }
         Ok(())
     });
@@ -1071,11 +1120,14 @@ mod tests {
     #[test]
     fn header_rejects_damaged_files() {
         let key = [7u8; 32];
-        let sections = vec![(K_INSNS, 10u64, vec![1u8; 5]), (K_MISC, 3u64, vec![2u8; 4])];
+        let sections = vec![
+            Stored { kind: K_INSNS, items: 2, raw_len: 10, bytes: vec![1u8; 5] },
+            Stored { kind: K_MISC, items: 1, raw_len: 3, bytes: vec![2u8; 4] },
+        ];
         let mut f = file_header(&key, &[9u8; 32], &sections);
         let head_len = f.len();
-        for (_, _, s) in &sections {
-            f.extend_from_slice(s);
+        for s in &sections {
+            f.extend_from_slice(&s.bytes);
         }
         let read = |b: &[u8]| read_header(&mut &b[..], b.len() as u64);
         let h = read(&f).expect("intact header");
@@ -1084,8 +1136,8 @@ mod tests {
         assert_eq!(
             h.sections,
             vec![
-                Section { kind: K_INSNS, raw_len: 10, offset: head_len as u64, stored_len: 5 },
-                Section { kind: K_MISC, raw_len: 3, offset: head_len as u64 + 5, stored_len: 4 },
+                Section { kind: K_INSNS, items: 2, raw_len: 10, offset: head_len as u64, stored_len: 5 },
+                Section { kind: K_MISC, items: 1, raw_len: 3, offset: head_len as u64 + 5, stored_len: 4 },
             ]
         );
         // The pre-key is rewritten in place: not covered by the hash.
@@ -1115,7 +1167,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("s.bin");
-        let section = Section { kind: K_COMMENTS, raw_len: raw.len() as u64, offset: 0, stored_len: stored.len() as u64 };
+        let section =
+            Section { kind: K_COMMENTS, items: 2, raw_len: raw.len() as u64, offset: 0, stored_len: stored.len() as u64 };
         let decode = |bytes: &[u8], s: &Section| {
             std::fs::write(&p, bytes).unwrap();
             decode_as::<Vec<((u64, CommentType), String)>>(&File::open(&p).unwrap(), s)
@@ -1164,17 +1217,29 @@ mod tests {
         ];
         let borrowed: Vec<(&u64, &Box<DecodedInstruction>)> = insns.iter().map(|(k, v)| (k, v)).collect();
         let raw = packed::encode_insns(&borrowed);
-        let back = packed::decode_insns(&raw).expect("decodes");
+        fn into_vec<T>(
+            raw: &[u8],
+            n: usize,
+            decode: fn(&[u8], &mut [MaybeUninit<T>]) -> Option<()>,
+        ) -> Option<Vec<T>> {
+            let mut v = Vec::with_capacity(n);
+            decode(raw, &mut v.spare_capacity_mut()[..n])?;
+            // SAFETY: `decode` wrote all `n` elements.
+            unsafe { v.set_len(n) };
+            Some(v)
+        }
+        let back = into_vec(&raw, insns.len(), packed::decode_insns).expect("decodes");
         assert_eq!(back.len(), insns.len());
         for ((k, a), (k2, b)) in insns.iter().zip(&back) {
             assert_eq!(k, k2);
             assert_eq!(format!("{a:?}"), format!("{b:?}"));
             assert_eq!(a.cache_text(), b.cache_text());
         }
-        assert!(packed::decode_insns(&raw[..raw.len() - 1]).is_none(), "truncated");
+        assert!(into_vec(&raw[..raw.len() - 1], 3, packed::decode_insns).is_none(), "truncated");
         let mut longer = raw.clone();
         longer.push(0);
-        assert!(packed::decode_insns(&longer).is_none(), "trailing bytes");
+        assert!(into_vec(&longer, 3, packed::decode_insns).is_none(), "trailing bytes");
+        assert!(into_vec(&raw, 2, packed::decode_insns).is_none(), "another count");
 
         let r = |from, to, t| reargo_program::Reference::new(from, to, t);
         let refs: Vec<(u64, RefList)> = vec![
@@ -1184,13 +1249,13 @@ mod tests {
         ];
         let borrowed: Vec<(&u64, &RefList)> = refs.iter().map(|(k, v)| (k, v)).collect();
         let raw = packed::encode_refs(&borrowed);
-        let back = packed::decode_refs(&raw).expect("decodes");
+        let back = into_vec(&raw, refs.len(), packed::decode_refs).expect("decodes");
         assert_eq!(format!("{refs:?}"), format!("{back:?}"));
-        assert!(packed::decode_refs(&raw[..raw.len() - 1]).is_none());
+        assert!(into_vec(&raw[..raw.len() - 1], 3, packed::decode_refs).is_none());
         let mut bad = raw.clone();
         let type_at = raw.iter().rposition(|&b| b == 8).unwrap(); // DataReadWrite
         bad[type_at] = 10; // no such reference type
-        assert!(packed::decode_refs(&bad).is_none());
+        assert!(into_vec(&bad, 3, packed::decode_refs).is_none());
     }
 
     fn cache_file(dir: &Path, name: &str, size: usize, mtime_secs: u64) -> PathBuf {

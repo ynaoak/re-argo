@@ -245,10 +245,10 @@ fn analyze_always_runs_the_pipeline_and_no_cache_env_bypasses() {
 }
 
 /// Offset of the first section in a cache file: magic 16 + format 4 +
-/// key 32 + pre-key 32 + section count 4, 20 bytes per section, BLAKE3 32.
+/// key 32 + pre-key 32 + section count 4, 28 bytes per section, BLAKE3 32.
 fn header_len(file: &[u8]) -> usize {
     let count = u32::from_le_bytes(file[84..88].try_into().unwrap()) as usize;
-    88 + 20 * count + 32
+    88 + 28 * count + 32
 }
 
 fn cache_files(cache: &Path) -> Vec<PathBuf> {
