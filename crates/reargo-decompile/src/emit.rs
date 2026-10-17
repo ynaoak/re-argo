@@ -2587,17 +2587,18 @@ pub(crate) fn small_hex(k: u64) -> String {
 mod tests {
     use super::*;
 
-    /// WS90: an integer cast covering the whole text, and the widening casts below an unsigned
-    /// one dropped (each dropped cast is the identity on the value it gets).
+    /// The names built by hand are those `format!` gives.
     #[test]
     fn names_match_the_formatting_machinery() {
         for v in [0u64, 1, 9, 10, 15, 16, 255, 0x1000, 0xdead_beef, u64::MAX, 1 << 63, 0x0123_4567_89ab_cdef] {
             assert_eq!(name_hex("tmp_", v), format!("tmp_{v:x}"));
-            assert_eq!(name_num("old_", v), cat!("old_", v));
-            assert_eq!(name_num_suffix("r", v, "d"), cat!("r", v, "d"));
+            assert_eq!(name_num("old_", v), format!("old_{v}"));
+            assert_eq!(name_num_suffix("r", v, "d"), format!("r{v}d"));
         }
     }
 
+    /// WS90: an integer cast covering the whole text, and the widening casts below an unsigned
+    /// one dropped (each dropped cast is the identity on the value it gets).
     #[test]
     fn integer_cast_chains() {
         assert_eq!(int_cast("(uint8_t)x"), Some((1, false, "x")));
