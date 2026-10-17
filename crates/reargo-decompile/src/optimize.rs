@@ -304,6 +304,8 @@ fn is_side_effecting(op: OpCode) -> bool {
 /// observable behaviour (set of dead ops, count returned) is
 /// identical to the fixpoint version.
 pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
+    // (the definitions left out would be removed here: no longer writes of their slots)
+    func.phantom_writes.clear();
     let n = func.ops.len();
     let candidate = |o: &crate::ssa::SsaOp| !o.dead && o.output.is_some() && !is_side_effecting(o.opcode);
     // The queue starts with every candidate in index order and takes the defining ops of a
@@ -568,21 +570,39 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
     // slot (0 when none). Asked only of the slots of the duplicates found: each one's writers
     // are scanned forward as the loop goes (`(scanned up to, version)`). (An op before `i`
     // keeps its dead flag from here on: only the op visited dies.)
-    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32)> = Default::default();
-    let version_before = |func: &SsaFunction, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32)>, slot: (u32, u64, u32), i: usize| {
-        let e = latest.entry(slot).or_insert((0, 0));
-        for op in &func.ops[e.0.min(i)..i] {
+    // (`(scanned up to, version, its position)`; the definitions left out by the pipeline
+    // write their slots too, at their positions: `SsaFunction::phantom_writes`)
+    let mut latest: rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32, usize)> = Default::default();
+    let mut phantom_writes: rustc_hash::FxHashMap<(u32, u64, u32), Vec<(usize, u32)>> = Default::default();
+    for (p, slot, v) in std::mem::take(&mut func.phantom_writes) {
+        phantom_writes.entry(slot).or_default().push((p, v));
+    }
+    // (the positions of the writes left out of `slot` in `(lo, hi)`)
+    let phantom_between = |slot: &(u32, u64, u32), lo: usize, hi: usize| {
+        phantom_writes.get(slot).is_some_and(|w| {
+            let k = w.partition_point(|&(p, _)| p <= lo);
+            w.get(k).is_some_and(|&(p, _)| p < hi)
+        })
+    };
+    let version_before = |func: &SsaFunction, latest: &mut rustc_hash::FxHashMap<(u32, u64, u32), (usize, u32, usize)>, slot: (u32, u64, u32), i: usize| {
+        let e = latest.entry(slot).or_insert((0, 0, 0));
+        for (k, op) in func.ops[e.0.min(i)..i].iter().enumerate() {
             if let Some(o) = op.output
                 && !op.dead
             {
                 let vn = &func.varnodes[o as usize];
                 if (vn.data.space.0, vn.data.offset, vn.data.size) == slot {
                     e.1 = vn.version;
+                    e.2 = 4 * (e.0.min(i) + k) + 2;
                 }
             }
         }
         e.0 = e.0.max(i);
-        e.1
+        // the last write left out before op `i`, when after the last op writing the slot
+        match phantom_writes.get(&slot).and_then(|w| w[..w.partition_point(|&(p, _)| p < 4 * i + 2)].last()) {
+            Some(&(p, v)) if p > e.2 => v,
+            _ => e.1,
+        }
     };
     // WS84: ... and still holds it at every reader of the removed value, not only where the
     // duplicate is (`rax = rdi + 12; rbx = rdi + 12; rax = 5; rcx = rbx + 1` read `rax` for
@@ -611,6 +631,9 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
                 *writers.entry((d.space.0, d.offset, d.size)).or_default() += 1;
             }
         }
+        for (slot, w) in &phantom_writes {
+            *writers.entry(*slot).or_default() += w.len() as u32;
+        }
         (readers, writers)
     };
     let mut maps: Option<(Readers, Writers)> = None;
@@ -634,7 +657,7 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
                     return true;
                 }
                 if ro.block == func.ops[i].block && r > i {
-                    !func.ops[i + 1..r].iter().any(writes_slot)
+                    !func.ops[i + 1..r].iter().any(writes_slot) && !phantom_between(&slot, 4 * i + 2, 4 * r + 2)
                 } else {
                     writers.get(&slot).copied().unwrap_or(0) <= 1
                 }
@@ -931,7 +954,10 @@ enum ArgValue {
 /// Classify the value `v` an argument register holds at a call; `None` when it
 /// holds nothing a callee could use (a call's clobber).
 fn arg_value(func: &SsaFunction, v: crate::ssa::VarId, depth: u32) -> Option<ArgValue> {
-    let Some(d) = func.varnodes[v as usize].def_op else { return Some(ArgValue::Incoming) };
+    let Some(d) = func.varnodes[v as usize].def_op else {
+        // (a call's clobber left out holds nothing either)
+        return func.is_incoming(&func.varnodes[v as usize]).then_some(ArgValue::Incoming);
+    };
     let op = &func.ops[d];
     if op.opcode == OpCode::Indirect {
         let ins: Vec<_> = op.inputs.iter().map(|&i| func.varnodes[i as usize].data).collect();

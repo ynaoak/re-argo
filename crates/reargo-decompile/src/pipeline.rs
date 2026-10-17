@@ -763,9 +763,18 @@ fn apply_call_convention(
     let Some(cc) = lifter.call_convention() else {
         return (instructions, 0, crate::ssa::PhantomDefs::default());
     };
-    let mut phantoms = crate::ssa::PhantomDefs { regs: cc.args.iter().take(32).copied().collect(), ..Default::default() };
-    // (the bit in `phantoms.regs` of each clobber that is an argument)
-    let phantom_bit: Vec<u32> = cc.clobbers.iter().map(|(full, _)| phantoms.regs.iter().position(|a| a == full).map_or(0, |i| 1 << i)).collect();
+    // (every clobber and its views, in order: the bits of `phantoms.at`; the SSA numbers the
+    // versions of those the code reads or writes)
+    let mut phantoms = crate::ssa::PhantomDefs::default();
+    // (the bit in `phantoms.regs` of each clobber's full register; its views follow it)
+    let mut phantom_bit: Vec<u32> = Vec::with_capacity(cc.clobbers.len());
+    for (full, views) in &cc.clobbers {
+        phantom_bit.push(phantoms.regs.len() as u32);
+        phantoms.regs.push(*full);
+        phantoms.regs.extend(views.iter().map(|&sz| VarnodeData::new(full.space, full.offset, sz)));
+    }
+    let numbered = phantoms.regs.len() <= 128;
+    let phantom_of = |j: usize, k: usize| 1u128 << (phantom_bit[j] as usize + k);
     // WS77: a `ret` lifts to `RETURN(target)` — the popped return address, not the value. Give
     // it the convention's return registers (`rax`, then `xmm0`) as further inputs so the value
     // reaching the `ret` is live and the emitter can print it (`emit::return_value`);
@@ -778,7 +787,7 @@ fn apply_call_convention(
         }
     }
     // the clobbers each call defines (`live_clobbers`)
-    let needed = live_clobbers(&instructions, &cc);
+    let needed = if numbered { live_clobbers(&instructions, &cc) } else { vec![(u128::MAX, u128::MAX); instructions.len()] };
     let mut omitted = 0usize;
     for (k, insn) in instructions.iter_mut().enumerate() {
         let Some(pos) = insn
@@ -788,8 +797,17 @@ fn apply_call_convention(
         else {
             continue;
         };
-        let need = needed[k];
-        let mut phantom_mask = 0u32;
+        let mut need = needed[k];
+        // (the clobber of the register holding the target is read by the definitions after it,
+        // which read the target: made, with its views)
+        if let Some(t) = insn.ops[pos].inputs.first()
+            && t.space == reargo_core::address::SpaceId::REGISTER
+            && let Some(j) = cc.clobbers.iter().position(|(full, _)| full.offset == t.offset)
+        {
+            need.0 |= 1u128 << j;
+            need.1 |= 1u128 << j;
+        }
+        let mut phantom_mask = 0u128;
         let insn_addr = insn.address;
         // WS89: the lifter found the callee returning a `long double` (the code after the call
         // pops it): `INDIRECT(target)` of an x87 slot after the call; rax / xmm0 are clobbered
@@ -832,10 +850,12 @@ fn apply_call_convention(
                 let with_full = need.0 & (1u128 << j) != 0;
                 let views: &[u32] = if with_full && need.1 & (1u128 << j) != 0 { all_views } else { &[] };
                 omitted += usize::from(!with_full) + all_views.len() - views.len();
-                // (only an argument register has versions to number: nothing else reads one
-                // the code does not touch)
+                // (the definitions left out, numbered by the SSA)
                 if !with_full {
-                    phantom_mask |= phantom_bit[j];
+                    phantom_mask |= phantom_of(j, 0);
+                }
+                for k in views.len()..all_views.len() {
+                    phantom_mask |= phantom_of(j, k + 1);
                 }
                 with_full.then_some(((full, views), true))
             }));
@@ -915,7 +935,6 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         }
         bit_of.get(&(v.offset, v.size)).map_or(0, |&b| 1u128 << b)
     };
-    let args: u128 = cc.args.iter().fold(0, |a, v| a | bit(v));
     // (gen, kill) of ops in reverse order, starting from `(g, k)`
     let transfer = |ops: &[reargo_core::pcode::PcodeOp], (mut g, mut k): (u128, u128)| {
         for op in ops.iter().rev() {
@@ -938,10 +957,6 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         .iter()
         .flat_map(|i| i.ops.iter())
         .fold(0u128, |a, o| o.inputs.iter().chain(o.output.as_ref()).fold(a, |a, v| a | bit(v)));
-    let kept: u128 = group.iter().enumerate().fold(0, |a, (j, &m)| if m & touched != 0 { a | (1u128 << j) } else { a });
-    if group.iter().all(|&m| m & touched != 0) {
-        return vec![(u128::MAX, u128::MAX); n];
-    }
     // (the full register's bit of each clobber)
     let full_bit: Vec<u128> = cc.clobbers.iter().map(|(full, _)| bit(full)).collect();
     // per instruction: its (gen, kill), and for a call the (gen, kill) of the ops after it
@@ -960,7 +975,10 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
                 for i in &insn.ops[pos].inputs {
                     g |= bit(i);
                 }
-                gen_kill.push(transfer(&insn.ops[..pos], (g | args, kl)));
+                // (the arguments the convention gives every call are not reads: one holding a
+                // clobber is no argument, `optimize::prune_call_args` drops it — a read of a
+                // value left out too)
+                gen_kill.push(transfer(&insn.ops[..pos], (g, kl)));
             }
             None => gen_kill.push(transfer(&insn.ops, (0, 0))),
         }
@@ -1025,8 +1043,19 @@ fn live_clobbers(instructions: &[LiftedInstruction], cc: &reargo_lift::CallConve
         .map(|k| match after_call[k] {
             Some((g, kl)) => {
                 let live = g | (live_out[k] & !kl);
-                let full = full_bit.iter().enumerate().fold(kept, |a, (j, &m)| if live & m != 0 { a | (1u128 << j) } else { a });
-                (full, kept)
+                let (mut full, mut views) = (0u128, 0u128);
+                for (j, (&m, &fb)) in group.iter().zip(&full_bit).enumerate() {
+                    if m & touched != 0 {
+                        // (all of a touched register's definitions, or none)
+                        if live & m != 0 {
+                            full |= 1u128 << j;
+                            views |= 1u128 << j;
+                        }
+                    } else if live & fb != 0 {
+                        full |= 1u128 << j;
+                    }
+                }
+                (full, views)
             }
             None => (0, 0),
         })

@@ -508,7 +508,7 @@ impl StructView {
                     continue;
                 }
                 if let Some(c) = indexed(ctx.entry, Some(i))
-                    && let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)
+                    && let Some(v) = func.varnodes.iter().find(|v| func.is_incoming(v) && v.data == *reg)
                 {
                     index_classes.push((node(&mut uf, &mut nodes, value_key(func, v.id)), c));
                 }
@@ -529,7 +529,7 @@ impl StructView {
             let ints: Vec<VarnodeData> = oracle.args().iter().filter(|a| a.size == 8).copied().collect();
             for (i, c) in classes.iter().enumerate().skip(usize::from(ctx.name_class.is_some())) {
                 let (Some(c), Some(reg)) = (c, ints.get(i + sret)) else { continue };
-                if let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)
+                if let Some(v) = func.varnodes.iter().find(|v| func.is_incoming(v) && v.data == *reg)
                     && let Some(&n) = nodes.get(&value_key(func, v.id))
                 {
                     declared.push((n, c.clone()));
@@ -555,7 +555,7 @@ impl StructView {
             }
             evidence.extend(index_classes.iter().cloned());
             if let (Some(reg), Some((c, Some(vt)))) = (ctx.arg_regs[usize::from(sret)], &this_class)
-                && let Some(v) = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)
+                && let Some(v) = func.varnodes.iter().find(|v| func.is_incoming(v) && v.data == reg)
                 && let Some(&n) = nodes.get(&value_key(func, v.id))
             {
                 evidence.push((n, (c.clone(), *vt)));
@@ -728,7 +728,7 @@ impl StructView {
             }
         }
         let this_root = ctx.arg_regs[usize::from(sret)].and_then(|reg| {
-            let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == reg)?;
+            let v = func.varnodes.iter().find(|v| func.is_incoming(v) && v.data == reg)?;
             nodes.get(&value_key(func, v.id)).copied().map(|n| uf.find(n))
         });
         // WS92: the object a virtual call is made on, loaded from a field of an object of a known
@@ -744,7 +744,7 @@ impl StructView {
                 .take(6)
                 .enumerate()
                 .filter_map(|(i, reg)| {
-                    let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data == *reg)?;
+                    let v = func.varnodes.iter().find(|v| func.is_incoming(v) && v.data == *reg)?;
                     Some((*nodes.get(&value_key(func, v.id))?, i))
                 })
                 .collect();
@@ -1009,7 +1009,7 @@ impl StructView {
 
     /// The struct a parameter register named `name` points to on entry.
     pub(crate) fn param_def(&self, func: &SsaFunction, name: &str, reg_name: &dyn Fn(&VarnodeData) -> String) -> Option<usize> {
-        let v = func.varnodes.iter().find(|v| v.def_op.is_none() && v.data.space == SpaceId::REGISTER && v.data.size == 8 && reg_name(&v.data) == name)?;
+        let v = func.varnodes.iter().find(|v| func.is_incoming(v) && v.data.space == SpaceId::REGISTER && v.data.size == 8 && reg_name(&v.data) == name)?;
         self.def_of_value(func, v.id)
     }
 

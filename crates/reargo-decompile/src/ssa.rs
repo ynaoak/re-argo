@@ -80,6 +80,16 @@ pub struct SsaFunction {
     /// The phis the left-out definitions would have caused ([`PhantomDefs`]; numbered, not
     /// made): for the statistics, which count them as removed dead code.
     pub phantom_phis: usize,
+    /// Where the left-out definitions and phis would have written their slots, until the first
+    /// dead code elimination (which would have removed them): sorted `(position, slot,
+    /// version)`, a position `4 * i` right before op `i` (a call's left-out definitions sit
+    /// after it), `4 * i + 1` for a phi of the block starting at op `i` (after definitions
+    /// left out at the end of the block before), and a live op `i` at `4 * i + 2`. Common
+    /// subexpression elimination reads them as writes of their slots.
+    pub phantom_writes: Vec<(usize, (u32, u64, u32), u32)>,
+    /// The values read of definitions left out (by phis nothing reads), increasing: they have
+    /// no defining op, but are no value on entry ([`Self::is_incoming`]).
+    pub phantom_vars: Vec<VarId>,
 }
 
 /// Definitions a pass left out of the P-code because nothing can read them
@@ -90,10 +100,10 @@ pub struct SsaFunction {
 /// version that is printed keeps its number.
 #[derive(Debug, Default)]
 pub struct PhantomDefs {
-    /// The registers (at most 32).
+    /// The registers (at most 128).
     pub regs: Vec<VarnodeData>,
     /// By the address of the instruction holding the call: bit `i` = `regs[i]` left out.
-    pub at: FxHashMap<u64, u32>,
+    pub at: FxHashMap<u64, u128>,
 }
 
 impl SsaFunction {
@@ -116,6 +126,8 @@ impl SsaFunction {
             return_float: None,
             vcall_targets: FxHashMap::default(),
             phantom_phis: 0,
+            phantom_writes: Vec::new(),
+            phantom_vars: Vec::new(),
         };
         func.build_ssa(phantoms);
         func
@@ -210,16 +222,16 @@ impl SsaFunction {
         // slot of an instruction (`regs` bits), looked up at its first call
         let reg_slot: SmallVec<[u32; 16]> =
             phantoms.regs.iter().map(|v| slot_of.get(&key_of(v)).copied().unwrap_or(NO_SLOT)).collect();
-        let with_slot = reg_slot.iter().enumerate().fold(0u32, |a, (i, &k)| if k != NO_SLOT && i < 32 { a | (1 << i) } else { a });
+        let with_slot = reg_slot.iter().enumerate().fold(0u128, |a, (i, &k)| if k != NO_SLOT && i < 128 { a | (1 << i) } else { a });
         let any_phantom = with_slot != 0 && !phantoms.at.is_empty();
-        let phantoms_at = |insn: &reargo_lift::LiftedInstruction, op: &reargo_core::pcode::PcodeOp, seen_call: &mut bool| -> u32 {
+        let phantoms_at = |insn: &reargo_lift::LiftedInstruction, op: &reargo_core::pcode::PcodeOp, seen_call: &mut bool| -> u128 {
             if !any_phantom || *seen_call || !matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
                 return 0;
             }
             *seen_call = true;
             phantoms.at.get(&insn.address).map_or(0, |&m| m & with_slot)
         };
-        let bits = |mut m: u32| {
+        let bits = |mut m: u128| {
             std::iter::from_fn(move || {
                 (m != 0).then(|| {
                     let i = m.trailing_zeros();
@@ -234,8 +246,11 @@ impl SsaFunction {
         let mut defsites: Vec<Vec<usize>> = vec![Vec::new(); n_slots];
         // the def blocks with the left-out definitions, by register
         let mut phantom_sites: Vec<Vec<usize>> = vec![Vec::new(); if any_phantom { phantoms.regs.len() } else { 0 }];
-        // the block (+ 1) that last wrote each slot
+        // the block (+ 1) that last wrote each slot, and that last listed it as a def site
+        // (real / left out: a block can be both)
         let mut killed_in = vec![0usize; n_slots];
+        let mut real_in = vec![0usize; n_slots];
+        let mut phantom_in = vec![0usize; if any_phantom { n_slots } else { 0 }];
         for (b, block) in cfg.blocks.iter().enumerate() {
             let mut at = kid_start[b];
             for insn in &block.instructions {
@@ -251,15 +266,17 @@ impl SsaFunction {
                     if op.output.is_some() {
                         let k = kids[at] as usize;
                         at += 1;
-                        if killed_in[k] != b + 1 {
-                            killed_in[k] = b + 1;
+                        killed_in[k] = b + 1;
+                        if real_in[k] != b + 1 {
+                            real_in[k] = b + 1;
                             defsites[k].push(b);
                         }
                     }
                     for r in bits(phantoms_at(insn, op, &mut seen_call)) {
                         let k = reg_slot[r] as usize;
-                        if killed_in[k] != b + 1 {
-                            killed_in[k] = b + 1;
+                        killed_in[k] = b + 1;
+                        if phantom_in[k] != b + 1 {
+                            phantom_in[k] = b + 1;
                             phantom_sites[r].push(b);
                         }
                     }
@@ -339,11 +356,20 @@ impl SsaFunction {
         }
         // (the marks of the second placement of a slot with left-out definitions: above all
         // the first ones)
+        // (the register of `phantoms.regs` of each slot, `u8::MAX` for none)
+        let mut phantom_reg = vec![u8::MAX; if any_phantom { n_slots } else { 0 }];
+        if any_phantom {
+            for (r, &k) in reg_slot.iter().enumerate().rev() {
+                if k != NO_SLOT && r < 128 {
+                    phantom_reg[k as usize] = r as u8;
+                }
+            }
+        }
         let mut base_has_phi = vec![0u32; if any_phantom { n } else { 0 }];
         let mut base_queued = base_has_phi.clone();
         for k in keys {
             let extra = if any_phantom {
-                reg_slot.iter().position(|&s| s == k).map(|r| &phantom_sites[r]).filter(|v| !v.is_empty())
+                phantom_reg.get(k as usize).and_then(|&r| phantom_sites.get(r as usize)).filter(|v| !v.is_empty())
             } else {
                 None
             };
@@ -352,14 +378,21 @@ impl SsaFunction {
                 place(&df, &mut work, sites, k + 1, &mut has_phi, &mut queued, |f| phis[f].push(k));
             }
             if let Some(extra) = extra {
-                // every def site, the left-out ones too: the phis not placed above are phantoms
+                // every def site, the left-out ones too
                 let mut all = sites.clone();
                 all.extend(extra.iter().copied().filter(|b| !sites.contains(b)));
-                place(&df, &mut work, &all, k + 1, &mut base_has_phi, &mut base_queued, |f| {
-                    if has_phi[f] != k + 1 {
-                        phantom_phis[f].push(k);
-                    }
-                });
+                if sites.is_empty() {
+                    // (no value of the code's own: the phis are phantoms)
+                    place(&df, &mut work, &all, k + 1, &mut base_has_phi, &mut base_queued, |f| {
+                        if has_phi[f] != k + 1 {
+                            phantom_phis[f].push(k);
+                        }
+                    });
+                } else {
+                    // the phis are made: they may read the code's values, whose readers the
+                    // passes look at before dead code elimination removes them
+                    place(&df, &mut work, &all, k + 1, &mut has_phi, &mut queued, |f| phis[f].push(k));
+                }
             }
         }
 
@@ -460,6 +493,7 @@ impl SsaFunction {
                         vars.versions[k as usize] += 1;
                         stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
                         pushed_by[b].push(k);
+                        self.phantom_writes.push((4 * block_start[b] + 1, slots[k as usize], vars.versions[k as usize]));
                         continue;
                     }
                     ri += 1;
@@ -489,7 +523,7 @@ impl SsaFunction {
                             } else {
                                 match stacks[k as usize].last() {
                                     // (never read: the values left out are those nothing reads)
-                                    Some(&id) if id >= PHANTOM_MIN => self.push_var(*inp, PHANTOM - id),
+                                    Some(&id) if id >= PHANTOM_MIN => self.phantom_var(*inp, PHANTOM - id),
                                     Some(&id) => id,
                                     None => self.incoming_var(&mut vars, k, inp),
                                 }
@@ -515,6 +549,7 @@ impl SsaFunction {
                                 vars.versions[k as usize] += 1;
                                 stacks[k as usize].push(PHANTOM - vars.versions[k as usize]);
                                 pushed_by[b].push(k);
+                                self.phantom_writes.push((4 * idx, slots[k as usize], vars.versions[k as usize]));
                             }
                         }
                     }
@@ -540,7 +575,7 @@ impl SsaFunction {
                             }
                             let id = match stacks[k as usize].last() {
                                 // (a phi reached from a value left out is read by nothing either)
-                                Some(&id) if id >= PHANTOM_MIN => self.push_var(slot_vn(k), PHANTOM - id),
+                                Some(&id) if id >= PHANTOM_MIN => self.phantom_var(slot_vn(k), PHANTOM - id),
                                 Some(&id) => id,
                                 None => self.incoming_var(&mut vars, k, &slot_vn(k)),
                             };
@@ -568,6 +603,7 @@ impl SsaFunction {
             }
         }
 
+        self.phantom_writes.sort_unstable();
         self.cfg = cfg;
     }
 
@@ -603,6 +639,19 @@ impl SsaFunction {
         self.next_var_id += 1;
         self.varnodes.push(SsaVarnode { id, data, version, def_op: None, uses: UseVec::new() });
         id
+    }
+
+    /// A read of a definition left out ([`PhantomDefs`]).
+    fn phantom_var(&mut self, data: VarnodeData, version: u32) -> VarId {
+        let id = self.push_var(data, version);
+        self.phantom_vars.push(id);
+        id
+    }
+
+    /// Is `v` the value of a slot on entry (no defining op, and not a read of a definition
+    /// left out)?
+    pub fn is_incoming(&self, v: &SsaVarnode) -> bool {
+        v.def_op.is_none() && self.phantom_vars.binary_search(&v.id).is_err()
     }
 
 
