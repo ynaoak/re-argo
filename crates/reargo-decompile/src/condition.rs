@@ -208,7 +208,9 @@ impl Readers {
     }
 
     fn build(func: &SsaFunction) -> Self {
-        let mut m: FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>> = FxHashMap::default();
+        // (about a value read per live op: sized once, not grown op by op)
+        let live = func.ops.iter().filter(|o| !o.dead).count();
+        let mut m: FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>> = FxHashMap::with_capacity_and_hasher(live + 16, Default::default());
         for op in func.ops.iter().filter(|o| !o.dead) {
             for &i in &op.inputs {
                 if func.varnodes[i as usize].data.space == reargo_core::address::SpaceId::CONST {
