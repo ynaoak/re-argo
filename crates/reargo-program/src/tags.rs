@@ -108,6 +108,9 @@ pub struct Tag {
     pub auto: bool,
 }
 
+/// Tags by address (or function entry).
+pub type TagMap = BTreeMap<u64, Vec<Tag>>;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TagManager {
     /// Address-scope tags: (address, [tags]).
@@ -123,12 +126,12 @@ impl TagManager {
 
     /// The address-scope and function-scope maps, for the on-disk
     /// analysis cache.
-    pub fn cache_parts(&self) -> (&BTreeMap<u64, Vec<Tag>>, &BTreeMap<u64, Vec<Tag>>) {
+    pub fn cache_parts(&self) -> (&TagMap, &TagMap) {
         (&self.by_address, &self.by_function)
     }
 
     /// A manager of the maps [`Self::cache_parts`] returned.
-    pub fn from_cache_parts(by_address: BTreeMap<u64, Vec<Tag>>, by_function: BTreeMap<u64, Vec<Tag>>) -> Self {
+    pub fn from_cache_parts(by_address: TagMap, by_function: TagMap) -> Self {
         Self { by_address, by_function }
     }
 

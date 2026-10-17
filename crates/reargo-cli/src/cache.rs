@@ -634,7 +634,7 @@ mod packed {
     }
 
     /// Instructions, in address order.
-    pub fn encode_insns(insns: &[(&u64, &Box<DecodedInstruction>)]) -> Vec<u8> {
+    pub fn encode_insns(insns: &[(&u64, &DecodedInstruction)]) -> Vec<u8> {
         let mut w = Writer(Vec::with_capacity(insns.len() * 10));
         w.varint(insns.len() as u64);
         let mut prev_end = 0u64;
@@ -799,13 +799,17 @@ where
     sorted_map(decode_chunks::<(K, V)>(file, of)?)
 }
 
+/// Decodes a chunk of exactly `out.len()` map entries into `out` (`Some`
+/// only when it wrote every element).
+type ChunkDecoder<K, V> = fn(&[u8], &mut [MaybeUninit<(K, V)>]) -> Option<()>;
+
 /// As [`decode_map`], for a map in a [`packed`] encoding: the chunks are
 /// decoded in parallel straight into their places in one vector of all
 /// the entries (each chunk's entry count is in the section table).
 fn decode_packed_map<K: Ord + Send, V: Send>(
     file: &File,
     of: &[Section],
-    decode: fn(&[u8], &mut [MaybeUninit<(K, V)>]) -> Option<()>,
+    decode: ChunkDecoder<K, V>,
 ) -> Option<BTreeMap<K, V>> {
     let counts: Vec<usize> = of.iter().map(|s| usize::try_from(s.items).ok()).collect::<Option<_>>()?;
     let total = counts.iter().try_fold(0usize, |a, &n| a.checked_add(n))?;
@@ -899,7 +903,7 @@ pub fn read(entry: &Entry) -> Option<AnalysisState> {
         if full.pre_trusted
             && let Some(pre) = &entry.pre
         {
-            write_prekey(&entry.file, &pre.key);
+            write_prekey(&entry.file, &full.key, &pre.key);
         }
     }
     let state = decode_state(&file, &header.sections)?;
@@ -907,10 +911,18 @@ pub fn read(entry: &Entry) -> Option<AnalysisState> {
     Some(state)
 }
 
-/// Store `key` as the pre-key of the cache file `path` (best effort).
-fn write_prekey(path: &Path, key: &[u8; 32]) {
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
-        let _ = f.seek(std::io::SeekFrom::Start(PREKEY_AT as u64)).and_then(|_| f.write_all(key));
+/// Store `prekey` as the pre-key of the cache file `path`, when the file
+/// (by now perhaps replaced by another process) holds the results of
+/// `key` — checked through the handle written to, and a file is never
+/// rewritten in place but for its pre-key. Best effort.
+fn write_prekey(path: &Path, key: &[u8; 32], prekey: &[u8; 32]) {
+    let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return;
+    };
+    let mut stored = [0u8; PREKEY_AT];
+    let same = f.read_exact(&mut stored).is_ok() && &stored[..16] == MAGIC && &stored[KEY_AT..] == key;
+    if same {
+        let _ = f.seek(std::io::SeekFrom::Start(PREKEY_AT as u64)).and_then(|_| f.write_all(prekey));
     }
 }
 
@@ -1055,7 +1067,7 @@ pub fn store(entry: &Entry, program: &Program) -> Result<(), String> {
     let (sym_addr, sym_name) = state.symbol_table.cache_parts();
     let (refs_from, refs_to, jumps) = state.references.cache_parts();
     let (tags_addr, tags_func) = state.tags.cache_parts();
-    let insns: Vec<_> = insns.iter().collect();
+    let insns: Vec<_> = insns.iter().map(|(k, v)| (k, &**v)).collect();
     let funcs: Vec<_> = funcs.iter().collect();
     let sym_addr: Vec<_> = sym_addr.iter().collect();
     let sym_name: Vec<_> = sym_name.iter().collect();
@@ -1215,7 +1227,7 @@ mod tests {
             (u64::MAX - 4, Box::new(DecodedInstruction::new(u64::MAX - 4, 5, "call".into(), "0x10".into(),
                 smallvec::smallvec![0xe8, 1, 2, 3, 4], FlowType::Call, Some(0x10)))),
         ];
-        let borrowed: Vec<(&u64, &Box<DecodedInstruction>)> = insns.iter().map(|(k, v)| (k, v)).collect();
+        let borrowed: Vec<(&u64, &DecodedInstruction)> = insns.iter().map(|(k, v)| (k, &**v)).collect();
         let raw = packed::encode_insns(&borrowed);
         fn into_vec<T>(
             raw: &[u8],
