@@ -278,6 +278,27 @@ pub fn elf_exported_functions(data: &[u8]) -> Vec<u64> {
     out
 }
 
+/// The PLT stubs of an ELF's imports (WS95): `(stub address, symbol name)` for each `.rela.plt`
+/// entry, at its `.plt` (after the resolver header), `.plt.sec` and `.plt.got` slots.
+pub fn elf_import_stubs(data: &[u8]) -> Vec<(u64, String)> {
+    let Ok(elf) = goblin::elf::Elf::parse(data) else {
+        return Vec::new();
+    };
+    let section_addr = |want: &str| elf.section_headers.iter().find(|sh| elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("") == want).map(|sh| sh.sh_addr);
+    let plt = section_addr(".plt");
+    let sec = section_addr(".plt.sec");
+    let got = section_addr(".plt.got");
+    let mut out = Vec::new();
+    for (i, reloc) in elf.pltrelocs.iter().enumerate() {
+        let Some(name) = elf.dynsyms.get(reloc.r_sym).and_then(|s| elf.dynstrtab.get_at(s.st_name)).filter(|n| !n.is_empty()) else { continue };
+        let i = i as u64;
+        for at in [plt.map(|b| b + (i + 1) * 16), sec.map(|b| b + i * 16), got.map(|b| b + i * 16)].into_iter().flatten() {
+            out.push((at, name.to_string()));
+        }
+    }
+    out
+}
+
 impl BinaryLoader {
     pub fn load(path: &Path) -> Result<BinaryInfo, LoaderError> {
         let data = std::fs::read(path)?;
