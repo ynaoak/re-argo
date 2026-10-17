@@ -1429,11 +1429,15 @@ fn vtables(mem: &Memory, words: &[(u64, u64)]) -> Vec<(u64, i64, u64, Vec<u64>)>
     let is_code = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e);
     let mut ti_ok: FxHashMap<u64, bool> = FxHashMap::default();
     let mut out = Vec::new();
+    // (WS96: a slot holding 0 in the file — `__cxa_pure_virtual` or another function of another
+    // module, bound by an absolute relocation; an abstract class's destructor — is a hole, `0`)
+    let hole = |a: u64| words.binary_search_by_key(&a, |w| w.0).is_err() && mem.read_u64(a).ok() == Some(0);
     let mut k = 1;
-    while k < words.len() {
-        let (p, f) = words[k];
+    while k <= words.len() {
         let (q, ti) = words[k - 1];
-        if q + 8 != p || !is_code(f) || is_code(ti) {
+        let p = q + 8;
+        let first = words.get(k).filter(|w| w.0 == p).map(|w| w.1);
+        if is_code(ti) || !(first.is_some_and(is_code) || (first.is_none() && hole(p))) {
             k += 1;
             continue;
         }
@@ -1445,9 +1449,23 @@ fn vtables(mem: &Memory, words: &[(u64, u64)]) -> Vec<(u64, i64, u64, Vec<u64>)>
         };
         let mut slots = Vec::new();
         let mut j = k;
-        while j < words.len() && words[j].0 == p + 8 * (j - k) as u64 && is_code(words[j].1) {
-            slots.push(words[j].1);
-            j += 1;
+        loop {
+            let at = p + 8 * slots.len() as u64;
+            match words.get(j) {
+                Some(&(a, f)) if a == at && is_code(f) => {
+                    slots.push(f);
+                    j += 1;
+                }
+                _ if slots.len() < 4096 && hole(at) && (1..=8).any(|d| words.get(j).is_some_and(|w| w.0 == at + 8 * d && is_code(w.1))) => slots.push(0),
+                _ => break,
+            }
+        }
+        while slots.last() == Some(&0) {
+            slots.pop();
+        }
+        if slots.is_empty() {
+            k += 1;
+            continue;
         }
         out.push((p, ott, ti, slots));
         k = j.max(k + 1);
@@ -1504,7 +1522,7 @@ pub fn universe(mem: &Memory) -> Universe {
     let mut slot_words: FxHashSet<u64> = FxHashSet::default();
     let mut primary: FxHashMap<u64, u32> = FxHashMap::default();
     for (p, ott, ti, slots) in &vts {
-        for (s, &f) in slots.iter().enumerate() {
+        for (s, &f) in slots.iter().enumerate().filter(|e| *e.1 != 0) {
             slot_words.insert(p + 8 * s as u64);
             in_vtables.insert(f);
         }
@@ -1512,7 +1530,7 @@ pub fn universe(mem: &Memory) -> Universe {
             && let Some(&c) = by_ti.get(ti)
         {
             primary.insert(*p, c);
-            for &f in slots {
+            for &f in slots.iter().filter(|&&f| f != 0) {
                 let e = listing.entry(f).or_default();
                 if !e.contains(&c) {
                     e.push(c);
@@ -2834,6 +2852,26 @@ mod tests {
         let m = plt_targets(&mem);
         assert_eq!(m.into_iter().collect::<Vec<_>>(), [(0x1500, 0x1100)]);
         assert!(!universe(&mem).taken.contains(&0x1100));
+    }
+
+    /// WS96: a vtable whose first slots hold 0 in the file (an abstract class's destructor,
+    /// `__cxa_pure_virtual` bound by an absolute relocation to another module) is a vtable: its
+    /// class is known, the slots after the holes are listed.
+    #[test]
+    fn a_vtable_starting_with_holes_is_found() {
+        let mut mem = Memory::new(reargo_core::address::SpaceId(1), Endian::Little);
+        mem.add_block(MemoryBlock { name: ".text".into(), start: 0x1000, size: 0x100, flags: MemoryFlags::READ | MemoryFlags::EXECUTE, data: Some(Arc::from(vec![0xc3u8; 0x100].as_slice())) });
+        // 0x2000: offset-to-top 0, type_info 0x2100, slots: 0, 0, 0x1010 ; 0x2100: type_info
+        // (vptr, name 0x2200) ; 0x2200: "6Action"
+        let mut d = vec![0u8; 0x300];
+        d[0x200..0x208].copy_from_slice(b"6Action\0");
+        mem.add_block(MemoryBlock { name: ".data.rel.ro".into(), start: 0x2000, size: d.len() as u64, flags: MemoryFlags::READ, data: Some(Arc::from(d.as_slice())) });
+        let rel = |at: u64, v: u64| [at.to_le_bytes(), 8u64.to_le_bytes(), v.to_le_bytes()].concat();
+        let relocs = [rel(0x2008, 0x2100), rel(0x2020, 0x1010), rel(0x2108, 0x2200)].concat();
+        mem.set_dynamic_relocations(Arc::from(relocs.as_slice()));
+        let u = universe(&mem);
+        assert_eq!(u.hierarchy.vtables, [0x2010]);
+        assert_eq!(u.listing.get(&0x1010), Some(&vec![0]));
     }
 
     /// The join of two classes is their nearest common base.
