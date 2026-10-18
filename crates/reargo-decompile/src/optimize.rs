@@ -774,46 +774,42 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
         // (only a key redirected changes: one of an output, never a constant's; `bloom` has the
         // bit of each redirected key, so most varnodes are passed over without a lookup)
         let bloom = redirects.keys().fold(0u64, |m, &k| m | key_bit(k));
-        for vn in &mut func.varnodes {
-            if vn.data.space == reargo_core::address::SpaceId::CONST {
-                continue;
-            }
-            let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-            if bloom & key_bit(key) == 0 {
-                continue;
-            }
-            let to = resolve_redirect(&redirects, key);
-            if to != key {
-                vn.data = reargo_core::pcode::VarnodeData::new(
-                    reargo_core::address::SpaceId(to.0),
-                    to.1,
-                    to.2,
-                );
-                vn.version = to.3;
-            }
-        }
         // WS86: the kept definition's output gains the removed one's readers — else dead code
         // elimination sees no reader of it once its own die (`sete [rsi+0x18]` loads and stores
         // through two copies of the address: the load died, so did the address the store read)
         let targets: rustc_hash::FxHashSet<ValueKey> = redirects.values().map(|&k| resolve_redirect(&redirects, k)).collect();
-        let bloom = targets.iter().fold(0u64, |m, &k| m | key_bit(k));
+        let target_bloom = targets.iter().fold(0u64, |m, &k| m | key_bit(k));
+        // (in the same pass: the varnodes then holding a target's key, and the one of them each
+        // live definition of a target writes — the last, by id)
         let mut defined: rustc_hash::FxHashMap<ValueKey, u32> = Default::default();
-        for vn in &func.varnodes {
-            // (the removed duplicate's output now carries the kept key too: not that one)
-            if vn.def_op.is_some_and(|d| !func.ops[d].dead && func.ops[d].output == Some(vn.id)) {
-                let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-                if bloom & key_bit(key) != 0 && targets.contains(&key) {
+        let mut holding: Vec<(usize, ValueKey)> = Vec::new();
+        let (ops, varnodes) = (&func.ops, &mut func.varnodes);
+        for (i, vn) in varnodes.iter_mut().enumerate() {
+            if vn.data.space == reargo_core::address::SpaceId::CONST {
+                continue;
+            }
+            let mut key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            if bloom & key_bit(key) != 0 {
+                let to = resolve_redirect(&redirects, key);
+                if to != key {
+                    vn.data = reargo_core::pcode::VarnodeData::new(
+                        reargo_core::address::SpaceId(to.0),
+                        to.1,
+                        to.2,
+                    );
+                    vn.version = to.3;
+                    key = to;
+                }
+            }
+            if target_bloom & key_bit(key) != 0 && targets.contains(&key) {
+                holding.push((i, key));
+                // (the removed duplicate's output now carries the kept key too: not that one)
+                if vn.def_op.is_some_and(|d| !ops[d].dead && ops[d].output == Some(vn.id)) {
                     defined.insert(key, vn.id);
                 }
             }
         }
-        let bloom = defined.keys().fold(0u64, |m, &k| m | key_bit(k));
-        for i in 0..if defined.is_empty() { 0 } else { func.varnodes.len() } {
-            let vn = &func.varnodes[i];
-            let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-            if bloom & key_bit(key) == 0 {
-                continue;
-            }
+        for &(i, key) in &holding {
             if let Some(&d) = defined.get(&key)
                 && d as usize != i
             {
