@@ -142,6 +142,9 @@ type Traces = FxHashMap<(usize, usize, u64), std::sync::Arc<Trace>>;
 #[derive(Default)]
 pub struct FlowCache {
     shards: Vec<Mutex<FlowShard>>,
+    /// The flows of the other lifters' instructions, by address and the decode state they
+    /// are lifted in ([`GenericFlows`]).
+    generic: Vec<Mutex<GenericFlows>>,
     /// the answers of the questions asked, by memory, symbols and target
     verdicts: Vec<Mutex<Verdicts>>,
     traces: Vec<Mutex<Traces>>,
@@ -151,6 +154,7 @@ impl FlowCache {
     pub fn new() -> Self {
         Self {
             shards: (0..64).map(|_| Mutex::new(FlowShard::default())).collect(),
+            generic: (0..64).map(|_| Mutex::new(GenericFlows::default())).collect(),
             verdicts: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
             traces: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
         }
@@ -192,6 +196,139 @@ impl FlowCache {
                 }
             }
         }
+    }
+}
+
+impl FlowCache {
+    /// `lifter.lift_range(memory, addr, ..)`'s instructions' flows (a lifter with the default
+    /// `lift_range`: a stream from a fresh decode state, up to the first instruction that
+    /// cannot be lifted), handed to `each` while it returns `true`. The lift of an instruction
+    /// is a function of its address and of the decode state it is lifted in (a Thumb IT
+    /// block), so its flow is kept by both: the searches of a batch lift each once.
+    fn run_generic(&self, lifter: &dyn PcodeLift, memory: &Memory, addr: u64, each: &mut dyn FnMut(Flow) -> bool) {
+        let shard_of = |a: u64| &self.generic[((a >> 12) % self.generic.len() as u64) as usize];
+        let mut at = addr;
+        let mut ctx = reargo_lift::LiftContext::default();
+        loop {
+            // (a pending delay slot is not kept: lifted each time)
+            let key = ctx.delay.is_none().then(|| (at, ctx.it.map(|it| (it.state, it.addr))));
+            let known = key.and_then(|k| shard_of(at).lock().ok().and_then(|m| m.get(k)));
+            let (flow, after) = match known {
+                Some(v) => v,
+                None => {
+                    let lifted = lifter.lift_instruction_ctx(memory, at, &mut ctx).ok();
+                    let flow = lifted.as_ref().map(Flow::of);
+                    let after = ctx.it.map(|it| (it.state, it.addr));
+                    if let Some(k) = key
+                        && ctx.delay.is_none()
+                        && let Ok(mut m) = shard_of(at).lock()
+                    {
+                        m.insert(k, &flow, after);
+                    }
+                    (flow, after)
+                }
+            };
+            let Some(f) = flow else { return };
+            if ctx.delay.is_none() {
+                ctx.it = after.map(|(state, addr)| reargo_lift::ItBlock { state, addr });
+            }
+            at = f.address + u64::from(f.length);
+            if !each(f) {
+                return;
+            }
+        }
+    }
+}
+
+/// An IT state (`(state, address)`).
+type ItKey = Option<(u8, u64)>;
+
+/// [`FlowCache::run_generic`]'s flows: `(address, IT state)` -> the flow (`None`: it cannot be
+/// lifted) and the IT state after it; those outside IT blocks (no state before nor after) at
+/// a 32-bit address packed in 32 bits ([`GenericFlows::pack`]) when they fit, the others as
+/// they are.
+#[derive(Default)]
+struct GenericFlows {
+    packed: FxHashMap<u32, u32>,
+    other: FxHashMap<(u64, ItKey), (Option<Flow>, ItKey)>,
+}
+
+/// A flow packed in 32 bits: lifted (bit 0; else the instruction could not be lifted), the
+/// length (bits 1..5), a trap (bit 5), the event count (bits 6..8), each event's kind (bits
+/// 8..10 and 11..13: exit, jump, conditional jump, call) and whether it has a target (bits 10,
+/// 13), and the one target relative to the address (bits 14..32, signed).
+const PACKED32_LIFTED: u32 = 1;
+
+impl GenericFlows {
+    fn get(&self, (addr, it): (u64, ItKey)) -> Option<(Option<Flow>, ItKey)> {
+        if it.is_none()
+            && let Ok(a) = u32::try_from(addr)
+            && let Some(&v) = self.packed.get(&a)
+        {
+            return Some((Self::unpack(addr, v), None));
+        }
+        self.other.get(&(addr, it)).cloned()
+    }
+
+    fn insert(&mut self, (addr, it): (u64, ItKey), flow: &Option<Flow>, after: ItKey) {
+        if it.is_none()
+            && after.is_none()
+            && let Ok(a) = u32::try_from(addr)
+            && let Some(v) = Self::pack(flow)
+        {
+            self.packed.insert(a, v);
+        } else {
+            self.other.insert((addr, it), (flow.clone(), after));
+        }
+    }
+
+    fn pack(f: &Option<Flow>) -> Option<u32> {
+        let Some(f) = f else { return Some(0) };
+        if f.length > 15 || f.events.len() > 2 {
+            return None;
+        }
+        let mut v = PACKED32_LIFTED | (f.length << 1) | (u32::from(f.trap) << 5) | ((f.events.len() as u32) << 6);
+        let mut target = None;
+        for (i, ev) in f.events.iter().enumerate() {
+            let (kind, t) = match *ev {
+                Event::Exit => (0u32, None),
+                Event::Branch { uncond: true, target } => (1, target),
+                Event::Branch { uncond: false, target } => (2, target),
+                Event::Call(t) => (3, Some(t)),
+            };
+            v |= kind << (8 + 3 * i);
+            if let Some(t) = t {
+                if target.is_some() {
+                    return None;
+                }
+                let rel = t.wrapping_sub(f.address) as i64;
+                if !(-(1 << 17)..1 << 17).contains(&rel) {
+                    return None;
+                }
+                target = Some(rel as i32);
+                v |= 1 << (10 + 3 * i);
+            }
+        }
+        Some(v | ((target.unwrap_or(0) as u32) << 14))
+    }
+
+    fn unpack(addr: u64, v: u32) -> Option<Flow> {
+        if v & PACKED32_LIFTED == 0 {
+            return None;
+        }
+        let target = addr.wrapping_add(((v as i32) >> 14) as i64 as u64);
+        let events = (0..((v >> 6) & 3) as usize)
+            .map(|i| {
+                let has = v & (1 << (10 + 3 * i)) != 0;
+                match (v >> (8 + 3 * i)) & 3 {
+                    0 => Event::Exit,
+                    1 => Event::Branch { uncond: true, target: has.then_some(target) },
+                    2 => Event::Branch { uncond: false, target: has.then_some(target) },
+                    _ => Event::Call(target),
+                }
+            })
+            .collect();
+        Some(Flow { address: addr, length: (v >> 1) & 0xf, trap: v & (1 << 5) != 0, events })
     }
 }
 
@@ -464,7 +601,7 @@ impl<'a> NoReturn<'a> {
                 return outcome(trace.exit, unsure);
             }
         }
-        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.lifter.as_x86().zip(self.cache), insns: Vec::with_capacity(CHUNK), index: FxHashMap::with_capacity_and_hasher(CHUNK, Default::default()) };
+        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.lifter.as_x86().zip(self.cache), shared: self.cache.filter(|_| self.lifter.as_x86().is_none()), insns: Vec::with_capacity(CHUNK), index: FxHashMap::with_capacity_and_hasher(CHUNK, Default::default()) };
         let mut unsure = false;
         let mut calls = Vec::new();
         let exit = code.at(target).map(|entry| {
@@ -489,6 +626,8 @@ struct Code<'a> {
     lifter: &'a dyn PcodeLift,
     memory: &'a Memory,
     flow: Option<(&'a reargo_lift::x86::X86Lifter, &'a FlowCache)>,
+    /// The batch's cache, for a lifter other than x86 ([`FlowCache::run_generic`]).
+    shared: Option<&'a FlowCache>,
     insns: Vec<Flow>,
     index: FxHashMap<u64, usize>,
 }
@@ -512,6 +651,20 @@ impl Code<'_> {
             Some((x86, cache)) => {
                 let mut n = 0;
                 cache.run(x86, self.memory, addr, &mut |f| {
+                    match self.index.entry(f.address) {
+                        std::collections::hash_map::Entry::Occupied(_) => return false, // runs into code lifted before
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(self.insns.len());
+                        }
+                    }
+                    self.insns.push(f);
+                    n += 1;
+                    n < CHUNK
+                });
+            }
+            None if let Some(cache) = self.shared => {
+                let mut n = 0;
+                cache.run_generic(self.lifter, self.memory, addr, &mut |f| {
                     match self.index.entry(f.address) {
                         std::collections::hash_map::Entry::Occupied(_) => return false, // runs into code lifted before
                         std::collections::hash_map::Entry::Vacant(v) => {
@@ -668,6 +821,37 @@ mod tests {
     use reargo_lift::x86::X86Lifter;
     use reargo_loader::memory::{MemoryBlock, MemoryFlags};
     use std::sync::Arc;
+
+    #[test]
+    fn generic_flows_round_trip() {
+        let at = 0x8_1000u64;
+        let flows = [
+            None,
+            Some(Flow { address: at, length: 2, trap: false, events: SmallVec::new() }),
+            Some(Flow { address: at, length: 4, trap: true, events: SmallVec::from_slice(&[Event::Exit]) }),
+            Some(Flow { address: at, length: 4, trap: false, events: SmallVec::from_slice(&[Event::Call(at - 0x1_fff0)]) }),
+            Some(Flow { address: at, length: 2, trap: false, events: SmallVec::from_slice(&[Event::Branch { uncond: false, target: Some(at + 0x1_fffe) }, Event::Exit]) }),
+            Some(Flow { address: at, length: 4, trap: false, events: SmallVec::from_slice(&[Event::Branch { uncond: true, target: None }]) }),
+            // (too far, two targets, an address past 32 bits: kept as they are)
+            Some(Flow { address: at, length: 4, trap: false, events: SmallVec::from_slice(&[Event::Call(at + 0x2_0000)]) }),
+            Some(Flow { address: at, length: 4, trap: false, events: SmallVec::from_slice(&[Event::Call(at + 8), Event::Branch { uncond: true, target: Some(at + 4) }]) }),
+        ];
+        for f in &flows {
+            let mut g = GenericFlows::default();
+            g.insert((at, None), f, None);
+            assert_eq!(g.get((at, None)), Some((f.clone(), None)));
+            assert_eq!(g.get((at, Some((0x18, at)))), None);
+            let it = Some((0x18, at + 2));
+            g.insert((at, Some((0x14, at))), f, it);
+            assert_eq!(g.get((at, Some((0x14, at)))), Some((f.clone(), it)));
+        }
+        let far = 0x1_0000_1000u64;
+        let f = Some(Flow { address: far, length: 4, trap: false, events: SmallVec::new() });
+        let mut g = GenericFlows::default();
+        g.insert((far, None), &f, None);
+        assert_eq!(g.get((far, None)), Some((f, None)));
+        assert!(g.packed.is_empty());
+    }
 
     fn mem(parts: &[(u64, &[u8])]) -> Memory {
         let mut m = Memory::new(SpaceId(1), Endian::Little);
