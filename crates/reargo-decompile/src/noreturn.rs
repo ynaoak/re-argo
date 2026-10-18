@@ -112,9 +112,9 @@ pub struct NoReturn<'a> {
     /// target -> verdict (and, for `Unsure`, the depth it was computed with), for the search
     /// of one question
     memo: Mutex<FxHashMap<u64, (Verdict, u32)>>,
-    /// The control flow of each instruction lifted alone, shared by the searches of a batch
-    /// (x86; [`FlowCache`]).
-    flow: Option<(&'a reargo_lift::x86::X86Lifter, &'a FlowCache)>,
+    /// The cache shared by the searches of a batch ([`FlowCache`]): the answers and searches
+    /// for every lifter, the control flow of each instruction lifted alone for x86.
+    cache: Option<&'a FlowCache>,
 }
 
 /// What [`search`] reads of an instruction: its extent and control flow. Shared by every
@@ -378,13 +378,14 @@ impl Flow {
 
 impl<'a> NoReturn<'a> {
     pub fn new(lifter: &'a dyn PcodeLift, memory: &'a Memory, symbols: Option<&'a BTreeMap<u64, String>>) -> Self {
-        Self { lifter, memory, symbols, memo: Mutex::new(FxHashMap::default()), flow: None }
+        Self { lifter, memory, symbols, memo: Mutex::new(FxHashMap::default()), cache: None }
     }
 
-    /// The same oracle reading the instructions' control flow from `cache` (x86 lifters only;
-    /// the answers do not change).
+    /// The same oracle sharing its answers and searches with the batch through `cache` (and,
+    /// for an x86 lifter, reading the instructions' control flow from it; the answers do not
+    /// change).
     pub fn with_flow_cache(mut self, cache: Option<&'a FlowCache>) -> Self {
-        self.flow = self.lifter.as_x86().zip(cache);
+        self.cache = cache;
         self
     }
 
@@ -397,7 +398,7 @@ impl<'a> NoReturn<'a> {
             return true;
         }
         let key = (std::ptr::from_ref(self.memory) as usize, self.symbols.map_or(0, |s| std::ptr::from_ref(s) as usize), target);
-        let shard = self.flow.and_then(|(_, cache)| cache.verdict_shard(target));
+        let shard = self.cache.and_then(|cache| cache.verdict_shard(target));
         if let Some(&v) = shard.and_then(|m| m.lock().ok()).as_ref().and_then(|m| m.get(&key)) {
             return v;
         }
@@ -456,14 +457,14 @@ impl<'a> NoReturn<'a> {
         // differs the search runs, asking those questions again — answered the same, from the
         // memo or as before, without changing it)
         let key = (std::ptr::from_ref(self.memory) as usize, self.symbols.map_or(0, |s| std::ptr::from_ref(s) as usize), target);
-        let shard = self.flow.and_then(|(_, cache)| cache.trace_shard(target));
+        let shard = self.cache.and_then(|cache| cache.trace_shard(target));
         if let Some(trace) = shard.and_then(|m| m.lock().ok().and_then(|m| m.get(&key).cloned())) {
             let mut unsure = false;
             if trace.calls.iter().all(|&(t, answer)| ask(t, stack, &mut unsure) == answer) {
                 return outcome(trace.exit, unsure);
             }
         }
-        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.flow, insns: Vec::with_capacity(CHUNK), index: FxHashMap::with_capacity_and_hasher(CHUNK, Default::default()) };
+        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.lifter.as_x86().zip(self.cache), insns: Vec::with_capacity(CHUNK), index: FxHashMap::with_capacity_and_hasher(CHUNK, Default::default()) };
         let mut unsure = false;
         let mut calls = Vec::new();
         let exit = code.at(target).map(|entry| {

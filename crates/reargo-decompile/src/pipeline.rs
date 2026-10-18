@@ -324,6 +324,7 @@ pub fn decompile_function_with_options(
         Some(&annotations),
         Some(&program.call_renderings),
         oracle.as_ref(),
+        None,
         opts,
     )
 }
@@ -394,6 +395,7 @@ pub fn decompile_function_with_maps(
         annotations,
         call_renderings,
         oracle.as_ref(),
+        None,
         &DecompileOptions::default(),
     )
 }
@@ -408,6 +410,8 @@ fn decompile_function_inner(
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
     oracle: Option<&CalleeParams<'_>>,
+    // the no-return cache a batch shares when `oracle` has none (no calling convention)
+    batch_flow: Option<&crate::noreturn::FlowCache>,
     opts: &DecompileOptions,
 ) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
@@ -464,7 +468,7 @@ fn decompile_function_inner(
     };
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
-    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()));
+    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()).or(batch_flow));
     crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
     // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
     let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);
@@ -1486,6 +1490,8 @@ pub fn decompile_all_with_options(
     // one callee-parameter memo for the whole batch
     let oracle = CalleeParams::new(lifter, &program.info.memory)
         .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index().with_entries(entries.clone()));
+    // (the no-return answers shared by the batch, for a lifter without an oracle)
+    let batch_flow = oracle.is_none().then(crate::noreturn::FlowCache::new);
 
     // Largest first, each worker taking the next function when it is done: the big
     // functions do not end up last on one thread (the results keep the listing order).
@@ -1507,6 +1513,7 @@ pub fn decompile_all_with_options(
             Some(&annotations),
             Some(&program.call_renderings),
             oracle.as_ref(),
+            batch_flow.as_ref(),
             opts,
         );
         if let Ok(mut s) = slots[i].lock() {
