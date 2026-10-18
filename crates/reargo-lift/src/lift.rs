@@ -81,22 +81,45 @@ impl InsnShape {
 #[derive(Clone)]
 pub struct InsnText {
     cell: std::sync::OnceLock<String>,
-    x86: Option<iced_x86::Instruction>,
+    src: TextSource,
+}
+
+/// What an [`InsnText`] not given is formatted from.
+#[derive(Clone)]
+enum TextSource {
+    Given,
+    X86(iced_x86::Instruction),
+    /// An ARM / Thumb instruction's bytes (as read from memory, `len` of them) at `address`,
+    /// formatted by Capstone ([`crate::arm32::format_text`]).
+    Arm { bytes: [u8; 4], len: u8, thumb: bool, word: u32, address: u64 },
 }
 
 impl InsnText {
     /// The text of `insn`, formatted when first read.
     pub fn x86_lazy(insn: iced_x86::Instruction) -> Self {
-        Self { cell: std::sync::OnceLock::new(), x86: Some(insn) }
+        Self { cell: std::sync::OnceLock::new(), src: TextSource::X86(insn) }
+    }
+
+    /// The text of the ARM (`thumb`: Thumb) instruction `bytes[..len]` (read as `word`) at
+    /// `address`, formatted when first read.
+    pub(crate) fn arm_lazy(bytes: [u8; 4], len: u8, thumb: bool, word: u32, address: u64) -> Self {
+        Self { cell: std::sync::OnceLock::new(), src: TextSource::Arm { bytes, len, thumb, word, address } }
     }
 
     /// The decoded x86 instruction the text is formatted from, if any.
     pub fn x86_instruction(&self) -> Option<&iced_x86::Instruction> {
-        self.x86.as_ref()
+        match &self.src {
+            TextSource::X86(i) => Some(i),
+            _ => None,
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        self.cell.get_or_init(|| self.x86.as_ref().map(crate::x86::format_instruction).unwrap_or_default())
+        self.cell.get_or_init(|| match &self.src {
+            TextSource::Given => String::new(),
+            TextSource::X86(i) => crate::x86::format_instruction(i),
+            TextSource::Arm { bytes, len, thumb, word, address } => crate::arm32::format_text(&bytes[..usize::from(*len)], *thumb, *word, *address),
+        })
     }
 }
 
@@ -104,7 +127,7 @@ impl From<String> for InsnText {
     fn from(text: String) -> Self {
         let cell = std::sync::OnceLock::new();
         let _ = cell.set(text);
-        Self { cell, x86: None }
+        Self { cell, src: TextSource::Given }
     }
 }
 
@@ -309,4 +332,14 @@ pub enum LiftError {
     DecodeFailed { address: u64, reason: String },
     #[error("unsupported instruction at 0x{address:x}: {mnemonic}")]
     Unsupported { address: u64, mnemonic: String },
+}
+
+#[cfg(test)]
+mod size_tests {
+    /// The lazily formatted ARM text shares the room of the x86 instruction: a lift stays
+    /// 112 bytes.
+    #[test]
+    fn lifted_instruction_size() {
+        assert_eq!(std::mem::size_of::<super::LiftedInstruction>(), 112);
+    }
 }

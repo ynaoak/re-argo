@@ -779,9 +779,6 @@ fn search(
 pub fn mark_noreturn_calls(insns: &mut [LiftedInstruction], oracle: &NoReturn<'_>) -> usize {
     let mut marked = 0;
     for insn in insns.iter_mut() {
-        if crate::cfg::is_trap(insn) {
-            continue;
-        }
         let target = insn
             .ops
             .iter()
@@ -789,7 +786,9 @@ pub fn mark_noreturn_calls(insns: &mut [LiftedInstruction], oracle: &NoReturn<'_
             .and_then(|op| op.inputs.first())
             .filter(|t| t.space == SpaceId::RAM)
             .map(|t| t.offset);
+        // (a trap is not marked; asked only of a call: its text may be formatted for it)
         if let Some(t) = target
+            && !crate::cfg::is_trap(insn)
             && oracle.is_noreturn(t)
         {
             insn.ops.push(marker(insn.address, insn.ops.len() as u32));

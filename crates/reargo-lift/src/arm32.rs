@@ -28,7 +28,7 @@ use reargo_core::pcode::{OpCode, PcodeOp, SeqNum, VarnodeData};
 use reargo_loader::Memory;
 use smallvec::SmallVec;
 
-use crate::lift::{ItBlock, LiftContext, LiftError, LiftedInstruction, PcodeLift};
+use crate::lift::{InsnText, ItBlock, LiftContext, LiftError, LiftedInstruction, PcodeLift};
 
 const CONST_SPACE: SpaceId = SpaceId::CONST;
 const RAM_SPACE: SpaceId = SpaceId::RAM;
@@ -68,13 +68,9 @@ fn flag(offset: u64) -> VarnodeData {
 }
 
 pub struct Arm32Lifter {
-    cs: capstone::Capstone,
     big_endian: bool,
     thumb: bool,
 }
-
-unsafe impl Send for Arm32Lifter {}
-unsafe impl Sync for Arm32Lifter {}
 
 impl Arm32Lifter {
     pub fn new(endian: Endian) -> Self {
@@ -83,15 +79,7 @@ impl Arm32Lifter {
 
     /// A32 (ARM) mode lifter.
     pub fn new_arm(endian: Endian) -> Self {
-        use capstone::prelude::*;
-        let cs = Capstone::new()
-            .arm()
-            .mode(arch::arm::ArchMode::Arm)
-            .detail(false)
-            .build()
-            .expect("failed to create ARM capstone");
         Self {
-            cs,
             big_endian: matches!(endian, Endian::Big),
             thumb: false,
         }
@@ -99,15 +87,7 @@ impl Arm32Lifter {
 
     /// T16/T32 (Thumb) mode lifter.
     pub fn new_thumb(endian: Endian) -> Self {
-        use capstone::prelude::*;
-        let cs = Capstone::new()
-            .arm()
-            .mode(arch::arm::ArchMode::Thumb)
-            .detail(false)
-            .build()
-            .expect("failed to create Thumb capstone");
         Self {
-            cs,
             big_endian: matches!(endian, Endian::Big),
             thumb: true,
         }
@@ -1743,20 +1723,37 @@ impl Arm32Lifter {
         out
     }
 
-    fn disasm_text(&self, bytes: &[u8], address: u64, word: u32) -> String {
-        match self.cs.disasm_count(bytes, address, 1) {
-            Ok(insns) => insns
-                .iter()
-                .next()
-                .map(|insn| {
-                    let m = insn.mnemonic().unwrap_or("???");
-                    let o = insn.op_str().unwrap_or("");
-                    if o.is_empty() { m.to_string() } else { format!("{} {}", m, o) }
-                })
-                .unwrap_or_else(|| format!(".word 0x{:08x}", word)),
-            Err(_) => format!(".word 0x{:08x}", word),
-        }
-    }
+}
+
+thread_local! {
+    /// The text formatters of each thread (A32, Thumb): one Capstone handle used on several
+    /// threads at once races on its state (the IT block it tracks).
+    static ARM_TEXT: capstone::Capstone = text_capstone(false);
+    static THUMB_TEXT: capstone::Capstone = text_capstone(true);
+}
+
+fn text_capstone(thumb: bool) -> capstone::Capstone {
+    use capstone::prelude::*;
+    let mode = if thumb { arch::arm::ArchMode::Thumb } else { arch::arm::ArchMode::Arm };
+    Capstone::new().arm().mode(mode).detail(false).build().expect("failed to create ARM capstone")
+}
+
+/// The text of the ARM (`thumb`: Thumb) instruction `bytes` (read as `word`) at `address`:
+/// Capstone's, or `.word` of it when Capstone cannot decode it.
+pub(crate) fn format_text(bytes: &[u8], thumb: bool, word: u32, address: u64) -> String {
+    let format = |cs: &capstone::Capstone| match cs.disasm_count(bytes, address, 1) {
+        Ok(insns) => insns
+            .iter()
+            .next()
+            .map(|insn| {
+                let m = insn.mnemonic().unwrap_or("???");
+                let o = insn.op_str().unwrap_or("");
+                if o.is_empty() { m.to_string() } else { format!("{} {}", m, o) }
+            })
+            .unwrap_or_else(|| format!(".word 0x{:08x}", word)),
+        Err(_) => format!(".word 0x{:08x}", word),
+    };
+    if thumb { THUMB_TEXT.with(format) } else { ARM_TEXT.with(format) }
 }
 
 impl PcodeLift for Arm32Lifter {
@@ -1770,12 +1767,12 @@ impl PcodeLift for Arm32Lifter {
                 let b3 = memory.read_byte(address + 3).ok_or(LiftError::UnreadableAddress(address))?;
                 let hw2 = self.read_half(b2, b3);
                 let ops = self.lift_thumb32(hw1, hw2, address);
-                let mnemonic = self.disasm_text(&[b0, b1, b2, b3], address, ((hw1 as u32) << 16) | hw2 as u32);
-                Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
+                let mnemonic = InsnText::arm_lazy([b0, b1, b2, b3], 4, true, ((hw1 as u32) << 16) | hw2 as u32, address);
+                Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
             } else {
                 let ops = self.lift_thumb16(hw1, address);
-                let mnemonic = self.disasm_text(&[b0, b1], address, hw1 as u32);
-                Ok(LiftedInstruction { address, length: 2, mnemonic: mnemonic.into(), ops })
+                let mnemonic = InsnText::arm_lazy([b0, b1, 0, 0], 2, true, hw1 as u32, address);
+                Ok(LiftedInstruction { address, length: 2, mnemonic, ops })
             }
         } else {
             let mut buf = [0u8; 4];
@@ -1784,8 +1781,8 @@ impl PcodeLift for Arm32Lifter {
                 .map_err(|_| LiftError::UnreadableAddress(address))?;
             let word = self.read_word(&buf);
             let ops = self.lift_word(word, address);
-            let mnemonic = self.disasm_text(&buf, address, word);
-            Ok(LiftedInstruction { address, length: 4, mnemonic: mnemonic.into(), ops })
+            let mnemonic = InsnText::arm_lazy(buf, 4, false, word, address);
+            Ok(LiftedInstruction { address, length: 4, mnemonic, ops })
         }
     }
 
