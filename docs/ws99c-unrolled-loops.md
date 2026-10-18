@@ -108,3 +108,26 @@ r13 は callee-saved で epilogue で呼び出し元の値に戻る。読む人�
   修正前は失敗を確認）。`cargo test --workspace --release`: 1320 passed。clippy 警告なし。
 - decompile-all（8 回、min / 中央値）: py.elf main 5.788 / 6.101 s → 5.588 / 6.121 s、bash.elf 2.274 / 2.580 → 2.367 / 2.507 s
   （ノイズ内）。
+
+### 2. 拡張したロードの下位の読み直し（Task 2）
+
+- SSA（`--ssa`）: `v1280 = LOAD 1, rdi; eax = INT_ZEXT v1280; al = SUBPIECE eax, 0`。eax の読み手は rax / ax / al の
+  ビュー（rax・ax は後で死ぬ）と al だけ。
+- `optimize::try_algebraic_simplify_op` に SUBPIECE の規則: `SUBPIECE(ZEXT/SEXT(x), 0)` で x と出力が同じ大きさ、x が一時値
+  （unique 空間 = ロードなどの式の値）、拡張の出力の生きた読み手がこの SUBPIECE だけのとき `COPY x`
+  （拡張は死に、x は 1 回だけ読まれる）。拡張の値がほかでも読まれる場合（`return eax;` 等）は従来どおり。
+  x がレジスタの場合は対象外（版の衝突を避ける）。
+- テスト `pipeline::tests::low_byte_of_a_zero_extended_load_is_the_load`（gcc -O2 の f_count の機械語、C / Rust、
+  拡張値も返す場合は残る。修正前は失敗を確認）。
+
+| | 行数 | キャスト | `xl = (uint8_t)exx;` |
+|---|---|---|---|
+| コーパス Task 1 → Task 2 | 4055 → 4049 | 578 → 566 | 10 → 4 |
+| jt2 | 245108 → 243999 | 23562 → 21273 | 1738 → 1359 |
+| big | 22127 → 22105 | 2024 → 1983 | 122 → 115 |
+| s40 | 4539 → 4529 | 711 → 693 | 13 → 11 |
+
+- 例（jt2）: `eax = (uint32_t)*(uint16_t*)(r12 + 0x7c); ax = (uint16_t)eax;` → `ax = *(uint16_t*)(r12 + 0x7c);`。
+  残る `al = (uint8_t)eax;` は拡張した値もほかで使うもの（`eax = (uint32_t)r15->field_18; al = (uint8_t)eax; if ((al & 1) == 0)
+  { edx = eax; …`）や計算結果の下位（f_bytes の `al = (uint8_t)eax; p[i] = al;`）。
+- コーパス不一致 0 / コンパイルエラー 0、goto は不変。`cargo test --workspace --release`: 1321 passed。

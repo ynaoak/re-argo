@@ -5084,6 +5084,28 @@ mod tests {
         assert!(!r.contains("goto") && !r.contains("'label_"), "{r}");
     }
 
+    /// WS99: `movzx eax, byte [rdi]; test al, al` reads the loaded byte: `al = *(uint8_t*)rdi;`
+    /// (`eax = (uint32_t)*(uint8_t*)rdi; al = (uint8_t)eax;` before), unless the extended value
+    /// is read too.
+    #[test]
+    fn low_byte_of_a_zero_extended_load_is_the_load() {
+        // gcc -O2 `int f_count(const char *s) { int c = 0; for (int i = 0; s[i]; i++) if (s[i] == 'a') c++; return c; }`
+        let code = [
+            0x0f, 0xb6, 0x07, 0x84, 0xc0, 0x74, 0x29, 0x48, 0x83, 0xc7, 0x01, 0x31, 0xd2, 0x0f, 0x1f, 0x00, //
+            0x3c, 0x61, 0x0f, 0x94, 0xc0, 0x48, 0x83, 0xc7, 0x01, 0x0f, 0xb6, 0xc0, 0x01, 0xc2, 0x0f, 0xb6, //
+            0x47, 0xff, 0x84, 0xc0, 0x75, 0xea, 0x89, 0xd0, 0xc3, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, //
+            0x31, 0xd2, 0x89, 0xd0, 0xc3,
+        ];
+        let c = c_raw(&code);
+        assert!(!c.contains("al = (uint8_t)eax;") && c.contains("al = *(uint8_t*)rdi;") && c.contains("al = *(uint8_t*)(rdi - 1);"), "{c}");
+        let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(!r.contains("eax as u8") && r.contains("al = unsafe { *(rdi as *const u8) };"), "{r}");
+        // the extended value is returned too: it stays
+        // (`movzx eax, byte [rdi]; test al, al; je 1f; ret; 1: mov eax, 2; ret`)
+        let c = c_raw(&[0x0f, 0xb6, 0x07, 0x84, 0xc0, 0x74, 0x01, 0xc3, 0xb8, 0x02, 0, 0, 0, 0xc3]);
+        assert!(c.contains("eax = (uint32_t)*(uint8_t*)rdi;"), "{c}");
+    }
+
     /// WS98: a concatenation whose halves fill the result prints as shifts C and Rust compile
     /// (`xor eax, eax; mov ah, cl`: `ax = CONCAT(ah, 0:1);` before).
     #[test]

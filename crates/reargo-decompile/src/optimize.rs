@@ -174,6 +174,35 @@ fn try_algebraic_simplify_op(func: &mut SsaFunction, i: usize) -> bool {
             }
             false
         }
+        // the low part of a zero / sign extension as wide as what was extended is that value:
+        // `movzx eax, byte [rdi]; test al, al` reads the loaded byte (`al = (uint8_t)eax;`
+        // before). Only when the extension's value is a temporary read here alone, so the
+        // extension dies and the value is still read once (WS99).
+        OpCode::Subpiece => {
+            let (Some(out), ext) = (func.ops[i].output, func.varnodes[in0 as usize].def_op) else { return false };
+            let Some(e) = ext else { return false };
+            let k = &func.varnodes[in1 as usize];
+            if k.data.space != CONST_SPACE || k.data.offset != 0 {
+                return false;
+            }
+            let eop = &func.ops[e];
+            if eop.dead || !matches!(eop.opcode, OpCode::IntZExt | OpCode::IntSExt) || eop.inputs.len() != 1 {
+                return false;
+            }
+            let x = eop.inputs[0];
+            let xd = func.varnodes[x as usize].data;
+            if xd.space != reargo_core::address::SpaceId::UNIQUE
+                || xd.size != func.varnodes[out as usize].data.size
+                || func.varnodes[in0 as usize].uses.iter().any(|&u| u != i && !func.ops[u].dead)
+            {
+                return false;
+            }
+            func.varnodes[in0 as usize].uses.clear();
+            func.varnodes[x as usize].uses.push(i);
+            func.ops[i].opcode = OpCode::Copy;
+            func.ops[i].inputs = smallvec::smallvec![x];
+            true
+        }
         _ => false,
     }
 }
