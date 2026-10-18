@@ -224,7 +224,66 @@ impl Architecture for ArmArch {
             return Err(DisasmError::UnreadableAddress(address));
         }
 
-        let insns = self.cs.disasm_count(&buf, address, 1)?;
+        // (an AArch64 instruction that does not read the PC decodes the same at every address:
+        // the decode of the same word made before, moved to `address`)
+        let word = (self.is_64 && buf.len() == 4).then(|| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])).filter(|&w| !aarch64_pc_relative(w));
+        if let Some(w) = word
+            && let Some(known) = A64_DECODES.with(|m| m.borrow().get(&w).cloned())
+        {
+            let mut d = known;
+            d.address = address;
+            return Ok(d);
+        }
+        let decoded = self.decode_with_capstone(&buf, address)?;
+        if let Some(w) = word {
+            A64_DECODES.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= A64_DECODES_CAP {
+                    m.clear();
+                }
+                m.insert(w, decoded.clone());
+            });
+        }
+        Ok(decoded)
+    }
+
+    fn calling_conventions(&self) -> &[CallingConvention] {
+        &self.calling_conventions
+    }
+
+    fn default_calling_convention(&self) -> Option<&CallingConvention> {
+        self.calling_conventions.first()
+    }
+
+    fn stack_pointer(&self) -> Option<&RegisterInfo> {
+        self.register_by_name("sp")
+    }
+}
+
+/// Decodes a thread keeps by AArch64 instruction word at most (emptied when full).
+const A64_DECODES_CAP: usize = 1 << 14;
+
+thread_local! {
+    /// The decode of each AArch64 instruction word that does not read the PC, at the address it
+    /// was first decoded at.
+    static A64_DECODES: std::cell::RefCell<rustc_hash::FxHashMap<u32, DecodedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// Does the AArch64 instruction `word` read the PC (its operands depend on its address)? The
+/// PC-relative encodings: `B` / `BL`, `CBZ` / `CBNZ`, `TBZ` / `TBNZ`, `B.cond`, `ADR` / `ADRP`
+/// and the literal loads; every other encoding decodes the same at any address.
+pub fn aarch64_pc_relative(word: u32) -> bool {
+    (word >> 26) & 0x1f == 0x05 // B, BL
+        || (word >> 25) & 0x3e == 0x1a // CBZ/CBNZ (011010), TBZ/TBNZ (011011)
+        || (word >> 24) & 0xfe == 0x54 // B.cond
+        || (word >> 24) & 0x1f == 0x10 // ADR, ADRP
+        || (word >> 24) & 0x3b == 0x18 // load literal
+}
+
+impl ArmArch {
+    /// The instruction `buf` starts with, at `address`, decoded by Capstone.
+    fn decode_with_capstone(&self, buf: &[u8], address: u64) -> Result<DecodedInstruction, DisasmError> {
+        let insns = self.cs.disasm_count(buf, address, 1)?;
 
         let insn = insns.iter().next().ok_or_else(|| DisasmError::DecodeError {
             address,
@@ -240,18 +299,6 @@ impl Architecture for ArmArch {
         let branch_target = extract_arm_branch_target(&operands, &flow_type);
 
         Ok(DecodedInstruction::new(address, length, mnemonic, operands, bytes, flow_type, branch_target))
-    }
-
-    fn calling_conventions(&self) -> &[CallingConvention] {
-        &self.calling_conventions
-    }
-
-    fn default_calling_convention(&self) -> Option<&CallingConvention> {
-        self.calling_conventions.first()
-    }
-
-    fn stack_pointer(&self) -> Option<&RegisterInfo> {
-        self.register_by_name("sp")
     }
 }
 
@@ -311,6 +358,31 @@ mod tests {
     use reargo_core::address::SpaceId;
     use reargo_loader::memory::{MemoryBlock, MemoryFlags};
     use std::sync::Arc;
+
+    /// Every word `aarch64_pc_relative` leaves out decodes the same at any address (what the
+    /// decode memo relies on).
+    #[test]
+    fn aarch64_non_pc_relative_words_decode_alike() {
+        let arch = ArmArch::new_aarch64().unwrap();
+        let at = |w: u32, a: u64| {
+            arch.decode_with_capstone(&w.to_le_bytes(), a)
+                .ok()
+                .map(|d| (d.mnemonic().to_string(), d.operands().to_string(), d.flow_type, d.branch_target, d.length, d.bytes.clone()))
+        };
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut checked = 0;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let w = (x >> 32) as u32;
+            if aarch64_pc_relative(w) {
+                continue;
+            }
+            let a = at(w, 0x40_1000);
+            assert_eq!(a, at(w, 0x7f_6543_2100), "word {w:08x}");
+            checked += usize::from(a.is_some());
+        }
+        assert!(checked > 10_000);
+    }
 
     fn make_memory(data: &[u8], addr: u64, endian: Endian) -> Memory {
         let mut mem = Memory::new(SpaceId(1), endian);

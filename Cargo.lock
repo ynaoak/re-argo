@@ -594,6 +594,7 @@ dependencies = [
  "quick-xml",
  "reargo-core",
  "reargo-loader",
+ "rustc-hash",
  "serde",
  "smallvec",
  "thiserror",
