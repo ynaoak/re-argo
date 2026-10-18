@@ -4929,4 +4929,92 @@ mod tests {
         let c = c_raw(&[0x8b, 0x44, 0xb7, 0x02, 0xc3]);
         assert!(!c.contains('['), "{c}");
     }
+
+    /// WS97: a `while` whose body ends stepping the register its test reads is a `for`.
+    #[test]
+    fn while_stepping_its_test_register_is_a_for() {
+        // xor eax, eax; 1: cmp rdi, rsi; je 2f; mov qword [rdi], 0; add rdi, 8; jmp 1b; 2: ret
+        let code = [0x31, 0xc0, 0x48, 0x39, 0xf7, 0x74, 0x0d, 0x48, 0xc7, 0x07, 0, 0, 0, 0, 0x48, 0x83, 0xc7, 0x08, 0xeb, 0xee, 0xc3];
+        let c = c_raw(&code);
+        assert!(c.contains("for (; rdi != rsi; rdi += 8) {"), "{c}");
+        assert!(c.contains("*(uint64_t*)rdi = 0;") && !c.contains("rdi = rdi + 8;"), "{c}");
+    }
+
+    /// WS97: a `do … while` becomes a `for` only when its test holds on entry: here the branch
+    /// before it compares the same values (`if (rdi == rsi) return;`).
+    #[test]
+    fn guarded_do_while_is_a_for() {
+        // cmp rdi, rsi; je 2f; 1: mov qword [rdi], 0; add rdi, 8; cmp rdi, rsi; jne 1b; 2: ret
+        let code = [0x48, 0x39, 0xf7, 0x74, 0x10, 0x48, 0xc7, 0x07, 0, 0, 0, 0, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xf7, 0x75, 0xf0, 0xc3];
+        let c = c_raw(&code);
+        assert!(c.contains("for (; rdi != rsi; rdi += 8) {"), "{c}");
+        assert!(!c.contains("do {"), "{c}");
+        // the guard compares other values (`rdi == rdx`): the body may run once with rdi == rsi
+        let mut other = code;
+        other[2] = 0xd7; // cmp rdi, rdx
+        let c = c_raw(&other);
+        assert!(c.contains("do {") && c.contains("} while (rdi != rsi);") && !c.contains("for ("), "{c}");
+        // a statement after the update reads the stepped value as `R + k` (mov rax, rdi after add rdi, 8)
+        let c = c_raw(&[0x48, 0x39, 0xf7, 0x74, 0x13, 0x48, 0xc7, 0x07, 0, 0, 0, 0, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x89, 0xf8, 0x48, 0x39, 0xf7, 0x75, 0xed, 0xc3]);
+        assert!(c.contains("for (; rdi != rsi; rdi += 8) {") && c.contains("rax = rdi + 8;"), "{c}");
+    }
+
+    /// WS97: a counted loop: the guard `n != 0` makes the first test `0 != n` hold, and the
+    /// induction variable's initialisation right before the loop is the init clause.
+    #[test]
+    fn counted_loop_is_a_for_with_its_init() {
+        // test rsi, rsi; je 2f; xor eax, eax; 1: mov byte [rdi+rax], 0; add rax, 1; cmp rsi, rax; jne 1b; 2: ret
+        let c = c_raw(&[0x48, 0x85, 0xf6, 0x74, 0x0f, 0x31, 0xc0, 0xc6, 0x04, 0x07, 0x00, 0x48, 0x83, 0xc0, 0x01, 0x48, 0x39, 0xc6, 0x75, 0xf3, 0xc3]);
+        assert!(c.contains("for (rax = 0; rsi != rax; rax++) {"), "{c}");
+        assert!(!c.lines().any(|l| l.trim() == "rax = 0;"), "{c}");
+        // `jb`: `rax < rsi` unsigned, `0 <u rsi` from `rsi != 0`
+        // test rsi, rsi; je 2f; xor eax, eax; 1: add qword [rdi+rax*8], 1; add rax, 1; cmp rax, rsi; jb 1b; 2: ret
+        let c = c_raw(&[0x48, 0x85, 0xf6, 0x74, 0x10, 0x31, 0xc0, 0x48, 0x83, 0x04, 0xc7, 0x01, 0x48, 0x83, 0xc0, 0x01, 0x48, 0x39, 0xf0, 0x72, 0xf2, 0xc3]);
+        assert!(c.contains("for (rax = 0; rax < rsi; rax++) {"), "{c}");
+        assert!(c.contains("((uint64_t*)rdi)[rax] = ((uint64_t*)rdi)[rax] + 1;"), "{c}");
+    }
+
+    /// WS97, Rust: a `do … while` tested on entry is a `while`; `R < n` stepping `R` by one,
+    /// with `R` not read after the loop, is `for R in a..n`.
+    #[test]
+    fn rust_loops_tested_on_entry() {
+        let rust = |code: &[u8]| decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        // cmp rdi, rsi; je 2f; 1: mov qword [rdi], 0; add rdi, 8; cmp rdi, rsi; jne 1b; 2: ret
+        let r = rust(&[0x48, 0x39, 0xf7, 0x74, 0x10, 0x48, 0xc7, 0x07, 0, 0, 0, 0, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xf7, 0x75, 0xf0, 0xc3]);
+        assert!(r.contains("while rdi != rsi {") && r.contains("rdi = rdi.wrapping_add(8);") && !r.contains("loop {"), "{r}");
+        // test rsi, rsi; je 2f; xor eax, eax; 1: add qword [rdi+rax*8], 1; add rax, 1; cmp rax, rsi; jb 1b; 2: xor eax, eax; ret
+        let code = [0x48, 0x85, 0xf6, 0x74, 0x10, 0x31, 0xc0, 0x48, 0x83, 0x04, 0xc7, 0x01, 0x48, 0x83, 0xc0, 0x01, 0x48, 0x39, 0xf0, 0x72, 0xf2, 0x31, 0xc0, 0xc3];
+        let r = rust(&code);
+        assert!(r.contains("for rax in 0..rsi {") && !r.contains("rax = rax.wrapping_add(1);"), "{r}");
+        // the same loop storing the counter after it (mov [rdx], rax; ret): no range
+        let mut ret = code[..code.len() - 3].to_vec();
+        ret.extend([0x48, 0x89, 0x02, 0xc3]);
+        let r = rust(&ret);
+        assert!(r.contains("while rax < rsi {") && r.contains("rax = rax.wrapping_add(1);") && !r.contains("for rax"), "{r}");
+    }
+
+    /// WS97: an update in the middle of the latch moves to the end; the statements after it read
+    /// the stepped value as `R + k`.
+    #[test]
+    fn update_before_the_end_of_the_latch_moves_to_the_header() {
+        // cmp rdi, rsi; je 2f; 1: add rdi, 16; mov eax, [rdi-4]; add [rdx], eax; cmp rdi, rsi; jne 1b; 2: ret
+        let code = [0x48, 0x39, 0xf7, 0x74, 0x0e, 0x48, 0x83, 0xc7, 0x10, 0x8b, 0x47, 0xfc, 0x01, 0x02, 0x48, 0x39, 0xf7, 0x75, 0xf2, 0xc3];
+        let c = c_raw(&code);
+        assert!(c.contains("for (; rdi != rsi; rdi += 0x10) {"), "{c}");
+        assert!(c.contains("*(uint32_t*)(rdi + 0xc)") && !c.contains("rdi - 4"), "{c}");
+        // (the Rust output keeps the update in place: `while c { …; rdi = …; …(rdi - 4) }`)
+        let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(r.contains("while rdi != rsi {") && r.contains("rdi = rdi.wrapping_add(0x10);") && r.contains("rdi.wrapping_sub(4)"), "{r}");
+    }
+
+    /// WS97: a loop to a fixed end (`rdx = rdi + 0x128`) needs no guard: `rdi != rdi + 0x128`.
+    #[test]
+    fn loop_to_a_fixed_end_is_a_for() {
+        // lea rdx, [rdi+0x128]; xor eax, eax; 1: add rax, [rdi]; add rdi, 8; cmp rdi, rdx; jne 1b; ret
+        let c = c_raw(&[0x48, 0x8d, 0x97, 0x28, 0x01, 0x00, 0x00, 0x31, 0xc0, 0x48, 0x03, 0x07, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xd7, 0x75, 0xf4, 0xc3]);
+        assert!(c.contains("for (; rdi != rdx; rdi += 8) {"), "{c}");
+        // (the end 8 bytes on: the first test may fail, the loop runs once)
+        let c = c_raw(&[0x48, 0x8d, 0x97, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x48, 0x03, 0x07, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xd7, 0x75, 0xf4, 0xc3]);
+        assert!(!c.contains("for ("), "{c}");
+    }
 }

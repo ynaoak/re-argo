@@ -72,6 +72,12 @@ pub struct RustEmitter<'a> {
     swap_hidden: rustc_hash::FxHashSet<usize>,
     /// Struct fields and virtual calls (WS91, as in C).
     structs: Option<&'a crate::structs::StructView>,
+    /// Loops printed as `for R in a..n` (WS97, [`crate::forloop`]), by condition block, and
+    /// the updates the range does.
+    ranges: rustc_hash::FxHashMap<usize, (String, crate::forloop::RangeInfo)>,
+    moved: rustc_hash::FxHashSet<usize>,
+    /// The `do … while` loops whose test holds on entry (WS97): printed as `while c { … }`.
+    entry_tested: rustc_hash::FxHashSet<usize>,
 }
 
 impl Default for RustEmitter<'static> {
@@ -105,6 +111,9 @@ impl RustEmitter<'static> {
             swaps: Default::default(),
             swap_hidden: Default::default(),
             structs: None,
+            ranges: Default::default(),
+            moved: Default::default(),
+            entry_tested: Default::default(),
         }
     }
 }
@@ -138,6 +147,9 @@ impl<'a> RustEmitter<'a> {
             swaps: Default::default(),
             swap_hidden: Default::default(),
             structs: None,
+            ranges: Default::default(),
+            moved: Default::default(),
+            entry_tested: Default::default(),
         }
     }
 
@@ -249,6 +261,58 @@ impl<'a> RustEmitter<'a> {
         Some((cat!("(*", base, ").", f.name()), f))
     }
 
+    /// Fill `ranges` / `moved` / `entry_tested` from [`crate::forloop::find`] (WS97): a range
+    /// only when the update prints as `R = R.wrapping_add(1);`.
+    fn find_for_loops(&mut self, func: &SsaFunction, structured: &StructuredBlock) {
+        self.ranges.clear();
+        self.moved.clear();
+        self.entry_tested.clear();
+        let mut gotos = std::collections::BTreeSet::new();
+        crate::emit::collect_goto_targets(structured, &mut gotos);
+        let printed = |o: usize| {
+            let op = &func.ops[o];
+            !op.dead && !self.noise.contains(&o) && !self.folded.contains(&o) && self.emit_op(func, op).is_some()
+        };
+        let merged = |b: usize| self.conds.is_some_and(|c| c.contains_key(&b));
+        let ctx = crate::forloop::Context { structured, goto_targets: &gotos, merged: &merged, printed: &printed };
+        let found = crate::forloop::find(func, &ctx);
+        let mut ranges = Vec::new();
+        for (cond, info) in found {
+            if info.do_while {
+                self.entry_tested.insert(cond);
+            }
+            let Some(r) = info.range else { continue };
+            let Some(line) = self.emit_op(func, &func.ops[r.update]) else { continue };
+            let Some(var) = line.strip_suffix(".wrapping_add(1);").and_then(|l| l.split_once(" = ")).filter(|(a, b)| a == b).map(|(a, _)| a.to_string()) else { continue };
+            ranges.push((cond, var, r));
+        }
+        for (cond, var, r) in ranges {
+            self.moved.insert(r.update);
+            self.ranges.insert(cond, (var, r));
+        }
+    }
+
+    /// The start of a `for R in a..n` (WS97): the statement `R = a;` printed right before the
+    /// loop, taken out of the output, else `R` itself.
+    fn take_range_start(&mut self, var: &str) -> String {
+        let prefix = "    ".repeat(self.indent);
+        let body = self.output.strip_suffix('\n').unwrap_or(&self.output);
+        let start = body.rfind('\n').map_or(0, |i| i + 1);
+        let a = body[start..]
+            .strip_prefix(prefix.as_str())
+            .and_then(|l| l.strip_suffix(';'))
+            .and_then(|l| l.split_once(" = "))
+            .filter(|(r, x)| *r == var && !x.contains("//") && !x.is_empty())
+            .map(|(_, x)| x.to_string());
+        match a {
+            Some(x) => {
+                self.output.truncate(start);
+                x
+            }
+            None => var.to_string(),
+        }
+    }
+
     pub fn emit_function(
         &mut self,
         func: &SsaFunction,
@@ -293,6 +357,8 @@ impl<'a> RustEmitter<'a> {
             let vptrs = sv.folded_vptr_loads(func, &|o| inl.contains(&o), &|c| self.member_call_obj(func, &func.ops[c]).is_some());
             self.folded.extend(vptrs);
         }
+        // WS97: `for R in a..n`, and `do … while` loops tested on entry as `while`
+        self.find_for_loops(func, structured);
         let mut sig = infer_signature(func);
         // WS91: a parameter pointing to a struct is typed so
         if let Some(sv) = self.structs {
@@ -425,7 +491,15 @@ impl<'a> RustEmitter<'a> {
                 self.emit_basic_block_no_branch(func, *condition_block);
                 let stmts = self.output.split_off(mark);
                 self.indent -= 1;
-                if stmts.lines().all(|l| l.trim_start().starts_with("//")) {
+                if stmts.lines().all(|l| l.trim_start().starts_with("//")) && let Some((var, r)) = self.ranges.get(condition_block).cloned() {
+                    // WS97: `for R in a..n`
+                    let start = self.take_range_start(&var);
+                    for l in stmts.lines() {
+                        self.line(l.trim_start());
+                    }
+                    linef!(self, "for {} in {}..{} {{", var, start, self.input_expr(func, &func.ops[r.cmp], r.bound));
+                    self.indent += 1;
+                } else if stmts.lines().all(|l| l.trim_start().starts_with("//")) {
                     for l in stmts.lines() {
                         self.line(l.trim_start());
                     }
@@ -438,6 +512,25 @@ impl<'a> RustEmitter<'a> {
                     linef!(self, "if {} {{ break; }}", self.condition_text(func, *condition_block, !*negated));
                 }
                 self.emit_block(func, body);
+                self.indent -= 1;
+                self.line("}");
+            }
+            StructuredBlock::DoWhileLoop {
+                body,
+                condition_block,
+                negated,
+            } if self.entry_tested.contains(condition_block) => {
+                // WS97: its test holds on entry: `while c { … }` (`for R in a..n`), the update last
+                match self.ranges.get(condition_block).cloned() {
+                    Some((var, r)) => {
+                        let start = self.take_range_start(&var);
+                        linef!(self, "for {} in {}..{} {{", var, start, self.input_expr(func, &func.ops[r.cmp], r.bound));
+                    }
+                    None => linef!(self, "while {} {{", self.condition_text(func, *condition_block, *negated)),
+                }
+                self.indent += 1;
+                self.emit_block(func, body);
+                self.emit_basic_block_no_branch(func, *condition_block);
                 self.indent -= 1;
                 self.line("}");
             }
@@ -566,7 +659,7 @@ impl<'a> RustEmitter<'a> {
         for &k in self.block_ops.of(func, block_id).iter() {
             let op = &func.ops[k as usize];
             // (a folded op only feeds the branch, which prints nothing here)
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) || self.moved.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -600,7 +693,7 @@ impl<'a> RustEmitter<'a> {
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for &k in self.block_ops.of(func, block_id).iter() {
             let op = &func.ops[k as usize];
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) || self.moved.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {

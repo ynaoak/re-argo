@@ -126,6 +126,16 @@ pub struct CEmitter<'a> {
     swap_hidden: rustc_hash::FxHashSet<usize>,
     /// Struct fields and virtual calls (WS91, `structs`); `None`: every access prints raw.
     structs: Option<&'a crate::structs::StructView>,
+    /// Loops printed as `for` (WS97, [`crate::forloop`]): by condition block, the update clause
+    /// and the registers it steps.
+    for_loops: rustc_hash::FxHashMap<usize, (String, Vec<String>, Vec<usize>)>,
+    /// The update statements printed in a `for` header, not in the body.
+    moved: rustc_hash::FxHashSet<usize>,
+    /// Per `for` (by condition block), the stepped values the rest of its latch reads (the
+    /// update moved to the end): `R + k` there.
+    sunk_by_loop: rustc_hash::FxHashMap<usize, Vec<(crate::condition::ValueKey, String, i64)>>,
+    /// The ones of the loops being printed.
+    sunk: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, (String, i64)>>,
 }
 
 /// Temporaries printed as the register they are copied to (WS88, `inline::coalesced`): the
@@ -186,6 +196,10 @@ impl CEmitter<'static> {
             swaps: Default::default(),
             swap_hidden: Default::default(),
             structs: None,
+            for_loops: Default::default(),
+            moved: Default::default(),
+            sunk_by_loop: Default::default(),
+            sunk: Default::default(),
         }
     }
 }
@@ -233,6 +247,10 @@ impl<'a> CEmitter<'a> {
             swaps: Default::default(),
             swap_hidden: Default::default(),
             structs: None,
+            for_loops: Default::default(),
+            moved: Default::default(),
+            sunk_by_loop: Default::default(),
+            sunk: Default::default(),
         }
     }
 
@@ -325,6 +343,8 @@ impl<'a> CEmitter<'a> {
             let vptrs = sv.folded_vptr_loads(func, &|o| inl.contains(&o), &|c| self.member_call(func, &func.ops[c]).is_some());
             self.folded.extend(vptrs);
         }
+        // WS97: loops stepping their induction variables at the end print as `for`
+        self.find_for_loops(func, structured);
         let mut sig = infer_signature(func);
         // WS91: a parameter pointing to a struct is typed so
         if let Some(sv) = self.structs {
@@ -482,7 +502,23 @@ impl<'a> CEmitter<'a> {
                 let stmts = self.output.split_off(mark);
                 self.indent -= 1;
                 let code_free = stmts.lines().all(|l| l.trim_start().starts_with("//"));
-                if code_free {
+                let is_for = code_free && self.for_loops.contains_key(condition_block);
+                if !is_for && let Some((_, _, ups)) = self.for_loops.remove(condition_block) {
+                    // (printed as before: its updates in the body)
+                    for u in ups {
+                        self.moved.remove(&u);
+                    }
+                }
+                if is_for {
+                    let upd = self.for_loops[condition_block].0.clone();
+                    // WS97: `for (init; c; update)`
+                    let init = self.take_init(func, *condition_block);
+                    for l in stmts.lines() {
+                        self.line(l.trim_start());
+                    }
+                    linef!(self, "for ({}; {}; {}) {{", init, self.condition_text(func, *condition_block, *negated), upd);
+                    self.indent += 1;
+                } else if code_free {
                     for l in stmts.lines() {
                         self.line(l.trim_start());
                     }
@@ -494,7 +530,25 @@ impl<'a> CEmitter<'a> {
                     self.output.push_str(&stmts);
                     linef!(self, "if ({}) break;", self.condition_text(func, *condition_block, !*negated));
                 }
-                self.emit_block(func, body);
+                if is_for {
+                    self.emit_for_body(func, *condition_block, body, false);
+                } else {
+                    self.emit_block(func, body);
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
+            StructuredBlock::DoWhileLoop {
+                body,
+                condition_block,
+                negated,
+            } if self.for_loops.contains_key(condition_block) => {
+                // WS97: a `do … while` whose test holds on entry, `for (init; c; update)`
+                let upd = self.for_loops[condition_block].0.clone();
+                let init = self.take_init(func, *condition_block);
+                linef!(self, "for ({}; {}; {}) {{", init, self.condition_text(func, *condition_block, *negated), upd);
+                self.indent += 1;
+                self.emit_for_body(func, *condition_block, body, true);
                 self.indent -= 1;
                 self.line("}");
             }
@@ -618,7 +672,7 @@ impl<'a> CEmitter<'a> {
         for &k in self.block_ops.of(func, block_id).iter() {
             let op = &func.ops[k as usize];
             // (a folded op only feeds the branch, which prints nothing here)
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) || self.moved.contains(&op.index) {
                 continue;
             }
             self.emit_annotations_for(op.address);
@@ -631,7 +685,7 @@ impl<'a> CEmitter<'a> {
     fn emit_basic_block_no_branch(&mut self, func: &SsaFunction, block_id: usize) {
         for &k in self.block_ops.of(func, block_id).iter() {
             let op = &func.ops[k as usize];
-            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) {
+            if op.dead || op.block != block_id || self.noise.contains(&op.index) || self.folded.contains(&op.index) || self.moved.contains(&op.index) {
                 continue;
             }
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch) {
@@ -646,6 +700,112 @@ impl<'a> CEmitter<'a> {
                 self.line(&line);
             }
         }
+    }
+
+    /// Fill `for_loops` / `moved` (WS97): the loops [`crate::forloop::find`] recovers whose
+    /// updates print as `R = R + k;` / `R = R - k;`, with their update clause (`rax++, rdi += 8`).
+    fn find_for_loops(&mut self, func: &SsaFunction, structured: &StructuredBlock) {
+        self.for_loops.clear();
+        self.moved.clear();
+        self.sunk_by_loop.clear();
+        self.sunk.borrow_mut().clear();
+        let printed = |o: usize| {
+            let op = &func.ops[o];
+            !op.dead && !self.noise.contains(&o) && !self.folded.contains(&o) && self.emit_op(func, op).is_some()
+        };
+        let merged = |b: usize| self.conds.is_some_and(|c| c.contains_key(&b));
+        let ctx = crate::forloop::Context { structured, goto_targets: &self.goto_targets, merged: &merged, printed: &printed };
+        let found = crate::forloop::find(func, &ctx);
+        let mut loops = Vec::new();
+        for (cond, info) in found {
+            let parts: Option<Vec<(String, String)>> = info.updates.iter().map(|&u| self.emit_op(func, &func.ops[u]).and_then(|l| crate::forloop::c_update(&l))).collect();
+            if let Some(p) = parts {
+                // (a merged test must read a stepped register)
+                if info.test_unknown {
+                    let c = self.condition_text(func, cond, false);
+                    if !p.iter().any(|x| crate::forloop::reads_name(&c, &x.0)) {
+                        continue;
+                    }
+                }
+                let text = p.iter().map(|x| x.1.as_str()).collect::<Vec<_>>().join(", ");
+                // the stepped values read after their update: `R + k`
+                let mut sunk = Vec::new();
+                for &u in &info.sunk {
+                    let op = &func.ops[u];
+                    let k = func.varnodes[op.inputs[1] as usize].data;
+                    let size = func.varnodes[op.output.expect("an update") as usize].data.size;
+                    let c = sign_extend(k.offset, k.size.min(size));
+                    let step = if op.opcode == OpCode::IntSub { c.wrapping_neg() } else { c };
+                    let Some(k) = info.updates.iter().position(|&x| x == u) else { continue };
+                    sunk.push((crate::condition::value_key(func, op.output.expect("an update")), p[k].0.clone(), step));
+                }
+                loops.push((cond, text, p.into_iter().map(|x| x.0).collect::<Vec<_>>(), info.updates, sunk));
+            }
+        }
+        for (cond, text, regs, ups, sunk) in loops {
+            self.moved.extend(ups.iter().copied());
+            self.for_loops.insert(cond, (text, regs, ups));
+            if !sunk.is_empty() {
+                self.sunk_by_loop.insert(cond, sunk);
+            }
+        }
+    }
+
+    /// Print the body of the `for` with condition block `cond`, its stepped values read after
+    /// their update as `R + k` (WS97).
+    fn emit_for_body(&mut self, func: &SsaFunction, cond: usize, body: &StructuredBlock, latch_too: bool) {
+        let sunk = self.sunk_by_loop.get(&cond).cloned().unwrap_or_default();
+        for (k, r, step) in &sunk {
+            self.sunk.borrow_mut().insert(*k, (r.clone(), *step));
+        }
+        self.emit_block(func, body);
+        if latch_too {
+            self.emit_basic_block_no_branch(func, cond);
+        }
+        for (k, _, _) in &sunk {
+            self.sunk.borrow_mut().remove(k);
+        }
+    }
+
+    /// `R + k` for a stepped value read after its update, moved to the end of a `for` (WS97):
+    /// the register and `k`.
+    fn sunk_value(&self, func: &SsaFunction, v: crate::ssa::VarId) -> Option<(String, i64)> {
+        let s = self.sunk.borrow();
+        if s.is_empty() {
+            return None;
+        }
+        s.get(&crate::condition::value_key(func, v)).cloned()
+    }
+
+    /// The `for` init clause (WS97): the statements right before the loop (the last lines
+    /// printed, at this indentation) that set a register the loop with condition block `cond`
+    /// steps, taken out of the output — `rax = 0, rdx = rdi`, or empty.
+    fn take_init(&mut self, _func: &SsaFunction, cond: usize) -> String {
+        let regs = self.for_loops.get(&cond).map(|l| l.1.clone()).unwrap_or_default();
+        let prefix = "    ".repeat(self.indent);
+        // the last lines at this indentation: (start in the output, statement)
+        let mut lines: Vec<(usize, usize, String)> = Vec::new();
+        let mut end = self.output.len();
+        while lines.len() < 4 && end > 0 {
+            let body = &self.output[..end];
+            let body = body.strip_suffix('\n').unwrap_or(body);
+            let start = body.rfind('\n').map_or(0, |i| i + 1);
+            let Some(stmt) = body[start..].strip_prefix(prefix.as_str()) else { break };
+            if stmt.starts_with(' ') {
+                break;
+            }
+            lines.push((start, end, stmt.to_string()));
+            end = start;
+        }
+        lines.reverse();
+        let stmts: Vec<&str> = lines.iter().map(|l| l.2.as_str()).collect();
+        let Some((taken, inits)) = crate::forloop::split_init(&stmts, &regs) else { return String::new() };
+        // (removed from the last up, so the earlier positions hold)
+        for &k in taken.iter().rev() {
+            let (start, end, _) = lines[k];
+            self.output.replace_range(start..end, "");
+        }
+        inits.join(", ")
     }
 
     /// Emit any analyzer-supplied annotations for `addr` as `// …`
@@ -723,6 +883,15 @@ impl<'a> CEmitter<'a> {
             }
             OpCode::IntAdd => {
                 let dst = out_name?;
+                // a stepped value read after its update moved to the end of a `for` (WS97):
+                // `(R + k) + c` is `R + (k + c)`
+                if let Some((r, k)) = self.sunk_value(func, op.inputs[0])
+                    && let Some(&c) = op.inputs.get(1)
+                    && func.varnodes[c as usize].data.space == SpaceId::CONST
+                {
+                    let c = &func.varnodes[c as usize].data;
+                    return Some(cat!(dst, " = ", offset_text(&r, k.wrapping_add(sign_extend(c.offset, c.size))), ";"));
+                }
                 let a = self.input_expr(func, op, 0);
                 // `x + 0xfffffffffffffffa` is `x - 6` (WS83)
                 if let Some(k) = op.inputs.get(1).and_then(|&v| negative_constant(&func.varnodes[v as usize].data)) {
@@ -1515,6 +1684,13 @@ impl<'a> CEmitter<'a> {
         if let Some(r) = self.coalesced.values.get(&crate::condition::value_key(func, op.inputs[idx])) {
             return r.clone();
         }
+        // a stepped value read after its update moved to the end of a `for` (WS97)
+        if let Some((r, k)) = self.sunk_value(func, op.inputs[idx]) {
+            let whole = (op.opcode == OpCode::Store && idx == 2)
+                || op.opcode == OpCode::Copy
+                || (matches!(op.opcode, OpCode::Call | OpCode::CallOther | OpCode::CallInd) && idx > 0);
+            return if k == 0 || whole { offset_text(&r, k) } else { cat!("(", offset_text(&r, k), ")") };
+        }
         let inlined = self.inlined.borrow().get(&crate::condition::value_key(func, op.inputs[idx])).copied();
         if let Some(rhs) = inlined.and_then(|d| self.inline_text(func, d)) {
             // a whole right-hand side needs no parentheses
@@ -1920,7 +2096,7 @@ struct FunctionSignature {
 }
 
 /// Every block a `Goto` in the tree jumps to.
-fn collect_goto_targets(block: &StructuredBlock, out: &mut std::collections::BTreeSet<usize>) {
+pub(crate) fn collect_goto_targets(block: &StructuredBlock, out: &mut std::collections::BTreeSet<usize>) {
     use StructuredBlock::*;
     match block {
         Goto(t) => {
@@ -2629,6 +2805,25 @@ pub(crate) fn negative_constant(v: &reargo_core::pcode::VarnodeData) -> Option<u
 }
 
 /// A constant as the C output prints it: decimal below 10, else hex.
+/// `v` of `size` bytes as a signed number.
+pub(crate) fn sign_extend(v: u64, size: u32) -> i64 {
+    if size >= 8 || size == 0 {
+        v as i64
+    } else {
+        let sh = 64 - 8 * size;
+        ((v << sh) as i64) >> sh
+    }
+}
+
+/// `r + k` / `r - k` / `r` (WS97).
+fn offset_text(r: &str, k: i64) -> String {
+    match k {
+        0 => r.to_string(),
+        k if k > 0 => cat!(r, " + ", small_hex(k as u64)),
+        k => cat!(r, " - ", small_hex(k.unsigned_abs())),
+    }
+}
+
 pub(crate) fn small_hex(k: u64) -> String {
     if k < 10 { k.to_string() } else { format!("0x{k:x}") }
 }

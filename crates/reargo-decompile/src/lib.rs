@@ -30,6 +30,7 @@ pub mod effects;
 pub mod emit;
 pub mod exception;
 pub mod flags;
+pub mod forloop;
 pub mod fparity;
 pub mod frame;
 pub mod index;
