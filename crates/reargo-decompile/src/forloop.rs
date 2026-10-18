@@ -323,6 +323,8 @@ struct Analysis<'f> {
     idom: Vec<Option<BlockId>>,
     /// The live op defining each value.
     defs: FxHashMap<ValueKey, OpIdx>,
+    /// The live ops of each block, in order.
+    by_block: Vec<Vec<OpIdx>>,
     readers: Readers,
     /// The induction variables' values of the loop looked at: a term of their own (`R` is the
     /// register, whatever its update adds).
@@ -332,12 +334,16 @@ struct Analysis<'f> {
 impl<'f> Analysis<'f> {
     fn new(func: &'f SsaFunction) -> Self {
         let mut defs = FxHashMap::default();
+        let mut by_block: Vec<Vec<OpIdx>> = vec![Vec::new(); func.cfg.blocks.len()];
         for op in func.ops.iter().filter(|o| !o.dead) {
             if let Some(o) = op.output {
                 defs.insert(value_key(func, o), op.index);
             }
+            if let Some(b) = by_block.get_mut(op.block) {
+                b.push(op.index);
+            }
         }
-        Self { func, idom: crate::dominator::compute_idom(&func.cfg), defs, readers: Readers::new(func), opaque: Default::default() }
+        Self { func, idom: crate::dominator::compute_idom(&func.cfg), defs, by_block, readers: Readers::new(func), opaque: Default::default() }
     }
 
     fn def(&self, v: VarId) -> Option<&'f crate::ssa::SsaOp> {
@@ -397,7 +403,7 @@ impl<'f> Analysis<'f> {
             return None;
         }
         // a `while`'s header prints no statement (else it is `while (true) { …; if (!c) break; }`)
-        let block_ops = |b: BlockId| func.ops.iter().filter(move |o| o.block == b && !o.dead);
+        let block_ops = |b: BlockId| self.by_block[b].iter().map(|&o| &func.ops[o]);
         let is_stmt = |o: &crate::ssa::SsaOp| !matches!(o.opcode, OpCode::Branch | OpCode::CBranch | OpCode::BranchInd) && (ctx.printed)(o.index);
         if !l.do_while && block_ops(h).any(is_stmt) {
             return None;
@@ -415,11 +421,14 @@ impl<'f> Analysis<'f> {
         }
         // no other op of the loop writes an updated register (or a part of it), printed or not
         // (a copy a temporary prints as)
-        cands.retain(|u| {
-            !(0..cfg.blocks.len()).filter(|&b| body[b]).any(|b| {
-                block_ops(b).any(|o| o.index != u.0 && o.opcode != OpCode::MultiEqual && o.output.and_then(|v| self.reg(v)).is_some_and(|r| overlaps(u.1, r)))
-            })
-        });
+        let writes: Vec<(OpIdx, (u64, u32))> = (0..cfg.blocks.len())
+            .filter(|&b| body[b])
+            .flat_map(block_ops)
+            .filter(|o| o.opcode != OpCode::MultiEqual)
+            .filter_map(|o| Some((o.index, self.reg(o.output?)?)))
+            .filter(|w| cands.iter().any(|u| overlaps(u.1, w.1)))
+            .collect();
+        cands.retain(|u| !writes.iter().any(|w| w.0 != u.0 && overlaps(u.1, w.1)));
         // after the update the loop reads the stepped value only in the rest of the latch (where
         // it prints as `R + k`: `R` is stepped at the end now), its test and the header's phi;
         // the value before the update not at all
@@ -602,7 +611,7 @@ impl<'f> Analysis<'f> {
         if succ.len() != 2 || body[succ[0]] == body[succ[1]] {
             return None;
         }
-        let br = func.ops.iter().rev().find(|o| o.block == cond && !o.dead && o.opcode == OpCode::CBranch)?;
+        let br = self.by_block[cond].iter().rev().map(|&o| &func.ops[o]).find(|o| o.opcode == OpCode::CBranch)?;
         let flag = *br.inputs.get(1)?;
         let ((cmp_op, neg), mut cmp) = self.compare(flag)?;
         // (the branch goes to its first successor when the flag is true)
@@ -779,7 +788,7 @@ impl<'f> Analysis<'f> {
         if succ.len() != 2 || succ[0] == succ[1] || !succ.contains(&t) {
             return None;
         }
-        let br = func.ops.iter().rev().find(|o| o.block == x && !o.dead && o.opcode == OpCode::CBranch)?;
+        let br = self.by_block[x].iter().rev().map(|&o| &func.ops[o]).find(|o| o.opcode == OpCode::CBranch)?;
         let (_, c) = self.compare(*br.inputs.get(1)?)?;
         Some(if succ[0] == t { c } else { c.negate() })
     }
