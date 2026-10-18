@@ -226,7 +226,14 @@ impl Architecture for ArmArch {
 
         // (an AArch64 instruction that does not read the PC decodes the same at every address:
         // the decode of the same word made before, moved to `address`)
-        let word = (self.is_64 && buf.len() == 4).then(|| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])).filter(|&w| !aarch64_pc_relative(w));
+        let word = (self.is_64 && buf.len() == 4).then(|| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+        // (a PC-relative branch or address is decoded without Capstone)
+        if let Some(w) = word
+            && let Some(d) = decode_pc_relative(w, &buf, address)
+        {
+            return Ok(d);
+        }
+        let word = word.filter(|&w| !aarch64_pc_relative(w));
         if let Some(w) = word
             && let Some(known) = A64_DECODES.with(|m| m.borrow().get(&w).cloned())
         {
@@ -269,15 +276,16 @@ thread_local! {
     static A64_DECODES: std::cell::RefCell<rustc_hash::FxHashMap<u32, DecodedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
-/// Does the AArch64 instruction `word` read the PC (its operands depend on its address)? The
-/// PC-relative encodings: `B` / `BL`, `CBZ` / `CBNZ`, `TBZ` / `TBNZ`, `B.cond`, `ADR` / `ADRP`
-/// and the literal loads; every other encoding decodes the same at any address.
-pub fn aarch64_pc_relative(word: u32) -> bool {
-    (word >> 26) & 0x1f == 0x05 // B, BL
-        || (word >> 25) & 0x3e == 0x1a // CBZ/CBNZ (011010), TBZ/TBNZ (011011)
-        || (word >> 24) & 0xfe == 0x54 // B.cond
-        || (word >> 24) & 0x1f == 0x10 // ADR, ADRP
-        || (word >> 24) & 0x3b == 0x18 // load literal
+pub use reargo_core::aarch64::is_pc_relative as aarch64_pc_relative;
+
+/// The decode of the AArch64 PC-relative branch or address-forming instruction `word` (its
+/// bytes `buf`) at `address`, as Capstone's ([`reargo_core::aarch64::PcRelative`]).
+fn decode_pc_relative(word: u32, buf: &[u8], address: u64) -> Option<DecodedInstruction> {
+    let insn = reargo_core::aarch64::PcRelative::decode(word, address)?;
+    let (mnemonic, operands) = insn.text();
+    let flow_type = classify_arm_flow(&mnemonic, &operands, true);
+    let branch_target = extract_arm_branch_target(&operands, &flow_type);
+    Some(DecodedInstruction::new(address, 4, mnemonic, operands, SmallVec::from_slice(buf), flow_type, branch_target))
 }
 
 impl ArmArch {
@@ -382,6 +390,29 @@ mod tests {
             checked += usize::from(a.is_some());
         }
         assert!(checked > 10_000);
+    }
+
+    /// The PC-relative branches and addresses decoded without Capstone are Capstone's decodes.
+    #[test]
+    fn aarch64_pc_relative_decodes_as_capstone() {
+        let arch = ArmArch::new_aarch64().unwrap();
+        let key = |d: &DecodedInstruction| (d.address, d.mnemonic().to_string(), d.operands().to_string(), d.flow_type, d.branch_target, d.length, d.bytes.clone());
+        let mut x: u64 = 0x7a4d_9e3b_1c55_0f61;
+        let mut native = 0;
+        let addrs = [0u64, 4, 0x1000, 0x40_1ffc, 0x7f_6543_2100, 0xffff_ffff_ffff_f000, 0x8000_0000_0000_0000, 0xffff_ffff_ffff_fffc];
+        for i in 0..300_000u32 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let class = [(0xfc00_0000u32, 0x1400_0000u32), (0xfc00_0000, 0x9400_0000), (0x7e00_0000, 0x3400_0000), (0x7e00_0000, 0x3600_0000), (0xff00_0000, 0x5400_0000), (0x1f00_0000, 0x1000_0000), (0x3b00_0000, 0x1800_0000)][(i % 7) as usize];
+            let w = ((x >> 32) as u32 & !class.0) | class.1;
+            let a = addrs[((x >> 8) % 8) as usize].wrapping_add(((x >> 12) & 0xffff_fffc) * u64::from(i % 3 == 0)) & !3;
+            let b = w.to_le_bytes();
+            let cap = arch.decode_with_capstone(&b, a).ok().map(|d| key(&d));
+            if let Some(d) = decode_pc_relative(w, &b, a) {
+                assert_eq!(Some(key(&d)), cap, "word {w:08x} at {a:x}");
+                native += 1;
+            }
+        }
+        assert!(native > 200_000, "{native}");
     }
 
     fn make_memory(data: &[u8], addr: u64, endian: Endian) -> Memory {
