@@ -212,13 +212,26 @@ impl Architecture for ArmArch {
     ) -> Result<DecodedInstruction, DisasmError> {
         // Thumb instructions are 2 or 4 bytes; read up to 4 but tolerate a
         // 2-byte tail at the end of a section.
-        let mut buf: Vec<u8> = Vec::with_capacity(4);
-        for i in 0..4u64 {
-            match memory.read_byte(address + i) {
-                Some(b) => buf.push(b),
-                None => break,
+        let mut bytes = [0u8; 4];
+        let len = match memory.slice(address, 4) {
+            // (the bytes `read_byte` reads, in one lookup)
+            Some(s) => {
+                bytes.copy_from_slice(s);
+                4
             }
-        }
+            None => {
+                let mut n = 0;
+                while n < 4 {
+                    match memory.read_byte(address + n as u64) {
+                        Some(b) => bytes[n] = b,
+                        None => break,
+                    }
+                    n += 1;
+                }
+                n
+            }
+        };
+        let buf = &bytes[..len];
         let min_len = if self.thumb { 2 } else { 4 };
         if buf.len() < min_len {
             return Err(DisasmError::UnreadableAddress(address));
@@ -229,7 +242,7 @@ impl Architecture for ArmArch {
         let word = (self.is_64 && buf.len() == 4).then(|| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
         // (a PC-relative branch or address is decoded without Capstone)
         if let Some(w) = word
-            && let Some(d) = decode_pc_relative(w, &buf, address)
+            && let Some(d) = decode_pc_relative(w, buf, address)
         {
             return Ok(d);
         }
@@ -241,7 +254,7 @@ impl Architecture for ArmArch {
             d.address = address;
             return Ok(d);
         }
-        let decoded = self.decode_with_capstone(&buf, address)?;
+        let decoded = self.decode_with_capstone(buf, address)?;
         if let Some(w) = word {
             A64_DECODES.with(|m| {
                 let mut m = m.borrow_mut();

@@ -89,27 +89,43 @@ impl PcRelative {
 
     /// The mnemonic and the operands, as Capstone prints them.
     pub fn text(&self) -> (String, String) {
-        let reg = |x: bool, r: u8| match (x, r) {
-            (true, 31) => "xzr".to_string(),
-            (false, 31) => "wzr".to_string(),
-            (true, r) => format!("x{r}"),
-            (false, r) => format!("w{r}"),
+        use std::fmt::Write;
+        let mut ops = String::with_capacity(28);
+        let reg = |o: &mut String, x: bool, r: u8| {
+            let _ = match (x, r) {
+                (true, 31) => o.write_str("xzr"),
+                (false, 31) => o.write_str("wzr"),
+                (true, r) => write!(o, "x{r}"),
+                (false, r) => write!(o, "w{r}"),
+            };
+            o.push_str(", ");
         };
-        let target = bang(self.target());
-        match *self {
-            Self::Branch { link, .. } => ((if link { "bl" } else { "b" }).to_string(), target),
-            Self::CondBranch { cond, .. } => (format!("b.{}", CONDS[usize::from(cond)]), target),
-            Self::CompareBranch { nonzero, x, rt, .. } => ((if nonzero { "cbnz" } else { "cbz" }).to_string(), format!("{}, {target}", reg(x, rt))),
-            Self::TestBranch { nonzero, x, rt, bit, .. } => {
-                ((if nonzero { "tbnz" } else { "tbz" }).to_string(), format!("{}, {}, {target}", reg(x, rt), bang(u64::from(bit))))
+        let mnemonic = match *self {
+            Self::Branch { link, .. } => (if link { "bl" } else { "b" }).to_string(),
+            Self::CondBranch { cond, .. } => format!("b.{}", CONDS[usize::from(cond)]),
+            Self::CompareBranch { nonzero, x, rt, .. } => {
+                reg(&mut ops, x, rt);
+                (if nonzero { "cbnz" } else { "cbz" }).to_string()
             }
-            Self::Address { page, rd, .. } => ((if page { "adrp" } else { "adr" }).to_string(), format!("{}, {target}", reg(true, rd))),
-        }
+            Self::TestBranch { nonzero, x, rt, bit, .. } => {
+                reg(&mut ops, x, rt);
+                bang(&mut ops, u64::from(bit));
+                ops.push_str(", ");
+                (if nonzero { "tbnz" } else { "tbz" }).to_string()
+            }
+            Self::Address { page, rd, .. } => {
+                reg(&mut ops, true, rd);
+                (if page { "adrp" } else { "adr" }).to_string()
+            }
+        };
+        bang(&mut ops, self.target());
+        (mnemonic, ops)
     }
 }
 
 /// An unsigned immediate as Capstone prints it (`printUInt64Bang`): `#0x…` above 9, else
 /// decimal.
-fn bang(v: u64) -> String {
-    if v > 9 { format!("#0x{v:x}") } else { format!("#{v}") }
+fn bang(out: &mut String, v: u64) {
+    use std::fmt::Write;
+    let _ = if v > 9 { write!(out, "#0x{v:x}") } else { write!(out, "#{v}") };
 }
