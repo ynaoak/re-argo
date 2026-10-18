@@ -574,8 +574,11 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
     // identical opcode+inputs but are different values; merging them
     // redirected a 16-byte XMM use to the 8-byte view.
     // (the opcode itself: its names are distinct)
-    let mut seen: rustc_hash::FxHashMap<(usize, OpCode, u32, InKeys), ValueKey> =
+    // (the ops with at most two inputs — every pure op of the lifters — by a key of fixed size,
+    // the unused input left at its default: no key of the other map is equal to one of these)
+    let mut seen: rustc_hash::FxHashMap<(u32, OpCode, u32, u8, [ValueKey; 2]), ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx, Default::default());
+    let mut seen_wide: rustc_hash::FxHashMap<(usize, OpCode, u32, InKeys), ValueKey> = Default::default();
     let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx / 2, Default::default());
 
@@ -694,40 +697,60 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
         }
         let Some(out_id) = func.ops[i].output else { continue };
 
-        let mut in_keys: InKeys = func.ops[i]
-            .inputs
-            .iter()
-            .map(|&id| resolve_redirect(&redirects, value_key(func, id)))
-            .collect();
-        if is_commutative(opcode) {
-            in_keys.sort();
-        }
         let out_size = func.varnodes[out_id as usize].data.size;
-        let key = (func.ops[i].block, opcode, out_size, in_keys);
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
+        let n_in = func.ops[i].inputs.len();
+        let (slot, existing) = if n_in <= 2 {
+            let mut in_keys = [(0u32, 0u64, 0u32, 0u32); 2];
+            for (j, &id) in func.ops[i].inputs.iter().enumerate() {
+                in_keys[j] = resolve_redirect(&redirects, value_key(func, id));
+            }
+            if is_commutative(opcode) && n_in == 2 && in_keys[1] < in_keys[0] {
+                in_keys.swap(0, 1);
+            }
+            let block = u32::try_from(func.ops[i].block).expect("block id");
+            match seen.entry((block, opcode, out_size, n_in as u8, in_keys)) {
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let e = *o.get();
+                    (o.into_mut(), Some(e))
+                }
+                std::collections::hash_map::Entry::Vacant(v) => (v.insert(out_key), None),
+            }
+        } else {
+            let mut in_keys: InKeys = func.ops[i]
+                .inputs
+                .iter()
+                .map(|&id| resolve_redirect(&redirects, value_key(func, id)))
+                .collect();
+            if is_commutative(opcode) {
+                in_keys.sort();
+            }
+            match seen_wide.entry((func.ops[i].block, opcode, out_size, in_keys)) {
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let e = *o.get();
+                    (o.into_mut(), Some(e))
+                }
+                std::collections::hash_map::Entry::Vacant(v) => (v.insert(out_key), None),
+            }
+        };
 
         // A value a phi reads keeps its own name (the phi prints as nothing).
         let feeds_phi =
             |func: &SsaFunction| func.varnodes[out_id as usize].uses.iter().any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
         let mut name_still_holds = |k: ValueKey| version_before(func, &mut latest, (k.0, k.1, k.2), i) == k.3;
         // (one lookup: the earlier value, or the slot this one takes)
-        let slot = match seen.entry(key) {
-            std::collections::hash_map::Entry::Occupied(o) => {
-                hits += 1;
-                let existing = *o.get();
-                if !feeds_phi(func)
-                    && name_still_holds(existing)
-                    && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
-                {
-                    redirects.insert(out_key, existing);
-                    func.ops[i].dead = true;
-                    eliminated += 1;
-                    continue;
-                }
-                o.into_mut()
+        if let Some(existing) = existing {
+            hits += 1;
+            if !feeds_phi(func)
+                && name_still_holds(existing)
+                && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
+            {
+                redirects.insert(out_key, existing);
+                func.ops[i].dead = true;
+                eliminated += 1;
+                continue;
             }
-            std::collections::hash_map::Entry::Vacant(v) => v.insert(out_key),
-        };
+        }
         *slot = out_key;
     }
 
