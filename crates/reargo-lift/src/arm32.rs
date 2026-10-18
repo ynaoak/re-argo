@@ -72,6 +72,10 @@ pub struct Arm32Lifter {
     thumb: bool,
 }
 
+/// The ops a lift starts with room for: most ARM / Thumb instructions lift to at most this many
+/// (a flag-setting one: the operation and its N / Z / C / V), so their op lists are not regrown.
+const OPS_CAPACITY: usize = 8;
+
 impl Arm32Lifter {
     pub fn new(endian: Endian) -> Self {
         Self::new_arm(endian)
@@ -119,7 +123,7 @@ impl Arm32Lifter {
     fn lift_thumb16(&self, h: u16, address: u64) -> Vec<PcodeOp> {
         let h = h as u32;
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut ops: Vec<PcodeOp> = Vec::with_capacity(OPS_CAPACITY);
         let mut s = 0u32;
         let top5 = h >> 11;
         let pc_next = address + 4;
@@ -472,7 +476,7 @@ impl Arm32Lifter {
     /// branch forms; other T32 encodings produce no P-code (length stays 4).
     fn lift_thumb32(&self, hw1: u16, hw2: u16, address: u64) -> Vec<PcodeOp> {
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut ops: Vec<PcodeOp> = Vec::with_capacity(OPS_CAPACITY);
         let hw1 = hw1 as u32;
         let hw2 = hw2 as u32;
 
@@ -689,7 +693,7 @@ impl Arm32Lifter {
 
     fn lift_word(&self, word: u32, address: u64) -> Vec<PcodeOp> {
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
-        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut ops: Vec<PcodeOp> = Vec::with_capacity(OPS_CAPACITY);
         let mut s = 0u32;
         let cond = word >> 28;
 
