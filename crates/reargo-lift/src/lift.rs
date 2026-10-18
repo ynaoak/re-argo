@@ -45,16 +45,9 @@ impl InsnShape {
     }
 
     pub fn of(insn: &LiftedInstruction) -> InsnShape {
-        Self::of_each(insn, |_| {})
-    }
-
-    /// [`Self::of`], calling `f` with each op in order on the way (a caller that looks at
-    /// every op too reads them once).
-    pub fn of_each(insn: &LiftedInstruction, mut f: impl FnMut(&PcodeOp)) -> InsnShape {
         use reargo_core::pcode::OpCode;
         let mut shape = InsnShape { address: insn.address, target: 0, flags: 0 };
         for op in &insn.ops {
-            f(op);
             match op.opcode {
                 OpCode::Call => shape.flags |= Self::CALL,
                 OpCode::CallInd => shape.flags |= Self::CALL | Self::CALLIND,

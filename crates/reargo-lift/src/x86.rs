@@ -414,19 +414,9 @@ impl LiftCache {
         let (flags, len, shape) = match &lifted {
             Some(insn) => {
                 let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
-                // (`reads_outside_pf` on the shape's pass over the ops)
-                let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
-                let (mut wrote_pf, mut reads_pf) = (false, false);
-                let shape = crate::lift::InsnShape::of_each(insn, |o| {
-                    if !wrote_pf && !reads_pf {
-                        reads_pf = o.inputs.iter().any(pf);
-                        wrote_pf = o.output.as_ref().is_some_and(pf);
-                    }
-                });
-                debug_assert_eq!(reads_pf, reads_outside_pf(insn));
-                let flags = if x87 { X87 } else { 0 } | if reads_pf { READS_PF } else { 0 };
+                let flags = if x87 { X87 } else { 0 } | if reads_outside_pf(insn) { READS_PF } else { 0 };
                 let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
-                (flags, len, shape)
+                (flags, len, crate::lift::InsnShape::of(insn))
             }
             None => (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() }),
         };
