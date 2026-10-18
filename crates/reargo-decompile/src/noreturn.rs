@@ -169,7 +169,7 @@ impl FlowCache {
     /// The flows of the instructions from `addr` on, each lifted alone, handed to `each` while
     /// it returns `true` (up to the first that cannot be lifted). The instructions of one
     /// 4 KB page share a shard, looked up under one lock.
-    fn run(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64, each: &mut dyn FnMut(&Flow) -> bool) {
+    fn run(&self, x86: &reargo_lift::x86::X86Lifter, memory: &Memory, addr: u64, each: &mut dyn FnMut(Flow) -> bool) {
         let shard_of = |a: u64| ((a >> 12) % self.shards.len() as u64) as usize;
         let mut at = addr;
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
@@ -186,10 +186,10 @@ impl FlowCache {
                     }
                 };
                 let Some(f) = f else { return };
-                if !each(&f) {
+                at = f.address + u64::from(f.length);
+                if !each(f) {
                     return;
                 }
-                at = f.address + u64::from(f.length);
             }
         }
     }
@@ -511,11 +511,13 @@ impl Code<'_> {
             Some((x86, cache)) => {
                 let mut n = 0;
                 cache.run(x86, self.memory, addr, &mut |f| {
-                    if self.index.contains_key(&f.address) {
-                        return false; // runs into code lifted before
+                    match self.index.entry(f.address) {
+                        std::collections::hash_map::Entry::Occupied(_) => return false, // runs into code lifted before
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(self.insns.len());
+                        }
                     }
-                    self.index.insert(f.address, self.insns.len());
-                    self.insns.push(f.clone());
+                    self.insns.push(f);
                     n += 1;
                     n < CHUNK
                 });
