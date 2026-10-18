@@ -25,7 +25,7 @@
 
 use super::*;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 /// The stack slots `st0`..`st7` (10 bytes each, 0x10 apart).
 pub(crate) const ST_BASE: u64 = 0x1100;
@@ -93,30 +93,31 @@ fn has_memory(insn: &Instruction) -> bool {
 
 pub(crate) fn kind(insn: &Instruction) -> Kind {
     use Mnemonic::*;
-    let i = max_st(insn);
+    // (the deepest register named, read only for an x87 instruction: most are none)
+    let i = || max_st(insn);
     let s = |needs: u8, pops: u8, pushes: u8| Kind::Stack { needs, pops, pushes };
-    let top = (i + 1).max(1);
+    let top = || (i() + 1).max(1);
     match insn.mnemonic() {
         Fld if has_memory(insn) => s(0, 0, 1),
-        Fld => s(i + 1, 0, 1),
+        Fld => s(i() + 1, 0, 1),
         Fild | Fbld | Fldz | Fld1 | Fldpi | Fldl2e | Fldl2t | Fldlg2 | Fldln2 => s(0, 0, 1),
-        Fst | Fist => s(top, 0, 0),
-        Fstp | Fstpnce | Fistp | Fisttp | Fbstp => s(top, 1, 0),
-        Fxch => s(top, 0, 0),
-        Fadd | Fsub | Fsubr | Fmul | Fdiv | Fdivr => s(top, 0, 0),
-        Faddp | Fsubp | Fsubrp | Fmulp | Fdivp | Fdivrp => s(top.max(2), 1, 0),
+        Fst | Fist => s(top(), 0, 0),
+        Fstp | Fstpnce | Fistp | Fisttp | Fbstp => s(top(), 1, 0),
+        Fxch => s(top(), 0, 0),
+        Fadd | Fsub | Fsubr | Fmul | Fdiv | Fdivr => s(top(), 0, 0),
+        Faddp | Fsubp | Fsubrp | Fmulp | Fdivp | Fdivrp => s(top().max(2), 1, 0),
         Fiadd | Fisub | Fisubr | Fimul | Fidiv | Fidivr => s(1, 0, 0),
         Fchs | Fabs | Fsqrt | Frndint | Fxam | Ftst | Fsin | Fcos | F2xm1 => s(1, 0, 0),
         Fptan | Fsincos | Fxtract => s(1, 0, 1),
         Fpatan | Fyl2x | Fyl2xp1 => s(2, 1, 0),
         Fscale | Fprem | Fprem1 => s(2, 0, 0),
-        Fcom | Fucom | Ficom => s(if has_memory(insn) { 1 } else { top.max(2) }, 0, 0),
-        Fcomp | Fucomp | Ficomp => s(if has_memory(insn) { 1 } else { top.max(2) }, 1, 0),
+        Fcom | Fucom | Ficom => s(if has_memory(insn) { 1 } else { top().max(2) }, 0, 0),
+        Fcomp | Fucomp | Ficomp => s(if has_memory(insn) { 1 } else { top().max(2) }, 1, 0),
         Fcompp | Fucompp => s(2, 2, 0),
-        Fcomi | Fucomi => s(top, 0, 0),
-        Fcomip | Fucomip => s(top, 1, 0),
-        Fcmovb | Fcmove | Fcmovbe | Fcmovu | Fcmovnb | Fcmovne | Fcmovnbe | Fcmovnu => s(top, 0, 0),
-        Ffreep => s(top, 1, 0),
+        Fcomi | Fucomi => s(top(), 0, 0),
+        Fcomip | Fucomip => s(top(), 1, 0),
+        Fcmovb | Fcmove | Fcmovbe | Fcmovu | Fcmovnb | Fcmovne | Fcmovnbe | Fcmovnu => s(top(), 0, 0),
+        Ffreep => s(top(), 1, 0),
         Ffree | Fnstcw | Fstcw | Fldcw | Fnstsw | Fstsw | Wait | Fnop | Fnclex | Fclex | Fneni | Feni | Fndisi
         | Fdisi | Fnsetpm | Fsetpm | Fnstenv | Fstenv | Fxsave | Fxsave64 => s(0, 0, 0),
         Fninit | Finit | Fnsave | Fsave => Kind::Reset,
