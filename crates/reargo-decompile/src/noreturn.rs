@@ -552,7 +552,8 @@ fn search(
     stops: &mut dyn FnMut(u64, &mut Vec<u64>) -> bool,
     stack: &mut Vec<u64>,
 ) -> bool {
-    let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    // (by the instruction's position in `code`, which only grows)
+    let mut seen: Vec<bool> = Vec::new();
     let mut queue: VecDeque<Item> = VecDeque::from([Item::Insn(entry)]);
     while let Some(item) = queue.pop_front() {
         let i = match item {
@@ -570,7 +571,10 @@ fn search(
                 }
             }
         };
-        if !seen.insert(i) {
+        if seen.len() <= i {
+            seen.resize(code.insns.len().max(i + 1), false);
+        }
+        if std::mem::replace(&mut seen[i], true) {
             continue;
         }
         let insn = code.insns[i].clone();
