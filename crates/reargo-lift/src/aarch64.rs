@@ -162,22 +162,25 @@ fn cs_reg_to_varnode(r: RegId) -> Option<VarnodeData> {
 // Aarch64Lifter
 // ---------------------------------------------------------------------------
 pub struct Aarch64Lifter {
-    cs: capstone::Capstone,
+    _private: (),
 }
 
-// Capstone's C library is thread-safe for independent instances.
-unsafe impl Send for Aarch64Lifter {}
-unsafe impl Sync for Aarch64Lifter {}
+thread_local! {
+    /// The decoder of each thread: Capstone's C library is thread-safe for independent
+    /// instances only — one handle decoding on several threads at once races on its state
+    /// (the ARM64 printer's `doing_mem` flag decides whether an operand is a memory one), so
+    /// the operand details, and the lifts, changed with the interleaving.
+    static CS: capstone::Capstone = Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .detail(true)
+        .build()
+        .expect("failed to create AArch64 capstone");
+}
 
 impl Aarch64Lifter {
     pub fn new() -> Self {
-        let cs = Capstone::new()
-            .arm64()
-            .mode(arch::arm64::ArchMode::Arm)
-            .detail(true)
-            .build()
-            .expect("failed to create AArch64 capstone");
-        Self { cs }
+        Self { _private: () }
     }
 
     // -------------------------------------------------------------------
@@ -1277,9 +1280,15 @@ impl PcodeLift for Aarch64Lifter {
             .read_bytes(address, &mut buf)
             .map_err(|_| LiftError::UnreadableAddress(address))?;
 
-        let insns = self
-            .cs
-            .disasm_count(&buf, address, 1)
+        CS.with(|cs| self.lift_bytes(cs, &buf, address))
+    }
+}
+
+impl Aarch64Lifter {
+    /// The lift of the instruction `buf` at `address`, decoded by `cs`.
+    fn lift_bytes(&self, cs: &capstone::Capstone, buf: &[u8; 4], address: u64) -> Result<LiftedInstruction, LiftError> {
+        let insns = cs
+            .disasm_count(buf, address, 1)
             .map_err(|e| LiftError::DecodeFailed {
                 address,
                 reason: e.to_string(),
@@ -1302,8 +1311,7 @@ impl PcodeLift for Aarch64Lifter {
         };
 
         // Obtain structured instruction detail from capstone.
-        let detail = self
-            .cs
+        let detail = cs
             .insn_detail(insn)
             .map_err(|e| LiftError::DecodeFailed {
                 address,
