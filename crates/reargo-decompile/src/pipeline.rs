@@ -2874,7 +2874,8 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("rsp = rsp + 8"), "{c}");
         assert!(!c.contains("= *(uint64_t*)rsp;"), "{c}");
-        assert!(c.contains("return rax;"), "{c}");
+        // (WS98: the copy and its zero extension print in the return)
+        assert!(c.contains("return ebx;") && !c.contains("eax"), "{c}");
         // (WS87: the push stores into its stack slot; the stack pointer update is not printed)
         assert!(c.contains("local_8 = rbx;") && !c.contains("rsp"), "the prologue is kept: {c}");
     }
@@ -5026,5 +5027,70 @@ mod tests {
         // (the end 8 bytes on: the first test may fail, the loop runs once)
         let c = c_raw(&[0x48, 0x8d, 0x97, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x48, 0x03, 0x07, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xd7, 0x75, 0xf4, 0xc3]);
         assert!(!c.contains("for ("), "{c}");
+    }
+
+    /// WS98: a duplicate CSE removes hands its readers to the value kept. `xor edx, edx; mov eax,
+    /// edx; ret` makes `rdx = ZEXT 0` and `rax = ZEXT 0`; the return read the removed one's
+    /// varnode, which copy propagation (by varnode id) passed over, and the kept definition died:
+    /// `return rdx;` with nothing assigning `rdx`.
+    #[test]
+    fn zeroed_register_copied_to_the_return_is_returned() {
+        let rust = |code: &[u8]| decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        // test edi, edi; jle 1f; lea eax, [rdi+rdi]; ret; 1: <zero edx>; mov eax, edx; ret
+        for (zero, ret) in [(&[0x31, 0xd2][..], "return 0;"), (&[0x29, 0xd2][..], "return 0;"), (&[0xba, 0x05, 0, 0, 0][..], "return 5;")] {
+            let mut code = vec![0x85, 0xff, 0x7e, 0x04, 0x8d, 0x04, 0x3f, 0xc3];
+            code.extend_from_slice(zero);
+            code.extend([0x89, 0xd0, 0xc3]);
+            let c = c_raw(&code);
+            assert!(c.contains(ret) && !c.contains("return rdx;"), "{c}");
+            let r = rust(&code);
+            assert!(!r.contains("return rdx;"), "{r}");
+        }
+        // gcc -O2 `int32_t f_sum32(const int32_t *a, int n) { int32_t s = 0; for (int i = 0; i < n; i++) s += a[i] * 3; return s; }`
+        let code = [
+            0x85, 0xf6, 0x7e, 0x24, 0x48, 0x63, 0xf6, 0x31, 0xd2, 0x48, 0x8d, 0x0c, 0xb7, 0x0f, 0x1f, 0x00, // test; jle; movslq; xor; lea; nop
+            0x8b, 0x07, 0x48, 0x83, 0xc7, 0x04, 0x8d, 0x04, 0x40, 0x01, 0xc2, 0x48, 0x39, 0xcf, 0x75, 0xf0, // loop
+            0x89, 0xd0, 0xc3, 0x0f, 0x1f, 0x44, 0x00, 0x00, // mov eax, edx; ret; nop
+            0x31, 0xd2, 0x89, 0xd0, 0xc3, // xor edx, edx; mov eax, edx; ret
+        ];
+        let c = c_raw(&code);
+        assert!(c.contains("return 0;") && !c.contains("return rdx;"), "{c}");
+        // (a register zeroed and copied twice in the same block: `rcx = rax + rsi` is `rsi`)
+        // test rdi, rdi; je 1f; xor eax, eax; mov edx, eax; mov rcx, rdx; add rcx, rsi; mov rax, rcx; ret; 1: xor edx, edx; mov eax, edx; mov ecx, eax; ret
+        let c = c_raw(&[0x48, 0x85, 0xff, 0x74, 0x0e, 0x31, 0xc0, 0x89, 0xc2, 0x48, 0x89, 0xd1, 0x48, 0x01, 0xf1, 0x48, 0x89, 0xc8, 0xc3, 0x31, 0xd2, 0x89, 0xd0, 0x89, 0xc1, 0xc3]);
+        assert!(c.contains("return 0;") && !c.contains("return rdx;"), "{c}");
+    }
+
+    /// WS98: a concatenation whose halves fill the result prints as shifts C and Rust compile
+    /// (`xor eax, eax; mov ah, cl`: `ax = CONCAT(ah, 0:1);` before).
+    #[test]
+    fn concatenation_prints_as_shift_and_or() {
+        // mov rcx, rsi; mov rax, rdi; xor eax, eax; mov ah, cl; ret
+        let code = [0x48, 0x89, 0xf1, 0x48, 0x89, 0xf8, 0x31, 0xc0, 0x88, 0xcc, 0xc3];
+        let c = c_raw(&code);
+        assert!(c.contains("ax = (uint16_t)ah << 8;") && !c.contains("CONCAT"), "{c}");
+        let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(r.contains(" as u16) << 8;") && !r.contains("concat("), "{r}");
+    }
+
+    /// WS98: the copies and zero extensions a `return` reads print in it, when nothing is
+    /// printed between them; a self-copy (`mov esi, esi`) prints only its zero extension.
+    #[test]
+    fn return_prints_the_value_under_its_copies() {
+        let rust = |code: &[u8]| decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        // mov eax, esi; ret
+        let c = c_raw(&[0x89, 0xf0, 0xc3]);
+        assert!(c.contains("return esi;") && !c.contains("eax"), "{c}");
+        let r = rust(&[0x89, 0xf0, 0xc3]);
+        assert!(r.contains("return esi as u64;"), "{r}");
+        // mov eax, esi; mov [rdi], ecx; ret: a store printed between
+        let c = c_raw(&[0x89, 0xf0, 0x89, 0x0f, 0xc3]);
+        assert!(c.contains("eax = esi;") && !c.contains("return esi;"), "{c}");
+        // movsxd rax, esi; ret: a sign extension is no copy
+        let c = c_raw(&[0x48, 0x63, 0xc6, 0xc3]);
+        assert!(!c.contains("return esi;"), "{c}");
+        // mov esi, esi; mov [rdi], rsi; ret
+        let c = c_raw(&[0x89, 0xf6, 0x48, 0x89, 0x37, 0xc3]);
+        assert!(!c.contains("esi = esi;") && c.contains("rsi = (uint64_t)esi;"), "{c}");
     }
 }

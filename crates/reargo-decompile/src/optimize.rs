@@ -815,8 +815,23 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
             {
                 // (and the definition is the kept op: the liveness walk through phis follows
                 // `def_op` from the readers' inputs)
+                // (a varnode a live op still writes keeps its readers)
+                let own = func.varnodes[i].def_op.is_some_and(|o| !func.ops[o].dead && func.ops[o].output == Some(i as u32));
                 func.varnodes[i].def_op = func.varnodes[d as usize].def_op;
-                let extra = func.varnodes[i].uses.clone();
+                // WS98: ... and they read the kept output itself: the passes after this one
+                // find a value's readers by its varnode id (copy propagation rewrote only the
+                // inputs equal to the copy's output and dropped the other readers from its
+                // uses: `xor edx, edx; mov eax, edx; ret` — `rdx = ZEXT 0` kept, `rax = ZEXT 0`
+                // removed — returned the `rax` varnode, now named `rdx` with no definition)
+                let extra = if own { func.varnodes[i].uses.clone() } else { std::mem::take(&mut func.varnodes[i].uses) };
+                let (vi, vd) = (i as u32, d);
+                for &u in extra.iter().filter(|_| !own) {
+                    for inp in &mut func.ops[u].inputs {
+                        if *inp == vi {
+                            *inp = vd;
+                        }
+                    }
+                }
                 let uses = &mut func.varnodes[d as usize].uses;
                 for u in extra {
                     if !uses.contains(&u) {

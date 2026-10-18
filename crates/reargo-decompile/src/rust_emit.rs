@@ -57,6 +57,8 @@ pub struct RustEmitter<'a> {
     /// The condition of a select / `setcc` folded into it, by the op (WS88, as in C:
     /// `emit::select_conditions`).
     select_conds: rustc_hash::FxHashMap<usize, String>,
+    /// WS98: a `return` printing the value its copies / zero extensions read (`return_chains`)
+    returns: rustc_hash::FxHashMap<usize, (usize, usize)>,
     /// The stack slots by name (WS88, `frame`, as in C).
     frame: std::borrow::Cow<'a, crate::frame::Frame>,
     /// The frame computed by the caller ([`Self::with_frame`]).
@@ -105,6 +107,7 @@ impl RustEmitter<'static> {
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             inlined: Default::default(),
             select_conds: Default::default(),
+            returns: Default::default(),
             frame: Default::default(),
             given_frame: None,
             coalesced: Default::default(),
@@ -142,6 +145,7 @@ impl<'a> RustEmitter<'a> {
             emitted: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             inlined: Default::default(),
             select_conds: Default::default(),
+            returns: Default::default(),
             frame: Default::default(),
             given_frame: None,
             coalesced: Default::default(),
@@ -363,6 +367,10 @@ impl<'a> RustEmitter<'a> {
             let vptrs = sv.folded_vptr_loads(func, &|o| inl.contains(&o), &|c| self.member_call_obj(func, &func.ops[c]).is_some());
             self.folded.extend(vptrs);
         }
+        // WS98: `eax = edx; rax = (uint64_t)eax; return rax;` is `return edx;`
+        let (returns, hidden) = crate::emit::return_chains(func, &|o| self.noise.contains(&o) || self.folded.contains(&o));
+        self.folded.extend(hidden);
+        self.returns = returns;
         // WS97: `for R in a..n`, and `do … while` loops tested on entry as `while`
         self.find_for_loops(func, structured);
         let mut sig = infer_signature(func);
@@ -753,7 +761,8 @@ impl<'a> RustEmitter<'a> {
                     }
                 }
                 let src = self.input_expr(func, op, 0);
-                Some(cat!(dst, " = ", src, ";"))
+                // (WS98: `mov edx, edx` — the zero extension after it is the statement)
+                (src != dst).then(|| cat!(dst, " = ", src, ";"))
             }
             // the address of a struct field (WS92, as in C)
             OpCode::IntAdd if self.field_address(func, op).is_some() => Some(cat!(out_name?, " = ", self.field_address(func, op)?, ";")),
@@ -1079,6 +1088,19 @@ impl<'a> RustEmitter<'a> {
                 let hi = self.input_expr(func, op, 0);
                 let lo = self.input_expr(func, op, 1);
                 let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
+                // WS98: as in C, `ax = (ah as u16) << 8;`
+                if let Some((_, _, shift)) = crate::emit::piece_types(func, op) {
+                    let out_sz = func.varnodes[op.output.unwrap() as usize].data.size;
+                    let (ty, lo_ty) = (size_to_rust_type(out_sz), size_to_rust_type(lo_sz));
+                    let lo_d = func.varnodes[op.inputs[1] as usize].data;
+                    let paren = |e: String| if crate::condition::is_atomic(&e) { e } else { format!("({e})") };
+                    let hi = format!("({} as {ty}) << {shift}", paren(hi));
+                    return Some(if lo_d.space == SpaceId::CONST {
+                        if lo_d.offset == 0 { format!("{dst} = {hi};") } else { format!("{dst} = {hi} | 0x{:x};", lo_d.offset) }
+                    } else {
+                        format!("{dst} = {hi} | {} as {lo_ty} as {ty};", paren(lo))
+                    });
+                }
                 Some(format!("{} = concat({}, {} /* {} bytes */);", dst, hi, lo, lo_sz))
             }
             OpCode::Subpiece if op.inputs.len() >= 2 => {
@@ -1250,6 +1272,18 @@ impl<'a> RustEmitter<'a> {
                 }
             }
             OpCode::Return => match crate::emit::return_value(func, op) {
+                // (WS98: the value under its copies / zero extensions, widened to the return's type)
+                Some(i) if self.returns.contains_key(&op.index) => {
+                    let (d, k) = self.returns[&op.index];
+                    let e = self.input_expr(func, &func.ops[d], k);
+                    let (from, to) = (func.varnodes[func.ops[d].inputs[k] as usize].data.size, func.varnodes[op.inputs[i] as usize].data.size);
+                    Some(if from < to {
+                        let e = if crate::condition::is_atomic(&e) { e } else { cat!("(", e, ")") };
+                        cat!("return ", e, " as ", size_to_rust_type(to), ";")
+                    } else {
+                        cat!("return ", e, ";")
+                    })
+                }
                 Some(i) => Some(cat!("return ", self.input_expr(func, op, i), ";")),
                 None => Some("return;".into()),
             },
@@ -1712,15 +1746,11 @@ mod tests {
             output
         );
         assert!(
-            output.contains("rax = 0x2a;"),
-            "Expected assignment, got:\n{}",
+            output.contains("return 0x2a;"),
+            "Expected the copy in the return (WS98), got:\n{}",
             output
         );
-        assert!(
-            output.contains("return rax;"),
-            "Expected return statement, got:\n{}",
-            output
-        );
+        assert!(!output.contains("rax = "), "Expected no assignment, got: {output}");
     }
 
     #[test]
