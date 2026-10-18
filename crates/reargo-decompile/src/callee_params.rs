@@ -92,6 +92,12 @@ pub struct CalleeParams<'a> {
     pub(crate) class_fields_memo: Mutex<FxHashMap<u64, ClassFields>>,
     /// The lifted-once, depth-independent analysis of each body.
     summary_memo: Mutex<FxHashMap<u64, Option<std::sync::Arc<Summary>>>>,
+    /// What [`Self::summarize_compact`] reads of each instruction lifted alone, shared by the
+    /// bodies (x86, a batch with [`Self::with_entries`]): the bodies at addresses inside
+    /// functions overlap (where `.cold` parts jump back to), each instruction is lifted once.
+    compact: Option<CompactTable>,
+    /// The functions' entries, in increasing order ([`Self::with_entries`]).
+    entries: Vec<u64>,
     /// The lengths and flags of the instructions lifted alone, for the range walks (x86).
     facts: Option<reargo_lift::x86::InsnFacts>,
     /// The lifts of the ranges a walk cannot answer (x87 code, the integer PF), for
@@ -180,6 +186,8 @@ impl<'a> CalleeParams<'a> {
             unwind_table: None,
             class_fields_memo: Mutex::new(FxHashMap::default()),
             summary_memo: Mutex::new(FxHashMap::default()),
+            compact: None,
+            entries: Vec::new(),
             facts: lifter.as_x86().map(|_| reargo_lift::x86::InsnFacts::new(memory)),
             range_cache: lifter.as_x86().map(|_| Mutex::new(reargo_lift::x86::LiftCache::new())),
             call_index: None,
@@ -188,6 +196,20 @@ impl<'a> CalleeParams<'a> {
             reloc_slots: std::sync::OnceLock::new(),
             vtables_memo: Mutex::new(FxHashMap::default()),
         })
+    }
+
+    /// The same oracle knowing the functions' entries (for a batch of decompiles): a body at
+    /// another address (inside a function, where a `.cold` part jumps back to it; a stub) is
+    /// summarised from the compact lifts of its instructions, shared by the bodies that
+    /// overlap it, without its parameter accesses until they are asked for. A function's own
+    /// body is lifted and analysed whole: its accesses are almost always asked for (it is
+    /// called directly from some function decompiled).
+    pub fn with_entries(mut self, mut entries: Vec<u64>) -> Self {
+        entries.sort_unstable();
+        entries.dedup();
+        self.entries = entries;
+        self.compact = self.lifter.as_x86().map(|_| CompactTable::new(self.memory));
+        self
     }
 
     /// The same oracle with the direct call sites of the whole binary indexed once (for a batch
@@ -258,7 +280,12 @@ impl<'a> CalleeParams<'a> {
     /// parameters are analysed. `None` when it cannot be lifted.
     pub fn param_use(&self, target: u64) -> Option<std::sync::Arc<ParamUse>> {
         self.params(target)?;
-        self.fields_memo.lock().ok()?.get(&target).cloned()
+        if let Some(f) = self.fields_memo.lock().ok()?.get(&target).cloned() {
+            return Some(f);
+        }
+        // (a body summarised without them, below a call: its accesses from its lift)
+        let f = self.body(target).map(|(cfg, _)| std::sync::Arc::new(self.param_accesses_of(&cfg, &crate::dominator::reverse_post_order(&cfg)))).unwrap_or_default();
+        Some(self.fields_memo.lock().ok()?.entry(target).or_insert(f).clone())
     }
 
     pub fn args(&self) -> &[VarnodeData] {
@@ -420,11 +447,16 @@ impl<'a> CalleeParams<'a> {
 
     /// The depth-independent part of the analysis of the function at `target`, lifted once
     /// and shared by every depth (`None` when it cannot be lifted).
+    ///
+    /// A function's body (or any, without [`Self::with_entries`]) is lifted and analysed as
+    /// a whole; another from the [`CompactTable`] when it can be, without the accesses
+    /// ([`Self::param_use`] finds them when asked).
     fn summary(&self, target: u64) -> Option<std::sync::Arc<Summary>> {
         if let Some(s) = self.summary_memo.lock().ok().and_then(|m| m.get(&target).cloned()) {
             return s;
         }
-        let s = self.summarize(target).map(std::sync::Arc::new);
+        let light = self.compact.is_some() && self.entries.binary_search(&target).is_err();
+        let s = if light { self.summarize_light(target) } else { self.summarize(target) }.map(std::sync::Arc::new);
         if let Ok(mut m) = self.summary_memo.lock() {
             m.insert(target, s.clone());
         }
@@ -432,11 +464,30 @@ impl<'a> CalleeParams<'a> {
     }
 
     fn summarize(&self, target: u64) -> Option<Summary> {
-        if let (Some(x86), Some(facts)) = (self.lifter.as_x86(), &self.facts)
+        let (cfg, truncated) = self.body(target)?;
+        Some(self.summarize_body(cfg, truncated))
+    }
+
+    /// [`Self::summarize`] without the parameter accesses, from the [`CompactTable`] when the
+    /// body is the lifts of its instructions alone.
+    fn summarize_light(&self, target: u64) -> Option<Summary> {
+        if let (Some(x86), Some(facts), Some(table)) = (self.lifter.as_x86(), &self.facts, &self.compact)
             && let Some(walk) = x86.plain_walk(self.memory, target, MAX_INSNS, facts, true)
-            && let Some(s) = self.summarize_plain(x86, target, &walk)
+            && let Some(s) = self.summarize_compact(x86, table, target, &walk)
         {
             return Some(s);
+        }
+        self.summarize(target)
+    }
+
+    /// The body [`Self::summarize`] analyses: the CFG of the instructions of
+    /// `trim_to_return(lift_range(target, MAX_INSNS))`, and whether it runs past the limit.
+    fn body(&self, target: u64) -> Option<(ControlFlowGraph, bool)> {
+        if let (Some(x86), Some(facts)) = (self.lifter.as_x86(), &self.facts)
+            && let Some(walk) = x86.plain_walk(self.memory, target, MAX_INSNS, facts, true)
+            && let Some(b) = self.body_plain(x86, target, &walk)
+        {
+            return Some(b);
         }
         let (insns, len, first, last) = match (self.lifter.as_x86(), self.range_cache.as_ref().and_then(|c| c.lock().ok())) {
             // (`trim_to_return(lift_range(…))` from the lifts of the range's instructions alone,
@@ -454,13 +505,13 @@ impl<'a> CalleeParams<'a> {
         let hit_limit = len >= MAX_INSNS;
         // the body runs past the lift limit (its last lifted instruction is live)
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
-        Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
+        Some((ControlFlowGraph::build_owned(insns), truncated))
     }
 
-    /// [`Self::summarize`] of a range that is the lifts of the walk's instructions alone
+    /// [`Self::body`] of a range that is the lifts of the walk's instructions alone
     /// ([`reargo_lift::x86::X86Lifter::plain_walk`]; with the integer PF when the walk needs
     /// it): only the instructions the trim keeps are lifted.
-    fn summarize_plain(&self, x86: &reargo_lift::x86::X86Lifter, target: u64, walk: &reargo_lift::x86::PlainWalk<'_>) -> Option<Summary> {
+    fn body_plain(&self, x86: &reargo_lift::x86::X86Lifter, target: u64, walk: &reargo_lift::x86::PlainWalk<'_>) -> Option<(ControlFlowGraph, bool)> {
         if walk.first() != Some(target) {
             return None;
         }
@@ -496,12 +547,17 @@ impl<'a> CalleeParams<'a> {
         let insns: Vec<LiftedInstruction> = lifted.into_iter().map(|(_, i)| i).collect();
         let hit_limit = walk.len() >= MAX_INSNS;
         let truncated = hit_limit && insns.last().map(|i| i.address) == last;
-        Some(self.summarize_body(ControlFlowGraph::build_owned(insns), truncated))
+        Some((ControlFlowGraph::build_owned(insns), truncated))
+    }
+
+    /// [`param_accesses`] of a body with this oracle's convention.
+    fn param_accesses_of(&self, cfg: &ControlFlowGraph, rpo: &[usize]) -> ParamUse {
+        param_accesses(cfg, rpo, &self.args, &self.caller_saved, self.returns.first())
     }
 
     fn summarize_body(&self, cfg: ControlFlowGraph, truncated: bool) -> Summary {
         let rpo = crate::dominator::reverse_post_order(&cfg);
-        let fields = std::sync::Arc::new(param_accesses(&cfg, &rpo, &self.args, &self.caller_saved, self.returns.first()));
+        let fields = Some(std::sync::Arc::new(self.param_accesses_of(&cfg, &rpo)));
         let ret_sites = self.return_sites(&cfg);
         let n = cfg.blocks.len();
 
@@ -544,9 +600,10 @@ impl<'a> CalleeParams<'a> {
     fn analyze(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
         let s = self.summary(target)?;
         if depth_left == MAX_DEPTH
+            && let Some(fields) = &s.fields
             && let Ok(mut m) = self.fields_memo.lock()
         {
-            m.entry(target).or_insert_with(|| s.fields.clone());
+            m.entry(target).or_insert_with(|| fields.clone());
         }
         let kind = self.return_kind_of(&s.ret_sites, depth_left);
         if let Ok(mut m) = self.ret_memo.lock() {
@@ -672,6 +729,7 @@ impl<'a> CalleeParams<'a> {
     }
 
     /// Arguments whose low byte lies in `[lo, hi)` of `space`.
+    #[inline(always)]
     fn covering(&self, space: SpaceId, lo: u64, hi: u64) -> u32 {
         let mut m = 0;
         // (the arguments by offset; `arg_space`: the one space they are all in)
@@ -708,6 +766,556 @@ impl<'a> CalleeParams<'a> {
     }
 }
 
+/// [`CInsn`]s by address and lift (with the integer PF or not), shared by the threads: per
+/// address of the executable memory (in pages allocated when first used) the position of its
+/// [`CInsn`] in an append-only arena (in chunks). A lookup reads two cells no other thread
+/// writes once they are set, so the threads share the entries without moving cache lines
+/// between their cores (as the locks of a shared map do).
+struct CompactTable {
+    base: u64,
+    end: u64,
+    /// Per page of addresses, the arena position + 1 of each address's entry (0: none yet),
+    /// without and with the PF.
+    pages: [Vec<std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>>>; 2],
+    chunks: Vec<std::sync::OnceLock<Box<[std::sync::OnceLock<CInsn>]>>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+const CT_PAGE_BITS: u32 = 8;
+const CT_CHUNK_BITS: u32 = 14;
+const CT_CHUNKS: usize = 1 << 12;
+
+impl CompactTable {
+    fn new(memory: &Memory) -> Self {
+        let exec = memory.blocks().filter(|b| b.flags.contains(reargo_loader::memory::MemoryFlags::EXECUTE));
+        let (mut base, mut end) = (u64::MAX, 0u64);
+        for b in exec {
+            base = base.min(b.start);
+            end = end.max(b.start.saturating_add(b.size));
+        }
+        let n = if base < end { ((end - 1) >> CT_PAGE_BITS) as usize - (base >> CT_PAGE_BITS) as usize + 1 } else { 0 };
+        let page = || (0..n).map(|_| std::sync::OnceLock::new()).collect();
+        Self {
+            base,
+            end,
+            pages: [page(), page()],
+            chunks: (0..CT_CHUNKS).map(|_| std::sync::OnceLock::new()).collect(),
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The cell of `addr` lifted with the PF or not (`None` outside the executable memory).
+    fn cell(&self, addr: u64, pf: bool) -> Option<&std::sync::atomic::AtomicU32> {
+        if addr < self.base || addr >= self.end {
+            return None;
+        }
+        let k = ((addr >> CT_PAGE_BITS) - (self.base >> CT_PAGE_BITS)) as usize;
+        let page = self.pages[usize::from(pf)][k].get_or_init(|| (0..1usize << CT_PAGE_BITS).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+        Some(&page[(addr & ((1 << CT_PAGE_BITS) - 1)) as usize])
+    }
+
+    fn get(&self, cell: &std::sync::atomic::AtomicU32) -> Option<CInsn> {
+        let i = cell.load(std::sync::atomic::Ordering::Acquire).checked_sub(1)? as usize;
+        self.chunks[i >> CT_CHUNK_BITS].get()?[i & ((1 << CT_CHUNK_BITS) - 1)].get().copied()
+    }
+
+    /// Adds `c` as the entry of `cell` (unless another thread did first).
+    fn put(&self, cell: &std::sync::atomic::AtomicU32, c: CInsn) {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(chunk) = self.chunks.get(i >> CT_CHUNK_BITS) else { return };
+        let chunk = chunk.get_or_init(|| (0..1usize << CT_CHUNK_BITS).map(|_| std::sync::OnceLock::new()).collect());
+        if chunk[i & ((1 << CT_CHUNK_BITS) - 1)].set(c).is_ok()
+            && let Ok(v) = u32::try_from(i + 1)
+        {
+            let _ = cell.compare_exchange(0, v, std::sync::atomic::Ordering::Release, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// What a summary reads of one instruction lifted alone ([`CalleeParams::summarize_compact`]):
+/// its flow (as `reachability`, the CFG's leaders and edges see it), its effect on the
+/// argument registers (as `run_block` / `block_writes` see it: the ops before its one call /
+/// jump, that event, the ops after it) and what a `ret` after it returns (as `return_sites`
+/// sees it).
+#[derive(Clone, Copy)]
+struct CInsn {
+    /// The one `RAM` address its jumps and calls name, relative to its own: the target of its
+    /// `BRANCH` / `CBRANCH` ([`CI_TARGET`]), [`crate::cfg::BasicBlock::branch_target`] of a
+    /// block it ends ([`CI_BT`]), the event's ([`EV_CALL`], [`EV_BRANCH`]) and the callee of
+    /// [`RET_CALL`].
+    rel: i32,
+    /// Before the event: the arguments its ops read that they did not write first, and those
+    /// they write; after it, the same (at most 16 arguments).
+    pre_ue: u16,
+    pre_w: u16,
+    post_ue: u16,
+    post_w: u16,
+    flags: u16,
+    len: u8,
+    /// The event ([`EV_NONE`], …) and, shifted by 4, what `return_sites` finds scanning its ops
+    /// backwards ([`RET_NONE`], …).
+    kind: u8,
+}
+
+/// It has a `BRANCH`.
+const CI_BRANCH: u16 = 1;
+const CI_CBRANCH: u16 = 2;
+const CI_RETURN: u16 = 4;
+const CI_BRANCHIND: u16 = 8;
+/// [`crate::cfg::is_trap`].
+const CI_TRAP: u16 = 16;
+/// The lift failed.
+const CI_FAILED: u16 = 32;
+const CI_TARGET: u16 = 64;
+const CI_BT: u16 = 128;
+/// `target` is set.
+const CI_ADDR: u16 = 256;
+
+/// The arguments of a mask in the compact form's 16 bits.
+fn narrow(m: u32) -> Option<u16> {
+    u16::try_from(m).ok()
+}
+
+const EV_NONE: u8 = 0;
+/// A `CALL` to a `RAM` target.
+const EV_CALL: u8 = 1;
+/// Another call (`CALLIND`, or a `CALL` to no `RAM` address).
+const EV_CALL_OTHER: u8 = 2;
+/// A `BRANCH` to a `RAM` target (a tail call when no block starts there).
+const EV_BRANCH: u8 = 3;
+const EV_IND: u8 = 4;
+
+const RET_NONE: u8 = 0;
+const RET_INT: u8 = 1;
+const RET_FLOAT: u8 = 2;
+/// A call to `target`.
+const RET_CALL: u8 = 3;
+/// A call to no known address.
+const RET_CALL_OTHER: u8 = 4;
+
+impl CInsn {
+    fn has(&self, f: u16) -> bool {
+        self.flags & f != 0
+    }
+
+    /// `compute_leaders` takes its target and the address after it.
+    fn leads(&self) -> bool {
+        self.has(CI_BRANCH | CI_CBRANCH | CI_BRANCHIND | CI_RETURN | CI_TRAP)
+    }
+
+    /// `reach_successors` follows it to the next instruction.
+    fn falls(&self) -> bool {
+        !self.has(CI_BRANCH | CI_RETURN | CI_BRANCHIND | CI_TRAP)
+    }
+
+    fn ev(&self) -> u8 {
+        self.kind & 0xf
+    }
+
+    fn ret(&self) -> u8 {
+        self.kind >> 4
+    }
+
+    /// The address it names, for the instruction at `at`.
+    fn addr(&self, at: u64) -> u64 {
+        at.wrapping_add(self.rel as i64 as u64)
+    }
+
+    fn target(&self, at: u64) -> Option<u64> {
+        self.has(CI_TARGET).then(|| self.addr(at))
+    }
+
+    fn branch_target(&self, at: u64) -> Option<u64> {
+        self.has(CI_BT).then(|| self.addr(at))
+    }
+
+    fn ret_site(&self, at: u64) -> Option<RetSite> {
+        match self.ret() {
+            RET_INT => Some(RetSite::Kind(ReturnKind::Int)),
+            RET_FLOAT => Some(RetSite::Kind(ReturnKind::Float)),
+            RET_CALL => Some(RetSite::Call(Some(self.addr(at)))),
+            RET_CALL_OTHER => Some(RetSite::Call(None)),
+            _ => None,
+        }
+    }
+
+    /// The argument registers a block of these writes (`block_writes`).
+    fn writes(&self) -> Option<u32> {
+        (!matches!(self.ev(), EV_CALL | EV_CALL_OTHER)).then_some(u32::from(self.pre_w | self.post_w))
+    }
+
+    /// Names `t` as its one `RAM` address, for the instruction at `at` (`false` when it names
+    /// another, or one too far away).
+    fn name(&mut self, at: u64, t: u64) -> bool {
+        let Ok(rel) = i32::try_from(t.wrapping_sub(at) as i64) else { return false };
+        if self.has(CI_ADDR) && self.rel != rel {
+            return false;
+        }
+        self.flags |= CI_ADDR;
+        self.rel = rel;
+        true
+    }
+
+    fn set_ev(&mut self, ev: u8) {
+        self.kind = self.kind & 0xf0 | ev;
+    }
+
+    fn set_ret(&mut self, ret: u8) {
+        self.kind = self.kind & 0xf | ret << 4;
+    }
+
+    const FAILED: CInsn = CInsn { rel: 0, pre_ue: 0, pre_w: 0, post_ue: 0, post_w: 0, flags: CI_FAILED, len: 0, kind: EV_NONE | RET_NONE << 4 };
+}
+
+impl<'a> CalleeParams<'a> {
+    /// The [`CInsn`] of `insn`; `None` for what the compact form does not hold (two jump
+    /// targets or two calls / jumps, a recovered jump table's cases, a length past a byte).
+    fn compact_insn(&self, insn: &LiftedInstruction) -> Option<CInsn> {
+        let mut c = CInsn { flags: 0, len: u8::try_from(insn.length).ok()?, ..CInsn::FAILED };
+        for op in &insn.ops {
+            let ram = op.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset);
+            match op.opcode {
+                OpCode::Branch | OpCode::CBranch => {
+                    c.flags |= if op.opcode == OpCode::Branch { CI_BRANCH } else { CI_CBRANCH };
+                    if let Some(t) = ram {
+                        if c.has(CI_TARGET) || !c.name(insn.address, t) {
+                            return None;
+                        }
+                        c.flags |= CI_TARGET;
+                    }
+                }
+                OpCode::BranchInd => {
+                    c.flags |= CI_BRANCHIND;
+                    if op.inputs.iter().skip(1).any(|t| t.space == SpaceId::RAM) {
+                        return None;
+                    }
+                }
+                OpCode::Return => c.flags |= CI_RETURN,
+                _ => {}
+            }
+        }
+        if crate::cfg::is_trap(insn) {
+            c.flags |= CI_TRAP;
+        }
+        if let Some(t) = insn.ops.iter().rev().find_map(|op| {
+            if matches!(op.opcode, OpCode::Branch | OpCode::CBranch | OpCode::Call) {
+                op.inputs.first().filter(|vn| vn.space == SpaceId::RAM).map(|vn| vn.offset)
+            } else {
+                None
+            }
+        }) {
+            if !c.name(insn.address, t) {
+                return None;
+            }
+            c.flags |= CI_BT;
+        }
+        // `return_sites`' backward scan
+        if self.returns.len() >= 2 {
+            let (int_reg, float_reg) = (self.returns[0], self.returns[1]);
+            for op in insn.ops.iter().rev() {
+                if matches!(op.opcode, OpCode::Call | OpCode::CallInd) {
+                    match (op.opcode == OpCode::Call).then(|| op.inputs.first()).flatten().filter(|t| t.space == SpaceId::RAM) {
+                        Some(t) if c.name(insn.address, t.offset) => c.set_ret(RET_CALL),
+                        Some(_) => return None,
+                        None => c.set_ret(RET_CALL_OTHER),
+                    }
+                    break;
+                }
+                let Some(out) = op.output else { continue };
+                if out.space != SpaceId::REGISTER {
+                    continue;
+                }
+                if out.offset == int_reg.offset && out.size <= int_reg.size {
+                    c.set_ret(RET_INT);
+                    break;
+                }
+                let scalar = out.offset == float_reg.offset && (out.size == 4 || out.size == 8) && !matches!(op.opcode, OpCode::Piece | OpCode::Subpiece);
+                let copy = out.offset == float_reg.offset
+                    && out.size == float_reg.size
+                    && op.opcode == OpCode::Copy
+                    && op.inputs.first().is_some_and(|i| i.space == SpaceId::REGISTER && i.size == float_reg.size);
+                if scalar || copy {
+                    c.set_ret(RET_FLOAT);
+                    break;
+                }
+            }
+        }
+        // `run_block`'s steps
+        let (mut ue, mut w) = (0u32, 0u32);
+        let mut zeroed = None;
+        for op in &insn.ops {
+            let ram = op.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset);
+            let ev = match op.opcode {
+                OpCode::Call => match ram {
+                    Some(t) => (EV_CALL, t),
+                    None => (EV_CALL_OTHER, 0),
+                },
+                OpCode::CallInd => (EV_CALL_OTHER, 0),
+                OpCode::Branch => match ram {
+                    Some(t) => (EV_BRANCH, t),
+                    None => continue,
+                },
+                OpCode::BranchInd => (EV_IND, 0),
+                _ => (EV_NONE, 0),
+            };
+            if ev.0 != EV_NONE {
+                if c.ev() != EV_NONE || (matches!(ev.0, EV_CALL | EV_BRANCH) && !c.name(insn.address, ev.1)) {
+                    return None;
+                }
+                c.set_ev(ev.0);
+                (c.pre_ue, c.pre_w) = (narrow(ue)?, narrow(w)?);
+                (ue, w) = (0, 0);
+                continue;
+            }
+            for (k, inp) in op.inputs.iter().enumerate() {
+                if inp.space == SpaceId::CONST || zeroed.get_or_insert_with(|| zero_idiom_operands(insn)).contains(inp) {
+                    continue;
+                }
+                let (lo, hi) = read_range(op, k, inp);
+                ue |= self.covering(inp.space, lo, hi) & !w;
+            }
+            if let Some(out) = &op.output {
+                w |= self.covering(out.space, out.offset, out.offset + out.size as u64);
+            }
+        }
+        if c.ev() == EV_NONE {
+            (c.pre_ue, c.pre_w) = (narrow(ue)?, narrow(w)?);
+        } else {
+            (c.post_ue, c.post_w) = (narrow(ue)?, narrow(w)?);
+        }
+        Some(c)
+    }
+
+    /// The [`CInsn`] of the instruction at `addr` lifted alone (with the integer PF when
+    /// `pf`), from `table` or lifted and added to it; `None` when its lift fails or the
+    /// compact form does not hold it.
+    fn compact_at<'m>(&self, x86: &reargo_lift::x86::X86Lifter, table: &CompactTable, addr: u64, pf: bool, cursor: &mut reargo_lift::x86::DecodeCursor<'m>) -> Option<CInsn>
+    where
+        'a: 'm,
+    {
+        let cell = table.cell(addr, pf);
+        if let Some(c) = cell.and_then(|cell| table.get(cell)) {
+            return (!c.has(CI_FAILED)).then_some(c);
+        }
+        let lifted = if pf { self.lifter.lift_instruction(self.memory, addr) } else { x86.lift_alone_with(self.memory, addr, cursor) };
+        let c = match lifted {
+            Ok(insn) => self.compact_insn(&insn).unwrap_or(CInsn::FAILED),
+            Err(_) => CInsn::FAILED,
+        };
+        if let Some(cell) = cell {
+            table.put(cell, c);
+        }
+        (!c.has(CI_FAILED)).then_some(c)
+    }
+
+    /// [`Self::summarize_body`] of [`Self::body_plain`]'s body without the parameter accesses,
+    /// from the [`CInsn`]s of its instructions: the same reachability, blocks, edges and
+    /// data flow over the compact form. `None` where the body has an instruction whose lift
+    /// fails or that the compact form does not hold (then [`Self::summarize`] answers).
+    fn summarize_compact(&self, x86: &reargo_lift::x86::X86Lifter, table: &CompactTable, target: u64, walk: &reargo_lift::x86::PlainWalk<'_>) -> Option<Summary> {
+        if walk.first() != Some(target) {
+            return None;
+        }
+        let idx_of = |a: u64| walk.index_of(a).map(|_| a);
+        let last = walk.last();
+        let mut seen = vec![0u64; (last.map_or(0, |l| l - target) as usize + 1).div_ceil(64)];
+        let mut insns: Vec<(u64, CInsn)> = Vec::new();
+        let mut stack = vec![target];
+        let mut cursor = reargo_lift::x86::DecodeCursor::default();
+        while let Some(a) = stack.pop() {
+            let off = (a - target) as usize;
+            if seen[off / 64] >> (off % 64) & 1 != 0 {
+                continue;
+            }
+            seen[off / 64] |= 1 << (off % 64);
+            let c = self.compact_at(x86, table, a, walk.needs_pf, &mut cursor)?;
+            // (`reach_successors`; the instruction after any but the walk's last is in it)
+            let fall = a + u64::from(c.len);
+            let next_in_walk = Some(a) != last;
+            let succ = |x: u64| if x == fall && next_in_walk { Some(x) } else { idx_of(x) };
+            if let Some(t) = c.target(a) {
+                stack.extend(succ(t));
+            }
+            if c.falls() {
+                stack.extend(succ(fall));
+            }
+            insns.push((a, c));
+        }
+        insns.sort_unstable_by_key(|(a, _)| *a);
+        let hit_limit = walk.len() >= MAX_INSNS;
+        let truncated = hit_limit && insns.last().map(|i| i.0) == last;
+        Some(self.compact_body(&insns, truncated))
+    }
+
+    /// The analysis of `summarize_body` over the [`CInsn`]s of a body's instructions (in
+    /// increasing address order, the first its entry), building its blocks as
+    /// `ControlFlowGraph::build_owned` does.
+    fn compact_body(&self, insns: &[(u64, CInsn)], truncated: bool) -> Summary {
+        // the leaders (`compute_leaders`)
+        let mut leaders: Vec<u64> = vec![insns[0].0];
+        for (a, c) in insns {
+            if c.leads() {
+                leaders.extend(c.target(*a));
+                leaders.push(a + u64::from(c.len));
+            }
+        }
+        leaders.sort_unstable();
+        leaders.dedup();
+        // each leader's run of instructions: the blocks, `(start, first, end)`
+        let mut blocks: Vec<(u64, usize, usize)> = Vec::with_capacity(leaders.len());
+        let mut at = 0;
+        for (k, &leader) in leaders.iter().enumerate() {
+            let next = leaders.get(k + 1).copied().unwrap_or(u64::MAX);
+            while at < insns.len() && insns[at].0 < leader {
+                at += 1;
+            }
+            let from = at;
+            while at < insns.len() && insns[at].0 < next {
+                at += 1;
+            }
+            if at > from {
+                blocks.push((leader, from, at));
+            }
+        }
+        let n = blocks.len();
+        let block_at = |a: u64| blocks.binary_search_by_key(&a, |b| b.0).ok();
+        // the edges (`finalize_cfg`), at most two per block
+        let mut succs: Vec<[usize; 2]> = vec![[usize::MAX; 2]; n];
+        for (i, &(_, _, end)) in blocks.iter().enumerate() {
+            let (a, c) = &insns[end - 1];
+            if c.has(CI_BRANCHIND) || c.has(CI_RETURN) || c.has(CI_TRAP) {
+                continue;
+            }
+            let fall = a + u64::from(c.len);
+            let (x, y) = if c.has(CI_BRANCH) && !c.has(CI_CBRANCH) {
+                (c.branch_target(*a).and_then(block_at), None)
+            } else if c.has(CI_CBRANCH) {
+                (c.branch_target(*a).and_then(block_at), block_at(fall))
+            } else {
+                (block_at(fall), None)
+            };
+            for (k, s) in [x, y].into_iter().flatten().enumerate() {
+                succs[i][k] = s;
+            }
+        }
+        let succ_of = |b: usize| succs[b].iter().copied().filter(|&s| s != usize::MAX);
+        // the number of distinct predecessors of each block and the first (`return_sites`
+        // follows a block's only one)
+        let mut preds: Vec<(u32, usize)> = vec![(0, usize::MAX); n];
+        for (i, &[x, y]) in succs.iter().enumerate() {
+            // (a block listed twice, a `CBRANCH` to the next instruction, is one predecessor)
+            for s in [x, y].into_iter().take(if x == y { 1 } else { 2 }) {
+                if s != usize::MAX {
+                    if preds[s].0 == 0 {
+                        preds[s].1 = i;
+                    }
+                    preds[s].0 += 1;
+                }
+            }
+        }
+        let entry = block_at(insns[0].0).unwrap_or(0);
+        // `reverse_post_order`
+        let rpo = {
+            let mut seen = vec![false; n];
+            let mut post: Vec<usize> = Vec::with_capacity(n);
+            let mut stack: Vec<(usize, usize)> = vec![(entry, 0)];
+            seen[entry] = true;
+            while let Some(top) = stack.last_mut() {
+                let (b, i) = *top;
+                if let Some(s) = succ_of(b).nth(i) {
+                    top.1 += 1;
+                    if !seen[s] {
+                        seen[s] = true;
+                        stack.push((s, 0));
+                    }
+                } else {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+            post.reverse();
+            post
+        };
+        let block_insns = |b: usize| &insns[blocks[b].1..blocks[b].2];
+        // `return_sites`
+        let mut ret_sites = Vec::new();
+        if self.returns.len() >= 2 {
+            for b in 0..n {
+                if !block_insns(b).last().is_some_and(|(_, c)| c.has(CI_RETURN)) {
+                    continue;
+                }
+                let mut cur = b;
+                let mut steps = 0;
+                let kind = loop {
+                    if let Some(r) = block_insns(cur).iter().rev().find_map(|(a, c)| c.ret_site(*a)) {
+                        break r;
+                    }
+                    steps += 1;
+                    if preds[cur].0 != 1 || steps > 8 {
+                        break RetSite::Kind(ReturnKind::Unknown);
+                    }
+                    cur = preds[cur].1;
+                };
+                ret_sites.push(kind);
+            }
+        }
+        // the must-defined data flow (`summarize_body`)
+        let all = (1u32 << self.args.len()) - 1;
+        let transfer: Vec<Option<u32>> = (0..n).map(|b| block_insns(b).iter().try_fold(0u32, |w, (_, c)| Some(w | c.writes()?))).collect();
+        let mut inn: Vec<Option<u32>> = vec![None; n];
+        inn[entry] = Some(0);
+        loop {
+            let mut changed = false;
+            for &b in &rpo {
+                let Some(state) = inn[b] else { continue };
+                let out = transfer[b].map_or(all, |w| state | w);
+                for s in succ_of(b) {
+                    let new = match inn[s] {
+                        None => out,
+                        Some(old) => old & out,
+                    };
+                    if s != entry && inn[s] != Some(new) {
+                        inn[s] = Some(new);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // `run_block` with the accumulator
+        let mut acc = Acc { reads: 0, complete: !truncated, calls: Vec::new() };
+        for &b in &rpo {
+            let Some(mut defined) = inn[b] else { continue };
+            let mut window = 0u32;
+            for &(a, c) in block_insns(b) {
+                acc.reads |= u32::from(c.pre_ue) & !defined;
+                defined |= u32::from(c.pre_w);
+                window |= u32::from(c.pre_w);
+                match c.ev() {
+                    EV_NONE => continue,
+                    EV_CALL | EV_CALL_OTHER => {
+                        acc.calls.push(InnerCall { target: (c.ev() == EV_CALL).then(|| c.addr(a)), window, defined });
+                        defined = all;
+                        window = 0;
+                    }
+                    EV_BRANCH => {
+                        if block_at(c.addr(a)).is_none() {
+                            acc.calls.push(InnerCall { target: Some(c.addr(a)), window, defined });
+                        }
+                    }
+                    _ => acc.complete = false,
+                }
+                acc.reads |= u32::from(c.post_ue) & !defined;
+                defined |= u32::from(c.post_w);
+                window |= u32::from(c.post_w);
+            }
+        }
+        Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields: None }
+    }
+}
+
 struct Acc {
     reads: u32,
     complete: bool,
@@ -716,6 +1324,7 @@ struct Acc {
 
 /// A call (or tail jump) inside a summarised body: its direct target, the argument registers
 /// set up right before it and those defined on every path to it.
+#[derive(PartialEq, Eq, Debug)]
 struct InnerCall {
     target: Option<u64>,
     window: u32,
@@ -723,7 +1332,7 @@ struct InnerCall {
 }
 
 /// What a `ret` returns: a known register, or what the call right before it returns.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RetSite {
     Kind(ReturnKind),
     Call(Option<u64>),
@@ -736,7 +1345,8 @@ struct Summary {
     complete: bool,
     calls: Vec<InnerCall>,
     ret_sites: Vec<RetSite>,
-    fields: std::sync::Arc<ParamUse>,
+    /// The parameter accesses, when the body was lifted as a whole ([`CalleeParams::summary`]).
+    fields: Option<std::sync::Arc<ParamUse>>,
 }
 
 /// Field offsets past this are no struct fields.
@@ -1023,16 +1633,25 @@ mod tests {
     const XMM0: u32 = 1 << 6;
     const XMM1: u32 = 1 << 7;
 
+    /// The parameters of the function at `at`, the same from its compact summary (no entry
+    /// known: every body is summarised from the compact lifts).
     fn params(parts: &[(u64, &[u8])], at: u64) -> ParamInfo {
         let lifter = X86Lifter::new_64();
         let mem = memory(parts);
-        CalleeParams::new(&lifter, &mem).unwrap().params(at).unwrap()
+        let p = CalleeParams::new(&lifter, &mem).unwrap();
+        let r = p.params(at).unwrap();
+        let compact = CalleeParams::new(&lifter, &mem).unwrap().with_entries(Vec::new());
+        assert_eq!(compact.params(at), Some(r), "compact summary at {at:#x}");
+        assert_eq!(compact.param_use(at), p.param_use(at), "compact summary's accesses at {at:#x}");
+        r
     }
 
     fn kind(parts: &[(u64, &[u8])], at: u64) -> ReturnKind {
         let lifter = X86Lifter::new_64();
         let mem = memory(parts);
-        CalleeParams::new(&lifter, &mem).unwrap().return_kind(at)
+        let k = CalleeParams::new(&lifter, &mem).unwrap().return_kind(at);
+        assert_eq!(CalleeParams::new(&lifter, &mem).unwrap().with_entries(Vec::new()).return_kind(at), k, "compact summary at {at:#x}");
+        k
     }
 
     #[test]
@@ -1045,6 +1664,9 @@ mod tests {
         assert_eq!(kind(&[(0x1000, &[0x0f, 0x28, 0xc1, 0xc3])], 0x1000), ReturnKind::Float);
         // ret alone -> unknown
         assert_eq!(kind(&[(0x1000, &[0xc3])], 0x1000), ReturnKind::Unknown);
+        // mov eax, 1 ; test edi, edi ; je +0 ; ret  -> int (the `ret`'s block has one
+        // predecessor, which the `je` names twice: as its target and as the next instruction)
+        assert_eq!(kind(&[(0x1000, &[0xb8, 1, 0, 0, 0, 0x85, 0xff, 0x74, 0x00, 0xc3])], 0x1000), ReturnKind::Int);
     }
 
     #[test]

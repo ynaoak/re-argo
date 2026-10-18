@@ -1480,7 +1480,7 @@ pub fn decompile_all_with_options(
     let annotations = build_annotations(program);
     // one callee-parameter memo for the whole batch
     let oracle = CalleeParams::new(lifter, &program.info.memory)
-        .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index());
+        .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index().with_entries(entries.clone()));
 
     // Largest first, each worker taking the next function when it is done: the big
     // functions do not end up last on one thread (the results keep the listing order).
