@@ -463,7 +463,7 @@ impl<'a> NoReturn<'a> {
                 return outcome(trace.exit, unsure);
             }
         }
-        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.flow, insns: Vec::new(), index: FxHashMap::default() };
+        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.flow, insns: Vec::with_capacity(CHUNK), index: FxHashMap::with_capacity_and_hasher(CHUNK, Default::default()) };
         let mut unsure = false;
         let mut calls = Vec::new();
         let exit = code.at(target).map(|entry| {

@@ -336,7 +336,7 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     let mut sweep = 0usize;
     // (for the phi cycles below: the live ops with side effects or no output, which this loop
     // never kills, and how many phis live)
-    let mut roots: Vec<usize> = Vec::new();
+    let mut roots: Vec<usize> = Vec::with_capacity(n);
     let mut live_phis = 0usize;
     let mut dead_before = 0usize;
     loop {
