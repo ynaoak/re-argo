@@ -57,7 +57,8 @@ impl Analyzer for FillerBytesAnalyzer {
                 if let Some(bytes) = section_bytes
                     && !matches!(bytes[offset as usize], 0xCC | 0x90 | 0x00)
                 {
-                    offset += 1;
+                    // (on to the next filler byte: every byte before it moves on by one)
+                    offset = memchr::memchr3(0xCC, 0x90, 0x00, &bytes[offset as usize..]).map_or(size, |i| offset + i as u64);
                     continue;
                 }
                 if has_instruction(current) {

@@ -324,6 +324,7 @@ pub fn decompile_function_with_options(
         Some(&annotations),
         Some(&program.call_renderings),
         oracle.as_ref(),
+        None,
         opts,
     )
 }
@@ -394,6 +395,7 @@ pub fn decompile_function_with_maps(
         annotations,
         call_renderings,
         oracle.as_ref(),
+        None,
         &DecompileOptions::default(),
     )
 }
@@ -408,6 +410,8 @@ fn decompile_function_inner(
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
     oracle: Option<&CalleeParams<'_>>,
+    // the no-return cache a batch shares when `oracle` has none (no calling convention)
+    batch_flow: Option<&crate::noreturn::FlowCache>,
     opts: &DecompileOptions,
 ) -> Result<DecompileResult, String> {
     let func = program.listing.get_function(func_entry);
@@ -450,9 +454,13 @@ fn decompile_function_inner(
             kept
         }
         None => {
-            let mut lifted = lifter
-                .lift_range(&program.info.memory, func_entry, max_insns)
-                .map_err(|e| e.to_string())?;
+            let mut lifted = match fde {
+                // (a lifter with the default `lift_range`: each instruction's lift depends on
+                // those before it only, so the range's lifts up to the body's end and the
+                // `int3`s after it are those of the whole range)
+                Some((start, len)) if lifter.as_x86().is_none() => lift_fde_prefix(lifter, &program.info.memory, func_entry, max_insns, start + len),
+                _ => lifter.lift_range(&program.info.memory, func_entry, max_insns).map_err(|e| e.to_string())?,
+            };
             if lifted.is_empty() {
                 return Err(format!("no instructions at 0x{:x}", func_entry));
             }
@@ -464,7 +472,7 @@ fn decompile_function_inner(
     };
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
-    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()));
+    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()).or(batch_flow));
     crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
     // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
     let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);
@@ -521,6 +529,29 @@ fn decompile_function_inner(
 /// to the next function is where a switch over an enum sends its impossible values (BDS
 /// 0x3b13ff0, the fmt argument type: `case 1: __builtin_trap();`). Only a jump table's case
 /// reaches them; the trim drops them otherwise.
+/// `lifter.lift_range(memory, entry, count)` (the default one: a stream from `entry`, up to
+/// the first instruction that cannot be lifted) as far as [`keep_fde_body`] with the body
+/// ending at `end` reads it: the instructions before `end`, then the `int3`s from `end` on.
+fn lift_fde_prefix(lifter: &dyn PcodeLift, memory: &Memory, entry: u64, count: usize, end: u64) -> Vec<LiftedInstruction> {
+    let mut out = Vec::new();
+    let mut addr = entry;
+    let mut next = end;
+    let mut ctx = reargo_lift::LiftContext::default();
+    for _ in 0..count {
+        let Ok(lifted) = lifter.lift_instruction_ctx(memory, addr, &mut ctx) else { break };
+        if lifted.address >= end {
+            // (past the body only an `int3` at `next` is kept, and the addresses increase)
+            if lifted.address != next || lifted.mnemonic.trim() != "int3" {
+                break;
+            }
+            next += u64::from(lifted.length);
+        }
+        addr += lifted.length as u64;
+        out.push(lifted);
+    }
+    out
+}
+
 fn keep_fde_body(lifted: Vec<LiftedInstruction>, start: u64, end: u64) -> Vec<LiftedInstruction> {
     let mut next = end;
     lifted
@@ -1486,6 +1517,8 @@ pub fn decompile_all_with_options(
     // one callee-parameter memo for the whole batch
     let oracle = CalleeParams::new(lifter, &program.info.memory)
         .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index().with_entries(entries.clone()));
+    // (the no-return answers shared by the batch, for a lifter without an oracle)
+    let batch_flow = oracle.is_none().then(crate::noreturn::FlowCache::new);
 
     // Largest first, each worker taking the next function when it is done: the big
     // functions do not end up last on one thread (the results keep the listing order).
@@ -1507,6 +1540,7 @@ pub fn decompile_all_with_options(
             Some(&annotations),
             Some(&program.call_renderings),
             oracle.as_ref(),
+            batch_flow.as_ref(),
             opts,
         );
         if let Ok(mut s) = slots[i].lock() {

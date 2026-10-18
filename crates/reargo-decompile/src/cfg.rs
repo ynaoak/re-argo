@@ -49,8 +49,7 @@ fn is_trap_op(op: &reargo_core::pcode::PcodeOp) -> bool {
 fn is_trap_text(insn: &LiftedInstruction) -> bool {
     // (the text's first word is `ud2` / `hlt` only for those instructions: the decoded
     // one answers without formatting the text)
-    let may_be = insn.mnemonic.x86_instruction().is_none_or(|i| matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt));
-    may_be && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
+    insn.mnemonic.may_be_trap_text() && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
 }
 
 /// A `pop` (its text: `pop reg`; the decoded instruction answers for the others without

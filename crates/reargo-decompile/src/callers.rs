@@ -208,17 +208,19 @@ fn site_verdict(lifter: &dyn PcodeLift, memory: &Memory, site: u64, rax: &Varnod
 /// that register and none the other, `Void` when every caller that decides ignores it.
 /// `None` without callers, a calling convention, or a consistent answer.
 pub fn return_hint(lifter: &dyn PcodeLift, memory: &Memory, target: u64) -> Option<ReturnHint> {
-    return_hint_at(lifter, memory, direct_call_sites(memory, target, MAX_SITES))
+    // (no convention, no answer: the sites are not looked for)
+    let cc = lifter.call_convention()?;
+    return_hint_at(lifter, memory, cc, direct_call_sites(memory, target, MAX_SITES))
 }
 
 /// [`return_hint`] with the call sites read from `index`.
 pub fn return_hint_indexed(lifter: &dyn PcodeLift, memory: &Memory, target: u64, index: &CallIndex) -> Option<ReturnHint> {
+    let cc = lifter.call_convention()?;
     let sites = index.sites(target, MAX_SITES).unwrap_or_else(|| direct_call_sites(memory, target, MAX_SITES));
-    return_hint_at(lifter, memory, sites)
+    return_hint_at(lifter, memory, cc, sites)
 }
 
-fn return_hint_at(lifter: &dyn PcodeLift, memory: &Memory, sites: Vec<u64>) -> Option<ReturnHint> {
-    let cc = lifter.call_convention()?;
+fn return_hint_at(lifter: &dyn PcodeLift, memory: &Memory, cc: reargo_lift::CallConvention, sites: Vec<u64>) -> Option<ReturnHint> {
     let (rax, xmm0) = match cc.returns.as_slice() {
         [(r, _), (x, _), ..] => (*r, *x),
         _ => return None,

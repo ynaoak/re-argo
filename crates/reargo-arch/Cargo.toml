@@ -15,6 +15,7 @@ reargo-core = { workspace = true }
 reargo-loader = { workspace = true }
 thiserror = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 iced-x86 = { workspace = true, optional = true }
 capstone = { workspace = true, optional = true }

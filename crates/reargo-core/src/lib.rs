@@ -2,6 +2,7 @@ pub mod address;
 pub mod datatype;
 pub mod error;
 pub mod pcode;
+pub mod aarch64;
 
 pub use address::{
     Address, AddressMap, AddressRange, AddressSet, AddressSpace, Endian,

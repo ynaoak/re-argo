@@ -162,22 +162,25 @@ fn cs_reg_to_varnode(r: RegId) -> Option<VarnodeData> {
 // Aarch64Lifter
 // ---------------------------------------------------------------------------
 pub struct Aarch64Lifter {
-    cs: capstone::Capstone,
+    _private: (),
 }
 
-// Capstone's C library is thread-safe for independent instances.
-unsafe impl Send for Aarch64Lifter {}
-unsafe impl Sync for Aarch64Lifter {}
+thread_local! {
+    /// The decoder of each thread: Capstone's C library is thread-safe for independent
+    /// instances only — one handle decoding on several threads at once races on its state
+    /// (the ARM64 printer's `doing_mem` flag decides whether an operand is a memory one), so
+    /// the operand details, and the lifts, changed with the interleaving.
+    static CS: capstone::Capstone = Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .detail(true)
+        .build()
+        .expect("failed to create AArch64 capstone");
+}
 
 impl Aarch64Lifter {
     pub fn new() -> Self {
-        let cs = Capstone::new()
-            .arm64()
-            .mode(arch::arm64::ArchMode::Arm)
-            .detail(true)
-            .build()
-            .expect("failed to create AArch64 capstone");
-        Self { cs }
+        Self { _private: () }
     }
 
     // -------------------------------------------------------------------
@@ -1277,9 +1280,136 @@ impl PcodeLift for Aarch64Lifter {
             .read_bytes(address, &mut buf)
             .map_err(|_| LiftError::UnreadableAddress(address))?;
 
-        let insns = self
-            .cs
-            .disasm_count(&buf, address, 1)
+        let word = u32::from_le_bytes(buf);
+        if is_pc_relative(word) {
+            // (a branch or address-forming one is lifted without Capstone)
+            if let Some(insn) = reargo_core::aarch64::PcRelative::decode(word, address) {
+                return Ok(self.lift_pc_relative(insn, address));
+            }
+            return CS.with(|cs| self.lift_bytes(cs, &buf, address));
+        }
+        // (an instruction that does not read the PC lifts the same at every address but for
+        // its ops' addresses: the lift of the same word made before, moved to `address`)
+        if let Some(lifted) = WORD_MEMO.with(|m| m.borrow().get(&word).map(|l| relocated(l, address))) {
+            return Ok(lifted);
+        }
+        let lifted = CS.with(|cs| self.lift_bytes(cs, &buf, address))?;
+        WORD_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= WORD_MEMO_CAP {
+                m.clear();
+            }
+            m.insert(word, lifted.clone());
+        });
+        Ok(lifted)
+    }
+}
+
+/// Lifts a thread keeps by instruction word at most (emptied when full).
+const WORD_MEMO_CAP: usize = 1 << 12;
+
+thread_local! {
+    /// The lift of each instruction word that does not read the PC, at the address it was
+    /// first lifted at.
+    static WORD_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<u32, LiftedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+use reargo_core::aarch64::is_pc_relative;
+
+/// `lifted` (an instruction that does not read the PC) as lifted at `address`.
+fn relocated(lifted: &LiftedInstruction, address: u64) -> LiftedInstruction {
+    let mut out = lifted.clone();
+    out.address = address;
+    for op in &mut out.ops {
+        op.seq.addr.offset = address;
+    }
+    out
+}
+
+impl Aarch64Lifter {
+    /// The lift of the PC-relative branch or address-forming instruction `insn` at `address`:
+    /// what [`Self::lift_bytes`] makes of it from Capstone's decode.
+    fn lift_pc_relative(&self, insn: reargo_core::aarch64::PcRelative, address: u64) -> LiftedInstruction {
+        use reargo_core::aarch64::PcRelative;
+        let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
+        // (Capstone's register: `w` / `x` n, `wzr` / `xzr` for 31)
+        let gpr = |x: bool, r: u8| reg(if r == 31 { XZR_OFFSET } else { u64::from(r) * 8 }, if x { 8 } else { 4 });
+        let mut ops: Vec<PcodeOp> = Vec::new();
+        let mut s: u32 = 0;
+        match insn {
+            PcRelative::Branch { link, target } => ops.push(PcodeOp {
+                opcode: if link { OpCode::Call } else { OpCode::Branch },
+                seq: seq(s),
+                output: None,
+                inputs: SmallVec::from_slice(&[ram(target, 8)]),
+            }),
+            PcRelative::CondBranch { cond, target } => {
+                // (Capstone's condition codes count from 1: EQ = 1 for the field 0)
+                let cc = u32::from(cond) + 1;
+                if cc != cs_cc::AL {
+                    let c = unique(s as u64 * 0x10 + 0x900, 1);
+                    self.emit_condition_check(cc, &mut ops, &mut s, address, c);
+                    ops.push(PcodeOp { opcode: OpCode::CBranch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(target, 8), c]) });
+                } else {
+                    ops.push(PcodeOp { opcode: OpCode::Branch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(target, 8)]) });
+                }
+            }
+            PcRelative::CompareBranch { nonzero, x, rt, target } => {
+                let test_reg = gpr(x, rt);
+                let c = unique(s as u64 * 0x10 + 0x900, 1);
+                ops.push(PcodeOp {
+                    opcode: if nonzero { OpCode::IntNotEqual } else { OpCode::IntEqual },
+                    seq: seq(s),
+                    output: Some(c),
+                    inputs: SmallVec::from_slice(&[test_reg, constant(0, test_reg.size)]),
+                });
+                s += 1;
+                ops.push(PcodeOp { opcode: OpCode::CBranch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(target, 8), c]) });
+            }
+            PcRelative::TestBranch { nonzero, x, rt, bit, target } => {
+                let test_reg = gpr(x, rt);
+                let shifted = unique(s as u64 * 0x10 + 0x900, test_reg.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntRight,
+                    seq: seq(s),
+                    output: Some(shifted),
+                    inputs: SmallVec::from_slice(&[test_reg, constant(u64::from(bit), 8)]),
+                });
+                s += 1;
+                let masked = unique(s as u64 * 0x10 + 0x900, test_reg.size);
+                ops.push(PcodeOp {
+                    opcode: OpCode::IntAnd,
+                    seq: seq(s),
+                    output: Some(masked),
+                    inputs: SmallVec::from_slice(&[shifted, constant(1, test_reg.size)]),
+                });
+                s += 1;
+                let c = unique(s as u64 * 0x10 + 0x900, 1);
+                ops.push(PcodeOp {
+                    opcode: if nonzero { OpCode::IntNotEqual } else { OpCode::IntEqual },
+                    seq: seq(s),
+                    output: Some(c),
+                    inputs: SmallVec::from_slice(&[masked, constant(0, test_reg.size)]),
+                });
+                s += 1;
+                ops.push(PcodeOp { opcode: OpCode::CBranch, seq: seq(s), output: None, inputs: SmallVec::from_slice(&[ram(target, 8), c]) });
+            }
+            PcRelative::Address { rd, target, .. } => ops.push(PcodeOp {
+                opcode: OpCode::Copy,
+                seq: seq(s),
+                output: Some(gpr(true, rd)),
+                inputs: SmallVec::from_slice(&[constant(target, 8)]),
+            }),
+        }
+        let (m, o) = insn.text();
+        let text = if o.is_empty() { m } else { format!("{m} {o}") };
+        LiftedInstruction { address, length: 4, mnemonic: text.into(), ops }
+    }
+
+    /// The lift of the instruction `buf` at `address`, decoded by `cs`.
+    fn lift_bytes(&self, cs: &capstone::Capstone, buf: &[u8; 4], address: u64) -> Result<LiftedInstruction, LiftError> {
+        let insns = cs
+            .disasm_count(buf, address, 1)
             .map_err(|e| LiftError::DecodeFailed {
                 address,
                 reason: e.to_string(),
@@ -1302,8 +1432,7 @@ impl PcodeLift for Aarch64Lifter {
         };
 
         // Obtain structured instruction detail from capstone.
-        let detail = self
-            .cs
+        let detail = cs
             .insn_detail(insn)
             .map_err(|e| LiftError::DecodeFailed {
                 address,
@@ -1351,6 +1480,60 @@ mod tests {
             data: Some(Arc::from(data)),
         });
         mem
+    }
+
+    /// Every word `is_pc_relative` leaves out lifts the same at any address but for the ops'
+    /// addresses (what the word memo relies on).
+    #[test]
+    fn non_pc_relative_words_lift_alike() {
+        let lifter = Aarch64Lifter::new();
+        let lift_at = |word: u32, at: u64| CS.with(|cs| lifter.lift_bytes(cs, &word.to_le_bytes(), at)).ok().map(|l| format!("{} {:?}", l.mnemonic, l.ops));
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut checked = 0;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let word = (x >> 32) as u32;
+            if is_pc_relative(word) {
+                continue;
+            }
+            let (a, b) = (0x40_1000u64, 0x7f_6543_2100u64);
+            let at_a = CS.with(|cs| lifter.lift_bytes(cs, &word.to_le_bytes(), a)).ok().map(|l| relocated(&l, b)).map(|l| format!("{} {:?}", l.mnemonic, l.ops));
+            assert_eq!(at_a, lift_at(word, b), "word {word:08x}");
+            checked += usize::from(at_a.is_some());
+        }
+        assert!(checked > 10_000);
+    }
+
+    /// The PC-relative branches and addresses lifted without Capstone lift as with it.
+    #[test]
+    fn pc_relative_lifts_as_capstone() {
+        let lifter = Aarch64Lifter::new();
+        let show = |l: &LiftedInstruction| format!("{} {} {} {:?}", l.address, l.length, l.mnemonic, l.ops);
+        let mut x: u64 = 0x3c6e_f372_fe94_f82b;
+        let mut native = 0;
+        let addrs = [0u64, 4, 0x1000, 0x40_1ffc, 0x7f_6543_2100, 0xffff_ffff_ffff_f000, 0x8000_0000_0000_0000, 0xffff_ffff_ffff_fffc];
+        for i in 0..300_000u32 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let class = [(0xfc00_0000u32, 0x1400_0000u32), (0xfc00_0000, 0x9400_0000), (0x7e00_0000, 0x3400_0000), (0x7e00_0000, 0x3600_0000), (0xff00_0000, 0x5400_0000), (0x1f00_0000, 0x1000_0000)][(i % 6) as usize];
+            let w = ((x >> 32) as u32 & !class.0) | class.1;
+            let a = addrs[((x >> 8) % 8) as usize].wrapping_add(((x >> 12) & 0xffff_fffc) * u64::from(i % 3 == 0)) & !3;
+            let cap = CS.with(|cs| lifter.lift_bytes(cs, &w.to_le_bytes(), a)).ok().map(|l| show(&l));
+            if let Some(insn) = reargo_core::aarch64::PcRelative::decode(w, a) {
+                assert_eq!(Some(show(&lifter.lift_pc_relative(insn, a))), cap, "word {w:08x} at {a:x}");
+                native += 1;
+            }
+        }
+        assert!(native > 200_000, "{native}");
+    }
+
+    #[test]
+    fn pc_relative_words_are_recognised() {
+        for word in [0x1400_0002u32, 0x9400_0002, 0xb400_0040, 0x3600_0040, 0x5400_0040, 0x1000_0040, 0x9000_0000, 0x5800_0040, 0x9800_0040] {
+            assert!(is_pc_relative(word), "{word:08x}");
+        }
+        for word in [0xd503_201fu32, 0xd65f_03c0, 0xaa01_03e0, 0xf940_0020] {
+            assert!(!is_pc_relative(word), "{word:08x}");
+        }
     }
 
     #[test]

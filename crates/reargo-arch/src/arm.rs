@@ -212,19 +212,99 @@ impl Architecture for ArmArch {
     ) -> Result<DecodedInstruction, DisasmError> {
         // Thumb instructions are 2 or 4 bytes; read up to 4 but tolerate a
         // 2-byte tail at the end of a section.
-        let mut buf: Vec<u8> = Vec::with_capacity(4);
-        for i in 0..4u64 {
-            match memory.read_byte(address + i) {
-                Some(b) => buf.push(b),
-                None => break,
+        let mut bytes = [0u8; 4];
+        let len = match memory.slice(address, 4) {
+            // (the bytes `read_byte` reads, in one lookup)
+            Some(s) => {
+                bytes.copy_from_slice(s);
+                4
             }
-        }
+            None => {
+                let mut n = 0;
+                while n < 4 {
+                    match memory.read_byte(address + n as u64) {
+                        Some(b) => bytes[n] = b,
+                        None => break,
+                    }
+                    n += 1;
+                }
+                n
+            }
+        };
+        let buf = &bytes[..len];
         let min_len = if self.thumb { 2 } else { 4 };
         if buf.len() < min_len {
             return Err(DisasmError::UnreadableAddress(address));
         }
 
-        let insns = self.cs.disasm_count(&buf, address, 1)?;
+        // (an AArch64 instruction that does not read the PC decodes the same at every address:
+        // the decode of the same word made before, moved to `address`)
+        let word = (self.is_64 && buf.len() == 4).then(|| u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+        // (a PC-relative branch or address is decoded without Capstone)
+        if let Some(w) = word
+            && let Some(d) = decode_pc_relative(w, buf, address)
+        {
+            return Ok(d);
+        }
+        let word = word.filter(|&w| !aarch64_pc_relative(w));
+        if let Some(w) = word
+            && let Some(known) = A64_DECODES.with(|m| m.borrow().get(&w).cloned())
+        {
+            let mut d = known;
+            d.address = address;
+            return Ok(d);
+        }
+        let decoded = self.decode_with_capstone(buf, address)?;
+        if let Some(w) = word {
+            A64_DECODES.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= A64_DECODES_CAP {
+                    m.clear();
+                }
+                m.insert(w, decoded.clone());
+            });
+        }
+        Ok(decoded)
+    }
+
+    fn calling_conventions(&self) -> &[CallingConvention] {
+        &self.calling_conventions
+    }
+
+    fn default_calling_convention(&self) -> Option<&CallingConvention> {
+        self.calling_conventions.first()
+    }
+
+    fn stack_pointer(&self) -> Option<&RegisterInfo> {
+        self.register_by_name("sp")
+    }
+}
+
+/// Decodes a thread keeps by AArch64 instruction word at most (emptied when full).
+const A64_DECODES_CAP: usize = 1 << 14;
+
+thread_local! {
+    /// The decode of each AArch64 instruction word that does not read the PC, at the address it
+    /// was first decoded at.
+    static A64_DECODES: std::cell::RefCell<rustc_hash::FxHashMap<u32, DecodedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+pub use reargo_core::aarch64::is_pc_relative as aarch64_pc_relative;
+
+/// The decode of the AArch64 PC-relative branch or address-forming instruction `word` (its
+/// bytes `buf`) at `address`, as Capstone's ([`reargo_core::aarch64::PcRelative`]).
+fn decode_pc_relative(word: u32, buf: &[u8], address: u64) -> Option<DecodedInstruction> {
+    let insn = reargo_core::aarch64::PcRelative::decode(word, address)?;
+    let (mnemonic, operands) = insn.text();
+    let flow_type = classify_arm_flow(&mnemonic, &operands, true);
+    let branch_target = extract_arm_branch_target(&operands, &flow_type);
+    Some(DecodedInstruction::new(address, 4, mnemonic, operands, SmallVec::from_slice(buf), flow_type, branch_target))
+}
+
+impl ArmArch {
+    /// The instruction `buf` starts with, at `address`, decoded by Capstone.
+    fn decode_with_capstone(&self, buf: &[u8], address: u64) -> Result<DecodedInstruction, DisasmError> {
+        let insns = self.cs.disasm_count(buf, address, 1)?;
 
         let insn = insns.iter().next().ok_or_else(|| DisasmError::DecodeError {
             address,
@@ -240,18 +320,6 @@ impl Architecture for ArmArch {
         let branch_target = extract_arm_branch_target(&operands, &flow_type);
 
         Ok(DecodedInstruction::new(address, length, mnemonic, operands, bytes, flow_type, branch_target))
-    }
-
-    fn calling_conventions(&self) -> &[CallingConvention] {
-        &self.calling_conventions
-    }
-
-    fn default_calling_convention(&self) -> Option<&CallingConvention> {
-        self.calling_conventions.first()
-    }
-
-    fn stack_pointer(&self) -> Option<&RegisterInfo> {
-        self.register_by_name("sp")
     }
 }
 
@@ -311,6 +379,54 @@ mod tests {
     use reargo_core::address::SpaceId;
     use reargo_loader::memory::{MemoryBlock, MemoryFlags};
     use std::sync::Arc;
+
+    /// Every word `aarch64_pc_relative` leaves out decodes the same at any address (what the
+    /// decode memo relies on).
+    #[test]
+    fn aarch64_non_pc_relative_words_decode_alike() {
+        let arch = ArmArch::new_aarch64().unwrap();
+        let at = |w: u32, a: u64| {
+            arch.decode_with_capstone(&w.to_le_bytes(), a)
+                .ok()
+                .map(|d| (d.mnemonic().to_string(), d.operands().to_string(), d.flow_type, d.branch_target, d.length, d.bytes.clone()))
+        };
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut checked = 0;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let w = (x >> 32) as u32;
+            if aarch64_pc_relative(w) {
+                continue;
+            }
+            let a = at(w, 0x40_1000);
+            assert_eq!(a, at(w, 0x7f_6543_2100), "word {w:08x}");
+            checked += usize::from(a.is_some());
+        }
+        assert!(checked > 10_000);
+    }
+
+    /// The PC-relative branches and addresses decoded without Capstone are Capstone's decodes.
+    #[test]
+    fn aarch64_pc_relative_decodes_as_capstone() {
+        let arch = ArmArch::new_aarch64().unwrap();
+        let key = |d: &DecodedInstruction| (d.address, d.mnemonic().to_string(), d.operands().to_string(), d.flow_type, d.branch_target, d.length, d.bytes.clone());
+        let mut x: u64 = 0x7a4d_9e3b_1c55_0f61;
+        let mut native = 0;
+        let addrs = [0u64, 4, 0x1000, 0x40_1ffc, 0x7f_6543_2100, 0xffff_ffff_ffff_f000, 0x8000_0000_0000_0000, 0xffff_ffff_ffff_fffc];
+        for i in 0..300_000u32 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let class = [(0xfc00_0000u32, 0x1400_0000u32), (0xfc00_0000, 0x9400_0000), (0x7e00_0000, 0x3400_0000), (0x7e00_0000, 0x3600_0000), (0xff00_0000, 0x5400_0000), (0x1f00_0000, 0x1000_0000), (0x3b00_0000, 0x1800_0000)][(i % 7) as usize];
+            let w = ((x >> 32) as u32 & !class.0) | class.1;
+            let a = addrs[((x >> 8) % 8) as usize].wrapping_add(((x >> 12) & 0xffff_fffc) * u64::from(i % 3 == 0)) & !3;
+            let b = w.to_le_bytes();
+            let cap = arch.decode_with_capstone(&b, a).ok().map(|d| key(&d));
+            if let Some(d) = decode_pc_relative(w, &b, a) {
+                assert_eq!(Some(key(&d)), cap, "word {w:08x} at {a:x}");
+                native += 1;
+            }
+        }
+        assert!(native > 200_000, "{native}");
+    }
 
     fn make_memory(data: &[u8], addr: u64, endian: Endian) -> Memory {
         let mut mem = Memory::new(SpaceId(1), endian);

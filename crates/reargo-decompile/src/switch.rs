@@ -310,10 +310,20 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
     // first without value ranges; then (WS86), for a dispatch with no bounds check right before
     // it (none found, or the table read as far as its entries go), the index's range on every
     // path — with the cases of the tables found as edges
-    let no_range = |_: usize, _: &VarnodeData| None;
+    // (and whether the recovery asked for a range: one that did not finds the same with them)
+    let mut asked: Vec<bool> = Vec::new();
     let mut found: Vec<(usize, Option<Recovered>)> = (0..insns.len())
         .filter(|&k| has(&insns[k], OpCode::BranchInd))
-        .map(|k| (k, recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &no_range)))
+        .map(|k| {
+            let probe = std::cell::Cell::new(false);
+            let no_range = |_: usize, _: &VarnodeData| {
+                probe.set(true);
+                None
+            };
+            let f = recover_one(insns, k, &addrs, (&bases, &loose), &loaded, memory, &no_range);
+            asked.push(probe.get());
+            (k, f)
+        })
         .collect();
     // (the index register as the dispatch reads it: its case edges bound it, WS87)
     let cases_of = |found: &[(usize, Option<Recovered>)]| -> crate::ranges::Cases {
@@ -331,8 +341,8 @@ pub fn recover_jump_tables(insns: &mut [LiftedInstruction], memory: &Memory) -> 
         // (computed when a dispatch asks: one that is no table never does; without ranges the
         // dispatches are recovered as without them)
         let ranges = std::cell::OnceCell::new();
-        for (k, f) in found.iter_mut() {
-            if f.as_ref().is_none_or(|f| f.2.default.is_none()) {
+        for ((k, f), &asked) in found.iter_mut().zip(&asked) {
+            if asked && f.as_ref().is_none_or(|f| f.2.default.is_none()) {
                 let k = *k;
                 let range = |at: usize, r: &VarnodeData| {
                     ranges.get_or_init(|| crate::ranges::Ranges::new(insns, &cases)).as_ref()?.at_dispatch(insns, at, k, r)
