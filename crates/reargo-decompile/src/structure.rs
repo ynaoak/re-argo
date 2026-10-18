@@ -234,6 +234,11 @@ struct Structurer<'a> {
     cfg: &'a ControlFlowGraph,
     /// The blocks' instructions (by block id; `cfg` may hold the edges only).
     code: &'a ControlFlowGraph,
+    idom: Vec<Option<BlockId>>,
+    /// Reverse post-order number of each block.
+    rpo_num: Vec<usize>,
+    /// The headers of the loops each block lies in.
+    loops_of: Vec<Vec<BlockId>>,
     ipdom: Vec<Option<BlockId>>,
     pdom: crate::dominator::PostDominators,
     /// header -> loop
@@ -328,9 +333,20 @@ impl<'a> Structurer<'a> {
             loops[h] = Some(LoopInfo { body, follow });
         }
 
+        let mut loops_of: Vec<Vec<BlockId>> = vec![Vec::new(); n];
+        for (h, l) in loops.iter().enumerate() {
+            if let Some(l) = l {
+                for (x, _) in l.body.iter().enumerate().filter(|(_, in_body)| **in_body) {
+                    loops_of[x].push(h);
+                }
+            }
+        }
         Structurer {
             cfg,
             code,
+            idom,
+            rpo_num,
+            loops_of,
             ipdom: pdom.ipdom.clone(),
             pdom,
             loops,
@@ -497,6 +513,17 @@ impl<'a> Structurer<'a> {
             }
             if !is_first {
                 if let Some(j) = self.jump_for(b) {
+                    // the join of an enclosing `if` reached from deeper inside its arm: a short
+                    // region that goes on with `break` / `continue` / a return tail is printed
+                    // here too rather than `goto` to it (WS99)
+                    if let StructuredBlock::Goto(x) = j
+                        && !self.emitted[x]
+                        && self.follow_stack.contains(&x)
+                        && let Some(copy) = self.copy_region(x, stop).filter(|c| ends_flow(self.cfg, c))
+                    {
+                        out.extend(copy);
+                        break;
+                    }
                     out.push(j);
                     break;
                 }
@@ -545,7 +572,7 @@ impl<'a> Structurer<'a> {
                 }
                 _ => {
                     // (the CFG never builds more than two successors)
-                    let (items, next) = self.structure_if(b, succs[0], succs[1]);
+                    let (items, next) = self.structure_if(b, succs[0], succs[1], stop);
                     out.extend(items);
                     cur = next;
                 }
@@ -554,7 +581,7 @@ impl<'a> Structurer<'a> {
         out
     }
 
-    fn structure_if(&mut self, b: BlockId, t: BlockId, f: BlockId) -> (Vec<StructuredBlock>, Option<BlockId>) {
+    fn structure_if(&mut self, b: BlockId, t: BlockId, f: BlockId, stop: Option<BlockId>) -> (Vec<StructuredBlock>, Option<BlockId>) {
         // the join: the immediate post-dominator, unless it lies outside the innermost loop
         // while the branch is inside it (then every arm ends in break / continue / return:
         // `if (c) break;` rather than an empty arm that falls out to a `break` after the if)
@@ -564,6 +591,21 @@ impl<'a> Structurer<'a> {
             if body[b] && !body[j] {
                 join = None;
             }
+        }
+        // an arm is the end of the region being walked (the join of an enclosing `if` that
+        // this branch's post-dominator lies beyond): it falls out of the region, so the `if`
+        // joins there — the walk stops at `stop` anyway (WS99)
+        if let Some(s) = stop
+            && join != Some(s)
+            && (t == s || f == s)
+        {
+            join = Some(s);
+        } else if let Some(s) = stop.filter(|&s| join != Some(s) && !self.pdom.post_dominates(s, b) && self.stop_join(b, t, f, s, join)) {
+            // both arms go on to `stop` or end the flow (`return`, a call that never returns,
+            // `break`): join there, not at a post-dominator past it
+            join = Some(s);
+        } else if let Some(m) = self.merge_join(b, t, f, join) {
+            join = Some(m);
         }
         // the fall-through is only a jump (`break`, `continue`, a `goto` to code printed
         // elsewhere): `if (!c) break;` and carry on with the taken branch in this sequence
@@ -627,6 +669,96 @@ impl<'a> Structurer<'a> {
             }],
         };
         (items, join)
+    }
+
+    /// Where the arms of the branch `b` meet when its post-dominator `join` does not say: the
+    /// arms' other ways out end the flow (a `return`, a call that never returns, `break` /
+    /// `continue`), so the post-dominator is the function's exit (`None`) or a shared return
+    /// tail past the meeting point. gcc's unrolled loop is the typical case: the odd iteration,
+    /// then the loop from its middle (`if (odd) { …; if (done) return x; }` and then the loop,
+    /// instead of a `goto` into the loop). WS99.
+    ///
+    /// The meeting block `m` is the first (reverse post-order) block both arms reach such that
+    /// everything the arms reach before it is code only this branch reaches (dominated by `b`,
+    /// not printed yet) or an exit as above, that code is not reached again from `m`, and `m`
+    /// lies in no loop that `b` is outside of (unless it is that loop's header, entered there
+    /// only).
+    fn merge_join(&self, b: BlockId, t: BlockId, f: BlockId, join: Option<BlockId>) -> Option<BlockId> {
+        const MAX_REGION: usize = 48;
+        const MAX_CANDIDATES: usize = 6;
+        if t == f || join.is_some_and(|j| return_tail(self.cfg, self.code, j).is_none()) {
+            return None;
+        }
+        let at = self.reach_from(b, t, None, join, MAX_REGION)?;
+        let af = self.reach_from(b, f, None, join, MAX_REGION)?;
+        let mut candidates: Vec<BlockId> = at.iter().copied().filter(|x| af.contains(x)).collect();
+        candidates.sort_by_key(|&x| self.rpo_num[x]);
+        for &m in candidates.iter().take(MAX_CANDIDATES) {
+            if self.loops_of[m].iter().any(|&h| h != m && !self.loop_info(h).body[b]) {
+                continue;
+            }
+            let (Some(rt), Some(rf)) = (self.reach_from(b, t, Some(m), join, MAX_REGION), self.reach_from(b, f, Some(m), join, MAX_REGION)) else {
+                continue;
+            };
+            if !(rt.contains(&m) || t == m) || !(rf.contains(&m) || f == m) {
+                continue;
+            }
+            // the loop `m` heads is entered at `m` only
+            if let Some(l) = self.loops[m].as_ref()
+                && rt.iter().chain(&rf).any(|&x| x != m && l.body[x])
+            {
+                continue;
+            }
+            let Some(after) = self.reach_from(b, m, None, join, MAX_REGION * 4) else { continue };
+            if rt.iter().chain(&rf).any(|&x| x != m && after.contains(&x)) {
+                continue;
+            }
+            return Some(m);
+        }
+        None
+    }
+
+    /// Both arms of `b` go on to `stop` (the end of the region being walked) or end the flow.
+    fn stop_join(&self, b: BlockId, t: BlockId, f: BlockId, stop: BlockId, join: Option<BlockId>) -> bool {
+        const MAX_REGION: usize = 48;
+        let (Some(rt), Some(rf)) = (self.reach_from(b, t, Some(stop), join, MAX_REGION), self.reach_from(b, f, Some(stop), join, MAX_REGION)) else {
+            return false;
+        };
+        rt.contains(&stop) || rf.contains(&stop)
+    }
+
+    /// The blocks the walk from `start` prints before `until` (included when reached), when
+    /// every one is code only the branch `b` reaches (dominated by `b`, not printed yet, not
+    /// `join`) apart from the ways out that end the flow (a short return tail — copied for
+    /// each `goto` — `break`, `continue`; not in the list): `None` when it reaches anything
+    /// else or more than `limit` blocks.
+    fn reach_from(&self, b: BlockId, start: BlockId, until: Option<BlockId>, join: Option<BlockId>, limit: usize) -> Option<Vec<BlockId>> {
+        let mut region: Vec<BlockId> = Vec::new();
+        let mut stack = vec![start];
+        while let Some(x) = stack.pop() {
+            if region.contains(&x) {
+                continue;
+            }
+            if Some(x) == until {
+                region.push(x);
+                continue;
+            }
+            match self.jump_for(x) {
+                Some(StructuredBlock::Break | StructuredBlock::Continue) => continue,
+                _ if return_tail(self.cfg, self.code, x).is_some() => continue,
+                Some(_) => return None,
+                None => {}
+            }
+            if Some(x) == join || self.emitted[x] || !dominates(&self.idom, b, x) {
+                return None;
+            }
+            region.push(x);
+            if region.len() > limit {
+                return None;
+            }
+            stack.extend(self.succs(x));
+        }
+        Some(region)
     }
 
     /// `(switch block, default)` when `b` is the bounds check of a jump table: it goes to the

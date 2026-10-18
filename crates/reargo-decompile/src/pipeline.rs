@@ -5061,6 +5061,29 @@ mod tests {
         assert!(c.contains("return 0;") && !c.contains("return rdx;"), "{c}");
     }
 
+    /// WS99: gcc -O2's 2x-unrolled loop is entered at its header from the odd-iteration code
+    /// too (`if (odd) { …; if (done) return m; }` then the loop): the `if` joins at the loop
+    /// header, not at the shared `ret` past the loop (`goto` into the loop before).
+    #[test]
+    fn unrolled_loop_entered_from_the_odd_iteration_prints_without_goto() {
+        // gcc -O2 `int64_t h_max(const int64_t *a, long n) { if (n <= 0) return 0; int64_t m = a[0];
+        // for (long i = 1; i < n; i++) if (a[i] > m) m = a[i]; return m; }`
+        let code = [
+            0x31, 0xc0, 0x48, 0x85, 0xf6, 0x7e, 0x57, 0x48, 0x8b, 0x07, 0x48, 0x83, 0xfe, 0x01, 0x74, 0x4e, //
+            0x48, 0x8d, 0x34, 0xf7, 0x48, 0x8d, 0x57, 0x08, 0x48, 0x89, 0xf1, 0x48, 0x29, 0xd1, 0x83, 0xe1, //
+            0x08, 0x74, 0x1d, 0x48, 0x8b, 0x12, 0x48, 0x39, 0xd0, 0x48, 0x0f, 0x4c, 0xc2, 0x48, 0x8d, 0x57, //
+            0x10, 0x48, 0x39, 0xf2, 0x74, 0x29, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x48, 0x8b, 0x0a, 0x48, 0x39, 0xc8, 0x48, 0x0f, 0x4c, 0xc1, 0x48, 0x8b, 0x4a, 0x08, 0x48, 0x39, //
+            0xc8, 0x48, 0x0f, 0x4c, 0xc1, 0x48, 0x83, 0xc2, 0x10, 0x48, 0x39, 0xf2, 0x75, 0xe2, 0xc3, 0xc3,
+        ];
+        let c = c_raw(&code);
+        assert!(!c.contains("goto") && c.contains("do {") && c.contains("} while (rdx != rsi);"), "{c}");
+        // the odd iteration sits in an `if` that returns when the array is done, then the loop
+        assert!(c.find("rdx = rdi + 0x10;").unwrap() < c.find("do {").unwrap(), "{c}");
+        let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(!r.contains("goto") && !r.contains("'label_"), "{r}");
+    }
+
     /// WS98: a concatenation whose halves fill the result prints as shifts C and Rust compile
     /// (`xor eax, eax; mov ah, cl`: `ax = CONCAT(ah, 0:1);` before).
     #[test]
