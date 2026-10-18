@@ -126,11 +126,25 @@ pub struct NoReturn<'a> {
 /// `(memory, symbols, target)` -> the function at `target` never returns.
 type Verdicts = FxHashMap<(usize, usize, u64), bool>;
 
+/// What a search of a function's code ([`NoReturn::analyze`]) asked and found: the calls it
+/// asked about, in order, with the answers it got, and whether control leaves (`None`: the
+/// code at the target cannot be lifted). The search is a function of the code and of those
+/// answers: given the same answers to the same questions it asks nothing else and finds the
+/// same, so another search of the function replays it.
+struct Trace {
+    calls: Box<[(u64, bool)]>,
+    exit: Option<bool>,
+}
+
+/// The last [`Trace`] of each function searched, by memory, symbols and target.
+type Traces = FxHashMap<(usize, usize, u64), std::sync::Arc<Trace>>;
+
 #[derive(Default)]
 pub struct FlowCache {
     shards: Vec<Mutex<FlowShard>>,
     /// the answers of the questions asked, by memory, symbols and target
     verdicts: Vec<Mutex<Verdicts>>,
+    traces: Vec<Mutex<Traces>>,
 }
 
 impl FlowCache {
@@ -138,7 +152,13 @@ impl FlowCache {
         Self {
             shards: (0..64).map(|_| Mutex::new(FlowShard::default())).collect(),
             verdicts: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
+            traces: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
         }
+    }
+
+    fn trace_shard(&self, target: u64) -> Option<&Mutex<Traces>> {
+        let n = self.traces.len() as u64;
+        (n > 0).then(|| &self.traces[((target ^ (target >> 5)) % n) as usize])
     }
 
     fn verdict_shard(&self, target: u64) -> Option<&Mutex<Verdicts>> {
@@ -417,23 +437,49 @@ impl<'a> NoReturn<'a> {
     }
 
     fn analyze(&self, target: u64, depth: u32, stack: &mut Vec<u64>) -> Verdict {
-        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.flow, insns: Vec::new(), index: FxHashMap::default() };
-        let Some(entry) = code.at(target) else { return Verdict::Returns };
-        let mut unsure = false;
-        let mut stops = |t: u64, s: &mut Vec<u64>| match self.verdict(t, depth - 1, s) {
+        let ask = |t: u64, s: &mut Vec<u64>, unsure: &mut bool| match self.verdict(t, depth - 1, s) {
             Verdict::NoReturn => true,
             Verdict::Returns => false,
             Verdict::Unsure => {
-                unsure = true;
+                *unsure = true;
                 false
             }
         };
-        let exit = search(&mut code, entry, &|t| self.named(t), &mut stops, stack);
-        match (exit, unsure) {
-            (false, _) => Verdict::NoReturn,
-            (true, false) => Verdict::Returns,
-            (true, true) => Verdict::Unsure,
+        let outcome = |exit: Option<bool>, unsure: bool| match (exit, unsure) {
+            (None, _) => Verdict::Returns,
+            (Some(false), _) => Verdict::NoReturn,
+            (Some(true), false) => Verdict::Returns,
+            (Some(true), true) => Verdict::Unsure,
+        };
+        // (a search of the function made before, by any question: the same questions asked in
+        // its order get the same answers, and so it finds the same; at the first answer that
+        // differs the search runs, asking those questions again — answered the same, from the
+        // memo or as before, without changing it)
+        let key = (std::ptr::from_ref(self.memory) as usize, self.symbols.map_or(0, |s| std::ptr::from_ref(s) as usize), target);
+        let shard = self.flow.and_then(|(_, cache)| cache.trace_shard(target));
+        if let Some(trace) = shard.and_then(|m| m.lock().ok().and_then(|m| m.get(&key).cloned())) {
+            let mut unsure = false;
+            if trace.calls.iter().all(|&(t, answer)| ask(t, stack, &mut unsure) == answer) {
+                return outcome(trace.exit, unsure);
+            }
         }
+        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.flow, insns: Vec::new(), index: FxHashMap::default() };
+        let mut unsure = false;
+        let mut calls = Vec::new();
+        let exit = code.at(target).map(|entry| {
+            let mut stops = |t: u64, s: &mut Vec<u64>| {
+                let answer = ask(t, s, &mut unsure);
+                if shard.is_some() {
+                    calls.push((t, answer));
+                }
+                answer
+            };
+            search(&mut code, entry, &|t| self.named(t), &mut stops, stack)
+        });
+        if let Some(mut m) = shard.and_then(|m| m.lock().ok()) {
+            m.insert(key, std::sync::Arc::new(Trace { calls: calls.into_boxed_slice(), exit }));
+        }
+        outcome(exit, unsure)
     }
 }
 
