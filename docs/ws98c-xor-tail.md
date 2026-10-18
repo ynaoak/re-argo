@@ -77,7 +77,7 @@ xor のゼロ化が引き金なのは、`edx = 0` が `rdx = ZEXT(edx)` と `rax
 - 実行確認ハーネスの `decomp2c.py` に `bsr` / `bsf` の定義を追加（-Os の `h_clz` が `bsr(edi)` の intrinsic を出す、デコンパイラ側は従来どおり）。
 - テスト `pipeline::tests::concatenation_prints_as_shift_and_or`。BDS 3 sample では `CONCAT` 0 件（変化なし）。
 
-#### 2b. return が読むコピー・ゼロ拡張を return の中に（commit 本節）
+#### 2b. return が読むコピー・ゼロ拡張を return の中に（commit da4cc08f）
 
 - 測定（Task 1 後）: 252 関数で `rax = (uint64_t)eax;` 133 回、その直後が `return rax;` 106 回（`eax = edx; rax = (uint64_t)eax; return rax;` 78 回）。
   jt2 でも `rax = (uint64_t)eax; return rax;` 99 回。自己代入 `edx = edx;`（`mov edx, edx`）8 回 / jt2 51 回。
