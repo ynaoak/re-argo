@@ -737,7 +737,7 @@ pub(crate) fn renumber_named_flags(text: &mut String, func: &SsaFunction) {
     // each word holding a `_` (a flag name holds one): from the `_`, back to its start and on
     // to its end
     let mut pos = 0;
-    while let Some(off) = text[pos..].find('_') {
+    while let Some(off) = memchr::memchr(b'_', &bytes[pos..]) {
         let under = pos + off;
         // (a flag name's `_` is followed by a digit: the first `_` of any other word is passed
         // over at once — a later one of the word decides the same, the word is split at its
