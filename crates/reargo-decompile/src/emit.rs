@@ -48,14 +48,24 @@ pub(crate) struct BlockOps {
 
 impl BlockOps {
     pub(crate) fn new(func: &SsaFunction) -> Self {
-        let mut by_block: Vec<Vec<u32>> = Vec::new();
-        for (i, op) in func.ops.iter().enumerate() {
-            if op.block >= by_block.len() {
-                by_block.resize_with(op.block + 1, Vec::new);
-            }
-            by_block[op.block].push(i as u32);
+        // (the positions grouped by block in one array, counted first: each block's list is
+        // then copied once)
+        let n = func.ops.iter().map(|o| o.block + 1).max().unwrap_or(0);
+        let mut start = vec![0u32; n + 1];
+        for op in &func.ops {
+            start[op.block + 1] += 1;
         }
-        Self { ops: func.ops.as_ptr() as usize, n_ops: func.ops.len(), by_block: by_block.into_iter().map(Into::into).collect() }
+        for b in 0..n {
+            start[b + 1] += start[b];
+        }
+        let mut at = start.clone();
+        let mut flat = vec![0u32; func.ops.len()];
+        for (i, op) in func.ops.iter().enumerate() {
+            flat[at[op.block] as usize] = i as u32;
+            at[op.block] += 1;
+        }
+        let by_block = (0..n).map(|b| std::sync::Arc::from(&flat[start[b] as usize..start[b + 1] as usize])).collect();
+        Self { ops: func.ops.as_ptr() as usize, n_ops: func.ops.len(), by_block }
     }
 
     /// The positions in `func.ops` of the ops of `block`, in order.

@@ -148,9 +148,17 @@ fn is_pure(op: OpCode) -> bool {
 
 /// The live ops of every block, in order.
 pub fn ops_by_block(func: &SsaFunction) -> Vec<Vec<OpIdx>> {
-    let mut v = vec![Vec::new(); func.cfg.blocks.len()];
+    // (counted first: each block's list allocated once)
+    let n = func.cfg.blocks.len();
+    let mut counts = vec![0usize; n];
     for op in &func.ops {
-        if !op.dead && op.block < v.len() {
+        if !op.dead && op.block < n {
+            counts[op.block] += 1;
+        }
+    }
+    let mut v: Vec<Vec<OpIdx>> = counts.into_iter().map(Vec::with_capacity).collect();
+    for op in &func.ops {
+        if !op.dead && op.block < n {
             v[op.block].push(op.index);
         }
     }
@@ -260,10 +268,13 @@ pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> V
     if br.opcode != OpCode::CBranch || br.inputs.len() < 2 {
         return Vec::new();
     }
-    let mut chain: Vec<OpIdx> = vec![last];
+    let mut chain: Vec<OpIdx> = Vec::with_capacity(ops.len());
+    chain.push(last);
     // what the ops left out (printed between a folded op and the branch) write
-    let mut written: Vec<reargo_core::pcode::VarnodeData> = Vec::new();
+    let mut written: Vec<reargo_core::pcode::VarnodeData> = Vec::with_capacity(body.len());
     let mut memory_written = false;
+    // (the leaves of the op looked at, a buffer reused for each)
+    let mut leaves = Vec::new();
     for &o in body.iter().rev() {
         let op = &func.ops[o];
         let folds = op.output.is_some_and(|out| {
@@ -279,7 +290,7 @@ pub fn condition_tail(func: &SsaFunction, ops: &[OpIdx], readers: &Readers) -> V
             // nothing printed after it changes what it reads — also through the definitions of
             // its inputs in the block that may print inside it (a `setcc`'s folded comparison,
             // an inlined temporary: `cl = rax == rbx; rbx = rax; if (… | cl)` must keep `cl`)
-            let mut leaves = Vec::new();
+            leaves.clear();
             let mut loads = op.opcode == OpCode::Load;
             for &i in &op.inputs {
                 collect_leaves(func, readers, i, op.block, 0, &mut leaves, &mut loads);
@@ -764,7 +775,8 @@ impl Inliner {
             return chain;
         }
         let starts = self.starts.get_or_init(|| crate::flags::block_starts(func));
-        let mut readers_ok: Vec<OpIdx> = chain.clone();
+        let mut readers_ok: Vec<OpIdx> = Vec::with_capacity(chain.len() + 1);
+        readers_ok.extend_from_slice(&chain);
         readers_ok.push(br);
         let mut cross: Vec<OpIdx> = Vec::new();
         for &r in readers_ok.iter() {

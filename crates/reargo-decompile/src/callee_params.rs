@@ -288,8 +288,25 @@ impl<'a> CalleeParams<'a> {
             return Some(f);
         }
         // (a body summarised without them, below a call: its accesses from its lift)
-        let f = self.body(target).map(|(cfg, _)| std::sync::Arc::new(self.param_accesses_of(&cfg, &crate::dominator::reverse_post_order(&cfg)))).unwrap_or_default();
+        let f = self.light_body_cfg(target).or_else(|| self.body(target).map(|(cfg, _)| cfg)).map(|cfg| std::sync::Arc::new(self.param_accesses_of(&cfg, &crate::dominator::reverse_post_order(&cfg)))).unwrap_or_default();
         Some(self.fields_memo.lock().ok()?.entry(target).or_insert(f).clone())
+    }
+
+    /// [`Self::body`]`(target)`'s CFG for a body summarised from the [`CompactTable`]: the
+    /// instructions its summary found reachable, lifted as [`Self::body_plain`] lifts them,
+    /// without walking the range again (`None` when there is no such summary or a lift fails).
+    fn light_body_cfg(&self, target: u64) -> Option<ControlFlowGraph> {
+        let s = self.summary_memo.lock().ok()?.get(&target).cloned()??;
+        let body = s.light_body.as_ref()?;
+        let x86 = self.lifter.as_x86()?;
+        let mut cursor = reargo_lift::x86::DecodeCursor::default();
+        let mut insns = Vec::with_capacity(body.offs.len());
+        for &off in &body.offs {
+            let a = target + u64::from(off);
+            let insn = if body.needs_pf { self.lifter.lift_instruction(self.memory, a) } else { x86.lift_alone_with(self.memory, a, &mut cursor) };
+            insns.push(insn.ok()?);
+        }
+        Some(ControlFlowGraph::build_owned(insns))
     }
 
     pub fn args(&self) -> &[VarnodeData] {
@@ -434,7 +451,14 @@ impl<'a> CalleeParams<'a> {
         // (the range's instructions, stepping over the spans of other walks: only those up to
         // the body's end and the `int3`s after it are looked at)
         let walk = x86.plain_walk(self.memory, start, count, self.facts.as_ref()?, false)?;
-        let mut out = Vec::new();
+        // (room for the instructions in `[lo, hi)`, counted first: the lifts are large, and
+        // growing moved them; the `int3`s after `hi` may still grow it)
+        let mut in_body = 0usize;
+        walk.each(|a| {
+            in_body += usize::from(a >= lo && a < hi);
+            a < hi
+        });
+        let mut out = Vec::with_capacity(in_body);
         let mut next = hi;
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
         let mut failed = false;
@@ -673,7 +697,7 @@ impl<'a> CalleeParams<'a> {
                 self.run_block(cfg, b, state, Some(&mut acc));
             }
         }
-        Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields }
+        Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields, light_body: None }
     }
 
     fn analyze(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
@@ -1281,7 +1305,8 @@ impl<'a> CalleeParams<'a> {
         let idx_of = |a: u64| walk.index_of(a).map(|_| a);
         let last = walk.last();
         let mut seen = vec![0u64; (last.map_or(0, |l| l - target) as usize + 1).div_ceil(64)];
-        let mut insns: Vec<(u64, CInsn)> = Vec::new();
+        // (room for a body of a few hundred instructions: most are, and growing moved them)
+        let mut insns: Vec<(u64, CInsn)> = Vec::with_capacity(walk.len().min(256));
         let mut stack = vec![target];
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
         while let Some(a) = stack.pop() {
@@ -1306,7 +1331,15 @@ impl<'a> CalleeParams<'a> {
         insns.sort_unstable_by_key(|(a, _)| *a);
         let hit_limit = walk.len() >= MAX_INSNS;
         let truncated = hit_limit && insns.last().map(|i| i.0) == last;
-        Some(self.compact_body(&insns, truncated))
+        let mut s = self.compact_body(&insns, truncated);
+        // (the body's addresses, for its parameter accesses when asked: `body_plain` lifts
+        // these, the same reachability from the same walk)
+        s.light_body = insns
+            .iter()
+            .map(|&(a, _)| u32::try_from(a - target).ok())
+            .collect::<Option<Box<[u32]>>>()
+            .map(|offs| LightBody { needs_pf: walk.needs_pf, offs });
+        Some(s)
     }
 
     /// The analysis of `summarize_body` over the [`CInsn`]s of a body's instructions (in
@@ -1314,7 +1347,9 @@ impl<'a> CalleeParams<'a> {
     /// `ControlFlowGraph::build_owned` does.
     fn compact_body(&self, insns: &[(u64, CInsn)], truncated: bool) -> Summary {
         // the leaders (`compute_leaders`)
-        let mut leaders: Vec<u64> = vec![insns[0].0];
+        // (room for every one: the entry and two per instruction that leads)
+        let mut leaders: Vec<u64> = Vec::with_capacity(1 + 2 * insns.iter().filter(|(_, c)| c.leads()).count());
+        leaders.push(insns[0].0);
         for (a, c) in insns {
             if c.leads() {
                 leaders.extend(c.target(*a));
@@ -1380,7 +1415,8 @@ impl<'a> CalleeParams<'a> {
         let rpo = {
             let mut seen = vec![false; n];
             let mut post: Vec<usize> = Vec::with_capacity(n);
-            let mut stack: Vec<(usize, usize)> = vec![(entry, 0)];
+            let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n);
+            stack.push((entry, 0));
             seen[entry] = true;
             while let Some(top) = stack.last_mut() {
                 let (b, i) = *top;
@@ -1474,7 +1510,7 @@ impl<'a> CalleeParams<'a> {
                 window |= u32::from(c.post_w);
             }
         }
-        Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields: None }
+        Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields: None, light_body: None }
     }
 }
 
@@ -1509,6 +1545,16 @@ struct Summary {
     ret_sites: Vec<RetSite>,
     /// The parameter accesses, when the body was lifted as a whole ([`CalleeParams::summary`]).
     fields: Option<std::sync::Arc<ParamUse>>,
+    /// The instructions of a body summarised from the [`CompactTable`] (without `fields`).
+    light_body: Option<LightBody>,
+}
+
+/// The instructions [`CalleeParams::body_plain`] lifts for a body summarised from the
+/// [`CompactTable`]: their offsets from the entry, in increasing order, and whether they are
+/// lifted with the integer PF ([`reargo_lift::x86::PlainWalk::needs_pf`]).
+struct LightBody {
+    needs_pf: bool,
+    offs: Box<[u32]>,
 }
 
 /// Field offsets past this are no struct fields.

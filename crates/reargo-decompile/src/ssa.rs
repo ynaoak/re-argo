@@ -45,6 +45,40 @@ pub struct SsaOp {
 const PHANTOM: VarId = VarId::MAX - 1;
 const PHANTOM_MIN: VarId = 1 << 31;
 
+/// Lists by index in one array (a compressed-row layout): `lists[i]` holds the values pushed
+/// with `i`, in the order pushed — the nested vectors it replaces grew one push at a time.
+struct Lists<T> {
+    start: Vec<u32>,
+    items: Vec<T>,
+}
+
+impl<T: Copy + Default> Lists<T> {
+    /// `n` lists from `(list, value)` pairs, in order.
+    fn new(n: usize, pairs: &[(u32, T)]) -> Self {
+        let mut start = vec![0u32; n + 1];
+        for &(i, _) in pairs {
+            start[i as usize + 1] += 1;
+        }
+        for i in 0..n {
+            start[i + 1] += start[i];
+        }
+        let mut at = start.clone();
+        let mut items = vec![T::default(); pairs.len()];
+        for &(i, v) in pairs {
+            items[at[i as usize] as usize] = v;
+            at[i as usize] += 1;
+        }
+        Self { start, items }
+    }
+}
+
+impl<T> std::ops::Index<usize> for Lists<T> {
+    type Output = [T];
+    fn index(&self, i: usize) -> &[T] {
+        &self.items[self.start[i] as usize..self.start[i + 1] as usize]
+    }
+}
+
 /// The renaming stacks of [`SsaFunction::build_ssa`], one per slot, in one list.
 struct ScopeStacks {
     /// Per slot, its top entry ([`NO_ENTRY`] when empty).
@@ -296,7 +330,8 @@ impl SsaFunction {
 
         // 1. global names (read before written in some block) and their def blocks
         let mut global = vec![false; n_slots];
-        let mut defsites: Vec<Vec<usize>> = vec![Vec::new(); n_slots];
+        // (`(slot, block)`: `defsites` below)
+        let mut def_pairs: Vec<(u32, usize)> = Vec::with_capacity(n_outputs);
         // the def blocks with the left-out definitions, by register
         let mut phantom_sites: Vec<Vec<usize>> = vec![Vec::new(); if any_phantom { phantoms.regs.len() } else { 0 }];
         // the block (+ 1) that last wrote each slot, and that last listed it as a def site
@@ -322,7 +357,7 @@ impl SsaFunction {
                         killed_in[k] = b + 1;
                         if real_in[k] != b + 1 {
                             real_in[k] = b + 1;
-                            defsites[k].push(b);
+                            def_pairs.push((k as u32, b));
                         }
                     }
                     for r in bits(phantoms_at(insn, op, &mut seen_call)) {
@@ -336,6 +371,9 @@ impl SsaFunction {
                 }
             }
         }
+
+        let defsites = Lists::new(n_slots, &def_pairs);
+        drop(def_pairs);
 
         // 2. phi placement on the iterated dominance frontier
         // WS82: landing pads are roots too, so their values reach the code after them
@@ -370,7 +408,8 @@ impl SsaFunction {
                 }
             }
         }
-        let mut phis: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // (`(block, slot)` in the order placed: `phis` below)
+        let mut phi_pairs: Vec<(u32, u32)> = Vec::new();
         // the phis only the left-out definitions would have caused: numbered, not made
         let mut phantom_phis: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut keys: Vec<u32> = (0..n_slots as u32).filter(|&k| global[k as usize]).collect();
@@ -428,11 +467,11 @@ impl SsaFunction {
             };
             let sites = &defsites[k as usize];
             if !sites.is_empty() {
-                place(&df, &mut work, sites, k + 1, &mut has_phi, &mut queued, |f| phis[f].push(k));
+                place(&df, &mut work, sites, k + 1, &mut has_phi, &mut queued, |f| phi_pairs.push((f as u32, k)));
             }
             if let Some(extra) = extra {
                 // every def site, the left-out ones too
-                let mut all = sites.clone();
+                let mut all = sites.to_vec();
                 all.extend(extra.iter().copied().filter(|b| !sites.contains(b)));
                 if sites.is_empty() {
                     // (no value of the code's own: the phis are phantoms)
@@ -444,7 +483,7 @@ impl SsaFunction {
                 } else {
                     // the phis are made: they may read the code's values, whose readers the
                     // passes look at before dead code elimination removes them
-                    place(&df, &mut work, &all, k + 1, &mut has_phi, &mut queued, |f| phis[f].push(k));
+                    place(&df, &mut work, &all, k + 1, &mut has_phi, &mut queued, |f| phi_pairs.push((f as u32, k)));
                 }
             }
         }
@@ -453,7 +492,9 @@ impl SsaFunction {
         // value written (phis too) and slot read on entry — and some room for the constants
         // and ops the passes add. (A guess of twice the ops was too small for half the
         // functions, and each growth copied the whole arena.)
-        let n_phis: usize = phis.iter().map(Vec::len).sum();
+        let phis = Lists::new(n, &phi_pairs);
+        drop(phi_pairs);
+        let n_phis: usize = phis.items.len();
         let new_values = n_consts + n_outputs + n_phis;
         self.ops.reserve(total_ops + n_phis + total_ops / 16 + 8);
         self.varnodes.reserve(new_values + n_slots + new_values / 16 + 16 + if any_phantom { n_call_reads } else { 0 });
@@ -491,14 +532,10 @@ impl SsaFunction {
         }
 
         // 4. rename along the dominator tree
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (b, &d) in idom.iter().enumerate().take(n) {
-            if let Some(d) = d
-                && d != b
-            {
-                children[d].push(b);
-            }
-        }
+        let child_pairs: Vec<(u32, usize)> =
+            idom.iter().enumerate().take(n).filter_map(|(b, &d)| d.filter(|&d| d != b).map(|d| (d as u32, b))).collect();
+        let children = Lists::new(n, &child_pairs);
+        drop(child_pairs);
         // per slot: the version count, the incoming value (`incoming_var`), the stack of
         // the versions in scope
         let mut vars = Slots { versions: vec![0; n_slots], incoming: vec![VarId::MAX; n_slots] };
