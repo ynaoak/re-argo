@@ -1738,6 +1738,17 @@ fn text_capstone(thumb: bool) -> capstone::Capstone {
     Capstone::new().arm().mode(mode).detail(false).build().expect("failed to create ARM capstone")
 }
 
+/// Whether Capstone may print the ARM (`thumb`: Thumb) instruction `word` of `len` bytes as
+/// `hlt` (the only trap text, `ud2` / `hlt`, an ARM instruction can have): A32
+/// `cccc 0001 0000 iiii iiii iiii 0111 iiii` (any condition), T16 `1011 1010 10ii iiii`.
+pub(crate) fn may_be_hlt(word: u32, len: u8, thumb: bool) -> bool {
+    match (thumb, len) {
+        (true, 2) => word & 0xffc0 == 0xba80,
+        (true, _) => false,
+        (false, _) => word & 0x0ff0_00f0 == 0x0100_0070,
+    }
+}
+
 /// The text of the ARM (`thumb`: Thumb) instruction `bytes` (read as `word`) at `address`:
 /// Capstone's, or `.word` of it when Capstone cannot decode it.
 pub(crate) fn format_text(bytes: &[u8], thumb: bool, word: u32, address: u64) -> String {
@@ -1894,6 +1905,40 @@ mod tests {
     use reargo_core::address::SpaceId as CoreSpace;
     use reargo_loader::memory::{MemoryBlock, MemoryFlags};
     use std::sync::Arc;
+
+    /// Capstone prints no ARM / Thumb instruction outside `may_be_hlt` as `ud2` / `hlt`.
+    #[test]
+    fn hlt_only_where_may_be_hlt() {
+        let trap = |bytes: &[u8], thumb: bool, word: u32| {
+            let t = format_text(bytes, thumb, word, 0x1_0000);
+            matches!(t.split_whitespace().next(), Some("ud2" | "hlt"))
+        };
+        // every T16 halfword
+        for hw in 0..=0xffffu32 {
+            if (hw >> 11) >= 0x1d {
+                continue; // a T32 prefix
+            }
+            let b = (hw as u16).to_le_bytes();
+            assert!(!trap(&b, true, hw) || may_be_hlt(hw, 2, true), "{hw:04x}");
+        }
+        let mut x: u64 = 0x1405_7b7e_f767_814f;
+        for i in 0..400_000u32 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut w = (x >> 32) as u32;
+            if i % 4 == 0 {
+                w = (w & 0xf00f_ff0f) | 0x0100_0070 ^ ((x as u32) & 0x00f0_0000); // around A32 HLT
+            }
+            assert!(!trap(&w.to_le_bytes(), false, w) || may_be_hlt(w, 4, false), "a32 {w:08x}");
+            // a T32 pair: the first halfword a prefix
+            let hw1 = ((w >> 16) & 0x07ff) | ((0x1d + ((x >> 20) % 3) as u32) << 11);
+            {
+                let hw2 = w & 0xffff;
+                let b = [(hw1 & 0xff) as u8, (hw1 >> 8) as u8, (hw2 & 0xff) as u8, (hw2 >> 8) as u8];
+                assert!(!trap(&b, true, (hw1 << 16) | hw2), "t32 {hw1:04x} {hw2:04x}");
+            }
+        }
+        assert!(may_be_hlt(0xe100_0070, 4, false) && may_be_hlt(0xba80, 2, true));
+    }
 
     fn make_memory(word: u32, addr: u64) -> Memory {
         let bytes = word.to_le_bytes();

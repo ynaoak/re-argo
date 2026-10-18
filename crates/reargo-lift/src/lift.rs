@@ -114,6 +114,17 @@ impl InsnText {
         }
     }
 
+    /// Whether the text may start with `ud2` or `hlt` (the trap instructions' texts): `false`
+    /// only when the decoded instruction, or for ARM the encoding, says it does not, without
+    /// formatting the text.
+    pub fn may_be_trap_text(&self) -> bool {
+        match &self.src {
+            TextSource::Given => true,
+            TextSource::X86(i) => matches!(i.mnemonic(), iced_x86::Mnemonic::Ud2 | iced_x86::Mnemonic::Hlt),
+            TextSource::Arm { len, thumb, word, .. } => crate::arm32::may_be_hlt(*word, *len, *thumb),
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         self.cell.get_or_init(|| match &self.src {
             TextSource::Given => String::new(),
