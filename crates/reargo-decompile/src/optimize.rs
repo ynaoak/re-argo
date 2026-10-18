@@ -334,13 +334,22 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     let mut head = 0usize;
     let mut removed = 0;
     let mut sweep = 0usize;
+    // (for the phi cycles below: the live ops with side effects or no output, which this loop
+    // never kills, and how many phis live)
+    let mut roots: Vec<usize> = Vec::new();
+    let mut live_phis = 0usize;
     loop {
         let i = if sweep < n {
             let i = sweep;
             sweep += 1;
-            if !candidate(&func.ops[i]) {
+            let o = &func.ops[i];
+            if !candidate(o) {
+                if !o.dead {
+                    roots.push(i);
+                }
                 continue;
             }
+            live_phis += usize::from(o.opcode == OpCode::MultiEqual);
             i
         } else if head < queue.len() {
             let i = queue[head];
@@ -366,6 +375,7 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
 
         func.ops[i].dead = true;
         removed += 1;
+        live_phis -= usize::from(func.ops[i].opcode == OpCode::MultiEqual);
 
         // The newly-dead op's inputs each just lost a use. Re-queue
         // the defining op of any input that itself is a DCE
@@ -387,11 +397,9 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     // Cycles through phi nodes (a loop counter nothing outside the loop
     // reads) keep each other "used" above. Mark what the side-effecting ops
     // actually need and drop the rest.
-    if func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::MultiEqual) {
+    if live_phis > 0 {
+        let mut stack = roots;
         let mut live = vec![false; n];
-        let mut stack: Vec<usize> = (0..n)
-            .filter(|&i| !func.ops[i].dead && (is_side_effecting(func.ops[i].opcode) || func.ops[i].output.is_none()))
-            .collect();
         for &i in &stack {
             live[i] = true;
         }
