@@ -324,6 +324,13 @@ impl LiftCache {
             self.retain_from(start);
             self.kept = self.live;
         }
+        // (nearly full: the dead entries at the front make room when they are a quarter of
+        // the arrays, moving the live ones once instead of the whole arrays into larger ones;
+        // not during a walk, which holds indices)
+        let (len, cap) = (self.lifted.len(), self.lifted.capacity());
+        if self.head > 0 && 4 * self.head >= len && 4 * (cap - len) < len {
+            self.compact();
+        }
         if let Some(p) = &mut self.parity {
             p.trim(start, at);
         }
@@ -350,24 +357,29 @@ impl LiftCache {
             self.head += 1;
         }
         // (the dead entries at the front removed once they are half of the arrays)
-        let h = self.head;
-        if h > 0 && 2 * h >= self.lifted.len() {
-            self.lifted.drain(..h);
-            self.meta.drain(..h);
-            self.shape.drain(..h);
-            self.head = 0;
-            let h = u32::try_from(h).expect("lift cache index");
-            // (the live entries link only to live ones, all at or after `h`; a dead one's
-            // link is not read)
-            for m in &mut self.meta {
-                m.next = if m.next == NO_NEXT || m.next < h { NO_NEXT } else { m.next - h };
-            }
-            self.map.retain(|_, i| {
-                let keep = *i >= h;
-                *i = i.wrapping_sub(h);
-                keep
-            });
+        if self.head > 0 && 2 * self.head >= self.lifted.len() {
+            self.compact();
         }
+    }
+
+    /// Removes the dead entries at the front of the arrays, shifting the links and the map.
+    fn compact(&mut self) {
+        let h = self.head;
+        self.lifted.drain(..h);
+        self.meta.drain(..h);
+        self.shape.drain(..h);
+        self.head = 0;
+        let h = u32::try_from(h).expect("lift cache index");
+        // (the live entries link only to live ones, all at or after `h`; a dead one's
+        // link is not read)
+        for m in &mut self.meta {
+            m.next = if m.next == NO_NEXT || m.next < h { NO_NEXT } else { m.next - h };
+        }
+        self.map.retain(|_, i| {
+            let keep = *i >= h;
+            *i = i.wrapping_sub(h);
+            keep
+        });
     }
 
     /// Room for `n` instructions and as many again (at least
@@ -883,7 +895,8 @@ impl X86Lifter {
         let mut check_pf = self.parity;
         let mut needs_pf = false;
         let mut pf_written = false;
-        let mut checkpoints = Vec::new();
+        // (a checkpoint per span, of some 50-60 instructions: room for a walk of `count`)
+        let mut checkpoints = Vec::with_capacity((count / 32).min(256) + 2);
         let (mut addr, mut idx) = (start, 0usize);
         // the page of cells `addr` is in, as `plain_range` keeps it: the table's bounds are
         // checked where a walk enters a page

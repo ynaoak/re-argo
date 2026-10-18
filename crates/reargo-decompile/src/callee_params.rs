@@ -1305,7 +1305,8 @@ impl<'a> CalleeParams<'a> {
         let idx_of = |a: u64| walk.index_of(a).map(|_| a);
         let last = walk.last();
         let mut seen = vec![0u64; (last.map_or(0, |l| l - target) as usize + 1).div_ceil(64)];
-        let mut insns: Vec<(u64, CInsn)> = Vec::new();
+        // (room for a body of a few hundred instructions: most are, and growing moved them)
+        let mut insns: Vec<(u64, CInsn)> = Vec::with_capacity(walk.len().min(256));
         let mut stack = vec![target];
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
         while let Some(a) = stack.pop() {
@@ -1346,7 +1347,9 @@ impl<'a> CalleeParams<'a> {
     /// `ControlFlowGraph::build_owned` does.
     fn compact_body(&self, insns: &[(u64, CInsn)], truncated: bool) -> Summary {
         // the leaders (`compute_leaders`)
-        let mut leaders: Vec<u64> = vec![insns[0].0];
+        // (room for every one: the entry and two per instruction that leads)
+        let mut leaders: Vec<u64> = Vec::with_capacity(1 + 2 * insns.iter().filter(|(_, c)| c.leads()).count());
+        leaders.push(insns[0].0);
         for (a, c) in insns {
             if c.leads() {
                 leaders.extend(c.target(*a));
@@ -1412,7 +1415,8 @@ impl<'a> CalleeParams<'a> {
         let rpo = {
             let mut seen = vec![false; n];
             let mut post: Vec<usize> = Vec::with_capacity(n);
-            let mut stack: Vec<(usize, usize)> = vec![(entry, 0)];
+            let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n);
+            stack.push((entry, 0));
             seen[entry] = true;
             while let Some(top) = stack.last_mut() {
                 let (b, i) = *top;
