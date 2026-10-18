@@ -206,35 +206,38 @@ impl FlowCache {
     /// is a function of its address and of the decode state it is lifted in (a Thumb IT
     /// block), so its flow is kept by both: the searches of a batch lift each once.
     fn run_generic(&self, lifter: &dyn PcodeLift, memory: &Memory, addr: u64, each: &mut dyn FnMut(Flow) -> bool) {
-        let shard_of = |a: u64| &self.generic[((a >> 12) % self.generic.len() as u64) as usize];
+        // (the instructions of one 4 KB page share a shard, looked up under one lock)
+        let shard_of = |a: u64| ((a >> 12) % self.generic.len() as u64) as usize;
         let mut at = addr;
         let mut ctx = reargo_lift::LiftContext::default();
         loop {
-            // (a pending delay slot is not kept: lifted each time)
-            let key = ctx.delay.is_none().then(|| (at, ctx.it.map(|it| (it.state, it.addr))));
-            let known = key.and_then(|k| shard_of(at).lock().ok().and_then(|m| m.get(k)));
-            let (flow, after) = match known {
-                Some(v) => v,
-                None => {
-                    let lifted = lifter.lift_instruction_ctx(memory, at, &mut ctx).ok();
-                    let flow = lifted.as_ref().map(Flow::of);
-                    let after = ctx.it.map(|it| (it.state, it.addr));
-                    if let Some(k) = key
-                        && ctx.delay.is_none()
-                        && let Ok(mut m) = shard_of(at).lock()
-                    {
-                        m.insert(k, &flow, after);
+            let k = shard_of(at);
+            let Ok(mut m) = self.generic[k].lock() else { return };
+            while shard_of(at) == k {
+                // (a pending delay slot is not kept: lifted each time)
+                let key = ctx.delay.is_none().then(|| (at, ctx.it.map(|it| (it.state, it.addr))));
+                let (flow, after) = match key.and_then(|k| m.get(k)) {
+                    Some(v) => v,
+                    None => {
+                        let lifted = lifter.lift_instruction_ctx(memory, at, &mut ctx).ok();
+                        let flow = lifted.as_ref().map(Flow::of);
+                        let after = ctx.it.map(|it| (it.state, it.addr));
+                        if let Some(k) = key
+                            && ctx.delay.is_none()
+                        {
+                            m.insert(k, &flow, after);
+                        }
+                        (flow, after)
                     }
-                    (flow, after)
+                };
+                let Some(f) = flow else { return };
+                if ctx.delay.is_none() {
+                    ctx.it = after.map(|(state, addr)| reargo_lift::ItBlock { state, addr });
                 }
-            };
-            let Some(f) = flow else { return };
-            if ctx.delay.is_none() {
-                ctx.it = after.map(|(state, addr)| reargo_lift::ItBlock { state, addr });
-            }
-            at = f.address + u64::from(f.length);
-            if !each(f) {
-                return;
+                at = f.address + u64::from(f.length);
+                if !each(f) {
+                    return;
+                }
             }
         }
     }
