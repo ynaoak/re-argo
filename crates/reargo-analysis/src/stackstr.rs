@@ -202,7 +202,8 @@ fn stitch_runs(captures: &[StackImmStore]) -> Vec<StitchedRun> {
     let mut sorted = captures.to_vec();
     sorted.sort_by_key(|c| c.disp);
 
-    let mut runs = Vec::new();
+    // (a run per capture at most)
+    let mut runs = Vec::with_capacity(sorted.len());
     let mut cur_bytes: Vec<u8> = Vec::new();
     let mut cur_addr: u64 = u64::MAX;
     let mut cur_next: i32 = i32::MIN;
