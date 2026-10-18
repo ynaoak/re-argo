@@ -394,6 +394,33 @@ fn is_printable(b: u8) -> bool {
     (0x20..=0x7E).contains(&b) || b == b'\t'
 }
 
+/// Does `bytes` hold 3 consecutive letters, pairwise distinct ignoring case? (A byte that is
+/// no letter ends every window holding it: the next one to try starts after it, so a run of
+/// digits / punctuation is looked at one byte in three.)
+fn has_word(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if !bytes[i + 2].is_ascii_alphabetic() {
+            i += 3;
+            continue;
+        }
+        if !bytes[i + 1].is_ascii_alphabetic() {
+            i += 2;
+            continue;
+        }
+        if !bytes[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let (a, b, c) = (bytes[i].to_ascii_lowercase(), bytes[i + 1].to_ascii_lowercase(), bytes[i + 2].to_ascii_lowercase());
+        if a != b && b != c && a != c {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Reject runs that are unlikely to be meaningful strings.
 ///
 /// The "decoded" candidate must (a) contain a run of at least 3
@@ -414,25 +441,7 @@ fn passes_filter(s: &str) -> bool {
     // the single strongest filter against XOR brute-force noise on
     // real binaries.
     let bytes = s.as_bytes();
-    let mut had_word = false;
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        let a = bytes[i].to_ascii_lowercase();
-        let b = bytes[i + 1].to_ascii_lowercase();
-        let c = bytes[i + 2].to_ascii_lowercase();
-        if a.is_ascii_alphabetic()
-            && b.is_ascii_alphabetic()
-            && c.is_ascii_alphabetic()
-            && a != b
-            && b != c
-            && a != c
-        {
-            had_word = true;
-            break;
-        }
-        i += 1;
-    }
-    if !had_word {
+    if !has_word(bytes) {
         return false;
     }
     // < 60% alnum → mostly punctuation, skip (`alnum * 5 < len * 3`,
@@ -594,6 +603,41 @@ mod tests {
             }
         }
         true
+    }
+
+    /// `has_word` finds a window of 3 pairwise distinct letters where the byte-by-byte search
+    /// does, in strings of letters, digits and punctuation and of every byte value.
+    #[test]
+    fn has_word_matches_windows() {
+        let naive = |bytes: &[u8]| {
+            bytes.windows(3).any(|w| {
+                let (a, b, c) = (w[0].to_ascii_lowercase(), w[1].to_ascii_lowercase(), w[2].to_ascii_lowercase());
+                a.is_ascii_alphabetic() && b.is_ascii_alphabetic() && c.is_ascii_alphabetic() && a != b && b != c && a != c
+            })
+        };
+        let mut state = 0x51ed_270b_9a3c_44f1u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let alphabets: [&[u8]; 4] = [b"0123456789aAbB.", b"aaAAbz9", b"@[`{AZaz", b"xY1"];
+        let mut found = 0;
+        for round in 0..40_000 {
+            let len = (next() % 200) as usize;
+            let bytes: Vec<u8> = match round % 5 {
+                4 => (0..len).map(|_| next() as u8).collect(),
+                r => (0..len).map(|_| alphabets[r][(next() as usize) % alphabets[r].len()]).collect(),
+            };
+            assert_eq!(has_word(&bytes), naive(&bytes), "{bytes:?}");
+            found += usize::from(has_word(&bytes));
+        }
+        assert!(found > 1000, "{found}");
+        // a word at the end, or cut off by it
+        for at in [0usize, 61, 62, 63, 64, 125, 126, 127, 128] {
+            let mut bytes = vec![b'1'; 200];
+            bytes[at..at + 3].copy_from_slice(b"aBc");
+            assert!(has_word(&bytes) && has_word(&bytes[..at + 3]) && !has_word(&bytes[..at + 2]), "{at}");
+        }
     }
 
     #[test]
