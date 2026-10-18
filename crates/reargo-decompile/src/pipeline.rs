@@ -454,9 +454,13 @@ fn decompile_function_inner(
             kept
         }
         None => {
-            let mut lifted = lifter
-                .lift_range(&program.info.memory, func_entry, max_insns)
-                .map_err(|e| e.to_string())?;
+            let mut lifted = match fde {
+                // (a lifter with the default `lift_range`: each instruction's lift depends on
+                // those before it only, so the range's lifts up to the body's end and the
+                // `int3`s after it are those of the whole range)
+                Some((start, len)) if lifter.as_x86().is_none() => lift_fde_prefix(lifter, &program.info.memory, func_entry, max_insns, start + len),
+                _ => lifter.lift_range(&program.info.memory, func_entry, max_insns).map_err(|e| e.to_string())?,
+            };
             if lifted.is_empty() {
                 return Err(format!("no instructions at 0x{:x}", func_entry));
             }
@@ -525,6 +529,29 @@ fn decompile_function_inner(
 /// to the next function is where a switch over an enum sends its impossible values (BDS
 /// 0x3b13ff0, the fmt argument type: `case 1: __builtin_trap();`). Only a jump table's case
 /// reaches them; the trim drops them otherwise.
+/// `lifter.lift_range(memory, entry, count)` (the default one: a stream from `entry`, up to
+/// the first instruction that cannot be lifted) as far as [`keep_fde_body`] with the body
+/// ending at `end` reads it: the instructions before `end`, then the `int3`s from `end` on.
+fn lift_fde_prefix(lifter: &dyn PcodeLift, memory: &Memory, entry: u64, count: usize, end: u64) -> Vec<LiftedInstruction> {
+    let mut out = Vec::new();
+    let mut addr = entry;
+    let mut next = end;
+    let mut ctx = reargo_lift::LiftContext::default();
+    for _ in 0..count {
+        let Ok(lifted) = lifter.lift_instruction_ctx(memory, addr, &mut ctx) else { break };
+        if lifted.address >= end {
+            // (past the body only an `int3` at `next` is kept, and the addresses increase)
+            if lifted.address != next || lifted.mnemonic.trim() != "int3" {
+                break;
+            }
+            next += u64::from(lifted.length);
+        }
+        addr += lifted.length as u64;
+        out.push(lifted);
+    }
+    out
+}
+
 fn keep_fde_body(lifted: Vec<LiftedInstruction>, start: u64, end: u64) -> Vec<LiftedInstruction> {
     let mut next = end;
     lifted
