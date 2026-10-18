@@ -601,7 +601,8 @@ impl<'a> NoReturn<'a> {
                 return outcome(trace.exit, unsure);
             }
         }
-        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.lifter.as_x86().zip(self.cache), shared: self.cache.filter(|_| self.lifter.as_x86().is_none()), insns: Vec::with_capacity(CHUNK), index: FxHashMap::with_capacity_and_hasher(CHUNK, Default::default()) };
+        let mut code = Code { lifter: self.lifter, memory: self.memory, flow: self.lifter.as_x86().zip(self.cache), shared: self.cache.filter(|_| self.lifter.as_x86().is_none()), insns: Vec::new(), index: FxHashMap::default() };
+        code.take_buffers();
         let mut unsure = false;
         let mut calls = Vec::new();
         let exit = code.at(target).map(|entry| {
@@ -634,6 +635,43 @@ struct Code<'a> {
 
 /// Instructions lifted at a time.
 const CHUNK: usize = 24;
+
+thread_local! {
+    /// The emptied buffers of the [`Code`]s a thread dropped (a search nests one per call
+    /// level it looks into): a new one takes them instead of growing its own to the function's
+    /// size again.
+    static CODE_BUFFERS: std::cell::RefCell<Vec<CodeBuffers>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A [`Code`]'s buffers: its flows and their index by address.
+type CodeBuffers = (Vec<Flow>, FxHashMap<u64, usize>);
+
+impl Code<'_> {
+    /// Take a dropped `Code`'s buffers, else room for a chunk.
+    fn take_buffers(&mut self) {
+        match CODE_BUFFERS.with(|b| b.borrow_mut().pop()) {
+            Some((insns, index)) => (self.insns, self.index) = (insns, index),
+            None => {
+                self.insns.reserve(CHUNK);
+                self.index.reserve(CHUNK);
+            }
+        }
+    }
+}
+
+impl Drop for Code<'_> {
+    fn drop(&mut self) {
+        let (mut insns, mut index) = (std::mem::take(&mut self.insns), std::mem::take(&mut self.index));
+        insns.clear();
+        index.clear();
+        CODE_BUFFERS.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.len() < 2 * MAX_DEPTH as usize {
+                b.push((insns, index));
+            }
+        });
+    }
+}
 
 impl Code<'_> {
     /// The instruction at `addr`, lifting from there when it is not lifted yet; `None` when it
