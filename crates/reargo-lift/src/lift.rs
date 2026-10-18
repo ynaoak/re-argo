@@ -246,6 +246,32 @@ pub trait PcodeLift: Send + Sync {
         None
     }
 
+    /// The `length` of the instruction a successful [`PcodeLift::lift_instruction_ctx`] at
+    /// `address` gives (whatever the context; its `address` is the one asked for), when it is
+    /// known without the lift: a stream of lifts from `a` then starts its instructions at the
+    /// addresses these lengths step through, as far as its lifts succeed. `None`: not known.
+    fn instruction_length(&self, _memory: &Memory, _address: u64) -> Option<u32> {
+        None
+    }
+
+    /// Extend `starts` (its last entry the start of an instruction of a stream) with the starts
+    /// of the stream's next instructions by [`PcodeLift::instruction_length`], until it holds
+    /// `len` entries or its last is above `until`. `false` when a length is not known at its
+    /// last entry (it is then not extended past it).
+    fn extend_instruction_starts(&self, memory: &Memory, starts: &mut Vec<u64>, len: usize, until: u64) -> bool {
+        while starts.len() < len {
+            let Some(&a) = starts.last() else { return false };
+            if a > until {
+                break;
+            }
+            match self.instruction_length(memory, a).filter(|&l| l > 0).and_then(|l| a.checked_add(u64::from(l))) {
+                Some(b) => starts.push(b),
+                None => return false,
+            }
+        }
+        true
+    }
+
     fn lift_instruction(
         &self,
         memory: &Memory,

@@ -562,8 +562,9 @@ fn lift_fde_prefix(lifter: &dyn PcodeLift, memory: &Memory, entry: u64, count: u
 /// stream stops after an instruction once
 /// * no address the instructions reachable from the entry lead to ([`reach_successor_addrs`])
 ///   is an address a later instruction of the stream may start at — after it and, when the
-///   lifter knows its longest instruction, below where the `count` lifts can reach — so no
-///   later instruction is reachable,
+///   lifter knows its longest instruction, below where the `count` lifts can reach; when it
+///   knows the lengths ([`PcodeLift::extend_instruction_starts`], Thumb), one of the addresses
+///   the later lifts start at ([`LiftChain`]) — so no later instruction is reachable,
 /// * neither is any address of the function's `body` (its `RAM` ranges, `[start, end)`), so
 ///   no later instruction is kept as part of it,
 /// * it is a jump, call or return, so the window of a later indirect jump does not reach back
@@ -592,6 +593,8 @@ fn lift_trimmed_prefix(
     // (whether the stream may still stop: addresses increase one instruction after the other,
     // no jump table, no float compare)
     let mut may_stop = true;
+    // (a lifter that tells no lengths at the entry: none asked for)
+    let mut chain = LiftChain { stuck: lifter.instruction_length(memory, entry).is_none(), ..LiftChain::default() };
     let mut addr = entry;
     let mut ctx = reargo_lift::LiftContext::default();
     for _ in 0..count {
@@ -648,9 +651,74 @@ fn lift_trimmed_prefix(
             if pending.range(..bound).next().is_none() && !body.iter().any(|&(s, e)| s < bound && e > next) {
                 break;
             }
+            // (where exactly: when the lifter knows its lengths)
+            if !chain.lands(lifter, memory, out.len(), next, count, &pending, body) {
+                break;
+            }
         }
     }
     out
+}
+
+/// The addresses the later lifts of [`lift_trimmed_prefix`]'s stream start at, as far as the
+/// lifter tells its lengths ([`PcodeLift::instruction_length`]) — the stream steps through them
+/// for as long as its lifts succeed — found as they are needed.
+#[derive(Default)]
+struct LiftChain {
+    /// The stream index of `addrs[0]`.
+    at: usize,
+    addrs: Vec<u64>,
+    /// A length not known (at `addrs.last()`): nothing is told.
+    stuck: bool,
+}
+
+impl LiftChain {
+    /// Whether a later lift of the stream — those from index `i` (at `next`) below `count` —
+    /// may start at an address in `pending` or in one of the `body` ranges: `true` unless the
+    /// lengths show that none does.
+    #[allow(clippy::too_many_arguments)]
+    fn lands(
+        &mut self,
+        lifter: &dyn PcodeLift,
+        memory: &Memory,
+        i: usize,
+        next: u64,
+        count: usize,
+        pending: &std::collections::BTreeSet<u64>,
+        body: &[(u64, u64)],
+    ) -> bool {
+        if self.stuck {
+            return true;
+        }
+        if self.addrs.is_empty() {
+            self.at = i;
+            self.addrs.push(next);
+        }
+        if i < self.at {
+            return true;
+        }
+        let need = i - self.at + 1;
+        if self.addrs.len() < need {
+            self.stuck = !lifter.extend_instruction_starts(memory, &mut self.addrs, need, u64::MAX);
+        }
+        if self.stuck || self.addrs.get(i - self.at) != Some(&next) {
+            // (the stream left the lengths: not known)
+            self.stuck = true;
+            return true;
+        }
+        // (no later lift lands beyond `last`)
+        let last = pending.last().copied().into_iter().chain(body.iter().filter(|&&(_, e)| e > next).map(|&(_, e)| e - 1)).max();
+        let Some(last) = last else { return false };
+        if self.addrs.last().is_some_and(|&a| a <= last) {
+            self.stuck = !lifter.extend_instruction_starts(memory, &mut self.addrs, count - self.at, last);
+        }
+        if self.stuck || (self.at + self.addrs.len() < count && self.addrs.last().is_some_and(|&a| a <= last)) {
+            return true;
+        }
+        let later = &self.addrs[i - self.at..];
+        pending.iter().any(|p| later.binary_search(p).is_ok())
+            || body.iter().any(|&(s, e)| e > next && later.get(later.partition_point(|&a| a < s)).is_some_and(|&a| a < e))
+    }
 }
 
 fn keep_fde_body(lifted: Vec<LiftedInstruction>, start: u64, end: u64) -> Vec<LiftedInstruction> {
@@ -5292,6 +5360,38 @@ mod tests {
         let mem = make_memory(&words(&code), 0x1000);
         let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 500, &[], &noreturn);
         assert_eq!(prefix.len(), 12);
+    }
+
+    /// With the lengths of Thumb code known, the lift also stops where a pending branch target
+    /// lies between two later instructions (no later lift can start at it), and keeps what the
+    /// whole stream keeps.
+    #[test]
+    fn lift_trimmed_prefix_follows_thumb_lengths() {
+        let lifter = reargo_lift::arm32::Arm32Lifter::new_thumb(reargo_core::address::Endian::Little);
+        // cmp r0, #0; beq 0x1008; bx lr; then mov.w r0, #0 (4 bytes each) from 0x1006: 0x1008
+        // is inside the first of them
+        let mut halves: Vec<u16> = vec![0x2800, 0xd001, 0x4770];
+        for _ in 0..40 {
+            halves.extend_from_slice(&[0xf04f, 0x0000]);
+        }
+        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let mem = make_memory(&bytes, 0x1000);
+        let noreturn = crate::noreturn::NoReturn::new(&lifter, &mem, None);
+        let mut full = lifter.lift_range(&mem, 0x1000, 500).unwrap();
+        assert_eq!(full.len(), 43);
+        crate::noreturn::mark_noreturn_calls(&mut full, &noreturn);
+        let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 500, &[], &noreturn);
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(trimmed(prefix, &mem), trimmed(full.clone(), &mem));
+        // beq 0x100a: the start of the second `mov.w`, so the stream goes on to it
+        halves[1] = 0xd002;
+        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let mem = make_memory(&bytes, 0x1000);
+        let mut full = lifter.lift_range(&mem, 0x1000, 500).unwrap();
+        crate::noreturn::mark_noreturn_calls(&mut full, &noreturn);
+        let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 500, &[], &noreturn);
+        assert!(prefix.len() > 4, "{}", prefix.len());
+        assert_eq!(trimmed(prefix, &mem), trimmed(full, &mem));
     }
 
     /// Only an indirect jump whose target can take a table's shape may be a jump table: the

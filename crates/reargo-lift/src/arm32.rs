@@ -1785,6 +1785,50 @@ impl PcodeLift for Arm32Lifter {
         Some(4)
     }
 
+    /// (Thumb: by the first halfword, as [`PcodeLift::lift_instruction`] reads it; not told for
+    /// A32, whose every instruction is a word: a stream's starts are known from its length bound)
+    fn instruction_length(&self, memory: &Memory, address: u64) -> Option<u32> {
+        if !self.thumb {
+            return None;
+        }
+        let hw1 = self.read_half(memory.read_byte(address)?, memory.read_byte(address + 1)?);
+        Some(if Self::is_thumb32(hw1) { 4 } else { 2 })
+    }
+
+    /// (over the bytes of the block, without a lookup per instruction)
+    fn extend_instruction_starts(&self, memory: &Memory, starts: &mut Vec<u64>, len: usize, until: u64) -> bool {
+        let Some(&first) = starts.last() else { return false };
+        if !self.thumb {
+            return false;
+        }
+        let end = memory.find_block(first).map_or(first, |b| b.start + b.size);
+        if let Some(bytes) = memory.slice(first, until.saturating_add(4).min(end).saturating_sub(first)) {
+            let mut a = first;
+            while starts.len() < len && a <= until {
+                let off = (a - first) as usize;
+                let step = match bytes.get(off..off + 2) {
+                    Some(&[b0, b1]) if Self::is_thumb32(self.read_half(b0, b1)) => 4,
+                    Some(_) => 2,
+                    None => break,
+                };
+                a += step;
+                starts.push(a);
+            }
+        }
+        // (the rest, past the slice, one by one)
+        while starts.len() < len {
+            let Some(&a) = starts.last() else { return false };
+            if a > until {
+                break;
+            }
+            match self.instruction_length(memory, a).and_then(|l| a.checked_add(u64::from(l))) {
+                Some(b) => starts.push(b),
+                None => return false,
+            }
+        }
+        true
+    }
+
     fn lift_instruction(&self, memory: &Memory, address: u64) -> Result<LiftedInstruction, LiftError> {
         if self.thumb {
             let b0 = memory.read_byte(address).ok_or(LiftError::UnreadableAddress(address))?;
@@ -1899,6 +1943,13 @@ impl MappedArmLifter {
 impl PcodeLift for MappedArmLifter {
     fn max_instruction_length(&self) -> Option<u32> {
         Some(4)
+    }
+
+    fn instruction_length(&self, memory: &Memory, address: u64) -> Option<u32> {
+        match self.region_at(address) {
+            ArmRegion::Thumb => self.thumb.instruction_length(memory, address),
+            _ => self.arm.instruction_length(memory, address),
+        }
     }
 
     fn lift_instruction(&self, memory: &Memory, address: u64) -> Result<LiftedInstruction, LiftError> {
