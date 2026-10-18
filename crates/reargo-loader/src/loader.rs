@@ -284,16 +284,46 @@ pub fn elf_import_stubs(data: &[u8]) -> Vec<(u64, String)> {
     let Ok(elf) = goblin::elf::Elf::parse(data) else {
         return Vec::new();
     };
-    let section_addr = |want: &str| elf.section_headers.iter().find(|sh| elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("") == want).map(|sh| sh.sh_addr);
-    let plt = section_addr(".plt");
-    let sec = section_addr(".plt.sec");
-    let got = section_addr(".plt.got");
+    // (WS96) each stub's `jmp [rip + slot]` names its GOT slot, the slot's relocation the
+    // symbol: right for `.plt`, `.plt.sec` (IBT) and `.plt.got` alike (the stubs are not in
+    // relocation order in the last two)
+    let mut by_slot: std::collections::HashMap<u64, &str> = std::collections::HashMap::new();
+    for reloc in elf.pltrelocs.iter().chain(elf.dynrelas.iter()) {
+        if let Some(name) = elf.dynsyms.get(reloc.r_sym).and_then(|s| elf.dynstrtab.get_at(s.st_name)).filter(|n| !n.is_empty()) {
+            by_slot.entry(reloc.r_offset).or_insert(name);
+        }
+    }
     let mut out = Vec::new();
-    for (i, reloc) in elf.pltrelocs.iter().enumerate() {
-        let Some(name) = elf.dynsyms.get(reloc.r_sym).and_then(|s| elf.dynstrtab.get_at(s.st_name)).filter(|n| !n.is_empty()) else { continue };
-        let i = i as u64;
-        for at in [plt.map(|b| b + (i + 1) * 16), sec.map(|b| b + i * 16), got.map(|b| b + i * 16)].into_iter().flatten() {
-            out.push((at, name.to_string()));
+    for sh in &elf.section_headers {
+        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        if !matches!(name, ".plt" | ".plt.sec" | ".plt.got") || sh.sh_type == goblin::elf::section_header::SHT_NOBITS {
+            continue;
+        }
+        let Some(bytes) = data.get(sh.sh_offset as usize..(sh.sh_offset + sh.sh_size) as usize) else { continue };
+        for (stub, slot) in plt_stub_slots(sh.sh_addr, bytes) {
+            if let Some(n) = by_slot.get(&slot) {
+                out.push((stub, n.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The stubs of a PLT section at `addr` and the GOT slot each jumps through: `(stub, slot)` for
+/// every entry (16 bytes, or 8 for an 8-byte `.plt.got`) holding `jmp [rip + d]` at its start,
+/// after `endbr64` and / or a `bnd` prefix.
+fn plt_stub_slots(addr: u64, bytes: &[u8]) -> Vec<(u64, u64)> {
+    let entry = if bytes.len().is_multiple_of(16) { 16 } else { 8 };
+    let mut out = Vec::new();
+    for (k, e) in bytes.chunks(entry).enumerate() {
+        let start = addr + (k * entry) as u64;
+        for at in [0usize, 1, 4, 5] {
+            if e.get(at..at + 2) == Some(&[0xff, 0x25]) && (at == 0 || e[..at] == [0xf2] || e[..4] == [0xf3, 0x0f, 0x1e, 0xfa]) {
+                let Some(d) = e.get(at + 2..at + 6) else { break };
+                let d = i32::from_le_bytes(d.try_into().expect("4 bytes"));
+                out.push((start, (start + at as u64 + 6).wrapping_add(d as i64 as u64)));
+                break;
+            }
         }
     }
     out
@@ -943,7 +973,24 @@ impl std::fmt::Display for SymbolKind {
 
 #[cfg(test)]
 mod reloc_tests {
-    use super::{elf_exported_functions, elf_pointer_relocations, relative_table, resolve_pointer_relocations};
+    use super::{elf_exported_functions, elf_pointer_relocations, plt_stub_slots, relative_table, resolve_pointer_relocations};
+
+    /// WS96: a PLT stub's GOT slot comes from its own `jmp [rip + d]` — a lazy `.plt` entry, an
+    /// IBT `.plt.sec` one (`endbr64; bnd jmp`), an 8-byte `.plt.got` one; the `.plt` header (no
+    /// such jump at its start) is none.
+    #[test]
+    fn plt_stubs_name_their_got_slots() {
+        // .plt at 0x1000: header (push [rip]; jmp [rip]); entry 1: jmp [rip + 0x2000]; push 0; jmp .plt
+        let mut plt = vec![0xff, 0x35, 0, 0, 0, 0, 0xf2, 0xff, 0x25, 0, 0, 0, 0, 0x0f, 0x1f, 0x00];
+        plt.extend([0xff, 0x25, 0x00, 0x20, 0x00, 0x00, 0x68, 0, 0, 0, 0, 0xe9, 0, 0, 0, 0]);
+        assert_eq!(plt_stub_slots(0x1000, &plt), [(0x1010, 0x1016 + 0x2000)]);
+        // .plt.sec at 0x2000: endbr64 ; bnd jmp [rip + 0x100] ; nop
+        let sec = [0xf3, 0x0f, 0x1e, 0xfa, 0xf2, 0xff, 0x25, 0x00, 0x01, 0x00, 0x00, 0x0f, 0x1f, 0x44, 0x00, 0x00];
+        assert_eq!(plt_stub_slots(0x2000, &sec), [(0x2000, 0x200b + 0x100)]);
+        // .plt.got (8-byte entries): jmp [rip + 0x10] ; xchg ax, ax
+        let got = [0xff, 0x25, 0x10, 0x00, 0x00, 0x00, 0x66, 0x90, 0xff, 0x25, 0x20, 0x00, 0x00, 0x00, 0x66, 0x90, 0xff, 0x25, 0x30, 0x00, 0x00, 0x00, 0x66, 0x90];
+        assert_eq!(plt_stub_slots(0x3000, &got), [(0x3000, 0x3016), (0x3008, 0x302e), (0x3010, 0x3046)]);
+    }
 
     /// WS93: no exports in what is no ELF; a BDS-internal function (`REARGO_TEST_BDS`) is none.
     #[test]

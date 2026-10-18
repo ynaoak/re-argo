@@ -4783,7 +4783,8 @@ fn cmd_this_index(path: &Path, addresses: &[u64], rebuild: bool, check: bool) ->
         println!("member classes   {}", idx.members.len());
         let pf_fns: std::collections::BTreeSet<u64> = idx.param_fields.keys().map(|k| k.0).collect();
         println!("param fields     {} (in {} functions)", idx.param_fields.len(), pf_fns.len());
-        println!("element classes  {}", idx.elements.len());
+        println!("element classes  {} (vectors {})", idx.elements.len(), idx.vectors.len());
+        println!("memory functions allocators {}, deallocators {}", s.allocators, s.deallocators);
     }
     for &a in addresses {
         println!("0x{a:x}");
