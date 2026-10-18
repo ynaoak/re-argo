@@ -114,6 +114,8 @@ pub struct CalleeParams<'a> {
     /// The RELATIVE relocations' slots by value, and the vtables of each function.
     reloc_slots: std::sync::OnceLock<Option<FxHashMap<u64, Vec<u64>>>>,
     vtables_memo: Mutex<FxHashMap<u64, Vec<u64>>>,
+    /// The number of this oracle's convention ([`convention_id`]; `u32::MAX`: none).
+    convention: u32,
 }
 
 /// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
@@ -169,6 +171,7 @@ impl<'a> CalleeParams<'a> {
             }
             _ => Vec::new(),
         };
+        let convention = convention_id(&cc.args, &cc.returns.iter().map(|(r, _)| *r).collect::<Vec<_>>());
         Some(Self {
             arg_space,
             arg_offsets,
@@ -195,6 +198,7 @@ impl<'a> CalleeParams<'a> {
             flow_cache: lifter.as_x86().map(|_| crate::noreturn::FlowCache::new()),
             reloc_slots: std::sync::OnceLock::new(),
             vtables_memo: Mutex::new(FxHashMap::default()),
+            convention,
         })
     }
 
@@ -907,6 +911,28 @@ impl CompactTable {
     }
 }
 
+/// [`CInsn`]s a thread keeps at most, by [`reargo_lift::x86::X86Lifter::alike_key`] (emptied
+/// when full; [`CalleeParams::compact_alone`]).
+const COMPACT_MEMO_CAP: usize = 1 << 16;
+
+thread_local! {
+    static COMPACT_MEMO: std::cell::RefCell<FxHashMap<(u32, (bool, iced_x86::Instruction)), CInsn>> = std::cell::RefCell::new(FxHashMap::default());
+}
+
+/// The calling conventions oracles were made with (arguments, returns): a [`CInsn`] depends
+/// on its oracle's, [`COMPACT_MEMO`] keeps them by its number here.
+static CONVENTIONS: Mutex<Vec<(Vec<VarnodeData>, Vec<VarnodeData>)>> = Mutex::new(Vec::new());
+
+/// The number of the convention `(args, returns)` in [`CONVENTIONS`].
+fn convention_id(args: &[VarnodeData], returns: &[VarnodeData]) -> u32 {
+    let Ok(mut known) = CONVENTIONS.lock() else { return u32::MAX };
+    let at = known.iter().position(|(a, r)| a == args && r == returns).unwrap_or_else(|| {
+        known.push((args.to_vec(), returns.to_vec()));
+        known.len() - 1
+    });
+    u32::try_from(at).unwrap_or(u32::MAX)
+}
+
 /// What a summary reads of one instruction lifted alone ([`CalleeParams::summarize_compact`]):
 /// its flow (as `reachability`, the CFG's leaders and edges see it), its effect on the
 /// argument registers (as `run_block` / `block_writes` see it: the ops before its one call /
@@ -1172,15 +1198,73 @@ impl<'a> CalleeParams<'a> {
         if let Some(c) = cell.and_then(|cell| table.get(cell)) {
             return (!c.has(CI_FAILED)).then_some(c);
         }
-        let lifted = if pf { self.lifter.lift_instruction(self.memory, addr) } else { x86.lift_alone_with(self.memory, addr, cursor) };
-        let c = match lifted {
-            Ok(insn) => self.compact_insn(&insn).unwrap_or(CInsn::FAILED),
-            Err(_) => CInsn::FAILED,
+        let c = if pf {
+            match self.lifter.lift_instruction(self.memory, addr) {
+                Ok(insn) => self.compact_insn(&insn).unwrap_or(CInsn::FAILED),
+                Err(_) => CInsn::FAILED,
+            }
+        } else {
+            self.compact_alone(x86, addr, cursor)
         };
         if let Some(cell) = cell {
             table.put(cell, c);
         }
         (!c.has(CI_FAILED)).then_some(c)
+    }
+
+    /// The [`CInsn`] of the instruction at `addr` lifted alone without the PF: that of an
+    /// instruction alike ([`reargo_lift::x86::X86Lifter::alike_key`]: but for its displacement or
+    /// branch target) made before, when the address it names is its branch target (the lift's
+    /// ops are the same but for those values: its own branch target named instead), else of
+    /// its lift.
+    fn compact_alone<'m>(&self, x86: &reargo_lift::x86::X86Lifter, addr: u64, cursor: &mut reargo_lift::x86::DecodeCursor<'m>) -> CInsn
+    where
+        'a: 'm,
+    {
+        let Ok(insn) = x86.decode_alone_with(self.memory, addr, cursor) else { return CInsn::FAILED };
+        if self.convention == u32::MAX {
+            return match x86.lift_decoded_alone(insn, addr) {
+                Ok(lifted) => self.compact_insn(&lifted).unwrap_or(CInsn::FAILED),
+                Err(_) => CInsn::FAILED,
+            };
+        }
+        let key = (self.convention, x86.alike_key(&insn));
+        let near = (0..insn.op_count())
+            .any(|i| matches!(insn.op_kind(i), iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64))
+            .then(|| insn.near_branch_target());
+        let len = insn.len();
+        let known = COMPACT_MEMO.with(|m| m.borrow().get(&key).copied());
+        if let Some(t) = known {
+            // (its length its own; the address it names its branch target, as for the lift)
+            let mut c = CInsn { len: u8::try_from(len).unwrap_or(0), ..t };
+            if !c.has(CI_ADDR) {
+                return c;
+            }
+            let Some(n) = near else { return CInsn::FAILED };
+            return match i32::try_from(n.wrapping_sub(addr) as i64) {
+                Ok(rel) => {
+                    c.rel = rel;
+                    c
+                }
+                Err(_) => CInsn::FAILED,
+            };
+        }
+        let c = match x86.lift_decoded_alone(insn, addr) {
+            Ok(lifted) => self.compact_insn(&lifted),
+            Err(_) => None,
+        };
+        if let Some(c) = c
+            && (!c.has(CI_ADDR) || near == Some(c.addr(addr)))
+        {
+            COMPACT_MEMO.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= COMPACT_MEMO_CAP {
+                    m.clear();
+                }
+                m.insert(key, c);
+            });
+        }
+        c.unwrap_or(CInsn::FAILED)
     }
 
     /// [`Self::summarize_body`] of [`Self::body_plain`]'s body without the parameter accesses,
