@@ -915,8 +915,11 @@ impl CompactTable {
 /// when full; [`CalleeParams::compact_alone`]).
 const COMPACT_MEMO_CAP: usize = 1 << 16;
 
+/// `(convention, alike key)` -> the [`CInsn`] of an instruction lifted alone.
+type CompactMemo = FxHashMap<(u32, (bool, iced_x86::Instruction)), CInsn>;
+
 thread_local! {
-    static COMPACT_MEMO: std::cell::RefCell<FxHashMap<(u32, (bool, iced_x86::Instruction)), CInsn>> = std::cell::RefCell::new(FxHashMap::default());
+    static COMPACT_MEMO: std::cell::RefCell<CompactMemo> = std::cell::RefCell::new(FxHashMap::default());
 }
 
 /// The calling conventions oracles were made with (arguments, returns): a [`CInsn`] depends
