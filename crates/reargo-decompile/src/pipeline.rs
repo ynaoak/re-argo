@@ -5106,6 +5106,26 @@ mod tests {
         assert!(c.contains("eax = (uint32_t)*(uint8_t*)rdi;"), "{c}");
     }
 
+    /// WS99: the Rust output's statements have their variables' types (it is type-checked
+    /// with rustc in the corpus run): a narrowing operation casts, a comparison into a byte
+    /// register is its byte, a low part has the view's type, a temporary read twice is declared
+    /// (in C too).
+    #[test]
+    fn rust_statements_have_their_variables_types() {
+        let rust = |code: &[u8]| decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        // lea eax, [rdi+rdi]; ret
+        let r = rust(&[0x8d, 0x04, 0x3f, 0xc3]);
+        assert!(r.contains("eax = (rdi.wrapping_add(rdi)) as u32;"), "{r}");
+        // cmp edi, esi; setl al; mov [rdx], al; ret
+        let r = rust(&[0x39, 0xf7, 0x0f, 0x9c, 0xc0, 0x88, 0x02, 0xc3]);
+        assert!(r.contains("al = ((edi as i32 as i64) < (esi as i32 as i64)) as u8;"), "{r}");
+        // movzx eax, byte [rdi+rdx-3]; movzx ecx, byte [rdi+rdx-2]; add eax, ecx; movzx ecx, byte [rdi+rdx-1]; add eax, ecx; ret
+        let code = [0x0f, 0xb6, 0x44, 0x17, 0xfd, 0x0f, 0xb6, 0x4c, 0x17, 0xfe, 0x01, 0xc8, 0x0f, 0xb6, 0x4c, 0x17, 0xff, 0x01, 0xc8, 0xc3];
+        let (c, r) = (c_raw(&code), rust(&code));
+        assert!(c.contains("uint64_t tmp_600;") && c.contains("tmp_600 = rdi + rdx;"), "{c}");
+        assert!(r.contains("let mut tmp_600: u64;") && r.contains("tmp_600 = rdi.wrapping_add(rdx);"), "{r}");
+    }
+
     /// WS98: a concatenation whose halves fill the result prints as shifts C and Rust compile
     /// (`xor eax, eax; mov ah, cl`: `ax = CONCAT(ah, 0:1);` before).
     #[test]

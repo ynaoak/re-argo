@@ -433,6 +433,22 @@ impl<'a> CEmitter<'a> {
                 }
             }
         }
+        // a temporary printed as its own statement (read in more than one place, so not inlined;
+        // WS99: it was used undeclared)
+        for vn in &func.varnodes {
+            if vn.data.space == SpaceId::UNIQUE
+                && vn.def_op.is_some_and(|d| {
+                    !func.ops[d].dead
+                        && !self.folded.contains(&d)
+                        && !self.noise.contains(&d)
+                        && !self.coalesced.defs.contains_key(&d)
+                        && self.emit_op(func, &func.ops[d]).is_some()
+                })
+                && declared.insert((u64::MAX - vn.data.offset, vn.data.size))
+            {
+                linef!(self, "{} {};", size_to_type(vn.data.size), varnode_name(vn));
+            }
+        }
         // the stack slots (WS87)
         let slots: Vec<crate::frame::Slot> = self.frame.slots().filter(|s| !s.is_arg()).copied().collect();
         for s in &slots {

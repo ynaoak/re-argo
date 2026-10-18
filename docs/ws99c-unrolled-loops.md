@@ -131,3 +131,69 @@ r13 は callee-saved で epilogue で呼び出し元の値に戻る。読む人�
   残る `al = (uint8_t)eax;` は拡張した値もほかで使うもの（`eax = (uint32_t)r15->field_18; al = (uint8_t)eax; if ((al & 1) == 0)
   { edx = eax; …`）や計算結果の下位（f_bytes の `al = (uint8_t)eax; p[i] = al;`）。
 - コーパス不一致 0 / コンパイルエラー 0、goto は不変。`cargo test --workspace --release`: 1321 passed。
+
+### 3. `mov rax, r13; pop r13; ret` → `return r13;`（Task 3、判断のみ・コード変更なし）
+
+- 確認: jt2 / big の callee-saved レジスタ（rbx / rbp / r12〜r15 と 32-bit ビュー）を返す `return` 206 / 75 件は
+  **すべて本体で代入した値**（`retcs.py`: 本体で代入されていない callee-saved を返すものは 0 件）。典型は
+  `local_20 = r13; …; r13 = rdi; …; *(uint64_t*)r13 = r14; return r13;`（sret / this を返す）。
+- 印字されたプログラムでは、prologue の push は `local_20 = r13;`（呼び出し元の値の退避）として見え、epilogue の pop は
+  その値がどこからも読まれないので印字されない。したがって `return r13;` の r13 は本体の r13 で、印字されたプログラムの
+  意味どおり。`rax = r13; return rax;` と書いても「pop の前の r13」を読む点は同じで、区別の情報は増えない。
+- pop の**後**で読む場合（`pop rbx; mov rax, rbx; ret`、呼び出し元の rbx を返す）は、pop が `rbx = local_8;` として印字される
+  （値が読まれるため）ので `local_8 = rbx; rbx = local_8; return rbx;` になり、取り違えは起きない（手で組んで確認）。
+- **判断: 誤読の余地はないので `return r13;` のままにする。** 実行確認コーパスに callee-saved を返す手書き関数 4 つ
+  （`h_a16`〜`h_a19`: `push r13; …; mov rax, r13; pop r13; ret`、分岐の合流、32-bit ビュー `lea ebx; mov eax, ebx`、
+  2 レジスタ）を追加（loops4 27 → 31 関数、コーパス 252 → 268 関数）。main・本ブランチとも不一致 0。
+- 副次的に見つけたもの（未対応）: `h_a18` で `local_8 = rbx;` の `rbx` が宣言されない（`ebx` だけ宣言）。C ハーネスは
+  レジスタファイルで吸収するが、出力単体では未宣言。
+
+### 4. Rust 出力の型検査（Task 4）
+
+ハーネス（scratch `run/`）: `rscheck.sh <src> <prefix> <opt> <tag> <exe>`（C 実行確認と同じ ELF の各関数を `--rust` で出し、
+`rs2lib.py` で 1 つの lib にまとめて `rustc --crate-type lib --emit=metadata`）、`rsall.sh <tag> <exe>`（12 ビルド分の集計）。
+rs2lib は型検査に要らない差だけを吸収する: 引数を `mut` に、引数を再宣言する `let mut rdi: u64;` を消す、宣言に `= 0`、
+出力が宣言しないレジスタのビュー（引数 `rdi` の `edi` 等。C ハーネスのレジスタファイルに相当）を宣言。実行はしない
+（Rust 出力のビューは別々の変数なので、レジスタファイルを模さないと値が合わない）。
+
+main の Rust 出力（268 関数）: **エラー 138**（型の不一致 112、未宣言の値 20、`bool | u8` 4、`bsr` 1、`return;` 1）。
+型の不一致の内訳: `eax = (rax as u32) as u64;`（SUBPIECE が `as u64` まで戻す）、`eax = rdi.wrapping_add(rdi);`
+（`lea eax, [rdi+rdi]` の 8 バイトの演算を 4 バイトへ）、`al = a < b;`（比較の bool をバイトへ）、`eax = (x as i16 as i64) as u64;`
+（SEXT が常に u64）、`if neg_0 {`（フラグが u8 宣言）。未宣言 = 複数回読まれる一時値 `tmp_600`（**C 出力でも未宣言**、
+C ハーネスが補っていた）。
+
+修正（`rust_emit.rs`、C 出力は一時値の宣言だけ）:
+- SUBPIECE / SEXT / 符号付きシフト・除算・剰余を出力の型で（`al = rax as u8;`、`eax = (x as i16 as i32) as u32;`）。
+- 文を変数の型に（`typed_statement`、印字する文だけ。インライン・条件に畳む右辺は従来どおり）: 比較・bool 演算を
+  整数レジスタへ代入するとき `(…) as uN`、広い値の演算・コピーを狭いレジスタへ代入するとき `(…) as uN`（C の代入の暗黙の切り詰め）。
+- 比較のフラグ（`lt_0` / `neg_0` 等、WS90 の名前付きフラグ）は C と同じく `bool` で宣言。
+- 比較の bool を整数演算の被演算子にインラインするとき `(…) as uN`。
+- 一時値（unique 空間）で文として印字されるもの（インラインされないもの）を C / Rust とも宣言（`uint64_t tmp_600;` /
+  `let mut tmp_600: u64;`、`old_N` も）。jt2 で 471 件、big・s40 も含めて差分は宣言の追加だけ。
+
+| | Rust エラー（268 関数） | C 実行確認 |
+|---|---|---|
+| main | 138 | 不一致 0 / コンパイルエラー 0 |
+| 本ブランチ | **6**（`bool \| u8` 4 = 条件の畳み込み（condition.rs）の 1 関数 × 4 最適化レベル、`bsr` の intrinsic 1、`void` 関数の `return;` 1） | 不一致 0 / コンパイルエラー 0 |
+
+- テスト `pipeline::tests::rust_statements_have_their_variables_types`（`lea eax, [rdi+rdi]`、`setl al`、3 回読む一時値の
+  宣言 C / Rust。修正前は失敗を確認）。`cargo test --workspace --release`: 1322 passed、clippy 警告なし。
+- decompile-all（8 回、min / 中央値）: py.elf main 5.411 / 5.965 s → 5.401 / 6.018 s、bash.elf 2.257 / 2.477 → 2.263 / 2.376 s（ノイズ内）。
+
+## まとめ（main 03060c98 → 本ブランチ）
+
+| | main | 本ブランチ |
+|---|---|---|
+| コーパス 268 関数: 不一致 / コンパイルエラー | 0 / 0 | 0 / 0 |
+| コーパス goto | 2 | 0 |
+| コーパス行数 / キャスト | 4223 / 578 | 4219 / 566 |
+| コーパス Rust エラー | 138 | 6 |
+| jt2 goto / 行 / キャスト | 4910 / 248313 / 23771 | 4788 / 244529 / 21273 |
+| big goto / 行 / キャスト | 285 / 22315 / 2023 | 279 / 22144 / 1983 |
+| s40 goto / 行 / キャスト | 23 / 4550 / 711 | 16 / 4545 / 693 |
+| `cargo test --workspace --release` | 1319 | 1322 |
+
+残り:
+- jt2 の goto 4788 の大半は同じ深さの後方 goto（3350）。既約な領域・出口が複数あるループ（ループの中へ 185）。
+- Rust: 条件の畳み込みで `bool | u8`（condition.rs の Rust 描画）、`bsr` 等の intrinsic、`void` 関数の推定。
+- `rbx` の push だけが印字されビュー（`ebx`）しか宣言されない場合の未宣言（C / Rust）。
