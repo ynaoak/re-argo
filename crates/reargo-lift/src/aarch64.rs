@@ -1280,8 +1280,56 @@ impl PcodeLift for Aarch64Lifter {
             .read_bytes(address, &mut buf)
             .map_err(|_| LiftError::UnreadableAddress(address))?;
 
-        CS.with(|cs| self.lift_bytes(cs, &buf, address))
+        let word = u32::from_le_bytes(buf);
+        if is_pc_relative(word) {
+            return CS.with(|cs| self.lift_bytes(cs, &buf, address));
+        }
+        // (an instruction that does not read the PC lifts the same at every address but for
+        // its ops' addresses: the lift of the same word made before, moved to `address`)
+        if let Some(lifted) = WORD_MEMO.with(|m| m.borrow().get(&word).map(|l| relocated(l, address))) {
+            return Ok(lifted);
+        }
+        let lifted = CS.with(|cs| self.lift_bytes(cs, &buf, address))?;
+        WORD_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= WORD_MEMO_CAP {
+                m.clear();
+            }
+            m.insert(word, lifted.clone());
+        });
+        Ok(lifted)
     }
+}
+
+/// Lifts a thread keeps by instruction word at most (emptied when full).
+const WORD_MEMO_CAP: usize = 1 << 12;
+
+thread_local! {
+    /// The lift of each instruction word that does not read the PC, at the address it was
+    /// first lifted at.
+    static WORD_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<u32, LiftedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// Does the instruction `word` read the PC (its operands, text or lift depend on its
+/// address)? The PC-relative encodings: `B` / `BL`, `CBZ` / `CBNZ`, `TBZ` / `TBNZ`,
+/// `B.cond`, `ADR` / `ADRP` and the literal loads (`LDR` / `LDRSW` / `PRFM` / SIMD `LDR`
+/// `label`); every other encoding decodes the same at any address.
+fn is_pc_relative(word: u32) -> bool {
+    (word >> 26) & 0x1f == 0x05 // B, BL
+        || (word >> 25) & 0x3e == 0x1a // CBZ/CBNZ (011010), TBZ/TBNZ (011011)
+        || (word >> 24) & 0xfe == 0x54 // B.cond
+        || (word >> 24) & 0x1f == 0x10 // ADR, ADRP
+        || (word >> 24) & 0x3b == 0x18 // load literal
+}
+
+/// `lifted` (an instruction that does not read the PC) as lifted at `address`.
+fn relocated(lifted: &LiftedInstruction, address: u64) -> LiftedInstruction {
+    let mut out = lifted.clone();
+    out.address = address;
+    for op in &mut out.ops {
+        op.seq.addr.offset = address;
+    }
+    out
 }
 
 impl Aarch64Lifter {
@@ -1359,6 +1407,38 @@ mod tests {
             data: Some(Arc::from(data)),
         });
         mem
+    }
+
+    /// Every word `is_pc_relative` leaves out lifts the same at any address but for the ops'
+    /// addresses (what the word memo relies on).
+    #[test]
+    fn non_pc_relative_words_lift_alike() {
+        let lifter = Aarch64Lifter::new();
+        let lift_at = |word: u32, at: u64| CS.with(|cs| lifter.lift_bytes(cs, &word.to_le_bytes(), at)).ok().map(|l| format!("{} {:?}", l.mnemonic, l.ops));
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut checked = 0;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let word = (x >> 32) as u32;
+            if is_pc_relative(word) {
+                continue;
+            }
+            let (a, b) = (0x40_1000u64, 0x7f_6543_2100u64);
+            let at_a = CS.with(|cs| lifter.lift_bytes(cs, &word.to_le_bytes(), a)).ok().map(|l| relocated(&l, b)).map(|l| format!("{} {:?}", l.mnemonic, l.ops));
+            assert_eq!(at_a, lift_at(word, b), "word {word:08x}");
+            checked += usize::from(at_a.is_some());
+        }
+        assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn pc_relative_words_are_recognised() {
+        for word in [0x1400_0002u32, 0x9400_0002, 0xb400_0040, 0x3600_0040, 0x5400_0040, 0x1000_0040, 0x9000_0000, 0x5800_0040, 0x9800_0040] {
+            assert!(is_pc_relative(word), "{word:08x}");
+        }
+        for word in [0xd503_201fu32, 0xd65f_03c0, 0xaa01_03e0, 0xf940_0020] {
+            assert!(!is_pc_relative(word), "{word:08x}");
+        }
     }
 
     #[test]
