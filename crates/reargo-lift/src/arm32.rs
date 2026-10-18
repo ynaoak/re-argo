@@ -1768,6 +1768,11 @@ pub(crate) fn format_text(bytes: &[u8], thumb: bool, word: u32, address: u64) ->
 }
 
 impl PcodeLift for Arm32Lifter {
+    /// (an A32 word, a T32 pair of halfwords, a T16 halfword)
+    fn max_instruction_length(&self) -> Option<u32> {
+        Some(4)
+    }
+
     fn lift_instruction(&self, memory: &Memory, address: u64) -> Result<LiftedInstruction, LiftError> {
         if self.thumb {
             let b0 = memory.read_byte(address).ok_or(LiftError::UnreadableAddress(address))?;
@@ -1880,6 +1885,10 @@ impl MappedArmLifter {
 }
 
 impl PcodeLift for MappedArmLifter {
+    fn max_instruction_length(&self) -> Option<u32> {
+        Some(4)
+    }
+
     fn lift_instruction(&self, memory: &Memory, address: u64) -> Result<LiftedInstruction, LiftError> {
         match self.region_at(address) {
             ArmRegion::Thumb => self.thumb.lift_instruction(memory, address),

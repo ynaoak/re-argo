@@ -1269,6 +1269,11 @@ impl Default for Aarch64Lifter {
 // PcodeLift implementation
 // ---------------------------------------------------------------------------
 impl PcodeLift for Aarch64Lifter {
+    /// (every instruction is a word: Capstone decodes it from 4 bytes)
+    fn max_instruction_length(&self) -> Option<u32> {
+        Some(4)
+    }
+
     fn lift_instruction(
         &self,
         memory: &Memory,

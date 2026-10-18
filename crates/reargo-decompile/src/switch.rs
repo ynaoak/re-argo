@@ -442,6 +442,68 @@ fn cbranch_target(insn: &LiftedInstruction) -> Option<u64> {
     insn.ops.iter().find(|o| o.opcode == OpCode::CBranch)?.inputs.first().filter(|t| t.space == SpaceId::RAM).map(|t| t.offset)
 }
 
+/// The first instruction of the straight-line run before the indirect jump `insns[k]` (at most
+/// [`MAX_WINDOW`] back): from the bounds check's fall-through, or from the target of a jump to
+/// the dispatch (after an unconditional jump / return / call).
+fn window_start(insns: &[LiftedInstruction], k: usize) -> usize {
+    let mut start = k;
+    while start > 0 && k - start < MAX_WINDOW {
+        let p = &insns[start - 1];
+        if is_window_end(p) || p.address + p.length as u64 != insns[start].address {
+            break;
+        }
+        start -= 1;
+    }
+    start
+}
+
+/// Does a dispatch's window stop after `insn` (a jump, call or return)? The window of a
+/// dispatch after such an instruction never reaches back over it.
+pub(crate) fn is_window_end(insn: &LiftedInstruction) -> bool {
+    [OpCode::CBranch, OpCode::Branch, OpCode::Return, OpCode::Call, OpCode::CallInd, OpCode::BranchInd]
+        .iter()
+        .any(|&o| has(insn, o))
+}
+
+/// Can [`recover_jump_tables`] find a table at the indirect jump `insns[k]` in any list of
+/// instructions with the same window (`insns[window_start..=k]`)? `false` when, from no
+/// start of the window, the jump's target evaluates to an expression that [`dispatch`] could
+/// accept after the recovery's substitutions of registers by constants ([`with_bases`],
+/// [`with_loose_bases`], [`nearest_constant`] — they only turn a register, or a widened
+/// constant, into a constant): its recovery then gives up before it reads anything else
+/// (`recover_one` returns `None` for every set of bases and ranges).
+pub(crate) fn may_dispatch(insns: &[LiftedInstruction], k: usize) -> bool {
+    let Some(target_vn) = insns[k].ops.iter().find(|o| o.opcode == OpCode::BranchInd).and_then(|o| o.inputs.first()).copied() else {
+        return false;
+    };
+    (window_start(insns, k)..=k).any(|st| may_be_dispatch(&evaluate(&insns[st..=k], &target_vn)))
+}
+
+/// Could `e`, with registers and widened constants replaced by constants, be a target
+/// [`dispatch`] accepts?
+fn may_be_dispatch(e: &E) -> bool {
+    // (what may become a constant)
+    fn constant(e: &E) -> bool {
+        match e {
+            E::Const(_) | E::Reg(_) => true,
+            E::Ext(a) => constant(a),
+            _ => false,
+        }
+    }
+    // `T + I * scale` ([`table_slot`] with a scale above 1)
+    let slot = |addr: &E, scale: u64| {
+        let E::Add(a, b) = addr else { return false };
+        let scaled = |m: &E, x: &E| matches!(m, E::Mul(_, s) if *s == scale) && constant(x);
+        scaled(a, b) || scaled(b, a)
+    };
+    let entry = |x: &E| matches!(x, E::Ext(l) if matches!(&**l, E::Load(addr, 4) if slot(addr, 4)));
+    match e {
+        E::Add(a, b) => (constant(a) && entry(b)) || (constant(b) && entry(a)),
+        E::Load(addr, 8) => slot(addr, 8),
+        _ => false,
+    }
+}
+
 fn recover_one(
     insns: &[LiftedInstruction],
     k: usize,
@@ -454,19 +516,7 @@ fn recover_one(
 ) -> Option<Recovered> {
     let jmp = &insns[k];
     let target_vn = *jmp.ops.iter().find(|o| o.opcode == OpCode::BranchInd)?.inputs.first()?;
-    // the straight-line run before the `jmp`: from the bounds check's fall-through, or from
-    // the target of a jump to the dispatch (after an unconditional jump / return / call)
-    let mut start = k;
-    while start > 0 && k - start < MAX_WINDOW {
-        let p = &insns[start - 1];
-        let control = [OpCode::CBranch, OpCode::Branch, OpCode::Return, OpCode::Call, OpCode::CallInd, OpCode::BranchInd]
-            .iter()
-            .any(|&o| has(p, o));
-        if control || p.address + p.length as u64 != insns[start].address {
-            break;
-        }
-        start -= 1;
-    }
+    let start = window_start(insns, k);
     // the window, the `jmp` included (`jmp [table+rax*8]` loads in the instruction itself);
     // started later when the index is computed in it (`mov eax, [rdi]` of an enum switch):
     // the index is then the register holding it

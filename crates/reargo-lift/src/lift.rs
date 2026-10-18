@@ -230,6 +230,12 @@ pub trait PcodeLift: Send + Sync {
         None
     }
 
+    /// The longest instruction this lifter lifts (the most `length` of a lift), when it is
+    /// known: a stream of `n` lifts from `a` then starts its instructions below `a + n * max`.
+    fn max_instruction_length(&self) -> Option<u32> {
+        None
+    }
+
     fn lift_instruction(
         &self,
         memory: &Memory,

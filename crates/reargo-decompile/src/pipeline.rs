@@ -441,6 +441,9 @@ fn decompile_function_inner(
     let fde = fde_bounds(&program.info.memory, &program.info.sections, func_entry);
     // (only the instructions kept are lifted, when the range allows)
     let kept = fde.and_then(|(start, len)| oracle?.lift_fde_body(func_entry, max_insns, start, start + len));
+    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()).or(batch_flow));
+    // (the calls that never return already marked)
+    let mut marked = false;
     let mut lifted = match kept {
         Some((any, mut kept)) => {
             if !any {
@@ -459,6 +462,14 @@ fn decompile_function_inner(
                 // those before it only, so the range's lifts up to the body's end and the
                 // `int3`s after it are those of the whole range)
                 Some((start, len)) if lifter.as_x86().is_none() => lift_fde_prefix(lifter, &program.info.memory, func_entry, max_insns, start + len),
+                // (no FDE: as far as the trim can keep anything, the same way)
+                None if lifter.as_x86().is_none() => {
+                    marked = true;
+                    let body: Vec<(u64, u64)> = func
+                        .map(|f| f.body.ranges().filter(|r| r.start.space == reargo_core::address::SpaceId::RAM).map(|r| (r.start.offset, r.end_offset())).collect())
+                        .unwrap_or_default();
+                    lift_trimmed_prefix(lifter, &program.info.memory, func_entry, max_insns, &body, &noreturn)
+                }
                 _ => lifter.lift_range(&program.info.memory, func_entry, max_insns).map_err(|e| e.to_string())?,
             };
             if lifted.is_empty() {
@@ -472,8 +483,9 @@ fn decompile_function_inner(
     };
     // WS81: a call that never returns ends the flow (before the trim, so the code behind it is
     // not reached through it)
-    let noreturn = crate::noreturn::NoReturn::new(lifter, &program.info.memory, Some(symbols)).with_flow_cache(oracle.and_then(|o| o.flow_cache()).or(batch_flow));
-    crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
+    if !marked {
+        crate::noreturn::mark_noreturn_calls(&mut lifted, &noreturn);
+    }
     // WS83: jump tables become the `jmp`'s successors (before the trim, which follows them)
     let switches = crate::switch::recover_jump_tables(&mut lifted, &program.info.memory);
     // WS85: `ucomiss; jne T; jp T` is one `a != b`, `jbe` after it `!(b < a)`
@@ -548,6 +560,104 @@ fn lift_fde_prefix(lifter: &dyn PcodeLift, memory: &Memory, entry: u64, count: u
         }
         addr += lifted.length as u64;
         out.push(lifted);
+    }
+    out
+}
+
+/// `lifter.lift_range(memory, entry, count)` (the default one: a stream from `entry`, up to the
+/// first instruction that cannot be lifted), with the calls that never return marked
+/// ([`crate::noreturn::mark_noreturn_calls`]), as far as the rest of it cannot change what
+/// [`trim_to_function_body`] keeps after the jump tables and parity checks are recovered: the
+/// stream stops after an instruction once
+/// * no address the instructions reachable from the entry lead to ([`reach_successor_addrs`])
+///   is an address a later instruction of the stream may start at — after it and, when the
+///   lifter knows its longest instruction, below where the `count` lifts can reach — so no
+///   later instruction is reachable,
+/// * neither is any address of the function's `body` (its `RAM` ranges, `[start, end)`), so
+///   no later instruction is kept as part of it,
+/// * it is a jump, call or return, so the window of a later indirect jump does not reach back
+///   over it (a table recovered there changes only later instructions,
+///   [`crate::switch::is_window_end`]),
+/// * no indirect jump before it can be a jump table (whose recovery reads the whole stream,
+///   [`crate::switch::may_dispatch`]) and no instruction before it is a float compare (whose
+///   parity folding reads the jump targets of the whole stream, [`crate::fparity`]).
+///
+/// The instructions after it are then all dropped by the trim, and those before it are kept
+/// and changed as they would be in the whole stream: the trim keeps the same instructions.
+fn lift_trimmed_prefix(
+    lifter: &dyn PcodeLift,
+    memory: &Memory,
+    entry: u64,
+    count: usize,
+    body: &[(u64, u64)],
+    noreturn: &crate::noreturn::NoReturn<'_>,
+) -> Vec<LiftedInstruction> {
+    let max_len = lifter.max_instruction_length().map(u64::from);
+    let mut out: Vec<LiftedInstruction> = Vec::new();
+    // which of `out` are reachable from the entry, and the reachable addresses not lifted yet
+    let mut reach: Vec<bool> = Vec::new();
+    let mut pending: std::collections::BTreeSet<u64> = std::collections::BTreeSet::from([entry]);
+    let mut stack: Vec<usize> = Vec::new();
+    // (whether the stream may still stop: addresses increase one instruction after the other,
+    // no jump table, no float compare)
+    let mut may_stop = true;
+    let mut addr = entry;
+    let mut ctx = reargo_lift::LiftContext::default();
+    for _ in 0..count {
+        let Ok(mut lifted) = lifter.lift_instruction_ctx(memory, addr, &mut ctx) else { break };
+        crate::noreturn::mark_noreturn_calls(std::slice::from_mut(&mut lifted), noreturn);
+        let Some(next) = addr.checked_add(u64::from(lifted.length)).filter(|_| lifted.address == addr && lifted.length > 0) else {
+            // (the stream as it is, to its end)
+            may_stop = false;
+            addr += lifted.length as u64;
+            out.push(lifted);
+            reach.push(false);
+            continue;
+        };
+        let at = out.len();
+        let is_end = crate::switch::is_window_end(&lifted);
+        let indirect = lifted.ops.iter().any(|o| o.opcode == reargo_core::pcode::OpCode::BranchInd);
+        may_stop &= !crate::fparity::is_float_compare(&lifted);
+        out.push(lifted);
+        reach.push(false);
+        if indirect {
+            may_stop &= !crate::switch::may_dispatch(&out, at);
+        }
+        if !may_stop {
+            addr = next;
+            continue;
+        }
+        // the addresses reached before this instruction's end: this one, or none
+        let reached = pending.first() == Some(&addr);
+        while pending.first().is_some_and(|&a| a < next) {
+            pending.pop_first();
+        }
+        if reached {
+            stack.push(at);
+            while let Some(i) = stack.pop() {
+                if reach[i] {
+                    continue;
+                }
+                reach[i] = true;
+                reach_successor_addrs(&out[i], |t| {
+                    if t >= next {
+                        pending.insert(t);
+                    } else if let Ok(j) = out.binary_search_by_key(&t, |x| x.address)
+                        && !reach[j]
+                    {
+                        stack.push(j);
+                    }
+                });
+            }
+        }
+        addr = next;
+        if is_end {
+            // (the later instructions start in `[next, bound)`)
+            let bound = max_len.map_or(u64::MAX, |m| next.saturating_add(((count - out.len()) as u64).saturating_mul(m)));
+            if pending.range(..bound).next().is_none() && !body.iter().any(|&(s, e)| s < bound && e > next) {
+                break;
+            }
+        }
     }
     out
 }
@@ -1947,6 +2057,17 @@ pub(crate) fn reachability<I: std::borrow::Borrow<LiftedInstruction>>(instructio
 /// Push onto `stack` the indices (`idx_of`) of the instructions [`reachability`] reaches from
 /// `insn`.
 pub(crate) fn reach_successors(insn: &LiftedInstruction, idx_of: impl Fn(u64) -> Option<usize>, stack: &mut Vec<usize>) {
+    reach_successor_addrs(insn, |a| {
+        if let Some(i) = idx_of(a) {
+            stack.push(i);
+        }
+    });
+}
+
+/// Call `f` with each address [`reachability`] follows from `insn` (the targets of its
+/// `BRANCH` / `CBRANCH`, the cases of a recovered jump table, the fall-through), in the order
+/// [`reach_successors`] pushes them.
+pub(crate) fn reach_successor_addrs(insn: &LiftedInstruction, mut f: impl FnMut(u64)) {
     use reargo_core::pcode::OpCode;
     let mut has_unconditional_transfer = false;
     let mut has_return_or_indjmp = false;
@@ -1956,26 +2077,22 @@ pub(crate) fn reach_successors(insn: &LiftedInstruction, idx_of: impl Fn(u64) ->
                 has_unconditional_transfer = true;
                 if let Some(tgt) = op.inputs.first()
                     && tgt.space == reargo_core::address::SpaceId::RAM
-                    && let Some(t_idx) = idx_of(tgt.offset)
                 {
-                    stack.push(t_idx);
+                    f(tgt.offset);
                 }
             }
             OpCode::CBranch => {
                 if let Some(tgt) = op.inputs.first()
                     && tgt.space == reargo_core::address::SpaceId::RAM
-                    && let Some(t_idx) = idx_of(tgt.offset)
                 {
-                    stack.push(t_idx);
+                    f(tgt.offset);
                 }
             }
             OpCode::Return | OpCode::BranchInd => {
                 has_return_or_indjmp = true;
                 // a recovered jump table's cases (WS83, `switch`)
                 for t in op.inputs.iter().skip(1).filter(|t| op.opcode == OpCode::BranchInd && t.space == reargo_core::address::SpaceId::RAM) {
-                    if let Some(t_idx) = idx_of(t.offset) {
-                        stack.push(t_idx);
-                    }
+                    f(t.offset);
                 }
             }
             _ => {}
@@ -1983,10 +2100,7 @@ pub(crate) fn reach_successors(insn: &LiftedInstruction, idx_of: impl Fn(u64) ->
     }
 
     if !has_return_or_indjmp && !has_unconditional_transfer && !crate::cfg::is_trap(insn) {
-        let fall = insn.address + insn.length as u64;
-        if let Some(f_idx) = idx_of(fall) {
-            stack.push(f_idx);
-        }
+        f(insn.address + insn.length as u64);
     }
 }
 
@@ -5126,5 +5240,91 @@ mod tests {
         // mov esi, esi; mov [rdi], rsi; ret
         let c = c_raw(&[0x89, 0xf6, 0x48, 0x89, 0x37, 0xc3]);
         assert!(!c.contains("esi = esi;") && c.contains("rsi = (uint64_t)esi;"), "{c}");
+    }
+
+    /// The lifts, marks and recoveries of `lifted`, trimmed as `decompile_function_inner`
+    /// trims them for a function without an entry in the listing.
+    fn trimmed(mut lifted: Vec<LiftedInstruction>, memory: &Memory) -> Vec<(u64, String)> {
+        let switches = crate::switch::recover_jump_tables(&mut lifted, memory);
+        crate::fparity::fold_parity_checks(&mut lifted, switches.iter().flat_map(|s| s.targets.iter().copied().chain(s.default)));
+        trim_to_return(lifted).iter().map(|i| (i.address, format!("{} {:?}", i.mnemonic, i.ops))).collect()
+    }
+
+    /// Without an FDE the lift stops where nothing later can be kept: after an AArch64 PLT-like
+    /// stub (`adrp; ldr; add; br x17`, no jump table whatever comes after it) and after a
+    /// function whose paths end in a `ret` and a tail branch far ahead; it keeps what the
+    /// whole stream keeps.
+    #[test]
+    fn lift_trimmed_prefix_keeps_what_the_whole_stream_keeps() {
+        let lifter = reargo_lift::aarch64::Aarch64Lifter::new();
+        let words = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        // adrp x16, 0x11000; ldr x17, [x16, #0x18]; add x16, x16, #0x18; br x17
+        let stub = [0x9000_0090u32, 0xf940_0e11, 0x9100_6210, 0xd61f_0220];
+        let mut code = Vec::new();
+        for _ in 0..40 {
+            code.extend_from_slice(&stub);
+        }
+        let mem = make_memory(&words(&code), 0x1000);
+        let noreturn = crate::noreturn::NoReturn::new(&lifter, &mem, None);
+        let full = lifter.lift_range(&mem, 0x1000, 500).unwrap();
+        assert_eq!(full.len(), 160);
+        assert!(full[3].mnemonic.starts_with("br x17"), "{}", full[3].mnemonic);
+        let mut full = full;
+        crate::noreturn::mark_noreturn_calls(&mut full, &noreturn);
+        let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 500, &[], &noreturn);
+        assert_eq!(prefix.len(), 4);
+        assert_eq!(trimmed(prefix, &mem), trimmed(full, &mem));
+
+        // cbz x0, 0x100c; mov x0, #1; ret; b 0x2000 (a tail branch past the stubs)
+        let mut code = vec![0xb400_0060u32, 0xd280_0020, 0xd65f_03c0, 0x1400_03fd];
+        for _ in 0..40 {
+            code.extend_from_slice(&stub);
+        }
+        let mem = make_memory(&words(&code), 0x1000);
+        let noreturn = crate::noreturn::NoReturn::new(&lifter, &mem, None);
+        let mut full = lifter.lift_range(&mem, 0x1000, 500).unwrap();
+        crate::noreturn::mark_noreturn_calls(&mut full, &noreturn);
+        // (the body covers the first two instructions only, the way discovery may stop)
+        let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 500, &[(0x1000, 0x1008)], &noreturn);
+        assert_eq!(prefix.len(), 4);
+        assert_eq!(trimmed(prefix, &mem), trimmed(full.clone(), &mem));
+        // a body reaching into the stubs keeps the stream going as far as it does
+        let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 500, &[(0x1000, 0x1008), (0x1020, 0x1024)], &noreturn);
+        assert_eq!(prefix.len(), 12);
+        // a tail branch into the stubs, within the count, too
+        let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 8, &[], &noreturn);
+        assert_eq!(prefix.len(), 4, "0x2000 is beyond where 8 lifts can reach");
+        code[3] = 0x1400_0005; // b 0x1020
+        let mem = make_memory(&words(&code), 0x1000);
+        let prefix = lift_trimmed_prefix(&lifter, &mem, 0x1000, 500, &[], &noreturn);
+        assert_eq!(prefix.len(), 12);
+    }
+
+    /// Only an indirect jump whose target can take a table's shape may be a jump table: the
+    /// x86 PIE dispatch and `jmp [rcx + rax*8]` (with `rcx` set to the table) may, a PLT stub's `br x17` and a virtual
+    /// `jmp [rax + 0x20]` cannot.
+    #[test]
+    fn may_dispatch_only_where_a_table_can_be() {
+        let x86 = X86Lifter::new_64();
+        let code: &[u8] = &[
+            0x89, 0xf8, // 0x1000 mov eax, edi
+            0x48, 0x8d, 0x0d, 0xf9, 0x00, 0x00, 0x00, // 0x1002 lea rcx, [0x1102]
+            0x48, 0x63, 0x04, 0x81, // 0x1009 movsxd rax, [rcx+rax*4]
+            0x48, 0x01, 0xc8, // 0x100d add rax, rcx
+            0xff, 0xe0, // 0x1010 jmp rax
+            0xff, 0x24, 0xc1, // 0x1012 jmp [rcx + rax*8]
+            0xff, 0x60, 0x20, // 0x1015 jmp [rax + 0x20]
+        ];
+        let mem = make_memory(code, 0x1000);
+        let l = x86.lift_range(&mem, 0x1000, 7).unwrap();
+        assert_eq!(l.len(), 7);
+        assert!(crate::switch::may_dispatch(&l, 4));
+        assert!(crate::switch::may_dispatch(&l, 5));
+        assert!(!crate::switch::may_dispatch(&l, 6));
+        let a64 = reargo_lift::aarch64::Aarch64Lifter::new();
+        let stub: Vec<u8> = [0x9000_0090u32, 0xf940_0e11, 0x9100_6210, 0xd61f_0220].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mem = make_memory(&stub, 0x1000);
+        let l = a64.lift_range(&mem, 0x1000, 4).unwrap();
+        assert!(!crate::switch::may_dispatch(&l, 3));
     }
 }
