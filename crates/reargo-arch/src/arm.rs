@@ -254,7 +254,46 @@ impl Architecture for ArmArch {
             d.address = address;
             return Ok(d);
         }
+        // (a Thumb instruction that does not read the PC decodes the same at every address,
+        // [`thumb_pc_relative16`] / [`thumb_pc_relative32`]: Capstone's `cs_disasm` starts each
+        // decode with an empty IT block, so a decode depends on the bytes and the address only)
+        let thumb = (self.thumb && !self.is_64).then(|| thumb_keys(buf));
+        if let Some((hw, w)) = thumb {
+            if !thumb_pc_relative16(hw)
+                && let Some(known) = T16_DECODES.with(|m| m.borrow().get(&u32::from(hw)).cloned())
+            {
+                let mut d = known;
+                d.address = address;
+                return Ok(d);
+            }
+            if let Some(w) = w.filter(|&w| !thumb_pc_relative32(w))
+                && let Some(known) = T32_DECODES.with(|m| m.borrow().get(&w).cloned())
+            {
+                let mut d = known;
+                d.address = address;
+                return Ok(d);
+            }
+        }
         let decoded = self.decode_with_capstone(buf, address)?;
+        if let Some((hw, w)) = thumb {
+            // (a halfword decoded as a T16 instruction is that instruction whatever follows it;
+            // a T32 one is decoded from both halfwords)
+            let memo = match (decoded.length, w) {
+                (2, _) if !thumb_pc_relative16(hw) => Some((&T16_DECODES, u32::from(hw))),
+                (4, Some(w)) if !thumb_pc_relative32(w) => Some((&T32_DECODES, w)),
+                _ => None,
+            };
+            if let Some((table, key)) = memo {
+                table.with(|m| {
+                    let mut m = m.borrow_mut();
+                    if m.len() >= THUMB_DECODES_CAP {
+                        m.clear();
+                    }
+                    m.insert(key, decoded.clone());
+                });
+            }
+            return Ok(decoded);
+        }
         if let Some(w) = word {
             A64_DECODES.with(|m| {
                 let mut m = m.borrow_mut();
@@ -287,6 +326,43 @@ thread_local! {
     /// The decode of each AArch64 instruction word that does not read the PC, at the address it
     /// was first decoded at.
     static A64_DECODES: std::cell::RefCell<rustc_hash::FxHashMap<u32, DecodedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// Decodes a thread keeps by Thumb halfword (T16) and by Thumb word (T32) at most, each
+/// (emptied when full).
+const THUMB_DECODES_CAP: usize = 1 << 14;
+
+thread_local! {
+    /// The decode of each T16 halfword that does not read the PC (key: the halfword), and of
+    /// each T32 instruction that does not (key: [`thumb_keys`]' word), at the address it was
+    /// first decoded at.
+    static T16_DECODES: std::cell::RefCell<rustc_hash::FxHashMap<u32, DecodedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    static T32_DECODES: std::cell::RefCell<rustc_hash::FxHashMap<u32, DecodedInstruction>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// The first halfword of the Thumb bytes `buf` (little-endian, at least 2 bytes) and, when it
+/// has 4 bytes, both halfwords as one word (`first << 16 | second`, as the T32 encodings are
+/// written).
+fn thumb_keys(buf: &[u8]) -> (u16, Option<u32>) {
+    let hw = u16::from_le_bytes([buf[0], buf[1]]);
+    let w = (buf.len() == 4).then(|| (u32::from(hw) << 16) | u32::from(u16::from_le_bytes([buf[2], buf[3]])));
+    (hw, w)
+}
+
+/// May the T16 instruction `hw` decode differently at different addresses? Its conditional
+/// and unconditional branches (`1101....`, `11100...`: Capstone prints their targets), CBZ /
+/// CBNZ (`1011.0.1`), ADR (`10100...`) and the literal load (`01001...`).
+fn thumb_pc_relative16(hw: u16) -> bool {
+    hw & 0xf000 == 0xd000 || hw & 0xf800 == 0xe000 || hw & 0xf500 == 0xb100 || hw & 0xf800 == 0xa000 || hw & 0xf800 == 0x4800
+}
+
+/// May the T32 instruction `w` ([`thumb_keys`]) decode differently at different addresses?
+/// Its branches and miscellaneous control (`11110...` then `1...`: B, BL, BLX and their
+/// targets) and anything with the PC as its base register (`Rn` = `1111` in the first
+/// halfword: ADR, the literal loads, TBB / TBH, ...).
+fn thumb_pc_relative32(w: u32) -> bool {
+    let (hw1, hw2) = (w >> 16, w & 0xffff);
+    (hw1 & 0xf800 == 0xf000 && hw2 & 0x8000 != 0) || hw1 & 0xf == 0xf
 }
 
 pub use reargo_core::aarch64::is_pc_relative as aarch64_pc_relative;
@@ -426,6 +502,92 @@ mod tests {
             }
         }
         assert!(native > 200_000, "{native}");
+    }
+
+    /// Every Thumb instruction `thumb_pc_relative16` / `thumb_pc_relative32` leave out decodes
+    /// the same at any address (what the Thumb decode memo relies on), and a halfword decoded
+    /// as a T16 instruction is that one whatever bytes follow it: every T16 halfword, every
+    /// first halfword of a T32 instruction with 48 second halfwords, and 400k random words.
+    #[test]
+    fn thumb_non_pc_relative_decodes_alike() {
+        let arch = ArmArch::new_arm32_thumb();
+        let at = |b: &[u8], a: u64| {
+            arch.decode_with_capstone(b, a)
+                .ok()
+                .map(|d| (d.mnemonic().to_string(), d.operands().to_string(), d.flow_type, d.branch_target, d.length, d.bytes.clone()))
+        };
+        let addrs = [0x1000u64, 0x1002, 0x3a2e5, 0x7fff_fffe, 0xffff_f000];
+        let mut checked = 0;
+        for hw in 0..=0xffffu16 {
+            let h = hw.to_le_bytes();
+            let alone = at(&h, 0x1000);
+            if alone.as_ref().is_some_and(|d| d.4 == 2) {
+                // (the same T16 instruction with any second halfword)
+                assert_eq!(at(&[h[0], h[1], 0xff, 0xf7], 0x1000), alone, "{hw:04x}");
+                assert_eq!(at(&[h[0], h[1], 0x00, 0x00], 0x1000), alone, "{hw:04x}");
+            }
+            if thumb_pc_relative16(hw) {
+                continue;
+            }
+            for &a in &addrs[1..] {
+                assert_eq!(at(&h, a), alone, "{hw:04x} at {a:x}");
+            }
+            checked += usize::from(alone.is_some());
+        }
+        assert!(checked > 40_000, "{checked}");
+        let mut x: u64 = 0x3c6e_f372_fe94_f82b;
+        let mut next = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        let mut words: Vec<u32> = Vec::new();
+        for hw1 in 0xe800..=0xffffu32 {
+            for k in 0..48 {
+                let hw2 = if k < 16 { (k << 12) | (next() & 0x0fff) } else { next() & 0xffff };
+                words.push((hw1 << 16) | hw2);
+            }
+        }
+        words.extend((0..400_000).map(|_| next()));
+        let mut checked = 0;
+        for (i, w) in words.into_iter().enumerate() {
+            if thumb_pc_relative32(w) {
+                continue;
+            }
+            let b = [(w >> 16) as u8, (w >> 24) as u8, w as u8, (w >> 8) as u8];
+            let d = at(&b, 0x1000);
+            if d.as_ref().is_none_or(|d| d.4 != 4) {
+                continue;
+            }
+            assert_eq!(thumb_keys(&b).1, Some(w));
+            assert_eq!(at(&b, addrs[1 + i % 4]), d, "{w:08x}");
+            checked += 1;
+        }
+        assert!(checked > 100_000, "{checked}");
+    }
+
+    /// The memo gives what Capstone does: a stream of Thumb code decoded twice (the second
+    /// time mostly from the memo) at other addresses.
+    #[test]
+    fn thumb_decode_memo_matches_capstone() {
+        let arch = ArmArch::new_arm32_thumb();
+        let mut x: u64 = 0x1d8e_4e27_c47d_124f;
+        let code: Vec<u8> = (0..20_000)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (x >> 40) as u8
+            })
+            .collect();
+        let key = |d: &DecodedInstruction| (d.address, d.mnemonic().to_string(), d.operands().to_string(), d.flow_type, d.branch_target, d.length, d.bytes.clone());
+        for base in [0x1_0000u64, 0x2_0002] {
+            let mem = make_memory(&code, base, Endian::Little);
+            let mut a = base;
+            while a + 4 <= base + code.len() as u64 {
+                let got = arch.decode_instruction(&mem, a).ok().map(|d| key(&d));
+                let cap = arch.decode_with_capstone(&code[(a - base) as usize..(a - base) as usize + 4], a).ok().map(|d| key(&d));
+                assert_eq!(got, cap, "at {a:x}");
+                a += got.map_or(2, |g| u64::from(g.5));
+            }
+        }
     }
 
     fn make_memory(data: &[u8], addr: u64, endian: Endian) -> Memory {

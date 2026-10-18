@@ -1269,6 +1269,11 @@ impl Default for Aarch64Lifter {
 // PcodeLift implementation
 // ---------------------------------------------------------------------------
 impl PcodeLift for Aarch64Lifter {
+    /// (every instruction is a word: Capstone decodes it from 4 bytes)
+    fn max_instruction_length(&self) -> Option<u32> {
+        Some(4)
+    }
+
     fn lift_instruction(
         &self,
         memory: &Memory,
@@ -1306,7 +1311,7 @@ impl PcodeLift for Aarch64Lifter {
 }
 
 /// Lifts a thread keeps by instruction word at most (emptied when full).
-const WORD_MEMO_CAP: usize = 1 << 12;
+const WORD_MEMO_CAP: usize = 1 << 14;
 
 thread_local! {
     /// The lift of each instruction word that does not read the PC, at the address it was

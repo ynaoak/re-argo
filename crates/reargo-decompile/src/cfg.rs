@@ -52,10 +52,10 @@ fn is_trap_text(insn: &LiftedInstruction) -> bool {
     insn.mnemonic.may_be_trap_text() && matches!(insn.mnemonic.split_whitespace().next(), Some("ud2" | "hlt"))
 }
 
-/// A `pop` (its text: `pop reg`; the decoded instruction answers for the others without
-/// formatting the text).
+/// A `pop` (its text: `pop reg`; the decoded instruction, or an ARM one's encoding, answers
+/// for the others without formatting the text).
 pub fn is_pop(insn: &LiftedInstruction) -> bool {
-    insn.mnemonic.x86_instruction().is_none_or(|i| i.mnemonic() == iced_x86::Mnemonic::Pop) && insn.mnemonic.starts_with("pop ")
+    insn.mnemonic.may_be_pop_text() && insn.mnemonic.starts_with("pop ")
 }
 
 /// An instruction of a function epilogue that only restores the caller's frame: `pop reg`,

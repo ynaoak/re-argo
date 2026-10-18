@@ -57,6 +57,11 @@ fn overlaps(x: &VarnodeData, w: &VarnodeData) -> bool {
 }
 
 /// `(a, b, eq)` of a float compare: its operands and its `a == b` temporary.
+/// Is `insn` a float compare [`fold_parity_checks`] folds the parity checks of?
+pub(crate) fn is_float_compare(insn: &LiftedInstruction) -> bool {
+    float_compare(insn).is_some()
+}
+
 fn float_compare(insn: &LiftedInstruction) -> Option<(VarnodeData, VarnodeData, VarnodeData)> {
     let eq = insn.ops.iter().find(|o| {
         o.opcode == OpCode::FloatEqual

@@ -125,6 +125,16 @@ impl InsnText {
         }
     }
 
+    /// Whether the text may start with `pop `: `false` only when the decoded instruction, or
+    /// for ARM the encoding, says it does not, without formatting the text.
+    pub fn may_be_pop_text(&self) -> bool {
+        match &self.src {
+            TextSource::Given => true,
+            TextSource::X86(i) => i.mnemonic() == iced_x86::Mnemonic::Pop,
+            TextSource::Arm { len, thumb, word, .. } => crate::arm32::may_be_pop(*word, *len, *thumb),
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         self.cell.get_or_init(|| match &self.src {
             TextSource::Given => String::new(),
@@ -227,6 +237,12 @@ pub trait PcodeLift: Send + Sync {
     /// [`crate::x86::X86Lifter::lift_range_cached`] gives exactly what its
     /// `lift_range` does, sharing the lifts of overlapping ranges.
     fn as_x86(&self) -> Option<&crate::x86::X86Lifter> {
+        None
+    }
+
+    /// The longest instruction this lifter lifts (the most `length` of a lift), when it is
+    /// known: a stream of `n` lifts from `a` then starts its instructions below `a + n * max`.
+    fn max_instruction_length(&self) -> Option<u32> {
         None
     }
 
