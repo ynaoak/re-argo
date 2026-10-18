@@ -787,7 +787,7 @@ fn search(
         if std::mem::replace(&mut seen[i], true) {
             continue;
         }
-        let insn = code.insns[i].clone();
+        let insn = &code.insns[i];
         if insn.trap {
             continue;
         }
