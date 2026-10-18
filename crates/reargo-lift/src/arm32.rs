@@ -1749,6 +1749,18 @@ pub(crate) fn may_be_hlt(word: u32, len: u8, thumb: bool) -> bool {
     }
 }
 
+/// Whether Capstone may print the ARM (`thumb`: Thumb) instruction `word` of `len` bytes as
+/// `pop …`: T16 POP `1011 110. .... ....`, the T32 `ldm sp!` / `ldr rt, [sp], #imm` first
+/// halfwords `e8bd` / `f85d`, A32 `ldm sp!` / `ldr rt, [sp], #imm` (`cccc 1000 1011 1101`,
+/// `cccc 0100 1001 1101`, any condition).
+pub(crate) fn may_be_pop(word: u32, len: u8, thumb: bool) -> bool {
+    match (thumb, len) {
+        (true, 2) => word & 0xfe00 == 0xbc00,
+        (true, _) => matches!(word >> 16, 0xe8bd | 0xf85d),
+        (false, _) => matches!(word & 0x0fff_0000, 0x08bd_0000 | 0x049d_0000),
+    }
+}
+
 /// The text of the ARM (`thumb`: Thumb) instruction `bytes` (read as `word`) at `address`:
 /// Capstone's, or `.word` of it when Capstone cannot decode it.
 pub(crate) fn format_text(bytes: &[u8], thumb: bool, word: u32, address: u64) -> String {
@@ -1947,6 +1959,62 @@ mod tests {
             }
         }
         assert!(may_be_hlt(0xe100_0070, 4, false) && may_be_hlt(0xba80, 2, true));
+    }
+
+    /// Capstone prints `pop …` only where `may_be_pop` says it may: every T16 halfword, every
+    /// T32 first halfword with 32 second ones, every A32 bits 27..16 with 32 others (and every
+    /// condition), and 400k random words of each.
+    #[test]
+    fn pop_only_where_may_be_pop() {
+        let pop = |bytes: &[u8], thumb: bool, word: u32| format_text(bytes, thumb, word, 0x1_0000).starts_with("pop ");
+        let mut seen = [0usize; 3];
+        for hw in 0..=0xffffu32 {
+            if (hw >> 11) >= 0x1d {
+                continue; // a T32 prefix
+            }
+            let p = pop(&(hw as u16).to_le_bytes(), true, hw);
+            assert!(!p || may_be_pop(hw, 2, true), "{hw:04x}");
+            seen[0] += usize::from(p);
+        }
+        let mut x: u64 = 0x9b05_688c_2b3e_6c1f;
+        let mut next = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        let mut t32 = |hw1: u32, hw2: u32| {
+            let b = [(hw1 & 0xff) as u8, (hw1 >> 8) as u8, (hw2 & 0xff) as u8, (hw2 >> 8) as u8];
+            let w = (hw1 << 16) | hw2;
+            let p = pop(&b, true, w);
+            assert!(!p || may_be_pop(w, 4, true), "t32 {hw1:04x} {hw2:04x}");
+            seen[1] += usize::from(p);
+        };
+        let mut words: Vec<(u32, u32)> = Vec::new();
+        for hw1 in 0xe800..=0xffffu32 {
+            for _ in 0..32 {
+                words.push((hw1, next() & 0xffff));
+            }
+        }
+        for _ in 0..400_000 {
+            let w = next();
+            words.push((0xe800 + (w >> 16) % 0x1800, w & 0xffff));
+        }
+        for (hw1, hw2) in words {
+            t32(hw1, hw2);
+        }
+        let mut a32: Vec<u32> = Vec::new();
+        for mid in 0..0x1000u32 {
+            for k in 0..32u32 {
+                a32.push(((k % 16) << 28) | (mid << 16) | (next() & 0xffff));
+            }
+        }
+        a32.extend((0..400_000).map(|_| next()));
+        for w in a32 {
+            let p = pop(&w.to_le_bytes(), false, w);
+            assert!(!p || may_be_pop(w, 4, false), "a32 {w:08x}");
+            seen[2] += usize::from(p);
+        }
+        // (T32 pops print `pop.w`)
+        assert!(seen[0] > 0 && seen[2] > 0, "{seen:?}");
     }
 
     fn make_memory(word: u32, addr: u64) -> Memory {

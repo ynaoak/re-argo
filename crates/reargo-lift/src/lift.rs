@@ -125,6 +125,16 @@ impl InsnText {
         }
     }
 
+    /// Whether the text may start with `pop `: `false` only when the decoded instruction, or
+    /// for ARM the encoding, says it does not, without formatting the text.
+    pub fn may_be_pop_text(&self) -> bool {
+        match &self.src {
+            TextSource::Given => true,
+            TextSource::X86(i) => i.mnemonic() == iced_x86::Mnemonic::Pop,
+            TextSource::Arm { len, thumb, word, .. } => crate::arm32::may_be_pop(*word, *len, *thumb),
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         self.cell.get_or_init(|| match &self.src {
             TextSource::Given => String::new(),
