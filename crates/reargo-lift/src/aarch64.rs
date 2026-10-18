@@ -1311,7 +1311,7 @@ impl PcodeLift for Aarch64Lifter {
 }
 
 /// Lifts a thread keeps by instruction word at most (emptied when full).
-const WORD_MEMO_CAP: usize = 1 << 12;
+const WORD_MEMO_CAP: usize = 1 << 14;
 
 thread_local! {
     /// The lift of each instruction word that does not read the PC, at the address it was
