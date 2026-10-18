@@ -5027,4 +5027,36 @@ mod tests {
         let c = c_raw(&[0x48, 0x8d, 0x97, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x48, 0x03, 0x07, 0x48, 0x83, 0xc7, 0x08, 0x48, 0x39, 0xd7, 0x75, 0xf4, 0xc3]);
         assert!(!c.contains("for ("), "{c}");
     }
+
+    /// WS98: a duplicate CSE removes hands its readers to the value kept. `xor edx, edx; mov eax,
+    /// edx; ret` makes `rdx = ZEXT 0` and `rax = ZEXT 0`; the return read the removed one's
+    /// varnode, which copy propagation (by varnode id) passed over, and the kept definition died:
+    /// `return rdx;` with nothing assigning `rdx`.
+    #[test]
+    fn zeroed_register_copied_to_the_return_is_returned() {
+        let rust = |code: &[u8]| decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        // test edi, edi; jle 1f; lea eax, [rdi+rdi]; ret; 1: <zero edx>; mov eax, edx; ret
+        for (zero, ret) in [(&[0x31, 0xd2][..], "return 0;"), (&[0x29, 0xd2][..], "return 0;"), (&[0xba, 0x05, 0, 0, 0][..], "return 5;")] {
+            let mut code = vec![0x85, 0xff, 0x7e, 0x04, 0x8d, 0x04, 0x3f, 0xc3];
+            code.extend_from_slice(zero);
+            code.extend([0x89, 0xd0, 0xc3]);
+            let c = c_raw(&code);
+            assert!(c.contains(ret) && !c.contains("return rdx;"), "{c}");
+            let r = rust(&code);
+            assert!(!r.contains("return rdx;"), "{r}");
+        }
+        // gcc -O2 `int32_t f_sum32(const int32_t *a, int n) { int32_t s = 0; for (int i = 0; i < n; i++) s += a[i] * 3; return s; }`
+        let code = [
+            0x85, 0xf6, 0x7e, 0x24, 0x48, 0x63, 0xf6, 0x31, 0xd2, 0x48, 0x8d, 0x0c, 0xb7, 0x0f, 0x1f, 0x00, // test; jle; movslq; xor; lea; nop
+            0x8b, 0x07, 0x48, 0x83, 0xc7, 0x04, 0x8d, 0x04, 0x40, 0x01, 0xc2, 0x48, 0x39, 0xcf, 0x75, 0xf0, // loop
+            0x89, 0xd0, 0xc3, 0x0f, 0x1f, 0x44, 0x00, 0x00, // mov eax, edx; ret; nop
+            0x31, 0xd2, 0x89, 0xd0, 0xc3, // xor edx, edx; mov eax, edx; ret
+        ];
+        let c = c_raw(&code);
+        assert!(c.contains("return 0;") && !c.contains("return rdx;"), "{c}");
+        // (a register zeroed and copied twice in the same block: `rcx = rax + rsi` is `rsi`)
+        // test rdi, rdi; je 1f; xor eax, eax; mov edx, eax; mov rcx, rdx; add rcx, rsi; mov rax, rcx; ret; 1: xor edx, edx; mov eax, edx; mov ecx, eax; ret
+        let c = c_raw(&[0x48, 0x85, 0xff, 0x74, 0x0e, 0x31, 0xc0, 0x89, 0xc2, 0x48, 0x89, 0xd1, 0x48, 0x01, 0xf1, 0x48, 0x89, 0xc8, 0xc3, 0x31, 0xd2, 0x89, 0xd0, 0x89, 0xc1, 0xc3]);
+        assert!(c.contains("return 0;") && !c.contains("return rdx;"), "{c}");
+    }
 }
