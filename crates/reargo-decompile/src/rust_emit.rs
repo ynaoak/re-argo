@@ -200,6 +200,32 @@ impl<'a> RustEmitter<'a> {
 
     /// The place `(*base).field_k` of a struct field access (WS91, as `CEmitter::field_access`),
     /// with the field. The base is a variable or another field place.
+    /// The pointer to an array element accessed by `op` (WS97, [`crate::index`]):
+    /// `(rdi as *const u64).wrapping_add(rax as usize)`, `.wrapping_sub(1)` after it for a
+    /// constant element offset.
+    fn element_ptr(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, size: u32, store: bool) -> Option<String> {
+        let addr = *op.inputs.get(1)?;
+        let inlined = |v: crate::ssa::VarId| {
+            let k = crate::condition::value_key(func, v);
+            if self.coalesced.values.contains_key(&k) {
+                return None;
+            }
+            self.inlined.borrow().get(&k).copied()
+        };
+        let e = crate::index::indexed(func, addr, size, &inlined)?;
+        let base = self.input_expr(func, &func.ops[e.base.0], e.base.1);
+        let index = self.input_expr(func, &func.ops[e.index.0], e.index.1);
+        let base = if crate::condition::is_atomic(&base) || method_call(&base) { base } else { cat!("(", base, ")") };
+        let index = if crate::condition::is_atomic(&index) || method_call(&index) { index } else { cat!("(", index, ")") };
+        let mut p = cat!("(", base, if store { " as *mut " } else { " as *const " }, size_to_rust_type(size), ").wrapping_add(", index, " as usize)");
+        match e.offset {
+            0 => {}
+            o if o > 0 => p = cat!(p, ".wrapping_add(", o.to_string(), ")"),
+            o => p = cat!(p, ".wrapping_sub(", o.unsigned_abs().to_string(), ")"),
+        }
+        Some(p)
+    }
+
     fn field_place(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<(String, crate::structs::Field)> {
         let sv = self.structs?;
         let a = sv.access.get(&op.index)?;
@@ -1006,6 +1032,10 @@ impl<'a> RustEmitter<'a> {
                         cat!(dst, " = unsafe { *(&raw const ", place, " as *const ", size_to_rust_type(out_size), ") };")
                     });
                 }
+                // an array element (WS97): `*(rdi as *const u64).wrapping_add(rax as usize)`
+                if let Some(e) = self.element_ptr(func, op, out_size, false) {
+                    return Some(cat!(dst, " = unsafe { *", e, " };"));
+                }
                 let addr = self.input_expr(func, op, 1);
                 let ty = size_to_rust_type(out_size);
                 Some(format!(
@@ -1047,6 +1077,9 @@ impl<'a> RustEmitter<'a> {
                     } else {
                         cat!("unsafe { *(&raw mut ", place, " as *mut ", size_to_rust_type(size), ") = ", val, "; }")
                     });
+                }
+                if let Some(e) = self.element_ptr(func, op, size, true) {
+                    return Some(cat!("unsafe { *", e, " = ", val, "; }"));
                 }
                 let addr = self.input_expr(func, op, 1);
                 let ty = size_to_rust_type(size);

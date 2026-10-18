@@ -94,6 +94,27 @@ pub fn is_member(s: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit()) && is_atomic(&s[..i])
 }
 
+/// The position of the `[` of a subscript `x[…]` ending `s` (its `]` the last character).
+pub(crate) fn subscript_start(s: &str) -> Option<usize> {
+    if !s.ends_with(']') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices().rev() {
+        match c {
+            ']' | ')' => depth += 1,
+            '[' | '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (c == '[').then_some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn is_atomic(s: &str) -> bool {
     let word = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if word(s) {
@@ -105,6 +126,10 @@ pub fn is_atomic(s: &str) -> bool {
     }
     if let Some(rest) = s.strip_prefix('!') {
         return is_atomic(rest);
+    }
+    // an array element `((uint64_t*)rdi)[rax]` (WS97) is a postfix expression
+    if let Some(open) = subscript_start(s) {
+        return open > 0 && is_atomic(&s[..open]);
     }
     // `(…)` / `f(…)` whose first `(` closes at the very end
     let Some(open) = s.find('(') else { return false };

@@ -32,6 +32,7 @@ pub mod exception;
 pub mod flags;
 pub mod fparity;
 pub mod frame;
+pub mod index;
 pub mod inline;
 pub mod rust_emit;
 pub mod noreturn;

@@ -1157,6 +1157,10 @@ impl<'a> CEmitter<'a> {
                 if let Some(f) = self.field_access(func, op, false) {
                     return Some(cat!(dst, " = ", f, ";"));
                 }
+                // an array element (WS97): `((uint64_t*)rdi)[rax]`
+                if let Some(e) = self.element_access(func, op, out_size) {
+                    return Some(cat!(dst, " = ", e, ";"));
+                }
                 let addr = self.input_expr(func, op, 1);
                 Some(cat!(dst, " = *(", size_to_type(out_size), "*)", addr, ";"))
             }
@@ -1196,6 +1200,9 @@ impl<'a> CEmitter<'a> {
                         Some(c) => cat!(f, " = ", val, ";  // vtable of ", c),
                         None => cat!(f, " = ", val, ";"),
                     });
+                }
+                if let Some(e) = self.element_access(func, op, size) {
+                    return Some(cat!(e, " = ", val, ";"));
                 }
                 let addr = self.input_expr(func, op, 1);
                 Some(cat!("*(", size_to_type(size), "*)", addr, " = ", val, ";"))
@@ -1388,6 +1395,24 @@ impl<'a> CEmitter<'a> {
         })
     }
 
+    /// A load / store of `size` bytes as an array element (WS97, [`crate::index`]):
+    /// `((uint64_t*)rdi)[rax]` for `*(uint64_t*)(rdi + (rax << 3))`.
+    fn element_access(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, size: u32) -> Option<String> {
+        let addr = *op.inputs.get(1)?;
+        let inlined = |v: crate::ssa::VarId| {
+            let k = crate::condition::value_key(func, v);
+            if self.coalesced.values.contains_key(&k) {
+                return None;
+            }
+            self.inlined.borrow().get(&k).copied()
+        };
+        let e = crate::index::indexed(func, addr, size, &inlined)?;
+        let base = self.input_expr(func, &func.ops[e.base.0], e.base.1);
+        let index = self.input_expr(func, &func.ops[e.index.0], e.index.1);
+        let base = if crate::condition::is_atomic(&base) || is_deref(&base) { base } else { cat!("(", base, ")") };
+        Some(cat!("((", size_to_type(size), "*)", base, ")[", crate::index::index_text(&index, e.offset), "]"))
+    }
+
     /// `&base->field_k` for a register set to a struct pointer plus a field's offset (WS91).
     fn field_address(&self, func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<String> {
         // (a register's own statement; a temporary inlined into an access stays `base + k`)
@@ -1549,6 +1574,9 @@ impl<'a> CEmitter<'a> {
             && is_deref(text)
         {
             return int_type_name(rest.split_once("*)")?.0);
+        }
+        if let Some(t) = element_type(text) {
+            return int_type_name(t);
         }
         // a struct field read whole (WS91): an integer field has its declared type
         if let Some(sv) = self.structs
@@ -2254,7 +2282,23 @@ pub(crate) fn int_cast(s: &str) -> Option<(u32, bool, &str)> {
 /// The integer type of a cast covering the whole text or a dereference (`*(uint8_t*)p`):
 /// `(width, signed)` (WS90).
 fn text_int_type(s: &str) -> Option<(u32, bool)> {
-    int_cast(s).map(|(k, signed, _)| (k, signed)).or_else(|| s.strip_prefix("*(").filter(|_| is_deref(s)).and_then(|r| int_type_name(r.split_once("*)")?.0)))
+    int_cast(s)
+        .map(|(k, signed, _)| (k, signed))
+        .or_else(|| s.strip_prefix("*(").filter(|_| is_deref(s)).and_then(|r| int_type_name(r.split_once("*)")?.0)))
+        .or_else(|| int_type_name(element_type(s)?))
+}
+
+/// The element type `T` of an array element `((T*)base)[i]` covering the whole text (WS97).
+pub(crate) fn element_type(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("((")?;
+    let (ty, _) = rest.split_once("*)")?;
+    if !crate::condition::is_atomic(s) || !s.ends_with(']') || !ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    // the subscripted operand is the parenthesised cast `((T*)base)`
+    let open = crate::condition::subscript_start(s)?;
+    let head = &s[..open];
+    (head.ends_with(')') && crate::condition::is_atomic(head) && head.starts_with('(')).then_some(ty)
 }
 
 /// `(intW_t)text` for a signed comparison's operand (WS90), without a cast of the same width

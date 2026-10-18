@@ -3654,7 +3654,8 @@ mod tests {
             0x44, 0x89, 0x4f, 0x08, // mov [rdi+8], r9d
             0xc3,
         ]);
-        assert!(c.contains("r9d = *(uint32_t*)(rdx + (rcx << 2));"), "{c}");
+        // (WS97: an array element)
+        assert!(c.contains("r9d = ((uint32_t*)rdx)[rcx];"), "{c}");
         assert!(!c.contains("tmp_"), "{c}");
         // cmp edi, [rsi]; mov dword [rsi], 0; jg +1; ret; ret: the compared value is read before
         // the store
@@ -4899,5 +4900,33 @@ mod tests {
         let c = c_of(&code);
         assert!(!c.contains("overflow_p") && !c.contains("!= !") && !c.contains("var_20"), "{c}");
         assert!(c.contains("= (int64_t)rsi < (int64_t)rdx;") && c.contains("= (int64_t)rdi < 0;"), "{c}");
+    }
+
+    /// WS97: an access whose scaled index matches its size is an array element.
+    #[test]
+    fn scaled_index_prints_as_an_array_element() {
+        // mov rax, [rdi+rsi*8] ; ret
+        let c = c_raw(&[0x48, 0x8b, 0x04, 0xf7, 0xc3]);
+        assert!(c.contains("rax = ((uint64_t*)rdi)[rsi];"), "{c}");
+        // mov eax, [rdi+rsi*4-4] ; ret: a constant of whole elements moves the element
+        let c = c_raw(&[0x8b, 0x44, 0xb7, 0xfc, 0xc3]);
+        assert!(c.contains("((uint32_t*)rdi)[rsi - 1]"), "{c}");
+        // mov word [rdi+rsi*2], dx ; ret
+        let c = c_raw(&[0x66, 0x89, 0x14, 0x77, 0xc3]);
+        assert!(c.contains("((uint16_t*)rdi)[rsi] = dx;"), "{c}");
+        let r = decompile(&X86Lifter::new_64(), &make_memory(&[0x48, 0x8b, 0x04, 0xf7, 0xc3], 0x1000), 0x1000, "f", 100).unwrap();
+        assert!(r.rust_code.contains("rax = unsafe { *(rdi as *const u64).wrapping_add(rsi as usize) };"), "{}", r.rust_code);
+    }
+
+    /// WS97: a scale that is not the access size (`[rdi+rsi*8]` read as 4 bytes, a 2-byte offset
+    /// into 4-byte elements) stays a raw dereference.
+    #[test]
+    fn mismatched_scale_stays_raw() {
+        // mov eax, [rdi+rsi*8] ; ret
+        let c = c_raw(&[0x8b, 0x04, 0xf7, 0xc3]);
+        assert!(c.contains("*(uint32_t*)(rdi + (rsi << 3))"), "{c}");
+        // mov eax, [rdi+rsi*4+2] ; ret
+        let c = c_raw(&[0x8b, 0x44, 0xb7, 0x02, 0xc3]);
+        assert!(!c.contains('['), "{c}");
     }
 }
