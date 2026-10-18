@@ -255,6 +255,23 @@ pub fn const_alg_strength(func: &mut SsaFunction) -> (usize, usize, usize) {
         if func.ops[i].dead || func.ops[i].output.is_none() {
             continue;
         }
+        // (the opcodes one of the three rewrites)
+        if !matches!(
+            func.ops[i].opcode,
+            OpCode::IntAdd
+                | OpCode::IntSub
+                | OpCode::IntAnd
+                | OpCode::IntOr
+                | OpCode::IntXor
+                | OpCode::IntEqual
+                | OpCode::IntMult
+                | OpCode::IntZExt
+                | OpCode::IntSExt
+                | OpCode::Subpiece
+                | OpCode::IntDiv
+        ) {
+            continue;
+        }
         if try_constant_fold_op(func, i) {
             folded += 1;
             continue;
@@ -317,13 +334,25 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     let mut head = 0usize;
     let mut removed = 0;
     let mut sweep = 0usize;
+    // (for the phi cycles below: the live ops with side effects or no output, which this loop
+    // never kills, and how many phis live)
+    let mut roots: Vec<usize> = Vec::new();
+    let mut live_phis = 0usize;
+    let mut dead_before = 0usize;
     loop {
         let i = if sweep < n {
             let i = sweep;
             sweep += 1;
-            if !candidate(&func.ops[i]) {
+            let o = &func.ops[i];
+            if !candidate(o) {
+                if !o.dead {
+                    roots.push(i);
+                } else {
+                    dead_before += 1;
+                }
                 continue;
             }
+            live_phis += usize::from(o.opcode == OpCode::MultiEqual);
             i
         } else if head < queue.len() {
             let i = queue[head];
@@ -349,6 +378,7 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
 
         func.ops[i].dead = true;
         removed += 1;
+        live_phis -= usize::from(func.ops[i].opcode == OpCode::MultiEqual);
 
         // The newly-dead op's inputs each just lost a use. Re-queue
         // the defining op of any input that itself is a DCE
@@ -370,14 +400,13 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     // Cycles through phi nodes (a loop counter nothing outside the loop
     // reads) keep each other "used" above. Mark what the side-effecting ops
     // actually need and drop the rest.
-    if func.ops.iter().any(|o| !o.dead && o.opcode == OpCode::MultiEqual) {
+    if live_phis > 0 {
+        let mut stack = roots;
         let mut live = vec![false; n];
-        let mut stack: Vec<usize> = (0..n)
-            .filter(|&i| !func.ops[i].dead && (is_side_effecting(func.ops[i].opcode) || func.ops[i].output.is_none()))
-            .collect();
         for &i in &stack {
             live[i] = true;
         }
+        let mut marked = stack.len();
         while let Some(i) = stack.pop() {
             for &inp in &func.ops[i].inputs {
                 if let Some(d) = func.varnodes[inp as usize].def_op
@@ -385,11 +414,14 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
                     && !func.ops[d].dead
                 {
                     live[d] = true;
+                    marked += 1;
                     stack.push(d);
                 }
             }
         }
-        for (i, alive) in live.iter().enumerate() {
+        // (every op living marked: none to drop)
+        let living = n - dead_before - removed;
+        for (i, alive) in live.iter().enumerate().take(if marked < living { n } else { 0 }) {
             if !alive && !func.ops[i].dead {
                 func.ops[i].dead = true;
                 removed += 1;
@@ -557,8 +589,11 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
     // identical opcode+inputs but are different values; merging them
     // redirected a 16-byte XMM use to the 8-byte view.
     // (the opcode itself: its names are distinct)
-    let mut seen: rustc_hash::FxHashMap<(usize, OpCode, u32, InKeys), ValueKey> =
+    // (the ops with at most two inputs — every pure op of the lifters — by a key of fixed size,
+    // the unused input left at its default: no key of the other map is equal to one of these)
+    let mut seen: rustc_hash::FxHashMap<(u32, OpCode, u32, u8, [ValueKey; 2]), ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx, Default::default());
+    let mut seen_wide: rustc_hash::FxHashMap<(usize, OpCode, u32, InKeys), ValueKey> = Default::default();
     let mut redirects: rustc_hash::FxHashMap<ValueKey, ValueKey> =
         rustc_hash::FxHashMap::with_capacity_and_hasher(approx / 2, Default::default());
 
@@ -677,40 +712,60 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
         }
         let Some(out_id) = func.ops[i].output else { continue };
 
-        let mut in_keys: InKeys = func.ops[i]
-            .inputs
-            .iter()
-            .map(|&id| resolve_redirect(&redirects, value_key(func, id)))
-            .collect();
-        if is_commutative(opcode) {
-            in_keys.sort();
-        }
         let out_size = func.varnodes[out_id as usize].data.size;
-        let key = (func.ops[i].block, opcode, out_size, in_keys);
         let out_key = resolve_redirect(&redirects, value_key(func, out_id));
+        let n_in = func.ops[i].inputs.len();
+        let (slot, existing) = if n_in <= 2 {
+            let mut in_keys = [(0u32, 0u64, 0u32, 0u32); 2];
+            for (j, &id) in func.ops[i].inputs.iter().enumerate() {
+                in_keys[j] = resolve_redirect(&redirects, value_key(func, id));
+            }
+            if is_commutative(opcode) && n_in == 2 && in_keys[1] < in_keys[0] {
+                in_keys.swap(0, 1);
+            }
+            let block = u32::try_from(func.ops[i].block).expect("block id");
+            match seen.entry((block, opcode, out_size, n_in as u8, in_keys)) {
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let e = *o.get();
+                    (o.into_mut(), Some(e))
+                }
+                std::collections::hash_map::Entry::Vacant(v) => (v.insert(out_key), None),
+            }
+        } else {
+            let mut in_keys: InKeys = func.ops[i]
+                .inputs
+                .iter()
+                .map(|&id| resolve_redirect(&redirects, value_key(func, id)))
+                .collect();
+            if is_commutative(opcode) {
+                in_keys.sort();
+            }
+            match seen_wide.entry((func.ops[i].block, opcode, out_size, in_keys)) {
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let e = *o.get();
+                    (o.into_mut(), Some(e))
+                }
+                std::collections::hash_map::Entry::Vacant(v) => (v.insert(out_key), None),
+            }
+        };
 
         // A value a phi reads keeps its own name (the phi prints as nothing).
         let feeds_phi =
             |func: &SsaFunction| func.varnodes[out_id as usize].uses.iter().any(|&u| func.ops[u].opcode == OpCode::MultiEqual);
         let mut name_still_holds = |k: ValueKey| version_before(func, &mut latest, (k.0, k.1, k.2), i) == k.3;
         // (one lookup: the earlier value, or the slot this one takes)
-        let slot = match seen.entry(key) {
-            std::collections::hash_map::Entry::Occupied(o) => {
-                hits += 1;
-                let existing = *o.get();
-                if !feeds_phi(func)
-                    && name_still_holds(existing)
-                    && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
-                {
-                    redirects.insert(out_key, existing);
-                    func.ops[i].dead = true;
-                    eliminated += 1;
-                    continue;
-                }
-                o.into_mut()
+        if let Some(existing) = existing {
+            hits += 1;
+            if !feeds_phi(func)
+                && name_still_holds(existing)
+                && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
+            {
+                redirects.insert(out_key, existing);
+                func.ops[i].dead = true;
+                eliminated += 1;
+                continue;
             }
-            std::collections::hash_map::Entry::Vacant(v) => v.insert(out_key),
-        };
+        }
         *slot = out_key;
     }
 
@@ -719,46 +774,42 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
         // (only a key redirected changes: one of an output, never a constant's; `bloom` has the
         // bit of each redirected key, so most varnodes are passed over without a lookup)
         let bloom = redirects.keys().fold(0u64, |m, &k| m | key_bit(k));
-        for vn in &mut func.varnodes {
-            if vn.data.space == reargo_core::address::SpaceId::CONST {
-                continue;
-            }
-            let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-            if bloom & key_bit(key) == 0 {
-                continue;
-            }
-            let to = resolve_redirect(&redirects, key);
-            if to != key {
-                vn.data = reargo_core::pcode::VarnodeData::new(
-                    reargo_core::address::SpaceId(to.0),
-                    to.1,
-                    to.2,
-                );
-                vn.version = to.3;
-            }
-        }
         // WS86: the kept definition's output gains the removed one's readers — else dead code
         // elimination sees no reader of it once its own die (`sete [rsi+0x18]` loads and stores
         // through two copies of the address: the load died, so did the address the store read)
         let targets: rustc_hash::FxHashSet<ValueKey> = redirects.values().map(|&k| resolve_redirect(&redirects, k)).collect();
-        let bloom = targets.iter().fold(0u64, |m, &k| m | key_bit(k));
+        let target_bloom = targets.iter().fold(0u64, |m, &k| m | key_bit(k));
+        // (in the same pass: the varnodes then holding a target's key, and the one of them each
+        // live definition of a target writes — the last, by id)
         let mut defined: rustc_hash::FxHashMap<ValueKey, u32> = Default::default();
-        for vn in &func.varnodes {
-            // (the removed duplicate's output now carries the kept key too: not that one)
-            if vn.def_op.is_some_and(|d| !func.ops[d].dead && func.ops[d].output == Some(vn.id)) {
-                let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-                if bloom & key_bit(key) != 0 && targets.contains(&key) {
+        let mut holding: Vec<(usize, ValueKey)> = Vec::new();
+        let (ops, varnodes) = (&func.ops, &mut func.varnodes);
+        for (i, vn) in varnodes.iter_mut().enumerate() {
+            if vn.data.space == reargo_core::address::SpaceId::CONST {
+                continue;
+            }
+            let mut key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
+            if bloom & key_bit(key) != 0 {
+                let to = resolve_redirect(&redirects, key);
+                if to != key {
+                    vn.data = reargo_core::pcode::VarnodeData::new(
+                        reargo_core::address::SpaceId(to.0),
+                        to.1,
+                        to.2,
+                    );
+                    vn.version = to.3;
+                    key = to;
+                }
+            }
+            if target_bloom & key_bit(key) != 0 && targets.contains(&key) {
+                holding.push((i, key));
+                // (the removed duplicate's output now carries the kept key too: not that one)
+                if vn.def_op.is_some_and(|d| !ops[d].dead && ops[d].output == Some(vn.id)) {
                     defined.insert(key, vn.id);
                 }
             }
         }
-        let bloom = defined.keys().fold(0u64, |m, &k| m | key_bit(k));
-        for i in 0..if defined.is_empty() { 0 } else { func.varnodes.len() } {
-            let vn = &func.varnodes[i];
-            let key = (vn.data.space.0, vn.data.offset, vn.data.size, vn.version);
-            if bloom & key_bit(key) == 0 {
-                continue;
-            }
+        for &(i, key) in &holding {
             if let Some(&d) = defined.get(&key)
                 && d as usize != i
             {
@@ -1233,7 +1284,12 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
     // live ops give no more matches. It runs every round (killing in another order can kill
     // more).
     let (mut fold_quiet, mut copies_quiet, mut cse_quiet) = (false, false, false);
-    for _ in 0..10 {
+    for round in 0..10 {
+        // (none of them runs: nothing changed since the last dead code elimination, which
+        // would find nothing again)
+        if round > 0 && fold_quiet && copies_quiet && cse_quiet {
+            break;
+        }
         // Three passes (constant_fold, algebraic_simplification,
         // strength_reduction) are fused into a single walk. See
         // `const_alg_strength` for the ordering argument.

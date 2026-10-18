@@ -114,6 +114,8 @@ pub struct CalleeParams<'a> {
     /// The RELATIVE relocations' slots by value, and the vtables of each function.
     reloc_slots: std::sync::OnceLock<Option<FxHashMap<u64, Vec<u64>>>>,
     vtables_memo: Mutex<FxHashMap<u64, Vec<u64>>>,
+    /// The number of this oracle's convention ([`convention_id`]; `u32::MAX`: none).
+    convention: u32,
 }
 
 /// `(offset, vtable)`: the fields of a class holding objects of a known class (WS92,
@@ -169,6 +171,7 @@ impl<'a> CalleeParams<'a> {
             }
             _ => Vec::new(),
         };
+        let convention = convention_id(&cc.args, &cc.returns.iter().map(|(r, _)| *r).collect::<Vec<_>>());
         Some(Self {
             arg_space,
             arg_offsets,
@@ -195,6 +198,7 @@ impl<'a> CalleeParams<'a> {
             flow_cache: lifter.as_x86().map(|_| crate::noreturn::FlowCache::new()),
             reloc_slots: std::sync::OnceLock::new(),
             vtables_memo: Mutex::new(FxHashMap::default()),
+            convention,
         })
     }
 
@@ -478,7 +482,69 @@ impl<'a> CalleeParams<'a> {
 
     fn summarize(&self, target: u64) -> Option<Summary> {
         let (cfg, truncated) = self.body(target)?;
-        Some(self.summarize_body(cfg, truncated))
+        Some(self.summarize_body(&cfg, truncated))
+    }
+
+    /// The summary of the function at `target` (one [`Self::summary`] lifts whole), from
+    /// `insns`: the lifts alone of the instructions of its range in address order
+    /// ([`Self::lift_fde_body`], which its decompile lifted), when they hold its body
+    /// ([`Self::body_plain`]'s instructions, those lifts too) — the same summary without
+    /// lifting them again. `insns` is left as it was.
+    pub(crate) fn seed_summary(&self, target: u64, insns: &mut Vec<LiftedInstruction>) {
+        let light = self.compact.is_some() && self.entries.binary_search(&target).is_err();
+        if light || self.summary_memo.lock().map_or(true, |m| m.contains_key(&target)) {
+            return;
+        }
+        let (Some(x86), Some(facts)) = (self.lifter.as_x86(), &self.facts) else { return };
+        let Some(walk) = x86.plain_walk(self.memory, target, MAX_INSNS, facts, true) else { return };
+        if walk.needs_pf || walk.first() != Some(target) {
+            return;
+        }
+        // `body_plain`'s search, through `insns`
+        let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
+        let last = walk.last();
+        let mut seen = vec![0u64; (last.map_or(0, |l| l - target) as usize + 1).div_ceil(64)];
+        let mut take = vec![false; insns.len()];
+        let mut taken = 0usize;
+        let mut stack = vec![target as usize];
+        while let Some(a) = stack.pop() {
+            let off = a - target as usize;
+            if seen[off / 64] >> (off % 64) & 1 != 0 {
+                continue;
+            }
+            seen[off / 64] |= 1 << (off % 64);
+            let Ok(k) = insns.binary_search_by_key(&(a as u64), |i| i.address) else { return };
+            let insn = &insns[k];
+            take[k] = true;
+            taken += 1;
+            let fall = insn.address + u64::from(insn.length);
+            let next_in_walk = Some(insn.address) != last;
+            crate::pipeline::reach_successors(insn, |x| if x == fall && next_in_walk { Some(x as usize) } else { idx_of(x) }, &mut stack);
+        }
+        let all = std::mem::take(insns);
+        let total = all.len();
+        let mut body = Vec::with_capacity(taken);
+        let mut rest = Vec::with_capacity(total - taken);
+        for (insn, t) in all.into_iter().zip(take) {
+            if t { body.push(insn) } else { rest.push(insn) }
+        }
+        let truncated = walk.len() >= MAX_INSNS && body.last().map(|i| i.address) == last;
+        let cfg = ControlFlowGraph::build_owned(body);
+        let s = std::sync::Arc::new(self.summarize_body(&cfg, truncated));
+        if let Ok(mut m) = self.summary_memo.lock() {
+            m.entry(target).or_insert(Some(s));
+        }
+        // (the blocks hold the body's instructions in address order)
+        let mut back = Vec::with_capacity(total);
+        let mut rest = rest.into_iter().peekable();
+        for insn in cfg.blocks.into_iter().flat_map(|b| b.instructions) {
+            while let Some(r) = rest.next_if(|r| r.address < insn.address) {
+                back.push(r);
+            }
+            back.push(insn);
+        }
+        back.extend(rest);
+        *insns = back;
     }
 
     /// [`Self::summarize`] without the parameter accesses, from the [`CompactTable`] when the
@@ -568,10 +634,10 @@ impl<'a> CalleeParams<'a> {
         param_accesses(cfg, rpo, &self.args, &self.caller_saved, self.returns.first())
     }
 
-    fn summarize_body(&self, cfg: ControlFlowGraph, truncated: bool) -> Summary {
-        let rpo = crate::dominator::reverse_post_order(&cfg);
-        let fields = Some(std::sync::Arc::new(self.param_accesses_of(&cfg, &rpo)));
-        let ret_sites = self.return_sites(&cfg);
+    fn summarize_body(&self, cfg: &ControlFlowGraph, truncated: bool) -> Summary {
+        let rpo = crate::dominator::reverse_post_order(cfg);
+        let fields = Some(std::sync::Arc::new(self.param_accesses_of(cfg, &rpo)));
+        let ret_sites = self.return_sites(cfg);
         let n = cfg.blocks.len();
 
         // must-defined (by low byte) sets at block entry; None = not reached yet
@@ -581,7 +647,7 @@ impl<'a> CalleeParams<'a> {
         // each block's transfer (`run_block` without `acc`): after a call every argument is
         // defined, else what it writes is added to what was defined on entry
         let all = (1u32 << self.args.len()) - 1;
-        let transfer: Vec<Option<u32>> = (0..n).map(|b| self.block_writes(&cfg, b)).collect();
+        let transfer: Vec<Option<u32>> = (0..n).map(|b| self.block_writes(cfg, b)).collect();
         loop {
             let mut changed = false;
             for &b in &rpo {
@@ -604,7 +670,7 @@ impl<'a> CalleeParams<'a> {
         }
         for &b in &rpo {
             if let Some(state) = inn[b] {
-                self.run_block(&cfg, b, state, Some(&mut acc));
+                self.run_block(cfg, b, state, Some(&mut acc));
             }
         }
         Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields }
@@ -843,6 +909,31 @@ impl CompactTable {
             let _ = cell.compare_exchange(0, v, std::sync::atomic::Ordering::Release, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// [`CInsn`]s a thread keeps at most, by [`reargo_lift::x86::X86Lifter::alike_key`] (emptied
+/// when full; [`CalleeParams::compact_alone`]).
+const COMPACT_MEMO_CAP: usize = 1 << 16;
+
+/// `(convention, alike key)` -> the [`CInsn`] of an instruction lifted alone.
+type CompactMemo = FxHashMap<(u32, (bool, iced_x86::Instruction)), CInsn>;
+
+thread_local! {
+    static COMPACT_MEMO: std::cell::RefCell<CompactMemo> = std::cell::RefCell::new(FxHashMap::default());
+}
+
+/// The calling conventions oracles were made with (arguments, returns): a [`CInsn`] depends
+/// on its oracle's, [`COMPACT_MEMO`] keeps them by its number here.
+static CONVENTIONS: Mutex<Vec<(Vec<VarnodeData>, Vec<VarnodeData>)>> = Mutex::new(Vec::new());
+
+/// The number of the convention `(args, returns)` in [`CONVENTIONS`].
+fn convention_id(args: &[VarnodeData], returns: &[VarnodeData]) -> u32 {
+    let Ok(mut known) = CONVENTIONS.lock() else { return u32::MAX };
+    let at = known.iter().position(|(a, r)| a == args && r == returns).unwrap_or_else(|| {
+        known.push((args.to_vec(), returns.to_vec()));
+        known.len() - 1
+    });
+    u32::try_from(at).unwrap_or(u32::MAX)
 }
 
 /// What a summary reads of one instruction lifted alone ([`CalleeParams::summarize_compact`]):
@@ -1110,15 +1201,73 @@ impl<'a> CalleeParams<'a> {
         if let Some(c) = cell.and_then(|cell| table.get(cell)) {
             return (!c.has(CI_FAILED)).then_some(c);
         }
-        let lifted = if pf { self.lifter.lift_instruction(self.memory, addr) } else { x86.lift_alone_with(self.memory, addr, cursor) };
-        let c = match lifted {
-            Ok(insn) => self.compact_insn(&insn).unwrap_or(CInsn::FAILED),
-            Err(_) => CInsn::FAILED,
+        let c = if pf {
+            match self.lifter.lift_instruction(self.memory, addr) {
+                Ok(insn) => self.compact_insn(&insn).unwrap_or(CInsn::FAILED),
+                Err(_) => CInsn::FAILED,
+            }
+        } else {
+            self.compact_alone(x86, addr, cursor)
         };
         if let Some(cell) = cell {
             table.put(cell, c);
         }
         (!c.has(CI_FAILED)).then_some(c)
+    }
+
+    /// The [`CInsn`] of the instruction at `addr` lifted alone without the PF: that of an
+    /// instruction alike ([`reargo_lift::x86::X86Lifter::alike_key`]: but for its displacement or
+    /// branch target) made before, when the address it names is its branch target (the lift's
+    /// ops are the same but for those values: its own branch target named instead), else of
+    /// its lift.
+    fn compact_alone<'m>(&self, x86: &reargo_lift::x86::X86Lifter, addr: u64, cursor: &mut reargo_lift::x86::DecodeCursor<'m>) -> CInsn
+    where
+        'a: 'm,
+    {
+        let Ok(insn) = x86.decode_alone_with(self.memory, addr, cursor) else { return CInsn::FAILED };
+        if self.convention == u32::MAX {
+            return match x86.lift_decoded_alone(insn, addr) {
+                Ok(lifted) => self.compact_insn(&lifted).unwrap_or(CInsn::FAILED),
+                Err(_) => CInsn::FAILED,
+            };
+        }
+        let key = (self.convention, x86.alike_key(&insn));
+        let near = (0..insn.op_count())
+            .any(|i| matches!(insn.op_kind(i), iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64))
+            .then(|| insn.near_branch_target());
+        let len = insn.len();
+        let known = COMPACT_MEMO.with(|m| m.borrow().get(&key).copied());
+        if let Some(t) = known {
+            // (its length its own; the address it names its branch target, as for the lift)
+            let mut c = CInsn { len: u8::try_from(len).unwrap_or(0), ..t };
+            if !c.has(CI_ADDR) {
+                return c;
+            }
+            let Some(n) = near else { return CInsn::FAILED };
+            return match i32::try_from(n.wrapping_sub(addr) as i64) {
+                Ok(rel) => {
+                    c.rel = rel;
+                    c
+                }
+                Err(_) => CInsn::FAILED,
+            };
+        }
+        let c = match x86.lift_decoded_alone(insn, addr) {
+            Ok(lifted) => self.compact_insn(&lifted),
+            Err(_) => None,
+        };
+        if let Some(c) = c
+            && (!c.has(CI_ADDR) || near == Some(c.addr(addr)))
+        {
+            COMPACT_MEMO.with(|m| {
+                let mut m = m.borrow_mut();
+                if m.len() >= COMPACT_MEMO_CAP {
+                    m.clear();
+                }
+                m.insert(key, c);
+            });
+        }
+        c.unwrap_or(CInsn::FAILED)
     }
 
     /// [`Self::summarize_body`] of [`Self::body_plain`]'s body without the parameter accesses,
@@ -1458,6 +1607,24 @@ fn param_accesses(cfg: &ControlFlowGraph, rpo: &[usize], args: &[VarnodeData], c
             dirty[b] = false;
             let returns = &mut block_returns[b];
             returns.clear();
+            if st.0.is_empty() {
+                // (nothing held: no op makes an entry from none, finds an access or a vtable
+                // store; a `ret` returns no argument)
+                for op in cfg.blocks[b].instructions.iter().flat_map(|i| i.ops.iter()) {
+                    if op.opcode == OpCode::Return {
+                        returns.push(false);
+                    }
+                }
+                for &succ in &cfg.blocks[b].successors {
+                    let new = Held::default();
+                    if succ != cfg.entry_block && inn[succ].as_ref() != Some(&new) {
+                        inn[succ] = Some(new);
+                        dirty[succ] = true;
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             // the constants the block wrote into registers (`lea rax, [vtable]`), for the stores
             let mut consts: SmallMap<(SpaceId, u64, u32), u64> = SmallMap::default();
             for insn in &cfg.blocks[b].instructions {

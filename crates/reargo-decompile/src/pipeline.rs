@@ -438,9 +438,14 @@ fn decompile_function_inner(
     // (only the instructions kept are lifted, when the range allows)
     let kept = fde.and_then(|(start, len)| oracle?.lift_fde_body(func_entry, max_insns, start, start + len));
     let mut lifted = match kept {
-        Some((any, kept)) => {
+        Some((any, mut kept)) => {
             if !any {
                 return Err(format!("no instructions at 0x{:x}", func_entry));
+            }
+            // (the function's own summary, asked for below, from these lifts when it is not
+            // known yet)
+            if let Some(o) = oracle {
+                o.seed_summary(func_entry, &mut kept);
             }
             kept
         }
