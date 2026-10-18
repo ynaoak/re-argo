@@ -115,6 +115,8 @@ pub struct NoReturn<'a> {
     /// The cache shared by the searches of a batch ([`FlowCache`]): the answers and searches
     /// for every lifter, the control flow of each instruction lifted alone for x86.
     cache: Option<&'a FlowCache>,
+    /// `symbols`' addresses that [`is_noreturn_name`], from `cache`.
+    named: Option<&'a rustc_hash::FxHashSet<u64>>,
 }
 
 /// What [`search`] reads of an instruction: its extent and control flow. Shared by every
@@ -148,6 +150,9 @@ pub struct FlowCache {
     /// the answers of the questions asked, by memory, symbols and target
     verdicts: Vec<Mutex<Verdicts>>,
     traces: Vec<Mutex<Traces>>,
+    /// The addresses whose symbol names a function that never returns, for the symbols (by
+    /// address) of the batch.
+    named: std::sync::OnceLock<(usize, rustc_hash::FxHashSet<u64>)>,
 }
 
 impl FlowCache {
@@ -157,6 +162,7 @@ impl FlowCache {
             generic: (0..64).map(|_| Mutex::new(GenericFlows::default())).collect(),
             verdicts: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
             traces: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
+            named: std::sync::OnceLock::new(),
         }
     }
 
@@ -518,7 +524,7 @@ impl Flow {
 
 impl<'a> NoReturn<'a> {
     pub fn new(lifter: &'a dyn PcodeLift, memory: &'a Memory, symbols: Option<&'a BTreeMap<u64, String>>) -> Self {
-        Self { lifter, memory, symbols, memo: Mutex::new(FxHashMap::default()), cache: None }
+        Self { lifter, memory, symbols, memo: Mutex::new(FxHashMap::default()), cache: None, named: None }
     }
 
     /// The same oracle sharing its answers and searches with the batch through `cache` (and,
@@ -526,6 +532,12 @@ impl<'a> NoReturn<'a> {
     /// change).
     pub fn with_flow_cache(mut self, cache: Option<&'a FlowCache>) -> Self {
         self.cache = cache;
+        // (the symbols that name such a function, collected once for the batch)
+        if let (Some(cache), Some(symbols)) = (cache, self.symbols) {
+            let id = std::ptr::from_ref(symbols) as usize;
+            let (of, set) = cache.named.get_or_init(|| (id, symbols.iter().filter(|(_, n)| is_noreturn_name(n)).map(|(&a, _)| a).collect()));
+            self.named = (*of == id).then_some(set);
+        }
         self
     }
 
@@ -553,7 +565,10 @@ impl<'a> NoReturn<'a> {
     }
 
     fn named(&self, target: u64) -> bool {
-        self.symbols.and_then(|s| s.get(&target)).is_some_and(|n| is_noreturn_name(n))
+        match self.named {
+            Some(set) => set.contains(&target),
+            None => self.symbols.and_then(|s| s.get(&target)).is_some_and(|n| is_noreturn_name(n)),
+        }
     }
 
     fn verdict(&self, target: u64, depth: u32, stack: &mut Vec<u64>) -> Verdict {
