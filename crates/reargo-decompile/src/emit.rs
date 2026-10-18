@@ -136,6 +136,8 @@ pub struct CEmitter<'a> {
     sunk_by_loop: rustc_hash::FxHashMap<usize, Vec<(crate::condition::ValueKey, String, i64)>>,
     /// The ones of the loops being printed.
     sunk: std::cell::RefCell<rustc_hash::FxHashMap<crate::condition::ValueKey, (String, i64)>>,
+    /// The loop counters, indices of the bytes they address (WS97).
+    counters: crate::index::Counters,
 }
 
 /// Temporaries printed as the register they are copied to (WS88, `inline::coalesced`): the
@@ -200,6 +202,7 @@ impl CEmitter<'static> {
             moved: Default::default(),
             sunk_by_loop: Default::default(),
             sunk: Default::default(),
+            counters: Default::default(),
         }
     }
 }
@@ -251,6 +254,7 @@ impl<'a> CEmitter<'a> {
             moved: Default::default(),
             sunk_by_loop: Default::default(),
             sunk: Default::default(),
+            counters: Default::default(),
         }
     }
 
@@ -303,6 +307,8 @@ impl<'a> CEmitter<'a> {
         structured: &StructuredBlock,
     ) -> String {
         self.block_ops = BlockOps::new(func);
+        // WS97: the loop counters (byte indices)
+        self.counters = crate::index::Counters::new(func);
         self.output.clear();
         self.goto_targets.clear();
         collect_goto_targets(structured, &mut self.goto_targets);
@@ -1575,7 +1581,7 @@ impl<'a> CEmitter<'a> {
             }
             self.inlined.borrow().get(&k).copied()
         };
-        let e = crate::index::indexed(func, addr, size, &inlined)?;
+        let e = crate::index::indexed(func, addr, size, &inlined, &self.counters)?;
         let base = self.input_expr(func, &func.ops[e.base.0], e.base.1);
         let index = self.input_expr(func, &func.ops[e.index.0], e.index.1);
         let base = if crate::condition::is_atomic(&base) || is_deref(&base) { base } else { cat!("(", base, ")") };

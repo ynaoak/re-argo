@@ -4967,6 +4967,11 @@ mod tests {
         let c = c_raw(&[0x48, 0x85, 0xf6, 0x74, 0x0f, 0x31, 0xc0, 0xc6, 0x04, 0x07, 0x00, 0x48, 0x83, 0xc0, 0x01, 0x48, 0x39, 0xc6, 0x75, 0xf3, 0xc3]);
         assert!(c.contains("for (rax = 0; rsi != rax; rax++) {"), "{c}");
         assert!(!c.lines().any(|l| l.trim() == "rax = 0;"), "{c}");
+        // the counter indexes the bytes it steps over
+        assert!(c.contains("((uint8_t*)rdi)[rax] = 0;"), "{c}");
+        // (a byte at the sum of two values that are no counter stays raw: mov byte [rdi+rsi], 0; ret)
+        let c = c_raw(&[0xc6, 0x04, 0x37, 0x00, 0xc3]);
+        assert!(c.contains("*(uint8_t*)(rdi + rsi) = 0;"), "{c}");
         // `jb`: `rax < rsi` unsigned, `0 <u rsi` from `rsi != 0`
         // test rsi, rsi; je 2f; xor eax, eax; 1: add qword [rdi+rax*8], 1; add rax, 1; cmp rax, rsi; jb 1b; 2: ret
         let c = c_raw(&[0x48, 0x85, 0xf6, 0x74, 0x10, 0x31, 0xc0, 0x48, 0x83, 0x04, 0xc7, 0x01, 0x48, 0x83, 0xc0, 0x01, 0x48, 0x39, 0xf0, 0x72, 0xf2, 0xc3]);

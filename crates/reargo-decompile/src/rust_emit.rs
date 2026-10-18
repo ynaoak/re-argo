@@ -78,6 +78,8 @@ pub struct RustEmitter<'a> {
     moved: rustc_hash::FxHashSet<usize>,
     /// The `do … while` loops whose test holds on entry (WS97): printed as `while c { … }`.
     entry_tested: rustc_hash::FxHashSet<usize>,
+    /// The loop counters, indices of the bytes they address (WS97).
+    counters: crate::index::Counters,
 }
 
 impl Default for RustEmitter<'static> {
@@ -114,6 +116,7 @@ impl RustEmitter<'static> {
             ranges: Default::default(),
             moved: Default::default(),
             entry_tested: Default::default(),
+            counters: Default::default(),
         }
     }
 }
@@ -150,6 +153,7 @@ impl<'a> RustEmitter<'a> {
             ranges: Default::default(),
             moved: Default::default(),
             entry_tested: Default::default(),
+            counters: Default::default(),
         }
     }
 
@@ -224,7 +228,7 @@ impl<'a> RustEmitter<'a> {
             }
             self.inlined.borrow().get(&k).copied()
         };
-        let e = crate::index::indexed(func, addr, size, &inlined)?;
+        let e = crate::index::indexed(func, addr, size, &inlined, &self.counters)?;
         let base = self.input_expr(func, &func.ops[e.base.0], e.base.1);
         let index = self.input_expr(func, &func.ops[e.index.0], e.index.1);
         let base = if crate::condition::is_atomic(&base) || method_call(&base) { base } else { cat!("(", base, ")") };
@@ -319,6 +323,8 @@ impl<'a> RustEmitter<'a> {
         structured: &StructuredBlock,
     ) -> String {
         self.block_ops = crate::emit::BlockOps::new(func);
+        // WS97: the loop counters (byte indices)
+        self.counters = crate::index::Counters::new(func);
         self.output.clear();
         self.noise = crate::emit::epilogue_noise(func);
         // WS88: the stack slots by name; the stack pointer updates only they read go (as in C)
