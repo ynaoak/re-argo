@@ -81,7 +81,7 @@ pub struct CEmitter<'a> {
     block_ops: BlockOps,
     indent: usize,
     output: String,
-    symbol_names: &'a BTreeMap<u64, String>,
+    symbol_names: crate::names::Names<'a>,
     string_literals: &'a BTreeMap<u64, String>,
     /// Per-instruction-address annotations (from the analyzer
     /// CommentManager). Surfaces them as inline `// …` lines in the
@@ -189,7 +189,7 @@ impl CEmitter<'static> {
             block_ops: Default::default(),
             indent: 0,
             output: String::new(),
-            symbol_names: empty_u64_map(),
+            symbol_names: crate::names::Names::new(empty_u64_map()),
             string_literals: empty_u64_map(),
             annotations: None,
             call_renderings: None,
@@ -235,14 +235,14 @@ impl<'a> CEmitter<'a> {
     /// stack-variable names, add the parameter and the read sites
     /// together so the data path is end-to-end honest.
     pub fn with_maps(
-        symbol_names: &'a BTreeMap<u64, String>,
+        symbol_names: impl Into<crate::names::Names<'a>>,
         string_literals: &'a BTreeMap<u64, String>,
     ) -> Self {
         Self {
             block_ops: Default::default(),
             indent: 0,
             output: String::new(),
-            symbol_names,
+            symbol_names: symbol_names.into(),
             string_literals,
             annotations: None,
             call_renderings: None,

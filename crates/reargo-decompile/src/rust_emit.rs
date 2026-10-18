@@ -30,7 +30,7 @@ pub struct RustEmitter<'a> {
     block_ops: crate::emit::BlockOps,
     indent: usize,
     output: String,
-    symbol_names: &'a BTreeMap<u64, String>,
+    symbol_names: crate::names::Names<'a>,
     string_literals: &'a BTreeMap<u64, String>,
     /// Per-instruction-address annotation map; mirrors the same
     /// surface CEmitter exposes so callers don't need to track
@@ -96,7 +96,7 @@ impl RustEmitter<'static> {
             block_ops: Default::default(),
             indent: 0,
             output: String::new(),
-            symbol_names: empty_u64_map(),
+            symbol_names: crate::names::Names::new(empty_u64_map()),
             string_literals: empty_u64_map(),
             annotations: None,
             call_renderings: None,
@@ -127,14 +127,14 @@ impl RustEmitter<'static> {
 impl<'a> RustEmitter<'a> {
     /// Borrow form of the constructor -- see `CEmitter::with_maps`.
     pub fn with_maps(
-        symbol_names: &'a BTreeMap<u64, String>,
+        symbol_names: impl Into<crate::names::Names<'a>>,
         string_literals: &'a BTreeMap<u64, String>,
     ) -> Self {
         Self {
             block_ops: Default::default(),
             indent: 0,
             output: String::new(),
-            symbol_names,
+            symbol_names: symbol_names.into(),
             string_literals,
             annotations: None,
             call_renderings: None,

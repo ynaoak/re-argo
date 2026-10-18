@@ -115,7 +115,8 @@ pub fn decompile_with_options(
     let call_params = callee_param_map(&trimmed, oracle.as_ref(), &imports);
     let own = own_params(oracle.as_ref(), entry);
     let call_returns = callee_return_map(&trimmed, oracle.as_ref(), &imports);
-    let symbols = &with_thunk_names(symbols, imports.thunk_names(&trimmed));
+    let thunks = imports.thunk_names(&trimmed);
+    let symbols = crate::names::Names::with_extra(symbols, &thunks);
     let mut trimmed = trimmed;
     long_double_tail_returns(&mut trimmed, &call_returns, &mut || match oracle.as_ref() {
         Some(o) => o.return_hint(entry),
@@ -169,18 +170,6 @@ fn own_params(
     Some((oracle.params(entry)?, oracle.args().to_vec()))
 }
 
-/// `symbols` with the names of import thunks added (borrowed when there are none).
-fn with_thunk_names(
-    symbols: &std::collections::BTreeMap<u64, String>,
-    extra: std::collections::BTreeMap<u64, String>,
-) -> std::borrow::Cow<'_, std::collections::BTreeMap<u64, String>> {
-    if extra.is_empty() {
-        return std::borrow::Cow::Borrowed(symbols);
-    }
-    let mut all = symbols.clone();
-    all.extend(extra);
-    std::borrow::Cow::Owned(all)
-}
 
 /// Parameters of every direct call's callee in `instructions`, keyed by the
 /// call instruction's address (WS78).
@@ -506,7 +495,8 @@ fn decompile_function_inner(
     let call_params = callee_param_map(&terminated, oracle, &imports);
     let own = own_params(oracle, func_entry);
     let call_returns = callee_return_map(&terminated, oracle, &imports);
-    let symbols = &with_thunk_names(symbols, imports.thunk_names(&terminated));
+    let thunks = imports.thunk_names(&terminated);
+    let symbols = crate::names::Names::with_extra(symbols, &thunks);
     let mut terminated = terminated;
     long_double_tail_returns(&mut terminated, &call_returns, &mut || match oracle {
         Some(o) => o.return_hint(func_entry),
@@ -1727,7 +1717,7 @@ fn build_decompile_result(
     (omitted_ops, phantoms): (usize, &crate::ssa::PhantomDefs),
     func_name: &str,
     entry: u64,
-    symbols: &std::collections::BTreeMap<u64, String>,
+    symbols: crate::names::Names<'_>,
     string_literals: &std::collections::BTreeMap<u64, String>,
     annotations: Option<&std::collections::BTreeMap<u64, Vec<String>>>,
     call_renderings: Option<&std::collections::BTreeMap<u64, String>>,
@@ -3711,7 +3701,7 @@ mod tests {
             (omitted, &phantoms),
             "f",
             0x1000,
-            &empty,
+            (&empty).into(),
             &empty,
             None,
             None,
