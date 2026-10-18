@@ -1604,6 +1604,24 @@ fn param_accesses(cfg: &ControlFlowGraph, rpo: &[usize], args: &[VarnodeData], c
             dirty[b] = false;
             let returns = &mut block_returns[b];
             returns.clear();
+            if st.0.is_empty() {
+                // (nothing held: no op makes an entry from none, finds an access or a vtable
+                // store; a `ret` returns no argument)
+                for op in cfg.blocks[b].instructions.iter().flat_map(|i| i.ops.iter()) {
+                    if op.opcode == OpCode::Return {
+                        returns.push(false);
+                    }
+                }
+                for &succ in &cfg.blocks[b].successors {
+                    let new = Held::default();
+                    if succ != cfg.entry_block && inn[succ].as_ref() != Some(&new) {
+                        inn[succ] = Some(new);
+                        dirty[succ] = true;
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             // the constants the block wrote into registers (`lea rax, [vtable]`), for the stores
             let mut consts: SmallMap<(SpaceId, u64, u32), u64> = SmallMap::default();
             for insn in &cfg.blocks[b].instructions {
