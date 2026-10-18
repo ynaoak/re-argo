@@ -338,6 +338,7 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
     // never kills, and how many phis live)
     let mut roots: Vec<usize> = Vec::new();
     let mut live_phis = 0usize;
+    let mut dead_before = 0usize;
     loop {
         let i = if sweep < n {
             let i = sweep;
@@ -346,6 +347,8 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
             if !candidate(o) {
                 if !o.dead {
                     roots.push(i);
+                } else {
+                    dead_before += 1;
                 }
                 continue;
             }
@@ -403,6 +406,7 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
         for &i in &stack {
             live[i] = true;
         }
+        let mut marked = stack.len();
         while let Some(i) = stack.pop() {
             for &inp in &func.ops[i].inputs {
                 if let Some(d) = func.varnodes[inp as usize].def_op
@@ -410,11 +414,14 @@ pub fn dead_code_elimination(func: &mut SsaFunction) -> usize {
                     && !func.ops[d].dead
                 {
                     live[d] = true;
+                    marked += 1;
                     stack.push(d);
                 }
             }
         }
-        for (i, alive) in live.iter().enumerate() {
+        // (every op living marked: none to drop)
+        let living = n - dead_before - removed;
+        for (i, alive) in live.iter().enumerate().take(if marked < living { n } else { 0 }) {
             if !alive && !func.ops[i].dead {
                 func.ops[i].dead = true;
                 removed += 1;
