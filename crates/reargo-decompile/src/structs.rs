@@ -333,6 +333,9 @@ pub struct Context<'a> {
     pub symbols: Option<&'a std::collections::BTreeMap<u64, String>>,
     /// The classes the callers pass (WS93): of the parameters, the callees' results, the fields.
     pub this_index: Option<&'a crate::thisclass::ThisIndex>,
+    /// The batch's index of the relocations (a lifter without `oracle`): the vtables listing a
+    /// function found without a pass over all of them.
+    pub batch: Option<&'a crate::noreturn::FlowCache>,
 }
 
 /// A raw access before the layout: op, base node, offset, width, value node (a pointer loaded
@@ -508,7 +511,16 @@ impl StructView {
         targets.extend(this_calls.iter().map(|&(_, t)| t));
         let listing = match (ctx.memory, ctx.oracle) {
             (Some(m), Some(o)) if std::ptr::eq(m, o.memory) => o.vtables_listing(&targets),
-            (Some(m), _) => crate::vcall::vtables_listing(m, &targets),
+            (Some(m), _) => match ctx.batch.and_then(|b| b.relative_slots(m)) {
+                Some(slots) => targets
+                    .iter()
+                    .filter_map(|&f| {
+                        let v = crate::vcall::this_vtables_indexed(m, slots, f);
+                        (!v.is_empty()).then_some((f, v))
+                    })
+                    .collect(),
+                None => crate::vcall::vtables_listing(m, &targets),
+            },
             (None, _) => FxHashMap::default(),
         };
         let class_of = |f: u64| ctx.memory.zip(listing.get(&f)).and_then(|(m, vts)| crate::vcall::method_class(m, vts));

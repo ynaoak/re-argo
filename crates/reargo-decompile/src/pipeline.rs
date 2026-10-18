@@ -124,7 +124,7 @@ pub fn decompile_with_options(
     let (terminated, omitted, phantoms) = apply_call_convention(trimmed, lifter, &call_returns);
     let empty: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let vcalls = ThisVcalls::new(lifter, memory, entry, &terminated, oracle.as_ref());
-    build_decompile_result(terminated, (omitted, &phantoms), func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts, oracle.as_ref())
+    build_decompile_result(terminated, (omitted, &phantoms), func_name, entry, symbols, &empty, None, None, call_params, own, vcalls, Some((lifter, memory)), &[], &switches, opts, oracle.as_ref(), None)
 }
 
 /// What resolving virtual calls on `this` needs (WS79, `vcall::resolve_this_vcalls`).
@@ -534,6 +534,7 @@ fn decompile_function_inner(
         &switches,
         opts,
         oracle,
+        batch_flow.filter(|_| oracle.is_none()),
     )
 }
 
@@ -1738,6 +1739,8 @@ fn build_decompile_result(
     switches: &[crate::switch::JumpTable],
     opts: &DecompileOptions,
     oracle: Option<&CalleeParams<'_>>,
+    // the cache a batch without an oracle shares
+    batch: Option<&crate::noreturn::FlowCache>,
 ) -> Result<DecompileResult, String> {
     if instructions.is_empty() {
         return Err(format!("no instructions at 0x{:x}", entry));
@@ -1826,7 +1829,7 @@ fn build_decompile_result(
         let memory = caller_hint.map(|(_, m)| m);
         let cc = caller_hint.and_then(|(l, _)| l.call_convention());
         let arg_regs = [cc.as_ref().and_then(|c| c.args.first().copied()), cc.as_ref().and_then(|c| c.args.get(1).copied())];
-        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle, name: Some(func_name), symbols: Some(symbols), this_index: opts.this_index.as_deref() };
+        let ctx = crate::structs::Context { memory, entry, arg_regs, name_class: crate::structs::method_class(func_name), oracle, name: Some(func_name), symbols: Some(symbols), this_index: opts.this_index.as_deref(), batch };
         match &frame {
             Some(f) => crate::structs::StructView::with_frame(&ssa, &ctx, f),
             None => crate::structs::StructView::new(&ssa, &ctx),
@@ -3719,6 +3722,7 @@ mod tests {
             &handlers,
             &[],
             &DecompileOptions::default(),
+            None,
             None,
         )
         .unwrap();

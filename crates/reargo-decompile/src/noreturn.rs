@@ -153,7 +153,13 @@ pub struct FlowCache {
     /// The addresses whose symbol names a function that never returns, for the symbols (by
     /// address) of the batch.
     named: std::sync::OnceLock<(usize, rustc_hash::FxHashSet<u64>)>,
+    /// The slots of the RELATIVE relocations by their value ([`crate::vcall::relative_slots`]),
+    /// for the memory (by address) of the batch.
+    relative_slots: std::sync::OnceLock<(usize, Option<RelativeSlots>)>,
 }
+
+/// The slots of the RELATIVE relocations by their value ([`crate::vcall::relative_slots`]).
+type RelativeSlots = FxHashMap<u64, Vec<u64>>;
 
 impl FlowCache {
     pub fn new() -> Self {
@@ -163,7 +169,16 @@ impl FlowCache {
             verdicts: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
             traces: (0..16).map(|_| Mutex::new(FxHashMap::default())).collect(),
             named: std::sync::OnceLock::new(),
+            relative_slots: std::sync::OnceLock::new(),
         }
+    }
+
+    /// [`crate::vcall::relative_slots`]`(memory)`, indexed once for the batch's memory (`None`
+    /// for another memory, as without a dynamic relocation table).
+    pub(crate) fn relative_slots(&self, memory: &Memory) -> Option<&RelativeSlots> {
+        let key = memory as *const Memory as usize;
+        let (k, slots) = self.relative_slots.get_or_init(|| (key, crate::vcall::relative_slots(memory)));
+        if *k == key { slots.as_ref() } else { None }
     }
 
     fn trace_shard(&self, target: u64) -> Option<&Mutex<Traces>> {
