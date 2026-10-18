@@ -584,6 +584,30 @@ impl<'f> PlainWalk<'f> {
         Some(out.into_boxed_slice())
     }
 
+    /// Calls `f` with the walk's addresses in order while it returns `true`.
+    pub fn each(&self, mut f: impl FnMut(u64) -> bool) {
+        let mut page: &[std::sync::atomic::AtomicU16] = &[];
+        let mut page_base = 0u64;
+        for (k, &(mut at, first)) in self.checkpoints.iter().enumerate() {
+            let end = self.checkpoints.get(k + 1).map_or(self.len, |&(_, i)| i as usize);
+            for _ in first as usize..end {
+                if !f(at) {
+                    return;
+                }
+                if at.wrapping_sub(page_base) >= page.len() as u64 {
+                    let Some(p) = self.facts.page_unchecked(at) else { return };
+                    page = p;
+                    page_base = at & !((1u64 << FACT_PAGE_BITS) - 1);
+                }
+                let fact = page[(at - page_base) as usize].load(std::sync::atomic::Ordering::Relaxed);
+                if fact & FACT_KNOWN == 0 {
+                    return;
+                }
+                at += u64::from(fact & 0xf);
+            }
+        }
+    }
+
     /// The walk's last address.
     pub fn last(&self) -> Option<u64> {
         let &(mut at, i) = self.checkpoints.last()?;
@@ -748,7 +772,11 @@ impl X86Lifter {
     }
 
     /// The span starting at `addr` (computed and kept when not known yet).
-    fn span<'m>(&self, memory: &'m Memory, addr: u64, facts: &InsnFacts, block: &mut Option<BlockDecoder<'m>>) -> Span {
+    ///
+    /// Only with `keep` is a span computed kept in a free slot: the first span of a walk starts
+    /// wherever the walk does (no other walk steps through its region from there), the next
+    /// ones where every walk agreeing on the instructions crosses into their regions.
+    fn span<'m>(&self, memory: &'m Memory, addr: u64, facts: &InsnFacts, block: &mut Option<BlockDecoder<'m>>, keep: bool) -> Span {
         use std::sync::atomic::Ordering;
         let Some((slots, key)) = facts.span_slots(addr) else { return Span(SPAN_KNOWN | SPAN_STOP) };
         // (acquire / release: the facts of its instructions are known to whoever reads it)
@@ -799,7 +827,7 @@ impl X86Lifter {
                 Some(false) => {}
             }
         }
-        for slot in slots {
+        for slot in slots.iter().filter(|_| keep) {
             match slot.compare_exchange(0, key | u64::from(v), Ordering::Release, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(other) if other & !0xffff_ffff == key => break,
@@ -833,7 +861,7 @@ impl X86Lifter {
                 page_base = addr & !((1u64 << FACT_PAGE_BITS) - 1);
             }
             checkpoints.push((addr, u32::try_from(idx).expect("walk index")));
-            let span = self.span(memory, addr, facts, &mut block);
+            let span = self.span(memory, addr, facts, &mut block, addr != start);
             if span.0 & SPAN_STOP == 0 && idx + span.count() <= count && span.count() > 0 {
                 if check_pf {
                     match span.pf(pf_written) {
@@ -4944,6 +4972,12 @@ mod tests {
                     assert_eq!(walk.len(), range.len(), "start +{start:#x} count {count}");
                     assert_eq!(walk.first(), range.first().copied());
                     assert_eq!(walk.last(), range.last().copied());
+                    let mut each = Vec::new();
+                    walk.each(|b| {
+                        each.push(b);
+                        true
+                    });
+                    assert_eq!(each, range, "start +{start:#x} count {count}");
                     for b in a.saturating_sub(2)..range.last().map_or(a, |l| l + 3) {
                         assert_eq!(walk.index_of(b), range.binary_search(&b).ok(), "start +{start:#x} count {count} at {b:#x}");
                     }

@@ -427,22 +427,35 @@ impl<'a> CalleeParams<'a> {
     /// a whole.
     pub(crate) fn lift_fde_body(&self, start: u64, count: usize, lo: u64, hi: u64) -> Option<(bool, Vec<LiftedInstruction>)> {
         let x86 = self.lifter.as_x86()?;
-        let addrs = x86.plain_range(self.memory, start, count, self.facts.as_ref()?)?;
+        // (the range's instructions, stepping over the spans of other walks: only those up to
+        // the body's end and the `int3`s after it are looked at)
+        let walk = x86.plain_walk(self.memory, start, count, self.facts.as_ref()?, false)?;
         let mut out = Vec::new();
         let mut next = hi;
         let mut cursor = reargo_lift::x86::DecodeCursor::default();
-        for &a in &addrs {
+        let mut failed = false;
+        walk.each(|a| {
             if a >= lo && a < hi {
-                out.push(x86.lift_alone_with(self.memory, a, &mut cursor).ok()?);
-            } else if a == next {
-                let insn = x86.lift_alone_with(self.memory, a, &mut cursor).ok()?;
-                if insn.mnemonic.trim() == "int3" {
-                    next += u64::from(insn.length);
-                    out.push(insn);
+                match x86.lift_alone_with(self.memory, a, &mut cursor) {
+                    Ok(insn) => out.push(insn),
+                    Err(_) => failed = true,
                 }
+            } else if a == next {
+                match x86.lift_alone_with(self.memory, a, &mut cursor) {
+                    Ok(insn) if insn.mnemonic.trim() == "int3" => {
+                        next += u64::from(insn.length);
+                        out.push(insn);
+                    }
+                    Ok(_) => {}
+                    Err(_) => failed = true,
+                }
+            } else if a > next && a >= hi {
+                // (the addresses increase: none after it is in the body or the `int3`s)
+                return false;
             }
-        }
-        Some((!addrs.is_empty(), out))
+            !failed
+        });
+        (!failed).then_some((!walk.is_empty(), out))
     }
 
     /// The depth-independent part of the analysis of the function at `target`, lifted once
