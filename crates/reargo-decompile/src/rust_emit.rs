@@ -1079,6 +1079,19 @@ impl<'a> RustEmitter<'a> {
                 let hi = self.input_expr(func, op, 0);
                 let lo = self.input_expr(func, op, 1);
                 let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
+                // WS98: as in C, `ax = (ah as u16) << 8;`
+                if let Some((_, _, shift)) = crate::emit::piece_types(func, op) {
+                    let out_sz = func.varnodes[op.output.unwrap() as usize].data.size;
+                    let (ty, lo_ty) = (size_to_rust_type(out_sz), size_to_rust_type(lo_sz));
+                    let lo_d = func.varnodes[op.inputs[1] as usize].data;
+                    let paren = |e: String| if crate::condition::is_atomic(&e) { e } else { format!("({e})") };
+                    let hi = format!("({} as {ty}) << {shift}", paren(hi));
+                    return Some(if lo_d.space == SpaceId::CONST {
+                        if lo_d.offset == 0 { format!("{dst} = {hi};") } else { format!("{dst} = {hi} | 0x{:x};", lo_d.offset) }
+                    } else {
+                        format!("{dst} = {hi} | {} as {lo_ty} as {ty};", paren(lo))
+                    });
+                }
                 Some(format!("{} = concat({}, {} /* {} bytes */);", dst, hi, lo, lo_sz))
             }
             OpCode::Subpiece if op.inputs.len() >= 2 => {

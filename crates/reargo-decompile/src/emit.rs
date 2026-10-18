@@ -1286,6 +1286,27 @@ impl<'a> CEmitter<'a> {
                 let hi = self.input_expr(func, op, 0);
                 let lo = self.input_expr(func, op, 1);
                 let lo_sz = func.varnodes[op.inputs[1] as usize].data.size;
+                // WS98: a concatenation C can compile (`mov cl, ah` after `xor eax, eax`:
+                // `ax = (uint16_t)ah << 8;`, it printed `ax = CONCAT(ah, 0:1);`)
+                if let Some((ty, lo_ty, shift)) = piece_types(func, op) {
+                    let hi = if crate::condition::is_atomic(&hi) { hi } else { format!("({hi})") };
+                    let lo_d = func.varnodes[op.inputs[1] as usize].data;
+                    return Some(if lo_d.space == SpaceId::CONST {
+                        if lo_d.offset == 0 {
+                            format!("{dst} = ({ty}){hi} << {shift};")
+                        } else {
+                            format!("{dst} = ({ty}){hi} << {shift} | 0x{:x};", lo_d.offset)
+                        }
+                    } else {
+                        // (a register of `lo`'s size is of its type already)
+                        if lo_d.space == SpaceId::REGISTER && lo == reg_name(lo_d.offset, lo_d.size) {
+                            format!("{dst} = ({ty}){hi} << {shift} | ({ty}){lo};")
+                        } else {
+                            let lo = if crate::condition::is_atomic(&lo) { lo } else { format!("({lo})") };
+                            format!("{dst} = ({ty}){hi} << {shift} | ({ty})({lo_ty}){lo};")
+                        }
+                    });
+                }
                 Some(format!("{} = CONCAT({}, {}:{});", dst, hi, lo, lo_sz))
             }
             OpCode::Subpiece if op.inputs.len() >= 2 => {
@@ -1917,6 +1938,15 @@ pub(crate) fn view_merge(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<V
         return None;
     }
     Some(ViewMerge::Keep { view: reg_name(out.offset, lo_d.size) })
+}
+
+/// The types of a concatenation `PIECE(hi, lo)` printed as `(T)hi << shift | (T)(L)lo`: the
+/// result's, `lo`'s and the shift in bits — when both halves fill the result, which is an
+/// integer C has.
+pub(crate) fn piece_types(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<(&'static str, &'static str, u32)> {
+    let out = func.varnodes[op.output? as usize].data.size;
+    let (hi, lo) = (func.varnodes[*op.inputs.first()? as usize].data.size, func.varnodes[*op.inputs.get(1)? as usize].data.size);
+    (hi + lo == out && matches!(out, 2 | 4 | 8 | 16) && matches!(lo, 1 | 2 | 4 | 8)).then(|| (size_to_type(out), size_to_type(lo), 8 * lo))
 }
 
 /// Is `hi` the upper bytes of the register `out` itself, `SUBPIECE(out, n)`?

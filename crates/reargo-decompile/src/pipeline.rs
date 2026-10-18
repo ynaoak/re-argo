@@ -5059,4 +5059,16 @@ mod tests {
         let c = c_raw(&[0x48, 0x85, 0xff, 0x74, 0x0e, 0x31, 0xc0, 0x89, 0xc2, 0x48, 0x89, 0xd1, 0x48, 0x01, 0xf1, 0x48, 0x89, 0xc8, 0xc3, 0x31, 0xd2, 0x89, 0xd0, 0x89, 0xc1, 0xc3]);
         assert!(c.contains("return 0;") && !c.contains("return rdx;"), "{c}");
     }
+
+    /// WS98: a concatenation whose halves fill the result prints as shifts C and Rust compile
+    /// (`xor eax, eax; mov ah, cl`: `ax = CONCAT(ah, 0:1);` before).
+    #[test]
+    fn concatenation_prints_as_shift_and_or() {
+        // mov rcx, rsi; mov rax, rdi; xor eax, eax; mov ah, cl; ret
+        let code = [0x48, 0x89, 0xf1, 0x48, 0x89, 0xf8, 0x31, 0xc0, 0x88, 0xcc, 0xc3];
+        let c = c_raw(&code);
+        assert!(c.contains("ax = (uint16_t)ah << 8;") && !c.contains("CONCAT"), "{c}");
+        let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(r.contains(" as u16) << 8;") && !r.contains("concat("), "{r}");
+    }
 }
