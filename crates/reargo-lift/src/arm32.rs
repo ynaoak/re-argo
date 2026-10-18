@@ -2016,12 +2016,22 @@ mod tests {
         assert!(may_be_hlt(0xe100_0070, 4, false) && may_be_hlt(0xba80, 2, true));
     }
 
-    /// Capstone prints `pop …` only where `may_be_pop` says it may: every T16 halfword, every
+    /// Capstone prints `pop …` only where `may_be_pop` says it may (and no other epilogue text,
+    /// nor a `jmp`): every T16 halfword, every
     /// T32 first halfword with 32 second ones, every A32 bits 27..16 with 32 others (and every
     /// condition), and 400k random words of each.
     #[test]
     fn pop_only_where_may_be_pop() {
-        let pop = |bytes: &[u8], thumb: bool, word: u32| format_text(bytes, thumb, word, 0x1_0000).starts_with("pop ");
+        // (and no other text of a frame-restoring instruction, `InsnText::may_be_epilogue_text`,
+        // nor a `jmp`, `InsnText::may_be_jmp_text`)
+        let pop = |bytes: &[u8], thumb: bool, word: u32| {
+            let t = format_text(bytes, thumb, word, 0x1_0000);
+            let m = t.trim();
+            let other = ["ret", "add rsp,", "lea rsp,", "mov rsp,", "jmp"].iter().any(|p| m.starts_with(p)) || m == "leave" || m == "vzeroupper";
+            assert!(!other, "{m}");
+            assert_eq!(m.starts_with("pop "), t.starts_with("pop "), "{t:?}");
+            m.starts_with("pop ")
+        };
         let mut seen = [0usize; 3];
         for hw in 0..=0xffffu32 {
             if (hw >> 11) >= 0x1d {

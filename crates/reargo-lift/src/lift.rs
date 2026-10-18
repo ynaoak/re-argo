@@ -135,6 +135,30 @@ impl InsnText {
         }
     }
 
+    /// Whether the text may be that of a frame-restoring instruction (it may start with `pop `,
+    /// `ret`, `add rsp,`, `lea rsp,` or `mov rsp,`, or be `leave` / `vzeroupper`): `false` only
+    /// when the decoded instruction, or for ARM the encoding (of those, only a `pop` prints so),
+    /// says it is not, without formatting the text.
+    pub fn may_be_epilogue_text(&self) -> bool {
+        use iced_x86::Mnemonic::*;
+        match &self.src {
+            TextSource::Given => true,
+            TextSource::X86(i) => matches!(i.mnemonic(), Pop | Add | Lea | Mov | Ret | Retf | Leave | Vzeroupper),
+            TextSource::Arm { len, thumb, word, .. } => crate::arm32::may_be_pop(*word, *len, *thumb),
+        }
+    }
+
+    /// Whether the text may start with `jmp`: `false` only when the decoded instruction says it
+    /// does not (x86), or it is an ARM / Thumb instruction's (no ARM text starts so), without
+    /// formatting the text.
+    pub fn may_be_jmp_text(&self) -> bool {
+        match &self.src {
+            TextSource::Given => true,
+            TextSource::X86(i) => matches!(i.mnemonic(), iced_x86::Mnemonic::Jmp | iced_x86::Mnemonic::Jmpe),
+            TextSource::Arm { .. } => false,
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         self.cell.get_or_init(|| match &self.src {
             TextSource::Given => String::new(),
