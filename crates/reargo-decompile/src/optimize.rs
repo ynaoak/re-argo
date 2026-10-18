@@ -255,6 +255,23 @@ pub fn const_alg_strength(func: &mut SsaFunction) -> (usize, usize, usize) {
         if func.ops[i].dead || func.ops[i].output.is_none() {
             continue;
         }
+        // (the opcodes one of the three rewrites)
+        if !matches!(
+            func.ops[i].opcode,
+            OpCode::IntAdd
+                | OpCode::IntSub
+                | OpCode::IntAnd
+                | OpCode::IntOr
+                | OpCode::IntXor
+                | OpCode::IntEqual
+                | OpCode::IntMult
+                | OpCode::IntZExt
+                | OpCode::IntSExt
+                | OpCode::Subpiece
+                | OpCode::IntDiv
+        ) {
+            continue;
+        }
         if try_constant_fold_op(func, i) {
             folded += 1;
             continue;
@@ -1233,7 +1250,12 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
     // live ops give no more matches. It runs every round (killing in another order can kill
     // more).
     let (mut fold_quiet, mut copies_quiet, mut cse_quiet) = (false, false, false);
-    for _ in 0..10 {
+    for round in 0..10 {
+        // (none of them runs: nothing changed since the last dead code elimination, which
+        // would find nothing again)
+        if round > 0 && fold_quiet && copies_quiet && cse_quiet {
+            break;
+        }
         // Three passes (constant_fold, algebraic_simplification,
         // strength_reduction) are fused into a single walk. See
         // `const_alg_strength` for the ordering argument.
