@@ -478,7 +478,69 @@ impl<'a> CalleeParams<'a> {
 
     fn summarize(&self, target: u64) -> Option<Summary> {
         let (cfg, truncated) = self.body(target)?;
-        Some(self.summarize_body(cfg, truncated))
+        Some(self.summarize_body(&cfg, truncated))
+    }
+
+    /// The summary of the function at `target` (one [`Self::summary`] lifts whole), from
+    /// `insns`: the lifts alone of the instructions of its range in address order
+    /// ([`Self::lift_fde_body`], which its decompile lifted), when they hold its body
+    /// ([`Self::body_plain`]'s instructions, those lifts too) — the same summary without
+    /// lifting them again. `insns` is left as it was.
+    pub(crate) fn seed_summary(&self, target: u64, insns: &mut Vec<LiftedInstruction>) {
+        let light = self.compact.is_some() && self.entries.binary_search(&target).is_err();
+        if light || self.summary_memo.lock().map_or(true, |m| m.contains_key(&target)) {
+            return;
+        }
+        let (Some(x86), Some(facts)) = (self.lifter.as_x86(), &self.facts) else { return };
+        let Some(walk) = x86.plain_walk(self.memory, target, MAX_INSNS, facts, true) else { return };
+        if walk.needs_pf || walk.first() != Some(target) {
+            return;
+        }
+        // `body_plain`'s search, through `insns`
+        let idx_of = |a: u64| walk.index_of(a).map(|_| a as usize);
+        let last = walk.last();
+        let mut seen = vec![0u64; (last.map_or(0, |l| l - target) as usize + 1).div_ceil(64)];
+        let mut take = vec![false; insns.len()];
+        let mut taken = 0usize;
+        let mut stack = vec![target as usize];
+        while let Some(a) = stack.pop() {
+            let off = a - target as usize;
+            if seen[off / 64] >> (off % 64) & 1 != 0 {
+                continue;
+            }
+            seen[off / 64] |= 1 << (off % 64);
+            let Ok(k) = insns.binary_search_by_key(&(a as u64), |i| i.address) else { return };
+            let insn = &insns[k];
+            take[k] = true;
+            taken += 1;
+            let fall = insn.address + u64::from(insn.length);
+            let next_in_walk = Some(insn.address) != last;
+            crate::pipeline::reach_successors(insn, |x| if x == fall && next_in_walk { Some(x as usize) } else { idx_of(x) }, &mut stack);
+        }
+        let all = std::mem::take(insns);
+        let total = all.len();
+        let mut body = Vec::with_capacity(taken);
+        let mut rest = Vec::with_capacity(total - taken);
+        for (insn, t) in all.into_iter().zip(take) {
+            if t { body.push(insn) } else { rest.push(insn) }
+        }
+        let truncated = walk.len() >= MAX_INSNS && body.last().map(|i| i.address) == last;
+        let cfg = ControlFlowGraph::build_owned(body);
+        let s = std::sync::Arc::new(self.summarize_body(&cfg, truncated));
+        if let Ok(mut m) = self.summary_memo.lock() {
+            m.entry(target).or_insert(Some(s));
+        }
+        // (the blocks hold the body's instructions in address order)
+        let mut back = Vec::with_capacity(total);
+        let mut rest = rest.into_iter().peekable();
+        for insn in cfg.blocks.into_iter().flat_map(|b| b.instructions) {
+            while let Some(r) = rest.next_if(|r| r.address < insn.address) {
+                back.push(r);
+            }
+            back.push(insn);
+        }
+        back.extend(rest);
+        *insns = back;
     }
 
     /// [`Self::summarize`] without the parameter accesses, from the [`CompactTable`] when the
@@ -568,10 +630,10 @@ impl<'a> CalleeParams<'a> {
         param_accesses(cfg, rpo, &self.args, &self.caller_saved, self.returns.first())
     }
 
-    fn summarize_body(&self, cfg: ControlFlowGraph, truncated: bool) -> Summary {
-        let rpo = crate::dominator::reverse_post_order(&cfg);
-        let fields = Some(std::sync::Arc::new(self.param_accesses_of(&cfg, &rpo)));
-        let ret_sites = self.return_sites(&cfg);
+    fn summarize_body(&self, cfg: &ControlFlowGraph, truncated: bool) -> Summary {
+        let rpo = crate::dominator::reverse_post_order(cfg);
+        let fields = Some(std::sync::Arc::new(self.param_accesses_of(cfg, &rpo)));
+        let ret_sites = self.return_sites(cfg);
         let n = cfg.blocks.len();
 
         // must-defined (by low byte) sets at block entry; None = not reached yet
@@ -581,7 +643,7 @@ impl<'a> CalleeParams<'a> {
         // each block's transfer (`run_block` without `acc`): after a call every argument is
         // defined, else what it writes is added to what was defined on entry
         let all = (1u32 << self.args.len()) - 1;
-        let transfer: Vec<Option<u32>> = (0..n).map(|b| self.block_writes(&cfg, b)).collect();
+        let transfer: Vec<Option<u32>> = (0..n).map(|b| self.block_writes(cfg, b)).collect();
         loop {
             let mut changed = false;
             for &b in &rpo {
@@ -604,7 +666,7 @@ impl<'a> CalleeParams<'a> {
         }
         for &b in &rpo {
             if let Some(state) = inn[b] {
-                self.run_block(&cfg, b, state, Some(&mut acc));
+                self.run_block(cfg, b, state, Some(&mut acc));
             }
         }
         Summary { reads: acc.reads, complete: acc.complete, calls: acc.calls, ret_sites, fields }
