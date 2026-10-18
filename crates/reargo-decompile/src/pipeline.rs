@@ -2874,7 +2874,8 @@ mod tests {
         let c = decompile(&lifter, &mem, 0x1000, "f", 100).unwrap().c_code;
         assert!(!c.contains("rsp = rsp + 8"), "{c}");
         assert!(!c.contains("= *(uint64_t*)rsp;"), "{c}");
-        assert!(c.contains("return rax;"), "{c}");
+        // (WS98: the copy and its zero extension print in the return)
+        assert!(c.contains("return ebx;") && !c.contains("eax"), "{c}");
         // (WS87: the push stores into its stack slot; the stack pointer update is not printed)
         assert!(c.contains("local_8 = rbx;") && !c.contains("rsp"), "the prologue is kept: {c}");
     }
@@ -5070,5 +5071,26 @@ mod tests {
         assert!(c.contains("ax = (uint16_t)ah << 8;") && !c.contains("CONCAT"), "{c}");
         let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
         assert!(r.contains(" as u16) << 8;") && !r.contains("concat("), "{r}");
+    }
+
+    /// WS98: the copies and zero extensions a `return` reads print in it, when nothing is
+    /// printed between them; a self-copy (`mov esi, esi`) prints only its zero extension.
+    #[test]
+    fn return_prints_the_value_under_its_copies() {
+        let rust = |code: &[u8]| decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        // mov eax, esi; ret
+        let c = c_raw(&[0x89, 0xf0, 0xc3]);
+        assert!(c.contains("return esi;") && !c.contains("eax"), "{c}");
+        let r = rust(&[0x89, 0xf0, 0xc3]);
+        assert!(r.contains("return esi as u64;"), "{r}");
+        // mov eax, esi; mov [rdi], ecx; ret: a store printed between
+        let c = c_raw(&[0x89, 0xf0, 0x89, 0x0f, 0xc3]);
+        assert!(c.contains("eax = esi;") && !c.contains("return esi;"), "{c}");
+        // movsxd rax, esi; ret: a sign extension is no copy
+        let c = c_raw(&[0x48, 0x63, 0xc6, 0xc3]);
+        assert!(!c.contains("return esi;"), "{c}");
+        // mov esi, esi; mov [rdi], rsi; ret
+        let c = c_raw(&[0x89, 0xf6, 0x48, 0x89, 0x37, 0xc3]);
+        assert!(!c.contains("esi = esi;") && c.contains("rsi = (uint64_t)esi;"), "{c}");
     }
 }

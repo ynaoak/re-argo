@@ -64,3 +64,50 @@ xor のゼロ化が引き金なのは、`edx = 0` が `rdx = ZEXT(edx)` と `rax
   `rax = rax; return rax;` → `return 0;`、`* tmp_2010` → `* 0xcccccccccccccccd`。
 - `cargo test --workspace --release`: 1317 passed（+1）。
 - decompile-all（8 回、min / 中央値）: py.elf main 6.069 / 6.998 s → 5.971 / 7.028 s、bash.elf 2.606 / 2.704 → 2.557 / 2.737 s（ノイズ内、退行なし）。
+
+### 2. 実行確認の再実行と次の改善（Task 2）
+
+コーパス = `run/runall.sh`（loops2 21 + loops3 15 + loops4 27 関数 × -O1/-O2/-O3/-Os = 252 関数）、計測 `run/stat.py`、BDS は `bstat.py`。
+
+#### 2a. `CONCAT(ah, 0:1)`（commit 08f5b604）
+
+- Task 1 の後、loops4 の `h_a7`（`xor eax, eax; mov ah, cl`）だけ C としてコンパイルできなかった: `ax = CONCAT(ah, 0:1);`。
+- PIECE の両半分が結果を埋め、結果が C の整数型（2/4/8/16 バイト）なら `ax = (uint16_t)ah << 8;` / `(T)hi << s | (T)(L)lo`
+  （`lo` がそのサイズのレジスタ名ならキャスト 1 つ）。Rust は `ax = (ah as u16) << 8;`。半分が埋まらない形（既存テストの 8+4→16）は従来どおり。
+- 実行確認ハーネスの `decomp2c.py` に `bsr` / `bsf` の定義を追加（-Os の `h_clz` が `bsr(edi)` の intrinsic を出す、デコンパイラ側は従来どおり）。
+- テスト `pipeline::tests::concatenation_prints_as_shift_and_or`。BDS 3 sample では `CONCAT` 0 件（変化なし）。
+
+#### 2b. return が読むコピー・ゼロ拡張を return の中に（commit 本節）
+
+- 測定（Task 1 後）: 252 関数で `rax = (uint64_t)eax;` 133 回、その直後が `return rax;` 106 回（`eax = edx; rax = (uint64_t)eax; return rax;` 78 回）。
+  jt2 でも `rax = (uint64_t)eax; return rax;` 99 回。自己代入 `edx = edx;`（`mov edx, edx`）8 回 / jt2 51 回。
+- `emit::return_chains`: return の値から、同じブロックの COPY / INT_ZEXT（出力がレジスタ、読み手が次の段だけ、入力がレジスタか定数、
+  入力が出力より広くない）を最大 4 段さかのぼる。条件: その段から return までの間に印字される文がない（dead / noise / folded だけ）、
+  間の op が入力のレジスタを書かない。→ `return edx;`（C は戻り値型 uint64_t への変換が同じゼロ拡張）、Rust は `return edx as u64;`。
+  消した段は `folded` に入る（宣言も消える）。入力が式（ロード・構造体フィールド）の段は対象外（符号付きの型だと return が符号拡張する）。
+  符号拡張 `(int64_t)(int32_t)` も対象外。
+- `mov edx, edx` の COPY は印字する右辺と左辺が同じなら文にしない（後ろのゼロ拡張 `rdx = (uint64_t)edx;` が本体）。C / Rust。
+- 既存テスト 3 件を新形式に更新（`emit_simple_function` ×2: `return 0x2a;`、`epilogue_frame_restore_is_not_printed`: `return ebx;`）。
+  新規 `pipeline::tests::return_prints_the_value_under_its_copies`（C/Rust、間に store がある場合・movsxd・自己コピー）。
+
+#### 結果
+
+| | 行数 | キャスト `(uintN_t)` | 宣言 | `rX = (uint64_t)eX;` | 自己代入 | goto | 実行不一致 / コンパイルエラー |
+|---|---|---|---|---|---|---|---|
+| コーパス 252 関数 main | — | — | — | — | — | — | loops2 -O2/-O3 で 2 値ずつ / 0 |
+| コーパス Task 1 + 2a | 4295 | 630 | 778 | 133 | 8 | 2 | 0 / 0 |
+| コーパス + 2b | 4059 | 578 | 713 | 81 | 0 | 2 | 0 / 0 |
+| jt2 (273) Task 1 → + 2b | 248681 → 248313 | 23870 → 23771 | | | 51 → 0 | 4910 → 4910 | |
+| big (150) | 22458 → 22315 | 2032 → 2023 | | | | 285 → 285 | |
+| s40 (40) | 4555 → 4550 | 711 → 711 | | | | 23 → 23 | |
+
+- jt2 の新しい return の内訳: `return r13;` 96、`return r15d;` 62、`return rbx;` 13 など（`mov rax, r13; pop r13; ret` の pop は印字されない
+  ので、印字されたプログラムの中では同じ値。逆アセンブルで確認）。
+- `cargo test --workspace --release`: 1319 passed（main 1316 + 3）。clippy（reargo-decompile）: 警告なし。
+- decompile-all（8 回、min / 中央値）: py.elf main 5.926 / 6.948 s → 5.854 / 6.912 s、bash.elf 2.415 / 2.860 → 2.486 / 2.852 s（ノイズ内）。
+
+## 残り
+
+- `h_max`（gcc -O2 の 2 倍展開ループ）の `goto label_1850;`（展開の端数処理からループの途中へ入る）は構造化の問題で未対応。
+- `al = (uint8_t)eax;`（`movzx eax, byte [..]; test al, al`）のようなビューの読み直しは残る（コーパスで多い次の候補）。
+- 実行確認ハーネスは C のみ（Rust 出力は単体テストだけで確認）。

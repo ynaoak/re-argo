@@ -117,6 +117,8 @@ pub struct CEmitter<'a> {
     /// a select's folded condition, by the select op (WS84: by op, not by value — two selects
     /// on one flag can see its operands in different states)
     select_conds: rustc_hash::FxHashMap<usize, String>,
+    /// WS98: a `return` printing the value its copies / zero extensions read (`return_chains`)
+    returns: rustc_hash::FxHashMap<usize, (usize, usize)>,
     /// Temporaries printed inside their readers' expressions (WS86, `inline::candidates`): the
     /// defining op by value, rendered where it is read (so a condition folding the values it
     /// reads folds them there too). Their definitions are in `folded`.
@@ -194,6 +196,7 @@ impl CEmitter<'static> {
             conds: None,
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
+            returns: Default::default(),
             inlined: Default::default(),
             emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             last_annotated: std::cell::Cell::new(None),
@@ -246,6 +249,7 @@ impl<'a> CEmitter<'a> {
             conds: None,
             inliner: crate::condition::Inliner::default(),
             select_conds: Default::default(),
+            returns: Default::default(),
             inlined: Default::default(),
             emitted: std::cell::RefCell::new(rustc_hash::FxHashSet::default()),
             last_annotated: std::cell::Cell::new(None),
@@ -359,6 +363,10 @@ impl<'a> CEmitter<'a> {
             let vptrs = sv.folded_vptr_loads(func, &|o| inl.contains(&o), &|c| self.member_call(func, &func.ops[c]).is_some());
             self.folded.extend(vptrs);
         }
+        // WS98: `eax = edx; rax = (uint64_t)eax; return rax;` is `return edx;`
+        let (returns, hidden) = crate::emit::return_chains(func, &|o| self.noise.contains(&o) || self.folded.contains(&o));
+        self.folded.extend(hidden);
+        self.returns = returns;
         // WS97: loops stepping their induction variables at the end print as `for`
         self.find_for_loops(func, structured);
         let mut sig = infer_signature(func);
@@ -891,7 +899,8 @@ impl<'a> CEmitter<'a> {
                     }
                 }
                 let src = self.input_expr(func, op, 0);
-                Some(cat!(dst, " = ", src, ";"))
+                // (WS98: `mov edx, edx` — the zero extension after it is the statement)
+                (src != dst).then(|| cat!(dst, " = ", src, ";"))
             }
             // the address of a struct field (WS91): `rdi = &rbx->field_98;`
             OpCode::IntAdd if self.field_address(func, op).is_some() => {
@@ -1498,7 +1507,11 @@ impl<'a> CEmitter<'a> {
                 Some(cat!(assign, "(*", target, ")(", args.join(", "), ");", ann))
             }
             OpCode::Return => match return_value(func, op) {
-                Some(i) => Some(cat!("return ", self.input_expr(func, op, i), ";")),
+                // (the value under its copies / zero extensions: the return type holds it zero-extended)
+                Some(i) => Some(match self.returns.get(&op.index) {
+                    Some(&(d, k)) => cat!("return ", self.input_expr(func, &func.ops[d], k), ";"),
+                    None => cat!("return ", self.input_expr(func, op, i), ";"),
+                }),
                 None => Some("return;".into()),
             },
             OpCode::Branch => None,
@@ -2258,6 +2271,80 @@ pub(crate) fn epilogue_noise(func: &SsaFunction) -> rustc_hash::FxHashSet<usize>
     noise
 }
 
+/// WS98: the copies and zero extensions a `return` reads, printed in it: `eax = edx; rax =
+/// (uint64_t)eax; return rax;` is `return edx;` (the return type, as wide as the register
+/// returned, zero-extends the narrower value). Each step is a copy or zero extension of the
+/// block, read only by the next, with nothing printed between it and the `return` (`hidden`:
+/// an op not printed): the value its input names there is the one it had. Returns, by
+/// `return`, the op and input whose expression it prints, and the ops then not printed.
+pub(crate) fn return_chains(
+    func: &SsaFunction,
+    hidden: &dyn Fn(usize) -> bool,
+) -> (rustc_hash::FxHashMap<usize, (usize, usize)>, Vec<usize>) {
+    let mut chains = rustc_hash::FxHashMap::default();
+    let mut gone = Vec::new();
+    for r in func.ops.iter().filter(|o| !o.dead && o.opcode == OpCode::Return) {
+        let Some(i) = return_value(func, r) else { continue };
+        let (mut reader, mut v) = (r.index, r.inputs[i]);
+        let mut root = None;
+        for _ in 0..4 {
+            let vn = &func.varnodes[v as usize];
+            let Some(d) = vn.def_op else { break };
+            let def = &func.ops[d];
+            if def.dead
+                || def.block != r.block
+                || d >= reader
+                || hidden(d)
+                || def.output != Some(v)
+                || !matches!(def.opcode, OpCode::Copy | OpCode::IntZExt)
+                || vn.data.space != SpaceId::REGISTER
+            {
+                break;
+            }
+            // read only by the next step
+            let mut readers = vn.uses.iter().filter(|&&u| !func.ops[u].dead && func.ops[u].inputs.contains(&v));
+            if readers.next() != Some(&reader) || readers.any(|&u| u != reader) {
+                break;
+            }
+            // nothing printed between it and the return
+            if !func.ops[d + 1..r.index].iter().all(|o| o.block == r.block && (o.dead || o.index == reader || gone.contains(&o.index) || hidden(o.index) || o.opcode == OpCode::Return)) {
+                break;
+            }
+            // (a narrowing copy is not the value the return reads)
+            let src = func.varnodes[def.inputs[0] as usize].data;
+            if src.size > vn.data.size {
+                break;
+            }
+            // (a register or a constant: an expression printed in place — a load, a struct
+            // field — may have a signed type, which the return would sign-extend)
+            if src.space != SpaceId::REGISTER && src.space != SpaceId::CONST {
+                break;
+            }
+            // (nor a register an op not printed writes before it: the restore of a callee-saved
+            // register, `pop rbx`, after `mov eax, ebx`)
+            let overlaps = |w: &reargo_core::pcode::VarnodeData| {
+                w.space == src.space && w.offset < src.offset + u64::from(src.size) && src.offset < w.offset + u64::from(w.size)
+            };
+            if src.space == SpaceId::REGISTER
+                && func.ops[d + 1..r.index].iter().any(|o| !o.dead && o.output.is_some_and(|w| overlaps(&func.varnodes[w as usize].data)))
+            {
+                break;
+            }
+            gone.push(d);
+            root = Some((d, 0));
+            reader = d;
+            v = def.inputs[0];
+            if func.varnodes[v as usize].data.space != SpaceId::REGISTER {
+                break;
+            }
+        }
+        if let Some(root) = root {
+            chains.insert(r.index, root);
+        }
+    }
+    (chains, gone)
+}
+
 pub(crate) fn return_value(func: &SsaFunction, op: &crate::ssa::SsaOp) -> Option<usize> {
     let reg_set = |v: u32| {
         let vn = &func.varnodes[v as usize];
@@ -2957,8 +3044,8 @@ mod tests {
         let output = emitter.emit_function(&ssa, &structured);
 
         assert!(output.contains("my_func(void)"));
-        assert!(output.contains("rax = 0x2a"));
-        assert!(output.contains("return"));
+        // (WS98: the copy prints in the return)
+        assert!(output.contains("return 0x2a;"), "{output}");
     }
 
     #[test]
