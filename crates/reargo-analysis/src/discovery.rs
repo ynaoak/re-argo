@@ -257,6 +257,8 @@ fn discover(
 fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize, usize, usize) {
     let seeds: Vec<u64> = work_queue.iter().copied().collect();
     let mut specs = speculate(program, &seeds);
+    // (the threads' memos of decodes: the walk decodes little more)
+    rayon::broadcast(|_| reargo_arch::arm::release_thread_decodes());
     let by_entry: FxHashMap<u64, u32> = specs.iter().enumerate().map(|(i, s)| (s.entry, i as u32)).collect();
     let mut state = ReplayState::default();
     let ahead: Vec<Option<Ahead>> = {
@@ -265,18 +267,25 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         specs
             .par_iter()
             .map(|spec| {
+                thread_local! {
+                    /// A thread's working sets, kept for its next walk.
+                    static SCRATCH: std::cell::RefCell<(Visited, Vec<Reference>, Vec<u64>)> = Default::default();
+                }
                 let mut local = ReplayState::default();
-                let mut visited = Visited::default();
-                let mut references = Vec::new();
-                let mut walked = Vec::new();
-                let mut walk = disassemble_function(
-                    spec.entry,
-                    &mut visited,
-                    &mut Replay { program, specs, by_entry, state: &mut local },
-                    &mut references,
-                    Some(&mut walked),
-                )
-                .ok()?;
+                let (mut walk, mut walked) = SCRATCH.with_borrow_mut(|(visited, references, walked)| {
+                    visited.clear();
+                    references.clear();
+                    walked.clear();
+                    let walk = disassemble_function(
+                        spec.entry,
+                        visited,
+                        &mut Replay { program, specs, by_entry, state: &mut local },
+                        references,
+                        Some(walked),
+                    )
+                    .ok()?;
+                    Some((walk, walked.as_slice().to_vec()))
+                })?;
                 // (one that needed a decode not made ahead is walked again,
                 // and one with an address [`START`] would mark)
                 if !local.fresh.is_empty()
@@ -286,15 +295,14 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 }
                 walk.body = Body::Set(std::mem::replace(&mut walk.body, Body::Set(AddressSet::new())).into_set());
                 walked.shrink_to_fit();
-                references.shrink_to_fit();
-                Some(Ahead { walk, references, walked })
+                Some(Ahead { walk, walked })
             })
             .collect()
     };
     let mut ahead = ahead;
     // (sized for the walks ahead: one allocation)
     let mut found = Found {
-        references: Vec::with_capacity(ahead.iter().flatten().map(|a| a.references.len()).sum::<usize>() * 9 / 8),
+        references: Vec::with_capacity(ahead.iter().flatten().map(|a| a.walk.reference_count).sum::<usize>() * 9 / 8),
         bodies: Vec::with_capacity(specs.len()),
     };
     let mut visited = Visited::default();
@@ -302,10 +310,16 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         if let Some(a) = by_entry.get(&entry).and_then(|&i| ahead[i as usize].take())
             && !a.walked.iter().any(|&addr| addr & START == 0 && visited.contains(addr))
         {
+            // (its references again, from the decodes: as many as its walk)
+            let mut replay = Replay { program, specs: &specs, by_entry: &by_entry, state: &mut state };
+            let mut hint = None;
             for &addr in &a.walked {
-                visited.insert(addr & !START);
+                let addr = addr & !START;
+                visited.insert(addr);
+                if let Some(insn) = replay.fetch(addr, &mut hint) {
+                    push_references(addr, &insn, references);
+                }
             }
-            references.extend_from_slice(&a.references);
             return Ok(a.walk);
         }
         disassemble_function(
@@ -331,15 +345,16 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         fresh.sort_unstable_by_key(|d| d.address);
         listing.add_unlisted_instructions(fresh);
     });
-    // (the speculated decodes not read, freed in parallel)
+    // (the speculated decodes not read, freed in parallel; then what the
+    // threads freed, given back)
     specs.into_par_iter().for_each(drop);
+    crate::release_free_memory();
     counts
 }
 
 /// An entry walked ahead, alone (see [`discover_parallel`]).
 struct Ahead {
     walk: FunctionDiscovery,
-    references: Vec<Reference>,
     /// The addresses of the instructions walked ([`disassemble_function`]).
     walked: Vec<u64>,
 }
@@ -351,6 +366,8 @@ struct Ahead {
 #[derive(Default)]
 struct Visited {
     pages: rustc_hash::FxHashMap<u64, Box<[u64; (PAGE / 64) as usize]>>,
+    /// Pages [`Self::clear`] emptied, for the next ones.
+    spare: Vec<Box<[u64; (PAGE / 64) as usize]>>,
 }
 
 /// Addresses per page of [`Visited`].
@@ -364,8 +381,17 @@ impl Visited {
 
     fn insert(&mut self, addr: u64) {
         let bit = addr % PAGE;
-        self.pages.entry(addr / PAGE).or_insert_with(|| Box::new([0; (PAGE / 64) as usize]))[(bit / 64) as usize] |=
-            1 << (bit % 64);
+        let spare = &mut self.spare;
+        self.pages.entry(addr / PAGE).or_insert_with(|| spare.pop().unwrap_or_else(|| Box::new([0; (PAGE / 64) as usize])))
+            [(bit / 64) as usize] |= 1 << (bit % 64);
+    }
+
+    /// Empty it (keeping its memory).
+    fn clear(&mut self) {
+        for (_, mut page) in self.pages.drain() {
+            page.fill(0);
+            self.spare.push(page);
+        }
     }
 }
 
@@ -590,9 +616,33 @@ fn speculate_one(
     entry: u64,
     entries: &mut Vec<(u64, bool)>,
 ) -> Spec {
-    let mut insns: Vec<SpecInsn> = Vec::new();
-    let mut seen: FxHashSet<u64> = FxHashSet::default();
-    let mut queue: Vec<u64> = vec![entry];
+    thread_local! {
+        /// A thread's working sets, kept for its next entry.
+        static SCRATCH: std::cell::RefCell<(Vec<SpecInsn>, FxHashSet<u64>, Vec<u64>)> = Default::default();
+    }
+    SCRATCH.with_borrow_mut(|(insns, seen, queue)| {
+        insns.clear();
+        seen.clear();
+        queue.clear();
+        speculate_into(program, listed, claims, entry, entries, insns, seen, queue);
+        insns.sort_unstable_by_key(|d| d.addr);
+        Spec { entry, insns: insns.drain(..).collect() }
+    })
+}
+
+/// [`speculate_one`] into the working sets `insns`, `seen` and `queue`.
+#[allow(clippy::too_many_arguments)]
+fn speculate_into(
+    program: &Program,
+    listed: &FxHashSet<u64>,
+    claims: &Claims,
+    entry: u64,
+    entries: &mut Vec<(u64, bool)>,
+    insns: &mut Vec<SpecInsn>,
+    seen: &mut FxHashSet<u64>,
+    queue: &mut Vec<u64>,
+) {
+    queue.push(entry);
     while let Some(start) = queue.pop() {
         let mut addr = start;
         for _ in 0..10_000 {
@@ -633,8 +683,6 @@ fn speculate_one(
             }
         }
     }
-    insns.sort_unstable_by_key(|d| d.addr);
-    Spec { entry, insns }
 }
 
 /// A function's body: the ranges of the instructions walked (one per
@@ -651,6 +699,33 @@ impl Body {
             Body::Ranges(ranges) => ranges.into_iter().collect(),
             Body::Set(set) => set,
         }
+    }
+}
+
+/// The references of the instruction at `insn_addr` the walk adds.
+fn push_references(insn_addr: u64, insn: &Facts, references: &mut Vec<Reference>) {
+    let fall_through = insn_addr + u64::from(insn.length);
+    match insn.flow {
+        FlowType::Call => {
+            if let Some(target) = insn.branch_target() {
+                references.push(Reference::new(insn_addr, target, RefType::UnconditionalCall));
+            }
+            references.push(Reference::new(insn_addr, fall_through, RefType::FallThrough));
+        }
+        FlowType::IndirectCall => references.push(Reference::new(insn_addr, 0, RefType::IndirectCall)),
+        FlowType::UnconditionalJump => {
+            if let Some(target) = insn.branch_target() {
+                references.push(Reference::new(insn_addr, target, RefType::UnconditionalJump));
+            }
+        }
+        FlowType::ConditionalJump => {
+            if let Some(target) = insn.branch_target() {
+                references.push(Reference::new(insn_addr, target, RefType::ConditionalJump));
+            }
+            references.push(Reference::new(insn_addr, fall_through, RefType::FallThrough));
+        }
+        FlowType::IndirectJump => references.push(Reference::new(insn_addr, 0, RefType::IndirectJump)),
+        FlowType::Return | FlowType::Fall => {}
     }
 }
 
@@ -678,7 +753,12 @@ fn disassemble_function<S: Source>(
     mut walked: Option<&mut Vec<u64>>,
 ) -> Result<FunctionDiscovery, AnalysisError> {
     let mut block_queue: VecDeque<(u64, S::Hint)> = VecDeque::new();
-    let mut block_visited: FxHashSet<u64> = FxHashSet::default();
+    thread_local! {
+        /// A thread's blocks visited, kept for its next walk.
+        static BLOCKS: std::cell::RefCell<FxHashSet<u64>> = Default::default();
+    }
+    let mut block_visited: FxHashSet<u64> = BLOCKS.with_borrow_mut(std::mem::take);
+    block_visited.clear();
     let mut body: Vec<AddressRange> = Vec::new();
     let mut call_targets: BTreeSet<u64> = BTreeSet::new();
     let references_before = references.len();
@@ -719,66 +799,38 @@ fn disassemble_function<S: Source>(
             ));
             instruction_count += 1;
 
+            push_references(insn_addr, &insn, references);
             match flow {
                 FlowType::Call => {
                     if let Some(target) = branch_target {
-                        references.push(Reference::new(
-                            insn_addr,
-                            target,
-                            RefType::UnconditionalCall,
-                        ));
                         call_targets.insert(target);
                     }
-                    let fall_through = insn_addr + insn_len;
-                    references.push(Reference::new(
-                        insn_addr,
-                        fall_through,
-                        RefType::FallThrough,
-                    ));
-                    addr = fall_through;
+                    addr = insn_addr + insn_len;
                 }
                 FlowType::IndirectCall => {
-                    references.push(Reference::new(insn_addr, 0, RefType::IndirectCall));
-                    let fall_through = insn_addr + insn_len;
-                    addr = fall_through;
+                    addr = insn_addr + insn_len;
                 }
                 FlowType::UnconditionalJump => {
-                    if let Some(target) = branch_target {
-                        references.push(Reference::new(
-                            insn_addr,
-                            target,
-                            RefType::UnconditionalJump,
-                        ));
-                        if !block_visited.contains(&target) {
-                            block_queue.push_back((target, hint));
-                        }
+                    if let Some(target) = branch_target
+                        && !block_visited.contains(&target)
+                    {
+                        block_queue.push_back((target, hint));
                     }
                     break;
                 }
                 FlowType::ConditionalJump => {
-                    if let Some(target) = branch_target {
-                        references.push(Reference::new(
-                            insn_addr,
-                            target,
-                            RefType::ConditionalJump,
-                        ));
-                        if !block_visited.contains(&target) {
-                            block_queue.push_back((target, hint));
-                        }
+                    if let Some(target) = branch_target
+                        && !block_visited.contains(&target)
+                    {
+                        block_queue.push_back((target, hint));
                     }
                     let fall_through = insn_addr + insn_len;
-                    references.push(Reference::new(
-                        insn_addr,
-                        fall_through,
-                        RefType::FallThrough,
-                    ));
                     if !block_visited.contains(&fall_through) {
                         block_queue.push_back((fall_through, hint));
                     }
                     break;
                 }
                 FlowType::IndirectJump => {
-                    references.push(Reference::new(insn_addr, 0, RefType::IndirectJump));
                     break;
                 }
                 FlowType::Return => {
@@ -790,6 +842,8 @@ fn disassemble_function<S: Source>(
             }
         }
     }
+
+    BLOCKS.with_borrow_mut(|b| *b = block_visited);
 
     #[allow(clippy::absurd_extreme_comparisons)]
     if instruction_count == 0 {

@@ -974,6 +974,16 @@ fn parse_hex(s: &str) -> Result<u64, String> {
 
 fn main() {
     let cli = Cli::parse();
+    // mimalloc keeps freed memory for a second before returning it: the
+    // analysis returns it after its parallel phases instead.
+    reargo_analysis::set_release_free_memory(|| {
+        unsafe extern "C" {
+            // (mimalloc's, `libmimalloc-sys` declares it with its `extended` feature only)
+            fn mi_collect(force: bool);
+        }
+        // SAFETY: mimalloc's own collection of the calling thread's heap
+        unsafe { mi_collect(true) }
+    });
 
     if let Err(e) = run(cli) {
         eprintln!("Error: {}", e);

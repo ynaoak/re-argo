@@ -318,6 +318,15 @@ impl Architecture for ArmArch {
     }
 }
 
+/// Free the decodes this thread keeps ([`A64_DECODES`], [`T16_DECODES`],
+/// [`T32_DECODES`]): for a thread that decoded for a while and will not
+/// for long (a decode is the same with or without them).
+pub fn release_thread_decodes() {
+    for memo in [&A64_DECODES, &T16_DECODES, &T32_DECODES] {
+        memo.with(|m| *m.borrow_mut() = rustc_hash::FxHashMap::default());
+    }
+}
+
 /// Decodes a thread keeps by AArch64 instruction word at most (emptied when full).
 const A64_DECODES_CAP: usize = 1 << 14;
 
