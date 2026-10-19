@@ -34,19 +34,19 @@ impl Listing {
         self.instructions.insert(insn.address, Box::new(insn));
     }
 
-    /// List `new`, instructions at addresses none listed has (sorted by
-    /// address, one per address): as [`Self::add_instruction`] of each, in
+    /// List `new`, instructions (by their address) at addresses none listed
+    /// has (sorted by address, one per address): as [`Self::add_instruction`] of each, in
     /// bulk.
-    pub fn add_new_instructions(&mut self, new: Vec<Box<DecodedInstruction>>) {
-        debug_assert!(new.windows(2).all(|w| w[0].address < w[1].address));
-        debug_assert!(new.iter().all(|i| !self.instructions.contains_key(&i.address)));
+    pub fn add_new_instructions(&mut self, new: Vec<(u64, Box<DecodedInstruction>)>) {
+        debug_assert!(new.windows(2).all(|w| w[0].0 < w[1].0));
+        debug_assert!(new.iter().all(|(a, i)| *a == i.address && !self.instructions.contains_key(a)));
         // (merging two maps rebuilds both: worth it when the new ones are not few)
         if new.len() >= self.instructions.len() / 16 {
-            let mut more: InstructionMap = new.into_iter().map(|i| (i.address, i)).collect();
+            let mut more: InstructionMap = new.into_iter().collect();
             self.instructions.append(&mut more);
         } else {
-            for i in new {
-                self.instructions.insert(i.address, i);
+            for (a, i) in new {
+                self.instructions.insert(a, i);
             }
         }
     }

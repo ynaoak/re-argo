@@ -93,18 +93,43 @@ pub type RefMap = BTreeMap<u64, RefList>;
 
 /// Append each of `refs` to `map`'s list at its `key`, in the order of
 /// `refs` (a stable sort by key keeps each list's order).
-fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) -> u64) {
+fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) -> u64 + Sync) {
     let mut sorted = refs.to_vec();
-    sorted.sort_by_key(&key);
-    let groups = sorted.chunk_by(|a, b| key(a) == key(b));
-    if map.is_empty() {
-        // (built in one pass from the sorted groups)
-        *map = groups.map(|g| (key(&g[0]), RefList::from_slice(g))).collect();
+    if sorted.len() >= 1 << 14 {
+        use rayon::slice::ParallelSliceMut;
+        sorted.par_sort_by_key(&key);
+    } else {
+        sorted.sort_by_key(&key);
+    }
+    let mut groups = sorted.chunk_by(|a, b| key(a) == key(b)).peekable();
+    if groups.peek().is_none() {
         return;
     }
-    for g in groups {
-        map.entry(key(&g[0])).or_default().extend_from_slice(g);
+    if sorted.len() < map.len() / 8 {
+        for g in groups {
+            map.entry(key(&g[0])).or_default().extend_from_slice(g);
+        }
+        return;
     }
+    // Many: both merged in address order into a new map, built in one pass.
+    let old = std::mem::take(map).into_iter();
+    let mut merged: Vec<(u64, RefList)> = Vec::with_capacity(old.len() + sorted.len());
+    let mut old = old.peekable();
+    for g in groups {
+        let k = key(&g[0]);
+        while let Some(o) = old.next_if(|(ok, _)| *ok < k) {
+            merged.push(o);
+        }
+        match old.next_if(|(ok, _)| *ok == k) {
+            Some((_, mut list)) => {
+                list.extend_from_slice(g);
+                merged.push((k, list));
+            }
+            None => merged.push((k, RefList::from_slice(g))),
+        }
+    }
+    merged.extend(old);
+    *map = merged.into_iter().collect();
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -181,8 +206,13 @@ impl ReferenceManager {
     /// is looked up once, in address order.
     pub fn add_all(&mut self, refs: &[Reference]) {
         self.jumps.extend(refs.iter().filter(|r| r.ref_type.is_jump()).copied());
-        add_grouped(&mut self.refs_from, refs, |r| r.from);
-        add_grouped(&mut self.refs_to, refs, |r| r.to);
+        let (from, to) = (&mut self.refs_from, &mut self.refs_to);
+        if refs.len() >= 1 << 12 {
+            rayon::join(|| add_grouped(from, refs, |r| r.from), || add_grouped(to, refs, |r| r.to));
+        } else {
+            add_grouped(from, refs, |r| r.from);
+            add_grouped(to, refs, |r| r.to);
+        }
     }
 
     /// Add `reference` unless a reference from its source already

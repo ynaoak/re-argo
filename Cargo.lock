@@ -709,6 +709,7 @@ name = "reargo-program"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "rayon",
  "reargo-arch",
  "reargo-core",
  "reargo-lift",
