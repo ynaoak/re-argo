@@ -91,6 +91,22 @@ pub type RefList = smallvec::SmallVec<[Reference; 2]>;
 /// References by source (or target) address.
 pub type RefMap = BTreeMap<u64, RefList>;
 
+/// Append each of `refs` to `map`'s list at its `key`, in the order of
+/// `refs` (a stable sort by key keeps each list's order).
+fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) -> u64) {
+    let mut sorted = refs.to_vec();
+    sorted.sort_by_key(&key);
+    let groups = sorted.chunk_by(|a, b| key(a) == key(b));
+    if map.is_empty() {
+        // (built in one pass from the sorted groups)
+        *map = groups.map(|g| (key(&g[0]), RefList::from_slice(g))).collect();
+        return;
+    }
+    for g in groups {
+        map.entry(key(&g[0])).or_default().extend_from_slice(g);
+    }
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceManager {
     // Address-ordered so `all_refs()` yields references in the same
@@ -158,6 +174,15 @@ impl ReferenceManager {
             .entry(reference.to)
             .or_default()
             .push(reference);
+    }
+
+    /// [`Self::add`] of each of `refs`, in order — the same lists in the
+    /// same order, the same jump log — in bulk: each source and target
+    /// is looked up once, in address order.
+    pub fn add_all(&mut self, refs: &[Reference]) {
+        self.jumps.extend(refs.iter().filter(|r| r.ref_type.is_jump()).copied());
+        add_grouped(&mut self.refs_from, refs, |r| r.from);
+        add_grouped(&mut self.refs_to, refs, |r| r.to);
     }
 
     /// Add `reference` unless a reference from its source already

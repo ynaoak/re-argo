@@ -6,7 +6,10 @@ use reargo_program::function::Function;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::symbol::SymbolType;
 use reargo_program::Program;
-use rustc_hash::FxHashSet;
+use rayon::prelude::*;
+use reargo_arch::DecodedInstruction;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Mutex;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer};
 
@@ -60,11 +63,6 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let mut work_queue: VecDeque<u64> = VecDeque::new();
-        let mut visited = Visited::default();
-        let mut functions_found = 0;
-        let mut references_found = 0;
-        let mut instructions_decoded = 0;
-
         work_queue.push_back(program.entry_point());
 
         for sym in program.symbol_table.function_symbols() {
@@ -107,75 +105,29 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             }
         }
 
-        const MAX_FUNCTIONS: usize = 50_000;
-        const MAX_INSTRUCTIONS: usize = 5_000_000;
-
-        while let Some(func_entry) = work_queue.pop_front() {
-            if functions_found >= MAX_FUNCTIONS || instructions_decoded >= MAX_INSTRUCTIONS {
-                break;
-            }
-            if visited.contains(func_entry) {
-                continue;
-            }
-            // A pre-existing function with an empty body (added by
-            // EhFrameAnalyzer, EntryPointAnalyzer, or by Symbols
-            // pre-seeding) still needs its body discovered — without
-            // it `function_containing` rejects every address inside
-            // and every downstream analyzer (callsite resolver,
-            // boundary checker, coverage…) treats those bytes as
-            // un-owned. Re-run discovery, then merge results in.
-            let needs_body = program
-                .listing
-                .get_function(func_entry)
-                .is_some_and(|f| f.body.is_empty());
-            if program.listing.has_function(func_entry) && !needs_body {
-                continue;
-            }
-
-            let result = disassemble_function(
-                program,
-                func_entry,
-                &mut visited,
-            );
-
-            match result {
-                Ok(discovery) => {
-                    instructions_decoded += discovery.instruction_count;
-                    references_found += discovery.references.len();
-
-                    for r in &discovery.references {
-                        program.references.add(*r);
-                    }
-
-                    if needs_body {
-                        if let Some(existing) = program.listing.get_function_mut(func_entry) {
-                            existing.body = discovery.body;
-                            existing.call_targets = discovery.call_targets.clone();
-                        }
-                    } else {
-                        let mut func =
-                            if let Some(sym) = program.symbol_table.primary_at(func_entry) {
-                                Function::new(func_entry, sym.name.clone())
-                            } else {
-                                Function::new(func_entry, format!("FUN_{:08x}", func_entry))
-                            };
-                        func.body = discovery.body;
-                        func.call_targets = discovery.call_targets.clone();
-                        program.listing.add_function(func);
-                        functions_found += 1;
-                    }
-
-                    for call_target in &discovery.call_targets {
-                        if !visited.contains(*call_target)
-                            && !program.listing.has_function(*call_target)
-                        {
-                            work_queue.push_back(*call_target);
-                        }
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
+        // With more than one thread, the code the walk will decode is
+        // decoded ahead, in parallel ([`speculate`]); the walk then
+        // reads it instead of decoding. Its result is the same either
+        // way: each decode is a pure function of the bytes and address.
+        let (functions_found, references_found, instructions_decoded) = if rayon::current_num_threads() > 1 {
+            let seeds: Vec<u64> = work_queue.iter().copied().collect();
+            let mut specs = speculate(program, &seeds);
+            let by_entry: FxHashMap<u64, u32> =
+                specs.iter().enumerate().map(|(i, s)| (s.entry, i as u32)).collect();
+            let mut source = Replay { specs: &specs, by_entry: &by_entry, used: Vec::new(), fresh: FxHashMap::default() };
+            let counts = discover(program, work_queue, &mut source);
+            let Replay { used, fresh, .. } = source;
+            // the instructions the walk read that were not listed, listed
+            let mut new: Vec<Box<DecodedInstruction>> =
+                used.into_iter().filter_map(|(s, i)| specs[s as usize].insns[i as usize].dec.take()).collect();
+            new.extend(fresh.into_values().filter_map(|(_, d)| d));
+            new.sort_unstable_by_key(|d| d.address);
+            new.dedup_by_key(|d| d.address);
+            program.listing.add_new_instructions(new);
+            counts
+        } else {
+            discover(program, work_queue, &mut Listed)
+        };
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
@@ -184,6 +136,95 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             instructions_decoded,
         })
     }
+}
+
+/// The discovery walk from the entries `work_queue` (and the calls it
+/// finds), reading instructions from `source`. Returns the functions,
+/// references and instructions found.
+fn discover<S: Source>(program: &mut Program, mut work_queue: VecDeque<u64>, source: &mut S) -> (usize, usize, usize) {
+    let mut visited = Visited::default();
+    let mut functions_found = 0;
+    let mut references_found = 0;
+    let mut instructions_decoded = 0;
+    // Added to the program after the walk, in bulk: the walk reads
+    // neither the references nor the bodies of the functions it found
+    // (an entry of one is visited).
+    let mut references: Vec<Reference> = Vec::new();
+    let mut bodies: Vec<(u64, Vec<AddressRange>)> = Vec::new();
+
+    const MAX_FUNCTIONS: usize = 50_000;
+    const MAX_INSTRUCTIONS: usize = 5_000_000;
+
+    while let Some(func_entry) = work_queue.pop_front() {
+        if functions_found >= MAX_FUNCTIONS || instructions_decoded >= MAX_INSTRUCTIONS {
+            break;
+        }
+        if visited.contains(func_entry) {
+            continue;
+        }
+        // A pre-existing function with an empty body (added by
+        // EhFrameAnalyzer, EntryPointAnalyzer, or by Symbols
+        // pre-seeding) still needs its body discovered — without
+        // it `function_containing` rejects every address inside
+        // and every downstream analyzer (callsite resolver,
+        // boundary checker, coverage…) treats those bytes as
+        // un-owned. Re-run discovery, then merge results in.
+        let needs_body = program
+            .listing
+            .get_function(func_entry)
+            .is_some_and(|f| f.body.is_empty());
+        if program.listing.has_function(func_entry) && !needs_body {
+            continue;
+        }
+
+        let result = disassemble_function(program, func_entry, &mut visited, source, &mut references);
+
+        match result {
+            Ok(discovery) => {
+                instructions_decoded += discovery.instruction_count;
+                references_found += discovery.reference_count;
+
+                if needs_body {
+                    if let Some(existing) = program.listing.get_function_mut(func_entry) {
+                        existing.call_targets = discovery.call_targets.clone();
+                        bodies.push((func_entry, discovery.body));
+                    }
+                } else {
+                    let mut func =
+                        if let Some(sym) = program.symbol_table.primary_at(func_entry) {
+                            Function::new(func_entry, sym.name.clone())
+                        } else {
+                            Function::new(func_entry, format!("FUN_{:08x}", func_entry))
+                        };
+                    func.call_targets = discovery.call_targets.clone();
+                    program.listing.add_function(func);
+                    bodies.push((func_entry, discovery.body));
+                    functions_found += 1;
+                }
+
+                for call_target in &discovery.call_targets {
+                    if !visited.contains(*call_target)
+                        && !program.listing.has_function(*call_target)
+                    {
+                        work_queue.push_back(*call_target);
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    program.references.add_all(&references);
+    // (the body's ranges made a set, in bulk: one range per
+    // instruction, re-decoded block starts repeat)
+    let bodies: Vec<(u64, AddressSet)> =
+        bodies.into_par_iter().map(|(entry, body)| (entry, body.into_iter().collect())).collect();
+    for (entry, body) in bodies {
+        if let Some(f) = program.listing.get_function_mut(entry) {
+            f.body = body;
+        }
+    }
+    (functions_found, references_found, instructions_decoded)
 }
 
 /// The instruction addresses a discovery run visited: a bit per
@@ -211,30 +252,250 @@ impl Visited {
     }
 }
 
+/// What the walk reads of an instruction.
+#[derive(Clone, Copy)]
+struct Facts {
+    length: u64,
+    flow: FlowType,
+    branch_target: Option<u64>,
+}
+
+impl Facts {
+    fn of(insn: &DecodedInstruction) -> Self {
+        Self { length: insn.length as u64, flow: insn.flow_type, branch_target: insn.branch_target }
+    }
+}
+
+/// Where the walk reads instructions from.
+trait Source {
+    /// Where the source last found an instruction, to look near it.
+    type Hint: Copy + Default;
+    /// The instruction at `addr` (`None`: there is none); `hint` is
+    /// where the one before it on the walk was found, updated.
+    fn fetch(&mut self, program: &mut Program, addr: u64, hint: &mut Self::Hint) -> Option<Facts>;
+}
+
+/// The program's listing: an instruction not listed is decoded and
+/// listed.
+struct Listed;
+
+impl Source for Listed {
+    type Hint = ();
+    fn fetch(&mut self, program: &mut Program, addr: u64, _: &mut ()) -> Option<Facts> {
+        // Decoding is a pure function of the bytes, and only this
+        // pass lists instructions: one listed at `addr` is the one
+        // decoding gives (a block starting inside code decoded
+        // before, or a later run of the pass).
+        let (arch, memory) = (&program.arch, &program.info.memory);
+        program
+            .listing
+            .instruction_or_insert_with(addr, || arch.decode_instruction(memory, addr).ok())
+            .map(Facts::of)
+    }
+}
+
+/// The instructions [`speculate`] decoded (else the listing's, else a
+/// decode): the walk's own decodes, made ahead. The ones read that were
+/// not listed are listed after the walk.
+struct Replay<'a> {
+    specs: &'a [Spec],
+    /// The index in `specs` of each entry's.
+    by_entry: &'a FxHashMap<u64, u32>,
+    /// The (spec, instruction) indices read whose instruction is not listed.
+    used: Vec<(u32, u32)>,
+    /// The instructions none was speculated for: decoded here (with
+    /// the decode when not listed).
+    fresh: FxHashMap<u64, (Option<Facts>, Option<Box<DecodedInstruction>>)>,
+}
+
+impl Replay<'_> {
+    /// The (spec, index) of the speculated instruction at `addr`, looked
+    /// up next to `hint`, else in the spec of the function at `addr`.
+    fn find(&self, addr: u64, hint: Option<(u32, u32)>) -> Option<(u32, u32)> {
+        if let Some((s, i)) = hint {
+            let insns = &self.specs[s as usize].insns;
+            if insns.get(i as usize + 1).is_some_and(|d| d.addr == addr) {
+                return Some((s, i + 1));
+            }
+            if let Ok(j) = insns.binary_search_by_key(&addr, |d| d.addr) {
+                return Some((s, j as u32));
+            }
+        }
+        let s = *self.by_entry.get(&addr)?;
+        let j = self.specs[s as usize].insns.binary_search_by_key(&addr, |d| d.addr).ok()?;
+        Some((s, j as u32))
+    }
+}
+
+impl Source for Replay<'_> {
+    type Hint = Option<(u32, u32)>;
+    fn fetch(&mut self, program: &mut Program, addr: u64, hint: &mut Self::Hint) -> Option<Facts> {
+        if let Some((s, i)) = self.find(addr, *hint) {
+            *hint = Some((s, i));
+            let d = &self.specs[s as usize].insns[i as usize];
+            if d.dec.is_some() {
+                self.used.push((s, i));
+            }
+            return Some(d.facts);
+        }
+        let entry = self.fresh.entry(addr).or_insert_with(|| match program.listing.get_instruction(addr) {
+            Some(insn) => (Some(Facts::of(insn)), None),
+            None => match program.arch.decode_instruction(&program.info.memory, addr) {
+                Ok(d) => (Some(Facts::of(&d)), Some(Box::new(d))),
+                Err(_) => (None, None),
+            },
+        });
+        entry.0
+    }
+}
+
+/// An instruction [`speculate`] decoded.
+struct SpecInsn {
+    addr: u64,
+    facts: Facts,
+    /// The decode, when the listing has none at `addr`.
+    dec: Option<Box<DecodedInstruction>>,
+}
+
+/// The code reachable from one entry, decoded ahead of the walk.
+struct Spec {
+    entry: u64,
+    /// By address, one per address.
+    insns: Vec<SpecInsn>,
+}
+
+/// Decode ahead, in parallel, the code the discovery walk from `seeds`
+/// will read: for each entry, the instructions its flow reaches (not
+/// stopping where another function's code was already walked, as the
+/// walk does — that depends on the order — so a bit more than the walk
+/// reads), and, as entries of their own, the calls it makes and the
+/// jumps to listed functions. What the walk then reads that is not
+/// here, it decodes itself.
+fn speculate(program: &Program, seeds: &[u64]) -> Vec<Spec> {
+    struct Ctx<'a> {
+        program: &'a Program,
+        claimed: Mutex<FxHashSet<u64>>,
+        specs: Mutex<Vec<Spec>>,
+    }
+    impl Ctx<'_> {
+        fn claim(&self, entry: u64) -> bool {
+            self.claimed.lock().is_ok_and(|mut c| c.insert(entry))
+        }
+        /// The walk never enters a listed function with a body as one
+        /// (only as another's code, by a jump).
+        fn has_body(&self, entry: u64) -> bool {
+            self.program.listing.get_function(entry).is_some_and(|f| !f.body.is_empty())
+        }
+    }
+    fn task<'s>(s: &rayon::Scope<'s>, ctx: &'s Ctx<'s>, entry: u64) {
+        let mut entries = Vec::new();
+        let spec = speculate_one(ctx.program, entry, &mut entries);
+        for (target, call) in entries {
+            if (!call || !ctx.has_body(target)) && ctx.claim(target) {
+                s.spawn(move |s| task(s, ctx, target));
+            }
+        }
+        if let Ok(mut specs) = ctx.specs.lock() {
+            specs.push(spec);
+        }
+    }
+    let ctx = Ctx { program, claimed: Mutex::new(FxHashSet::default()), specs: Mutex::new(Vec::new()) };
+    let ctx = &ctx;
+    rayon::scope(|s| {
+        for &entry in seeds {
+            if !ctx.has_body(entry) && ctx.claim(entry) {
+                s.spawn(move |s| task(s, ctx, entry));
+            }
+        }
+    });
+    std::mem::take(&mut *ctx.specs.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The instructions reachable from `entry` (see [`speculate`]); the
+/// entries it reaches are added to `entries` (with whether by a call).
+fn speculate_one(program: &Program, entry: u64, entries: &mut Vec<(u64, bool)>) -> Spec {
+    let mut insns: Vec<SpecInsn> = Vec::new();
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+    let mut queue: Vec<u64> = vec![entry];
+    let follow = |target: u64, queue: &mut Vec<u64>, entries: &mut Vec<(u64, bool)>| {
+        if target != entry && program.listing.has_function(target) {
+            entries.push((target, false));
+        } else {
+            queue.push(target);
+        }
+    };
+    while let Some(start) = queue.pop() {
+        let mut addr = start;
+        for _ in 0..10_000 {
+            if !seen.insert(addr) {
+                break;
+            }
+            let (facts, dec) = match program.listing.get_instruction(addr) {
+                Some(insn) => (Facts::of(insn), None),
+                None => match program.arch.decode_instruction(&program.info.memory, addr) {
+                    Ok(d) => (Facts::of(&d), Some(Box::new(d))),
+                    Err(_) => break,
+                },
+            };
+            insns.push(SpecInsn { addr, facts, dec });
+            let next = addr + facts.length;
+            match facts.flow {
+                FlowType::Call => {
+                    if let Some(target) = facts.branch_target {
+                        entries.push((target, true));
+                    }
+                    addr = next;
+                }
+                FlowType::IndirectCall | FlowType::Fall => addr = next,
+                FlowType::UnconditionalJump => {
+                    if let Some(target) = facts.branch_target {
+                        follow(target, &mut queue, entries);
+                    }
+                    break;
+                }
+                FlowType::ConditionalJump => {
+                    if let Some(target) = facts.branch_target {
+                        follow(target, &mut queue, entries);
+                    }
+                    queue.push(next);
+                    break;
+                }
+                FlowType::IndirectJump | FlowType::Return => break,
+            }
+        }
+    }
+    insns.sort_unstable_by_key(|d| d.addr);
+    Spec { entry, insns }
+}
+
 struct FunctionDiscovery {
-    body: AddressSet,
+    /// The body's ranges, one per instruction walked.
+    body: Vec<AddressRange>,
     call_targets: BTreeSet<u64>,
-    references: Vec<Reference>,
+    reference_count: usize,
     instruction_count: usize,
 }
 
-fn disassemble_function(
+/// Walk the function at `entry`, reading instructions from `source`,
+/// adding its references to `references`; stops at code an earlier walk
+/// of the run visited (`global_visited`).
+fn disassemble_function<S: Source>(
     program: &mut Program,
     entry: u64,
     global_visited: &mut Visited,
+    source: &mut S,
+    references: &mut Vec<Reference>,
 ) -> Result<FunctionDiscovery, AnalysisError> {
-    let mut block_queue: VecDeque<u64> = VecDeque::new();
+    let mut block_queue: VecDeque<(u64, S::Hint)> = VecDeque::new();
     let mut block_visited: FxHashSet<u64> = FxHashSet::default();
-    // The body's ranges, gathered here and made a set at the end (in
-    // bulk: one range per instruction, re-decoded block starts repeat).
     let mut body: Vec<AddressRange> = Vec::new();
     let mut call_targets: BTreeSet<u64> = BTreeSet::new();
-    let mut references = Vec::new();
+    let references_before = references.len();
     let mut instruction_count = 0;
 
-    block_queue.push_back(entry);
+    block_queue.push_back((entry, S::Hint::default()));
 
-    while let Some(block_start) = block_queue.pop_front() {
+    while let Some((block_start, mut hint)) = block_queue.pop_front() {
         if block_visited.contains(&block_start) {
             continue;
         }
@@ -248,21 +509,13 @@ fn disassemble_function(
                 break;
             }
 
-            // Decoding is a pure function of the bytes, and only this
-            // pass lists instructions: one listed at `addr` is the one
-            // decoding gives (a block starting inside code decoded
-            // before, or a later run of the pass).
-            let (arch, memory) = (&program.arch, &program.info.memory);
-            let Some(insn) = program
-                .listing
-                .instruction_or_insert_with(addr, || arch.decode_instruction(memory, addr).ok())
-            else {
+            let Some(insn) = source.fetch(program, addr, &mut hint) else {
                 break;
             };
 
-            let insn_addr = insn.address;
-            let insn_len = insn.length as u64;
-            let flow = insn.flow_type;
+            let insn_addr = addr;
+            let insn_len = insn.length;
+            let flow = insn.flow;
             let branch_target = insn.branch_target;
 
             global_visited.insert(insn_addr);
@@ -303,7 +556,7 @@ fn disassemble_function(
                             RefType::UnconditionalJump,
                         ));
                         if !block_visited.contains(&target) {
-                            block_queue.push_back(target);
+                            block_queue.push_back((target, hint));
                         }
                     }
                     break;
@@ -316,7 +569,7 @@ fn disassemble_function(
                             RefType::ConditionalJump,
                         ));
                         if !block_visited.contains(&target) {
-                            block_queue.push_back(target);
+                            block_queue.push_back((target, hint));
                         }
                     }
                     let fall_through = insn_addr + insn_len;
@@ -326,7 +579,7 @@ fn disassemble_function(
                         RefType::FallThrough,
                     ));
                     if !block_visited.contains(&fall_through) {
-                        block_queue.push_back(fall_through);
+                        block_queue.push_back((fall_through, hint));
                     }
                     break;
                 }
@@ -353,9 +606,9 @@ fn disassemble_function(
     }
 
     Ok(FunctionDiscovery {
-        body: body.into_iter().collect::<AddressSet>(),
+        body,
         call_targets,
-        references,
+        reference_count: references.len() - references_before,
         instruction_count,
     })
 }

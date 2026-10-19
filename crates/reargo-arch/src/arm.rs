@@ -105,6 +105,21 @@ fn aarch64_calling_conventions() -> Vec<CallingConvention> {
     }]
 }
 
+fn capstone_arm32() -> capstone::CsResult<capstone::Capstone> {
+    use capstone::prelude::*;
+    Capstone::new().arm().mode(arch::arm::ArchMode::Arm).detail(true).build()
+}
+
+fn capstone_thumb() -> capstone::CsResult<capstone::Capstone> {
+    use capstone::prelude::*;
+    Capstone::new().arm().mode(arch::arm::ArchMode::Thumb).detail(true).build()
+}
+
+fn capstone_aarch64() -> capstone::CsResult<capstone::Capstone> {
+    use capstone::prelude::*;
+    Capstone::new().arm64().mode(arch::arm64::ArchMode::Arm).detail(true).build()
+}
+
 pub struct ArmArch {
     is_64: bool,
     thumb: bool,
@@ -115,53 +130,37 @@ pub struct ArmArch {
 
 impl ArmArch {
     pub fn new_arm32() -> Result<Self, DisasmError> {
-        use capstone::prelude::*;
-        let cs = Capstone::new()
-            .arm()
-            .mode(arch::arm::ArchMode::Arm)
-            .detail(true)
-            .build()
+        let cs = capstone_arm32()
             .map_err(|e| DisasmError::EngineError(format!("ARM capstone init: {}", e)))?;
         Ok(Self {
             is_64: false,
             thumb: false,
             registers: arm32_registers(),
             calling_conventions: arm32_calling_conventions(),
-            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+            cs: crate::capstone_wrapper::SafeCapstone::with_builder(cs, || capstone_arm32().ok()),
         })
     }
 
     pub fn new_arm32_thumb() -> Self {
-        use capstone::prelude::*;
-        let cs = Capstone::new()
-            .arm()
-            .mode(arch::arm::ArchMode::Thumb)
-            .detail(true)
-            .build()
-            .expect("failed to create Thumb capstone");
+        let cs = capstone_thumb().expect("failed to create Thumb capstone");
         Self {
             is_64: false,
             thumb: true,
             registers: arm32_registers(),
             calling_conventions: arm32_calling_conventions(),
-            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+            cs: crate::capstone_wrapper::SafeCapstone::with_builder(cs, || capstone_thumb().ok()),
         }
     }
 
     pub fn new_aarch64() -> Result<Self, DisasmError> {
-        use capstone::prelude::*;
-        let cs = Capstone::new()
-            .arm64()
-            .mode(arch::arm64::ArchMode::Arm)
-            .detail(true)
-            .build()
+        let cs = capstone_aarch64()
             .map_err(|e| DisasmError::EngineError(format!("AArch64 capstone init: {}", e)))?;
         Ok(Self {
             is_64: true,
             thumb: false,
             registers: aarch64_registers(),
             calling_conventions: aarch64_calling_conventions(),
-            cs: crate::capstone_wrapper::SafeCapstone::new(cs),
+            cs: crate::capstone_wrapper::SafeCapstone::with_builder(cs, || capstone_aarch64().ok()),
         })
     }
 }
