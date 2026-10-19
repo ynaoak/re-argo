@@ -34,16 +34,12 @@ impl Listing {
         self.instructions.insert(insn.address, Box::new(insn));
     }
 
-    /// List `new`, instructions (by their address) at addresses none listed
-    /// has (sorted by address, one per address): as [`Self::add_instruction`] of each, in
-    /// bulk.
-    pub fn add_new_instructions(&mut self, new: Vec<(u64, Box<DecodedInstruction>)>) {
-        debug_assert!(new.windows(2).all(|w| w[0].0 < w[1].0));
-        debug_assert!(new.iter().all(|(a, i)| *a == i.address && !self.instructions.contains_key(a)));
-        // (in address order: each insertion near the one before; no
-        // second copy of them, as building a map from them would make)
-        for (a, i) in new {
-            self.instructions.insert(a, i);
+    /// List each of `new` at its address unless one is listed there (as
+    /// [`Self::instruction_or_insert_with`] does): in bulk, fastest in
+    /// address order.
+    pub fn add_unlisted_instructions(&mut self, new: impl IntoIterator<Item = Box<DecodedInstruction>>) {
+        for i in new {
+            self.instructions.entry(i.address).or_insert(i);
         }
     }
 

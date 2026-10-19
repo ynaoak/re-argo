@@ -6,6 +6,7 @@ use reargo_program::function::Function;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::symbol::SymbolType;
 use reargo_program::Program;
+use reargo_program::listing::Listing;
 use rayon::prelude::*;
 use reargo_arch::DecodedInstruction;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -117,7 +118,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             let counts = discover(program, work_queue, &mut Visited::default(), &mut found, |program, entry, visited, references| {
                 disassemble_function(entry, visited, &mut Listed(program), references, None)
             });
-            found.apply(program, Vec::new());
+            found.apply(program, |_| ());
             counts
         };
 
@@ -140,9 +141,9 @@ struct Found {
 }
 
 impl Found {
-    /// Add the references, bodies and the instructions `new` (not
-    /// listed, by address, one per address) to the program.
-    fn apply(self, program: &mut Program, new: Vec<(u64, Box<DecodedInstruction>)>) {
+    /// Add the references and bodies to the program, and list the
+    /// instructions `list` lists.
+    fn apply(self, program: &mut Program, list: impl FnOnce(&mut Listing) + Send) {
         let Found { references, bodies } = self;
         let (listing, refs) = (&mut program.listing, &mut program.references);
         rayon::join(
@@ -155,9 +156,7 @@ impl Found {
                         f.body = body;
                     }
                 }
-                if !new.is_empty() {
-                    listing.add_new_instructions(new);
-                }
+                list(listing);
             },
         );
     }
@@ -321,17 +320,17 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
     // The instructions the walk read that were not listed, to list: the
     // ones decoded at the addresses it visited (it visits each one it
     // reads), else decoded during the walk.
-    let visited = &visited;
-    let mut new: Vec<(u64, Box<DecodedInstruction>)> = specs
-        .par_iter_mut()
-        .flat_map_iter(|spec| {
-            spec.insns.iter_mut().filter(|d| visited.contains(d.addr)).filter_map(|d| Some((d.addr, d.dec.take()?)))
-        })
-        .collect();
-    new.extend(state.fresh.into_iter().filter_map(|(a, (_, d))| Some((a, d?))));
-    new.par_sort_unstable_by_key(|d| d.0);
-    new.dedup_by_key(|d| d.0);
-    found.apply(program, new);
+    found.apply(program, |listing| {
+        // (in address order, roughly: the specs by their first address)
+        specs.sort_unstable_by_key(|spec| spec.insns.first().map_or(u64::MAX, |d| d.addr));
+        let from_specs = specs.iter_mut().flat_map(|spec| {
+            spec.insns.iter_mut().filter(|d| visited.contains(d.addr)).filter_map(|d| d.dec.take())
+        });
+        listing.add_unlisted_instructions(from_specs);
+        let mut fresh: Vec<Box<DecodedInstruction>> = state.fresh.into_values().filter_map(|(_, d)| d).collect();
+        fresh.sort_unstable_by_key(|d| d.address);
+        listing.add_unlisted_instructions(fresh);
+    });
     // (the speculated decodes not read, freed in parallel)
     specs.into_par_iter().for_each(drop);
     counts
@@ -373,14 +372,24 @@ impl Visited {
 /// What the walk reads of an instruction.
 #[derive(Clone, Copy)]
 struct Facts {
+    target: u64,
     length: u32,
     flow: FlowType,
-    branch_target: Option<u64>,
+    has_target: bool,
 }
 
 impl Facts {
     fn of(insn: &DecodedInstruction) -> Self {
-        Self { length: insn.length, flow: insn.flow_type, branch_target: insn.branch_target }
+        Self {
+            target: insn.branch_target.unwrap_or(0),
+            length: insn.length,
+            flow: insn.flow_type,
+            has_target: insn.branch_target.is_some(),
+        }
+    }
+
+    fn branch_target(&self) -> Option<u64> {
+        self.has_target.then_some(self.target)
     }
 }
 
@@ -605,18 +614,18 @@ fn speculate_one(
             let next = addr + u64::from(facts.length);
             match facts.flow {
                 FlowType::Call => {
-                    if let Some(target) = facts.branch_target {
+                    if let Some(target) = facts.branch_target() {
                         entries.push((target, true));
                     }
                     addr = next;
                 }
                 FlowType::IndirectCall | FlowType::Fall => addr = next,
                 FlowType::UnconditionalJump => {
-                    queue.extend(facts.branch_target);
+                    queue.extend(facts.branch_target());
                     break;
                 }
                 FlowType::ConditionalJump => {
-                    queue.extend(facts.branch_target);
+                    queue.extend(facts.branch_target());
                     queue.push(next);
                     break;
                 }
@@ -701,7 +710,7 @@ fn disassemble_function<S: Source>(
             let insn_addr = addr;
             let insn_len = u64::from(insn.length);
             let flow = insn.flow;
-            let branch_target = insn.branch_target;
+            let branch_target = insn.branch_target();
 
             global_visited.insert(insn_addr);
             body.push(AddressRange::new(
