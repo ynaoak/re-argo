@@ -230,41 +230,36 @@ pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<De
     let mut hits: Vec<DecodedString> = Vec::new();
     for group in Group::all().iter().filter(|g| tried(&g.methods[0])) {
         let chunk = |lo: usize| scan_chunk(buf, lo, (lo + CHUNK).min(buf.len()), nonprintable, opts, group);
-        let mut found: Vec<Vec<Vec<(usize, usize)>>> = if buf.len() <= CHUNK {
+        let found: Vec<Vec<Vec<(usize, usize)>>> = if buf.len() <= CHUNK {
             vec![chunk(0)]
         } else {
             (0..buf.len()).step_by(CHUNK).collect::<Vec<_>>().into_par_iter().map(chunk).collect()
         };
-        // the runs left to each pass, in address order
-        let runs: Vec<Vec<(usize, usize)>> =
-            (0..group.methods.len()).map(|q| found.iter_mut().flat_map(|c| std::mem::take(&mut c[q])).collect()).collect();
-        // The rest of the filter and the strings, for the passes in order,
-        // a batch at a time in parallel: the passes past the one that
-        // reaches the cap are not looked at.
-        let pass_hits = |q: usize| -> Vec<DecodedString> {
-            let method = group.methods[q];
-            runs[q]
-                .iter()
-                .filter(|&&(i, j)| passes_filter_rest(&buf[i..j], &group.classes[q]))
-                .map(|&(i, j)| DecodedString {
+        // The rest of the filter for the passes in order, a batch at a time
+        // in parallel, and their hits up to the cap: the passes past the
+        // batch that reaches it are not looked at, nor are the strings
+        // past it built.
+        let runs = |q: usize| found.iter().flat_map(move |c| &c[q]);
+        let pass_runs = |q: usize| -> Vec<(usize, usize)> {
+            runs(q).copied().filter(|&(i, j)| passes_filter_rest(&buf[i..j], &group.classes[q])).collect()
+        };
+        let passes: Vec<usize> = (0..group.methods.len()).collect();
+        for batch in passes.chunks(rayon::current_num_threads().max(1) * 2) {
+            let per_pass: Vec<Vec<(usize, usize)>> = if buf.len() <= CHUNK {
+                batch.iter().map(|&q| pass_runs(q)).collect()
+            } else {
+                batch.par_iter().map(|&q| pass_runs(q)).collect()
+            };
+            for (&q, runs) in batch.iter().zip(per_pass) {
+                let method = group.methods[q];
+                let room = opts.max_per_section - hits.len();
+                hits.extend(runs.iter().take(room).map(|&(i, j)| DecodedString {
                     address: base_addr + i as u64,
                     method,
                     // printable ASCII: one char per byte
                     plaintext: buf[i..j].iter().map(|&b| char::from(method.decode(b))).collect(),
-                })
-                .collect()
-        };
-        let passes: Vec<usize> = (0..group.methods.len()).collect();
-        for batch in passes.chunks(rayon::current_num_threads().max(1) * 2) {
-            let per_pass: Vec<Vec<DecodedString>> = if buf.len() <= CHUNK {
-                batch.iter().map(|&q| pass_hits(q)).collect()
-            } else {
-                batch.par_iter().map(|&q| pass_hits(q)).collect()
-            };
-            for found in per_pass {
-                hits.extend(found);
-                if hits.len() > opts.max_per_section {
-                    hits.truncate(opts.max_per_section);
+                }));
+                if runs.len() > room {
                     return hits;
                 }
             }
