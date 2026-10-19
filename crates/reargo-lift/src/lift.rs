@@ -135,6 +135,30 @@ impl InsnText {
         }
     }
 
+    /// Whether the text may be that of a frame-restoring instruction (it may start with `pop `,
+    /// `ret`, `add rsp,`, `lea rsp,` or `mov rsp,`, or be `leave` / `vzeroupper`): `false` only
+    /// when the decoded instruction, or for ARM the encoding (of those, only a `pop` prints so),
+    /// says it is not, without formatting the text.
+    pub fn may_be_epilogue_text(&self) -> bool {
+        use iced_x86::Mnemonic::*;
+        match &self.src {
+            TextSource::Given => true,
+            TextSource::X86(i) => matches!(i.mnemonic(), Pop | Add | Lea | Mov | Ret | Retf | Leave | Vzeroupper),
+            TextSource::Arm { len, thumb, word, .. } => crate::arm32::may_be_pop(*word, *len, *thumb),
+        }
+    }
+
+    /// Whether the text may start with `jmp`: `false` only when the decoded instruction says it
+    /// does not (x86), or it is an ARM / Thumb instruction's (no ARM text starts so), without
+    /// formatting the text.
+    pub fn may_be_jmp_text(&self) -> bool {
+        match &self.src {
+            TextSource::Given => true,
+            TextSource::X86(i) => matches!(i.mnemonic(), iced_x86::Mnemonic::Jmp | iced_x86::Mnemonic::Jmpe),
+            TextSource::Arm { .. } => false,
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         self.cell.get_or_init(|| match &self.src {
             TextSource::Given => String::new(),
@@ -244,6 +268,32 @@ pub trait PcodeLift: Send + Sync {
     /// known: a stream of `n` lifts from `a` then starts its instructions below `a + n * max`.
     fn max_instruction_length(&self) -> Option<u32> {
         None
+    }
+
+    /// The `length` of the instruction a successful [`PcodeLift::lift_instruction_ctx`] at
+    /// `address` gives (whatever the context; its `address` is the one asked for), when it is
+    /// known without the lift: a stream of lifts from `a` then starts its instructions at the
+    /// addresses these lengths step through, as far as its lifts succeed. `None`: not known.
+    fn instruction_length(&self, _memory: &Memory, _address: u64) -> Option<u32> {
+        None
+    }
+
+    /// Extend `starts` (its last entry the start of an instruction of a stream) with the starts
+    /// of the stream's next instructions by [`PcodeLift::instruction_length`], until it holds
+    /// `len` entries or its last is above `until`. `false` when a length is not known at its
+    /// last entry (it is then not extended past it).
+    fn extend_instruction_starts(&self, memory: &Memory, starts: &mut Vec<u64>, len: usize, until: u64) -> bool {
+        while starts.len() < len {
+            let Some(&a) = starts.last() else { return false };
+            if a > until {
+                break;
+            }
+            match self.instruction_length(memory, a).filter(|&l| l > 0).and_then(|l| a.checked_add(u64::from(l))) {
+                Some(b) => starts.push(b),
+                None => return false,
+            }
+        }
+        true
     }
 
     fn lift_instruction(

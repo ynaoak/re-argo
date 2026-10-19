@@ -36,6 +36,7 @@ pub mod frame;
 pub mod index;
 pub mod inline;
 pub mod rust_emit;
+pub mod names;
 pub mod noreturn;
 pub mod optimize;
 pub mod pipeline;

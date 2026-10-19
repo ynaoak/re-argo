@@ -16,7 +16,7 @@ type Pad = (Vec<(u64, u64)>, Vec<EhAction>);
 pub type Handler = (u64, String);
 
 /// The landing pads of the function at `entry`, in address order; empty without an LSDA.
-pub fn handlers(memory: &Memory, sections: &[Section], symbols: &BTreeMap<u64, String>, entry: u64) -> Vec<Handler> {
+pub fn handlers(memory: &Memory, sections: &[Section], symbols: crate::names::Names<'_>, entry: u64) -> Vec<Handler> {
     let Some(hdr) = sections.iter().find(|s| s.name == ".eh_frame_hdr").map(|s| s.address) else {
         return Vec::new();
     };
@@ -45,7 +45,7 @@ pub fn handlers(memory: &Memory, sections: &[Section], symbols: &BTreeMap<u64, S
         .collect()
 }
 
-fn action_text(memory: &Memory, symbols: &BTreeMap<u64, String>, a: &EhAction) -> String {
+fn action_text(memory: &Memory, symbols: crate::names::Names<'_>, a: &EhAction) -> String {
     match *a {
         EhAction::Cleanup => "cleanup".into(),
         EhAction::Filter => "exception specification".into(),
@@ -61,7 +61,7 @@ fn action_text(memory: &Memory, symbols: &BTreeMap<u64, String>, a: &EhAction) -
 
 /// The C++ name of the type whose `std::type_info` is at `ti`: its symbol, or the mangled
 /// name its second word points to.
-fn type_name(memory: &Memory, symbols: &BTreeMap<u64, String>, ti: u64) -> Option<String> {
+fn type_name(memory: &Memory, symbols: crate::names::Names<'_>, ti: u64) -> Option<String> {
     if ti == 0 {
         return None;
     }

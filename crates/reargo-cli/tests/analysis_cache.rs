@@ -99,8 +99,9 @@ fn second_run_reads_the_cache_and_prints_the_same() {
     let (cold, cold_err) = export(&cache, &bin, &out, false);
     assert!(cold.contains("\"functions\""), "unexpected export output");
     assert!(!cold_err.contains(HIT), "first run cannot hit: {cold_err}");
-    let entries = std::fs::read_dir(&cache).expect("cache dir written").count();
-    assert_eq!(entries, 1, "one cache file per binary");
+    // (the analysis entries; beside them the executable's digest, once it is settled)
+    assert!(cache.is_dir(), "cache dir written");
+    assert_eq!(cache_files(&cache).len(), 1, "one cache file per binary");
 
     let (warm, warm_err) = export(&cache, &bin, &out, false);
     assert!(warm_err.contains(HIT), "second run should hit the cache: {warm_err}");
@@ -204,7 +205,7 @@ fn changed_binary_or_sidecar_never_reads_stale_results() {
     assert!(rehit_err.contains(HIT), "the new binary's results are cached in turn");
 
     // Still one file: the entry for a path is replaced, not added to.
-    assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+    assert_eq!(cache_files(&cache).len(), 1);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

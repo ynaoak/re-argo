@@ -330,7 +330,7 @@ pub struct Context<'a> {
     /// The function's own (mangled) name: its parameter types (WS92).
     pub name: Option<&'a str>,
     /// Names by address: the parameter types of the callees with a mangled name (WS92).
-    pub symbols: Option<&'a std::collections::BTreeMap<u64, String>>,
+    pub symbols: Option<crate::names::Names<'a>>,
     /// The classes the callers pass (WS93): of the parameters, the callees' results, the fields.
     pub this_index: Option<&'a crate::thisclass::ThisIndex>,
     /// The batch's index of the relocations (a lifter without `oracle`): the vtables listing a
@@ -1244,7 +1244,7 @@ impl StructView {
 /// last): the structs are numbered in the order the body first uses them.
 /// The name of the slot function `target` of a virtual call on an object of class `class`:
 /// its symbol (demangled), else `Class::method_at_<addr>`.
-pub(crate) fn method_name(symbols: &std::collections::BTreeMap<u64, String>, class: Option<&str>, target: u64) -> String {
+pub(crate) fn method_name(symbols: crate::names::Names<'_>, class: Option<&str>, target: u64) -> String {
     if let Some(s) = symbols.get(&target) {
         return demangle_symbol(s).unwrap_or_else(|| s.clone());
     }

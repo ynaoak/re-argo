@@ -11,11 +11,11 @@
 //!   analysed binary path (`<hash of the canonical path>.rac`), replaced
 //!   when the key no longer matches.
 //! * **Key**: a BLAKE3 hash over [`CACHE_FORMAT`], the crate version, the
-//!   bytes of the running `re-argo` executable (any rebuild changes it),
-//!   the binary's canonical path and its full contents, and the file the
-//!   PE header analyzers read relative to the working directory
-//!   (`./<file name>`: absent, the binary itself, or another file's
-//!   contents). The key is stored in the file and compared on load.
+//!   length and BLAKE3 digest of the running `re-argo` executable's bytes
+//!   (any rebuild changes it), the binary's canonical path and the digest
+//!   of its full contents, and the file the PE header analyzers read
+//!   relative to the working directory (`./<file name>`: absent, the
+//!   binary itself, or another file's digest). The key is stored in the file and compared on load.
 //!   The `<binary>.gra.json` override sidecar's contents are in the key
 //!   too (absent / its bytes): editing it (`annotate`, `iterate --apply`)
 //!   re-runs the pipeline once. The cache holds the results *before* the
@@ -33,6 +33,13 @@
 //!   stat means equal bytes. Otherwise (or when the pre-key differs, e.g.
 //!   after a `touch`) the full key decides, and a matching full key
 //!   stores the then-current pre-key in the file's header.
+//! * **Executable digest** (Unix): the executable is the same for every
+//!   binary, so its digest is kept in `<hash of its path>.dig` in the
+//!   cache directory with its `stat`, under the pre-key's rule (stored
+//!   only for a file whose stat did not change while it was hashed and
+//!   whose times are at least [`RACY`] older than the hashing; used only
+//!   while the stat is the same): a cache miss on a new binary does not
+//!   hash the executable again.
 //! * **Flags**: no command-line flag reaches the pipeline. `--thumb`
 //!   only selects the lifters of `disasm` / `pcode` / `decompile` / …,
 //!   which run after the analysis and are not cached.
@@ -79,7 +86,7 @@ use serde::{Deserialize, Serialize};
 /// Bump whenever the stored layout changes in a way the executable hash
 /// would not catch on its own (it always changes with the code, so this
 /// is a belt-and-braces version tag).
-pub const CACHE_FORMAT: u32 = 3;
+pub const CACHE_FORMAT: u32 = 4;
 
 /// zstd level of the stored sections.
 pub const ZSTD_LEVEL: i32 = 1;
@@ -233,8 +240,15 @@ impl Entry {
                 let mut files = Vec::new();
                 let mut h = blake3::Hasher::new();
                 field(&mut h, "kind", b"content");
+                let memo = self.file.parent().map(|d| digest_memo_path(d, &self.exe));
                 let r = derive_key(&self.path, &self.canonical, &self.exe, &mut h, &mut |h, p| {
-                    hash_file(h, p)?;
+                    // (the executable is the same for every binary: its digest is kept by its stat)
+                    let (len, digest) = match memo.as_deref().filter(|_| p == self.exe) {
+                        Some(m) => exe_digest(m, p)?,
+                        None => file_digest(p)?,
+                    };
+                    h.update(&len.to_le_bytes());
+                    h.update(&digest);
                     files.push(p.to_path_buf());
                     Ok(())
                 });
@@ -303,21 +317,84 @@ fn pre_key(path: &Path, canonical: &Path, exe: &Path) -> Option<PreKey> {
     Some(PreKey { key: *h.finalize().as_bytes(), stamps })
 }
 
-/// A file's length and bytes, into the key.
-fn hash_file(hasher: &mut blake3::Hasher, path: &Path) -> std::io::Result<()> {
+/// A file's length and the BLAKE3 hash of its bytes, for the key.
+fn file_digest(path: &Path) -> std::io::Result<(u64, [u8; 32])> {
     let len = std::fs::metadata(path)?.len();
     let data = std::fs::read(path)?;
     // A file that changed size while it was read is no stable input.
     if data.len() as u64 != len {
         return Err(std::io::Error::other("file changed while it was hashed"));
     }
-    hasher.update(&len.to_le_bytes());
+    let mut hasher = blake3::Hasher::new();
     if data.len() >= 1 << 20 {
         hasher.update_rayon(&data);
     } else {
         hasher.update(&data);
     }
-    Ok(())
+    Ok((len, *hasher.finalize().as_bytes()))
+}
+
+const DIGEST_MAGIC: &[u8; 16] = b"REARGO-EXEDIGST\0";
+const DIGEST_EXT: &str = "dig";
+/// magic | stat (56) | length u64 | digest [32] | BLAKE3 of all of it before.
+const DIGEST_LEN: usize = 16 + 56 + 8 + 32 + 32;
+
+/// Where the digest of the executable at `exe` is kept in the cache directory `dir`.
+fn digest_memo_path(dir: &Path, exe: &Path) -> PathBuf {
+    let name = blake3::hash(exe.as_os_str().as_encoded_bytes());
+    dir.join(format!("{}.{DIGEST_EXT}", &name.to_hex()[..32]))
+}
+
+/// [`file_digest`] of the executable `exe`, read from the memo file `memo` when it was stored
+/// for the stat `exe` has now: the pre-key's rule (see the module documentation) for one file —
+/// the memo is only written for a file whose stat did not change while it was hashed and whose
+/// times are at least [`RACY`] older than the hashing, so an equal stat means equal bytes.
+fn exe_digest(memo: &Path, exe: &Path) -> std::io::Result<(u64, [u8; 32])> {
+    let Ok(before) = stamp(exe) else { return file_digest(exe) };
+    if let Some(d) = read_digest_memo(memo, &before) {
+        return Ok(d);
+    }
+    let start = SystemTime::now();
+    let d = file_digest(exe)?;
+    let settled = start
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .is_ok_and(|t| before.newest_ns < t.saturating_sub(RACY).as_nanos() as i128);
+    if settled && stamp(exe).is_ok_and(|now| now == before) {
+        write_digest_memo(memo, &before, d);
+    }
+    Ok(d)
+}
+
+fn digest_memo_bytes(st: &Stamp, (len, digest): (u64, [u8; 32])) -> [u8; DIGEST_LEN] {
+    let mut b = [0u8; DIGEST_LEN];
+    b[..16].copy_from_slice(DIGEST_MAGIC);
+    b[16..72].copy_from_slice(&st.raw);
+    b[72..80].copy_from_slice(&len.to_le_bytes());
+    b[80..112].copy_from_slice(&digest);
+    let check = blake3::hash(&b[..112]);
+    b[112..].copy_from_slice(check.as_bytes());
+    b
+}
+
+/// The length and digest in the memo file `memo`, when it is intact and was stored for `st`.
+fn read_digest_memo(memo: &Path, st: &Stamp) -> Option<(u64, [u8; 32])> {
+    let b = std::fs::read(memo).ok()?;
+    if b.len() != DIGEST_LEN || &b[..16] != DIGEST_MAGIC || b[16..72] != st.raw || blake3::hash(&b[..112]).as_bytes()[..] != b[112..] {
+        return None;
+    }
+    Some((u64::from_le_bytes(b[72..80].try_into().ok()?), b[80..112].try_into().ok()?))
+}
+
+/// Store the memo (to a temporary name, renamed into place). Best effort.
+fn write_digest_memo(memo: &Path, st: &Stamp, d: (u64, [u8; 32])) {
+    let Some(dir) = memo.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = memo.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, digest_memo_bytes(st, d)).and_then(|_| std::fs::rename(&tmp, memo)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn field(hasher: &mut blake3::Hasher, tag: &str, bytes: &[u8]) {
@@ -1313,6 +1390,40 @@ mod tests {
         touch(&p);
         let m = std::fs::metadata(&p).unwrap().modified().unwrap();
         assert!(m > std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exe_digest_memo_is_used_only_for_the_same_stat() {
+        let dir = std::env::temp_dir().join(format!("reargo-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("exe");
+        std::fs::write(&exe, b"build one").unwrap();
+        let memo = digest_memo_path(&dir, &exe);
+        let real = file_digest(&exe).unwrap();
+        assert_eq!(real.0, 9);
+        // Just written: hashed, but too recent for a memo.
+        assert_eq!(exe_digest(&memo, &exe).unwrap(), real);
+        assert!(!memo.exists());
+        // A memo for the current stat stands for the bytes (a made-up digest shows it is read).
+        let fake = (9u64, [5u8; 32]);
+        write_digest_memo(&memo, &stamp(&exe).unwrap(), fake);
+        assert_eq!(exe_digest(&memo, &exe).unwrap(), fake);
+        // Damaged: ignored.
+        let mut b = std::fs::read(&memo).unwrap();
+        b[90] ^= 1;
+        std::fs::write(&memo, &b).unwrap();
+        assert_eq!(exe_digest(&memo, &exe).unwrap(), real);
+        // Rewritten (same size, the old mtime put back): another stat, the memo is not used.
+        write_digest_memo(&memo, &stamp(&exe).unwrap(), fake);
+        let mtime = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&exe, b"build two").unwrap();
+        std::fs::OpenOptions::new().append(true).open(&exe).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(exe_digest(&memo, &exe).unwrap(), file_digest(&exe).unwrap());
+        assert_ne!(file_digest(&exe).unwrap(), real);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
