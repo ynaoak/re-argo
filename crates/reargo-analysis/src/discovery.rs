@@ -111,9 +111,9 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             }
         }
 
-        // With more than one thread, the pool decodes ahead of the walk
-        // what it will read, while it walks ([`discover_parallel`]). The
-        // result is the same either way.
+        // With more than one thread, other threads decode ahead of the
+        // walk what it will read, while it walks ([`discover_parallel`]).
+        // The result is the same either way.
         let (functions_found, references_found, instructions_decoded) = if rayon::current_num_threads() > 1 {
             discover_parallel(program, work_queue)
         } else {
@@ -251,14 +251,15 @@ fn discover(
     (functions_found, references_found, instructions_decoded)
 }
 
-/// [`discover`] while the pool decodes ahead: the pool's threads take
-/// the entries the walk may reach (the seeds, the calls, the functions
-/// jumped or run into) and decode the code each one reaches
-/// ([`speculate_one`]); the walk, on this thread and in its own order,
-/// reads an instruction from those decodes when one is there, else
-/// decodes it itself — it never waits for the pool, which may be busy
-/// with other work. Decoding is a pure function of the bytes and the
+/// [`discover`] while other threads decode ahead of it: they take the
+/// entries the walk may reach (the seeds, the calls, the functions jumped
+/// or run into) and decode the code each one reaches ([`speculate_one`]);
+/// the walk, on this thread and in its own order, reads an instruction
+/// from those decodes when one is there, else decodes it itself — it never
+/// waits for them. Decoding is a pure function of the bytes and the
 /// address, so the result is the serial one, whatever the threads did.
+/// The references and the bodies' sets are made on threads too, while the
+/// walk goes on.
 fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize, usize, usize) {
     let Program { arch, info, listing, symbol_table, references: reference_manager, .. } = &mut *program;
     let shared = Shared {
@@ -278,8 +279,9 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
     let seeds: Vec<u64> =
         work_queue.iter().copied().filter(|&e| !shared.has_body.contains(&e) && shared.claims.claim(e)).collect();
     shared.queue.lock().unwrap_or_else(|e| e.into_inner()).entries.extend(seeds);
-    // (threads of their own, not the pool's: the pool may be busy with
-    // other work, and the walk never waits for these)
+    // (threads of their own, not the rayon pool's: the pool may be busy
+    // with other work — the analyzers started early — and a scope on it
+    // would wait for that)
     let helpers = rayon::current_num_threads() - 1;
     let (counts, bodies) = std::thread::scope(|s| {
         // The references found are added, and the bodies' sets made, on
@@ -400,9 +402,10 @@ const REFERENCE_BATCH: usize = 1 << 13;
 
 /// The instructions the walk reads before threads start decoding ahead
 /// of it ([`discover_parallel`]).
-const HELP_AFTER: usize = 8192;
+const HELP_AFTER: usize = 1 << 15;
 
-/// What the walk and the pool share in [`discover_parallel`].
+/// What the walk and the threads decoding ahead share in
+/// [`discover_parallel`].
 struct Shared<'a> {
     arch: &'a dyn Architecture,
     memory: &'a Memory,
@@ -437,7 +440,7 @@ struct Queue {
     collect: bool,
 }
 
-/// The code the pool decoded so far.
+/// The code decoded ahead so far.
 #[derive(Default)]
 struct Done {
     specs: Vec<Arc<Spec>>,
@@ -602,7 +605,7 @@ impl Source for Listed<'_> {
     }
 }
 
-/// The pool's decodes (else [`Listed`]): read near the one the walk read
+/// The decodes made ahead (else [`Listed`]): read near the one the walk read
 /// before, else in the code decoded from the entry at the address.
 struct Ahead<'a, 'l> {
     shared: &'a Shared<'a>,
@@ -651,8 +654,8 @@ struct Spec {
     insns: Vec<SpecInsn>,
 }
 
-/// The entries the pool has taken (to decode from), shared by its
-/// tasks: a bit per address of the executable code, else in a set.
+/// The entries the threads decoding ahead have taken (to decode from),
+/// shared by them: a bit per address of the executable code, else in a set.
 struct Claims {
     base: u64,
     bits: Vec<AtomicU64>,
@@ -690,7 +693,7 @@ impl Claims {
 }
 
 /// The instructions the flow from `entry` reaches, not entering the
-/// functions listed when the run started nor the entries the pool has
+/// functions listed when the run started nor the entries the threads have
 /// taken (another task decodes from those); the entries it reaches are
 /// added to `entries` (with whether by a call). The walk reads about
 /// these (it stops where the run walked before, which depends on the
