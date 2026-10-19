@@ -91,6 +91,45 @@ pub type RefList = smallvec::SmallVec<[Reference; 2]>;
 /// References by source (or target) address.
 pub type RefMap = BTreeMap<u64, RefList>;
 
+/// Append each of `refs` to `map`'s list at its `key`, in the order of
+/// `refs` (a stable sort by key keeps each list's order).
+fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) -> u64) {
+    if refs.is_empty() {
+        return;
+    }
+    // (sorted by key with their order, not by a stable sort through the
+    // references: their keys read once, in order)
+    let mut order: Vec<(u64, u32)> = refs.iter().enumerate().map(|(i, r)| (key(r), i as u32)).collect();
+    order.sort_unstable();
+    let groups = order.chunk_by(|a, b| a.0 == b.0);
+    let list = |g: &[(u64, u32)]| g.iter().map(|&(_, i)| refs[i as usize]).collect::<RefList>();
+    if order.len() < map.len() {
+        // (few: in address order, each lookup near the one before)
+        for g in groups {
+            map.entry(g[0].0).or_default().extend(g.iter().map(|&(_, i)| refs[i as usize]));
+        }
+        return;
+    }
+    // Many: both merged in address order into a map built in one pass.
+    let mut old = std::mem::take(map).into_iter().peekable();
+    let mut merged: Vec<(u64, RefList)> = Vec::with_capacity(old.len() + order.len());
+    for g in groups {
+        let k = g[0].0;
+        while let Some(o) = old.next_if(|(ok, _)| *ok < k) {
+            merged.push(o);
+        }
+        match old.next_if(|(ok, _)| *ok == k) {
+            Some((_, mut l)) => {
+                l.extend(g.iter().map(|&(_, i)| refs[i as usize]));
+                merged.push((k, l));
+            }
+            None => merged.push((k, list(g))),
+        }
+    }
+    merged.extend(old);
+    *map = merged.into_iter().collect();
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceManager {
     // Address-ordered so `all_refs()` yields references in the same
@@ -158,6 +197,15 @@ impl ReferenceManager {
             .entry(reference.to)
             .or_default()
             .push(reference);
+    }
+
+    /// [`Self::add`] of each of `refs`, in order — the same lists in the
+    /// same order, the same jump log — in bulk: each source and target
+    /// is looked up once, in address order.
+    pub fn add_all(&mut self, refs: &[Reference]) {
+        self.jumps.extend(refs.iter().filter(|r| r.ref_type.is_jump()).copied());
+        add_grouped(&mut self.refs_from, refs, |r| r.from);
+        add_grouped(&mut self.refs_to, refs, |r| r.to);
     }
 
     /// Add `reference` unless a reference from its source already

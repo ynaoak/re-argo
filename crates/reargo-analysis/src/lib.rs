@@ -94,3 +94,25 @@ pub mod yara_lite;
 pub use analyzer::Analyzer;
 pub use callgraph::CallGraph;
 pub use manager::AnalysisManager;
+
+/// What gives the memory the allocator holds free back to the operating
+/// system ([`set_release_free_memory`]).
+static RELEASE_FREE_MEMORY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Set the function that gives the memory the program's allocator holds
+/// free back to the operating system (with mimalloc: `mi_collect(true)`,
+/// which also takes in what threads that ended left). The analysis calls
+/// it after a phase whose threads allocated much and freed most of it:
+/// an allocator that keeps freed memory for a while (to hand it out again
+/// cheaply) would otherwise keep it through the run, where other threads
+/// may not reuse it. Unset, nothing is done.
+pub fn set_release_free_memory(release: fn()) {
+    let _ = RELEASE_FREE_MEMORY.set(release);
+}
+
+/// Call the function [`set_release_free_memory`] set.
+pub(crate) fn release_free_memory() {
+    if let Some(release) = RELEASE_FREE_MEMORY.get() {
+        release();
+    }
+}

@@ -34,7 +34,7 @@ struct DisasmText {
     // Boxed: most instructions never have their text formatted, and an
     // instruction is kept per address of the listing (a few hundred
     // thousand on a large binary): 8 bytes instead of 48 inline.
-    cell: std::sync::OnceLock<Box<(String, String)>>,
+    cell: std::sync::OnceLock<std::sync::Arc<(String, String)>>,
     /// The x86 bitness to decode `bytes` with when the text is formatted
     /// lazily; 0 when the text was given.
     #[cfg_attr(not(feature = "x86"), allow(dead_code))]
@@ -53,7 +53,7 @@ impl DecodedInstruction {
         branch_target: Option<u64>,
     ) -> Self {
         let cell = std::sync::OnceLock::new();
-        let _ = cell.set(Box::new((mnemonic, operands)));
+        let _ = cell.set(std::sync::Arc::new((mnemonic, operands)));
         Self { address, length, bytes, flow_type, branch_target, text: DisasmText { cell, lazy_x86_bitness: 0 } }
     }
 
@@ -76,9 +76,9 @@ impl DecodedInstruction {
         self.text.cell.get_or_init(|| {
             #[cfg(feature = "x86")]
             if self.text.lazy_x86_bitness != 0 {
-                return Box::new(crate::x86::format_text(&self.bytes, self.address, self.text.lazy_x86_bitness as u32));
+                return std::sync::Arc::new(crate::x86::format_text(&self.bytes, self.address, self.text.lazy_x86_bitness as u32));
             }
-            Box::new((String::new(), String::new()))
+            std::sync::Arc::new((String::new(), String::new()))
         })
     }
 
@@ -114,7 +114,7 @@ impl DecodedInstruction {
     ) -> Self {
         let cell = std::sync::OnceLock::new();
         if let Some(text) = text {
-            let _ = cell.set(Box::new(text));
+            let _ = cell.set(std::sync::Arc::new(text));
         }
         Self { address, length, bytes, flow_type, branch_target, text: DisasmText { cell, lazy_x86_bitness } }
     }
