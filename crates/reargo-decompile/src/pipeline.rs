@@ -5271,6 +5271,71 @@ mod tests {
         assert!(c.contains("return 0;") && !c.contains("return rdx;"), "{c}");
     }
 
+    /// WS99: gcc -O2's 2x-unrolled loop is entered at its header from the odd-iteration code
+    /// too (`if (odd) { …; if (done) return m; }` then the loop): the `if` joins at the loop
+    /// header, not at the shared `ret` past the loop (`goto` into the loop before).
+    #[test]
+    fn unrolled_loop_entered_from_the_odd_iteration_prints_without_goto() {
+        // gcc -O2 `int64_t h_max(const int64_t *a, long n) { if (n <= 0) return 0; int64_t m = a[0];
+        // for (long i = 1; i < n; i++) if (a[i] > m) m = a[i]; return m; }`
+        let code = [
+            0x31, 0xc0, 0x48, 0x85, 0xf6, 0x7e, 0x57, 0x48, 0x8b, 0x07, 0x48, 0x83, 0xfe, 0x01, 0x74, 0x4e, //
+            0x48, 0x8d, 0x34, 0xf7, 0x48, 0x8d, 0x57, 0x08, 0x48, 0x89, 0xf1, 0x48, 0x29, 0xd1, 0x83, 0xe1, //
+            0x08, 0x74, 0x1d, 0x48, 0x8b, 0x12, 0x48, 0x39, 0xd0, 0x48, 0x0f, 0x4c, 0xc2, 0x48, 0x8d, 0x57, //
+            0x10, 0x48, 0x39, 0xf2, 0x74, 0x29, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x48, 0x8b, 0x0a, 0x48, 0x39, 0xc8, 0x48, 0x0f, 0x4c, 0xc1, 0x48, 0x8b, 0x4a, 0x08, 0x48, 0x39, //
+            0xc8, 0x48, 0x0f, 0x4c, 0xc1, 0x48, 0x83, 0xc2, 0x10, 0x48, 0x39, 0xf2, 0x75, 0xe2, 0xc3, 0xc3,
+        ];
+        let c = c_raw(&code);
+        assert!(!c.contains("goto") && c.contains("do {") && c.contains("} while (rdx != rsi);"), "{c}");
+        // the odd iteration sits in an `if` that returns when the array is done, then the loop
+        assert!(c.find("rdx = rdi + 0x10;").unwrap() < c.find("do {").unwrap(), "{c}");
+        let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(!r.contains("goto") && !r.contains("'label_"), "{r}");
+    }
+
+    /// WS99: `movzx eax, byte [rdi]; test al, al` reads the loaded byte: `al = *(uint8_t*)rdi;`
+    /// (`eax = (uint32_t)*(uint8_t*)rdi; al = (uint8_t)eax;` before), unless the extended value
+    /// is read too.
+    #[test]
+    fn low_byte_of_a_zero_extended_load_is_the_load() {
+        // gcc -O2 `int f_count(const char *s) { int c = 0; for (int i = 0; s[i]; i++) if (s[i] == 'a') c++; return c; }`
+        let code = [
+            0x0f, 0xb6, 0x07, 0x84, 0xc0, 0x74, 0x29, 0x48, 0x83, 0xc7, 0x01, 0x31, 0xd2, 0x0f, 0x1f, 0x00, //
+            0x3c, 0x61, 0x0f, 0x94, 0xc0, 0x48, 0x83, 0xc7, 0x01, 0x0f, 0xb6, 0xc0, 0x01, 0xc2, 0x0f, 0xb6, //
+            0x47, 0xff, 0x84, 0xc0, 0x75, 0xea, 0x89, 0xd0, 0xc3, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, //
+            0x31, 0xd2, 0x89, 0xd0, 0xc3,
+        ];
+        let c = c_raw(&code);
+        assert!(!c.contains("al = (uint8_t)eax;") && c.contains("al = *(uint8_t*)rdi;") && c.contains("al = *(uint8_t*)(rdi - 1);"), "{c}");
+        let r = decompile_raw(&X86Lifter::new_64(), &make_memory(&code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        assert!(!r.contains("eax as u8") && r.contains("al = unsafe { *(rdi as *const u8) };"), "{r}");
+        // the extended value is returned too: it stays
+        // (`movzx eax, byte [rdi]; test al, al; je 1f; ret; 1: mov eax, 2; ret`)
+        let c = c_raw(&[0x0f, 0xb6, 0x07, 0x84, 0xc0, 0x74, 0x01, 0xc3, 0xb8, 0x02, 0, 0, 0, 0xc3]);
+        assert!(c.contains("eax = (uint32_t)*(uint8_t*)rdi;"), "{c}");
+    }
+
+    /// WS99: the Rust output's statements have their variables' types (it is type-checked
+    /// with rustc in the corpus run): a narrowing operation casts, a comparison into a byte
+    /// register is its byte, a low part has the view's type, a temporary read twice is declared
+    /// (in C too).
+    #[test]
+    fn rust_statements_have_their_variables_types() {
+        let rust = |code: &[u8]| decompile_raw(&X86Lifter::new_64(), &make_memory(code, 0x1000), 0x1000, "f", 100).unwrap().rust_code;
+        // lea eax, [rdi+rdi]; ret
+        let r = rust(&[0x8d, 0x04, 0x3f, 0xc3]);
+        assert!(r.contains("eax = (rdi.wrapping_add(rdi)) as u32;"), "{r}");
+        // cmp edi, esi; setl al; mov [rdx], al; ret
+        let r = rust(&[0x39, 0xf7, 0x0f, 0x9c, 0xc0, 0x88, 0x02, 0xc3]);
+        assert!(r.contains("al = ((edi as i32 as i64) < (esi as i32 as i64)) as u8;"), "{r}");
+        // movzx eax, byte [rdi+rdx-3]; movzx ecx, byte [rdi+rdx-2]; add eax, ecx; movzx ecx, byte [rdi+rdx-1]; add eax, ecx; ret
+        let code = [0x0f, 0xb6, 0x44, 0x17, 0xfd, 0x0f, 0xb6, 0x4c, 0x17, 0xfe, 0x01, 0xc8, 0x0f, 0xb6, 0x4c, 0x17, 0xff, 0x01, 0xc8, 0xc3];
+        let (c, r) = (c_raw(&code), rust(&code));
+        assert!(c.contains("uint64_t tmp_600;") && c.contains("tmp_600 = rdi + rdx;"), "{c}");
+        assert!(r.contains("let mut tmp_600: u64;") && r.contains("tmp_600 = rdi.wrapping_add(rdx);"), "{r}");
+    }
+
     /// WS98: a concatenation whose halves fill the result prints as shifts C and Rust compile
     /// (`xor eax, eax; mov ah, cl`: `ax = CONCAT(ah, 0:1);` before).
     #[test]

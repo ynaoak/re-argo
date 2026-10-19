@@ -416,11 +416,28 @@ impl<'a> RustEmitter<'a> {
                 if declared.insert(key) {
                     let type_name = match (self.structs, typed.get(&vn.data.offset)) {
                         (Some(sv), Some(&d)) if vn.data.size == 8 => cat!("*mut ", crate::structs::rust_ident(&sv.defs[d].name)),
+                        // a compare's flag (WS90) is a `bool`, as in C (WS99)
+                        _ if crate::flags::named_flag(vn.data.offset).is_some() => "bool".to_string(),
                         _ => size_to_rust_type(vn.data.size).to_string(),
                     };
                     let var_name = reg_name(vn.data.offset, vn.data.size);
                     linef!(self, "let mut {}: {};", var_name, type_name);
                 }
+            }
+        }
+        // a temporary printed as its own statement (as in C, WS99)
+        for vn in &func.varnodes {
+            if vn.data.space == SpaceId::UNIQUE
+                && vn.def_op.is_some_and(|d| {
+                    !func.ops[d].dead
+                        && !self.folded.contains(&d)
+                        && !self.noise.contains(&d)
+                        && !self.coalesced.defs.contains_key(&d)
+                        && self.emit_op(func, &func.ops[d]).is_some()
+                })
+                && declared.insert((u64::MAX - vn.data.offset, vn.data.size))
+            {
+                linef!(self, "let mut {}: {};", varnode_name(vn), size_to_rust_type(vn.data.size));
             }
         }
         // the stack slots (WS88)
@@ -678,6 +695,7 @@ impl<'a> RustEmitter<'a> {
             }
             self.emit_annotations_for(op.address);
             if let Some(line) = self.emit_op(func, op) {
+                let line = self.typed_statement(func, op, line);
                 self.line(&line);
             }
         }
@@ -719,8 +737,71 @@ impl<'a> RustEmitter<'a> {
             }
             self.emit_annotations_for(op.address);
             if let Some(line) = self.emit_op(func, op) {
+                let line = self.typed_statement(func, op, line);
                 self.line(&line);
             }
+        }
+    }
+
+    /// A statement's value as its variable's type (WS99: the Rust output type-checks): a
+    /// comparison's `bool` into a byte register (`al = (a < b) as u8;`), an operation on wider
+    /// values into a narrower register (`eax = (rdi.wrapping_add(rdi)) as u32;`, which C's
+    /// assignment truncates implicitly). Only the printed statement: an inlined or folded
+    /// right-hand side (a condition) keeps its own type.
+    fn typed_statement(&self, func: &SsaFunction, op: &crate::ssa::SsaOp, line: String) -> String {
+        let Some(out) = op.output else { return line };
+        let od = func.varnodes[out as usize].data;
+        if od.space != SpaceId::REGISTER || self.coalesced.defs.contains_key(&op.index) || crate::flags::named_flag(od.offset).is_some() {
+            return line;
+        }
+        let wide_arith = |o: &crate::ssa::SsaOp, size: u32| {
+            matches!(
+                o.opcode,
+                OpCode::IntAdd
+                    | OpCode::IntSub
+                    | OpCode::IntMult
+                    | OpCode::IntAnd
+                    | OpCode::IntOr
+                    | OpCode::IntXor
+                    | OpCode::IntLeft
+                    | OpCode::IntRight
+                    | OpCode::IntNegate
+                    | OpCode::Int2Comp
+                    | OpCode::IntDiv
+                    | OpCode::IntRem
+            ) && o.inputs.first().is_some_and(|&v| func.varnodes[v as usize].data.size > size)
+        };
+        let cast = match op.opcode {
+            _ if is_bool_op(op, &self.select_conds) => true,
+            // a copy of a wider value, or of an inlined operation on wider values
+            OpCode::Copy => op.inputs.first().is_some_and(|&v| {
+                let vn = &func.varnodes[v as usize];
+                vn.data.size > od.size
+                    || (vn.data.space == SpaceId::UNIQUE
+                        && self.inlined.borrow().contains_key(&crate::condition::value_key(func, v))
+                        && vn.def_op.is_some_and(|d| wide_arith(&func.ops[d], od.size)))
+            }),
+            OpCode::IntAdd
+            | OpCode::IntSub
+            | OpCode::IntMult
+            | OpCode::IntAnd
+            | OpCode::IntOr
+            | OpCode::IntXor
+            | OpCode::IntLeft
+            | OpCode::IntRight
+            | OpCode::IntNegate
+            | OpCode::Int2Comp
+            | OpCode::IntDiv
+            | OpCode::IntRem => wide_arith(op, od.size),
+            _ => false,
+        };
+        if !cast {
+            return line;
+        }
+        let dst = varnode_name(&func.varnodes[out as usize]);
+        match line.strip_prefix(&cat!(dst, " = ")).and_then(|r| r.strip_suffix(';')) {
+            Some(e) if !e.contains(';') => cat!(dst, " = (", crate::emit::strip_outer_parens(e), ") as ", size_to_rust_type(od.size), ";"),
+            _ => line,
         }
     }
 
@@ -878,7 +959,7 @@ impl<'a> RustEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(cat!(dst, " = ((", a, " as ", ty, ") >> ", b, ") as u64;"))
+                Some(cat!(dst, " = ((", a, " as ", ty, ") >> ", b, ") as ", size_to_rust_type(func.varnodes[op.output? as usize].data.size), ";"))
             }
             OpCode::IntDiv => {
                 let dst = out_name?;
@@ -891,7 +972,7 @@ impl<'a> RustEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(cat!(dst, " = ((", a, " as ", ty, ") / (", b, " as ", ty, ")) as u64;"))
+                Some(cat!(dst, " = ((", a, " as ", ty, ") / (", b, " as ", ty, ")) as ", size_to_rust_type(func.varnodes[op.output? as usize].data.size), ";"))
             }
             OpCode::IntRem => {
                 let dst = out_name?;
@@ -904,7 +985,7 @@ impl<'a> RustEmitter<'a> {
                 let a = self.input_expr(func, op, 0);
                 let b = self.input_expr(func, op, 1);
                 let ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(cat!(dst, " = ((", a, " as ", ty, ") % (", b, " as ", ty, ")) as u64;"))
+                Some(cat!(dst, " = ((", a, " as ", ty, ") % (", b, " as ", ty, ")) as ", size_to_rust_type(func.varnodes[op.output? as usize].data.size), ";"))
             }
             OpCode::FloatAdd => {
                 let dst = out_name?;
@@ -1112,17 +1193,19 @@ impl<'a> RustEmitter<'a> {
                 }
                 let a = self.input_expr(func, op, 0);
                 let k = &func.varnodes[op.inputs[1] as usize].data;
+                // (of the output's own type, WS99: `al = rax as u8;`, as declared)
                 let out_ty = size_to_rust_type(func.varnodes[op.output.unwrap() as usize].data.size);
                 if k.space == SpaceId::CONST {
                     let sh = k.offset * 8;
                     if sh == 0 {
-                        Some(cat!(dst, " = (", a, " as ", out_ty, ") as u64;"))
+                        let a = if crate::condition::is_atomic(&a) || method_call(&a) { a } else { cat!("(", a, ")") };
+                        Some(cat!(dst, " = ", a, " as ", out_ty, ";"))
                     } else {
-                        Some(format!("{} = (({} >> {}) as {}) as u64;", dst, a, sh, out_ty))
+                        Some(format!("{} = ({} >> {}) as {};", dst, a, sh, out_ty))
                     }
                 } else {
                     let kexpr = self.input_expr(func, op, 1);
-                    Some(cat!(dst, " = ((", a, " >> (", kexpr, " * 8)) as ", out_ty, ") as u64;"))
+                    Some(cat!(dst, " = (", a, " >> (", kexpr, " * 8)) as ", out_ty, ";"))
                 }
             }
             OpCode::IntSExt => {
@@ -1131,7 +1214,9 @@ impl<'a> RustEmitter<'a> {
                 let dst = out_name?;
                 let a = self.input_expr(func, op, 0);
                 let src_ty = size_to_rust_signed_type(func.varnodes[op.inputs[0] as usize].data.size);
-                Some(cat!(dst, " = (", a, " as ", src_ty, " as i64) as u64;"))
+                // (to the output's own type, WS99: `eax = (x as i16 as i32) as u32;`)
+                let out_size = func.varnodes[op.output? as usize].data.size;
+                Some(cat!(dst, " = (", a, " as ", src_ty, " as ", size_to_rust_signed_type(out_size), ") as ", size_to_rust_type(out_size), ";"))
             }
             OpCode::Load => {
                 let dst = out_name?;
@@ -1390,6 +1475,26 @@ impl<'a> RustEmitter<'a> {
                 || op.opcode == OpCode::Copy
                 || (matches!(op.opcode, OpCode::Call | OpCode::CallOther | OpCode::CallInd) && idx > 0);
             let block = rhs.starts_with("unsafe {") && rhs.ends_with('}') && !rhs[1..rhs.len() - 1].contains('}');
+            // a comparison's `bool` in integer arithmetic is its byte (WS99: `(a < b) as u8 | x`; an
+            // extension casts its operand itself)
+            if let Some(d) = inlined
+                && is_bool_op(&func.ops[d], &self.select_conds)
+                && matches!(
+                    op.opcode,
+                    OpCode::IntOr
+                        | OpCode::IntAnd
+                        | OpCode::IntXor
+                        | OpCode::IntAdd
+                        | OpCode::IntSub
+                        | OpCode::IntMult
+                        | OpCode::IntLeft
+                        | OpCode::IntRight
+                        | OpCode::Piece
+                        | OpCode::Store
+                )
+            {
+                return cat!("(", crate::emit::strip_outer_parens(&rhs), ") as ", size_to_rust_type(func.varnodes[op.inputs[idx] as usize].data.size));
+            }
             return if whole || block || method_call(&rhs) || crate::condition::is_atomic(&rhs) { rhs } else { cat!("(", rhs, ")") };
         }
         if let Some(e) = self.inliner.get(func, op.inputs[idx]) {
@@ -1546,6 +1651,31 @@ fn infer_signature(func: &SsaFunction) -> RustFunctionSignature {
     RustFunctionSignature {
         return_type,
         params,
+    }
+}
+
+/// Does `op` print a `bool` (a comparison, a flag of an add, `!x` / `x && y`)?
+fn is_bool_op(op: &crate::ssa::SsaOp, select_conds: &rustc_hash::FxHashMap<usize, String>) -> bool {
+    match op.opcode {
+        OpCode::IntEqual
+        | OpCode::IntNotEqual
+        | OpCode::IntLess
+        | OpCode::IntLessEqual
+        | OpCode::IntSLess
+        | OpCode::IntSLessEqual
+        | OpCode::IntCarry
+        | OpCode::IntSCarry
+        | OpCode::IntSBorrow
+        | OpCode::FloatEqual
+        | OpCode::FloatNotEqual
+        | OpCode::FloatLess
+        | OpCode::FloatLessEqual
+        | OpCode::FloatNan
+        | OpCode::BoolAnd
+        | OpCode::BoolOr => true,
+        // (a `setcc` whose condition folded prints `(…) as u8` already)
+        OpCode::BoolNegate => !select_conds.contains_key(&op.index),
+        _ => false,
     }
 }
 
