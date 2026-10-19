@@ -118,16 +118,21 @@ impl Memory {
     /// inside the range — so a per-address [`Memory::read_byte`] /
     /// [`Memory::read_bytes`] there sees exactly these bytes. `None` otherwise.
     pub fn slice(&self, offset: u64, len: u64) -> Option<&[u8]> {
-        let block = self.find_block(offset)?;
+        // (`find_block`, keeping where the blocks starting after `offset` begin)
+        let i = self.blocks.partition_point(|b| b.start <= offset);
+        let block = self.blocks.get(i.checked_sub(1)?)?;
+        if !block.contains(offset) {
+            return None;
+        }
         let data = block.data.as_ref()?;
         let start = usize::try_from(offset - block.start).ok()?;
         let end = start.checked_add(usize::try_from(len).ok()?)?;
         if end > data.len() || end as u64 > block.size {
             return None;
         }
-        // A block starting in `offset + 1 .. offset + len`.
-        let next_start = |a: u64| self.blocks.partition_point(|b| b.start < a);
-        if len > 1 && next_start(offset + 1) < next_start(offset + len) {
+        // A block starting in `offset + 1 .. offset + len`: the first one starting after
+        // `offset` (the blocks are sorted by start) does, if any.
+        if len > 1 && self.blocks.get(i).is_some_and(|b| b.start < offset + len) {
             return None;
         }
         Some(&data[start..end])
@@ -237,6 +242,20 @@ mod tests {
         assert_eq!(mem.read_byte(0x3000), Some(3));
         assert!(mem.slice(0x2000, 8).is_some());
         assert!(mem.slice(0x2000, 9).is_none());
+        // `slice` is the bytes of `find_block(offset)` when no other block starts inside the
+        // range (searched for each of its addresses here)
+        for offset in 0xff0..0x3020u64 {
+            for len in 0..24u64 {
+                let want = mem.find_block(offset).and_then(|b| {
+                    let data = b.data.as_ref()?;
+                    let start = (offset - b.start) as usize;
+                    let end = start + len as usize;
+                    let other = (offset + 1..offset + len).any(|a| mem.blocks().any(|o| o.start == a));
+                    (end <= data.len() && !other).then(|| &data[start..end])
+                });
+                assert_eq!(mem.slice(offset, len), want, "{offset:x} {len}");
+            }
+        }
         mem.add_block(block(0x2000, 0x4, 5));
         assert_eq!(mem.read_byte(0x2000), Some(5));
         assert!(mem.find_block(0x2004).is_none());
