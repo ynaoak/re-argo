@@ -568,6 +568,7 @@ dependencies = [
  "cpp_demangle",
  "goblin",
  "iced-x86",
+ "libc",
  "md-5",
  "memchr",
  "petgraph",
@@ -709,7 +710,6 @@ name = "reargo-program"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "rayon",
  "reargo-arch",
  "reargo-core",
  "reargo-lift",

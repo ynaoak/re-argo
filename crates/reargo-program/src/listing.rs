@@ -34,13 +34,30 @@ impl Listing {
         self.instructions.insert(insn.address, Box::new(insn));
     }
 
-    /// List each of `new` at its address unless one is listed there (as
-    /// [`Self::instruction_or_insert_with`] does): in bulk, fastest in
-    /// address order.
-    pub fn add_unlisted_instructions(&mut self, new: impl IntoIterator<Item = Box<DecodedInstruction>>) {
-        for i in new {
-            self.instructions.entry(i.address).or_insert(i);
+    /// List each of `new` (by its address: sorted, one per address) at its
+    /// address unless one is listed there (as
+    /// [`Self::instruction_or_insert_with`] does), in bulk: the map is
+    /// built again in one pass from both when the new ones are many.
+    pub fn add_unlisted_instructions(&mut self, new: Vec<(u64, Box<DecodedInstruction>)>) {
+        debug_assert!(new.windows(2).all(|w| w[0].0 < w[1].0));
+        if new.len() < self.instructions.len() {
+            for (a, i) in new {
+                self.instructions.entry(a).or_insert(i);
+            }
+            return;
         }
+        let old = std::mem::take(&mut self.instructions);
+        let mut merged: Vec<(u64, Box<DecodedInstruction>)> = Vec::with_capacity(old.len() + new.len());
+        let mut old = old.into_iter().peekable();
+        for (a, i) in new {
+            while let Some(o) = old.next_if(|(oa, _)| *oa < a) {
+                merged.push(o);
+            }
+            // (the listed one kept)
+            merged.push(old.next_if(|(oa, _)| *oa == a).unwrap_or((a, i)));
+        }
+        merged.extend(old);
+        self.instructions = merged.into_iter().collect();
     }
 
     /// The instruction at `address`: the one listed, else `decode()`'s,

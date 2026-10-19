@@ -96,32 +96,23 @@ pub use callgraph::CallGraph;
 pub use manager::AnalysisManager;
 
 /// What gives the memory the allocator holds free back to the operating
-/// system, on the calling thread ([`set_release_free_memory`]).
+/// system ([`set_release_free_memory`]).
 static RELEASE_FREE_MEMORY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Set the function that gives the memory the program's allocator holds
-/// free back to the operating system, on the calling thread (with
-/// mimalloc: `mi_collect(true)`). The analysis calls it on every thread
-/// after a parallel phase whose threads freed much of what they had
-/// allocated: an allocator that keeps freed memory for a while (to hand
-/// it out again cheaply) would otherwise keep it all through the run, on
-/// threads that may not allocate the same again. Unset, nothing is done.
+/// free back to the operating system (with mimalloc: `mi_collect(true)`,
+/// which also takes in what threads that ended left). The analysis calls
+/// it after a phase whose threads allocated much and freed most of it:
+/// an allocator that keeps freed memory for a while (to hand it out again
+/// cheaply) would otherwise keep it through the run, where other threads
+/// may not reuse it. Unset, nothing is done.
 pub fn set_release_free_memory(release: fn()) {
     let _ = RELEASE_FREE_MEMORY.set(release);
 }
 
-/// After a parallel phase: on every thread of the pool (each when it is
-/// done with what it is running: this does not wait) and on this one,
-/// free what the thread keeps for its next decodes and call the function
-/// [`set_release_free_memory`] set.
+/// Call the function [`set_release_free_memory`] set.
 pub(crate) fn release_free_memory() {
-    let release = RELEASE_FREE_MEMORY.get().copied();
-    let release = move || {
-        reargo_arch::arm::release_thread_decodes();
-        if let Some(release) = release {
-            release();
-        }
-    };
-    rayon::spawn_broadcast(move |_| release());
-    release();
+    if let Some(release) = RELEASE_FREE_MEMORY.get() {
+        release();
+    }
 }

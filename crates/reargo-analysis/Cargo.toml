@@ -24,3 +24,6 @@ iced-x86 = { workspace = true }
 md-5 = { workspace = true }
 goblin = { workspace = true }
 memchr = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

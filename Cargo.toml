@@ -33,6 +33,7 @@ reargo-sleigh = { path = "crates/reargo-sleigh" }
 reargo-jvm = { path = "crates/reargo-jvm" }
 goblin = "0.9"
 memmap2 = "0.9"
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 smallvec = { version = "1", features = ["union"] }
