@@ -1028,6 +1028,87 @@ mod tests {
         assert!(result.references_found > 0);
     }
 
+    /// Everything the pass leaves in the program, as text.
+    fn discovery_state(program: &Program, mark: reargo_program::reference::JumpMark) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for i in program.listing.instructions() {
+            let _ = writeln!(out, "insn {:x} {} {:?} {:?}", i.address, i.length, i.flow_type, i.branch_target);
+        }
+        for f in program.listing.functions() {
+            let _ = writeln!(out, "fn {:x} {} {:?} {:?}", f.entry_point, f.name, f.body, f.call_targets);
+        }
+        let mut targets = BTreeSet::new();
+        for r in program.references.all_refs() {
+            let _ = writeln!(out, "ref {:?}", r);
+            targets.insert(r.to);
+        }
+        for t in targets {
+            let _ = writeln!(out, "to {:x} {:?}", t, program.references.get_refs_to(t));
+        }
+        let _ = writeln!(out, "jumps {:?}", program.references.jumps_since(mark));
+        out
+    }
+
+    /// Discovery with threads decoding ahead (a walk long enough for them
+    /// to start, functions jumping into each other and sharing code) gives
+    /// what it gives on one thread.
+    #[test]
+    fn parallel_discovery_matches_serial() {
+        // Function k at 64 * k: 40 nops, then a call to function k + 1
+        // and a ret, a jump into the middle of function k + 3 (every 7th),
+        // or a conditional jump back into function k - 1 then a ret
+        // (every 5th); 2200 functions, ~95k instructions.
+        let count = 2200u64;
+        let base = 0x10000u64;
+        let mut code = vec![0xccu8; (count * 64) as usize];
+        for k in 0..count {
+            let at = (k * 64) as usize;
+            code[at..at + 40].fill(0x90);
+            let mut p = at + 40;
+            let rel = |from: usize, to: u64| ((to as i64) - (base as i64 + from as i64)) as i32;
+            if k + 1 < count {
+                // call rel32
+                let r = rel(p + 5, base + (k + 1) * 64);
+                code[p] = 0xe8;
+                code[p + 1..p + 5].copy_from_slice(&r.to_le_bytes());
+                p += 5;
+            }
+            if k % 7 == 3 && k + 3 < count {
+                // jmp rel32 into the middle of function k + 3
+                let r = rel(p + 5, base + (k + 3) * 64 + 20);
+                code[p] = 0xe9;
+                code[p + 1..p + 5].copy_from_slice(&r.to_le_bytes());
+            } else if k % 5 == 2 && k > 0 {
+                // jne rel32 into function k - 1, then ret
+                let r = rel(p + 6, base + (k - 1) * 64 + 10);
+                code[p] = 0x0f;
+                code[p + 1] = 0x85;
+                code[p + 2..p + 6].copy_from_slice(&r.to_le_bytes());
+                code[p + 6] = 0xc3;
+            } else {
+                code[p] = 0xc3;
+            }
+        }
+        let run = |threads: usize| {
+            let mut program = make_x86_64_program(&code, base);
+            let mark = program.references.jump_mark();
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let result = pool.install(|| FunctionDiscoveryAnalyzer.analyze(&mut program)).unwrap();
+            assert!(result.instructions_decoded > HELP_AFTER, "{}", result.instructions_decoded);
+            (discovery_state(&program, mark), result.functions_found, result.references_found, result.instructions_decoded)
+        };
+        let serial = run(1);
+        for threads in [2, 4] {
+            let parallel = run(threads);
+            assert_eq!((serial.1, serial.2, serial.3), (parallel.1, parallel.2, parallel.3));
+            assert_eq!(serial.0.len(), parallel.0.len());
+            if let Some((a, b)) = serial.0.lines().zip(parallel.0.lines()).find(|(a, b)| a != b) {
+                panic!("{threads} threads: {a} != {b}");
+            }
+        }
+    }
+
     #[test]
     fn empty_program_no_crash() {
         let code = [0x00u8; 0]; // empty
