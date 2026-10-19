@@ -94,42 +94,23 @@ pub type RefMap = BTreeMap<u64, RefList>;
 /// Append each of `refs` to `map`'s list at its `key`, in the order of
 /// `refs` (a stable sort by key keeps each list's order).
 fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) -> u64 + Sync) {
-    let mut sorted = refs.to_vec();
-    if sorted.len() >= 1 << 14 {
+    if refs.is_empty() {
+        return;
+    }
+    // (the references' indices sorted, not copies of them)
+    let mut order: Vec<u32> = (0..refs.len() as u32).collect();
+    let key_of = |&i: &u32| key(&refs[i as usize]);
+    if order.len() >= 1 << 14 {
         use rayon::slice::ParallelSliceMut;
-        sorted.par_sort_by_key(&key);
+        order.par_sort_by_key(key_of);
     } else {
-        sorted.sort_by_key(&key);
+        order.sort_by_key(key_of);
     }
-    let mut groups = sorted.chunk_by(|a, b| key(a) == key(b)).peekable();
-    if groups.peek().is_none() {
-        return;
+    // (in address order: each lookup near the one before)
+    for g in order.chunk_by(|a, b| key_of(a) == key_of(b)) {
+        let list = map.entry(key_of(&g[0])).or_default();
+        list.extend(g.iter().map(|&i| refs[i as usize]));
     }
-    if sorted.len() < map.len() / 8 {
-        for g in groups {
-            map.entry(key(&g[0])).or_default().extend_from_slice(g);
-        }
-        return;
-    }
-    // Many: both merged in address order into a new map, built in one pass.
-    let old = std::mem::take(map).into_iter();
-    let mut merged: Vec<(u64, RefList)> = Vec::with_capacity(old.len() + sorted.len());
-    let mut old = old.peekable();
-    for g in groups {
-        let k = key(&g[0]);
-        while let Some(o) = old.next_if(|(ok, _)| *ok < k) {
-            merged.push(o);
-        }
-        match old.next_if(|(ok, _)| *ok == k) {
-            Some((_, mut list)) => {
-                list.extend_from_slice(g);
-                merged.push((k, list));
-            }
-            None => merged.push((k, RefList::from_slice(g))),
-        }
-    }
-    merged.extend(old);
-    *map = merged.into_iter().collect();
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

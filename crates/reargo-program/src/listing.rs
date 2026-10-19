@@ -40,14 +40,10 @@ impl Listing {
     pub fn add_new_instructions(&mut self, new: Vec<(u64, Box<DecodedInstruction>)>) {
         debug_assert!(new.windows(2).all(|w| w[0].0 < w[1].0));
         debug_assert!(new.iter().all(|(a, i)| *a == i.address && !self.instructions.contains_key(a)));
-        // (merging two maps rebuilds both: worth it when the new ones are not few)
-        if new.len() >= self.instructions.len() / 16 {
-            let mut more: InstructionMap = new.into_iter().collect();
-            self.instructions.append(&mut more);
-        } else {
-            for (a, i) in new {
-                self.instructions.insert(a, i);
-            }
+        // (in address order: each insertion near the one before; no
+        // second copy of them, as building a map from them would make)
+        for (a, i) in new {
+            self.instructions.insert(a, i);
         }
     }
 

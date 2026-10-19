@@ -136,8 +136,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
 #[derive(Default)]
 struct Found {
     references: Vec<Reference>,
-    /// The body ranges of each function walked (one per instruction).
-    bodies: Vec<(u64, Vec<AddressRange>)>,
+    bodies: Vec<(u64, Body)>,
 }
 
 impl Found {
@@ -149,9 +148,8 @@ impl Found {
         rayon::join(
             || refs.add_all(&references),
             || {
-                // (each body's ranges made a set: re-walked block starts repeat)
                 let bodies: Vec<(u64, AddressSet)> =
-                    bodies.into_par_iter().map(|(entry, body)| (entry, body.into_iter().collect())).collect();
+                    bodies.into_par_iter().map(|(entry, body)| (entry, body.into_set())).collect();
                 for (entry, body) in bodies {
                     if let Some(f) = listing.get_function_mut(entry) {
                         f.body = body;
@@ -271,29 +269,42 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 let mut local = ReplayState::default();
                 let mut visited = Visited::default();
                 let mut references = Vec::new();
-                let mut checked = Vec::new();
-                let walk = disassemble_function(
+                let mut walked = Vec::new();
+                let mut walk = disassemble_function(
                     spec.entry,
                     &mut visited,
                     &mut Replay { program, specs, by_entry, state: &mut local },
                     &mut references,
-                    Some(&mut checked),
+                    Some(&mut walked),
                 )
                 .ok()?;
-                // (one that needed a decode not made ahead is walked again)
-                local.fresh.is_empty().then_some(Ahead { walk, references, checked })
+                // (one that needed a decode not made ahead is walked again,
+                // and one with an address [`START`] would mark)
+                if !local.fresh.is_empty()
+                    || matches!(&walk.body, Body::Ranges(r) if r.iter().any(|r| r.start.offset & START != 0))
+                {
+                    return None;
+                }
+                walk.body = Body::Set(std::mem::replace(&mut walk.body, Body::Set(AddressSet::new())).into_set());
+                walked.shrink_to_fit();
+                references.shrink_to_fit();
+                Some(Ahead { walk, references, walked })
             })
             .collect()
     };
     let mut ahead = ahead;
-    let mut found = Found::default();
+    // (sized for the walks ahead: one allocation)
+    let mut found = Found {
+        references: Vec::with_capacity(ahead.iter().flatten().map(|a| a.references.len()).sum::<usize>() * 9 / 8),
+        bodies: Vec::with_capacity(specs.len()),
+    };
     let mut visited = Visited::default();
     let counts = discover(program, work_queue, &mut visited, &mut found, |program, entry, visited, references| {
         if let Some(a) = by_entry.get(&entry).and_then(|&i| ahead[i as usize].take())
-            && !a.checked.iter().any(|&addr| visited.contains(addr))
+            && !a.walked.iter().any(|&addr| addr & START == 0 && visited.contains(addr))
         {
-            for r in &a.walk.body {
-                visited.insert(r.start.offset);
+            for &addr in &a.walked {
+                visited.insert(addr & !START);
             }
             references.extend_from_slice(&a.references);
             return Ok(a.walk);
@@ -330,8 +341,8 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
 struct Ahead {
     walk: FunctionDiscovery,
     references: Vec<Reference>,
-    /// The addresses the walk checked were not visited (and walked).
-    checked: Vec<u64>,
+    /// The addresses of the instructions walked ([`disassemble_function`]).
+    walked: Vec<u64>,
 }
 
 /// The instruction addresses a discovery run visited: a bit per
@@ -362,14 +373,14 @@ impl Visited {
 /// What the walk reads of an instruction.
 #[derive(Clone, Copy)]
 struct Facts {
-    length: u64,
+    length: u32,
     flow: FlowType,
     branch_target: Option<u64>,
 }
 
 impl Facts {
     fn of(insn: &DecodedInstruction) -> Self {
-        Self { length: insn.length as u64, flow: insn.flow_type, branch_target: insn.branch_target }
+        Self { length: insn.length, flow: insn.flow_type, branch_target: insn.branch_target }
     }
 }
 
@@ -591,7 +602,7 @@ fn speculate_one(
                 },
             };
             insns.push(SpecInsn { addr, facts, dec });
-            let next = addr + facts.length;
+            let next = addr + u64::from(facts.length);
             match facts.flow {
                 FlowType::Call => {
                     if let Some(target) = facts.branch_target {
@@ -617,24 +628,45 @@ fn speculate_one(
     Spec { entry, insns }
 }
 
+/// A function's body: the ranges of the instructions walked (one per
+/// instruction), or their set.
+enum Body {
+    Ranges(Vec<AddressRange>),
+    Set(AddressSet),
+}
+
+impl Body {
+    fn into_set(self) -> AddressSet {
+        match self {
+            // (re-walked block starts repeat)
+            Body::Ranges(ranges) => ranges.into_iter().collect(),
+            Body::Set(set) => set,
+        }
+    }
+}
+
+/// Marks the first instruction of a block in a walk's `walked` list (no
+/// address has the top bit).
+const START: u64 = 1 << 63;
+
 struct FunctionDiscovery {
-    /// The body's ranges, one per instruction walked.
-    body: Vec<AddressRange>,
+    body: Body,
     call_targets: BTreeSet<u64>,
     reference_count: usize,
     instruction_count: usize,
 }
 
 /// Walk the function at `entry`, reading instructions from `source`,
-/// adding its references to `references` (and to `checked` the
-/// addresses it checked were not visited); stops at code an earlier walk
-/// of the run visited (`global_visited`).
+/// adding its references to `references` (and to `walked` the addresses
+/// of the instructions walked, [`START`] marking a block's first: the
+/// others are the ones checked were not visited); stops at code an
+/// earlier walk of the run visited (`global_visited`).
 fn disassemble_function<S: Source>(
     entry: u64,
     global_visited: &mut Visited,
     source: &mut S,
     references: &mut Vec<Reference>,
-    mut checked: Option<&mut Vec<u64>>,
+    mut walked: Option<&mut Vec<u64>>,
 ) -> Result<FunctionDiscovery, AnalysisError> {
     let mut block_queue: VecDeque<(u64, S::Hint)> = VecDeque::new();
     let mut block_visited: FxHashSet<u64> = FxHashSet::default();
@@ -655,21 +687,19 @@ fn disassemble_function<S: Source>(
         let max_insns = 10_000;
 
         for _ in 0..max_insns {
-            if addr != block_start {
-                if global_visited.contains(addr) {
-                    break;
-                }
-                if let Some(checked) = checked.as_deref_mut() {
-                    checked.push(addr);
-                }
+            if global_visited.contains(addr) && addr != block_start {
+                break;
             }
 
             let Some(insn) = source.fetch(addr, &mut hint) else {
                 break;
             };
+            if let Some(walked) = walked.as_deref_mut() {
+                walked.push(if addr == block_start { addr | START } else { addr });
+            }
 
             let insn_addr = addr;
-            let insn_len = insn.length;
+            let insn_len = u64::from(insn.length);
             let flow = insn.flow;
             let branch_target = insn.branch_target;
 
@@ -761,7 +791,7 @@ fn disassemble_function<S: Source>(
     }
 
     Ok(FunctionDiscovery {
-        body,
+        body: Body::Ranges(body),
         call_targets,
         reference_count: references.len() - references_before,
         instruction_count,
