@@ -298,7 +298,8 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         });
         // (the threads decoding ahead start once the walk has read enough
         // for them to be worth it: a short one is done before they would be)
-        let mut decoding = Vec::new();
+        let mut decoding = 0;
+        let (read_out, read_in) = std::sync::mpsc::channel();
         // (should the walk panic: the threads let go, not waited for forever)
         let _release = ReleaseOnDrop(shared);
         let mut walked = 0;
@@ -314,8 +315,12 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 let _ = bodies_out.send((entry, body));
             },
             |listing, entry, visited, references| {
-                if decoding.is_empty() && walked >= HELP_AFTER {
-                    decoding.extend((0..helpers).map(|_| s.spawn(|| speculate_loop(shared))));
+                if decoding == 0 && walked >= HELP_AFTER {
+                    decoding = helpers;
+                    for _ in 0..helpers {
+                        let read_out = read_out.clone();
+                        s.spawn(move || speculate_loop(shared, read_out));
+                    }
                 }
                 if references.len() >= REFERENCE_BATCH {
                     let _ = references_out.send(std::mem::take(references));
@@ -347,9 +352,10 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         // their code now) each gives the decodes the walk read, to list.
         drop(std::mem::take(&mut *shared.done.write().unwrap_or_else(|e| e.into_inner())));
         shared.release();
+        drop(read_out);
         let mut decodes: Vec<(u64, Box<DecodedInstruction>)> = Vec::new();
-        for thread in decoding {
-            decodes.extend(thread.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+        for read in read_in.iter().take(decoding) {
+            decodes.extend(read);
         }
         // (each sorted: one run per thread)
         decodes.sort_by_key(|d| d.0);
@@ -443,7 +449,7 @@ struct Done {
 /// reachable from it ([`speculate_one`]), make it the walk's to read,
 /// take the entries it reaches; until the walk is done or there is
 /// nothing left.
-fn speculate_loop(shared: &Shared) -> Vec<(u64, Box<DecodedInstruction>)> {
+fn speculate_loop(shared: &Shared, read_out: std::sync::mpsc::Sender<Vec<(u64, Box<DecodedInstruction>)>>) {
     let mut entries = Vec::new();
     // the code this thread decoded
     let mut own: Vec<Arc<Spec>> = Vec::new();
@@ -496,12 +502,14 @@ fn speculate_loop(shared: &Shared) -> Vec<(u64, Box<DecodedInstruction>)> {
     }
     let visited = shared.visited.read().unwrap_or_else(|e| e.into_inner());
     let mut read = Vec::new();
+    let mut rest = Vec::with_capacity(own.len());
     for spec in own {
         match Arc::try_unwrap(spec) {
             Ok(mut spec) => {
                 read.extend(
                     spec.insns.iter_mut().filter(|d| visited.contains(d.addr)).filter_map(|d| Some((d.addr, d.dec.take()?))),
                 );
+                rest.push(spec);
             }
             // (were one still held: its decodes copied)
             Err(spec) => read.extend(
@@ -511,8 +519,10 @@ fn speculate_loop(shared: &Shared) -> Vec<(u64, Box<DecodedInstruction>)> {
     }
     drop(visited);
     read.sort_unstable_by_key(|d| d.0);
+    let _ = read_out.send(read);
+    // (while the walk lists them)
+    drop(rest);
     crate::release_free_memory();
-    read
 }
 
 /// The instruction addresses a discovery run visited: a bit per
