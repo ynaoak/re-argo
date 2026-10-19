@@ -8,6 +8,7 @@ use reargo_program::symbol::SymbolType;
 use reargo_program::Program;
 use reargo_program::listing::Listing;
 use reargo_program::symbol::SymbolTable;
+use reargo_program::reference::ReferenceManager;
 use reargo_arch::Architecture;
 use reargo_loader::memory::Memory;
 
@@ -251,112 +252,137 @@ fn discover(
     (functions_found, references_found, instructions_decoded)
 }
 
-/// [`discover`] while other threads decode ahead of it: they take the
-/// entries the walk may reach (the seeds, the calls, the functions jumped
-/// or run into) and decode the code each one reaches ([`speculate_one`]);
-/// the walk, on this thread and in its own order, reads an instruction
-/// from those decodes when one is there, else decodes it itself — it never
-/// waits for them. Decoding is a pure function of the bytes and the
-/// address, so the result is the serial one, whatever the threads did.
-/// The references and the bodies' sets are made on threads too, while the
-/// walk goes on.
+/// [`discover`] while other threads decode ahead of it: once the walk
+/// has read [`HELP_AFTER`] instructions (a shorter one is done before
+/// they would help), they take the entries the walk may reach (the calls
+/// found, the functions jumped or run into) and decode the code each one
+/// reaches ([`speculate_one`]); the walk, on this thread and in its own
+/// order, reads an instruction from those decodes when one is there, else
+/// decodes it itself — it never waits for them. Decoding is a pure
+/// function of the bytes and the address, so the result is the serial
+/// one, whatever the threads did. From then on the references and the
+/// bodies' sets are made on threads too, while the walk goes on.
 fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize, usize, usize) {
     let Program { arch, info, listing, symbol_table, references: reference_manager, .. } = &mut *program;
-    let shared = Shared {
-        arch: &**arch,
-        memory: &info.memory,
-        listed: listing.functions().map(|f| f.entry_point).collect(),
-        has_body: listing.functions().filter(|f| !f.body.is_empty()).map(|f| f.entry_point).collect(),
-        claims: Claims::new(&info.memory),
-        walking: Claims::new(&info.memory),
-        stop: AtomicBool::new(false),
-        visited: RwLock::new(Visited::default()),
-        queue: Mutex::new(Queue::default()),
-        wake: Condvar::new(),
-        done: RwLock::new(Done::default()),
-    };
-    let shared = &shared;
-    let seeds: Vec<u64> =
-        work_queue.iter().copied().filter(|&e| !shared.has_body.contains(&e) && shared.claims.claim(e)).collect();
-    shared.queue.lock().unwrap_or_else(|e| e.into_inner()).entries.extend(seeds);
+    let (arch, memory) = (&**arch, &info.memory);
     // (threads of their own, not the rayon pool's: the pool may be busy
     // with other work — the analyzers started early — and a scope on it
     // would wait for that)
     let helpers = rayon::current_num_threads() - 1;
+    let shared: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+    let visited_lock = RwLock::new(Visited::default());
+    let (shared, visited_lock) = (&shared, &visited_lock);
+    let mut reference_manager = Some(reference_manager);
     let (counts, bodies) = std::thread::scope(|s| {
-        // The references found are added, and the bodies' sets made, on
-        // threads of their own while the walk goes on (the walk reads
-        // neither; the references in the order found).
-        let (references_out, references_in) = std::sync::mpsc::channel::<Vec<Reference>>();
-        let adding = s.spawn(move || {
-            for batch in references_in {
-                reference_manager.add_all(&batch);
-            }
-        });
-        let (bodies_out, bodies_in) = std::sync::mpsc::channel::<(u64, Vec<AddressRange>)>();
-        let sets = s.spawn(move || {
-            // (re-walked block starts repeat)
-            bodies_in.into_iter().map(|(entry, body)| (entry, body.into_iter().collect::<AddressSet>())).collect::<Vec<_>>()
-        });
-        // (the threads decoding ahead start once the walk has read enough
-        // for them to be worth it: a short one is done before they would be)
-        let mut decoding = 0;
-        let (read_out, read_in) = std::sync::mpsc::channel();
+        // what the walk found that is not handed to a thread yet
+        let mut references = Vec::new();
+        let mut bodies: Vec<(u64, Vec<AddressRange>)> = Vec::new();
+        // the entries the walk may reach, for the threads to start with
+        let mut calls: Vec<u64> = Vec::new();
+        let mut walked = 0;
+        // once the threads are started: the ways to them
+        // (shared by the two hooks below: a cell)
+        let started: std::cell::RefCell<Option<Started>> = std::cell::RefCell::new(None);
         // (should the walk panic: the threads let go, not waited for forever)
         let _release = ReleaseOnDrop(shared);
-        let mut walked = 0;
-        let mut references = Vec::new();
-        let mut visited = shared.visited.write().unwrap_or_else(|e| e.into_inner());
+        let mut walk_visited = visited_lock.write().unwrap_or_else(|e| e.into_inner());
         let counts = discover(
             listing,
             symbol_table,
             work_queue,
-            &mut visited,
+            &mut walk_visited,
             &mut references,
             |entry, body| {
-                let _ = bodies_out.send((entry, body));
+                bodies.push((entry, body));
+                if let Some(started) = &*started.borrow()
+                    && bodies.len() >= BODY_BATCH
+                {
+                    let _ = started.bodies.send(std::mem::take(&mut bodies));
+                }
             },
             |listing, entry, visited, references| {
-                if decoding == 0 && walked >= HELP_AFTER {
-                    decoding = helpers;
-                    for _ in 0..helpers {
-                        let read_out = read_out.clone();
-                        s.spawn(move || speculate_loop(shared, read_out));
+                if started.borrow().is_none() && walked >= HELP_AFTER {
+                    let shared = shared.get_or_init(|| Shared {
+                        arch,
+                        memory,
+                        listed: listing.functions().map(|f| f.entry_point).collect(),
+                        has_body: listing.functions().filter(|f| !f.body.is_empty()).map(|f| f.entry_point).collect(),
+                        claims: Claims::new(memory),
+                        walking: Claims::new(memory),
+                        stop: AtomicBool::new(false),
+                        queue: Mutex::new(Queue::default()),
+                        wake: Condvar::new(),
+                        done: RwLock::new(Done::default()),
+                    });
+                    let entries: Vec<u64> = calls
+                        .drain(..)
+                        .filter(|&e| !visited.contains(e) && !shared.has_body.contains(&e) && shared.claims.claim(e))
+                        .collect();
+                    shared.queue.lock().unwrap_or_else(|e| e.into_inner()).entries.extend(entries);
+                    if let Some(reference_manager) = reference_manager.take() {
+                        *started.borrow_mut() = Some(Started::start(s, shared, visited_lock, helpers, reference_manager));
                     }
                 }
-                if references.len() >= REFERENCE_BATCH {
-                    let _ = references_out.send(std::mem::take(references));
+                let is_started = started.borrow().is_some();
+                if let Some(started) = &*started.borrow()
+                    && references.len() >= REFERENCE_BATCH
+                {
+                    let _ = started.references.send(std::mem::take(references));
                 }
-                shared.walking.claim(entry);
-                let result = disassemble_function(entry, visited, &mut Ahead { shared, listing }, references);
+                let result = match shared.get().filter(|_| is_started) {
+                    Some(shared) => {
+                        shared.walking.claim(entry);
+                        disassemble_function(entry, visited, &mut Ahead { shared, listing }, references)
+                    }
+                    // (before the threads start there is nothing decoded ahead)
+                    None => disassemble_function(entry, visited, &mut Listed { arch, memory, listing }, references),
+                };
                 if let Ok(d) = &result {
                     walked += d.instruction_count;
-                    // (the calls it makes: entries for the threads too)
-                    let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-                    let before = queue.entries.len();
-                    for &target in &d.call_targets {
-                        if !shared.has_body.contains(&target) && shared.claims.claim(target) {
-                            queue.entries.push_back(target);
+                    match shared.get().filter(|_| is_started) {
+                        Some(shared) => {
+                            // (the calls it makes: entries for the threads too)
+                            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                            let before = queue.entries.len();
+                            for &target in &d.call_targets {
+                                if !shared.has_body.contains(&target) && shared.claims.claim(target) {
+                                    queue.entries.push_back(target);
+                                }
+                            }
+                            if queue.entries.len() > before {
+                                drop(queue);
+                                shared.wake.notify_one();
+                            }
                         }
-                    }
-                    if queue.entries.len() > before {
-                        drop(queue);
-                        shared.wake.notify_one();
+                        None => calls.extend(&d.call_targets),
                     }
                 }
                 result
             },
         );
-        drop(visited);
-        let _ = references_out.send(references);
-        drop((references_out, bodies_out));
+        drop(walk_visited);
+        let Some(started) = started.into_inner() else {
+            // (a short walk: all on this thread)
+            if let Some(reference_manager) = reference_manager.take() {
+                reference_manager.add_all(&references);
+            }
+            let bodies = bodies.into_iter().map(|(entry, body)| (entry, body.into_iter().collect::<AddressSet>())).collect();
+            return (counts, bodies);
+        };
+        let _ = started.references.send(references);
+        let _ = started.bodies.send(bodies);
+        let Started { references, bodies, adding, sets, read, decoding } = started;
+        drop((references, bodies));
         // The decoding threads: stopped, then (the walk holding none of
         // their code now) each gives the decodes the walk read, to list.
-        drop(std::mem::take(&mut *shared.done.write().unwrap_or_else(|e| e.into_inner())));
-        shared.release();
-        drop(read_out);
+        if let Some(shared) = shared.get() {
+            drop(std::mem::take(&mut *shared.done.write().unwrap_or_else(|e| e.into_inner())));
+        }
+        if let Some(shared) = shared.get() {
+            shared.release();
+        }
         let mut decodes: Vec<(u64, Box<DecodedInstruction>)> = Vec::new();
-        for read in read_in.iter().take(decoding) {
+        for read in read.iter().take(decoding) {
             decodes.extend(read);
         }
         // (each sorted: one run per thread)
@@ -377,6 +403,53 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
     counts
 }
 
+/// The threads [`discover_parallel`] started, and the ways to them.
+struct Started<'scope> {
+    references: std::sync::mpsc::Sender<Vec<Reference>>,
+    bodies: std::sync::mpsc::Sender<Vec<(u64, Vec<AddressRange>)>>,
+    adding: std::thread::ScopedJoinHandle<'scope, ()>,
+    sets: std::thread::ScopedJoinHandle<'scope, Vec<(u64, AddressSet)>>,
+    /// What each decoding thread gives back: the decodes the walk read.
+    read: std::sync::mpsc::Receiver<Vec<(u64, Box<DecodedInstruction>)>>,
+    decoding: usize,
+}
+
+impl<'scope> Started<'scope> {
+    /// Start the threads: `helpers` decoding ahead (reading the walk's
+    /// `visited` once it is done), one adding the references to
+    /// `reference_manager`, one making the bodies' sets.
+    fn start<'env>(
+        s: &'scope std::thread::Scope<'scope, 'env>,
+        shared: &'env Shared<'env>,
+        visited: &'env RwLock<Visited>,
+        helpers: usize,
+        reference_manager: &'env mut ReferenceManager,
+    ) -> Self {
+        // (the references in the order found)
+        let (references, references_in) = std::sync::mpsc::channel::<Vec<Reference>>();
+        let adding = s.spawn(move || {
+            for batch in references_in {
+                reference_manager.add_all(&batch);
+            }
+        });
+        let (bodies, bodies_in) = std::sync::mpsc::channel::<Vec<(u64, Vec<AddressRange>)>>();
+        let sets = s.spawn(move || {
+            // (re-walked block starts repeat)
+            bodies_in
+                .into_iter()
+                .flatten()
+                .map(|(entry, body)| (entry, body.into_iter().collect::<AddressSet>()))
+                .collect::<Vec<_>>()
+        });
+        let (read_out, read) = std::sync::mpsc::channel();
+        for _ in 0..helpers {
+            let read_out = read_out.clone();
+            s.spawn(move || speculate_loop(shared, visited, read_out));
+        }
+        Self { references, bodies, adding, sets, read, decoding: helpers }
+    }
+}
+
 impl Shared<'_> {
     /// Stop the threads decoding ahead and have them give what the walk
     /// read.
@@ -387,12 +460,14 @@ impl Shared<'_> {
     }
 }
 
-/// [`Shared::release`] when dropped.
-struct ReleaseOnDrop<'a>(&'a Shared<'a>);
+/// [`Shared::release`] when dropped (once made).
+struct ReleaseOnDrop<'a>(&'a std::sync::OnceLock<Shared<'a>>);
 
 impl Drop for ReleaseOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.release();
+        if let Some(shared) = self.0.get() {
+            shared.release();
+        }
     }
 }
 
@@ -400,16 +475,20 @@ impl Drop for ReleaseOnDrop<'_> {
 /// [`discover_parallel`].
 const REFERENCE_BATCH: usize = 1 << 13;
 
+/// The bodies the walk gathers before their sets are made, in
+/// [`discover_parallel`].
+const BODY_BATCH: usize = 256;
+
 /// The instructions the walk reads before threads start decoding ahead
 /// of it ([`discover_parallel`]).
-const HELP_AFTER: usize = 1 << 15;
+const HELP_AFTER: usize = 1 << 16;
 
 /// What the walk and the threads decoding ahead share in
 /// [`discover_parallel`].
 struct Shared<'a> {
     arch: &'a dyn Architecture,
     memory: &'a Memory,
-    /// The entries of the functions listed when the run started.
+    /// The entries of the functions listed when the threads started.
     listed: FxHashSet<u64>,
     /// The ones of them with a body: the walk never enters one as a
     /// function (only as another's code).
@@ -420,8 +499,6 @@ struct Shared<'a> {
     /// Set when the walk is done: what the threads have not decoded yet,
     /// they leave.
     stop: AtomicBool,
-    /// The walk's (its own while it runs).
-    visited: RwLock<Visited>,
     /// The entries taken, not decoded yet.
     queue: Mutex<Queue>,
     /// Signalled when `queue` gains entries, or its last busy thread is
@@ -452,7 +529,11 @@ struct Done {
 /// reachable from it ([`speculate_one`]), make it the walk's to read,
 /// take the entries it reaches; until the walk is done or there is
 /// nothing left.
-fn speculate_loop(shared: &Shared, read_out: std::sync::mpsc::Sender<Vec<(u64, Box<DecodedInstruction>)>>) {
+fn speculate_loop(
+    shared: &Shared,
+    visited: &RwLock<Visited>,
+    read_out: std::sync::mpsc::Sender<Vec<(u64, Box<DecodedInstruction>)>>,
+) {
     let mut entries = Vec::new();
     // the code this thread decoded
     let mut own: Vec<Arc<Spec>> = Vec::new();
@@ -503,7 +584,7 @@ fn speculate_loop(shared: &Shared, read_out: std::sync::mpsc::Sender<Vec<(u64, B
             queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
         }
     }
-    let visited = shared.visited.read().unwrap_or_else(|e| e.into_inner());
+    let visited = visited.read().unwrap_or_else(|e| e.into_inner());
     let mut read = Vec::new();
     let mut rest = Vec::with_capacity(own.len());
     for spec in own {
@@ -655,45 +736,56 @@ struct Spec {
 }
 
 /// The entries the threads decoding ahead have taken (to decode from),
-/// shared by them: a bit per address of the executable code, else in a set.
+/// shared by them: a bit per address of the executable code, in pages
+/// made on first use (else in a set).
 struct Claims {
     base: u64,
-    bits: Vec<AtomicU64>,
+    pages: Vec<std::sync::OnceLock<Box<[AtomicU64; CLAIM_PAGE / 64]>>>,
     others: Mutex<FxHashSet<u64>>,
 }
+
+/// Addresses per page of [`Claims`].
+const CLAIM_PAGE: usize = 1 << 14;
 
 impl Claims {
     fn new(memory: &Memory) -> Self {
         let exec = memory.blocks().filter(|b| b.flags.contains(MemoryFlags::EXECUTE));
         let (lo, hi) = exec.fold((u64::MAX, 0), |(lo, hi), b| (lo.min(b.start), hi.max(b.start.saturating_add(b.size))));
-        // (up to 64 MiB of code: 8 MiB of bits at most)
-        let span = if lo < hi && hi - lo <= 1 << 26 { hi - lo } else { 0 };
-        let bits = (0..span.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
-        Self { base: lo, bits, others: Mutex::new(FxHashSet::default()) }
+        // (up to 4 GiB of code: 2 MiB of page pointers at most)
+        let span = if lo < hi && hi - lo <= 1 << 32 { hi - lo } else { 0 };
+        let pages = (0..span.div_ceil(CLAIM_PAGE as u64)).map(|_| std::sync::OnceLock::new()).collect();
+        Self { base: lo, pages, others: Mutex::new(FxHashSet::default()) }
     }
 
-    /// The word and bit of `addr` in `bits`.
-    fn slot(&self, addr: u64) -> Option<(&AtomicU64, u64)> {
+    /// The page of `addr` (`None`: outside the code) and its word and bit
+    /// there.
+    fn slot(&self, addr: u64) -> Option<(&std::sync::OnceLock<Box<[AtomicU64; CLAIM_PAGE / 64]>>, usize, u64)> {
         let i = addr.checked_sub(self.base)?;
-        Some((self.bits.get((i / 64) as usize)?, 1 << (i % 64)))
+        let page = self.pages.get((i / CLAIM_PAGE as u64) as usize)?;
+        let bit = i % CLAIM_PAGE as u64;
+        Some((page, (bit / 64) as usize, 1 << (bit % 64)))
     }
 
     /// Take `addr`: whether it was not taken before.
     fn claim(&self, addr: u64) -> bool {
         match self.slot(addr) {
-            Some((word, bit)) => word.fetch_or(bit, Ordering::Relaxed) & bit == 0,
+            Some((page, word, bit)) => {
+                let page = page.get_or_init(|| Box::new(std::array::from_fn(|_| AtomicU64::new(0))));
+                page[word].fetch_or(bit, Ordering::Relaxed) & bit == 0
+            }
             None => self.others.lock().is_ok_and(|mut c| c.insert(addr)),
         }
     }
 
     /// Whether `addr` is taken (outside the code: assumed not).
     fn claimed(&self, addr: u64) -> bool {
-        self.slot(addr).is_some_and(|(word, bit)| word.load(Ordering::Relaxed) & bit != 0)
+        self.slot(addr)
+            .is_some_and(|(page, word, bit)| page.get().is_some_and(|page| page[word].load(Ordering::Relaxed) & bit != 0))
     }
 }
 
 /// The instructions the flow from `entry` reaches, not entering the
-/// functions listed when the run started nor the entries the threads have
+/// functions listed when the threads started nor the entries the threads have
 /// taken (another task decodes from those); the entries it reaches are
 /// added to `entries` (with whether by a call). The walk reads about
 /// these (it stops where the run walked before, which depends on the
