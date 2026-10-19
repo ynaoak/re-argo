@@ -257,8 +257,6 @@ fn discover(
 fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize, usize, usize) {
     let seeds: Vec<u64> = work_queue.iter().copied().collect();
     let mut specs = speculate(program, &seeds);
-    // (the threads' memos of decodes: the walk decodes little more)
-    rayon::broadcast(|_| reargo_arch::arm::release_thread_decodes());
     let by_entry: FxHashMap<u64, u32> = specs.iter().enumerate().map(|(i, s)| (s.entry, i as u32)).collect();
     let mut state = ReplayState::default();
     let ahead: Vec<Option<Ahead>> = {

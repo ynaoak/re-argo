@@ -110,11 +110,18 @@ pub fn set_release_free_memory(release: fn()) {
     let _ = RELEASE_FREE_MEMORY.set(release);
 }
 
-/// Call the function [`set_release_free_memory`] set on every thread of
-/// the pool and on this one.
+/// After a parallel phase: on every thread of the pool (each when it is
+/// done with what it is running: this does not wait) and on this one,
+/// free what the thread keeps for its next decodes and call the function
+/// [`set_release_free_memory`] set.
 pub(crate) fn release_free_memory() {
-    if let Some(&release) = RELEASE_FREE_MEMORY.get() {
-        rayon::broadcast(|_| release());
-        release();
-    }
+    let release = RELEASE_FREE_MEMORY.get().copied();
+    let release = move || {
+        reargo_arch::arm::release_thread_decodes();
+        if let Some(release) = release {
+            release();
+        }
+    };
+    rayon::spawn_broadcast(move |_| release());
+    release();
 }
