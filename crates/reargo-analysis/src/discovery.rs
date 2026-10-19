@@ -269,11 +269,11 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         claims: Claims::new(&info.memory),
         walking: Claims::new(&info.memory),
         stop: AtomicBool::new(false),
+        visited: RwLock::new(Visited::default()),
         queue: Mutex::new(Queue::default()),
         wake: Condvar::new(),
         done: RwLock::new(Done::default()),
     };
-    let mut visited = Visited::default();
     let shared = &shared;
     let seeds: Vec<u64> =
         work_queue.iter().copied().filter(|&e| !shared.has_body.contains(&e) && shared.claims.claim(e)).collect();
@@ -281,7 +281,7 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
     // (threads of their own, not the pool's: the pool may be busy with
     // other work, and the walk never waits for these)
     let helpers = rayon::current_num_threads() - 1;
-    let (counts, bodies, specs) = std::thread::scope(|s| {
+    let (counts, bodies) = std::thread::scope(|s| {
         // The references found are added, and the bodies' sets made, on
         // threads of their own while the walk goes on (the walk reads
         // neither; the references in the order found).
@@ -298,9 +298,12 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         });
         // (the threads decoding ahead start once the walk has read enough
         // for them to be worth it: a short one is done before they would be)
-        let mut started = false;
+        let mut decoding = Vec::new();
+        // (should the walk panic: the threads let go, not waited for forever)
+        let _release = ReleaseOnDrop(shared);
         let mut walked = 0;
         let mut references = Vec::new();
+        let mut visited = shared.visited.write().unwrap_or_else(|e| e.into_inner());
         let counts = discover(
             listing,
             symbol_table,
@@ -311,11 +314,8 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 let _ = bodies_out.send((entry, body));
             },
             |listing, entry, visited, references| {
-                if !started && walked >= HELP_AFTER {
-                    started = true;
-                    for _ in 0..helpers {
-                        s.spawn(|| speculate_loop(shared));
-                    }
+                if decoding.is_empty() && walked >= HELP_AFTER {
+                    decoding.extend((0..helpers).map(|_| s.spawn(|| speculate_loop(shared))));
                 }
                 if references.len() >= REFERENCE_BATCH {
                     let _ = references_out.send(std::mem::take(references));
@@ -340,57 +340,52 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 result
             },
         );
-        shared.stop.store(true, Ordering::Relaxed);
-        shared.wake.notify_all();
+        drop(visited);
         let _ = references_out.send(references);
         drop((references_out, bodies_out));
-        // The instructions the walk read from the decodes made ahead,
-        // listed: the ones at the addresses it visited (it visits each one
-        // it reads) not listed (it listed its own decodes).
-        let done = std::mem::take(&mut *shared.done.write().unwrap_or_else(|e| e.into_inner()));
-        let mut specs: Vec<Spec> = done
-            .specs
-            .into_iter()
-            .map(|spec| {
-                // (the walk holds none now; were one held, its decodes copied)
-                Arc::try_unwrap(spec).unwrap_or_else(|spec| Spec {
-                    insns: spec
-                        .insns
-                        .iter()
-                        .map(|d| SpecInsn { addr: d.addr, facts: d.facts, dec: d.dec.clone() })
-                        .collect(),
-                })
-            })
-            .collect();
-        let visited = &visited;
-        let mut decodes: Vec<(u64, Box<DecodedInstruction>)> = specs
-            .iter_mut()
-            .flat_map(|spec| spec.insns.iter_mut())
-            .filter(|d| visited.contains(d.addr))
-            .filter_map(|d| Some((d.addr, d.dec.take()?)))
-            .collect();
-        decodes.sort_unstable_by_key(|d| d.0);
+        // The decoding threads: stopped, then (the walk holding none of
+        // their code now) each gives the decodes the walk read, to list.
+        drop(std::mem::take(&mut *shared.done.write().unwrap_or_else(|e| e.into_inner())));
+        shared.release();
+        let mut decodes: Vec<(u64, Box<DecodedInstruction>)> = Vec::new();
+        for thread in decoding {
+            decodes.extend(thread.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+        }
+        // (each sorted: one run per thread)
+        decodes.sort_by_key(|d| d.0);
         decodes.dedup_by_key(|d| d.0);
         listing.add_unlisted_instructions(decodes);
         let bodies = sets.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
         if let Err(e) = adding.join() {
             std::panic::resume_unwind(e);
         }
-        (counts, bodies, specs)
+        (counts, bodies)
     });
     for (entry, body) in bodies {
         if let Some(f) = listing.get_function_mut(entry) {
             f.body = body;
         }
     }
-    // The decodes not read freed, and then the memory the threads that
-    // decoded them freed given back, on a thread of their own: the
-    // analysis goes on meanwhile.
-    std::thread::spawn(move || {
-        drop(specs);
-        crate::release_free_memory();
-    });
     counts
+}
+
+impl Shared<'_> {
+    /// Stop the threads decoding ahead and have them give what the walk
+    /// read.
+    fn release(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).collect = true;
+        self.wake.notify_all();
+    }
+}
+
+/// [`Shared::release`] when dropped.
+struct ReleaseOnDrop<'a>(&'a Shared<'a>);
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 /// The references the walk gathers before they are added, in
@@ -413,9 +408,11 @@ struct Shared<'a> {
     claims: Claims,
     /// The entries the walk has started on (its own decodes): left to it.
     walking: Claims,
-    /// Set when the walk is done: what the pool has not decoded yet, it
-    /// leaves.
+    /// Set when the walk is done: what the threads have not decoded yet,
+    /// they leave.
     stop: AtomicBool,
+    /// The walk's (its own while it runs).
+    visited: RwLock<Visited>,
     /// The entries taken, not decoded yet.
     queue: Mutex<Queue>,
     /// Signalled when `queue` gains entries, or its last busy thread is
@@ -430,6 +427,8 @@ struct Queue {
     entries: VecDeque<u64>,
     /// The threads decoding from an entry (they may add more).
     busy: usize,
+    /// Set when the walk is done and holds none of the code decoded.
+    collect: bool,
 }
 
 /// The code the pool decoded so far.
@@ -444,14 +443,16 @@ struct Done {
 /// reachable from it ([`speculate_one`]), make it the walk's to read,
 /// take the entries it reaches; until the walk is done or there is
 /// nothing left.
-fn speculate_loop(shared: &Shared) {
+fn speculate_loop(shared: &Shared) -> Vec<(u64, Box<DecodedInstruction>)> {
     let mut entries = Vec::new();
-    loop {
+    // the code this thread decoded
+    let mut own: Vec<Arc<Spec>> = Vec::new();
+    'work: loop {
         let entry = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if shared.stop.load(Ordering::Relaxed) {
-                    return;
+                    break 'work;
                 }
                 if let Some(entry) = queue.entries.pop_front() {
                     if shared.walking.claimed(entry) {
@@ -461,18 +462,19 @@ fn speculate_loop(shared: &Shared) {
                     break entry;
                 }
                 if queue.busy == 0 {
-                    return;
+                    break 'work;
                 }
                 queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
         entries.clear();
-        let spec = speculate_one(shared, entry, &mut entries);
+        let spec = Arc::new(speculate_one(shared, entry, &mut entries));
         if let Ok(mut done) = shared.done.write() {
             let index = done.specs.len() as u32;
             done.by_entry.insert(entry, index);
-            done.specs.push(Arc::new(spec));
+            done.specs.push(spec.clone());
         }
+        own.push(spec);
         let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         for &(target, call) in &entries {
             if (!call || !shared.has_body.contains(&target)) && shared.claims.claim(target) {
@@ -483,6 +485,34 @@ fn speculate_loop(shared: &Shared) {
         drop(queue);
         shared.wake.notify_all();
     }
+    // Once the walk is done and holds none of the code decoded: the
+    // decodes it read (at the addresses it visited), for the listing;
+    // the others freed here, and what this thread freed given back.
+    {
+        let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        while !queue.collect {
+            queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    let visited = shared.visited.read().unwrap_or_else(|e| e.into_inner());
+    let mut read = Vec::new();
+    for spec in own {
+        match Arc::try_unwrap(spec) {
+            Ok(mut spec) => {
+                read.extend(
+                    spec.insns.iter_mut().filter(|d| visited.contains(d.addr)).filter_map(|d| Some((d.addr, d.dec.take()?))),
+                );
+            }
+            // (were one still held: its decodes copied)
+            Err(spec) => read.extend(
+                spec.insns.iter().filter(|d| visited.contains(d.addr)).filter_map(|d| Some((d.addr, d.dec.clone()?))),
+            ),
+        }
+    }
+    drop(visited);
+    read.sort_unstable_by_key(|d| d.0);
+    crate::release_free_memory();
+    read
 }
 
 /// The instruction addresses a discovery run visited: a bit per
