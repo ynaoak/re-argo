@@ -740,7 +740,10 @@ fn speculate_one(shared: &Shared, entry: u64, entries: &mut Vec<(u64, bool)>) ->
             }
         }
         insns.sort_unstable_by_key(|d| d.addr);
-        Spec { insns: insns.drain(..).collect() }
+        // (exactly sized; the working set keeps its room)
+        let mut own = Vec::with_capacity(insns.len());
+        own.append(insns);
+        Spec { insns: own }
     })
 }
 
