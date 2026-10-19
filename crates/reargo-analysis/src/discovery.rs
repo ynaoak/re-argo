@@ -740,12 +740,15 @@ struct Spec {
 /// made on first use (else in a set).
 struct Claims {
     base: u64,
-    pages: Vec<std::sync::OnceLock<Box<[AtomicU64; CLAIM_PAGE / 64]>>>,
+    pages: Vec<std::sync::OnceLock<ClaimPage>>,
     others: Mutex<FxHashSet<u64>>,
 }
 
 /// Addresses per page of [`Claims`].
 const CLAIM_PAGE: usize = 1 << 14;
+
+/// A page of [`Claims`]: a bit per address.
+type ClaimPage = Box<[AtomicU64; CLAIM_PAGE / 64]>;
 
 impl Claims {
     fn new(memory: &Memory) -> Self {
@@ -759,7 +762,7 @@ impl Claims {
 
     /// The page of `addr` (`None`: outside the code) and its word and bit
     /// there.
-    fn slot(&self, addr: u64) -> Option<(&std::sync::OnceLock<Box<[AtomicU64; CLAIM_PAGE / 64]>>, usize, u64)> {
+    fn slot(&self, addr: u64) -> Option<(&std::sync::OnceLock<ClaimPage>, usize, u64)> {
         let i = addr.checked_sub(self.base)?;
         let page = self.pages.get((i / CLAIM_PAGE as u64) as usize)?;
         let bit = i % CLAIM_PAGE as u64;
