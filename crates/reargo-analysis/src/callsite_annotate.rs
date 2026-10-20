@@ -132,7 +132,7 @@ fn resolve(
     let mut round0 = Vec::with_capacity(shared.funcs.len());
     let mut snapshots = Vec::with_capacity(shared.funcs.len());
     for f in shared.funcs.iter_mut() {
-        round0.push(FunctionWalk { entry: f.entry, max_insns: f.max_insns, sites: f.walk.take() });
+        round0.push(FunctionWalk { entry: f.entry, max_insns: f.max_insns, sites: f.walk.take(), prefix: f.prefix.take() });
         snapshots.push(f.snapshots.take().unwrap_or_default());
     }
     // (the snapshots merge, in listing order, on another thread while
@@ -163,6 +163,7 @@ fn resolve(
     // Give the walks back for Format Varargs (780).
     for (f, w) in shared.funcs.iter_mut().zip(round0) {
         f.walk = w.sites;
+        f.prefix = w.prefix;
     }
 
     // Layer multi-block CFG-aware constant propagation on top:

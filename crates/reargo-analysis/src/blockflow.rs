@@ -959,7 +959,7 @@ mod tests {
     /// the lift's shape does.
     #[test]
     fn marked_walk_matches_shaped_walk() {
-        use crate::callsite::{walk_function_marked, walk_function_shaped, ParamSummaries};
+        use crate::callsite::{walk_function_shaped, walk_prefix, ParamSummaries, WalkPrefix};
         let mut seed = 0x0f1e_2d3c_4b5a_6978_u64;
         let (mut sites, mut known) = (0, 0);
         for round in 0..400 {
@@ -982,7 +982,8 @@ mod tests {
             let marks = LiftMarks::new(&shape, &external, owns);
             let none = ParamSummaries::default();
             let a = walk_function_shaped(0x1000, &insns, &shape, &none, &external, owns_at);
-            let b = walk_function_marked(0x1000, &insns, &shape, &marks, &none);
+            let prefix = WalkPrefix::of_marks(&shape, &marks, true);
+            let b = walk_prefix(0x1000, &insns, &prefix.flags, &none);
             assert_eq!(a, b, "round {round}");
             sites += a.len();
             known += a.iter().flat_map(|s| &s.args).filter(|r| r.value.is_some()).count();

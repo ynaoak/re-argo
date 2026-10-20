@@ -47,7 +47,7 @@ use rayon::prelude::*;
 use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
-use crate::callsite::{walk_function_marked, walk_function_shaped, CallSite, ParamSummaries};
+use crate::callsite::{walk_function_shaped, walk_prefix, CallSite, ParamSummaries, WalkPrefix};
 use crate::func_lift::function_jobs;
 
 /// One function's results.
@@ -59,6 +59,9 @@ pub(crate) struct FunctionResults {
     /// Its round-0 call sites ([`crate::callsite::walk_function`] with
     /// no summaries), or `None` when the lift failed.
     pub walk: Option<Vec<CallSite>>,
+    /// What the walk read of the lift (an increasing lift), for the
+    /// resolver's rewalks.
+    pub prefix: Option<WalkPrefix>,
     /// Its owned `cfg_const` and VSA call snapshots, when computed
     /// (empty for a failed lift).
     pub snapshots: Option<(crate::cfg_const::CallSnapshots, crate::vsa::CallSnapshots)>,
@@ -372,8 +375,11 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         Ok(k) => calls[k].1,
         Err(_) => owner.owns(a),
     };
-    let walk = match &marks {
-        Some(marks) => walk_function_marked(entry, insns, &shape, marks, &ParamSummaries::default()),
+    // (a lift through the cache is plain: lifted instruction by
+    // instruction)
+    let prefix = marks.as_ref().map(|marks| WalkPrefix::of_marks(&shape, marks, shapes.is_some()));
+    let walk = match &prefix {
+        Some(prefix) => walk_prefix(entry, insns, &prefix.flags, &ParamSummaries::default()),
         None => walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call),
     };
     // The walk asks who owns each call instruction.
@@ -411,6 +417,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         entry,
         max_insns,
         walk: Some(walk),
+        prefix,
         snapshots,
         lifted,
         external: external.into_iter().collect(),
