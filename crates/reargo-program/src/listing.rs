@@ -143,23 +143,23 @@ impl Listing {
         body: &reargo_core::address::AddressSet,
         mut f: impl FnMut(bool, &'a DecodedInstruction),
     ) {
-        let ranges: Vec<(u64, u64)> =
-            body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).collect();
-        let mut i = 0;
-        while i < ranges.len() {
-            let mut j = i;
-            while j + 1 < ranges.len() && ranges[j + 1].0 == ranges[j].1 {
-                j += 1;
-            }
-            let mut it = self.instructions.range(ranges[i].0..ranges[j].1).peekable();
-            for &(_, end) in &ranges[i..=j] {
+        // (the ranges read as they come: no list of them is made)
+        let mut ranges = body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).peekable();
+        while let Some((start, mut end)) = ranges.next() {
+            // the run of ranges from `start`: one lookup, read up to the
+            // end of each in turn
+            let mut it = self.instructions.range(start..).peekable();
+            loop {
                 let mut first = true;
                 while let Some((_, insn)) = it.next_if(|(a, _)| **a < end) {
                     f(first, insn);
                     first = false;
                 }
+                match ranges.next_if(|&(s, _)| s == end) {
+                    Some((_, e)) => end = e,
+                    None => break,
+                }
             }
-            i = j + 1;
         }
     }
 

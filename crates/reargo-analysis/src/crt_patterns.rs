@@ -103,13 +103,33 @@ impl Analyzer for CrtPatternAnalyzer {
                 candidates.extend((first..=end - 24).step_by(16));
             }
         }
-        candidates.par_sort_unstable();
+        // (a few ascending runs: the stable sort merges them)
+        candidates.sort();
         candidates.dedup();
 
+        // The first bytes a pattern can start with (every byte for one
+        // whose first byte is masked out).
+        let mut first_byte = [false; 256];
+        for pattern in &patterns {
+            match (pattern.prefix.first(), pattern.mask.first()) {
+                (Some(&p), Some(&m)) if m != 0 => first_byte[p as usize] = true,
+                _ => first_byte = [true; 256],
+            }
+        }
         let found: Vec<(u64, &'static str)> = candidates
             .par_iter()
             .with_min_len(4096)
             .filter_map(|&entry| {
+                let mut buf = [0u8; 24];
+                let n = [24, 16, 12, 8]
+                    .iter()
+                    .copied()
+                    .find(|&n| program.info.memory.read_bytes(entry, &mut buf[..n]).is_ok())?;
+                let bytes = &buf[..n];
+                if !first_byte[bytes[0] as usize] {
+                    return None;
+                }
+                let pattern = patterns.iter().find(|pattern| matches_pattern(bytes, pattern.prefix, pattern.mask))?;
                 // Skip candidates that already host a function with a
                 // non-generic name (user / DWARF / earlier analyzer wins).
                 let already_named = program
@@ -119,16 +139,7 @@ impl Analyzer for CrtPatternAnalyzer {
                 if already_named {
                     return None;
                 }
-                let mut buf = [0u8; 24];
-                let n = [24, 16, 12, 8]
-                    .iter()
-                    .copied()
-                    .find(|&n| program.info.memory.read_bytes(entry, &mut buf[..n]).is_ok())?;
-                let bytes = &buf[..n];
-                patterns
-                    .iter()
-                    .find(|pattern| matches_pattern(bytes, pattern.prefix, pattern.mask))
-                    .map(|pattern| (entry, pattern.name))
+                Some((entry, pattern.name))
             })
             .collect();
         Box::new(found)

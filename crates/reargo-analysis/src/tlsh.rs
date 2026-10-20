@@ -226,13 +226,8 @@ fn build_buckets(data: &[u8]) -> ([u32; 128], u8) {
             (0..windows.div_ceil(CHUNK))
                 .into_par_iter()
                 .map(|c| {
-                    let mut b = [0u32; 128];
                     let end = ((c + 1) * CHUNK).min(windows);
-                    let first = FirstLookups::new();
-                    for w in data[c * CHUNK..end + 4].windows(5) {
-                        first.bucket_window(&mut b, w);
-                    }
-                    b
+                    FirstLookups::new().count(&data[c * CHUNK..end + 4])
                 })
                 .reduce(
                     || [0u32; 128],
@@ -273,15 +268,33 @@ impl FirstLookups {
         }))
     }
 
-    /// [`bucket_window`].
-    #[inline]
-    fn bucket_window(&self, buckets: &mut [u32; 128], p: &[u8]) {
-        let a = p[0] as usize;
-        let rest = [(p[1], p[2]), (p[1], p[3]), (p[2], p[3]), (p[2], p[4]), (p[1], p[4]), (p[3], p[4])];
-        for (first, (b, c)) in self.0.iter().zip(rest) {
-            let idx = V_TABLE[(V_TABLE[(first[a] ^ b) as usize] ^ c) as usize];
-            buckets[(idx & 0x7F) as usize] += 1;
+    /// The bucket counts of every 5-byte window of `data`
+    /// ([`bucket_window`] of each).
+    fn count(&self, data: &[u8]) -> [u32; 128] {
+        // The last lookup gives the bucket (its low 7 bits) as an index
+        // into 256 counters: no mask and no bounds check per update.
+        const LOW: [u8; 256] = {
+            let mut t = [0u8; 256];
+            let mut i = 0;
+            while i < 256 {
+                t[i] = V_TABLE[i] & 0x7F;
+                i += 1;
+            }
+            t
+        };
+        let mut counts = [0u32; 256];
+        let [f0, f1, f2, f3, f4, f5] = &self.0;
+        let last = |first: u8, b: u8, c: u8| LOW[(V_TABLE[(first ^ b) as usize] ^ c) as usize] as usize;
+        for p in data.windows(5) {
+            let (a, p1, p2, p3, p4) = (p[0] as usize, p[1], p[2], p[3], p[4]);
+            counts[last(f0[a], p1, p2)] += 1;
+            counts[last(f1[a], p1, p3)] += 1;
+            counts[last(f2[a], p2, p3)] += 1;
+            counts[last(f3[a], p2, p4)] += 1;
+            counts[last(f4[a], p1, p4)] += 1;
+            counts[last(f5[a], p3, p4)] += 1;
         }
+        std::array::from_fn(|i| counts[i])
     }
 }
 
