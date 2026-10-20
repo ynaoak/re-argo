@@ -116,6 +116,11 @@ impl Listing {
         self.instructions.values().map(|b| &**b)
     }
 
+    /// The addresses of the instructions listed in `start..end`, ascending.
+    pub fn instruction_addresses_in_range(&self, start: u64, end: u64) -> impl Iterator<Item = u64> + '_ {
+        self.instructions.range(start..end).map(|(&a, _)| a)
+    }
+
     pub fn instructions_in_range(
         &self,
         start: u64,
