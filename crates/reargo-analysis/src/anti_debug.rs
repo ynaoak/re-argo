@@ -22,7 +22,6 @@
 //! Patterns 1-3 are bytewise; pattern 4 is a symbol-table lookup
 //! that piggybacks on the signature DB.
 
-use std::collections::BTreeSet;
 
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
@@ -138,42 +137,31 @@ impl Analyzer for AntiDebugAnalyzer {
         // `ptrace` to inherit the plate annotation. Filter them — a
         // function that's marked thunk *or* whose name carries the
         // @plt suffix is not "using" the API in the analysis sense.
-        let func_ranges: Vec<(u64, Vec<(u64, u64)>)> = program
-            .listing
-            .functions()
-            .filter(|f| !f.is_thunk && !f.name.contains("@plt"))
-            .map(|f| {
-                (
-                    f.entry_point,
-                    f.body
-                        .ranges()
-                        .map(|r| (r.start.offset, r.start.offset + r.size))
-                        .collect(),
-                )
-            })
-            .collect();
-        let finding_addrs: BTreeSet<u64> = bytewise
-            .iter()
-            .map(|(a, _)| *a)
-            .chain(api_edges.iter().map(|(a, _)| *a))
-            .collect();
+        let mut finding_addrs: Vec<u64> = bytewise.iter().map(|(a, _)| *a).chain(api_edges.iter().map(|(a, _)| *a)).collect();
+        finding_addrs.sort_unstable();
+        finding_addrs.dedup();
         let mut flagged_funcs = 0usize;
-        for (entry, ranges) in &func_ranges {
-            let touched = ranges.iter().any(|(s, e)| {
-                finding_addrs
-                    .range(*s..*e)
-                    .next()
-                    .is_some()
+        let Program { listing, comments, .. } = program;
+        for f in listing.functions().filter(|f| !f.is_thunk && !f.name.contains("@plt")) {
+            // (its ranges are sorted by start: the first finding at or
+            // after each start only moves forward)
+            let mut ranges = f.body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).peekable();
+            let Some(&(first, _)) = ranges.peek() else { continue };
+            let mut at = finding_addrs.partition_point(|&a| a < first);
+            let touched = ranges.any(|(s, e)| {
+                while finding_addrs.get(at).is_some_and(|&a| a < s) {
+                    at += 1;
+                }
+                finding_addrs.get(at).is_some_and(|&a| a < e)
             });
             if !touched {
                 continue;
             }
-            if program.comments.get(*entry, CommentType::Plate).is_some() {
+            let entry = f.entry_point;
+            if comments.get(entry, CommentType::Plate).is_some() {
                 continue;
             }
-            program
-                .comments
-                .set(*entry, CommentType::Plate, "anti-debug / anti-analysis indicators");
+            comments.set(entry, CommentType::Plate, "anti-debug / anti-analysis indicators");
             flagged_funcs += 1;
         }
 
