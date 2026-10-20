@@ -954,6 +954,36 @@ impl std::borrow::Borrow<LiftedInstruction> for RangeInsn<'_> {
     }
 }
 
+/// One instruction of [`X86Lifter::lift_range_lazy`], read as its [`LiftedInstruction`]
+/// (`Borrow`): lifted when first read when the decode gives its facts. Unlike a
+/// [`RangeInsn`], it owns its lift (and may be shared between threads).
+pub struct LazyInsn {
+    address: u64,
+    is_64: bool,
+    /// The decoded instruction, when it is lifted when first read.
+    decoded: iced_x86::Instruction,
+    lift: std::sync::OnceLock<LiftedInstruction>,
+}
+
+impl std::borrow::Borrow<LiftedInstruction> for LazyInsn {
+    #[inline]
+    fn borrow(&self) -> &LiftedInstruction {
+        self.lift.get_or_init(|| {
+            X86Lifter { is_64: self.is_64, parity: false }
+                .lift_decoded(self.decoded, self.address, None)
+                .expect("an instruction `decoded_facts` answers for lifts")
+        })
+    }
+}
+
+/// A range lifted by [`X86Lifter::lift_range_lazy`].
+pub enum LazyRange {
+    /// Every instruction lifted alone, those the decode gives the facts of when first read.
+    Lazy(Vec<LazyInsn>),
+    /// Lifted as a whole (`lift_range`: an x87 instruction or a PF reader in the range).
+    Eager(Vec<LiftedInstruction>),
+}
+
 pub struct X86Lifter {
     is_64: bool,
     /// Compute PF for integer instructions (WS85). On by default; [`PcodeLift::lift_range`]
@@ -1111,6 +1141,7 @@ impl X86Lifter {
     /// `jmp` (`BRANCH` to a near target, else `BRANCHIND`), `ret` (`RETURN`) and the
     /// conditional jumps (`CBRANCH`); the parity condition codes and `lahf` read PF, which
     /// nothing of them writes before (an SSE compare writes PF before reading it).
+    #[inline(always)]
     fn decoded_facts(insn: &iced_x86::Instruction) -> Option<(u8, u64, bool)> {
         use crate::lift::InsnShape as S;
         use iced_x86::Mnemonic::*;
@@ -1624,6 +1655,49 @@ impl X86Lifter {
                 }
             })
             .collect()
+    }
+
+    /// `lift_range(memory, start, count)`, an instruction whose facts the decode gives
+    /// ([`Self::decoded_facts`]) lifted only when it is first read ([`LazyRange::Lazy`]), when
+    /// every instruction of the range is lifted alone: no x87 instruction (the x87 pass
+    /// rewrites nothing in a range without one) and, with the integer PF, no instruction
+    /// reading a PF it does not write first (the range is not lifted again with it). Otherwise
+    /// the range as `lift_range` lifts it ([`LazyRange::Eager`]).
+    pub fn lift_range_lazy(&self, memory: &Memory, start: u64, count: usize) -> LazyRange {
+        let fast = X86Lifter { is_64: self.is_64, parity: false };
+        let eager = || LazyRange::Eager(PcodeLift::lift_range(self, memory, start, count).unwrap_or_default());
+        let mut out = Vec::with_capacity(count.min(4096));
+        let mut addr = start;
+        // decoded through one decoder over the block, as `lift_range` does
+        let mut block = None;
+        for _ in 0..count {
+            let Ok(insn) = fast.decode_in_block(memory, addr, &mut block) else { break };
+            match Self::decoded_facts(&insn) {
+                Some((_, _, reads_pf)) => {
+                    if reads_pf && self.parity {
+                        return eager();
+                    }
+                    out.push(LazyInsn { address: addr, is_64: self.is_64, decoded: insn, lift: std::sync::OnceLock::new() });
+                    addr += insn.len() as u64;
+                }
+                None => match fast.lift_decoded(insn, addr, None) {
+                    Ok(lifted) => {
+                        if lifted.mnemonic.x86_instruction().is_none_or(x87::is_x87) || (self.parity && reads_outside_pf(&lifted)) {
+                            return eager();
+                        }
+                        addr += lifted.length as u64;
+                        out.push(LazyInsn {
+                            address: lifted.address,
+                            is_64: self.is_64,
+                            decoded: iced_x86::Instruction::default(),
+                            lift: std::sync::OnceLock::from(lifted),
+                        });
+                    }
+                    Err(_) => break,
+                },
+            }
+        }
+        LazyRange::Lazy(out)
     }
 
     /// Does the linear range `lift_range(memory, start, count)` would lift
@@ -5480,6 +5554,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `lift_range_lazy` read in random orders equals `lift_range` (x87, PF readers and
+    /// failing instructions included), with and without the integer PF.
+    #[test]
+    fn lift_range_lazy_equals_range_lift() {
+        let mut seed = 0x2f6b_1d3a_9c47_e581_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pieces: &[&[u8]] = &[
+            &[0x48, 0x89, 0xc3], // mov rbx, rax
+            &[0x83, 0xf8, 0x00], // cmp eax, 0
+            &[0x7a, 0x02],       // jp
+            &[0x0f, 0x2e, 0xc1], // ucomiss xmm0, xmm1
+            &[0x75, 0x04],       // jne
+            &[0xe8, 0x10, 0, 0, 0], // call
+            &[0xff, 0xd0],       // call rax
+            &[0xd9, 0x07],       // fld dword [rdi]
+            &[0xde, 0xc1],       // faddp
+            &[0xc3],             // ret
+            &[0x0f, 0x9a, 0xc0], // setp al
+            &[0x8e, 0xd8],       // mov ds, ax (fails to lift)
+            &[0x48, 0x8d, 0x05, 0x10, 0, 0, 0], // lea rax, [rip+0x10]
+        ];
+        let text = |v: &[&LiftedInstruction]| format!("{:?}", v.iter().map(|i| (i.address, i.length, &i.ops, &*i.mnemonic)).collect::<Vec<_>>());
+        let (mut lazy, mut eager) = (0, 0);
+        for round in 0..300 {
+            let lifter = if round % 3 == 2 { X86Lifter::new_64().without_parity() } else { X86Lifter::new_64() };
+            let mut code = Vec::new();
+            while code.len() < 96 {
+                if next() % 4 == 0 {
+                    code.extend((0..1 + next() % 6).map(|_| next() as u8));
+                } else {
+                    code.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+                }
+            }
+            let mem = make_memory(&code, 0x1000);
+            for start in 0..code.len() as u64 {
+                let at = 0x1000 + start;
+                let count = [40, 1, 7, 3][(next() % 4) as usize];
+                let order = next();
+                let got = match lifter.lift_range_lazy(&mem, at, count) {
+                    LazyRange::Lazy(v) => {
+                        lazy += 1;
+                        // (some of them read first, from the back)
+                        for (i, insn) in v.iter().enumerate().rev() {
+                            if (order >> (i % 64)) & 1 == 1 {
+                                let _: &LiftedInstruction = std::borrow::Borrow::borrow(insn);
+                            }
+                        }
+                        text(&v.iter().map(std::borrow::Borrow::borrow).collect::<Vec<_>>())
+                    }
+                    LazyRange::Eager(v) => {
+                        eager += 1;
+                        text(&v.iter().collect::<Vec<_>>())
+                    }
+                };
+                let fresh = lifter.lift_range(&mem, at, count).unwrap();
+                assert_eq!(got, text(&fresh.iter().collect::<Vec<_>>()), "round {round} start +{start:#x} count {count}");
+            }
+        }
+        assert!(lazy > 1000 && eager > 1000, "{lazy} lazy, {eager} eager");
     }
 
     /// The facts found while a lift is finished are the ones its ops give.
