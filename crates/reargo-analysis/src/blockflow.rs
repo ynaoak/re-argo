@@ -90,7 +90,7 @@ impl<'a> LiftShape<'a> {
             let s = InsnShape::of(insn.borrow());
             if s.flags != 0 {
                 special.push(i as u32);
-                push_branches(&mut branches, i, s, insn.borrow());
+                push_branches(&mut branches, i, s, || insn.borrow());
             }
             addrs.push(s.address);
             flags.push(s.flags);
@@ -106,7 +106,7 @@ impl<'a> LiftShape<'a> {
         let mut special = Vec::with_capacity(shapes.special().len());
         for i in shapes.special() {
             special.push(i as u32);
-            push_branches(&mut branches, i, shapes.shape(i), insns[i].borrow());
+            push_branches(&mut branches, i, shapes.shape(i), || insns[i].borrow());
         }
         LiftShape {
             increasing: shapes.increasing,
@@ -132,12 +132,12 @@ fn increasing(addrs: &[u64]) -> bool {
 }
 
 /// The `(i, target)` of the jumps of instruction `i` (shape `s`, lifted
-/// as `insn`) with a target, in op order.
-fn push_branches(branches: &mut Vec<(usize, u64)>, i: usize, s: InsnShape, insn: &LiftedInstruction) {
+/// as `insn()`, read only for several targets) with a target, in op order.
+fn push_branches<'a>(branches: &mut Vec<(usize, u64)>, i: usize, s: InsnShape, insn: impl FnOnce() -> &'a LiftedInstruction) {
     if s.flags & InsnShape::TARGET != 0 {
         branches.push((i, s.target));
     } else if s.flags & InsnShape::TARGETS != 0 {
-        for op in &insn.ops {
+        for op in &insn().ops {
             if matches!(op.opcode, OpCode::Branch | OpCode::CBranch)
                 && let Some(t) = target(op)
             {
@@ -689,7 +689,11 @@ pub fn propagate_cfg<S: FlowState, T, I: Borrow<LiftedInstruction>>(
             }
         }
         if falls_through && b + 1 < nb {
-            add_edge(&mut out, b + 1, &st);
+            // (the state is not read after: moved onto the edge unless one is there)
+            match out.iter_mut().find(|(t, _)| *t == b + 1) {
+                Some((_, prev)) => *prev = prev.join(&st),
+                None => out.push((b + 1, st)),
+            }
         }
         out.sort_unstable_by_key(|(to, _)| *to);
         for (to, s) in out.drain(..) {

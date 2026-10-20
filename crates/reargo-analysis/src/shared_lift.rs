@@ -204,7 +204,7 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     // the run before it did not)
     let computed: Vec<Vec<(FunctionResults, Extra)>> = chunks
         .into_par_iter()
-        .map_init(reargo_lift::x86::LiftCache::new, |cache, chunk| {
+        .map_init(reargo_lift::x86::LiftCache::lazy, |cache, chunk| {
             let (x86, jumps) = (&x86, jumps.as_ref());
             chunk
                 .into_iter()
@@ -225,7 +225,7 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
                     } else {
                         &[max_insns]
                     };
-                    x86.lift_prefixes_cached(memory, entry, budgets, true, cache, |k, insns, shapes| match k {
+                    x86.lift_prefixes_lazy(memory, entry, budgets, cache, |k, insns, shapes| match k {
                         0 => {
                             results = Some(compute_lifted(
                                 program,

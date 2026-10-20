@@ -40,7 +40,7 @@ impl Analyzer for CallingConventionAnalyzer {
         let jobs: Vec<(u64, usize)> = func_entries.iter().map(|&e| (e, LIFT_BUDGET)).collect();
         let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
         let inferences: Vec<Option<(u64, &'static str)>> = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
-            crate::range_lift::map_lifted_ranges(&program.info.memory, missing, convention_lifted)
+            crate::range_lift::map_lifted_ranges(&program.info.memory, missing, |entry, insns| convention_lifted(entry, insns))
         });
 
         // Phase 2: apply serially. Each entry targets a distinct
@@ -75,7 +75,7 @@ pub(crate) struct Ahead(pub crate::range_lift::AheadMap<Option<(u64, &'static st
 /// (RDI/RSI/RDX/RCX) argument register usage; return the winning
 /// convention name, or `None` if neither set was touched. Pure
 /// function-local work on the instructions `lifted` from `entry`.
-pub(crate) fn convention_lifted(entry: u64, lifted: &[&reargo_lift::LiftedInstruction]) -> Option<(u64, &'static str)> {
+pub(crate) fn convention_lifted<L: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(entry: u64, lifted: &[L]) -> Option<(u64, &'static str)> {
     let win_regs = [0x08u64, 0x10, 0x80, 0x88]; // RCX, RDX, R8, R9
     let sysv_regs = [0x38u64, 0x30, 0x10, 0x08]; // RDI, RSI, RDX, RCX
 
@@ -83,6 +83,7 @@ pub(crate) fn convention_lifted(entry: u64, lifted: &[&reargo_lift::LiftedInstru
     let mut sysv_score = 0;
 
     for insn in lifted {
+        let insn = insn.borrow();
         for op in &insn.ops {
             for inp in &op.inputs {
                 if inp.space == SpaceId::REGISTER {

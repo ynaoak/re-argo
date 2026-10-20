@@ -182,8 +182,17 @@ pub struct LiftCache {
     head: usize,
     /// Entries held (not dead).
     live: usize,
-    /// The lift of each index; `None` where it failed ([`FAILED`]) or was dropped ([`DEAD`]).
-    lifted: Vec<Option<LiftedInstruction>>,
+    /// The lift of each index (none where it failed, [`FAILED`], or was dropped, [`DEAD`]),
+    /// made when the entry is added or, for an instruction whose facts the decode gives
+    /// ([`X86Lifter::decoded_facts`]), when first read ([`Self::insn`]): a range's walk reads
+    /// the facts of every instruction, its passes the ops of a few.
+    lifted: Vec<std::cell::OnceCell<LiftedInstruction>>,
+    /// The decoded instruction of each index lifted when first read (the default elsewhere).
+    decoded: Vec<iced_x86::Instruction>,
+    /// The lifter's mode, for the lifts made when first read.
+    is_64: bool,
+    /// Lift an instruction whose facts the decode gives when it is first read ([`Self::lazy`]).
+    lazy: bool,
     /// The link, length and flags of each index.
     meta: Vec<Meta>,
     /// The [`InsnShape`] of each index, by field (only its address where
@@ -310,6 +319,14 @@ impl LiftCache {
         Self::default()
     }
 
+    /// A cache that lifts an instruction whose facts the decode gives
+    /// ([`X86Lifter::decoded_facts`]) only when it is first read, for walks reading the ops of
+    /// few of the instructions they step through ([`X86Lifter::lift_prefixes_lazy`]); the
+    /// others read them all.
+    pub fn lazy() -> Self {
+        Self { lazy: true, ..Self::default() }
+    }
+
     /// Instructions held.
     pub fn len(&self) -> usize {
         self.live
@@ -355,7 +372,7 @@ impl LiftCache {
                 if self.addr[p] >= start {
                     break;
                 }
-                self.lifted[p] = None;
+                self.lifted[p].take();
                 self.meta[p] = Meta { next: NO_NEXT, len: 0, flags: DEAD };
                 self.live -= 1;
             }
@@ -371,6 +388,7 @@ impl LiftCache {
     fn compact(&mut self) {
         let h = self.head;
         self.lifted.drain(..h);
+        self.decoded.drain(..h);
         self.meta.drain(..h);
         self.addr.drain(..h);
         self.sflags.drain(..h);
@@ -396,16 +414,36 @@ impl LiftCache {
     fn reserve(&mut self, n: usize) {
         let n = (2 * n).max(CACHE_RESERVE);
         self.lifted.reserve(n);
+        self.decoded.reserve(n);
         self.meta.reserve(n);
         self.addr.reserve(n);
         self.sflags.reserve(n);
         self.target.reserve(n);
     }
 
-    /// The instruction at index `i`, lifted.
+    /// The instruction at index `i` (not failed or dropped), lifted (now when it was not yet).
     #[inline]
     fn insn(&self, i: u32) -> &LiftedInstruction {
-        self.lifted[i as usize].as_ref().expect("lifted")
+        self.lifted[i as usize].get_or_init(|| self.lift_entry(i))
+    }
+
+    /// The lift alone, without the integer PF, of entry `i`'s decoded instruction.
+    #[cold]
+    fn lift_entry(&self, i: u32) -> LiftedInstruction {
+        debug_assert!(self.meta[i as usize].flags & (FAILED | DEAD) == 0);
+        X86Lifter { is_64: self.is_64, parity: false }
+            .lift_decoded(self.decoded[i as usize], self.addr[i as usize], None)
+            .expect("an instruction `decoded_facts` answers for lifts")
+    }
+
+    /// The lift of entry `i`, `None` where it failed (or was dropped).
+    fn lifted(&self, i: u32) -> Option<&LiftedInstruction> {
+        (self.meta[i as usize].flags & (FAILED | DEAD) == 0).then(|| self.insn(i))
+    }
+
+    /// The instructions at `idxs` as [`RangeInsn`]s, each lifted when first read.
+    fn range_insns(&self, idxs: &[u32]) -> Vec<RangeInsn<'_>> {
+        idxs.iter().map(|&i| RangeInsn(RangeInsnRepr::Cached(self, i))).collect()
     }
 
     /// The instructions at `idxs`, all lifted.
@@ -459,25 +497,39 @@ impl LiftCache {
         }
         let i = u32::try_from(self.lifted.len()).expect("lift cache index");
         assert!(i != NO_INDEX, "lift cache index");
-        let mut facts = OpFacts::default();
-        // (the lift pushed where it is matched, not moved through an `Option` first)
-        let (flags, len, shape) = match lifter
-            .decode_in_block(memory, addr, block)
-            .and_then(|insn| lifter.lift_decoded_facts(insn, addr, None, &mut facts))
-        {
-            Ok(insn) => {
-                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
-                let flags = if x87 { X87 } else { 0 } | if facts.reads_outside_pf { READS_PF } else { 0 };
-                let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
-                let shape = crate::lift::InsnShape { address: addr, target: facts.target, flags: facts.flags };
-                debug_assert_eq!(shape, crate::lift::InsnShape::of(&insn));
-                debug_assert_eq!(facts.reads_outside_pf, reads_outside_pf(&insn));
-                self.lifted.push(Some(insn));
-                (flags, len, shape)
-            }
-            Err(_) => {
-                self.lifted.push(None);
-                (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() })
+        let decoded = lifter.decode_in_block(memory, addr, block);
+        // an instruction whose facts the decode gives is lifted when first read (only by the
+        // lifter without the integer PF, the one `Self::lift_entry` lifts with)
+        let lazy = match &decoded {
+            Ok(insn) if self.lazy && !lifter.parity => X86Lifter::decoded_facts(insn).map(|f| (*insn, f)),
+            _ => None,
+        };
+        let (flags, len, shape) = if let Some((insn, (sflags, target, reads_pf))) = lazy {
+            self.is_64 = lifter.is_64;
+            let len = u8::try_from(insn.len()).expect("an x86 instruction is at most 15 bytes");
+            self.lifted.push(std::cell::OnceCell::new());
+            self.decoded.push(insn);
+            (if reads_pf { READS_PF } else { 0 }, len, crate::lift::InsnShape { address: addr, target, flags: sflags })
+        } else {
+            let mut facts = OpFacts::default();
+            // (the lift pushed where it is matched, not moved through an `Option` first)
+            match decoded.and_then(|insn| lifter.lift_decoded_facts(insn, addr, None, &mut facts)) {
+                Ok(insn) => {
+                    let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
+                    let flags = if x87 { X87 } else { 0 } | if facts.reads_outside_pf { READS_PF } else { 0 };
+                    let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
+                    let shape = crate::lift::InsnShape { address: addr, target: facts.target, flags: facts.flags };
+                    debug_assert_eq!(shape, crate::lift::InsnShape::of(&insn));
+                    debug_assert_eq!(facts.reads_outside_pf, reads_outside_pf(&insn));
+                    self.lifted.push(std::cell::OnceCell::from(insn));
+                    self.decoded.push(iced_x86::Instruction::default());
+                    (flags, len, shape)
+                }
+                Err(_) => {
+                    self.lifted.push(std::cell::OnceCell::new());
+                    self.decoded.push(iced_x86::Instruction::default());
+                    (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() })
+                }
             }
         };
         self.meta.push(Meta { next: NO_NEXT, len, flags });
@@ -811,6 +863,36 @@ impl CachedRange<'_> {
     }
 }
 
+/// One instruction of a range lifted through a [`LiftCache`]
+/// ([`X86Lifter::lift_prefixes_lazy`]), read as its [`LiftedInstruction`] (`Borrow`): an
+/// instruction the cache holds only decoded is lifted when first read.
+#[derive(Clone, Copy)]
+pub struct RangeInsn<'c>(RangeInsnRepr<'c>);
+
+#[derive(Clone, Copy)]
+enum RangeInsnRepr<'c> {
+    Lifted(&'c LiftedInstruction),
+    Cached(&'c LiftCache, u32),
+}
+
+impl<'c> RangeInsn<'c> {
+    /// The instruction, lifted.
+    #[inline]
+    pub fn get(&self) -> &'c LiftedInstruction {
+        match self.0 {
+            RangeInsnRepr::Lifted(l) => l,
+            RangeInsnRepr::Cached(c, i) => c.insn(i),
+        }
+    }
+}
+
+impl std::borrow::Borrow<LiftedInstruction> for RangeInsn<'_> {
+    #[inline]
+    fn borrow(&self) -> &LiftedInstruction {
+        self.get()
+    }
+}
+
 pub struct X86Lifter {
     is_64: bool,
     /// Compute PF for integer instructions (WS85). On by default; [`PcodeLift::lift_range`]
@@ -955,6 +1037,72 @@ impl X86Lifter {
             }
         };
         if f & FACT_FAILED != 0 { f } else { f | u16::try_from(insn.len()).expect("an x86 instruction is at most 15 bytes") }
+    }
+
+    /// What a [`LiftCache`] keeps of the lift alone of `insn` without the integer PF — its
+    /// [`crate::lift::InsnShape`] flags and target and [`reads_outside_pf`] — read from the
+    /// decoded instruction without lifting it, for an instruction whose lift is sure to
+    /// succeed and is not x87 (`None` otherwise: it is then lifted to find them).
+    ///
+    /// Not x87, the lift fails only where it lifts an operand it cannot (a register it does
+    /// not map, a far pointer, a string operand), so an instruction whose every operand can be
+    /// lifted lifts. Its control ops are those of `call` (`CALL`, a `CALLIND` for an operand),
+    /// `jmp` (`BRANCH` to a near target, else `BRANCHIND`), `ret` (`RETURN`) and the
+    /// conditional jumps (`CBRANCH`); the parity condition codes and `lahf` read PF, which
+    /// nothing of them writes before (an SSE compare writes PF before reading it).
+    fn decoded_facts(insn: &iced_x86::Instruction) -> Option<(u8, u64, bool)> {
+        use crate::lift::InsnShape as S;
+        use iced_x86::Mnemonic::*;
+        use iced_x86::OpKind;
+        if x87::is_x87(insn) {
+            return None;
+        }
+        // (an XMM register routes the instruction to the SSE lift, so it is liftable wherever
+        // it is named; the integer lift names no XMM register)
+        let mut sse = false;
+        for i in 0..insn.op_count() {
+            let liftable = match insn.op_kind(i) {
+                OpKind::Register => {
+                    let r = insn.op_register(i);
+                    let xmm = iced_xmm_offset(r).is_some();
+                    sse |= xmm;
+                    xmm || iced_reg_to_varnode(r).is_some()
+                }
+                OpKind::Immediate8
+                | OpKind::Immediate16
+                | OpKind::Immediate32
+                | OpKind::Immediate64
+                | OpKind::Immediate8to16
+                | OpKind::Immediate8to32
+                | OpKind::Immediate8to64
+                | OpKind::Immediate32to64
+                | OpKind::Memory
+                | OpKind::NearBranch16
+                | OpKind::NearBranch32
+                | OpKind::NearBranch64 => true,
+                _ => false,
+            };
+            if !liftable {
+                return None;
+            }
+        }
+        if sse || matches!(insn.mnemonic(), Cvttss2si | Cvttsd2si | Cvtss2si | Cvtsd2si) {
+            debug_assert!(insn_touches_xmm(insn));
+            return Some((0, 0, false));
+        }
+        debug_assert!(!insn_touches_xmm(insn));
+        let near = insn.op_count() > 0 && matches!(insn.op0_kind(), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64);
+        let jump = |pf: bool| Some((S::ENDS | S::TARGET, insn.near_branch_target(), pf));
+        match insn.mnemonic() {
+            Call if near => Some((S::CALL, 0, false)),
+            Call => Some((S::CALL | S::CALLIND, 0, false)),
+            Jmp if near => Some((S::ENDS | S::STOPS | S::TARGET, insn.near_branch_target(), false)),
+            Jmp | Ret => Some((S::ENDS | S::STOPS, 0, false)),
+            Je | Jne | Jl | Jge | Jb | Jae | Js | Jns | Jo | Jno | Ja | Jbe | Jle | Jg => jump(false),
+            Jp | Jnp => jump(true),
+            Setp | Setnp | Cmovp | Cmovnp | Lahf => Some((0, 0, true)),
+            _ => Some((0, 0, false)),
+        }
     }
 
     /// The facts bits of an instruction lifted alone without the integer PF (without
@@ -1269,7 +1417,7 @@ impl X86Lifter {
         let mut addr = start;
         for _ in 0..count {
             let i = parity.index_of(self, memory, addr, &mut block);
-            let Some(l) = &parity.lifted[i as usize] else { break };
+            let Some(l) = parity.lifted(i) else { break };
             addr += u64::from(l.length);
             out.push(l.clone());
         }
@@ -1317,7 +1465,8 @@ impl X86Lifter {
         }
         // `needs_integer_parity`, its per-instruction test read from the cache
         if self.parity && any & READS_PF != 0 {
-            let insns = cache.insns(&idxs);
+            // (the instructions looked back over are lifted, no other)
+            let insns = cache.range_insns(&idxs);
             if parity_needed(&insns, |k| cache.meta[idxs[k] as usize].flags & READS_PF != 0) {
                 return Err(idxs);
             }
@@ -1370,6 +1519,47 @@ impl X86Lifter {
                 Err(idxs) => {
                     let insns = self.lift_range_from_cache(memory, start, b, &idxs, cache);
                     g(k, &insns.iter().collect::<Vec<_>>(), None)
+                }
+            })
+            .collect()
+    }
+
+    /// [`Self::lift_prefixes_cached`], with each instruction a [`RangeInsn`]: the instructions
+    /// the cache holds only decoded are lifted when `g` first reads them (the facts the walks
+    /// read — lengths, shapes, x87 and PF — need no lift: [`Self::decoded_facts`]).
+    pub fn lift_prefixes_lazy<R>(
+        &self,
+        memory: &Memory,
+        start: u64,
+        budgets: &[usize],
+        cache: &mut LiftCache,
+        mut g: impl FnMut(usize, &[RangeInsn], Option<&crate::lift::RangeShapes>) -> R,
+    ) -> Vec<R> {
+        let max = budgets.iter().copied().max().unwrap_or(0);
+        if let Ok(idxs) = self.walk_cached(memory, start, max, cache) {
+            let insns = cache.range_insns(&idxs);
+            let shapes = cache.shapes(&idxs);
+            return budgets
+                .iter()
+                .enumerate()
+                .map(|(k, &b)| {
+                    let n = b.min(insns.len());
+                    g(k, &insns[..n], Some(&shapes.prefix(n)))
+                })
+                .collect();
+        }
+        budgets
+            .iter()
+            .enumerate()
+            .map(|(k, &b)| match self.walk_cached(memory, start, b, cache) {
+                Ok(idxs) => {
+                    let shapes = cache.shapes(&idxs);
+                    g(k, &cache.range_insns(&idxs), Some(&shapes))
+                }
+                Err(idxs) => {
+                    let insns = self.lift_range_from_cache(memory, start, b, &idxs, cache);
+                    let refs: Vec<RangeInsn> = insns.iter().map(|l| RangeInsn(RangeInsnRepr::Lifted(l))).collect();
+                    g(k, &refs, None)
                 }
             })
             .collect()
@@ -5169,6 +5359,68 @@ mod tests {
         }
     }
 
+    /// A lazy cache's ranges ([`X86Lifter::lift_prefixes_lazy`]) are `lift_range`'s, whichever
+    /// of their instructions are read first and in whatever order, on random code (biased to
+    /// jumps, calls, parity reads and x87) and after dropping what lies below a start.
+    #[test]
+    fn lazy_ranges_equal_range_lift() {
+        let mut seed = 0x51_7cc1_b727_220a_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pieces: &[&[u8]] = &[
+            &[0x48, 0x89, 0xc3], // mov rbx, rax
+            &[0x83, 0xf8, 0x00], // cmp eax, 0
+            &[0x7a, 0x02],       // jp
+            &[0x0f, 0x2e, 0xc1], // ucomiss xmm0, xmm1
+            &[0x75, 0x04],       // jne
+            &[0xe8, 0x10, 0, 0, 0], // call
+            &[0xff, 0xd0],       // call rax
+            &[0xd9, 0x07],       // fld dword [rdi]
+            &[0xde, 0xc1],       // faddp
+            &[0xc3],             // ret
+            &[0x0f, 0x9a, 0xc0], // setp al
+            &[0x8e, 0xd8],       // mov ds, ax (fails to lift)
+            &[0x48, 0x8d, 0x05, 0x10, 0, 0, 0], // lea rax, [rip+0x10]
+        ];
+        let lifter = X86Lifter::new_64();
+        let text = |v: &[&LiftedInstruction]| format!("{:?}", v.iter().map(|i| (i.address, i.length, &i.ops, &*i.mnemonic)).collect::<Vec<_>>());
+        for round in 0..300 {
+            let mut code = Vec::new();
+            while code.len() < 96 {
+                if next() % 4 == 0 {
+                    code.extend((0..1 + next() % 6).map(|_| next() as u8));
+                } else {
+                    code.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+                }
+            }
+            let mem = make_memory(&code, 0x1000);
+            let mut cache = LiftCache::lazy();
+            for start in 0..code.len() as u64 {
+                let at = 0x1000 + start;
+                cache.trim(at, 64);
+                let budgets = [40, 1, 7, 3];
+                let order = next();
+                let got = lifter.lift_prefixes_lazy(&mem, at, &budgets, &mut cache, |k, v, _| {
+                    // (some of them read first, from the back)
+                    for (i, insn) in v.iter().enumerate().rev() {
+                        if (order >> (i % 64)) & 1 == 1 {
+                            let _ = insn.get();
+                        }
+                    }
+                    (k, text(&v.iter().map(RangeInsn::get).collect::<Vec<_>>()))
+                });
+                for (k, &count) in budgets.iter().enumerate() {
+                    let fresh = lifter.lift_range(&mem, at, count).unwrap();
+                    assert_eq!(got[k], (k, text(&fresh.iter().collect::<Vec<_>>())), "round {round} start +{start:#x} count {count}");
+                }
+            }
+        }
+    }
+
     /// The facts found while a lift is finished are the ones its ops give.
     #[test]
     fn lift_facts_match_ops() {
@@ -5205,6 +5457,78 @@ mod tests {
             }
         }
         assert!(lifted > 50_000, "{lifted}");
+    }
+
+    /// The facts of one decoded instruction from `decoded_facts` (when it gives them) against
+    /// its lift's: the lift succeeds, and the shape and PF read are the lift's.
+    fn check_decoded_facts(lifter: &X86Lifter, insn: iced_x86::Instruction, what: &dyn std::fmt::Debug) -> bool {
+        let Some((flags, target, pf)) = X86Lifter::decoded_facts(&insn) else { return false };
+        let fast = X86Lifter { is_64: lifter.is_64, parity: false };
+        let l = fast.lift_decoded(insn, insn.ip(), None).unwrap_or_else(|e| panic!("{what:02x?} {insn}: {e:?}"));
+        let shape = crate::lift::InsnShape::of(&l);
+        assert_eq!((flags, target), (shape.flags, shape.target), "{what:02x?} {insn}");
+        assert_eq!(pf, reads_outside_pf(&l), "{what:02x?} {insn}");
+        assert!(!x87::is_x87(&insn));
+        true
+    }
+
+    /// `decoded_facts` gives what the lift gives, on random bytes (biased to the prefixes,
+    /// escapes and jumps) and on every instruction of this test's own executable code.
+    #[test]
+    fn decoded_facts_match_lift() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut checked = 0usize;
+        let mut tried = 0usize;
+        for round in 0..400_000u32 {
+            let mut bytes = [0u8; 16];
+            for b in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            match round % 16 {
+                0 => bytes[0] = 0x0f,
+                1 => bytes[0] = 0x66,
+                2 => bytes[0] = 0xf2,
+                3 => bytes[0] = 0xf3,
+                4 => bytes[0] = 0xff,
+                5 => (bytes[0], bytes[1]) = (0x66, 0x0f),
+                6 => (bytes[0], bytes[1]) = (0xf2, 0x0f),
+                7 => (bytes[0], bytes[1]) = (0xf3, 0x0f),
+                8 => bytes[0] = 0x40 | (bytes[0] & 0xf),
+                9 => bytes[0] = 0xc5,
+                10 => bytes[0] = 0xc4,
+                11 => bytes[0] = 0x70 | (bytes[0] & 0xf),
+                _ => {}
+            }
+            for lifter in [X86Lifter::new_64(), X86Lifter::new_32()] {
+                let mut d = iced_x86::Decoder::with_ip(if lifter.is_64 { 64 } else { 32 }, &bytes, 0x40_1000, iced_x86::DecoderOptions::NONE);
+                let insn = d.decode();
+                if insn.is_invalid() {
+                    continue;
+                }
+                tried += 1;
+                checked += usize::from(check_decoded_facts(&lifter, insn, &bytes));
+            }
+        }
+        assert!(checked > 400_000 && checked * 10 > tried * 7, "{checked} of {tried}");
+        // real code: this executable's own
+        let exe = std::env::current_exe().expect("the test executable");
+        let info = reargo_loader::loader::BinaryLoader::load(&exe).expect("load it");
+        let mut real = 0usize;
+        let lifter = X86Lifter::new_64();
+        for b in info.memory.blocks().filter(|b| b.flags.contains(reargo_loader::memory::MemoryFlags::EXECUTE)) {
+            let Some(data) = &b.data else { continue };
+            let code = &data[..data.len().min(b.size as usize)];
+            let mut d = iced_x86::Decoder::with_ip(64, code, b.start, iced_x86::DecoderOptions::NONE);
+            for insn in &mut d {
+                if !insn.is_invalid() {
+                    real += usize::from(check_decoded_facts(&lifter, insn, &insn.ip()));
+                }
+            }
+        }
+        assert!(real > 100_000, "{real}");
     }
 
     /// `plain_range` answers only when `lift_range` is the lifts of its addresses alone, and
