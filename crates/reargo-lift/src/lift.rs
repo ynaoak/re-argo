@@ -45,31 +45,142 @@ impl InsnShape {
     }
 
     pub fn of(insn: &LiftedInstruction) -> InsnShape {
-        use reargo_core::pcode::OpCode;
         let mut shape = InsnShape { address: insn.address, target: 0, flags: 0 };
         for op in &insn.ops {
-            match op.opcode {
-                OpCode::Call => shape.flags |= Self::CALL,
-                OpCode::CallInd => shape.flags |= Self::CALL | Self::CALLIND,
-                OpCode::Branch | OpCode::CBranch => {
-                    if let Some(t) = Self::branch_target(op) {
-                        if shape.flags & (Self::TARGET | Self::TARGETS) == 0 {
-                            shape.flags |= Self::TARGET;
-                            shape.target = t;
-                        } else {
-                            shape.flags = (shape.flags & !Self::TARGET) | Self::TARGETS;
-                        }
-                    }
-                    shape.flags |= Self::ENDS;
-                    if op.opcode == OpCode::Branch {
-                        shape.flags |= Self::STOPS;
-                    }
-                }
-                OpCode::Return | OpCode::BranchInd => shape.flags |= Self::ENDS | Self::STOPS,
-                _ => {}
-            }
+            shape.add(op);
         }
         shape
+    }
+
+    /// The shape with the next op of the instruction, `op`.
+    #[inline]
+    pub(crate) fn add(&mut self, op: &PcodeOp) {
+        use reargo_core::pcode::OpCode;
+        match op.opcode {
+            OpCode::Call => self.flags |= Self::CALL,
+            OpCode::CallInd => self.flags |= Self::CALL | Self::CALLIND,
+            OpCode::Branch | OpCode::CBranch => {
+                if let Some(t) = Self::branch_target(op) {
+                    if self.flags & (Self::TARGET | Self::TARGETS) == 0 {
+                        self.flags |= Self::TARGET;
+                        self.target = t;
+                    } else {
+                        self.flags = (self.flags & !Self::TARGET) | Self::TARGETS;
+                    }
+                }
+                self.flags |= Self::ENDS;
+                if op.opcode == OpCode::Branch {
+                    self.flags |= Self::STOPS;
+                }
+            }
+            OpCode::Return | OpCode::BranchInd => self.flags |= Self::ENDS | Self::STOPS,
+            _ => {}
+        }
+    }
+}
+
+/// The [`InsnShape`]s of a range lifted through a [`crate::x86::LiftCache`]
+/// ([`crate::x86::X86Lifter::lift_prefixes_cached`]), kept by the cache in
+/// arrays by instruction: borrowed from them when the range's instructions
+/// are consecutive entries of the cache (a function's lift continuing the
+/// lift of the one before it), copied otherwise. The walks over many
+/// overlapping lifts read them in place instead of copying each shape.
+#[derive(Debug, Clone)]
+pub struct RangeShapes<'c> {
+    /// Each instruction's address.
+    pub addrs: std::borrow::Cow<'c, [u64]>,
+    /// Each instruction's [`InsnShape`] flags.
+    pub flags: std::borrow::Cow<'c, [u8]>,
+    /// Each instruction's [`InsnShape`] target.
+    targets: std::borrow::Cow<'c, [u64]>,
+    /// The positions plus `base` of the instructions with flags,
+    /// ascending (the others have none).
+    special: std::borrow::Cow<'c, [u32]>,
+    base: u32,
+    /// The addresses strictly increase.
+    pub increasing: bool,
+}
+
+impl<'c> RangeShapes<'c> {
+    /// Shapes borrowed from arrays by cache index: the entries
+    /// `start..start + n`, `special` the cache indices of those with flags
+    /// in that range.
+    /// (a range's instructions follow each other: each address is the one before plus its
+    /// length, so they strictly increase unless they wrap around, when the last is below the
+    /// first)
+    pub(crate) fn borrowed(addrs: &'c [u64], flags: &'c [u8], targets: &'c [u64], special: &'c [u32], start: u32) -> Self {
+        use std::borrow::Cow::Borrowed;
+        let increasing = chain_increasing(addrs);
+        RangeShapes { addrs: Borrowed(addrs), flags: Borrowed(flags), targets: Borrowed(targets), special: Borrowed(special), base: start, increasing }
+    }
+
+    /// Shapes copied out by instruction, of a range (`increasing` as
+    /// [`Self::borrowed`] finds it).
+    pub(crate) fn owned(addrs: Vec<u64>, flags: Vec<u8>, targets: Vec<u64>) -> RangeShapes<'static> {
+        let increasing = chain_increasing(&addrs);
+        Self::owned_with(addrs, flags, targets, increasing)
+    }
+
+    fn owned_with(addrs: Vec<u64>, flags: Vec<u8>, targets: Vec<u64>, increasing: bool) -> RangeShapes<'static> {
+        let special = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect::<Vec<_>>();
+        use std::borrow::Cow::Owned;
+        RangeShapes { addrs: Owned(addrs), flags: Owned(flags), targets: Owned(targets), special: Owned(special), base: 0, increasing }
+    }
+
+    /// The shapes of `insns`, read from their ops.
+    pub fn of<I: std::borrow::Borrow<LiftedInstruction>>(insns: &[I]) -> RangeShapes<'static> {
+        let shapes: Vec<InsnShape> = insns.iter().map(|i| InsnShape::of(i.borrow())).collect();
+        let addrs: Vec<u64> = shapes.iter().map(|s| s.address).collect();
+        let increasing = addrs.windows(2).all(|w| w[0] < w[1]);
+        Self::owned_with(addrs, shapes.iter().map(|s| s.flags).collect(), shapes.iter().map(|s| s.target).collect(), increasing)
+    }
+
+    /// How many instructions.
+    pub fn len(&self) -> usize {
+        self.addrs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.addrs.is_empty()
+    }
+
+    /// The shapes of the first `n` instructions.
+    pub fn prefix(&self, n: usize) -> RangeShapes<'_> {
+        use std::borrow::Cow::Borrowed;
+        let n = n.min(self.len());
+        let end = self.base as u64 + n as u64;
+        let k = self.special.partition_point(|&p| u64::from(p) < end);
+        RangeShapes {
+            addrs: Borrowed(&self.addrs[..n]),
+            flags: Borrowed(&self.flags[..n]),
+            targets: Borrowed(&self.targets[..n]),
+            special: Borrowed(&self.special[..k]),
+            base: self.base,
+            // (a prefix of an increasing range increases; of one wrapping around, may)
+            increasing: self.increasing || chain_increasing(&self.addrs[..n]),
+        }
+    }
+
+    /// The positions of the instructions with flags (a call, a jump, a
+    /// return), ascending.
+    pub fn special(&self) -> impl ExactSizeIterator<Item = usize> + DoubleEndedIterator + '_ {
+        let base = self.base;
+        self.special.iter().map(move |&p| (p - base) as usize)
+    }
+
+    /// The [`InsnShape`] of instruction `i`.
+    pub fn shape(&self, i: usize) -> InsnShape {
+        InsnShape { address: self.addrs[i], target: self.targets[i], flags: self.flags[i] }
+    }
+}
+
+/// Whether the addresses of a range's instructions (each the one before plus
+/// its length) strictly increase: they do unless they wrap around the address
+/// space, and then the last is below the first.
+fn chain_increasing(addrs: &[u64]) -> bool {
+    match (addrs.first(), addrs.last()) {
+        (Some(first), Some(last)) => addrs.len() == 1 || last > first,
+        _ => true,
     }
 }
 

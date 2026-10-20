@@ -190,7 +190,7 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
                     // Only a `CallInd` gives a result, and the walk runs
                     // forward: what follows the last one changes nothing.
                     let last = match shapes {
-                        Some(shapes) => shapes.iter().rposition(|s| s.flags & reargo_lift::InsnShape::CALLIND != 0),
+                        Some(shapes) => shapes.special().rev().find(|&i| shapes.flags[i] & reargo_lift::InsnShape::CALLIND != 0),
                         None => insns.len().checked_sub(1),
                     };
                     if got.is_some()

@@ -393,7 +393,7 @@ pub(crate) fn walk_function_shaped<I: std::borrow::Borrow<LiftedInstruction>>(
         return out;
     };
     let mut joins = join_points_shaped(shape);
-    for (j, a) in joins.iter_mut().zip(&shape.addrs) {
+    for (j, a) in joins.iter_mut().zip(shape.addrs.iter()) {
         *j |= external.contains(a);
     }
     for ((insn, &join), &owned) in insns[..=last].iter().map(std::borrow::Borrow::borrow).zip(&joins).zip(&owned) {
@@ -991,7 +991,7 @@ fn join_points_shaped(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
                 out[i] = true;
             }
         }
-        for (o, &f) in out.iter_mut().skip(1).zip(&shape.flags) {
+        for (o, &f) in out.iter_mut().skip(1).zip(shape.flags.iter()) {
             *o |= f & reargo_lift::InsnShape::STOPS != 0;
         }
         return out;
@@ -1054,7 +1054,7 @@ mod tests {
                 .iter()
                 .map(|&s| if s { reargo_lift::InsnShape::STOPS | reargo_lift::InsnShape::ENDS } else { 0 })
                 .collect();
-            let shape = crate::blockflow::LiftShape { increasing: true, flags, addrs, branches };
+            let shape = crate::blockflow::LiftShape::from_parts(true, addrs, flags, branches);
             assert_eq!(join_points_shaped(&shape), join_points_hashed(&shape));
         }
     }
