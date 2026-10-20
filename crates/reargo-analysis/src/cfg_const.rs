@@ -36,7 +36,7 @@ use reargo_program::Program;
 use rayon::prelude::*;
 
 use crate::blockflow::{self, FlowState};
-use crate::byteconst::{eval, is_unmodeled, is_view_refresh, ByteConst, ByteMem, RegFile};
+use crate::byteconst::{eval, is_unmodeled, is_view_refresh, ByteConst, ByteMem, RegList};
 use crate::func_lift::{external_entries, function_jobs, in_extent, lift_function};
 
 /// Constants observed on entry to each call instruction.
@@ -139,7 +139,7 @@ pub fn merge_snapshots(out: &mut CallConstants, snaps: CallSnapshots) {
 /// non-register varnodes (UNIQUE temporaries, …) with their size.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct State {
-    regs: RegFile,
+    regs: RegList,
     temps: ByteMem<SpaceId>,
 }
 
