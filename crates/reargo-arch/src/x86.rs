@@ -708,8 +708,14 @@ mod tests {
             let mut decoder = arch.instruction_decoder(&mem);
             // in order, backwards, and jumping between the blocks
             let mixed = addrs.iter().copied().step_by(7).chain(addrs.iter().rev().copied().step_by(3));
-            for a in addrs.iter().copied().chain(mixed) {
+            for a in addrs.iter().copied().chain(mixed.clone()) {
                 assert_eq!(key(decoder.decode(a)), key(arch.decode_instruction(&mem, a)), "at {a:#x}");
+            }
+            // the flow alone, as the decode gives it (an error where it gives one)
+            let mut decoder = arch.instruction_decoder(&mem);
+            for a in addrs.iter().copied().chain(mixed) {
+                let expected = arch.decode_instruction(&mem, a).map(|d| (d.length, d.flow_type, d.branch_target)).map_err(|e| e.to_string());
+                assert_eq!(decoder.decode_flow(a).map_err(|e| e.to_string()), expected, "flow at {a:#x}");
             }
         }
     }

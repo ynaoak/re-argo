@@ -1134,6 +1134,45 @@ mod tests {
         assert!(sites > 1000 && known > 300, "{sites} {known}");
     }
 
+    /// The prefix walk, which steps over the runs that give nothing once a
+    /// stack address escaped and `rbp` was written, records what the walk
+    /// from the lift's shape does (lifts that write `rbp` and pass stack
+    /// addresses around).
+    #[test]
+    fn marked_walk_with_frame_registers_matches_shaped_walk() {
+        use crate::callsite::{walk_function_shaped, walk_prefix, ParamSummaries, WalkPrefix};
+        let mut seed = 0x7a3c_91e5_02d4_b86f_u64;
+        let (mut sites, mut known) = (0, 0);
+        for round in 0..600 {
+            let n = 1 + round % 80;
+            let mut insns = random_lift(&mut seed, n);
+            // registers 0..3 as rdi, rbp and rsp: copies of rsp leave stack
+            // addresses in rdi / rbp
+            for insn in &mut insns {
+                for op in &mut insn.ops {
+                    for vn in op.inputs.iter_mut().chain(op.output.as_mut()) {
+                        if vn.space == SpaceId::REGISTER {
+                            vn.offset = [0x38, 0x28, 0x20][vn.offset as usize];
+                        }
+                    }
+                }
+            }
+            let external: BTreeSet<u64> = insns.iter().map(|i| i.address).filter(|a| a.is_multiple_of(28)).collect();
+            let shape = LiftShape::of(&insns);
+            let owns = |i: usize| insns[i].address.is_multiple_of(5);
+            let owns_at = |a: u64| insns.iter().position(|i| i.address == a).is_some_and(owns);
+            let marks = LiftMarks::new(&shape, &external, owns);
+            let none = ParamSummaries::default();
+            let a = walk_function_shaped(0x1000, &insns, &shape, &none, &external, owns_at);
+            let prefix = WalkPrefix::of_marks(&shape, &marks, true);
+            let b = walk_prefix(0x1000, &insns, &prefix.flags, &none);
+            assert_eq!(a, b, "round {round}");
+            sites += a.len();
+            known += a.iter().flat_map(|s| &s.args).filter(|r| r.value.is_some()).count();
+        }
+        assert!(sites > 500 && known > 50, "{sites} {known}");
+    }
+
     /// The block-indexed walk gives exactly the address-keyed one, and
     /// walking only the blocks that reach the wanted calls keeps their
     /// snapshots, in order.
