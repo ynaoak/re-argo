@@ -33,7 +33,8 @@ pub struct FormatVarargsAnalyzer;
 
 impl Analyzer for FormatVarargsAnalyzer {
     fn writes(&self) -> State {
-        State::COMMENTS.union(State::METADATA).union(State::CACHE)
+        // it takes the shared results the Call Site Annotator stored
+        State::COMMENTS.union(State::METADATA).union(State::CACHE).union(State::SHARED_LIFT)
     }
     fn name(&self) -> &str {
         "Format Varargs"

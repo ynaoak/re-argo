@@ -484,15 +484,22 @@ where
 {
     let memory = &program.info.memory;
     match lifter.as_x86() {
-        Some(x86) => jobs
-            .par_iter()
-            .with_min_len(crate::range_lift::min_len(jobs.len()))
-            .map_init(reargo_lift::x86::LiftCache::new, |cache, &(entry, max_insns)| {
-                crate::range_lift::trim(cache, entry);
-                let range = x86.lift_range_cached(memory, entry, max_insns, cache);
-                Some(f(entry, &range.insns()))
-            })
-            .collect(),
+        Some(x86) => {
+            // runs of consecutive jobs bounded by their budgets
+            let costs: Vec<usize> = jobs.iter().map(|&(_, max_insns)| max_insns).collect();
+            crate::range_lift::cost_chunks(&costs)
+                .into_par_iter()
+                .flat_map_iter(|run| {
+                    let mut cache = reargo_lift::x86::LiftCache::new();
+                    let f = &f;
+                    jobs[run].iter().map(move |&(entry, max_insns)| {
+                        crate::range_lift::trim(&mut cache, entry);
+                        let range = x86.lift_range_cached(memory, entry, max_insns, &mut cache);
+                        Some(f(entry, &range.insns()))
+                    })
+                })
+                .collect()
+        }
         None => jobs
             .par_iter()
             .map(|&(entry, max_insns)| {

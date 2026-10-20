@@ -361,3 +361,127 @@ impl AnalysisManager {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An analyzer that only declares what it reads and writes.
+    struct Fake {
+        name: &'static str,
+        priority: u32,
+        reads: Option<State>,
+        writes: State,
+    }
+
+    impl Analyzer for Fake {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn priority(&self) -> u32 {
+            self.priority
+        }
+        fn analyze(&self, _: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+            unreachable!("never run")
+        }
+        fn writes(&self) -> State {
+            self.writes
+        }
+        fn prepare_reads(&self) -> Option<State> {
+            self.reads
+        }
+    }
+
+    fn fake(name: &'static str, priority: u32, reads: Option<State>, writes: State) -> Box<dyn Analyzer> {
+        Box::new(Fake { name, priority, reads, writes })
+    }
+
+    /// Where each split analyzer prepares: the index of the first
+    /// analyzer of that run, by name.
+    fn prepared_at(manager: &AnalysisManager) -> Vec<(String, usize)> {
+        manager
+            .windows()
+            .iter()
+            .flat_map(|w| w.prepared.iter().map(|&i| (manager.analyzers[i].name().to_string(), w.analyzers.start)))
+            .collect()
+    }
+
+    fn index_of(manager: &AnalysisManager, name: &str) -> usize {
+        manager.analyzers.iter().position(|a| a.name() == name).expect("in the pipeline")
+    }
+
+    /// Every split analyzer prepares no later than its own place, at the
+    /// start of a run, and no analyzer from there up to its place writes
+    /// anything its `prepare` reads.
+    fn assert_placement_holds(manager: &AnalysisManager) {
+        let windows = manager.windows();
+        let mut seen = 0;
+        for w in &windows {
+            for &i in &w.prepared {
+                seen += 1;
+                let reads = manager.analyzers[i].prepare_reads().expect("a split analyzer");
+                assert!(w.analyzers.start <= i, "{} prepares after its place", manager.analyzers[i].name());
+                for a in &manager.analyzers[w.analyzers.start..i] {
+                    assert!(
+                        !reads.intersects(a.writes()),
+                        "{} prepares before {}, which writes what it reads",
+                        manager.analyzers[i].name(),
+                        a.name()
+                    );
+                }
+            }
+        }
+        let split = manager.analyzers.iter().filter(|a| a.prepare_reads().is_some()).count();
+        assert_eq!(seen, split, "every split analyzer prepares once");
+    }
+
+    #[test]
+    fn pipeline_prepares_after_the_writers_of_their_reads() {
+        assert_placement_holds(&AnalysisManager::new());
+    }
+
+    #[test]
+    fn shared_lift_reader_prepares_after_its_writer() {
+        // a run that prepares from the start, then an analyzer storing
+        // the shared results and one writing something else
+        let mut m = AnalysisManager {
+            analyzers: vec![
+                fake("early", 1, Some(State::TAGS), State::NONE),
+                fake("stores shared results", 2, None, State::CACHE.union(State::SHARED_LIFT)),
+                fake("other", 3, None, State::METADATA),
+                fake("reads shared results", 4, Some(State::SHARED_LIFT), State::COMMENTS),
+            ],
+            overlap: true,
+        };
+        assert_placement_holds(&m);
+        let at = prepared_at(&m);
+        assert_eq!(at, [("early".to_string(), 0), ("reads shared results".to_string(), 3)]);
+        // without the flag nothing would hold it back
+        m.analyzers[1] = fake("stores shared results", 2, None, State::NONE);
+        assert_eq!(prepared_at(&m)[1], ("reads shared results".to_string(), 0));
+    }
+
+    #[test]
+    fn call_site_annotator_prepares_after_a_shared_lift_writer() {
+        // in the real pipeline, the annotator's `prepare` (which looks
+        // for stored shared results) stays after any analyzer before it
+        // that stores or takes them, even one writing nothing else
+        let annotator = "Call Site Annotator";
+        let mut m = AnalysisManager::new();
+        let place = m.analyzers[index_of(&m, annotator)].priority();
+        m.add_analyzer(fake("stores shared results", place - 1, None, State::CACHE.union(State::SHARED_LIFT)));
+        assert_placement_holds(&m);
+        let writer = index_of(&m, "stores shared results");
+        let (_, start) = prepared_at(&m).into_iter().find(|(n, _)| n == annotator).expect("the annotator prepares");
+        assert!(start > writer, "the annotator prepares at {start}, before the writer at {writer}");
+        // an analyzer writing only other cache entries does not hold it back
+        let mut m = AnalysisManager::new();
+        let before = prepared_at(&m).into_iter().find(|(n, _)| n == annotator).unwrap().1;
+        m.add_analyzer(fake("other cache entry", place - 1, None, State::CACHE));
+        let after = prepared_at(&m).into_iter().find(|(n, _)| n == annotator).unwrap().1;
+        assert!(after <= before + 1, "{after} vs {before}");
+    }
+}

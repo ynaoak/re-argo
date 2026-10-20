@@ -13,25 +13,28 @@ use reargo_lift::x86::{LiftCache, X86Lifter};
 use reargo_lift::{InsnShape, LiftedInstruction};
 use reargo_loader::Memory;
 
-/// Fewest consecutive jobs run on one thread with one cache: the
-/// overlap into the next run of jobs is lifted again.
+/// Most consecutive jobs run on one thread with one cache
+/// ([`cost_chunks`]): the overlap into the next run of jobs is lifted
+/// again.
 pub(crate) const CHUNK: usize = 64;
-
-/// The fewest consecutive jobs of `jobs` run on one thread: [`CHUNK`],
-/// or fewer when that would leave threads idle (a few jobs, as the new
-/// functions an analyzer finds not computed ahead).
-pub(crate) fn min_len(jobs: usize) -> usize {
-    CHUNK.min(jobs.div_ceil(rayon::current_num_threads()).max(1))
-}
 
 /// Runs of consecutive jobs (index ranges, in order) for jobs of the
 /// given `costs`: each at most [`CHUNK`] jobs and, past its first job,
 /// at most an even share of the total cost split many ways per thread.
 /// A run of the costliest neighbours (one large function after another)
 /// would otherwise be the last thing a run of jobs waits for.
+/// On one thread there is nothing to balance: one run of every job.
 pub(crate) fn cost_chunks(costs: &[usize]) -> Vec<std::ops::Range<usize>> {
+    cost_chunks_for(costs, rayon::current_num_threads())
+}
+
+/// [`cost_chunks`] for `threads` threads.
+fn cost_chunks_for(costs: &[usize], threads: usize) -> Vec<std::ops::Range<usize>> {
+    if threads <= 1 {
+        return if costs.is_empty() { Vec::new() } else { vec![0..costs.len()] };
+    }
     let total: usize = costs.iter().sum();
-    let cap = (total / (rayon::current_num_threads() * 16)).max(1);
+    let cap = (total / (threads * 16)).max(1);
     let mut chunks = Vec::new();
     let mut start = 0;
     let mut cost = 0;
@@ -67,26 +70,35 @@ where
     T: Send,
     F: Fn(u64, &[&LiftedInstruction]) -> T + Sync,
 {
-    map_with_lifter(memory, jobs, |&(entry, count), lifter| lifter.with(entry, count, |insns| f(entry, insns)))
+    map_with_lifter(
+        memory,
+        jobs,
+        |&(_, count)| count,
+        |&(entry, count), lifter| lifter.with(entry, count, |insns| f(entry, insns)),
+    )
 }
 
 /// `f(job, lifter)` for every job in order, where `lifter` lifts any
 /// ranges the job needs ([`RangeLifter::with`]); the consecutive jobs a
-/// thread runs (runs of at least [`CHUNK`]) share the lifted
-/// instructions, the instructions below the job's ranges dropped as the
-/// run moves on ([`trim`]).
-pub fn map_with_lifter<J, T, F>(memory: &Memory, jobs: &[J], f: F) -> Vec<T>
+/// thread runs share the lifted instructions, the instructions below
+/// the job's ranges dropped as the run moves on ([`trim`]). The runs
+/// are bounded by the jobs' `cost` (the instructions a job lifts,
+/// [`cost_chunks`]), so no thread is left with a run of the largest
+/// functions at the end.
+pub fn map_with_lifter<J, T, F>(memory: &Memory, jobs: &[J], cost: impl Fn(&J) -> usize, f: F) -> Vec<T>
 where
     J: Sync,
     T: Send,
     F: Fn(&J, &mut RangeLifter) -> T + Sync,
 {
-    jobs.par_iter()
-        .with_min_len(min_len(jobs.len()))
-        .map_init(
-            || RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() },
-            |lifter, job| f(job, lifter),
-        )
+    let costs: Vec<usize> = jobs.iter().map(cost).collect();
+    cost_chunks(&costs)
+        .into_par_iter()
+        .flat_map_iter(|run| {
+            let mut lifter = RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() };
+            let f = &f;
+            jobs[run].iter().map(move |job| f(job, &mut lifter))
+        })
         .collect()
 }
 
@@ -150,6 +162,32 @@ pub fn with_ahead<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_chunks_cover_the_jobs_in_order() {
+        let costs: Vec<usize> = (0..1000).map(|k| if k % 97 == 0 { 50_000 } else { 500 + k % 7 }).collect();
+        for threads in [1, 2, 4, 8] {
+            let chunks = cost_chunks_for(&costs, threads);
+            let mut next = 0;
+            for c in &chunks {
+                assert_eq!(c.start, next);
+                assert!(!c.is_empty() && c.len() <= if threads == 1 { costs.len() } else { CHUNK });
+                next = c.end;
+            }
+            assert_eq!(next, costs.len());
+            if threads > 1 {
+                // a run of several jobs costs no more than its share
+                let cap = costs.iter().sum::<usize>() / (threads * 16);
+                assert!(chunks.iter().filter(|c| c.len() > 1).all(|c| costs[c.clone()].iter().sum::<usize>() <= cap));
+                // so a large job runs alone
+                assert!(chunks.iter().all(|c| c.len() == 1 || costs[c.clone()].iter().all(|&x| x < 50_000)));
+            } else {
+                assert_eq!(chunks.len(), 1);
+            }
+        }
+        assert!(cost_chunks_for(&[], 4).is_empty());
+        assert!(cost_chunks_for(&[], 1).is_empty());
+    }
 
     #[test]
     fn with_ahead_keeps_job_order() {
