@@ -52,7 +52,7 @@ impl MemoryBlock {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Memory {
     /// By start address, at most one per start (a block added at the
     /// start of another replaces it). A sorted vector: a handful of

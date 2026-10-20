@@ -71,8 +71,10 @@ impl Analyzer for TlshAnalyzer {
     }
     fn start_early(&self, program: &mut Program) {
         // the loaded bytes are fixed for the run
-        let buf = binary_bytes(&program.info);
-        crate::analyzer::Early::<TlshAnalyzer, Option<String>>::start(program, move || hash(&buf));
+        // the bytes are gathered on that thread (a clone of the memory
+        // shares them)
+        let memory = program.info.memory.clone();
+        crate::analyzer::Early::<TlshAnalyzer, Option<String>>::start(program, move || hash(&binary_bytes(&memory)));
     }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
@@ -104,13 +106,13 @@ impl Analyzer for TlshAnalyzer {
 /// PE / ELF header bytes (which would otherwise dominate small
 /// samples). For multi-MB binaries the header noise is negligible.
 pub fn compute_for_binary(info: &BinaryInfo) -> Option<String> {
-    hash(&binary_bytes(info))
+    hash(&binary_bytes(&info.memory))
 }
 
 /// The bytes [`compute_for_binary`] hashes.
-fn binary_bytes(info: &BinaryInfo) -> Vec<u8> {
+fn binary_bytes(memory: &reargo_loader::memory::Memory) -> Vec<u8> {
     let mut buf = Vec::new();
-    for block in info.memory.blocks() {
+    for block in memory.blocks() {
         if let Some(data) = &block.data {
             buf.extend_from_slice(data);
             if buf.len() > 8 * 1024 * 1024 {
