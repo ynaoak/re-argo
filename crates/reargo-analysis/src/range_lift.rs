@@ -17,6 +17,13 @@ use reargo_loader::Memory;
 /// overlap into the next run of jobs is lifted again.
 pub(crate) const CHUNK: usize = 64;
 
+/// The fewest consecutive jobs of `jobs` run on one thread: [`CHUNK`],
+/// or fewer when that would leave threads idle (a few jobs, as the new
+/// functions an analyzer finds not computed ahead).
+pub(crate) fn min_len(jobs: usize) -> usize {
+    CHUNK.min(jobs.div_ceil(rayon::current_num_threads()).max(1))
+}
+
 /// Instructions a cache holds before those below the range being lifted
 /// are dropped ([`trim`]).
 const RETAIN_AT: usize = 4096;
@@ -50,7 +57,7 @@ where
     F: Fn(&J, &mut RangeLifter) -> T + Sync,
 {
     jobs.par_iter()
-        .with_min_len(CHUNK)
+        .with_min_len(min_len(jobs.len()))
         .map_init(
             || RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() },
             |lifter, job| f(job, lifter),

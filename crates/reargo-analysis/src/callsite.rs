@@ -487,7 +487,7 @@ where
     match lifter.as_x86() {
         Some(x86) => jobs
             .par_iter()
-            .with_min_len(crate::range_lift::CHUNK)
+            .with_min_len(crate::range_lift::min_len(jobs.len()))
             .map_init(reargo_lift::x86::LiftCache::new, |cache, &(entry, max_insns)| {
                 crate::range_lift::trim(cache, entry);
                 let range = x86.lift_range_cached(memory, entry, max_insns, cache);
