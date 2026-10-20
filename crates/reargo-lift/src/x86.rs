@@ -548,6 +548,9 @@ impl LiftCache {
 /// Addresses per page of an [`AddrIndex`].
 const INDEX_PAGE: u64 = 1024;
 
+/// The emptied pages an [`AddrIndex`] keeps for reuse, at most.
+const MAX_SPARE_PAGES: usize = 128;
+
 /// No index ([`AddrIndex`]).
 const NO_INDEX: u32 = u32::MAX;
 
@@ -563,7 +566,7 @@ struct AddrIndex {
     /// The page looked up last and its position (`None`: none yet).
     last: Option<(u64, u32)>,
     /// Pages [`Self::shift_down`] emptied (every slot [`NO_INDEX`]), for
-    /// [`Self::page_of`] to use again.
+    /// [`Self::page_of`] to use again (up to [`MAX_SPARE_PAGES`]).
     spare: Vec<Box<[u32; INDEX_PAGE as usize]>>,
 }
 
@@ -607,7 +610,7 @@ impl AddrIndex {
             if any {
                 kept.insert(at as u32, self.pages.len() as u32);
                 self.pages.push(page);
-            } else {
+            } else if self.spare.len() < MAX_SPARE_PAGES {
                 self.spare.push(page);
             }
         }
