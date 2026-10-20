@@ -185,9 +185,23 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
             fn lifted<'c>(insns: &[reargo_lift::x86::RangeInsn<'c>]) -> Vec<&'c reargo_lift::LiftedInstruction> {
                 insns.iter().map(|i| i.get()).collect()
             }
+            /// The instructions up to the first whose lift returns, lifted.
+            fn lifted_to_return<'c>(insns: &[reargo_lift::x86::RangeInsn<'c>]) -> Vec<&'c reargo_lift::LiftedInstruction> {
+                let mut out = Vec::with_capacity(insns.len());
+                for i in insns {
+                    let insn = i.get();
+                    out.push(insn);
+                    if insn.ops.iter().any(|op| op.opcode == OpCode::Return) {
+                        break;
+                    }
+                }
+                out
+            }
             lifter.with_budgets_lazy(entry, budgets, |k, insns, shapes| match k {
                 STACK => {
-                    let insns = lifted(insns);
+                    // (both stop after the first instruction that
+                    // returns: the rest is not lifted for them)
+                    let insns = lifted_to_return(insns);
                     stack = Some(stack_info_lifted(entry, &insns));
                     propagation = crate::propagation::analyse_lifted(&insns, &valid_ranges);
                 }

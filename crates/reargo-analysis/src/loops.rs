@@ -135,17 +135,12 @@ impl Analyzer for LoopAnalyzer {
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         type Comments = Vec<(u64, String)>;
         let (posts, plates): (Comments, Comments) = crate::analyzer::prepared(prepared);
-        let mut emitted = 0usize;
-        for (branch, text) in posts {
-            if program.comments.set_if_absent(branch, CommentType::Post, text) {
-                emitted += 1;
-            }
-        }
-        for (target, text) in plates {
-            if program.comments.set_if_absent(target, CommentType::Plate, text) {
-                emitted += 1;
-            }
-        }
+        let emitted = program.comments.set_all_if_absent(
+            posts
+                .into_iter()
+                .map(|(branch, text)| (branch, CommentType::Post, text))
+                .chain(plates.into_iter().map(|(target, text)| (target, CommentType::Plate, text))),
+        );
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

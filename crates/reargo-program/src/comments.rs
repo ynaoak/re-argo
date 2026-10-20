@@ -53,6 +53,32 @@ impl CommentManager {
         }
     }
 
+    /// [`Self::set_if_absent`] of each item in turn; returns how many
+    /// were set. Many items are merged into the map in one pass over it
+    /// instead of a lookup each.
+    pub fn set_all_if_absent<S: Into<String>>(&mut self, items: impl IntoIterator<Item = (u64, CommentType, S)>) -> usize {
+        let mut new: Vec<((u64, CommentType), S)> = items.into_iter().map(|(a, t, s)| ((a, t), s)).collect();
+        if new.len() < 64 || new.len() * 8 < self.comments.len() {
+            return new.into_iter().map(|((a, t), s)| usize::from(self.set_if_absent(a, t, s))).sum();
+        }
+        // the first item of each key (a stable sort keeps their order) …
+        new.sort_by_key(|(k, _)| *k);
+        new.dedup_by(|later, earlier| later.0 == earlier.0);
+        // … whose key the map does not hold (the map's keys from the
+        // first item's on, read along)
+        {
+            let mut keys = self.comments.range(new[0].0..).map(|(k, _)| *k).peekable();
+            new.retain(|(k, _)| {
+                while keys.next_if(|e| e < k).is_some() {}
+                keys.peek() != Some(k)
+            });
+        }
+        let set = new.len();
+        let mut added: BTreeMap<(u64, CommentType), String> = new.into_iter().map(|(k, s)| (k, s.into())).collect();
+        self.comments.append(&mut added);
+        set
+    }
+
     pub fn get(&self, address: u64, comment_type: CommentType) -> Option<&str> {
         self.comments.get(&(address, comment_type)).map(|s| s.as_str())
     }
@@ -135,6 +161,39 @@ impl BookmarkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bulk set gives the map and count `set_if_absent` of each item
+    /// in turn gives (repeated keys, keys already there, few and many).
+    #[test]
+    fn set_all_if_absent_matches_one_by_one() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let types = [CommentType::Eol, CommentType::Post, CommentType::Plate];
+        for (existing, items) in [(0usize, 10usize), (5, 100), (300, 100), (1000, 20), (50, 2000)] {
+            let mut base = CommentManager::new();
+            for _ in 0..existing {
+                let k = next();
+                base.set(k % 512, types[(k >> 20) as usize % 3], format!("old {k}"));
+            }
+            let list: Vec<(u64, CommentType, String)> = (0..items)
+                .map(|i| {
+                    let k = next();
+                    (k % 512, types[(k >> 20) as usize % 3], format!("new {i}"))
+                })
+                .collect();
+            let mut one = CommentManager::from_cache_parts(base.cache_parts().clone());
+            let n_one: usize = list.iter().map(|(a, t, s)| usize::from(one.set_if_absent(*a, *t, s.clone()))).sum();
+            let mut bulk = CommentManager::from_cache_parts(base.cache_parts().clone());
+            let n_bulk = bulk.set_all_if_absent(list);
+            assert_eq!(n_bulk, n_one);
+            assert_eq!(bulk.cache_parts(), one.cache_parts());
+        }
+    }
 
     #[test]
     fn comment_manager() {

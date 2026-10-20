@@ -148,28 +148,46 @@ impl Analyzer for StringHintRenameAnalyzer {
     }
 }
 
-fn read_c_string(program: &Program, addr: u64) -> Option<String> {
-    let mut buf = [0u8; 64];
-    let n = [64, 32, 16, 8]
-        .into_iter()
-        .find(|&n| program.info.memory.read_bytes(addr, &mut buf[..n]).is_ok())?;
-    let nul = buf[..n].iter().position(|&b| b == 0)?;
+fn read_c_string(program: &Program, addr: u64) -> Option<std::borrow::Cow<'_, str>> {
+    // The bytes `Memory::read_bytes` reads (the longest of the probe
+    // lengths the block holding `addr` has initialized bytes for), in
+    // place.
+    let block = program.info.memory.find_block(addr)?;
+    let data = block.data.as_deref()?;
+    let avail = data.len().checked_sub(usize::try_from(addr - block.start).ok()?)?;
+    let n = [64, 32, 16, 8].into_iter().find(|&n| n <= avail)?;
+    let start = data.len() - avail;
+    let buf = &data[start..start + n];
+    let nul = memchr::memchr(0, buf)?;
     if nul < 6 {
         return None;
     }
     let s = &buf[..nul];
-    let printable = s
-        .iter()
-        .filter(|&&b| (b' '..=b'~').contains(&b) || b == b'\n' || b == b'\t')
-        .count();
-    if printable * 5 < s.len() * 4 {
-        return None;
+    // At least four fifths printable: stop at the first byte of the
+    // others that makes them more than a fifth.
+    const OTHER: [bool; 256] = {
+        let mut t = [true; 256];
+        let mut b = b' ';
+        while b <= b'~' {
+            t[b as usize] = false;
+            b += 1;
+        }
+        t[b'\n' as usize] = false;
+        t[b'\t' as usize] = false;
+        t
+    };
+    let mut others = 0usize;
+    for &b in s {
+        others += usize::from(OTHER[b as usize]);
+        if others * 5 > s.len() {
+            return None;
+        }
     }
     let has_alpha = s.iter().any(|&b| b.is_ascii_alphabetic());
     if !has_alpha {
         return None;
     }
-    Some(String::from_utf8_lossy(s).into_owned())
+    Some(String::from_utf8_lossy(s))
 }
 
 /// Turn a free-form string into a C-identifier-shaped slug, capped

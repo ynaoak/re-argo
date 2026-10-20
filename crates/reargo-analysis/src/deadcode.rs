@@ -115,6 +115,17 @@ impl Analyzer for DeadCodeAnalyzer {
 
             block_starts.sort_unstable();
             block_starts.dedup();
+            // The instruction each block start is, found in one pass over
+            // both sorted lists (`u32::MAX`: none starts there): what the
+            // walk's search from a block start finds.
+            let mut start_at: Vec<u32> = Vec::with_capacity(block_starts.len());
+            let mut j = 0;
+            for &s in &block_starts {
+                while j < insns.len() && insns[j].0 < s {
+                    j += 1;
+                }
+                start_at.push(if j < insns.len() && insns[j].0 == s { j as u32 } else { u32::MAX });
+            }
 
             // Walk reachability from entry using fall-through +
             // branch edges (in any order: the set reached is the same).
@@ -125,7 +136,8 @@ impl Analyzer for DeadCodeAnalyzer {
             let mut queue: Vec<u64> = vec![snap.entry];
             while let Some(b) = queue.pop() {
                 let p = block_starts.partition_point(|&s| s <= b);
-                let fresh = if p > 0 && block_starts[p - 1] == b {
+                let is_start = p > 0 && block_starts[p - 1] == b;
+                let fresh = if is_start {
                     !std::mem::replace(&mut reached_start[p - 1], true)
                 } else {
                     reached_other.insert(b)
@@ -137,7 +149,12 @@ impl Analyzer for DeadCodeAnalyzer {
                 // bump into the next block start.
                 let mut cur = b;
                 let next_start = block_starts.get(p).copied().unwrap_or(u64::MAX);
-                let mut idx = insns.binary_search_by_key(&cur, |(a, _, _, _)| *a);
+                let mut idx = match is_start {
+                    // (an instruction at `b` is found either way; the
+                    // instructions of an address are alike)
+                    true if start_at[p - 1] != u32::MAX => Ok(start_at[p - 1] as usize),
+                    _ => insns.binary_search_by_key(&cur, |(a, _, _, _)| *a),
+                };
                 while let Ok(i) = idx {
                     let (addr, len, ft, tgt) = insns[i];
                     if addr >= next_start {
@@ -191,12 +208,9 @@ impl Analyzer for DeadCodeAnalyzer {
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         let all_unreachable: Vec<u64> = crate::analyzer::prepared(prepared);
-        let mut emitted = 0usize;
-        for addr in all_unreachable {
-            if program.comments.set_if_absent(addr, CommentType::Plate, "unreachable from function entry") {
-                emitted += 1;
-            }
-        }
+        let emitted = program
+            .comments
+            .set_all_if_absent(all_unreachable.into_iter().map(|addr| (addr, CommentType::Plate, "unreachable from function entry")));
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
@@ -212,17 +226,19 @@ impl Analyzer for DeadCodeAnalyzer {
 /// space: always).
 fn merge_body_ranges(body: &reargo_core::address::AddressSet) -> Vec<(u64, u64)> {
     let mut merged: Vec<(u64, u64)> = Vec::new();
-    let mut last: Option<(u64, u64)> = None;
+    // (merging ranges in order of their starts gives the merge; a start
+    // before the one before — another space's — falls back to sorting)
+    let mut last_start = 0;
     for r in body.ranges() {
         let (s, e) = (r.start.offset, r.start.offset + r.size);
         if s >= e {
             continue;
         }
-        if last.is_some_and(|l| (s, e) < l) {
+        if s < last_start {
             let ranges: Vec<(u64, u64)> = body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).collect();
             return merge_ranges(&ranges);
         }
-        last = Some((s, e));
+        last_start = s;
         match merged.last_mut() {
             Some(m) if s <= m.1 => m.1 = m.1.max(e),
             _ => merged.push((s, e)),
