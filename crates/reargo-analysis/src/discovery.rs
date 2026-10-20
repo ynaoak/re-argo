@@ -164,7 +164,7 @@ impl Found {
         for (entry, body) in self.bodies {
             if let Some(f) = program.listing.get_function_mut(entry) {
                 // (re-walked block starts repeat)
-                f.body = body.into_iter().collect();
+                f.body = body_set(body);
             }
         }
     }
@@ -250,6 +250,19 @@ fn discover(
         }
     }
     (functions_found, references_found, instructions_decoded)
+}
+
+/// The set of the ranges of a function's instructions walked (one per
+/// instruction, in the walk's order: ascending within each block, block
+/// starts walked again repeated). As collecting them into the set does,
+/// sorted and deduplicated — by a sort that takes the ascending runs as
+/// they are, and by address alone: they are all in one space, and the
+/// instruction at an address has one length.
+fn body_set(mut body: Vec<AddressRange>) -> AddressSet {
+    debug_assert!(body.windows(2).all(|w| w[0].start.space == w[1].start.space));
+    body.sort_by_key(|r| r.start.offset);
+    body.dedup();
+    body.into_iter().collect()
 }
 
 /// [`discover`] while other threads decode ahead of it: once the walk
@@ -381,7 +394,7 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             if let Some(reference_manager) = reference_manager.take() {
                 reference_manager.add_all_unpooled(&references);
             }
-            let bodies = bodies.into_iter().map(|(entry, body)| (entry, body.into_iter().collect::<AddressSet>())).collect();
+            let bodies = bodies.into_iter().map(|(entry, body)| (entry, body_set(body))).collect();
             return (counts, bodies);
         };
         let _ = started.references.send(references);
@@ -453,7 +466,7 @@ impl<'scope> Started<'scope> {
             bodies_in
                 .into_iter()
                 .flatten()
-                .map(|(entry, body)| (entry, body.into_iter().collect::<AddressSet>()))
+                .map(|(entry, body)| (entry, body_set(body)))
                 .collect::<Vec<_>>()
         });
         let (read_out, read) = std::sync::mpsc::channel();

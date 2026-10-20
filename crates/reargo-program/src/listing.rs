@@ -48,7 +48,9 @@ impl Listing {
             }
             return;
         }
+        let tt = std::time::Instant::now();
         let old = std::mem::take(&mut self.instructions);
+        let oldn = old.len();
         let mut merged: Vec<(u64, Box<DecodedInstruction>)> = Vec::with_capacity(old.len() + total);
         let mut old = old.into_iter().peekable();
         let mut heads: Vec<_> = runs.into_iter().map(|r| r.into_iter().peekable()).collect();
@@ -75,7 +77,9 @@ impl Listing {
             merged.push(old.next_if(|(oa, _)| *oa == a).unwrap_or((a, i)));
         }
         merged.extend(old);
+        let t1 = tt.elapsed();
         self.instructions = merged.into_iter().collect();
+        if std::env::var_os("LD_TRACE").is_some() { eprintln!("TRACE merge {:?} build {:?} old {}", t1, tt.elapsed(), oldn); }
     }
 
     /// The instruction at `address`: the one listed, else `decode()`'s,

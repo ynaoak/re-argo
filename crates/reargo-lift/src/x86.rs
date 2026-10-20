@@ -177,7 +177,7 @@ fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
 #[derive(Default)]
 pub struct LiftCache {
     /// Index of each address held (and of some dropped: [`DEAD`] in `meta`).
-    map: rustc_hash::FxHashMap<u64, u32>,
+    map: AddrIndex,
     /// The entries before it are all dead.
     head: usize,
     /// Entries held (not dead).
@@ -375,11 +375,7 @@ impl LiftCache {
         for m in &mut self.meta {
             m.next = if m.next == NO_NEXT || m.next < h { NO_NEXT } else { m.next - h };
         }
-        self.map.retain(|_, i| {
-            let keep = *i >= h;
-            *i = i.wrapping_sub(h);
-            keep
-        });
+        self.map.shift_down(h);
     }
 
     /// Room for `n` instructions and as many again (at least
@@ -387,7 +383,6 @@ impl LiftCache {
     /// arrays one doubling at a time moved them over and over.
     fn reserve(&mut self, n: usize) {
         let n = (2 * n).max(CACHE_RESERVE);
-        self.map.reserve(n);
         self.lifted.reserve(n);
         self.meta.reserve(n);
         self.shape.reserve(n);
@@ -413,9 +408,8 @@ impl LiftCache {
         addr: u64,
         block: &mut Option<BlockDecoder<'m>>,
     ) -> u32 {
-        if let Some(&i) = self.map.get(&addr)
-            && self.meta[i as usize].flags & DEAD == 0
-        {
+        let i = *self.map.slot(addr);
+        if i != NO_INDEX && self.meta[i as usize].flags & DEAD == 0 {
             return i;
         }
         if self.lifted.len() == self.lifted.capacity() {
@@ -433,12 +427,84 @@ impl LiftCache {
             None => (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() }),
         };
         let i = u32::try_from(self.lifted.len()).expect("lift cache index");
+        assert!(i != NO_INDEX, "lift cache index");
         self.lifted.push(lifted);
         self.meta.push(Meta { next: NO_NEXT, len, flags });
         self.shape.push(shape);
-        self.map.insert(addr, i);
+        *self.map.slot(addr) = i;
         self.live += 1;
         i
+    }
+}
+
+/// Addresses per page of an [`AddrIndex`].
+const INDEX_PAGE: u64 = 1024;
+
+/// No index ([`AddrIndex`]).
+const NO_INDEX: u32 = u32::MAX;
+
+/// A [`LiftCache`]'s index of each address: a direct-mapped slot per
+/// address, in pages of [`INDEX_PAGE`] addresses made on first use. Most
+/// lookups are of an address near the one before (a range walk steps
+/// through its instructions), in the page looked up last: no hashing then.
+#[derive(Default)]
+struct AddrIndex {
+    pages: Vec<Box<[u32; INDEX_PAGE as usize]>>,
+    /// The position in `pages` of each page (by address / [`INDEX_PAGE`]).
+    by_page: rustc_hash::FxHashMap<u64, u32>,
+    /// The page looked up last and its position (`None`: none yet).
+    last: Option<(u64, u32)>,
+}
+
+impl AddrIndex {
+    /// The slot of `addr` ([`NO_INDEX`] when it has none), its page made
+    /// when it has none.
+    #[inline]
+    fn slot(&mut self, addr: u64) -> &mut u32 {
+        let page = addr / INDEX_PAGE;
+        let at = match self.last {
+            Some((p, at)) if p == page => at,
+            _ => self.page_of(page),
+        };
+        &mut self.pages[at as usize][(addr % INDEX_PAGE) as usize]
+    }
+
+    /// The position of page `page` in `pages`, made when missing.
+    #[cold]
+    fn page_of(&mut self, page: u64) -> u32 {
+        let next = u32::try_from(self.pages.len()).expect("lift cache pages");
+        let at = *self.by_page.entry(page).or_insert(next);
+        if at == next {
+            self.pages.push(Box::new([NO_INDEX; INDEX_PAGE as usize]));
+        }
+        self.last = Some((page, at));
+        at
+    }
+
+    /// The indices below `h` dropped, the others lowered by `h` (the
+    /// entries before `h` left the arrays); the pages left empty freed.
+    fn shift_down(&mut self, h: u32) {
+        let pages = std::mem::take(&mut self.pages);
+        let mut kept: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        for (at, mut page) in pages.into_iter().enumerate() {
+            let mut any = false;
+            for i in page.iter_mut() {
+                *i = if *i == NO_INDEX || *i < h { NO_INDEX } else { *i - h };
+                any |= *i != NO_INDEX;
+            }
+            if any {
+                kept.insert(at as u32, self.pages.len() as u32);
+                self.pages.push(page);
+            }
+        }
+        self.by_page.retain(|_, at| match kept.get(at) {
+            Some(&new) => {
+                *at = new;
+                true
+            }
+            None => false,
+        });
+        self.last = None;
     }
 }
 
