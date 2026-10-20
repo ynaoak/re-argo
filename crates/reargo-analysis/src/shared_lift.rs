@@ -48,7 +48,7 @@ use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
 use crate::callsite::{walk_function_shaped, CallSite, ParamSummaries};
-use crate::func_lift::{function_jobs, owns};
+use crate::func_lift::function_jobs;
 
 /// One function's results.
 pub(crate) struct FunctionResults {
@@ -101,8 +101,8 @@ pub(crate) struct Cached {
 impl SharedLift {
     /// The round-0 call sites of the whole program, as
     /// [`crate::callsite::resolve_call_sites`] gives them.
-    pub fn round0_sites(&self) -> Vec<CallSite> {
-        crate::callsite::dedup_sites(self.funcs.iter().filter_map(|f| f.walk.as_deref()))
+    pub fn round0_sites(&self) -> Vec<&CallSite> {
+        crate::callsite::dedup_site_refs(self.funcs.iter().filter_map(|f| f.walk.as_deref()))
     }
 }
 
@@ -138,13 +138,22 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
         }
         None => (FxHashMap::default(), None),
     };
-    let jobs: Vec<(u64, usize, Option<FunctionResults>)> = function_jobs(program)
-        .into_iter()
-        .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
-        .collect();
-    // Argument Arity's budget of each function, in the same order.
-    let arity_budgets: Vec<usize> =
-        if with_snapshots { program.listing.functions().map(crate::arity::budget).collect() } else { Vec::new() };
+    // With nothing cached every function is computed: the jump index
+    // (below) is built meanwhile.
+    let none_cached = cached_funcs.is_empty();
+    let (early_jumps, (jobs, arity_budgets)) = rayon::join(
+        || none_cached.then(|| crate::func_lift::JumpIndex::new(program)),
+        || {
+            let jobs: Vec<(u64, usize, Option<FunctionResults>)> = function_jobs(program)
+                .into_iter()
+                .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
+                .collect();
+            // Argument Arity's budget of each function, in the same order.
+            let arity_budgets: Vec<usize> =
+                if with_snapshots { program.listing.functions().map(crate::arity::budget).collect() } else { Vec::new() };
+            (jobs, arity_budgets)
+        },
+    );
     drop(cached_funcs);
     // The cached results that still hold; the others are computed again.
     let jobs: Vec<(u64, usize, Option<FunctionResults>)> = jobs
@@ -159,24 +168,36 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     // Index the jump references when many functions are computed (else
     // a lookup per lifted instruction costs less than the index).
     let stale = jobs.iter().filter(|j| j.2.is_none()).count();
-    let jumps = (stale > jobs.len() / 8).then(|| crate::func_lift::JumpIndex::new(program));
+    let jumps = (stale > jobs.len() / 8).then(|| early_jumps.unwrap_or_else(|| crate::func_lift::JumpIndex::new(program)));
     // The consecutive functions a thread runs share a lift cache
     // ([`crate::range_lift::map_with_lifter`]): a function is lifted
     // linearly well past its end, over its neighbours
     // (`lift_range_cached` gives exactly what `lift_range` would).
     let x86 = reargo_lift::x86::X86Lifter::new_64();
     type Extra = Option<(u64, usize, usize, Option<(u64, &'static str)>)>;
-    let jobs: Vec<(u64, usize, Option<FunctionResults>, usize)> = if with_snapshots {
+    // (entry, max instructions, results kept, arity budget)
+    type Job = (u64, usize, Option<FunctionResults>, usize);
+    let jobs: Vec<Job> = if with_snapshots {
         jobs.into_iter().zip(arity_budgets).map(|((e, m, k), a)| (e, m, k, a)).collect()
     } else {
         jobs.into_iter().map(|(e, m, k)| (e, m, k, 0)).collect()
     };
-    let computed: Vec<(FunctionResults, Extra)> = jobs
+    // Runs of consecutive jobs bounded by their cost (the budget of
+    // each function computed), so no run of large functions is left
+    // for one thread at the end.
+    let costs: Vec<usize> = jobs.iter().map(|j| if j.2.is_some() { 1 } else { j.1.max(j.3) }).collect();
+    let mut jobs = jobs.into_iter();
+    let chunks: Vec<Vec<Job>> = crate::range_lift::cost_chunks(&costs)
+        .into_iter()
+        .map(|r| jobs.by_ref().take(r.len()).collect())
+        .collect();
+    let computed: Vec<(FunctionResults, Extra)> = chunks
         .into_par_iter()
-        .with_min_len(crate::range_lift::CHUNK)
-        .map_init(
-            reargo_lift::x86::LiftCache::new,
-            |cache, (entry, max_insns, kept, arity_budget)| {
+        .flat_map_iter(|chunk| {
+            let (x86, jumps) = (&x86, jumps.as_ref());
+            let mut cache = reargo_lift::x86::LiftCache::new();
+            chunk.into_iter().map(move |(entry, max_insns, kept, arity_budget)| {
+                let cache = &mut cache;
                 if let Some(kept) = kept {
                     return (kept, None);
                 }
@@ -197,7 +218,7 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
                     0 => {
                         results = Some(compute_lifted(
                             program,
-                            jumps.as_ref(),
+                            jumps,
                             entry,
                             max_insns,
                             insns,
@@ -211,8 +232,8 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
                 let results = results.expect("the function's lift");
                 let extra = with_snapshots.then_some((entry, arity_budget, arity, convention));
                 (results, extra)
-            },
-        )
+            })
+        })
         .collect();
     let mut ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
     let funcs: Vec<FunctionResults> = computed
@@ -269,7 +290,8 @@ fn still_valid(
     {
         return false;
     }
-    old.owned.iter().all(|&(addr, o)| owns(program, old.entry, addr) == o)
+    let owner = crate::func_lift::Owner::new(program, old.entry);
+    old.owned.iter().all(|&(addr, o)| owner.owns(addr) == o)
 }
 
 /// Whether one of the jump references `changed` (sorted by target)
@@ -309,6 +331,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     with_snapshots: bool,
 ) -> FunctionResults {
     let next_entry = program.listing.next_function_after(entry).map(|f| f.entry_point);
+    let owner = crate::func_lift::Owner::new(program, entry);
     // What the walk and the blocks need of each instruction, read once
     // (or kept beside the lift).
     let shape = match shapes {
@@ -326,11 +349,11 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         .iter()
         .zip(&shape.addrs)
         .filter(|(call, _)| **call)
-        .map(|(_, &a)| (a, owns(program, entry, a)))
+        .map(|(_, &a)| (a, owner.owns(a)))
         .collect();
     let owns_call = |a: u64| match calls.binary_search_by_key(&a, |c| c.0) {
         Ok(k) => calls[k].1,
-        Err(_) => owns(program, entry, a),
+        Err(_) => owner.owns(a),
     };
     let walk = walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call);
     // The walk asks who owns each call instruction.
@@ -346,8 +369,8 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, insns);
         addrs.extend(cfg.iter().map(|(a, _)| *a));
         addrs.extend(vsa.iter().map(|(a, _)| *a));
-        cfg.retain(|(a, _)| owns(program, entry, *a));
-        vsa.retain(|(a, _)| owns(program, entry, *a));
+        cfg.retain(|(a, _)| owner.owns(*a));
+        vsa.retain(|(a, _)| owner.owns(*a));
         (cfg, vsa)
     });
     let offsets: Option<Box<[u32]>> =

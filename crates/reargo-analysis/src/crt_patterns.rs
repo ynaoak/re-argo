@@ -30,6 +30,7 @@
 //! FLIRT signatures do, just without the .pat / .sig file format
 //! overhead — we encode the patterns directly in Rust.
 
+use rayon::prelude::*;
 use reargo_program::comments::CommentType;
 use reargo_program::function::Function;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
@@ -80,12 +81,14 @@ impl Analyzer for CrtPatternAnalyzer {
         //     Discovery never reaches the CRT helper at all (e.g.,
         //     `.init_array` is unmapped in our memory model so
         //     `frame_dummy` is never queued).
-        let mut candidates: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for f in program.listing.functions() {
-            if f.name.starts_with("FUN_") {
-                candidates.insert(f.entry_point);
-            }
-        }
+        // (in address order, each once; the 16-byte steps of a section
+        // are matched in parallel)
+        let mut candidates: Vec<u64> = program
+            .listing
+            .functions()
+            .filter(|f| f.name.starts_with("FUN_"))
+            .map(|f| f.entry_point)
+            .collect();
         for sec in &program.info.sections {
             if !sec.flags.contains(reargo_loader::SectionFlags::EXECUTE) {
                 continue;
@@ -95,40 +98,39 @@ impl Analyzer for CrtPatternAnalyzer {
             // 16-byte boundary can't be one of these.
             let base = sec.address;
             let end = sec.address + sec.size;
-            let mut a = (base + 15) & !15;
-            while a + 24 <= end {
-                candidates.insert(a);
-                a += 16;
+            let first = (base + 15) & !15;
+            if first + 24 <= end {
+                candidates.extend((first..=end - 24).step_by(16));
             }
         }
+        candidates.par_sort_unstable();
+        candidates.dedup();
 
-        let mut found: Vec<(u64, &'static str)> = Vec::new();
-        for entry in candidates {
-            // Skip candidates that already host a function with a
-            // non-generic name (user / DWARF / earlier analyzer wins).
-            let already_named = program
-                .listing
-                .get_function(entry)
-                .is_some_and(|f| !f.name.starts_with("FUN_"));
-            if already_named {
-                continue;
-            }
-            let mut buf = [0u8; 24];
-            let read_len = [24, 16, 12, 8]
-                .iter()
-                .copied()
-                .find(|&n| program.info.memory.read_bytes(entry, &mut buf[..n]).is_ok());
-            let Some(n) = read_len else {
-                continue;
-            };
-            let bytes = &buf[..n];
-            for pattern in &patterns {
-                if matches_pattern(bytes, pattern.prefix, pattern.mask) {
-                    found.push((entry, pattern.name));
-                    break;
+        let found: Vec<(u64, &'static str)> = candidates
+            .par_iter()
+            .with_min_len(4096)
+            .filter_map(|&entry| {
+                // Skip candidates that already host a function with a
+                // non-generic name (user / DWARF / earlier analyzer wins).
+                let already_named = program
+                    .listing
+                    .get_function(entry)
+                    .is_some_and(|f| !f.name.starts_with("FUN_"));
+                if already_named {
+                    return None;
                 }
-            }
-        }
+                let mut buf = [0u8; 24];
+                let n = [24, 16, 12, 8]
+                    .iter()
+                    .copied()
+                    .find(|&n| program.info.memory.read_bytes(entry, &mut buf[..n]).is_ok())?;
+                let bytes = &buf[..n];
+                patterns
+                    .iter()
+                    .find(|pattern| matches_pattern(bytes, pattern.prefix, pattern.mask))
+                    .map(|pattern| (entry, pattern.name))
+            })
+            .collect();
         Box::new(found)
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {

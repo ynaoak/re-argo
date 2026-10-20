@@ -27,6 +27,7 @@
 //! functions sharing their lifted instructions, see `range_lift`),
 //! then the apply step writes into `program.references` serially.
 
+use rayon::prelude::*;
 use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
 use reargo_lift::LiftedInstruction;
@@ -131,13 +132,25 @@ impl Analyzer for PcodeReferenceAnalyzer {
         .flatten()
         .collect();
 
-        // Phase 2 (serial): dedup against existing refs and apply.
-        let mut refs_found = 0usize;
-        for (from, to, kind) in candidates {
-            if program.references.add_unless(Reference::new(from, to, kind), |r| r.to == to && r.ref_type == kind) {
-                refs_found += 1;
-            }
-        }
+        // Phase 2: dedup against existing refs and apply — each candidate
+        // added unless a reference from its source to its target of its
+        // kind is there (before, or added for an earlier candidate): the
+        // first of each that is not there before, in order, in bulk.
+        let references = &program.references;
+        let present: Vec<bool> = candidates
+            .par_iter()
+            .with_min_len(4096)
+            .map(|&(from, to, kind)| references.get_refs_from(from).iter().any(|r| r.to == to && r.ref_type == kind))
+            .collect();
+        let mut seen: rustc_hash::FxHashSet<(u64, u64, RefType)> = rustc_hash::FxHashSet::default();
+        let added: Vec<Reference> = candidates
+            .into_iter()
+            .zip(present)
+            .filter(|&(c, present)| !present && seen.insert(c))
+            .map(|((from, to, kind), _)| Reference::new(from, to, kind))
+            .collect();
+        let refs_found = added.len();
+        program.references.add_all(&added);
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

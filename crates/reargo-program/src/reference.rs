@@ -204,8 +204,14 @@ impl ReferenceManager {
     /// is looked up once, in address order.
     pub fn add_all(&mut self, refs: &[Reference]) {
         self.jumps.extend(refs.iter().filter(|r| r.ref_type.is_jump()).copied());
-        add_grouped(&mut self.refs_from, refs, |r| r.from);
-        add_grouped(&mut self.refs_to, refs, |r| r.to);
+        // (the two maps at the same time, when there are many)
+        let (from, to) = (&mut self.refs_from, &mut self.refs_to);
+        if refs.len() >= 1024 {
+            rayon::join(|| add_grouped(from, refs, |r| r.from), || add_grouped(to, refs, |r| r.to));
+        } else {
+            add_grouped(from, refs, |r| r.from);
+            add_grouped(to, refs, |r| r.to);
+        }
     }
 
     /// Add `reference` unless a reference from its source already

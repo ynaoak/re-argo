@@ -37,7 +37,7 @@ use rayon::prelude::*;
 
 use crate::blockflow::{self, FlowState};
 use crate::byteconst::{eval, is_unmodeled, is_view_refresh, ByteConst, ByteMem, RegFile};
-use crate::func_lift::{external_entries, function_jobs, in_extent, lift_function, owns};
+use crate::func_lift::{external_entries, function_jobs, in_extent, lift_function};
 
 /// Constants observed on entry to each call instruction.
 /// Outer key = instruction address of the Call; inner key = REGISTER
@@ -87,7 +87,8 @@ pub(crate) fn function_snapshots_with(
         return Vec::new();
     }
     let mut snaps = function_snapshots_unowned(program, entry, insns, external);
-    snaps.retain(|(addr, _)| owns(program, entry, *addr));
+    let owner = crate::func_lift::Owner::new(program, entry);
+    snaps.retain(|(addr, _)| owner.owns(*addr));
     snaps
 }
 

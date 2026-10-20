@@ -21,6 +21,7 @@
 //!   section, dereferences up to 64 bytes and previews them as a C-style
 //!   string literal when ≥ 2 printable bytes appear before the first NUL.
 
+use rayon::prelude::*;
 use reargo_lift::PcodeLift;
 use reargo_program::comments::CommentType;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
@@ -122,22 +123,33 @@ fn resolve(
     // as they are done), merged in listing order. The walks are left
     // on the program for Format Varargs (780).
     let mut round0 = Vec::with_capacity(shared.funcs.len());
-    let mut cfg_constants = crate::cfg_const::CallConstants::new();
-    let mut vsa_constants = crate::vsa::VsaResult::new();
+    let mut snapshots = Vec::with_capacity(shared.funcs.len());
     for f in shared.funcs.iter_mut() {
         round0.push(FunctionWalk { entry: f.entry, max_insns: f.max_insns, sites: f.walk.take() });
-        let (cfg_snaps, vsa_snaps) = f.snapshots.take().unwrap_or_default();
-        crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
-        crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
+        snapshots.push(f.snapshots.take().unwrap_or_default());
     }
-    // Iterative inter-procedural resolver: a function whose
-    // parameter has a *single* observed value across all
-    // observed call sites is treated as a compile-time constant
-    // inside that function. Round-by-round propagation pushes
-    // constants through callback chains like
-    //   register_parser(my_parser) -> list_add(my_parser) -> …
-    // 4 rounds is enough for everything we've measured.
-    let mut sites = match resolve_call_sites_iterative_from(&*lifter, program, &round0, 4) {
+    // (the snapshots merge, in listing order, on another thread while
+    // the call sites are resolved)
+    let ((cfg_constants, vsa_constants), sites) = rayon::join(
+        move || {
+            let mut cfg_constants = crate::cfg_const::CallConstants::new();
+            let mut vsa_constants = crate::vsa::VsaResult::new();
+            for (cfg_snaps, vsa_snaps) in snapshots {
+                crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
+                crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
+            }
+            (cfg_constants, vsa_constants)
+        },
+        // Iterative inter-procedural resolver: a function whose
+        // parameter has a *single* observed value across all
+        // observed call sites is treated as a compile-time constant
+        // inside that function. Round-by-round propagation pushes
+        // constants through callback chains like
+        //   register_parser(my_parser) -> list_add(my_parser) -> …
+        // 4 rounds is enough for everything we've measured.
+        || resolve_call_sites_iterative_from(&*lifter, program, &round0, 4),
+    );
+    let mut sites = match sites {
         Ok(sites) => sites,
         Err(e) => return (shared, Err(e)),
     };
@@ -160,7 +172,7 @@ fn resolve(
     // degenerate range), which catches arguments built from a
     // conditional join with two equal-valued predecessors that the
     // point tracker can't represent.
-    for site in sites.iter_mut() {
+    sites.par_iter_mut().with_min_len(1024).for_each(|site| {
         let snap = cfg_constants.get(&site.call_site);
         let vsa_snap = vsa_constants.get(&site.call_site);
         for arg in site.args.iter_mut() {
@@ -180,7 +192,7 @@ fn resolve(
                 arg.value = Some(v);
             }
         }
-    }
+    });
     (shared, Ok(sites))
 }
 

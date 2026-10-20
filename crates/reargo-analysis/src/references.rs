@@ -98,7 +98,8 @@ impl Analyzer for ScalarReferenceAnalyzer {
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         let instructions: Vec<(u64, Vec<Constant>)> = crate::analyzer::prepared(prepared);
-        let mut refs_found = 0;
+        // (the references in bulk, in the same order, after)
+        let mut refs: Vec<Reference> = Vec::new();
         for (insn_addr, constants) in &instructions {
             for (k, c) in constants.iter().enumerate() {
                 let target = c.target;
@@ -112,8 +113,7 @@ impl Analyzer for ScalarReferenceAnalyzer {
                 } else {
                     RefType::DataRead
                 };
-                program.references.add(Reference::new(*insn_addr, target, ref_type));
-                refs_found += 1;
+                refs.push(Reference::new(*insn_addr, target, ref_type));
 
                 if c.string && program.symbol_table.primary_at(target).is_none() {
                     program.symbol_table.add(Symbol::new(
@@ -125,6 +125,8 @@ impl Analyzer for ScalarReferenceAnalyzer {
                 }
             }
         }
+        let refs_found = refs.len();
+        program.references.add_all(&refs);
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

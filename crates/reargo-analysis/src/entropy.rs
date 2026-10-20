@@ -55,14 +55,18 @@ impl Analyzer for EntropyAnalyzer {
     }
     fn start_early(&self, program: &mut Program) {
         // the sections' bytes are fixed for the run
-        let samples = section_samples(program);
-        crate::analyzer::Early::<EntropyAnalyzer, Measured>::start(program, move || measure(samples));
+        // the sections' bytes are read on that thread (a clone of the
+        // memory shares them)
+        let (sections, memory) = (program.info.sections.clone(), program.info.memory.clone());
+        crate::analyzer::Early::<EntropyAnalyzer, Measured>::start(program, move || {
+            measure(section_samples(&sections, &memory))
+        });
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let (per_section, overall_hist, overall_total) =
             match crate::analyzer::Early::<EntropyAnalyzer, Measured>::take(program) {
                 Some(measured) => measured,
-                None => measure(section_samples(program)),
+                None => measure(section_samples(&program.info.sections, &program.info.memory)),
             };
 
         let mut packed_tags: Vec<(u64, f64)> = Vec::new();
@@ -109,31 +113,30 @@ type Measured = (Vec<(String, u64, f64)>, [u64; 256], u64);
 /// The name, address and first MiB (the sample measured) of each
 /// section with an address and a size whose bytes can be read, in
 /// section order.
-fn section_samples(program: &Program) -> Vec<(String, u64, Vec<u8>)> {
-    program
-        .info
-        .sections
+fn section_samples<'m>(
+    sections: &[reargo_loader::Section],
+    memory: &'m reargo_loader::memory::Memory,
+) -> Vec<(String, u64, std::borrow::Cow<'m, [u8]>)> {
+    sections
         .iter()
         .filter(|s| s.address != 0 && s.size > 0)
         .filter_map(|s| {
             // Cap per section so a single huge resource section
             // can't dominate runtime. A 1 MiB sample is more than
             // enough to characterise the section's distribution.
-            let mut buf = vec![0u8; s.size.min(1_024 * 1_024) as usize];
-            program.info.memory.read_bytes(s.address, &mut buf).ok()?;
-            Some((s.name.clone(), s.address, buf))
+            Some((s.name.clone(), s.address, memory.bytes(s.address, s.size.min(1_024 * 1_024) as usize)?))
         })
         .collect()
 }
 
-fn measure(samples: Vec<(String, u64, Vec<u8>)>) -> Measured {
+fn measure(samples: Vec<(String, u64, std::borrow::Cow<'_, [u8]>)>) -> Measured {
     let mut overall_hist = [0u64; 256];
     let mut overall_total: u64 = 0;
     let per_section = samples
         .into_iter()
         .map(|(name, addr, buf)| {
             let entropy = shannon_entropy(&buf);
-            for &b in &buf {
+            for &b in buf.iter() {
                 overall_hist[b as usize] += 1;
             }
             overall_total += buf.len() as u64;

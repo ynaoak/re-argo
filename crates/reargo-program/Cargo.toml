@@ -6,6 +6,7 @@ license.workspace = true
 description = "Program model for RE-Argo: functions, symbols, references, listing"
 
 [dependencies]
+rayon = { workspace = true }
 reargo-core = { workspace = true }
 reargo-loader = { workspace = true }
 reargo-arch = { workspace = true }

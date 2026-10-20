@@ -89,15 +89,19 @@ impl Analyzer for FlossLiteAnalyzer {
     }
     fn start_early(&self, program: &mut Program) {
         // the sections' bytes are fixed for the run
-        let sections = section_bytes(program);
-        Early::<FlossLiteAnalyzer, usize>::start(program, move || count_decoded(sections, &pipeline_options()));
+        // the sections' bytes are read on that thread (a clone of the
+        // memory shares them)
+        let (sections, memory) = (program.info.sections.clone(), program.info.memory.clone());
+        Early::<FlossLiteAnalyzer, usize>::start(program, move || {
+            count_decoded(section_bytes(&sections, &memory), &pipeline_options())
+        });
     }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let opts = pipeline_options();
         let total = match Early::<FlossLiteAnalyzer, usize>::take(program) {
             Some(total) => total,
-            None => count_decoded(section_bytes(program), &opts),
+            None => count_decoded(section_bytes(&program.info.sections, &program.info.memory), &opts),
         };
 
         // Only emit a single `obfuscated-string` tag at the entry
@@ -137,22 +141,21 @@ fn pipeline_options() -> FlossOptions {
 
 /// The address and bytes of every section the pipeline scans
 /// (non-executable, non-empty, at most 16 MiB, readable).
-fn section_bytes(program: &Program) -> Vec<(u64, Vec<u8>)> {
-    program
-        .info
-        .sections
+fn section_bytes<'m>(
+    sections: &[reargo_loader::Section],
+    memory: &'m reargo_loader::memory::Memory,
+) -> Vec<(u64, std::borrow::Cow<'m, [u8]>)> {
+    sections
         .iter()
         .filter(|s| s.size > 0 && s.size <= 16 * 1024 * 1024 && !s.flags.contains(SectionFlags::EXECUTE))
         .filter_map(|s| {
-            let mut buf = vec![0u8; s.size as usize];
-            program.info.memory.read_bytes(s.address, &mut buf).ok()?;
-            Some((s.address, buf))
+            Some((s.address, memory.bytes(s.address, s.size as usize)?))
         })
         .collect()
 }
 
 /// The number of strings [`decode_section`] finds in all of `sections`.
-fn count_decoded(sections: Vec<(u64, Vec<u8>)>, opts: &FlossOptions) -> usize {
+fn count_decoded(sections: Vec<(u64, std::borrow::Cow<'_, [u8]>)>, opts: &FlossOptions) -> usize {
     sections.iter().map(|(addr, buf)| decode_section(buf, *addr, opts).len()).sum()
 }
 

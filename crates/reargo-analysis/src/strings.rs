@@ -27,16 +27,18 @@ impl Analyzer for StringSearchAnalyzer {
 
     fn start_early(&self, program: &mut Program) {
         // the data sections' bytes are fixed for the run
-        let sections = data_section_bytes(program);
+        // the bytes are read on that thread (a clone of the memory
+        // shares them)
+        let (sections, memory) = (program.info.sections.clone(), program.info.memory.clone());
         crate::analyzer::Early::<StringSearchAnalyzer, Vec<SectionStrings>>::start(program, move || {
-            sections.into_par_iter().map(section_strings).collect()
+            data_section_bytes(&sections, &memory).into_par_iter().map(section_strings).collect()
         });
     }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let per_section = match crate::analyzer::Early::<StringSearchAnalyzer, Vec<SectionStrings>>::take(program) {
             Some(per_section) => per_section,
-            None => data_section_bytes(program).into_par_iter().map(section_strings).collect(),
+            None => data_section_bytes(&program.info.sections, &program.info.memory).into_par_iter().map(section_strings).collect(),
         };
 
         let mut strings_found = 0;
@@ -72,21 +74,20 @@ type SectionStrings = (String, u64, Vec<(u64, String)>);
 
 /// The name, address, size and bytes of each readable data section, in
 /// section order.
-fn data_section_bytes(program: &Program) -> Vec<(String, u64, u64, Vec<u8>)> {
-    program
-        .info
-        .sections
+fn data_section_bytes<'m>(
+    sections: &[reargo_loader::Section],
+    memory: &'m reargo_loader::memory::Memory,
+) -> Vec<(String, u64, u64, std::borrow::Cow<'m, [u8]>)> {
+    sections
         .iter()
         .filter(|s| is_data_section(&s.name))
         .filter_map(|s| {
-            let mut buf = vec![0u8; s.size as usize];
-            program.info.memory.read_bytes(s.address, &mut buf).ok()?;
-            Some((s.name.clone(), s.address, s.size, buf))
+            Some((s.name.clone(), s.address, s.size, memory.bytes(s.address, s.size as usize)?))
         })
         .collect()
 }
 
-fn section_strings((name, addr, size, buf): (String, u64, u64, Vec<u8>)) -> SectionStrings {
+fn section_strings((name, addr, size, buf): (String, u64, u64, std::borrow::Cow<'_, [u8]>)) -> SectionStrings {
     let found = find_strings(&buf, addr)
         .into_iter()
         .map(|(string_addr, string_val)| {

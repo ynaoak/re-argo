@@ -39,7 +39,7 @@ use rayon::prelude::*;
 
 use crate::blockflow::{self, FlowState};
 use crate::byteconst::{bit_mask, eval, is_unmodeled, is_view_refresh, ByteConst};
-use crate::func_lift::{external_entries, function_jobs, in_extent, lift_function, owns};
+use crate::func_lift::{external_entries, function_jobs, in_extent, lift_function};
 
 /// Set → Range widening threshold. A `Set` join that crosses this
 /// size collapses to a Range envelope to keep the per-block state
@@ -466,7 +466,8 @@ pub(crate) fn function_snapshots_with(
         return Vec::new();
     }
     let mut snaps = function_snapshots_unowned(program, entry, insns, external);
-    snaps.retain(|(addr, _)| owns(program, entry, *addr));
+    let owner = crate::func_lift::Owner::new(program, entry);
+    snaps.retain(|(addr, _)| owner.owns(*addr));
     snaps
 }
 

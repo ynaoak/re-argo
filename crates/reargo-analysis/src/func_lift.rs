@@ -51,6 +51,36 @@ pub fn owns(program: &Program, entry: u64, addr: u64) -> bool {
     program.listing.function_containing(addr).map(|f| f.entry_point) == Some(entry)
 }
 
+/// [`owns`] for the function at one entry, its listing lookups done
+/// once: the last function at or before an address is the one at
+/// `entry` exactly when the address is in `[entry, next entry)`, and
+/// [`reargo_program::listing::Listing::function_containing`] gives it
+/// when its body holds the address.
+pub struct Owner<'p> {
+    entry: u64,
+    next: Option<u64>,
+    function: Option<&'p reargo_program::Function>,
+}
+
+impl<'p> Owner<'p> {
+    pub fn new(program: &'p Program, entry: u64) -> Self {
+        Self {
+            entry,
+            next: program.listing.next_function_after(entry).map(|f| f.entry_point),
+            function: program.listing.get_function(entry),
+        }
+    }
+
+    /// [`owns`]`(program, entry, addr)`.
+    pub fn owns(&self, addr: u64) -> bool {
+        addr >= self.entry
+            && self.next.is_none_or(|n| addr < n)
+            && self.function.is_some_and(|f| {
+                f.body.contains(&reargo_core::address::Address::new(reargo_core::address::SpaceId::RAM, addr))
+            })
+    }
+}
+
 /// Instructions of `insns` that control can reach other than along
 /// the jumps and fall-throughs of `insns` itself: the targets of a
 /// recovered jump table (`IndirectJump` references) and of a jump from
