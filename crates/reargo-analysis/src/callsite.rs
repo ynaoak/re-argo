@@ -485,10 +485,25 @@ pub(crate) fn walk_prefix<I: std::borrow::Borrow<LiftedInstruction>>(
     if let Some(summary) = summaries.get(&entry) {
         tracker.seed_from_summary(summary);
     }
-    for (insn, &f) in insns.iter().map(std::borrow::Borrow::borrow).zip(flags) {
+    let n = insns.len().min(flags.len());
+    let mut i = 0;
+    while i < n {
+        let f = flags[i];
         if f & WalkPrefix::JOIN != 0 {
             tracker.reset();
+            // A run up to the next join with no call the function owns
+            // gives nothing when what a reset keeps is set already (it is
+            // only ever set): the next join resets all the rest.
+            if tracker.escaped && tracker.rbp_written {
+                let end = flags[i + 1..n].iter().position(|&g| g & WalkPrefix::JOIN != 0).map_or(n, |k| i + 1 + k);
+                if flags[i..end].iter().all(|&g| g & WalkPrefix::OWNED == 0) {
+                    i = end;
+                    continue;
+                }
+            }
         }
+        let insn: &LiftedInstruction = insns[i].borrow();
+        i += 1;
         let owned = f & WalkPrefix::OWNED != 0;
         for op in &insn.ops {
             match op.opcode {

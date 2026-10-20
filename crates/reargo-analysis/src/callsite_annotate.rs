@@ -213,14 +213,18 @@ impl CallSiteAnnotator {
 
         let mut annotated = 0usize;
         let mut string_promotions: Vec<u64> = Vec::new();
+        // The signature of each call target, looked up once (the symbols
+        // do not change in the loop).
+        let mut sig_of: rustc_hash::FxHashMap<u64, Option<&FunctionSignature>> = rustc_hash::FxHashMap::default();
         for site in &sites {
             let Some(target) = site.call_target else {
                 continue;
             };
-            let Some(sym) = program.symbol_table.primary_at(target) else {
-                continue;
-            };
-            let Some(sig) = db.lookup_by_name(&sym.name) else {
+            let found = *sig_of.entry(target).or_insert_with(|| {
+                let sym = program.symbol_table.primary_at(target)?;
+                db.lookup_by_name(&sym.name)
+            });
+            let Some(sig) = found else {
                 continue;
             };
             if program
