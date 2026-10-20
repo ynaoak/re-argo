@@ -13,41 +13,87 @@ use reargo_lift::x86::{LiftCache, X86Lifter};
 use reargo_lift::{InsnShape, LiftedInstruction};
 use reargo_loader::Memory;
 
-/// Most consecutive jobs run on one thread with one cache
-/// ([`cost_chunks`]): the overlap into the next run of jobs is lifted
-/// again.
+/// How many jobs past a full run [`span_chunks`] looks for the place to
+/// end it.
 pub(crate) const CHUNK: usize = 64;
 
-/// Runs of consecutive jobs (index ranges, in order) for jobs of the
-/// given `costs`: each at most [`CHUNK`] jobs and, past its first job,
-/// at most an even share of the total cost split many ways per thread.
-/// A run of the costliest neighbours (one large function after another)
-/// would otherwise be the last thing a run of jobs waits for.
-/// On one thread there is nothing to balance: one run of every job.
-pub(crate) fn cost_chunks(costs: &[usize]) -> Vec<std::ops::Range<usize>> {
-    cost_chunks_for(costs, rayon::current_num_threads())
+/// One job of a run of jobs sharing a lift cache: it lifts `insns`
+/// instructions linearly from `entry` and does `work` more with them
+/// (in instructions lifted: a lift costs 1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Span {
+    pub entry: u64,
+    pub insns: usize,
+    pub work: usize,
 }
 
-/// [`cost_chunks`] for `threads` threads.
-fn cost_chunks_for(costs: &[usize], threads: usize) -> Vec<std::ops::Range<usize>> {
-    if threads <= 1 {
-        return if costs.is_empty() { Vec::new() } else { vec![0..costs.len()] };
+/// Bytes an instruction is taken to span ([`span_chunks`] estimates
+/// where a lift ends).
+const INSN_BYTES: u64 = 4;
+
+impl Span {
+    fn end(&self) -> u64 {
+        self.entry.saturating_add(self.insns as u64 * INSN_BYTES)
     }
-    let total: usize = costs.iter().sum();
+    /// Its cost in a run whose jobs before it lifted up to `reach`.
+    fn cost(&self, reach: u64) -> usize {
+        (self.end().saturating_sub(reach.max(self.entry)) / INSN_BYTES) as usize + self.work
+    }
+}
+
+/// Runs of consecutive jobs (index ranges, in order) of the jobs
+/// `spans` (by ascending entry), each run on one thread with one lift
+/// cache. A function's lift runs well past its end, over the next
+/// functions, which a run lifts once: a job costs the instructions it
+/// lifts that the jobs before it in its run did not, plus its own work.
+/// Each run is filled to an even share of the total cost split many
+/// ways per thread (so no thread is left with a run of large functions
+/// at the end), then ended, among the next [`CHUNK`] jobs, before the
+/// one whose lift the run covers least — the next run lifts again what
+/// the run lifted from that job's entry on (the end of a large
+/// function's lift, the functions after it read).
+pub(crate) fn span_chunks(spans: &[Span]) -> Vec<std::ops::Range<usize>> {
+    span_chunks_for(spans, rayon::current_num_threads())
+}
+
+/// [`span_chunks`] for `threads` threads.
+fn span_chunks_for(spans: &[Span], threads: usize) -> Vec<std::ops::Range<usize>> {
+    let total: usize = {
+        let mut reach = 0;
+        spans
+            .iter()
+            .map(|s| {
+                let c = s.cost(reach);
+                reach = reach.max(s.end());
+                c
+            })
+            .sum()
+    };
     let cap = (total / (threads * 16)).max(1);
     let mut chunks = Vec::new();
     let mut start = 0;
-    let mut cost = 0;
-    for (k, &c) in costs.iter().enumerate() {
-        if k > start && (k - start >= CHUNK || cost + c > cap) {
-            chunks.push(start..k);
-            start = k;
-            cost = 0;
+    while start < spans.len() {
+        // fill the run to its share
+        let (mut reach, mut cost, mut k) = (0u64, 0usize, start);
+        while k < spans.len() && (k == start || cost < cap) {
+            cost += spans[k].cost(reach);
+            reach = reach.max(spans[k].end());
+            k += 1;
         }
-        cost += c;
-    }
-    if start < costs.len() {
-        chunks.push(start..costs.len());
+        // then end it before the job (of the next ones) whose lift it
+        // covers least, or with the last job
+        let mut cut = (k, reach.saturating_sub(spans.get(k).map_or(u64::MAX, |s| s.entry)));
+        let mut j = k;
+        while j < spans.len() && j < k + CHUNK && cut.1 > 0 {
+            reach = reach.max(spans[j].end());
+            j += 1;
+            let overlap = spans.get(j).map_or(0, |s| reach.saturating_sub(s.entry));
+            if overlap < cut.1 {
+                cut = (j, overlap);
+            }
+        }
+        chunks.push(start..cut.0);
+        start = cut.0;
     }
     chunks
 }
@@ -73,7 +119,7 @@ where
     map_with_lifter(
         memory,
         jobs,
-        |&(_, count)| count,
+        |&(entry, count)| Span { entry, insns: count, work: count / 4 },
         |&(entry, count), lifter| lifter.with(entry, count, |insns| f(entry, insns)),
     )
 }
@@ -82,17 +128,16 @@ where
 /// ranges the job needs ([`RangeLifter::with`]); the consecutive jobs a
 /// thread runs share the lifted instructions, the instructions below
 /// the job's ranges dropped as the run moves on ([`trim`]). The runs
-/// are bounded by the jobs' `cost` (the instructions a job lifts,
-/// [`cost_chunks`]), so no thread is left with a run of the largest
-/// functions at the end.
-pub fn map_with_lifter<J, T, F>(memory: &Memory, jobs: &[J], cost: impl Fn(&J) -> usize, f: F) -> Vec<T>
+/// are cut by the lift and work of each job (its [`Span`],
+/// [`span_chunks`]).
+pub(crate) fn map_with_lifter<J, T, F>(memory: &Memory, jobs: &[J], span: impl Fn(&J) -> Span, f: F) -> Vec<T>
 where
     J: Sync,
     T: Send,
     F: Fn(&J, &mut RangeLifter) -> T + Sync,
 {
-    let costs: Vec<usize> = jobs.iter().map(cost).collect();
-    cost_chunks(&costs)
+    let spans: Vec<Span> = jobs.iter().map(span).collect();
+    span_chunks(&spans)
         .into_par_iter()
         .flat_map_iter(|run| {
             let mut lifter = RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() };
@@ -164,29 +209,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cost_chunks_cover_the_jobs_in_order() {
-        let costs: Vec<usize> = (0..1000).map(|k| if k % 97 == 0 { 50_000 } else { 500 + k % 7 }).collect();
+    fn span_chunks_cover_the_jobs_in_order() {
+        // functions of 0x40 bytes lifting 500 instructions (well past
+        // their ends), a large one every 97
+        let spans: Vec<Span> = (0..1000u64)
+            .map(|k| {
+                let insns = if k % 97 == 0 { 50_000 } else { 500 };
+                Span { entry: 0x1000 + k * 0x40, insns, work: insns / 4 }
+            })
+            .collect();
         for threads in [1, 2, 4, 8] {
-            let chunks = cost_chunks_for(&costs, threads);
+            let chunks = span_chunks_for(&spans, threads);
             let mut next = 0;
             for c in &chunks {
                 assert_eq!(c.start, next);
-                assert!(!c.is_empty() && c.len() <= if threads == 1 { costs.len() } else { CHUNK });
+                assert!(!c.is_empty());
                 next = c.end;
             }
-            assert_eq!(next, costs.len());
-            if threads > 1 {
-                // a run of several jobs costs no more than its share
-                let cap = costs.iter().sum::<usize>() / (threads * 16);
-                assert!(chunks.iter().filter(|c| c.len() > 1).all(|c| costs[c.clone()].iter().sum::<usize>() <= cap));
-                // so a large job runs alone
-                assert!(chunks.iter().all(|c| c.len() == 1 || costs[c.clone()].iter().all(|&x| x < 50_000)));
-            } else {
-                assert_eq!(chunks.len(), 1);
-            }
+            assert_eq!(next, spans.len());
+            assert!(chunks.len() >= threads.min(spans.len()));
         }
-        assert!(cost_chunks_for(&[], 4).is_empty());
-        assert!(cost_chunks_for(&[], 1).is_empty());
+        assert!(span_chunks_for(&[], 4).is_empty());
+        // separate functions, each lifting only itself: one run each
+        let apart: Vec<Span> = (0..3u64).map(|k| Span { entry: k * 0x10000, insns: 100, work: 100 }).collect();
+        assert_eq!(span_chunks_for(&apart, 4), [0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn span_chunks_end_a_run_where_the_next_relifts_least() {
+        // a large function whose lift covers the next 20 small ones,
+        // then small ones apart: the run of the large function keeps
+        // the small ones its lift covers
+        let mut spans = vec![Span { entry: 0, insns: 1000, work: 0 }];
+        spans.extend((0..20u64).map(|k| Span { entry: 0x100 + k * 0x10, insns: 10, work: 0 }));
+        spans.extend((0..40u64).map(|k| Span { entry: 0x10000 + k * 0x1000, insns: 100, work: 0 }));
+        let chunks = span_chunks_for(&spans, 4);
+        assert_eq!(chunks[0], 0..21);
     }
 
     #[test]

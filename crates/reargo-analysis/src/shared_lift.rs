@@ -182,12 +182,18 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     } else {
         jobs.into_iter().map(|(e, m, k)| (e, m, k, 0)).collect()
     };
-    // Runs of consecutive jobs bounded by their cost (the budget of
-    // each function computed), so no run of large functions is left
-    // for one thread at the end.
-    let costs: Vec<usize> = jobs.iter().map(|j| if j.2.is_some() { 1 } else { j.1.max(j.3) }).collect();
+    // Runs of consecutive jobs cut by their lifts and work (the budget
+    // of each function computed, [`crate::range_lift::span_chunks`]),
+    // so no run of large functions is left for one thread at the end.
+    let spans: Vec<crate::range_lift::Span> = jobs
+        .iter()
+        .map(|j| match j.2 {
+            Some(_) => crate::range_lift::Span { entry: j.0, insns: 0, work: 1 },
+            None => crate::range_lift::Span { entry: j.0, insns: j.1.max(j.3), work: j.1 },
+        })
+        .collect();
     let mut jobs = jobs.into_iter();
-    let chunks: Vec<Vec<Job>> = crate::range_lift::cost_chunks(&costs)
+    let chunks: Vec<Vec<Job>> = crate::range_lift::span_chunks(&spans)
         .into_iter()
         .map(|r| jobs.by_ref().take(r.len()).collect())
         .collect();
