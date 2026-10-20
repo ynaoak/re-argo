@@ -36,6 +36,7 @@ use reargo_core::pcode::{OpCode, PcodeOp, VarnodeData};
 use reargo_lift::{LiftedInstruction, PcodeLift};
 use reargo_program::Program;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use crate::blockflow::{self, FlowState};
 use crate::byteconst::{bit_mask, eval, is_unmodeled, is_view_refresh, ByteConst};
@@ -240,23 +241,124 @@ fn add(a: AbstractValue, b: AbstractValue, size: u32) -> AbstractValue {
 
 /// State: registers by base offset, other varnodes by `(space, offset)`
 /// with their size. A missing entry is Top.
+///
+/// A register is either known bytes ([`Slot::Bytes`], in `regs`) or an
+/// abstract low part ([`Slot::Low`], in `abs`). The flows keep few
+/// values (about one register at a join), so each kind is a small list
+/// sorted by key rather than a map or an array of every register: a
+/// lookup scans a few entries, and a clone, a comparison or a join
+/// touches only what is known. The lists hold no unknown entry, so two
+/// states are equal exactly when they hold the same values.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct State {
-    regs: BTreeMap<u64, Slot>,
-    temps: BTreeMap<(SpaceId, i64), (u32, Slot)>,
+    /// Registers with a known byte: `(base, bytes)`, by base.
+    regs: SmallVec<[(u64, ByteConst); 4]>,
+    /// Registers holding an abstract low part: `(base, width, value)`,
+    /// by base.
+    abs: Vec<(u64, u32, AbstractValue)>,
+    /// Other varnodes: `(space, offset, size, value)`, by `(space,
+    /// offset)`.
+    temps: Vec<(SpaceId, i64, u32, Slot)>,
+}
+
+/// An input of an op as [`State::eval`]'s abstract part reads it.
+enum Input {
+    Const(u64),
+    Top,
+    /// A register or temporary holding an abstract value.
+    Abstract,
 }
 
 impl State {
+    /// The known bytes of the register at `base` (none for an abstract
+    /// one).
+    #[inline]
+    fn reg_bytes(&self, base: u64) -> ByteConst {
+        for (b, v) in &self.regs {
+            if *b >= base {
+                return if *b == base { *v } else { ByteConst::UNKNOWN };
+            }
+        }
+        ByteConst::UNKNOWN
+    }
+
+    /// The abstract low part of the register at `base`.
+    #[inline]
+    fn reg_abs(&self, base: u64) -> Option<(u32, &AbstractValue)> {
+        if self.abs.is_empty() {
+            return None;
+        }
+        let k = self.abs.binary_search_by_key(&base, |e| e.0).ok()?;
+        Some((self.abs[k].1, &self.abs[k].2))
+    }
+
+    /// The register at `base` as a slot (`None`: Top).
+    fn reg_slot(&self, base: u64) -> Option<Slot> {
+        if let Some((w, v)) = self.reg_abs(base) {
+            return Some(Slot::Low(w, v.clone()));
+        }
+        let b = self.reg_bytes(base);
+        (!b.is_unknown()).then_some(Slot::Bytes(b))
+    }
+
+    /// Set the known bytes of the register at `base`, which holds no
+    /// abstract value (unknown: Top).
+    #[inline]
+    fn set_bytes(&mut self, base: u64, b: ByteConst) {
+        let k = self.regs.partition_point(|e| e.0 < base);
+        match self.regs.get(k) {
+            Some(e) if e.0 == base => {
+                if b.is_unknown() {
+                    self.regs.remove(k);
+                } else {
+                    self.regs[k].1 = b;
+                }
+            }
+            _ if b.is_unknown() => {}
+            _ => self.regs.insert(k, (base, b)),
+        }
+    }
+
+    /// Set the register at `base` (`Slot::Bytes(UNKNOWN)`: Top).
+    fn set_reg(&mut self, base: u64, slot: Slot) {
+        let at = if self.abs.is_empty() { Err(0) } else { self.abs.binary_search_by_key(&base, |e| e.0) };
+        match slot {
+            Slot::Bytes(b) => {
+                if let Ok(k) = at {
+                    self.abs.remove(k);
+                }
+                self.set_bytes(base, b);
+            }
+            Slot::Low(w, v) => {
+                self.set_bytes(base, ByteConst::UNKNOWN);
+                match at {
+                    Ok(k) => self.abs[k] = (base, w, v),
+                    Err(k) => self.abs.insert(k, (base, w, v)),
+                }
+            }
+        }
+    }
+
+    /// The temporary at `(space, offset)`: `(size, value)`.
+    #[inline]
+    fn temp(&self, space: SpaceId, offset: i64) -> Option<(u32, &Slot)> {
+        if self.temps.is_empty() {
+            return None;
+        }
+        let k = self.temps.binary_search_by(|e| (e.0, e.1).cmp(&(space, offset))).ok()?;
+        Some((self.temps[k].2, &self.temps[k].3))
+    }
+
     /// The known bytes of a varnode.
     fn read_bytes(&self, vn: &VarnodeData) -> ByteConst {
         match vn.space {
             SpaceId::CONST => ByteConst::konst(vn.offset, vn.size),
             SpaceId::REGISTER => match split(vn.offset, vn.size) {
-                Some((base, pos)) => self.regs.get(&base).map_or(ByteConst::UNKNOWN, |s| s.bytes().bytes_at(pos, vn.size)),
+                Some((base, pos)) => self.reg_bytes(base).bytes_at(pos, vn.size),
                 None => ByteConst::UNKNOWN,
             },
-            s => match self.temps.get(&(s, vn.offset as i64)) {
-                Some((sz, slot)) if *sz >= vn.size => slot.bytes().trunc(vn.size),
+            s => match self.temp(s, vn.offset as i64) {
+                Some((sz, slot)) if sz >= vn.size => slot.bytes().trunc(vn.size),
                 _ => ByteConst::UNKNOWN,
             },
         }
@@ -267,14 +369,47 @@ impl State {
         match vn.space {
             SpaceId::CONST => AbstractValue::Const(vn.offset & bit_mask(vn.size)),
             SpaceId::REGISTER => match split(vn.offset, vn.size) {
-                Some((base, pos)) => self.regs.get(&base).map_or(AbstractValue::Top, |s| s.read(pos, vn.size)),
+                Some((base, pos)) => match self.reg_abs(base) {
+                    Some((w, v)) if pos == 0 && vn.size <= w => fit(v.clone(), vn.size),
+                    Some(_) => AbstractValue::Top,
+                    None => self
+                        .reg_bytes(base)
+                        .bytes_at(pos, vn.size)
+                        .get(vn.size)
+                        .map_or(AbstractValue::Top, AbstractValue::Const),
+                },
                 None => AbstractValue::Top,
             },
-            s => match self.temps.get(&(s, vn.offset as i64)) {
-                Some((sz, slot)) if *sz >= vn.size => slot.read(0, vn.size),
+            s => match self.temp(s, vn.offset as i64) {
+                Some((sz, slot)) if sz >= vn.size => slot.read(0, vn.size),
                 _ => AbstractValue::Top,
             },
         }
+    }
+
+    /// [`State::read`] when it is a constant or Top; `Abstract` when
+    /// the varnode reads an abstract value (which [`State::read`] may
+    /// narrow to a constant).
+    #[inline]
+    fn read_input(&self, vn: &VarnodeData) -> Input {
+        let bytes = match vn.space {
+            SpaceId::CONST => return Input::Const(vn.offset & bit_mask(vn.size)),
+            SpaceId::REGISTER => match split(vn.offset, vn.size) {
+                Some((base, pos)) => {
+                    if self.reg_abs(base).is_some() {
+                        return Input::Abstract;
+                    }
+                    self.reg_bytes(base).bytes_at(pos, vn.size)
+                }
+                None => return Input::Top,
+            },
+            s => match self.temp(s, vn.offset as i64) {
+                Some((sz, Slot::Bytes(b))) if sz >= vn.size => b.trunc(vn.size),
+                Some((sz, Slot::Low(..))) if sz >= vn.size => return Input::Abstract,
+                _ => return Input::Top,
+            },
+        };
+        bytes.get(vn.size).map_or(Input::Top, Input::Const)
     }
 
     fn write(&mut self, out: &VarnodeData, v: Val) {
@@ -285,41 +420,49 @@ impl State {
         };
         if out.space == SpaceId::REGISTER {
             let Some((base, pos)) = split(out.offset, out.size) else {
+                // forget every register the write touches
+                let lo = out.offset & !7;
                 let end = out.offset.saturating_add(u64::from(out.size.max(1)));
-                let bases: Vec<u64> = self.regs.range(out.offset & !7..end).map(|(b, _)| *b).collect();
-                for b in bases {
-                    self.regs.remove(&b);
-                }
+                self.regs.retain(|e| !(e.0 >= lo && e.0 < end));
+                self.abs.retain(|e| !(e.0 >= lo && e.0 < end));
                 return;
             };
-            let next = match v {
-                Val::Abs(a) if pos == 0 => Slot::Low(out.size, a),
-                Val::Abs(_) => Slot::Bytes(self.regs.get(&base).map_or(ByteConst::UNKNOWN, Slot::bytes).merge(
-                    pos,
-                    out.size,
-                    ByteConst::UNKNOWN,
-                )),
-                Val::Bytes(b) => {
-                    Slot::Bytes(self.regs.get(&base).map_or(ByteConst::UNKNOWN, Slot::bytes).merge(pos, out.size, b))
+            match v {
+                Val::Abs(a) if pos == 0 => self.set_reg(base, Slot::Low(out.size, a)),
+                Val::Abs(_) => {
+                    let b = self.reg_bytes(base).merge(pos, out.size, ByteConst::UNKNOWN);
+                    self.set_reg(base, Slot::Bytes(b));
                 }
-            };
-            if next == Slot::Bytes(ByteConst::UNKNOWN) {
-                self.regs.remove(&base);
-            } else {
-                self.regs.insert(base, next);
+                Val::Bytes(b) => {
+                    let b = self.reg_bytes(base).merge(pos, out.size, b);
+                    if self.abs.is_empty() {
+                        self.set_bytes(base, b);
+                    } else {
+                        self.set_reg(base, Slot::Bytes(b));
+                    }
+                }
             }
             return;
         }
         let off = out.offset as i64;
-        let end = off.saturating_add(i64::from(out.size.max(1)));
-        let overlapping: smallvec::SmallVec<[(SpaceId, i64); 4]> = self
-            .temps
-            .range((out.space, off.saturating_sub(8))..(out.space, end))
-            .filter(|((_, o), (sz, _))| o.saturating_add(i64::from(*sz)) > off)
-            .map(|(k, _)| *k)
-            .collect();
-        for k in overlapping {
-            self.temps.remove(&k);
+        let space = out.space;
+        if !self.temps.is_empty() {
+            // forget every entry the write overlaps (an entry is at
+            // most 8 bytes wide, so it starts after `off - 8`)
+            let end = off.saturating_add(i64::from(out.size.max(1)));
+            let lo = self.temps.partition_point(|e| (e.0, e.1) < (space, off.saturating_sub(8)));
+            let hi = self.temps.partition_point(|e| (e.0, e.1) < (space, end));
+            if lo < hi {
+                let mut w = lo;
+                for r in lo..hi {
+                    let (o, sz) = (self.temps[r].1, self.temps[r].2);
+                    if o.saturating_add(i64::from(sz)) <= off {
+                        self.temps.swap(w, r);
+                        w += 1;
+                    }
+                }
+                self.temps.drain(w..hi);
+            }
         }
         if out.size > 8 {
             return;
@@ -329,7 +472,10 @@ impl State {
             Val::Bytes(b) if !b.trunc(out.size).is_unknown() => Slot::Bytes(b.trunc(out.size)),
             Val::Bytes(_) => return,
         };
-        self.temps.insert((out.space, off), (out.size, slot));
+        match self.temps.binary_search_by(|e| (e.0, e.1).cmp(&(space, off))) {
+            Ok(k) => self.temps[k] = (space, off, out.size, slot),
+            Err(k) => self.temps.insert(k, (space, off, out.size, slot)),
+        }
     }
 
     /// The output value of a non-call op.
@@ -345,6 +491,53 @@ impl State {
             && b.get(out.size).is_some()
         {
             return Val::Bytes(b);
+        }
+        let otherwise = Val::Bytes(bytes.unwrap_or(ByteConst::UNKNOWN));
+        // The abstract value from inputs that are constants or Top (a
+        // constant or Top, as the general case below gives it); `None`
+        // when an input is abstract.
+        let input = |i: usize| op.inputs.get(i).map_or(Input::Top, |vn| self.read_input(vn));
+        let konst: Option<Option<u64>> = match op.opcode {
+            OpCode::Copy | OpCode::IntZExt => match input(0) {
+                Input::Const(c) => Some(Some(c)),
+                Input::Top => Some(None),
+                Input::Abstract => None,
+            },
+            OpCode::IntSExt => match op.inputs.first() {
+                None => Some(None),
+                Some(vn) => match self.read_input(vn) {
+                    Input::Const(c) => match sext(AbstractValue::Const(c), vn.size) {
+                        AbstractValue::Const(x) => Some(Some(x)),
+                        _ => Some(None),
+                    },
+                    Input::Top => Some(None),
+                    Input::Abstract => None,
+                },
+            },
+            OpCode::Subpiece => match op.inputs.get(1) {
+                Some(k) if k.space == SpaceId::CONST && k.offset == 0 => match input(0) {
+                    Input::Const(c) => Some(Some(c)),
+                    Input::Top => Some(None),
+                    Input::Abstract => None,
+                },
+                // only a set shifts
+                Some(k) if k.space == SpaceId::CONST && k.offset < 8 => match input(0) {
+                    Input::Abstract => None,
+                    _ => Some(None),
+                },
+                _ => Some(None),
+            },
+            OpCode::IntAdd => match (input(0), input(1)) {
+                (Input::Abstract, _) | (_, Input::Abstract) => None,
+                (Input::Const(x), Input::Const(y)) => Some(Some(x.wrapping_add(y) & bit_mask(out.size))),
+                _ => Some(None),
+            },
+            _ => return otherwise,
+        };
+        match konst {
+            Some(Some(c)) if out.size <= 8 => return Val::Bytes(ByteConst::konst(c, out.size)),
+            Some(_) => return otherwise,
+            None => {}
         }
         let input = |i: usize| op.inputs.get(i).map_or(AbstractValue::Top, |vn| self.read(vn));
         let abs = match op.opcode {
@@ -364,7 +557,7 @@ impl State {
         match fit(abs, out.size.min(8)) {
             a @ (AbstractValue::Set(_) | AbstractValue::Range(..)) if out.size <= 8 => Val::Abs(a),
             AbstractValue::Const(c) if out.size <= 8 => Val::Bytes(ByteConst::konst(c, out.size)),
-            _ => Val::Bytes(bytes.unwrap_or(ByteConst::UNKNOWN)),
+            _ => otherwise,
         }
     }
 
@@ -386,32 +579,70 @@ impl State {
 
     /// Every register whose 8 bytes are pinned, at a call.
     fn call_snapshot(&self) -> BTreeMap<u64, AbstractValue> {
-        self.regs
-            .iter()
-            .filter_map(|(b, s)| {
-                let v = s.read(0, 8);
-                (!matches!(v, AbstractValue::Top | AbstractValue::Bot)).then_some((*b, v))
-            })
-            .collect()
+        let consts = self.regs.iter().filter_map(|(b, s)| s.get(8).map(|v| (*b, AbstractValue::Const(v))));
+        if self.abs.is_empty() {
+            return consts.collect();
+        }
+        let lows = self.abs.iter().filter_map(|(b, w, v)| {
+            let v = Slot::Low(*w, v.clone()).read(0, 8);
+            (!matches!(v, AbstractValue::Top | AbstractValue::Bot)).then_some((*b, v))
+        });
+        consts.chain(lows).collect()
     }
 
     /// CFG join.
     fn join(&self, other: &State) -> State {
-        let regs = self
-            .regs
-            .iter()
-            .filter_map(|(b, s)| Some((*b, s.join(other.regs.get(b)?)?)))
-            .collect();
-        let temps = self
-            .temps
-            .iter()
-            .filter_map(|(k, (sz, s))| {
-                let (osz, o) = other.temps.get(k)?;
-                (osz == sz).then_some(())?;
-                Some((*k, (*sz, s.join(o)?)))
-            })
-            .collect();
-        State { regs, temps }
+        let mut out = State::default();
+        if self.abs.is_empty() && other.abs.is_empty() {
+            // known bytes only: merge the two sorted lists
+            let mut k = 0;
+            for &(base, a) in &self.regs {
+                while k < other.regs.len() && other.regs[k].0 < base {
+                    k += 1;
+                }
+                let Some(&(ob, b)) = other.regs.get(k) else { break };
+                if ob != base {
+                    continue;
+                }
+                if a == b {
+                    out.regs.push((base, a));
+                } else if let Some(j) = Slot::Bytes(a).join(&Slot::Bytes(b)) {
+                    match j {
+                        Slot::Bytes(j) => out.regs.push((base, j)),
+                        Slot::Low(w, v) => out.abs.push((base, w, v)),
+                    }
+                }
+            }
+        } else {
+            let mut bases: SmallVec<[u64; 8]> =
+                self.regs.iter().map(|e| e.0).chain(self.abs.iter().map(|e| e.0)).collect();
+            bases.sort_unstable();
+            for base in bases {
+                if let (Some(x), Some(y)) = (self.reg_slot(base), other.reg_slot(base))
+                    && let Some(j) = x.join(&y)
+                {
+                    match j {
+                        Slot::Bytes(j) => out.regs.push((base, j)),
+                        Slot::Low(w, v) => out.abs.push((base, w, v)),
+                    }
+                }
+            }
+        }
+        // temporaries: both sorted by key
+        let mut k = 0;
+        for (space, off, sz, s) in &self.temps {
+            while k < other.temps.len() && (other.temps[k].0, other.temps[k].1) < (*space, *off) {
+                k += 1;
+            }
+            if let Some((os, oo, osz, o)) = other.temps.get(k)
+                && (*os, *oo) == (*space, *off)
+                && osz == sz
+                && let Some(j) = s.join(o)
+            {
+                out.temps.push((*space, *off, *sz, j));
+            }
+        }
+        out
     }
 }
 
@@ -540,6 +771,7 @@ impl FlowState for State {
     /// register); temporaries are kept.
     fn after_call(&mut self) {
         self.regs.clear();
+        self.abs.clear();
     }
 }
 
@@ -799,6 +1031,323 @@ mod tests {
             }
             other => panic!("expected Set, got {:?}", other),
         }
+    }
+
+    /// The `State` before the register file: registers and temporaries
+    /// in `BTreeMap`s. The reference for [`state_matches_map_state`].
+    mod old {
+        use super::super::*;
+
+    /// State: registers by base offset, other varnodes by `(space, offset)`
+    /// with their size. A missing entry is Top.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(super) struct OldState {
+        pub(super) regs: BTreeMap<u64, Slot>,
+        pub(super) temps: BTreeMap<(SpaceId, i64), (u32, Slot)>,
+    }
+
+    impl OldState {
+        /// The known bytes of a varnode.
+        pub(super) fn read_bytes(&self, vn: &VarnodeData) -> ByteConst {
+            match vn.space {
+                SpaceId::CONST => ByteConst::konst(vn.offset, vn.size),
+                SpaceId::REGISTER => match split(vn.offset, vn.size) {
+                    Some((base, pos)) => self.regs.get(&base).map_or(ByteConst::UNKNOWN, |s| s.bytes().bytes_at(pos, vn.size)),
+                    None => ByteConst::UNKNOWN,
+                },
+                s => match self.temps.get(&(s, vn.offset as i64)) {
+                    Some((sz, slot)) if *sz >= vn.size => slot.bytes().trunc(vn.size),
+                    _ => ByteConst::UNKNOWN,
+                },
+            }
+        }
+
+        /// The abstract value of a varnode.
+        pub(super) fn read(&self, vn: &VarnodeData) -> AbstractValue {
+            match vn.space {
+                SpaceId::CONST => AbstractValue::Const(vn.offset & bit_mask(vn.size)),
+                SpaceId::REGISTER => match split(vn.offset, vn.size) {
+                    Some((base, pos)) => self.regs.get(&base).map_or(AbstractValue::Top, |s| s.read(pos, vn.size)),
+                    None => AbstractValue::Top,
+                },
+                s => match self.temps.get(&(s, vn.offset as i64)) {
+                    Some((sz, slot)) if *sz >= vn.size => slot.read(0, vn.size),
+                    _ => AbstractValue::Top,
+                },
+            }
+        }
+
+        fn write(&mut self, out: &VarnodeData, v: Val) {
+            let v = match v {
+                Val::Abs(AbstractValue::Const(c)) => Val::Bytes(ByteConst::konst(c, out.size)),
+                Val::Abs(AbstractValue::Top | AbstractValue::Bot) => Val::Bytes(ByteConst::UNKNOWN),
+                v => v,
+            };
+            if out.space == SpaceId::REGISTER {
+                let Some((base, pos)) = split(out.offset, out.size) else {
+                    let end = out.offset.saturating_add(u64::from(out.size.max(1)));
+                    let bases: Vec<u64> = self.regs.range(out.offset & !7..end).map(|(b, _)| *b).collect();
+                    for b in bases {
+                        self.regs.remove(&b);
+                    }
+                    return;
+                };
+                let next = match v {
+                    Val::Abs(a) if pos == 0 => Slot::Low(out.size, a),
+                    Val::Abs(_) => Slot::Bytes(self.regs.get(&base).map_or(ByteConst::UNKNOWN, Slot::bytes).merge(
+                        pos,
+                        out.size,
+                        ByteConst::UNKNOWN,
+                    )),
+                    Val::Bytes(b) => {
+                        Slot::Bytes(self.regs.get(&base).map_or(ByteConst::UNKNOWN, Slot::bytes).merge(pos, out.size, b))
+                    }
+                };
+                if next == Slot::Bytes(ByteConst::UNKNOWN) {
+                    self.regs.remove(&base);
+                } else {
+                    self.regs.insert(base, next);
+                }
+                return;
+            }
+            let off = out.offset as i64;
+            let end = off.saturating_add(i64::from(out.size.max(1)));
+            let overlapping: smallvec::SmallVec<[(SpaceId, i64); 4]> = self
+                .temps
+                .range((out.space, off.saturating_sub(8))..(out.space, end))
+                .filter(|((_, o), (sz, _))| o.saturating_add(i64::from(*sz)) > off)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in overlapping {
+                self.temps.remove(&k);
+            }
+            if out.size > 8 {
+                return;
+            }
+            let slot = match v {
+                Val::Abs(a) => Slot::Low(out.size, a),
+                Val::Bytes(b) if !b.trunc(out.size).is_unknown() => Slot::Bytes(b.trunc(out.size)),
+                Val::Bytes(_) => return,
+            };
+            self.temps.insert((out.space, off), (out.size, slot));
+        }
+
+        /// The output value of a non-call op.
+        fn eval(&self, op: &PcodeOp) -> Val {
+            let Some(out) = op.output.as_ref() else {
+                return Val::Bytes(ByteConst::UNKNOWN);
+            };
+            if op.opcode == OpCode::Load {
+                return Val::Bytes(ByteConst::UNKNOWN);
+            }
+            let bytes = eval(op, |vn| self.read_bytes(vn));
+            if let Some(b) = bytes
+                && b.get(out.size).is_some()
+            {
+                return Val::Bytes(b);
+            }
+            let input = |i: usize| op.inputs.get(i).map_or(AbstractValue::Top, |vn| self.read(vn));
+            let abs = match op.opcode {
+                OpCode::Copy | OpCode::IntZExt => input(0),
+                OpCode::IntSExt => op.inputs.first().map_or(AbstractValue::Top, |vn| sext(self.read(vn), vn.size)),
+                OpCode::Subpiece => match op.inputs.get(1) {
+                    Some(k) if k.space == SpaceId::CONST && k.offset == 0 => input(0),
+                    Some(k) if k.space == SpaceId::CONST && k.offset < 8 => match input(0) {
+                        AbstractValue::Set(s) => AbstractValue::Set(s.into_iter().map(|v| v >> (k.offset * 8)).collect()),
+                        _ => AbstractValue::Top,
+                    },
+                    _ => AbstractValue::Top,
+                },
+                OpCode::IntAdd => add(input(0), input(1), out.size),
+                _ => AbstractValue::Top,
+            };
+            match fit(abs, out.size.min(8)) {
+                a @ (AbstractValue::Set(_) | AbstractValue::Range(..)) if out.size <= 8 => Val::Abs(a),
+                AbstractValue::Const(c) if out.size <= 8 => Val::Bytes(ByteConst::konst(c, out.size)),
+                _ => Val::Bytes(bytes.unwrap_or(ByteConst::UNKNOWN)),
+            }
+        }
+
+        /// Apply one non-call op.
+        pub(super) fn apply(&mut self, op: &PcodeOp) {
+            if is_unmodeled(op) {
+                *self = OldState::default();
+                return;
+            }
+            let Some(out) = op.output.as_ref() else {
+                return;
+            };
+            if is_view_refresh(op) {
+                return;
+            }
+            let v = self.eval(op);
+            self.write(out, v);
+        }
+
+        /// Every register whose 8 bytes are pinned, at a call.
+        pub(super) fn call_snapshot(&self) -> BTreeMap<u64, AbstractValue> {
+            self.regs
+                .iter()
+                .filter_map(|(b, s)| {
+                    let v = s.read(0, 8);
+                    (!matches!(v, AbstractValue::Top | AbstractValue::Bot)).then_some((*b, v))
+                })
+                .collect()
+        }
+
+        /// CFG join.
+        pub(super) fn join(&self, other: &OldState) -> OldState {
+            let regs = self
+                .regs
+                .iter()
+                .filter_map(|(b, s)| Some((*b, s.join(other.regs.get(b)?)?)))
+                .collect();
+            let temps = self
+                .temps
+                .iter()
+                .filter_map(|(k, (sz, s))| {
+                    let (osz, o) = other.temps.get(k)?;
+                    (osz == sz).then_some(())?;
+                    Some((*k, (*sz, s.join(o)?)))
+                })
+                .collect();
+            OldState { regs, temps }
+        }
+    }
+
+
+    }
+
+    /// The new state in the old one's maps.
+    fn as_old(s: &State) -> old::OldState {
+        let mut regs = BTreeMap::new();
+        for (base, b) in &s.regs {
+            assert!(!b.is_unknown());
+            regs.insert(*base, Slot::Bytes(*b));
+        }
+        for (base, w, v) in &s.abs {
+            assert!(regs.insert(*base, Slot::Low(*w, v.clone())).is_none());
+        }
+        assert!(s.regs.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(s.abs.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(s.temps.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+        let temps = s.temps.iter().map(|(sp, o, sz, v)| ((*sp, *o), (*sz, v.clone()))).collect();
+        old::OldState { regs, temps }
+    }
+
+    /// The list state behaves exactly as the map state on
+    /// random op sequences, joins and calls: same contents, reads,
+    /// snapshots and equalities.
+    #[test]
+    fn state_matches_map_state() {
+        use crate::byteconst::testseq::{k, op};
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const BASES: [u64; 12] = [0x0, 0x8, 0x30, 0x38, 0xb8, 0xc0, 0x200, 0x208, 0x218, 0x220, 0x1200, 0x1208];
+        const SIZES: [u32; 6] = [1, 2, 4, 8, 8, 16];
+        const VALUES: [u64; 8] = [0, 1, 2, 3, 0x80, 0xff, 0xffff_ffff_ffff_fff0, 0x4020_0000];
+        let vn = |next: &mut dyn FnMut() -> u64| -> VarnodeData {
+            let size = SIZES[(next() % 6) as usize];
+            match next() % 10 {
+                0..=4 => {
+                    let base = BASES[(next() % 12) as usize];
+                    let pos = if next().is_multiple_of(3) { next() % 8 } else { 0 };
+                    VarnodeData::new(SpaceId::REGISTER, base + pos, size)
+                }
+                5..=7 => VarnodeData::new(SpaceId::UNIQUE, 0x100 + next() % 24, size),
+                8 => VarnodeData::new(SpaceId::RAM, 0x5000 + next() % 16, size),
+                _ => k(VALUES[(next() % 8) as usize], size),
+            }
+        };
+        let mut checked = (0, 0, 0, 0);
+        for round in 0..300 {
+            let mut pool: Vec<(State, old::OldState)> = vec![(State::default(), old::OldState::default())];
+            for step in 0..200 {
+                let i = (next() as usize) % pool.len();
+                match next() % 16 {
+                    0 | 1 if pool.len() > 1 => {
+                        let j = (next() as usize) % pool.len();
+                        let n = pool[i].0.join(&pool[j].0);
+                        let o = pool[i].1.join(&pool[j].1);
+                        checked.1 += 1;
+                        pool.push((n, o));
+                    }
+                    2 if next().is_multiple_of(4) => {
+                        pool[i].0.after_call();
+                        pool[i].1.regs.clear();
+                    }
+                    3 => {
+                        let c = pool[i].clone();
+                        pool.push(c);
+                    }
+                    4..=6 => {
+                        // pin a whole register
+                        let r = VarnodeData::new(SpaceId::REGISTER, BASES[(next() % 12) as usize], 8);
+                        let o = op(OpCode::Copy, Some(r), &[k(VALUES[(next() % 8) as usize], 8)]);
+                        pool[i].0.apply(&o);
+                        pool[i].1.apply(&o);
+                    }
+                    _ => {
+                        let opcode = [
+                            OpCode::Copy,
+                            OpCode::Copy,
+                            OpCode::Copy,
+                            OpCode::IntZExt,
+                            OpCode::IntSExt,
+                            OpCode::Subpiece,
+                            OpCode::IntAdd,
+                            OpCode::IntAdd,
+                            OpCode::IntSub,
+                            OpCode::IntAnd,
+                            OpCode::IntXor,
+                            OpCode::Piece,
+                            OpCode::Load,
+                            OpCode::CallOther,
+                            OpCode::Store,
+                            OpCode::IntLess,
+                        ][(next() % 16) as usize];
+                        let out = vn(&mut next);
+                        let a = vn(&mut next);
+                        let b = match opcode {
+                            OpCode::Subpiece => k(next() % 9, 4),
+                            OpCode::CallOther => k([0, 1, 0xff, 0x100][(next() % 4) as usize], 4),
+                            _ => vn(&mut next),
+                        };
+                        let o = match opcode {
+                            OpCode::CallOther => op(opcode, Some(out), &[b, a]),
+                            OpCode::Store => op(opcode, None, &[a, b]),
+                            OpCode::IntZExt | OpCode::IntSExt | OpCode::Copy => op(opcode, Some(out), &[a]),
+                            _ => op(opcode, Some(out), &[a, b]),
+                        };
+                        pool[i].0.apply(&o);
+                        pool[i].1.apply(&o);
+                    }
+                }
+                for (n, o) in &pool {
+                    assert_eq!(&as_old(n), o, "round {round} step {step}");
+                    assert_eq!(n.call_snapshot(), o.call_snapshot(), "round {round} step {step}");
+                    let v = vn(&mut next);
+                    assert_eq!(n.read(&v), o.read(&v));
+                    assert_eq!(n.read_bytes(&v), o.read_bytes(&v));
+                    checked.2 += usize::from(n.abs.len() + n.temps.len() > 0);
+                    checked.3 += usize::from(n.regs.len() > 4);
+                }
+                let (a, b) = ((next() as usize) % pool.len(), (next() as usize) % pool.len());
+                assert_eq!(pool[a].0 == pool[b].0, pool[a].1 == pool[b].1);
+                checked.0 += usize::from(pool[a].0 == pool[b].0 && a != b);
+                if pool.len() > 12 {
+                    pool.remove((next() as usize) % pool.len());
+                }
+            }
+        }
+        // the sequences reach abstract values, temporaries, joins and
+        // equal states
+        assert!(checked.0 > 100 && checked.1 > 1000 && checked.2 > 10000 && checked.3 > 1000, "{checked:?}");
     }
 
     /// The lifter's sub-register sequences, each followed by a call.
