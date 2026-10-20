@@ -345,7 +345,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         None => crate::blockflow::LiftShape::of(insns),
     };
     let external = match jumps {
-        Some(jumps) => jumps.external_entries_at(program, &shape.addrs),
+        Some(jumps) => jumps.external_entries_ordered(program, &shape.addrs, shape.increasing),
         None => crate::func_lift::external_entries_at(program, &shape.addrs),
     };
     // Who owns each call instruction, asked once: the walk, the blocks

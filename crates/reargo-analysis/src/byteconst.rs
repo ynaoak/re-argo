@@ -138,11 +138,17 @@ impl ByteConst {
     pub fn intersect(self, other: ByteConst) -> Self {
         let both = self.known & other.known;
         let diff = (self.value ^ other.value) & bits_of(both);
-        let same = (0..8u8)
-            .filter(|&i| both & (1 << i) != 0 && (diff >> (i * 8)) & 0xff == 0)
-            .fold(0u8, |m, i| m | (1 << i));
-        Self::new(self.value, same)
+        Self::new(self.value, both & !nonzero_bytes(diff))
     }
+}
+
+/// The mask of the bytes of `x` that are not zero (bit `i`: byte `i`).
+fn nonzero_bytes(x: u64) -> u8 {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    // (the high bit of each byte: set when the byte is not zero)
+    let high = (((x & LOW7) + LOW7) | x) & !LOW7;
+    // (the high bits gathered into one byte, byte `i`'s at bit `i`)
+    ((high >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8
 }
 
 /// `(base, byte position)` of a REGISTER access when it lies inside one
@@ -614,6 +620,31 @@ pub(crate) mod testseq {
 mod tests {
     use super::*;
     use reargo_core::address::Address;
+
+    #[test]
+    fn nonzero_bytes_matches_per_byte() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..100_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // (bytes zero, 0x80, 0x7f, 0xff, 0x01 or random, by the seed)
+            let x = (0..8).fold(0u64, |x, i| {
+                let pick = (seed >> (i * 3)) & 7;
+                let b = match pick {
+                    0..=2 => 0,
+                    3 => 0x80,
+                    4 => 0x7f,
+                    5 => 0xff,
+                    6 => 0x01,
+                    _ => (seed >> (24 + i * 4)) & 0xff,
+                };
+                x | (b << (i * 8))
+            });
+            let want = (0..8).filter(|i| (x >> (i * 8)) & 0xff != 0).fold(0u8, |m, i| m | (1 << i));
+            assert_eq!(nonzero_bytes(x), want, "{x:#x}");
+        }
+    }
     use reargo_core::pcode::SeqNum;
 
     fn reg(off: u64, size: u32) -> VarnodeData {
