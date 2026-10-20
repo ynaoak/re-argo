@@ -47,19 +47,36 @@ pub struct LiftShape {
     pub increasing: bool,
     /// Each instruction's address.
     pub addrs: Vec<u64>,
-    /// It has a `Call` / `CallInd` op.
-    pub has_call: Vec<bool>,
+    /// Each instruction's [`InsnShape`] flags: see
+    /// [`LiftShape::has_call`], [`LiftShape::ends_block`],
+    /// [`LiftShape::stops`].
+    pub flags: Vec<u8>,
     /// `(instruction index, target)` of every `Branch` / `CBranch` with
     /// a jump target in the lift's space ([`target`]), in op order.
     pub branches: Vec<(usize, u64)>,
-    /// It has a `Branch`, `CBranch`, `Return` or `BranchInd` op (it
-    /// ends its block).
-    pub ends_block: Vec<bool>,
-    /// It has a `Branch`, `Return` or `BranchInd` op (no fall-through).
-    pub stops: Vec<bool>,
 }
 
 impl LiftShape {
+    /// Instruction `i` has a `Call` / `CallInd` op.
+    #[inline]
+    pub fn has_call(&self, i: usize) -> bool {
+        self.flags[i] & InsnShape::CALL != 0
+    }
+
+    /// Instruction `i` has a `Branch`, `CBranch`, `Return` or
+    /// `BranchInd` op (it ends its block).
+    #[inline]
+    pub fn ends_block(&self, i: usize) -> bool {
+        self.flags[i] & InsnShape::ENDS != 0
+    }
+
+    /// Instruction `i` has a `Branch`, `Return` or `BranchInd` op (no
+    /// fall-through).
+    #[inline]
+    pub fn stops(&self, i: usize) -> bool {
+        self.flags[i] & InsnShape::STOPS != 0
+    }
+
     pub fn of<I: Borrow<LiftedInstruction>>(insns: &[I]) -> LiftShape {
         Self::build(insns, |i| InsnShape::of(insns[i].borrow()))
     }
@@ -75,10 +92,8 @@ impl LiftShape {
         let mut shape = LiftShape {
             increasing: true,
             addrs: Vec::with_capacity(n),
-            has_call: Vec::with_capacity(n),
+            flags: Vec::with_capacity(n),
             branches: Vec::new(),
-            ends_block: Vec::with_capacity(n),
-            stops: Vec::with_capacity(n),
         };
         for (i, insn) in insns.iter().enumerate() {
             let s = shape_of(i);
@@ -97,9 +112,7 @@ impl LiftShape {
                 shape.increasing = false;
             }
             shape.addrs.push(s.address);
-            shape.has_call.push(s.flags & InsnShape::CALL != 0);
-            shape.ends_block.push(s.flags & InsnShape::ENDS != 0);
-            shape.stops.push(s.flags & InsnShape::STOPS != 0);
+            shape.flags.push(s.flags);
         }
         shape
     }
@@ -142,8 +155,8 @@ impl LiftMarks {
         let target_idx: Vec<Option<usize>> = shape
             .branches
             .iter()
-            .map(|&(_, t)| {
-                let i = addrs.binary_search(&t).ok()?;
+            .map(|&(from, t)| {
+                let i = find_near(addrs, from, t)?;
                 flags[i] |= Self::TARGET;
                 Some(i)
             })
@@ -155,7 +168,7 @@ impl LiftMarks {
         }
         let mut owned_calls = Vec::new();
         let mut calls = Vec::new();
-        for (i, _) in shape.has_call.iter().enumerate().filter(|(_, c)| **c) {
+        for i in (0..addrs.len()).filter(|&i| shape.has_call(i)) {
             let owned = owns(i);
             if owned {
                 flags[i] |= Self::OWNED_CALL;
@@ -164,6 +177,41 @@ impl LiftMarks {
             calls.push((addrs[i], owned));
         }
         LiftMarks { flags, target_idx, owned_calls, calls }
+    }
+}
+
+/// The index of `t` in the strictly increasing `addrs`, searched
+/// outwards from index `from` (a jump's own: most jumps are short) —
+/// what `addrs.binary_search(&t).ok()` gives.
+fn find_near(addrs: &[u64], from: usize, t: u64) -> Option<usize> {
+    let n = addrs.len();
+    if t >= addrs[from] {
+        // addrs[lo] <= t; the first probe at or past `t` bounds it
+        let (mut lo, mut step) = (from, 1);
+        loop {
+            let hi = from + step;
+            if hi >= n {
+                return addrs[lo..].binary_search(&t).ok().map(|k| lo + k);
+            }
+            if addrs[hi] >= t {
+                return addrs[lo..=hi].binary_search(&t).ok().map(|k| lo + k);
+            }
+            lo = hi;
+            step *= 2;
+        }
+    }
+    // addrs[hi] > t
+    let (mut hi, mut step) = (from, 1);
+    loop {
+        if step > from {
+            return addrs[..hi].binary_search(&t).ok();
+        }
+        let lo = from - step;
+        if addrs[lo] <= t {
+            return addrs[lo..hi].binary_search(&t).ok().map(|k| lo + k);
+        }
+        hi = lo;
+        step *= 2;
     }
 }
 
@@ -239,11 +287,10 @@ impl Cfg {
                 is_start[t] = true;
             }
         }
-        for (start, &ends) in is_start[1..].iter_mut().zip(&shape.ends_block) {
-            *start |= ends;
+        for (start, &f) in is_start[1..].iter_mut().zip(&shape.flags) {
+            *start |= f & InsnShape::ENDS != 0;
         }
         let targets = &shape.branches;
-        let stops = &shape.stops;
         let start_idx: Vec<usize> = (0..n).filter(|&i| is_start[i]).collect();
         let start_addr: Vec<u64> = start_idx.iter().map(|&i| addr(i)).collect();
         let nb = start_idx.len();
@@ -265,7 +312,7 @@ impl Cfg {
                 succs.extend(block_of(targets[ti].1));
                 ti += 1;
             }
-            if !stops[last] && b + 1 < nb {
+            if !shape.stops(last) && b + 1 < nb {
                 succs.push(b + 1);
             }
         }
@@ -312,8 +359,8 @@ impl Cfg {
         let mut start_idx: Vec<usize> = Vec::with_capacity(n / 4 + 1);
         start_idx.push(0);
         // (instruction `i` with the end of instruction `i - 1`)
-        for ((i, &f), &after_end) in flags.iter().enumerate().skip(1).zip(&shape.ends_block) {
-            if f & (LiftMarks::TARGET | LiftMarks::EXTERNAL) != 0 || after_end {
+        for ((i, &f), &before) in flags.iter().enumerate().skip(1).zip(&shape.flags) {
+            if f & (LiftMarks::TARGET | LiftMarks::EXTERNAL) != 0 || before & InsnShape::ENDS != 0 {
                 start_idx.push(i);
             }
         }
@@ -322,7 +369,6 @@ impl Cfg {
         // (a jump target is a block start)
         let block_of = |i: usize| start_idx.binary_search(&i).ok();
         let targets = &shape.branches;
-        let stops = &shape.stops;
         let mut succs: Vec<usize> = Vec::with_capacity(nb + targets.len());
         let mut succ_at: Vec<usize> = Vec::with_capacity(nb + 1);
         let mut ti = 0;
@@ -336,7 +382,7 @@ impl Cfg {
                 succs.extend(marks.target_idx[ti].and_then(block_of));
                 ti += 1;
             }
-            if !stops[last] && b + 1 < nb {
+            if !shape.stops(last) && b + 1 < nb {
                 succs.push(b + 1);
             }
         }
@@ -856,6 +902,31 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn find_near_is_binary_search() {
+        let mut seed = 0x5555_aaaa_1234_9876_u64;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..2000 {
+            let n = 1 + next(80) as usize;
+            let mut a = next(10);
+            let addrs: Vec<u64> = (0..n)
+                .map(|_| {
+                    a += 1 + next(6);
+                    a
+                })
+                .collect();
+            let from = next(n as u64) as usize;
+            for t in 0..a + 8 {
+                assert_eq!(find_near(&addrs, from, t), addrs.binary_search(&t).ok(), "{addrs:?} {from} {t}");
+            }
+        }
+    }
+
     /// The blocks built from [`LiftMarks`] are the blocks built from the
     /// lift's shape, and keep the same calls.
     #[test]
@@ -873,12 +944,12 @@ mod tests {
             let mut a = Cfg::build_shaped(&shape, &external, in_body);
             let mut b = Cfg::build_marked(&shape, &marks, in_body);
             assert_eq!(a, b, "round {round}");
-            a.keep_calls_at(n, |i| shape.has_call[i] && owns(i));
+            a.keep_calls_at(n, |i| shape.has_call(i) && owns(i));
             b.keep_owned_calls(&marks);
             assert_eq!(a, b, "round {round}");
             kept += a.relevant.as_ref().map_or(0, |r| r.iter().filter(|r| **r).count());
             let calls: Vec<(u64, bool)> =
-                (0..n).filter(|&i| shape.has_call[i]).map(|i| (insns[i].address, owns(i))).collect();
+                (0..n).filter(|&i| shape.has_call(i)).map(|i| (insns[i].address, owns(i))).collect();
             assert_eq!(marks.calls, calls);
         }
         assert!(kept > 1000, "{kept}");

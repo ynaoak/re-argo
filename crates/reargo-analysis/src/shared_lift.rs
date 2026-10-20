@@ -363,12 +363,9 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         .then(|| crate::blockflow::LiftMarks::new(&shape, &external, |i| owner.owns(shape.addrs[i])));
     let calls: Vec<(u64, bool)> = match &mut marks {
         Some(marks) => std::mem::take(&mut marks.calls),
-        None => shape
-            .has_call
-            .iter()
-            .zip(&shape.addrs)
-            .filter(|(call, _)| **call)
-            .map(|(_, &a)| (a, owner.owns(a)))
+        None => (0..shape.addrs.len())
+            .filter(|&i| shape.has_call(i))
+            .map(|i| (shape.addrs[i], owner.owns(shape.addrs[i])))
             .collect(),
     };
     let owns_call = |a: u64| match calls.binary_search_by_key(&a, |c| c.0) {
@@ -393,7 +390,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
             }
             None => {
                 let mut blocks = crate::blockflow::Cfg::build_shaped(&shape, &external, in_body);
-                blocks.keep_calls_at(insns.len(), |i| shape.has_call[i] && owns_call(shape.addrs[i]));
+                blocks.keep_calls_at(insns.len(), |i| shape.has_call(i) && owns_call(shape.addrs[i]));
                 blocks
             }
         };

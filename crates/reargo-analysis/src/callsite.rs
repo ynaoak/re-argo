@@ -386,7 +386,8 @@ pub(crate) fn walk_function_shaped<I: std::borrow::Borrow<LiftedInstruction>>(
     // *its* tracker state (e.g. all unresolved), and the dedup would
     // block the real owner from re-recording it with the correct
     // seeded state.
-    let owned: Vec<bool> = shape.has_call.iter().zip(&shape.addrs).map(|(&call, &a)| call && owns_call(a)).collect();
+    let owned: Vec<bool> =
+        (0..shape.addrs.len()).map(|i| shape.has_call(i) && owns_call(shape.addrs[i])).collect();
     // Nothing after the last owned call is recorded: the walk stops there.
     let Some(last) = owned.iter().rposition(|&o| o) else {
         return out;
@@ -452,7 +453,7 @@ pub(crate) fn walk_function_marked<I: std::borrow::Borrow<LiftedInstruction>>(
         let flags = marks.flags[i];
         // a join point: a jump target, an external entry, or after an
         // instruction with no fall-through
-        if flags & (LiftMarks::TARGET | LiftMarks::EXTERNAL) != 0 || (i > 0 && shape.stops[i - 1]) {
+        if flags & (LiftMarks::TARGET | LiftMarks::EXTERNAL) != 0 || (i > 0 && shape.stops(i - 1)) {
             tracker.reset();
         }
         let owned = flags & LiftMarks::OWNED_CALL != 0;
@@ -938,8 +939,8 @@ fn join_points_shaped(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
                 out[i] = true;
             }
         }
-        for (o, &stop) in out.iter_mut().skip(1).zip(&shape.stops) {
-            *o |= stop;
+        for (o, &f) in out.iter_mut().skip(1).zip(&shape.flags) {
+            *o |= f & reargo_lift::InsnShape::STOPS != 0;
         }
         return out;
     }
@@ -953,7 +954,7 @@ fn join_points_hashed(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
     let mut after_terminator = false;
     for (i, &a) in shape.addrs.iter().enumerate() {
         out[i] = after_terminator || targets.contains(&a);
-        after_terminator = shape.stops[i];
+        after_terminator = shape.stops(i);
     }
     out
 }
@@ -997,14 +998,11 @@ mod tests {
                 .map(|_| (next(n.max(1) as u64) as usize, 0xff8 + next(a - 0xff0)))
                 .collect::<Vec<_>>();
             let stops = (0..n).map(|_| next(4) == 0).collect::<Vec<_>>();
-            let shape = crate::blockflow::LiftShape {
-                increasing: true,
-                has_call: vec![false; n],
-                ends_block: stops.clone(),
-                addrs,
-                branches,
-                stops,
-            };
+            let flags = stops
+                .iter()
+                .map(|&s| if s { reargo_lift::InsnShape::STOPS | reargo_lift::InsnShape::ENDS } else { 0 })
+                .collect();
+            let shape = crate::blockflow::LiftShape { increasing: true, flags, addrs, branches };
             assert_eq!(join_points_shaped(&shape), join_points_hashed(&shape));
         }
     }
