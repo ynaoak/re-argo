@@ -23,6 +23,7 @@
 //! all key off names, so renaming `main` cascades through the entire
 //! pipeline.
 
+use rayon::prelude::*;
 use reargo_lift::PcodeLift;
 use reargo_program::function::Function;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
@@ -152,10 +153,11 @@ fn candidate_owners(
     let mut hits: Vec<u64> = Vec::new();
     for block in program.info.memory.blocks() {
         let Some(data) = block.data.as_deref() else { continue };
-        for (i, &b) in data.iter().enumerate() {
+        // every byte is looked at on its own: the scan runs in parallel
+        let is_hit = |i: usize| {
             let p = block.start.wrapping_add(i as u64);
             let rest = &data[i + 1..];
-            let hit = match b {
+            match data[i] {
                 0xE8 if !lsm_addrs.is_empty() => {
                     // rel32, or rel16 under an operand-size prefix
                     (rest.len() >= 4 && lsm_addrs.contains(&p.wrapping_add(5).wrapping_add(sext32(rest))))
@@ -175,11 +177,15 @@ fn candidate_owners(
                     slot.is_some_and(|s| lsm_slots.contains(&s) || lsm_slots.contains(&(s & 0xffff_ffff)))
                 }
                 _ => false,
-            };
-            if hit {
-                hits.push(p);
             }
-        }
+        };
+        hits.par_extend(
+            (0..data.len())
+                .into_par_iter()
+                .with_min_len(1 << 16)
+                .filter(|&i| is_hit(i))
+                .map(|i| block.start.wrapping_add(i as u64)),
+        );
     }
     let mut owners = rustc_hash::FxHashSet::default();
     for p in hits {

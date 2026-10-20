@@ -138,6 +138,19 @@ impl Memory {
         Some(&data[start..end])
     }
 
+    /// The bytes [`Memory::read_bytes`] reads at `[offset, offset + len)`:
+    /// borrowed when the one block it reads from holds them all, as
+    /// [`Memory::slice`] gives them, else read into a copy; `None` when
+    /// the read fails.
+    pub fn bytes(&self, offset: u64, len: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        if let Some(bytes) = self.slice(offset, len as u64) {
+            return Some(std::borrow::Cow::Borrowed(bytes));
+        }
+        let mut buf = vec![0u8; len];
+        self.read_bytes(offset, &mut buf).ok()?;
+        Some(std::borrow::Cow::Owned(buf))
+    }
+
     pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), LoaderError> {
         let block = self
             .find_block(offset)

@@ -24,6 +24,31 @@ pub(crate) fn min_len(jobs: usize) -> usize {
     CHUNK.min(jobs.div_ceil(rayon::current_num_threads()).max(1))
 }
 
+/// Runs of consecutive jobs (index ranges, in order) for jobs of the
+/// given `costs`: each at most [`CHUNK`] jobs and, past its first job,
+/// at most an even share of the total cost split many ways per thread.
+/// A run of the costliest neighbours (one large function after another)
+/// would otherwise be the last thing a run of jobs waits for.
+pub(crate) fn cost_chunks(costs: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let total: usize = costs.iter().sum();
+    let cap = (total / (rayon::current_num_threads() * 16)).max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut cost = 0;
+    for (k, &c) in costs.iter().enumerate() {
+        if k > start && (k - start >= CHUNK || cost + c > cap) {
+            chunks.push(start..k);
+            start = k;
+            cost = 0;
+        }
+        cost += c;
+    }
+    if start < costs.len() {
+        chunks.push(start..costs.len());
+    }
+    chunks
+}
+
 /// Instructions a cache holds before those below the range being lifted
 /// are dropped ([`trim`]).
 const RETAIN_AT: usize = 4096;

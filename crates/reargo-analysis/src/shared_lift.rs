@@ -175,17 +175,29 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     // (`lift_range_cached` gives exactly what `lift_range` would).
     let x86 = reargo_lift::x86::X86Lifter::new_64();
     type Extra = Option<(u64, usize, usize, Option<(u64, &'static str)>)>;
-    let jobs: Vec<(u64, usize, Option<FunctionResults>, usize)> = if with_snapshots {
+    // (entry, max instructions, results kept, arity budget)
+    type Job = (u64, usize, Option<FunctionResults>, usize);
+    let jobs: Vec<Job> = if with_snapshots {
         jobs.into_iter().zip(arity_budgets).map(|((e, m, k), a)| (e, m, k, a)).collect()
     } else {
         jobs.into_iter().map(|(e, m, k)| (e, m, k, 0)).collect()
     };
-    let computed: Vec<(FunctionResults, Extra)> = jobs
+    // Runs of consecutive jobs bounded by their cost (the budget of
+    // each function computed), so no run of large functions is left
+    // for one thread at the end.
+    let costs: Vec<usize> = jobs.iter().map(|j| if j.2.is_some() { 1 } else { j.1.max(j.3) }).collect();
+    let mut jobs = jobs.into_iter();
+    let chunks: Vec<Vec<Job>> = crate::range_lift::cost_chunks(&costs)
+        .into_iter()
+        .map(|r| jobs.by_ref().take(r.len()).collect())
+        .collect();
+    let computed: Vec<(FunctionResults, Extra)> = chunks
         .into_par_iter()
-        .with_min_len(crate::range_lift::CHUNK)
-        .map_init(
-            reargo_lift::x86::LiftCache::new,
-            |cache, (entry, max_insns, kept, arity_budget)| {
+        .flat_map_iter(|chunk| {
+            let (x86, jumps) = (&x86, jumps.as_ref());
+            let mut cache = reargo_lift::x86::LiftCache::new();
+            chunk.into_iter().map(move |(entry, max_insns, kept, arity_budget)| {
+                let cache = &mut cache;
                 if let Some(kept) = kept {
                     return (kept, None);
                 }
@@ -206,7 +218,7 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
                     0 => {
                         results = Some(compute_lifted(
                             program,
-                            jumps.as_ref(),
+                            jumps,
                             entry,
                             max_insns,
                             insns,
@@ -220,8 +232,8 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
                 let results = results.expect("the function's lift");
                 let extra = with_snapshots.then_some((entry, arity_budget, arity, convention));
                 (results, extra)
-            },
-        )
+            })
+        })
         .collect();
     let mut ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
     let funcs: Vec<FunctionResults> = computed

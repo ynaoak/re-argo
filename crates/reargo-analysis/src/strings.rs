@@ -74,19 +74,20 @@ type SectionStrings = (String, u64, Vec<(u64, String)>);
 
 /// The name, address, size and bytes of each readable data section, in
 /// section order.
-fn data_section_bytes(sections: &[reargo_loader::Section], memory: &reargo_loader::memory::Memory) -> Vec<(String, u64, u64, Vec<u8>)> {
+fn data_section_bytes<'m>(
+    sections: &[reargo_loader::Section],
+    memory: &'m reargo_loader::memory::Memory,
+) -> Vec<(String, u64, u64, std::borrow::Cow<'m, [u8]>)> {
     sections
         .iter()
         .filter(|s| is_data_section(&s.name))
         .filter_map(|s| {
-            let mut buf = vec![0u8; s.size as usize];
-            memory.read_bytes(s.address, &mut buf).ok()?;
-            Some((s.name.clone(), s.address, s.size, buf))
+            Some((s.name.clone(), s.address, s.size, memory.bytes(s.address, s.size as usize)?))
         })
         .collect()
 }
 
-fn section_strings((name, addr, size, buf): (String, u64, u64, Vec<u8>)) -> SectionStrings {
+fn section_strings((name, addr, size, buf): (String, u64, u64, std::borrow::Cow<'_, [u8]>)) -> SectionStrings {
     let found = find_strings(&buf, addr)
         .into_iter()
         .map(|(string_addr, string_val)| {

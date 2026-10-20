@@ -147,6 +147,31 @@ impl TagManager {
         });
     }
 
+    /// [`Self::add_address`] of every `(address, kind, text)` of `tags`
+    /// in order, with `auto`. The addresses not tagged before are added
+    /// in one bulk build when `tags` is sorted by address.
+    pub fn add_addresses(&mut self, tags: Vec<(u64, TagKind, String)>, auto: bool) {
+        if !tags.is_sorted_by_key(|t| t.0) {
+            for (address, kind, text) in tags {
+                self.add_address(address, kind, text, auto);
+            }
+            return;
+        }
+        let mut fresh: Vec<(u64, Vec<Tag>)> = Vec::new();
+        for (address, kind, text) in tags {
+            let tag = Tag { kind, text, auto };
+            match fresh.last_mut() {
+                Some((a, v)) if *a == address => v.push(tag),
+                _ => match self.by_address.get_mut(&address) {
+                    Some(v) => v.push(tag),
+                    None => fresh.push((address, vec![tag])),
+                },
+            }
+        }
+        let mut fresh: TagMap = fresh.into_iter().collect();
+        self.by_address.append(&mut fresh);
+    }
+
     pub fn add_function(&mut self, entry: u64, kind: TagKind, text: impl Into<String>, auto: bool) {
         self.by_function.entry(entry).or_default().push(Tag {
             kind,

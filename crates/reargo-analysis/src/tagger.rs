@@ -141,9 +141,7 @@ impl Analyzer for TagAnalyzer {
         type Tags = Vec<(u64, TagKind, String)>;
         let (derived, function_tags): (Tags, Tags) = crate::analyzer::prepared(prepared);
         let tag_count = derived.len() + function_tags.len();
-        for (addr, cat, text) in derived {
-            program.tags.add_address(addr, cat, text, true);
-        }
+        program.tags.add_addresses(derived, true);
         for (entry, cat, text) in function_tags {
             program.tags.add_function(entry, cat, text, true);
         }

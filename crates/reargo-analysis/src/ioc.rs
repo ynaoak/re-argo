@@ -104,21 +104,22 @@ impl Analyzer for IocExtractor {
 /// The address and bytes of each data section (at most its first
 /// 8 MiB, to keep this cheap on resource-heavy binaries), in section
 /// order.
-fn data_section_bytes(sections: &[reargo_loader::Section], memory: &reargo_loader::memory::Memory) -> Vec<(u64, Vec<u8>)> {
+fn data_section_bytes<'m>(
+    sections: &[reargo_loader::Section],
+    memory: &'m reargo_loader::memory::Memory,
+) -> Vec<(u64, std::borrow::Cow<'m, [u8]>)> {
     sections
         .iter()
         .filter(|s| is_data_section(&s.name) && s.size > 0)
         .filter_map(|s| {
-            let mut buf = vec![0u8; s.size.min(8 * 1024 * 1024) as usize];
-            memory.read_bytes(s.address, &mut buf).ok()?;
-            Some((s.address, buf))
+            Some((s.address, memory.bytes(s.address, s.size.min(8 * 1024 * 1024) as usize)?))
         })
         .collect()
 }
 
 /// Every string of `sections` that is an IoC, in section and address
 /// order.
-fn find_iocs(sections: &[(u64, Vec<u8>)]) -> Vec<(u64, IocKind, String)> {
+fn find_iocs(sections: &[(u64, std::borrow::Cow<'_, [u8]>)]) -> Vec<(u64, IocKind, String)> {
     let mut matches: Vec<(u64, IocKind, String)> = Vec::new();
     for (addr, buf) in sections {
         for (sym_addr, s) in find_strings(buf, *addr) {

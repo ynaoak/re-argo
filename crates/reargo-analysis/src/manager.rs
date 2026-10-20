@@ -213,32 +213,37 @@ impl AnalysisManager {
             analyzer.start_early(program);
         }
         let mut results = Vec::with_capacity(self.analyzers.len());
+        // each split analyzer's prepared result, from the run it
+        // prepared in to its place
+        let mut ready: Vec<Option<(Prepared, std::time::Duration)>> = self.analyzers.iter().map(|_| None).collect();
         for window in self.windows() {
             // The prepares run at the same time, on the program as it is
             // here; each one's result is the same as at its analyzer's
             // own place (nothing in between writes what it reads).
-            let mut prepared: Vec<Option<(Prepared, std::time::Duration)>> =
-                window.prepared.iter().map(|_| None).collect();
             if window.prepared.len() >= 2 {
                 let shared = &*program;
+                let mut slots: Vec<(usize, Option<(Prepared, std::time::Duration)>)> =
+                    window.prepared.iter().map(|&i| (i, None)).collect();
                 rayon::scope(|s| {
-                    for (slot, &i) in prepared.iter_mut().zip(&window.prepared) {
-                        let analyzer = &*self.analyzers[i];
+                    for (i, slot) in slots.iter_mut() {
+                        let analyzer = &*self.analyzers[*i];
                         s.spawn(move |_| {
                             let t = std::time::Instant::now();
                             *slot = Some((analyzer.prepare(shared), t.elapsed()));
                         });
                     }
                 });
+                for (i, slot) in slots {
+                    ready[i] = slot;
+                }
             }
-            let mut prepared = window.prepared.iter().copied().zip(prepared).peekable();
             for i in window.analyzers {
                 let analyzer = &self.analyzers[i];
                 let t = std::time::Instant::now();
                 // a prepared analyzer counts its prepare's time too
-                let (r, extra) = match prepared.next_if(|(p, _)| *p == i) {
-                    Some((_, Some((p, d)))) => (analyzer.apply(program, p), d),
-                    _ => (analyzer.analyze(program), std::time::Duration::ZERO),
+                let (r, extra) = match ready[i].take() {
+                    Some((p, d)) => (analyzer.apply(program, p), d),
+                    None => (analyzer.analyze(program), std::time::Duration::ZERO),
                 };
                 results.push((analyzer.name(), t.elapsed() + extra, r));
             }
@@ -248,13 +253,16 @@ impl AnalysisManager {
 
     /// The pipeline cut into runs of consecutive analyzers, each with
     /// the split analyzers ([`Analyzer::prepare_reads`]) that prepare at
-    /// its start: those that no analyzer of the run before them writes
-    /// any of the state they read of. A split analyzer that one does is
-    /// where the next run starts.
+    /// its start. A split analyzer that an analyzer of the run before it
+    /// writes any of the state it reads of starts the next run; each
+    /// split analyzer then prepares at the start of the earliest run
+    /// from which no analyzer up to its own place writes any of that
+    /// state (so its prepares fill the cores another run's leave idle).
     fn windows(&self) -> Vec<Window> {
         let mut windows = Vec::new();
         let mut current = Window { analyzers: 0..0, prepared: Vec::new() };
         let mut written = State::NONE;
+        let mut split = Vec::new();
         for (i, analyzer) in self.analyzers.iter().enumerate() {
             if let Some(reads) = analyzer.prepare_reads().filter(|_| self.overlap) {
                 if reads.intersects(written) {
@@ -262,12 +270,38 @@ impl AnalysisManager {
                     windows.push(std::mem::replace(&mut current, next));
                     written = State::NONE;
                 }
-                current.prepared.push(i);
+                split.push((i, reads));
             }
             current.analyzers.end = i + 1;
             written = written | analyzer.writes();
         }
         windows.push(current);
+        let homes: Vec<bool> = windows.iter().map(|w| split.iter().any(|(i, _)| w.analyzers.contains(i))).collect();
+        for (i, reads) in split {
+            // the run it is in, then earlier ones while nothing from
+            // their start up to it writes what it reads
+            let mut w = windows.iter().rposition(|w| w.analyzers.start <= i).expect("a run holds it");
+            let mut written = self.analyzers[windows[w].analyzers.start..i]
+                .iter()
+                .fold(State::NONE, |acc, a| acc | a.writes());
+            while w > 0 {
+                let before = self.analyzers[windows[w - 1].analyzers.clone()]
+                    .iter()
+                    .fold(State::NONE, |acc, a| acc | a.writes());
+                if reads.intersects(written | before) {
+                    break;
+                }
+                written = written | before;
+                w -= 1;
+            }
+            // only into a run that prepares anyway
+            let home = windows.iter().rposition(|x| x.analyzers.start <= i).unwrap();
+            while w < home && !homes[w] {
+                w += 1;
+            }
+            debug_assert!(!reads.intersects(written));
+            windows[w].prepared.push(i);
+        }
         windows
     }
 

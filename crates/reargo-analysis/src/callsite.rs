@@ -348,9 +348,8 @@ pub(crate) fn walk_function_with<I: std::borrow::Borrow<LiftedInstruction>>(
     summaries: &ParamSummaries,
     external: &std::collections::BTreeSet<u64>,
 ) -> Vec<CallSite> {
-    walk_function_owning(entry, insns, summaries, external, |a| {
-        program.listing.function_containing(a).map(|f| f.entry_point) == Some(entry)
-    })
+    let owner = crate::func_lift::Owner::new(program, entry);
+    walk_function_owning(entry, insns, summaries, external, |a| owner.owns(a))
 }
 
 /// [`walk_function_with`] with whether the function owns the call
