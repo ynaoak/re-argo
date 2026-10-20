@@ -34,24 +34,42 @@ impl Listing {
         self.instructions.insert(insn.address, Box::new(insn));
     }
 
-    /// List each of `new` (by its address: sorted, one per address) at its
-    /// address unless one is listed there (as
-    /// [`Self::instruction_or_insert_with`] does), in bulk: the map is
-    /// built again in one pass from both when the new ones are many.
-    pub fn add_unlisted_instructions(&mut self, new: Vec<(u64, Box<DecodedInstruction>)>) {
-        debug_assert!(new.windows(2).all(|w| w[0].0 < w[1].0));
-        if new.len() < self.instructions.len() {
-            for (a, i) in new {
+    /// List each instruction of `runs` at its address unless one is listed
+    /// there (as [`Self::instruction_or_insert_with`] does), in bulk: the
+    /// map is built again in one pass from both when the new ones are
+    /// many. Each run is sorted by address; an address may repeat, in a
+    /// run or across runs, with the same instruction (the first kept).
+    pub fn add_unlisted_instructions(&mut self, runs: Vec<Vec<(u64, Box<DecodedInstruction>)>>) {
+        debug_assert!(runs.iter().all(|r| r.windows(2).all(|w| w[0].0 <= w[1].0)));
+        let total: usize = runs.iter().map(Vec::len).sum();
+        if total < self.instructions.len() {
+            for (a, i) in runs.into_iter().flatten() {
                 self.instructions.entry(a).or_insert(i);
             }
             return;
         }
         let old = std::mem::take(&mut self.instructions);
-        let mut merged: Vec<(u64, Box<DecodedInstruction>)> = Vec::with_capacity(old.len() + new.len());
+        let mut merged: Vec<(u64, Box<DecodedInstruction>)> = Vec::with_capacity(old.len() + total);
         let mut old = old.into_iter().peekable();
-        for (a, i) in new {
+        let mut heads: Vec<_> = runs.into_iter().map(|r| r.into_iter().peekable()).collect();
+        loop {
+            // (the run whose next address is the lowest: few runs)
+            let mut lowest: Option<(usize, u64)> = None;
+            for (k, head) in heads.iter_mut().enumerate() {
+                if let Some(&(a, _)) = head.peek()
+                    && lowest.is_none_or(|(_, l)| a < l)
+                {
+                    lowest = Some((k, a));
+                }
+            }
+            let Some((k, a)) = lowest else { break };
+            let Some((_, i)) = heads[k].next() else { break };
             while let Some(o) = old.next_if(|(oa, _)| *oa < a) {
                 merged.push(o);
+            }
+            // (a repeat: the one before kept)
+            if merged.last().is_some_and(|(la, _)| *la == a) {
+                continue;
             }
             // (the listed one kept)
             merged.push(old.next_if(|(oa, _)| *oa == a).unwrap_or((a, i)));
