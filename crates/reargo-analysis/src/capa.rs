@@ -172,12 +172,52 @@ impl Analyzer for CapaAnalyzer {
 }
 
 struct CapaContext {
-    imports_lower: BTreeSet<String>,
-    /// For each lower-cased import, the first import (in sorted
-    /// order) that lower-cases to it.
-    original_import: std::collections::BTreeMap<String, String>,
-    strings_lower: Vec<String>,
+    /// The lower-cased import / symbol names, sorted and distinct.
+    imports_lower: Haystack,
+    /// For each of `imports_lower`, the first import (in sorted order)
+    /// that lower-cases to it.
+    original_import: Vec<String>,
+    /// The comments, lower-cased.
+    strings_lower: Haystack,
     present_tags: BTreeSet<String>,
+}
+
+/// Strings searched for the first one holding a needle: kept joined,
+/// each followed by a NUL, so one search over all of them finds it
+/// (a match holds no NUL, so it lies in one string, and the first
+/// match is in the first string holding one).
+#[derive(Default)]
+struct Haystack {
+    joined: Vec<u8>,
+    /// Where each string starts in `joined`.
+    starts: Vec<usize>,
+    /// Whether a string holds a NUL itself (then each is searched alone).
+    has_nul: bool,
+}
+
+impl Haystack {
+    fn push(&mut self, s: &[u8]) {
+        self.has_nul |= memchr::memchr(0, s).is_some();
+        self.starts.push(self.joined.len());
+        self.joined.extend_from_slice(s);
+        self.joined.push(0);
+    }
+
+    fn get(&self, i: usize) -> &[u8] {
+        let end = self.starts.get(i + 1).map_or(self.joined.len(), |&e| e) - 1;
+        &self.joined[self.starts[i]..end]
+    }
+
+    /// The index of the first string that contains `needle`, as testing
+    /// each in order finds it.
+    fn first_containing(&self, needle: &[u8]) -> Option<usize> {
+        let finder = memchr::memmem::Finder::new(needle);
+        if self.has_nul || needle.contains(&0) || needle.is_empty() {
+            return (0..self.starts.len()).find(|&i| finder.find(self.get(i)).is_some());
+        }
+        let at = finder.find(&self.joined)?;
+        Some(self.starts.partition_point(|&s| s <= at) - 1)
+    }
 }
 
 /// The result and evidence of each import / string predicate, by
@@ -232,14 +272,17 @@ fn eval_with(p: &Predicate, present_tags: &BTreeSet<String>, leaves: &Leaves, ev
 
 /// The kinds of the tags on the program, as slugs.
 fn present_tags(program: &Program) -> BTreeSet<String> {
-    let mut present_tags: BTreeSet<String> = BTreeSet::new();
-    for (_, tag) in program.tags.iter_addresses() {
-        present_tags.insert(tag.kind.as_str().to_string());
+    // (the distinct kinds borrowed first: a tag per address or function,
+    // a handful of kinds)
+    let mut kinds: BTreeSet<&str> = BTreeSet::new();
+    let mut last: Option<&TagKind> = None;
+    for (_, tag) in program.tags.iter_addresses().chain(program.tags.iter_functions()) {
+        if last != Some(&tag.kind) {
+            kinds.insert(tag.kind.as_str());
+            last = Some(&tag.kind);
+        }
     }
-    for (_, tag) in program.tags.iter_functions() {
-        present_tags.insert(tag.kind.as_str().to_string());
-    }
-    present_tags
+    kinds.into_iter().map(str::to_string).collect()
 }
 
 fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaContext {
@@ -255,14 +298,22 @@ fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaConte
     let mut lowered: Vec<(String, &str)> = imports.par_iter().map(|s| (s.to_ascii_lowercase(), *s)).collect();
     lowered.par_sort_by(|a, b| a.0.cmp(&b.0));
     lowered.dedup_by(|later, first| later.0 == first.0);
-    let original_import: std::collections::BTreeMap<String, String> =
-        lowered.into_iter().map(|(lower, s)| (lower, s.to_string())).collect();
-    let imports_lower: BTreeSet<String> = original_import.keys().cloned().collect();
+    // (sorted by the lower-cased name: the order of a set of them)
+    let mut imports_lower = Haystack::default();
+    let mut original_import: Vec<String> = Vec::with_capacity(lowered.len());
+    for (lower, s) in lowered {
+        imports_lower.push(lower.as_bytes());
+        original_import.push(s.to_string());
+    }
 
     // Pull strings from inline comments / immediate-string annotations
     // (every string the analyzer cared about flows through these).
-    let comments: Vec<&str> = program.comments.iter_refs().map(|(_, _, text)| text).collect();
-    let strings_lower: Vec<String> = comments.par_iter().map(|text| text.to_ascii_lowercase()).collect();
+    let mut strings_lower = Haystack::default();
+    for (_, _, text) in program.comments.iter_refs() {
+        let at = strings_lower.joined.len();
+        strings_lower.push(text.as_bytes());
+        strings_lower.joined[at..].make_ascii_lowercase();
+    }
 
     CapaContext {
         imports_lower,
@@ -278,22 +329,11 @@ fn eval(p: &Predicate, ctx: &CapaContext, evidence: &mut Vec<String>) -> bool {
             let mut hit = false;
             for needle in *needles {
                 let nl = needle.to_ascii_lowercase();
-                // `imp.contains(&nl)`, with the searcher built once
-                let finder = memchr::memmem::Finder::new(nl.as_bytes());
-                for imp in &ctx.imports_lower {
-                    if finder.find(imp.as_bytes()).is_some() {
-                        // Find the original-cased name for the
-                        // evidence list (from ctx.original_import — there
-                        // may be exact matches).
-                        let original = ctx
-                            .original_import
-                            .get(imp)
-                            .cloned()
-                            .unwrap_or_else(|| (*needle).to_string());
-                        evidence.push(format!("import {}", original));
-                        hit = true;
-                        break;
-                    }
+                // the first import holding it, by its original-cased
+                // name for the evidence list
+                if let Some(i) = ctx.imports_lower.first_containing(nl.as_bytes()) {
+                    evidence.push(format!("import {}", ctx.original_import[i]));
+                    hit = true;
                 }
             }
             hit
@@ -311,14 +351,9 @@ fn eval(p: &Predicate, ctx: &CapaContext, evidence: &mut Vec<String>) -> bool {
             let mut hit = false;
             for needle in *needles {
                 let nl = needle.to_ascii_lowercase();
-                // `s.contains(&nl)`, with the searcher built once
-                let finder = memchr::memmem::Finder::new(nl.as_bytes());
-                for s in &ctx.strings_lower {
-                    if finder.find(s.as_bytes()).is_some() {
-                        evidence.push(format!("string {:?}", needle));
-                        hit = true;
-                        break;
-                    }
+                if ctx.strings_lower.first_containing(nl.as_bytes()).is_some() {
+                    evidence.push(format!("string {:?}", needle));
+                    hit = true;
                 }
             }
             hit
@@ -526,17 +561,41 @@ static BUILTIN_RULES: [Rule; 20] = [
 mod tests {
     use super::*;
 
+    /// The joined search finds the first string holding a needle, as a
+    /// search of each string in order does (NULs in the strings or the
+    /// needle, empty ones, repeats).
+    #[test]
+    fn haystack_finds_the_first_holder() {
+        let sets: [&[&str]; 4] = [&["abc", "", "xbcd", "bc", "zzz"], &["a\0b", "b", "ab"], &[], &["", "only"]];
+        let needles = ["bc", "b", "", "a\0b", "zz", "abcx", "\0", "c\0x", "only", "d"];
+        for set in sets {
+            let mut h = Haystack::default();
+            for s in set {
+                h.push(s.as_bytes());
+            }
+            for n in needles {
+                let expected = set.iter().position(|s| s.contains(n));
+                assert_eq!(h.first_containing(n.as_bytes()), expected, "{set:?} {n:?}");
+            }
+        }
+    }
+
     fn ctx_with_imports(names: &[&str]) -> CapaContext {
         let imports: BTreeSet<String> = names.iter().map(|s| s.to_string()).collect();
-        let mut original_import = std::collections::BTreeMap::new();
+        let mut by_lower = std::collections::BTreeMap::new();
         for s in &imports {
-            original_import.entry(s.to_ascii_lowercase()).or_insert_with(|| s.clone());
+            by_lower.entry(s.to_ascii_lowercase()).or_insert_with(|| s.clone());
         }
-        let imports_lower: BTreeSet<String> = original_import.keys().cloned().collect();
+        let mut imports_lower = Haystack::default();
+        let mut original_import = Vec::new();
+        for (lower, s) in by_lower {
+            imports_lower.push(lower.as_bytes());
+            original_import.push(s);
+        }
         CapaContext {
             imports_lower,
             original_import,
-            strings_lower: vec![],
+            strings_lower: Haystack::default(),
             present_tags: BTreeSet::new(),
         }
     }

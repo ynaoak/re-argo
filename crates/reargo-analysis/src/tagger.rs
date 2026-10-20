@@ -201,29 +201,89 @@ fn derive_tags(text: &str) -> Vec<(TagKind, Option<String>)> {
         out.push((TagKind::Suspicious, None));
     }
 
-    // Case-insensitive needles — only allocate the lowered copy when
-    // at least one of these is reached.
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("stack-protected") || lower.contains("canary load") {
+    // Case-insensitive needles, found in one pass over the text (as
+    // `text.to_ascii_lowercase().contains(needle)` finds them).
+    let found = ci_needles_found(text);
+    let has = |needle: usize| found & (1 << needle) != 0;
+    if has(CI_STACK_PROTECTED) || has(CI_CANARY_LOAD) {
         out.push((TagKind::StackProtected, None));
     }
-    if lower.contains("anti-debug")
-        || lower.contains("rdtsc")
-        || lower.contains("int3")
-        || lower.contains("ptrace")
-        || lower.contains("isdebuggerpresent")
-    {
+    if has(CI_ANTI_DEBUG) || has(CI_RDTSC) || has(CI_INT3) || has(CI_PTRACE) || has(CI_ISDEBUGGERPRESENT) {
         out.push((TagKind::AntiDebug, None));
     }
-    if lower.contains("itanium abi") && !out.iter().any(|(k, _)| matches!(k, TagKind::Exception)) {
+    if has(CI_ITANIUM_ABI) && !out.iter().any(|(k, _)| matches!(k, TagKind::Exception)) {
         out.push((TagKind::Exception, None));
     }
     out
 }
 
+/// The case-insensitive needles of [`derive_tags`] (lower-case ASCII),
+/// by their bit in [`ci_needles_found`].
+const CI_NEEDLES: [&[u8]; 8] =
+    [b"stack-protected", b"canary load", b"anti-debug", b"rdtsc", b"int3", b"ptrace", b"isdebuggerpresent", b"itanium abi"];
+const CI_STACK_PROTECTED: usize = 0;
+const CI_CANARY_LOAD: usize = 1;
+const CI_ANTI_DEBUG: usize = 2;
+const CI_RDTSC: usize = 3;
+const CI_INT3: usize = 4;
+const CI_PTRACE: usize = 5;
+const CI_ISDEBUGGERPRESENT: usize = 6;
+const CI_ITANIUM_ABI: usize = 7;
+
+/// A bit per needle of [`CI_NEEDLES`] that `text` contains ignoring
+/// ASCII case — `text.to_ascii_lowercase().contains(needle)`: the
+/// lower-casing changes only ASCII letters, in place, and a needle
+/// (ASCII) matches no other byte. One pass, trying at each position the
+/// needles starting with its letter.
+fn ci_needles_found(text: &str) -> u8 {
+    let b = text.as_bytes();
+    let mut found = 0u8;
+    for i in 0..b.len() {
+        // (every needle starts with a letter: `| 0x20` is its lower case
+        // exactly for that letter in either case)
+        let candidates: &[usize] = match b[i] | 0x20 {
+            b's' => &[CI_STACK_PROTECTED],
+            b'c' => &[CI_CANARY_LOAD],
+            b'a' => &[CI_ANTI_DEBUG],
+            b'r' => &[CI_RDTSC],
+            b'i' => &[CI_INT3, CI_ISDEBUGGERPRESENT, CI_ITANIUM_ABI],
+            b'p' => &[CI_PTRACE],
+            _ => continue,
+        };
+        for &k in candidates {
+            let needle = CI_NEEDLES[k];
+            if found & (1 << k) == 0 && b[i..].get(..needle.len()).is_some_and(|w| w.eq_ignore_ascii_case(needle)) {
+                found |= 1 << k;
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one-pass search finds what lower-casing and `contains` find.
+    #[test]
+    fn ci_needles_match_lowered_contains() {
+        let texts = [
+            "", "stack-protected", "STACK-PROTECTED here", "Canary Load", "possible ANTI-debug", "rdtsc", "rDtSc x",
+            "int", "INT3", "pTrace(", "IsDebuggerPresent@plt", "Itanium ABI personality", "itanium  abi",
+            "aaaanti-debug", "iiint3", "isisdebuggerpresent", "ssstack-protected", "\u{e9}int3\u{e9}", "int\u{130}3",
+            "loop header (back-edges from 0x55039, 0x55049)", "stack-protecte", "PTRACE PTRACE", "xxitanium abi",
+        ];
+        for t in texts {
+            let lower = t.to_ascii_lowercase();
+            let mut expected = 0u8;
+            for (k, n) in CI_NEEDLES.iter().enumerate() {
+                if lower.contains(std::str::from_utf8(n).unwrap()) {
+                    expected |= 1 << k;
+                }
+            }
+            assert_eq!(ci_needles_found(t), expected, "{t:?}");
+        }
+    }
 
     #[test]
     fn crypto_plate_recognised() {
