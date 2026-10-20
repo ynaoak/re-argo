@@ -214,6 +214,24 @@ impl ReferenceManager {
         }
     }
 
+    /// [`Self::add_all`] without the rayon pool, for a caller the pool's
+    /// work must not hold up (the pool may be busy with other work, and a
+    /// `join` from outside it waits for a worker): on this thread, with
+    /// many the second map on a thread of its own.
+    pub fn add_all_unpooled(&mut self, refs: &[Reference]) {
+        self.jumps.extend(refs.iter().filter(|r| r.ref_type.is_jump()).copied());
+        let (from, to) = (&mut self.refs_from, &mut self.refs_to);
+        if refs.len() >= 1 << 14 {
+            std::thread::scope(|s| {
+                s.spawn(|| add_grouped(to, refs, |r| r.to));
+                add_grouped(from, refs, |r| r.from);
+            });
+        } else {
+            add_grouped(from, refs, |r| r.from);
+            add_grouped(to, refs, |r| r.to);
+        }
+    }
+
     /// Add `reference` unless a reference from its source already
     /// satisfies `present` (as `get_refs_from(from).iter().any(present)`
     /// then `add`, with one lookup of the source). Returns whether it

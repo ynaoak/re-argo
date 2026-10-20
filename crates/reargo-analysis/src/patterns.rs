@@ -69,24 +69,36 @@ impl Analyzer for PatternFunctionAnalyzer {
             .collect();
 
         for &(base, size) in &text_sections {
-            // Read the section once and test the (cheap) byte pattern
-            // before the listing lookups: an address that matches no
-            // prologue moves on by one byte whatever the listing says,
-            // so only matches need the "already inside a function"
-            // checks. A section not readable as one slice takes the
-            // per-address path.
             let section_bytes = program.info.memory.slice(base, size);
-            let mut offset = 0u64;
-            while offset + 4 <= size {
-                let addr = base + offset;
-
-                if let Some(bytes) = section_bytes {
-                    let tail = &bytes[offset as usize..];
-                    if !X86_64_PROLOGUE_PATTERNS.iter().any(|pat| tail.starts_with(pat)) {
-                        offset += 1;
-                        continue;
-                    }
+            // The offsets to test (`offset + 4 <= size`): those where a
+            // prologue pattern starts when the section reads as one slice
+            // (found with a substring search: an offset that matches no
+            // prologue moves on by one byte whatever the listing says, so
+            // only matches need the listing lookups below), else all (the
+            // per-address path).
+            let last = size.saturating_sub(3);
+            let candidates: Box<dyn Iterator<Item = u64>> = match section_bytes {
+                Some(bytes) if size >= 4 => {
+                    let mut at: Vec<u64> = X86_64_PROLOGUE_PATTERNS
+                        .iter()
+                        .flat_map(|pat| memchr::memmem::find_iter(bytes, pat).map(|i| i as u64))
+                        .filter(|&i| i < last)
+                        .collect();
+                    at.sort_unstable();
+                    at.dedup();
+                    Box::new(at.into_iter())
                 }
+                Some(_) => Box::new(std::iter::empty()),
+                None => Box::new(0..last),
+            };
+            // (offsets below it were skipped over, after a match)
+            let mut next = 0u64;
+            for offset in candidates {
+                if offset < next {
+                    continue;
+                }
+                next = offset + 1;
+                let addr = base + offset;
 
                 // Skip addresses that are already known to be inside
                 // a function body. `has_function` only catches the
@@ -98,14 +110,12 @@ impl Analyzer for PatternFunctionAnalyzer {
                     || program.listing.has_instruction(addr)
                     || program.listing.function_containing(addr).is_some()
                 {
-                    offset += 1;
                     continue;
                 }
 
                 let mut buf = [0u8; 8];
                 let read = buf.len().min((size - offset) as usize);
                 if program.info.memory.read_bytes(addr, &mut buf[..read]).is_err() {
-                    offset += 1;
                     continue;
                 }
 
@@ -115,7 +125,6 @@ impl Analyzer for PatternFunctionAnalyzer {
 
                 if matched {
                     if buf[0] == 0xCC || buf[0] == 0x00 {
-                        offset += 1;
                         continue;
                     }
 
@@ -135,7 +144,6 @@ impl Analyzer for PatternFunctionAnalyzer {
                             .is_ok()
                             && is_boundary_byte(pb[0]);
                         if !prev_ok {
-                            offset += 1;
                             continue;
                         }
                     }
@@ -151,9 +159,7 @@ impl Analyzer for PatternFunctionAnalyzer {
                         .listing
                         .add_function(Function::new(addr, name));
                     found += 1;
-                    offset += 4;
-                } else {
-                    offset += 1;
+                    next = offset + 4;
                 }
             }
         }

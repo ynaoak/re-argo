@@ -6,7 +6,7 @@ use reargo_program::function::Function;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::symbol::SymbolType;
 use reargo_program::Program;
-use reargo_program::listing::Listing;
+use reargo_program::listing::{InstructionRun, Listing};
 use reargo_program::symbol::SymbolTable;
 use reargo_program::reference::ReferenceManager;
 use reargo_arch::Architecture;
@@ -126,10 +126,10 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                 listing,
                 symbol_table,
                 work_queue,
-                &mut Visited::default(),
+                &mut Visited::new(memory),
                 references,
                 |entry, body| bodies.push((entry, body)),
-                |listing, entry, visited, references| {
+                |listing, _, entry, visited, references| {
                     disassemble_function(entry, visited, &mut Listed { arch, memory, listing }, references)
                 },
             );
@@ -164,7 +164,7 @@ impl Found {
         for (entry, body) in self.bodies {
             if let Some(f) = program.listing.get_function_mut(entry) {
                 // (re-walked block starts repeat)
-                f.body = body.into_iter().collect();
+                f.body = body_set(body);
             }
         }
     }
@@ -183,7 +183,7 @@ fn discover(
     visited: &mut Visited,
     references: &mut Vec<Reference>,
     mut body_found: impl FnMut(u64, Vec<AddressRange>),
-    mut walk: impl FnMut(&mut Listing, u64, &mut Visited, &mut Vec<Reference>) -> Result<FunctionDiscovery, AnalysisError>,
+    mut walk: impl FnMut(&mut Listing, &VecDeque<u64>, u64, &mut Visited, &mut Vec<Reference>) -> Result<FunctionDiscovery, AnalysisError>,
 ) -> (usize, usize, usize) {
     let mut functions_found = 0;
     let mut references_found = 0;
@@ -213,7 +213,7 @@ fn discover(
             continue;
         }
 
-        let result = walk(listing, func_entry, visited, references);
+        let result = walk(listing, &work_queue, func_entry, visited, references);
 
         match result {
             Ok(discovery) => {
@@ -252,6 +252,19 @@ fn discover(
     (functions_found, references_found, instructions_decoded)
 }
 
+/// The set of the ranges of a function's instructions walked (one per
+/// instruction, in the walk's order: ascending within each block, block
+/// starts walked again repeated). As collecting them into the set does,
+/// sorted and deduplicated — by a sort that takes the ascending runs as
+/// they are, and by address alone: they are all in one space, and the
+/// instruction at an address has one length.
+fn body_set(mut body: Vec<AddressRange>) -> AddressSet {
+    debug_assert!(body.windows(2).all(|w| w[0].start.space == w[1].start.space));
+    body.sort_by_key(|r| r.start.offset);
+    body.dedup();
+    body.into_iter().collect()
+}
+
 /// [`discover`] while other threads decode ahead of it: once the walk
 /// has read [`HELP_AFTER`] instructions (a shorter one is done before
 /// they would help), they take the entries the walk may reach (the calls
@@ -261,7 +274,14 @@ fn discover(
 /// decodes it itself — it never waits for them. Decoding is a pure
 /// function of the bytes and the address, so the result is the serial
 /// one, whatever the threads did. From then on the references and the
-/// bodies' sets are made on threads too, while the walk goes on.
+/// bodies' sets are made on threads too, while the walk goes on. When the
+/// walk starts from many entries ([`SEED_START`]: Late Discovery, which
+/// fills the bodies of the functions added since the first run), the
+/// threads start at once, taking those entries in the walk's order. The
+/// walk marks each decode it reads; at the end the threads hand over
+/// those, by address (sorted while they wait for the walk, once out of
+/// entries), cut into parts of the code that are listed on threads of
+/// their own.
 fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize, usize, usize) {
     let Program { arch, info, listing, symbol_table, references: reference_manager, .. } = &mut *program;
     let (arch, memory) = (&**arch, &info.memory);
@@ -270,9 +290,17 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
     // would wait for that)
     let helpers = rayon::current_num_threads() - 1;
     let shared: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
-    let visited_lock = RwLock::new(Visited::default());
-    let (shared, visited_lock) = (&shared, &visited_lock);
+    let shared = &shared;
     let mut reference_manager = Some(reference_manager);
+    // Many entries to walk from (a later run of the pass, which fills the
+    // bodies of the functions added since): the threads start at once,
+    // taking them in the walk's order.
+    let seeded = work_queue
+        .iter()
+        .filter(|&&e| !listing.get_function(e).is_some_and(|f| !f.body.is_empty()))
+        .take(SEED_START)
+        .count()
+        >= SEED_START;
     let (counts, bodies) = std::thread::scope(|s| {
         // what the walk found that is not handed to a thread yet
         let mut references = Vec::new();
@@ -285,7 +313,7 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         let started: std::cell::RefCell<Option<Started>> = std::cell::RefCell::new(None);
         // (should the walk panic: the threads let go, not waited for forever)
         let _release = ReleaseOnDrop(shared);
-        let mut walk_visited = visited_lock.write().unwrap_or_else(|e| e.into_inner());
+        let mut walk_visited = Visited::new(memory);
         let counts = discover(
             listing,
             symbol_table,
@@ -300,27 +328,36 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                     let _ = started.bodies.send(std::mem::take(&mut bodies));
                 }
             },
-            |listing, entry, visited, references| {
-                if started.borrow().is_none() && walked >= HELP_AFTER {
+            |listing, queue, entry, visited, references| {
+                if started.borrow().is_none() && (walked >= HELP_AFTER || seeded) {
                     let shared = shared.get_or_init(|| Shared {
                         arch,
                         memory,
                         listed: listing.functions().map(|f| f.entry_point).collect(),
                         has_body: listing.functions().filter(|f| !f.body.is_empty()).map(|f| f.entry_point).collect(),
                         claims: Claims::new(memory),
+                        cuts: {
+                            let (base, span) = code_span(memory);
+                            let parts = rayon::current_num_threads() as u64;
+                            (1..parts).map(|k| base + span / parts * k).collect()
+                        },
                         walking: Claims::new(memory),
                         stop: AtomicBool::new(false),
                         queue: Mutex::new(Queue::default()),
                         wake: Condvar::new(),
                         done: RwLock::new(Done::default()),
                     });
-                    let entries: Vec<u64> = calls
-                        .drain(..)
-                        .filter(|&e| !visited.contains(e) && !shared.has_body.contains(&e) && shared.claims.claim(e))
+                    // (the entries the walk takes next, in its order, then the
+                    // calls it found)
+                    let entries: Vec<u64> = queue
+                        .iter()
+                        .copied()
+                        .chain(calls.drain(..))
+                        .filter(|&e| e != entry && !visited.contains(e) && !shared.has_body.contains(&e) && shared.claims.claim(e))
                         .collect();
                     shared.queue.lock().unwrap_or_else(|e| e.into_inner()).entries.extend(entries);
                     if let Some(reference_manager) = reference_manager.take() {
-                        *started.borrow_mut() = Some(Started::start(s, shared, visited_lock, helpers, reference_manager));
+                        *started.borrow_mut() = Some(Started::start(s, shared, helpers, reference_manager));
                     }
                 }
                 let is_started = started.borrow().is_some();
@@ -364,9 +401,9 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         let Some(started) = started.into_inner() else {
             // (a short walk: all on this thread)
             if let Some(reference_manager) = reference_manager.take() {
-                reference_manager.add_all(&references);
+                reference_manager.add_all_unpooled(&references);
             }
-            let bodies = bodies.into_iter().map(|(entry, body)| (entry, body.into_iter().collect::<AddressSet>())).collect();
+            let bodies = bodies.into_iter().map(|(entry, body)| (entry, body_set(body))).collect();
             return (counts, bodies);
         };
         let _ = started.references.send(references);
@@ -381,13 +418,14 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         if let Some(shared) = shared.get() {
             shared.release();
         }
-        let mut decodes: Vec<(u64, Box<DecodedInstruction>)> = Vec::new();
-        for read in read.iter().take(decoding) {
-            decodes.extend(read);
+        // (by part of the code, then by thread: each run sorted)
+        let mut decodes: Vec<Vec<InstructionRun>> = Vec::new();
+        for parts in read.iter().take(decoding) {
+            decodes.resize_with(decodes.len().max(parts.len()), Vec::new);
+            for (k, run) in parts.into_iter().enumerate() {
+                decodes[k].push(run);
+            }
         }
-        // (each sorted: one run per thread)
-        decodes.sort_by_key(|d| d.0);
-        decodes.dedup_by_key(|d| d.0);
         listing.add_unlisted_instructions(decodes);
         let bodies = sets.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
         if let Err(e) = adding.join() {
@@ -409,8 +447,9 @@ struct Started<'scope> {
     bodies: std::sync::mpsc::Sender<Vec<(u64, Vec<AddressRange>)>>,
     adding: std::thread::ScopedJoinHandle<'scope, ()>,
     sets: std::thread::ScopedJoinHandle<'scope, Vec<(u64, AddressSet)>>,
-    /// What each decoding thread gives back: the decodes the walk read.
-    read: std::sync::mpsc::Receiver<Vec<(u64, Box<DecodedInstruction>)>>,
+    /// What each decoding thread gives back: the decodes the walk read, by
+    /// address, cut into parts at [`Shared::cuts`].
+    read: std::sync::mpsc::Receiver<Vec<InstructionRun>>,
     decoding: usize,
 }
 
@@ -421,7 +460,6 @@ impl<'scope> Started<'scope> {
     fn start<'env>(
         s: &'scope std::thread::Scope<'scope, 'env>,
         shared: &'env Shared<'env>,
-        visited: &'env RwLock<Visited>,
         helpers: usize,
         reference_manager: &'env mut ReferenceManager,
     ) -> Self {
@@ -429,7 +467,7 @@ impl<'scope> Started<'scope> {
         let (references, references_in) = std::sync::mpsc::channel::<Vec<Reference>>();
         let adding = s.spawn(move || {
             for batch in references_in {
-                reference_manager.add_all(&batch);
+                reference_manager.add_all_unpooled(&batch);
             }
         });
         let (bodies, bodies_in) = std::sync::mpsc::channel::<Vec<(u64, Vec<AddressRange>)>>();
@@ -438,13 +476,13 @@ impl<'scope> Started<'scope> {
             bodies_in
                 .into_iter()
                 .flatten()
-                .map(|(entry, body)| (entry, body.into_iter().collect::<AddressSet>()))
+                .map(|(entry, body)| (entry, body_set(body)))
                 .collect::<Vec<_>>()
         });
         let (read_out, read) = std::sync::mpsc::channel();
         for _ in 0..helpers {
             let read_out = read_out.clone();
-            s.spawn(move || speculate_loop(shared, visited, read_out));
+            s.spawn(move || speculate_loop(shared, read_out));
         }
         Self { references, bodies, adding, sets, read, decoding: helpers }
     }
@@ -483,6 +521,10 @@ const BODY_BATCH: usize = 256;
 /// of it ([`discover_parallel`]).
 const HELP_AFTER: usize = 1 << 16;
 
+/// The entries to walk from (functions not listed or without a body) from
+/// which the threads start decoding ahead at once ([`discover_parallel`]).
+const SEED_START: usize = 512;
+
 /// What the walk and the threads decoding ahead share in
 /// [`discover_parallel`].
 struct Shared<'a> {
@@ -494,6 +536,10 @@ struct Shared<'a> {
     /// function (only as another's code).
     has_body: FxHashSet<u64>,
     claims: Claims,
+    /// Where the decodes handed over are cut into parts, listed on
+    /// threads of their own ([`Listing::add_unlisted_instructions`]):
+    /// ascending addresses splitting the code into equal spans.
+    cuts: Vec<u64>,
     /// The entries the walk has started on (its own decodes): left to it.
     walking: Claims,
     /// Set when the walk is done: what the threads have not decoded yet,
@@ -531,8 +577,7 @@ struct Done {
 /// nothing left.
 fn speculate_loop(
     shared: &Shared,
-    visited: &RwLock<Visited>,
-    read_out: std::sync::mpsc::Sender<Vec<(u64, Box<DecodedInstruction>)>>,
+    read_out: std::sync::mpsc::Sender<Vec<InstructionRun>>,
 ) {
     let mut entries = Vec::new();
     // the code this thread decoded
@@ -575,63 +620,121 @@ fn speculate_loop(
         drop(queue);
         shared.wake.notify_all();
     }
+    // Out of work while the walk goes on: the order of its decodes by
+    // address, made now (the walk reads none of this).
+    let order = (!shared.stop.load(Ordering::Relaxed)).then(|| {
+        let mut order: Vec<(u64, u32, u32)> = own
+            .iter()
+            .enumerate()
+            .flat_map(|(s, spec)| spec.insns.iter().enumerate().map(move |(i, d)| (d.addr, s as u32, i as u32)))
+            .collect();
+        order.sort_unstable();
+        order
+    });
     // Once the walk is done and holds none of the code decoded: the
-    // decodes it read (at the addresses it visited), for the listing;
-    // the others freed here, and what this thread freed given back.
+    // decodes it read (at the addresses it visited), for the listing, by
+    // address; the others freed here, and what this thread freed given
+    // back.
     {
         let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         while !queue.collect {
             queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
         }
     }
-    let visited = visited.read().unwrap_or_else(|e| e.into_inner());
-    let mut read = Vec::new();
-    let mut rest = Vec::with_capacity(own.len());
-    for spec in own {
-        match Arc::try_unwrap(spec) {
-            Ok(mut spec) => {
-                read.extend(
-                    spec.insns.iter_mut().filter(|d| visited.contains(d.addr)).filter_map(|d| Some((d.addr, d.dec.take()?))),
-                );
-                rest.push(spec);
-            }
-            // (were one still held: its decodes copied)
-            Err(spec) => read.extend(
-                spec.insns.iter().filter(|d| visited.contains(d.addr)).filter_map(|d| Some((d.addr, d.dec.clone()?))),
-            ),
+    // (were one still held: its decodes copied)
+    let mut specs: Vec<Result<Spec, Arc<Spec>>> = own.into_iter().map(Arc::try_unwrap).collect();
+    let take = |spec: &mut Result<Spec, Arc<Spec>>, i: usize| match spec {
+        Ok(spec) => {
+            let d = &mut spec.insns[i];
+            if *d.read.get_mut() { Some((d.addr, d.dec.take()?)) } else { None }
         }
+        Err(spec) => {
+            let d = &spec.insns[i];
+            if d.read.load(Ordering::Relaxed) { Some((d.addr, d.dec.clone()?)) } else { None }
+        }
+    };
+    let read: Vec<(u64, Box<DecodedInstruction>)> = match order {
+        Some(order) => order.into_iter().filter_map(|(_, s, i)| take(&mut specs[s as usize], i as usize)).collect(),
+        None => {
+            let mut read: Vec<_> = specs
+                .iter_mut()
+                .flat_map(|spec| {
+                    let n = match spec {
+                        Ok(s) => s.insns.len(),
+                        Err(s) => s.insns.len(),
+                    };
+                    (0..n).filter_map(|i| take(spec, i)).collect::<Vec<_>>()
+                })
+                .collect();
+            read.sort_unstable_by_key(|d| d.0);
+            read
+        }
+    };
+    // (cut into the parts, at `shared.cuts`)
+    let mut parts: Vec<InstructionRun> = Vec::with_capacity(shared.cuts.len() + 1);
+    let mut rest = read;
+    for &cut in shared.cuts.iter().rev() {
+        let at = rest.partition_point(|d| d.0 < cut);
+        parts.push(rest.split_off(at));
     }
-    drop(visited);
-    read.sort_unstable_by_key(|d| d.0);
-    let _ = read_out.send(read);
+    parts.push(rest);
+    parts.reverse();
+    let _ = read_out.send(parts);
     // (while the walk lists them)
-    drop(rest);
+    drop(specs);
     crate::release_free_memory();
 }
 
 /// The instruction addresses a discovery run visited: a bit per
-/// address in pages of [`PAGE`] addresses. A run visits addresses
-/// mostly in order, so this is much cheaper to probe than a hash set
-/// of addresses.
-#[derive(Default)]
+/// address in pages of [`PAGE`] addresses, found by their index over the
+/// executable code (else in a map). A run visits addresses mostly in
+/// order, so this is much cheaper to probe than a hash set of addresses.
 struct Visited {
-    pages: rustc_hash::FxHashMap<u64, Box<[u64; (PAGE / 64) as usize]>>,
+    base: u64,
+    pages: Vec<Option<VisitedPage>>,
+    others: FxHashMap<u64, VisitedPage>,
 }
 
 /// Addresses per page of [`Visited`].
 const PAGE: u64 = 4096;
 
+/// A page of [`Visited`]: a bit per address.
+type VisitedPage = Box<[u64; (PAGE / 64) as usize]>;
+
 impl Visited {
+    /// An empty set, indexed over the executable code of `memory`.
+    fn new(memory: &Memory) -> Self {
+        let (base, span) = code_span(memory);
+        Self { base, pages: (0..span.div_ceil(PAGE)).map(|_| None).collect(), others: FxHashMap::default() }
+    }
+
     fn contains(&self, addr: u64) -> bool {
         let bit = addr % PAGE;
-        self.pages.get(&(addr / PAGE)).is_some_and(|p| p[(bit / 64) as usize] & (1 << (bit % 64)) != 0)
+        let page = match addr.checked_sub(self.base).and_then(|i| self.pages.get((i / PAGE) as usize)) {
+            Some(page) => page.as_ref(),
+            None => self.others.get(&(addr / PAGE)),
+        };
+        page.is_some_and(|p| p[(bit / 64) as usize] & (1 << (bit % 64)) != 0)
     }
 
     fn insert(&mut self, addr: u64) {
         let bit = addr % PAGE;
-        self.pages.entry(addr / PAGE).or_insert_with(|| Box::new([0; (PAGE / 64) as usize]))[(bit / 64) as usize] |=
-            1 << (bit % 64);
+        let new = || Box::new([0; (PAGE / 64) as usize]);
+        let page = match addr.checked_sub(self.base).and_then(|i| self.pages.get_mut((i / PAGE) as usize)) {
+            Some(page) => page.get_or_insert_with(new),
+            None => self.others.entry(addr / PAGE).or_insert_with(new),
+        };
+        page[(bit / 64) as usize] |= 1 << (bit % 64);
     }
+}
+
+/// The start and length of the span of `memory`'s executable blocks
+/// (an empty one when there are none or it is over 4 GiB).
+fn code_span(memory: &Memory) -> (u64, u64) {
+    let exec = memory.blocks().filter(|b| b.flags.contains(MemoryFlags::EXECUTE));
+    let (lo, hi) = exec.fold((u64::MAX, 0), |(lo, hi), b| (lo.min(b.start), hi.max(b.start.saturating_add(b.size))));
+    // (up to 4 GiB of code)
+    if lo < hi && hi - lo <= 1 << 32 { (lo, hi - lo) } else { (0, 0) }
 }
 
 /// What the walk reads of an instruction.
@@ -705,6 +808,7 @@ impl Source for Ahead<'_, '_> {
             };
             if let Some(at) = at {
                 *i = at as u32;
+                insns[at].read.store(true, Ordering::Relaxed);
                 return Some(insns[at].facts);
             }
         }
@@ -713,6 +817,7 @@ impl Source for Ahead<'_, '_> {
             && let Ok(at) = spec.insns.binary_search_by_key(&addr, |d| d.addr)
         {
             let facts = spec.insns[at].facts;
+            spec.insns[at].read.store(true, Ordering::Relaxed);
             *hint = Some((spec, at as u32));
             return Some(facts);
         }
@@ -725,6 +830,8 @@ impl Source for Ahead<'_, '_> {
 struct SpecInsn {
     addr: u64,
     facts: Facts,
+    /// Set when the walk read it (visited its address): listed then.
+    read: AtomicBool,
     /// The decode (taken when listed).
     dec: Option<Box<DecodedInstruction>>,
 }
@@ -752,10 +859,8 @@ type ClaimPage = Box<[AtomicU64; CLAIM_PAGE / 64]>;
 
 impl Claims {
     fn new(memory: &Memory) -> Self {
-        let exec = memory.blocks().filter(|b| b.flags.contains(MemoryFlags::EXECUTE));
-        let (lo, hi) = exec.fold((u64::MAX, 0), |(lo, hi), b| (lo.min(b.start), hi.max(b.start.saturating_add(b.size))));
         // (up to 4 GiB of code: 2 MiB of page pointers at most)
-        let span = if lo < hi && hi - lo <= 1 << 32 { hi - lo } else { 0 };
+        let (lo, span) = code_span(memory);
         let pages = (0..span.div_ceil(CLAIM_PAGE as u64)).map(|_| std::sync::OnceLock::new()).collect();
         Self { base: lo, pages, others: Mutex::new(FxHashSet::default()) }
     }
@@ -824,7 +929,7 @@ fn speculate_one(shared: &Shared, entry: u64, entries: &mut Vec<(u64, bool)>) ->
                     break;
                 };
                 let facts = Facts::of(&d);
-                insns.push(SpecInsn { addr, facts, dec: Some(Box::new(d)) });
+                insns.push(SpecInsn { addr, facts, read: AtomicBool::new(false), dec: Some(Box::new(d)) });
                 let next = addr + u64::from(facts.length);
                 match facts.flow {
                     FlowType::Call => {
@@ -1055,6 +1160,17 @@ mod tests {
     /// what it gives on one thread.
     #[test]
     fn parallel_discovery_matches_serial() {
+        parallel_matches_serial(false);
+    }
+
+    /// The same with the threads seeded from the start: every function an
+    /// entry of the walk (a symbol), as in Late Discovery.
+    #[test]
+    fn seeded_parallel_discovery_matches_serial() {
+        parallel_matches_serial(true);
+    }
+
+    fn parallel_matches_serial(seeded: bool) {
         // Function k at 64 * k: 40 nops, then a call to function k + 1
         // and a ret, a jump into the middle of function k + 3 (every 7th),
         // or a conditional jump back into function k - 1 then a ret
@@ -1092,6 +1208,17 @@ mod tests {
         }
         let run = |threads: usize| {
             let mut program = make_x86_64_program(&code, base);
+            if seeded {
+                // (in reverse: the walk takes them in another order than the calls)
+                for k in (1..count).rev() {
+                    program.symbol_table.add(reargo_program::symbol::Symbol::new(
+                        format!("f{k}"),
+                        base + k * 64,
+                        SymbolType::Function,
+                        reargo_program::symbol::SourceType::Analysis,
+                    ));
+                }
+            }
             let mark = program.references.jump_mark();
             let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
             let result = pool.install(|| FunctionDiscoveryAnalyzer.analyze(&mut program)).unwrap();
