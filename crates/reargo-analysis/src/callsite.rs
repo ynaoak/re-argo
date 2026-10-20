@@ -490,18 +490,21 @@ where
                 .iter()
                 .map(|&(entry, max_insns)| crate::range_lift::Span { entry, insns: max_insns, work: max_insns })
                 .collect();
-            crate::range_lift::span_chunks(&spans)
+            // (the runs one rayon job takes, in order, share one cache)
+            let runs: Vec<Vec<Option<T>>> = crate::range_lift::span_chunks(&spans)
                 .into_par_iter()
-                .flat_map_iter(|run| {
-                    let mut cache = reargo_lift::x86::LiftCache::new();
-                    let f = &f;
-                    jobs[run].iter().map(move |&(entry, max_insns)| {
-                        crate::range_lift::trim(&mut cache, entry);
-                        let range = x86.lift_range_cached(memory, entry, max_insns, &mut cache);
-                        Some(f(entry, &range.insns()))
-                    })
+                .map_init(reargo_lift::x86::LiftCache::new, |cache, run| {
+                    jobs[run]
+                        .iter()
+                        .map(|&(entry, max_insns)| {
+                            crate::range_lift::trim(cache, entry);
+                            let range = x86.lift_range_cached(memory, entry, max_insns, cache);
+                            Some(f(entry, &range.insns()))
+                        })
+                        .collect()
                 })
-                .collect()
+                .collect();
+            runs.into_iter().flatten().collect()
         }
         None => jobs
             .par_iter()
