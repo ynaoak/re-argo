@@ -93,6 +93,46 @@ pub type RefMap = BTreeMap<u64, RefList>;
 
 /// Append each of `refs` to `map`'s list at its `key`, in the order of
 /// `refs` (a stable sort by key keeps each list's order).
+/// Sort `order` (keys with their indices, the indices ascending) as
+/// `sort_unstable` does: by key, then index. Many keys within 2^32 of each
+/// other: by a radix sort on the key's bits (stable, so equal keys keep
+/// their ascending indices), passes of up to 12 bits.
+fn sort_keyed(order: &mut Vec<(u64, u32)>) {
+    debug_assert!(order.windows(2).all(|w| w[0].1 < w[1].1));
+    let (min, max) = order.iter().fold((u64::MAX, 0), |(lo, hi), &(k, _)| (lo.min(k), hi.max(k)));
+    let span = max.wrapping_sub(min);
+    if order.len() < 1 << 12 || min > max || span >> 32 != 0 {
+        order.sort_unstable();
+        return;
+    }
+    let bits = 64 - span.leading_zeros();
+    let passes = bits.div_ceil(12);
+    let digit = bits.div_ceil(passes.max(1));
+    let mask = (1u64 << digit) - 1;
+    // (each pass writes every slot)
+    let mut buf: Vec<(u64, u32)> = vec![(0, 0); order.len()];
+    let mut counts = vec![0usize; 1 << digit];
+    for p in 0..passes {
+        let shift = p * digit;
+        counts.fill(0);
+        for &(k, _) in order.iter() {
+            counts[((k - min) >> shift & mask) as usize] += 1;
+        }
+        let mut at = 0;
+        for c in counts.iter_mut() {
+            let n = *c;
+            *c = at;
+            at += n;
+        }
+        for &e in order.iter() {
+            let d = ((e.0 - min) >> shift & mask) as usize;
+            buf[counts[d]] = e;
+            counts[d] += 1;
+        }
+        std::mem::swap(order, &mut buf);
+    }
+}
+
 fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) -> u64) {
     if refs.is_empty() {
         return;
@@ -100,7 +140,7 @@ fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) ->
     // (sorted by key with their order, not by a stable sort through the
     // references: their keys read once, in order)
     let mut order: Vec<(u64, u32)> = refs.iter().enumerate().map(|(i, r)| (key(r), i as u32)).collect();
-    order.sort_unstable();
+    sort_keyed(&mut order);
     let groups = order.chunk_by(|a, b| a.0 == b.0);
     let list = |g: &[(u64, u32)]| g.iter().map(|&(_, i)| refs[i as usize]).collect::<RefList>();
     if order.len() < map.len() {
@@ -333,6 +373,28 @@ impl ReferenceManager {
 
 #[cfg(test)]
 mod tests {
+    /// The radix sort orders as `sort_unstable` does (key, then index), for
+    /// keys of every span: repeats, a span past 2^32, few and many.
+    #[test]
+    fn sort_keyed_matches_sort_unstable() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (n, span) in [(10, 100u64), (5000, 1), (5000, 7), (9000, 1 << 12), (9000, 1 << 13), (20000, 1 << 24), (20000, 1 << 25), (20000, u32::MAX as u64), (20000, 1 << 33), (20000, u64::MAX)] {
+            let base = next() % (u64::MAX - span.min(u64::MAX / 2));
+            let mut order: Vec<(u64, u32)> =
+                (0..n).map(|i| (if span == u64::MAX { next() } else { base + next() % (span + 1) }, i as u32)).collect();
+            let mut expected = order.clone();
+            expected.sort_unstable();
+            super::sort_keyed(&mut order);
+            assert_eq!(order, expected, "{n} {span}");
+        }
+    }
+
     use super::*;
 
     #[test]
