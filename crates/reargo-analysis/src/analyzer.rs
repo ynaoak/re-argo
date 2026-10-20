@@ -51,6 +51,11 @@ pub trait Analyzer: Send + Sync {
     /// there and this one has changed any of it (each declares what it
     /// changes with [`writes`](Self::writes)), and calls `apply` at the
     /// analyzer's own place. `None` (the default): not split.
+    ///
+    /// `prepare` cannot take an entry out of `program.analysis_cache`;
+    /// it may look for one whose part of the state has a flag of its
+    /// own ([`State::SHARED_LIFT`]), declared here and by the analyzers
+    /// that store or take it.
     fn prepare_reads(&self) -> Option<State> {
         None
     }
@@ -108,8 +113,16 @@ impl State {
     pub const METADATA: State = State(1 << 11);
     pub const CALL_RENDERINGS: State = State(1 << 12);
     pub const DATA_TYPES: State = State(1 << 13);
-    /// `program.analysis_cache`.
+    /// `program.analysis_cache`: an analyzer that inserts or takes any
+    /// entry writes it.
     pub const CACHE: State = State(1 << 14);
+    /// The per-function call-site results stored in the analysis cache
+    /// for the next analyzer that needs them
+    /// ([`crate::shared_lift::store`]); an analyzer that stores or takes
+    /// them writes it (besides [`CACHE`](Self::CACHE)). A `prepare`
+    /// that looks for them reads it, so the pipeline never moves that
+    /// `prepare` before an analyzer that stores or takes them.
+    pub const SHARED_LIFT: State = State(1 << 15);
     /// The instructions and the functions' code: [`INSNS`](Self::INSNS),
     /// [`FUNCS`](Self::FUNCS) and [`FUNC_THUNK`](Self::FUNC_THUNK).
     pub const CODE: State = Self::INSNS.union(Self::FUNCS).union(Self::FUNC_THUNK);
@@ -125,6 +138,11 @@ impl State {
 
     pub const fn union(self, other: State) -> State {
         State(self.0 | other.0)
+    }
+
+    /// The parts of `self` not in `other`.
+    pub const fn difference(self, other: State) -> State {
+        State(self.0 & !other.0)
     }
 
     pub const fn intersects(self, other: State) -> bool {

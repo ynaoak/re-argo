@@ -151,7 +151,16 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
         let sections = crate::pcoderef::SectionMap::from(program);
         let got = crate::indirect_resolve::GotMap::new(program);
         let plt_of_got = |g: u64| got.as_ref().and_then(|got| got.plt_of_got(g));
-        let out = crate::range_lift::map_with_lifter(&program.info.memory, &jobs, |job, lifter| {
+        // a job lifts its largest budget and scans each prefix
+        let span = |job: &Job| {
+            let insns = if x86_64 {
+                STACK_LIFT_BUDGET.max(job.pcode).max(job.indirect).max(job.arity).max(crate::callingconv::LIFT_BUDGET)
+            } else {
+                STACK_LIFT_BUDGET
+            };
+            crate::range_lift::Span { entry: job.entry, insns, work: insns / 4 }
+        };
+        let out = crate::range_lift::map_with_lifter(&program.info.memory, &jobs, span, |job, lifter| {
             let entry = job.entry;
             let mut stack = None;
             let mut propagation = Vec::new();

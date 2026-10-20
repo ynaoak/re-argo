@@ -53,11 +53,18 @@ impl Analyzer for CallSiteAnnotator {
     }
 
     fn prepare_reads(&self) -> Option<State> {
-        // all of it, so it always starts a run
-        Some(State::ALL)
+        // all of the program, so it always starts a run, and of the
+        // analysis cache only whether shared results are stored
+        // (`shared_lift::has_stored`)
+        Some(State::ALL.difference(State::CACHE).union(State::SHARED_LIFT))
     }
     fn writes(&self) -> State {
-        State::SYMBOLS.union(State::COMMENTS).union(State::CALL_RENDERINGS).union(State::CACHE)
+        // `apply` takes the shared results stored before and stores its own
+        State::SYMBOLS
+            .union(State::COMMENTS)
+            .union(State::CALL_RENDERINGS)
+            .union(State::CACHE)
+            .union(State::SHARED_LIFT)
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let prepared = self.prepare(program);
