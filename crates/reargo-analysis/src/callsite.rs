@@ -315,7 +315,7 @@ pub(crate) fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) ->
 }
 
 /// [`dedup_sites`] without copying them.
-fn dedup_site_refs<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<&'a CallSite> {
+pub(crate) fn dedup_site_refs<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<&'a CallSite> {
     let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     let mut out: Vec<&CallSite> = Vec::new();
     for site in per_func.flatten() {

@@ -59,22 +59,24 @@ impl Analyzer for FormatVarargsAnalyzer {
         // The round-0 call sites, reusing the walks the Call Site
         // Annotator (750) left for the functions unchanged since. The
         // last reader: the shared results are dropped here.
-        let sites = crate::shared_lift::compute(program, false).round0_sites();
+        let shared = crate::shared_lift::compute(program, false);
+        let sites = shared.round0_sites();
 
         let mut per_callee_max: BTreeMap<String, usize> = BTreeMap::new();
         let mut emitted = 0usize;
 
-        for site in &sites {
+        for site in sites.iter().copied() {
             let Some(target) = site.call_target else {
                 continue;
             };
             let Some(sym) = program.symbol_table.primary_at(target) else {
                 continue;
             };
-            let raw_name = sym.name.strip_suffix("@plt").unwrap_or(&sym.name).to_string();
-            let Some(fmt_idx) = printf_family_format_index(&raw_name) else {
+            let raw_name = sym.name.strip_suffix("@plt").unwrap_or(&sym.name);
+            let Some(fmt_idx) = printf_family_format_index(raw_name) else {
                 continue;
             };
+            let raw_name = raw_name.to_string();
             if fmt_idx >= site.args.len() {
                 continue;
             }
@@ -103,6 +105,9 @@ impl Analyzer for FormatVarargsAnalyzer {
             }
         }
 
+        // (freed on another thread)
+        drop(sites);
+        rayon::spawn(move || drop(shared));
         for (name, max_count) in &per_callee_max {
             program.metadata.set_property(
                 format!("varargs_{}_max", name),

@@ -48,7 +48,7 @@ use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
 use crate::callsite::{walk_function_shaped, CallSite, ParamSummaries};
-use crate::func_lift::{function_jobs, owns};
+use crate::func_lift::function_jobs;
 
 /// One function's results.
 pub(crate) struct FunctionResults {
@@ -101,8 +101,8 @@ pub(crate) struct Cached {
 impl SharedLift {
     /// The round-0 call sites of the whole program, as
     /// [`crate::callsite::resolve_call_sites`] gives them.
-    pub fn round0_sites(&self) -> Vec<CallSite> {
-        crate::callsite::dedup_sites(self.funcs.iter().filter_map(|f| f.walk.as_deref()))
+    pub fn round0_sites(&self) -> Vec<&CallSite> {
+        crate::callsite::dedup_site_refs(self.funcs.iter().filter_map(|f| f.walk.as_deref()))
     }
 }
 
@@ -278,7 +278,8 @@ fn still_valid(
     {
         return false;
     }
-    old.owned.iter().all(|&(addr, o)| owns(program, old.entry, addr) == o)
+    let owner = crate::func_lift::Owner::new(program, old.entry);
+    old.owned.iter().all(|&(addr, o)| owner.owns(addr) == o)
 }
 
 /// Whether one of the jump references `changed` (sorted by target)
@@ -318,6 +319,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     with_snapshots: bool,
 ) -> FunctionResults {
     let next_entry = program.listing.next_function_after(entry).map(|f| f.entry_point);
+    let owner = crate::func_lift::Owner::new(program, entry);
     // What the walk and the blocks need of each instruction, read once
     // (or kept beside the lift).
     let shape = match shapes {
@@ -335,11 +337,11 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         .iter()
         .zip(&shape.addrs)
         .filter(|(call, _)| **call)
-        .map(|(_, &a)| (a, owns(program, entry, a)))
+        .map(|(_, &a)| (a, owner.owns(a)))
         .collect();
     let owns_call = |a: u64| match calls.binary_search_by_key(&a, |c| c.0) {
         Ok(k) => calls[k].1,
-        Err(_) => owns(program, entry, a),
+        Err(_) => owner.owns(a),
     };
     let walk = walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call);
     // The walk asks who owns each call instruction.
@@ -355,8 +357,8 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, insns);
         addrs.extend(cfg.iter().map(|(a, _)| *a));
         addrs.extend(vsa.iter().map(|(a, _)| *a));
-        cfg.retain(|(a, _)| owns(program, entry, *a));
-        vsa.retain(|(a, _)| owns(program, entry, *a));
+        cfg.retain(|(a, _)| owner.owns(*a));
+        vsa.retain(|(a, _)| owner.owns(*a));
         (cfg, vsa)
     });
     let offsets: Option<Box<[u32]>> =
