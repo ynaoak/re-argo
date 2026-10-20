@@ -9,7 +9,7 @@
 //! and runs the runs in parallel with the results kept in job order.
 
 use rayon::prelude::*;
-use reargo_lift::x86::{LiftCache, X86Lifter};
+use reargo_lift::x86::{LiftCache, RangeInsn, X86Lifter};
 use reargo_lift::{LiftedInstruction, RangeShapes};
 use reargo_loader::Memory;
 
@@ -140,13 +140,40 @@ where
     T: Send,
     F: Fn(&J, &mut RangeLifter) -> T + Sync,
 {
+    map_with_lifter_in(memory, jobs, span, LiftCache::new, f)
+}
+
+/// [`map_with_lifter`] through lazy caches ([`LiftCache::lazy`]): an
+/// instruction whose facts its decode gives is lifted when first read
+/// ([`RangeLifter::with_budgets_lazy`]).
+pub(crate) fn map_with_lazy_lifter<J, T, F>(memory: &Memory, jobs: &[J], span: impl Fn(&J) -> Span, f: F) -> Vec<T>
+where
+    J: Sync,
+    T: Send,
+    F: Fn(&J, &mut RangeLifter) -> T + Sync,
+{
+    map_with_lifter_in(memory, jobs, span, LiftCache::lazy, f)
+}
+
+fn map_with_lifter_in<J, T, F>(
+    memory: &Memory,
+    jobs: &[J],
+    span: impl Fn(&J) -> Span,
+    cache: fn() -> LiftCache,
+    f: F,
+) -> Vec<T>
+where
+    J: Sync,
+    T: Send,
+    F: Fn(&J, &mut RangeLifter) -> T + Sync,
+{
     let spans: Vec<Span> = jobs.iter().map(span).collect();
     // (the runs one rayon job takes, in order, share one cache: a run lifts again only what
     // the run before it did not — its ranges overlap the next run's start)
     let runs: Vec<Vec<T>> = span_chunks(&spans)
         .into_par_iter()
         .map_init(
-            || RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() },
+            || RangeLifter { lifter: X86Lifter::new_64(), memory, cache: cache() },
             |lifter, run| jobs[run].iter().map(|job| f(job, lifter)).collect(),
         )
         .collect();
@@ -182,6 +209,20 @@ impl RangeLifter<'_> {
     ) -> Vec<R> {
         trim(&mut self.cache, entry);
         self.lifter.lift_prefixes_cached(self.memory, entry, budgets, true, &mut self.cache, g)
+    }
+
+    /// [`Self::with_budgets`] with the instructions as [`RangeInsn`]s, each
+    /// lifted when first read (in a lazy cache, [`map_with_lazy_lifter`]),
+    /// and `shapes` given whenever the range lifts as the cache holds it
+    /// ([`X86Lifter::lift_prefixes_lazy`]).
+    pub fn with_budgets_lazy<R>(
+        &mut self,
+        entry: u64,
+        budgets: &[usize],
+        g: impl FnMut(usize, &[RangeInsn], Option<&RangeShapes>) -> R,
+    ) -> Vec<R> {
+        trim(&mut self.cache, entry);
+        self.lifter.lift_prefixes_lazy(self.memory, entry, budgets, &mut self.cache, g)
     }
 }
 

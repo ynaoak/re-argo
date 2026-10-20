@@ -123,6 +123,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             let (arch, memory) = (&**arch, &info.memory);
             let Found { references, bodies } = &mut found;
             let mut decoder = arch.instruction_decoder(memory);
+            let mut decodes = Decodes::new(memory);
             let counts = discover(
                 listing,
                 symbol_table,
@@ -131,10 +132,12 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                 references,
                 |entry, body| bodies.push((entry, body)),
                 |listing, _, entry, visited, references| {
-                    disassemble_function(entry, visited, &mut Listed { decoder: &mut *decoder, listing }, references)
+                    let source = &mut Listed { decoder: &mut *decoder, listing, decodes: &mut decodes };
+                    disassemble_function(entry, visited, source, references)
                 },
             );
             drop(decoder);
+            listing.add_unlisted_instructions(vec![vec![decodes.into_sorted()]]);
             found.apply(program);
             counts
         };
@@ -257,11 +260,51 @@ fn discover(
 /// The set of the ranges of a function's instructions walked (one per
 /// instruction, in the walk's order: ascending within each block, block
 /// starts walked again repeated). As collecting them into the set does,
-/// sorted and deduplicated — by a sort that takes the ascending runs as
-/// they are, and by address alone: they are all in one space, and the
-/// instruction at an address has one length.
-fn body_set(mut body: Vec<AddressRange>) -> AddressSet {
+/// sorted and deduplicated, by address alone: they are all in one space,
+/// and the instruction at an address has one length. The blocks' runs are
+/// taken in order by their first address (shorter first), each appended or
+/// — a block start walked again — found among those before; anything else
+/// (a block run into the middle of an instruction) is sorted.
+fn body_set(body: Vec<AddressRange>) -> AddressSet {
     debug_assert!(body.windows(2).all(|w| w[0].start.space == w[1].start.space));
+    // the runs of instructions each starting where the one before ends
+    // (a block's): (first address, length, start)
+    let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+    for (i, r) in body.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if body[i - 1].size > 0 && body[i - 1].start.offset.checked_add(body[i - 1].size) == Some(r.start.offset) => {
+                run.1 += 1
+            }
+            _ => runs.push((r.start.offset, 1, i as u32)),
+        }
+    }
+    if runs.len() <= 1 {
+        // (one run: ascending)
+        return body.into_iter().collect();
+    }
+    runs.sort_unstable();
+    let mut sorted: Vec<AddressRange> = Vec::with_capacity(body.len());
+    let merged = runs.iter().all(|&(_, len, start)| {
+        let run = &body[start as usize..(start + len) as usize];
+        match sorted.last() {
+            Some(last) if last.start.offset >= run[0].start.offset => {
+                if *last == run[0] {
+                    sorted.extend_from_slice(&run[1..]);
+                    true
+                } else {
+                    run.iter().all(|r| sorted.binary_search_by_key(&r.start.offset, |s| s.start.offset).is_ok_and(|k| sorted[k] == *r))
+                }
+            }
+            _ => {
+                sorted.extend_from_slice(run);
+                true
+            }
+        }
+    });
+    if merged {
+        return sorted.into_iter().collect();
+    }
+    let mut body = body;
     body.sort_by_key(|r| r.start.offset);
     body.dedup();
     body.into_iter().collect()
@@ -318,6 +361,7 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         let mut walk_visited = Visited::new(memory);
         // (the walk's own decodes)
         let mut decoder = arch.instruction_decoder(memory);
+        let mut decodes = Decodes::new(memory);
         let counts = discover(
             listing,
             symbol_table,
@@ -373,10 +417,14 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 let result = match shared.get().filter(|_| is_started) {
                     Some(shared) => {
                         shared.walking.claim(entry);
-                        disassemble_function(entry, visited, &mut Ahead { shared, listing, decoder: &mut *decoder }, references)
+                        let source = &mut Ahead { shared, listing, decoder: &mut *decoder, decodes: &mut decodes };
+                        disassemble_function(entry, visited, source, references)
                     }
                     // (before the threads start there is nothing decoded ahead)
-                    None => disassemble_function(entry, visited, &mut Listed { decoder: &mut *decoder, listing }, references),
+                    None => {
+                        let source = &mut Listed { decoder: &mut *decoder, listing, decodes: &mut decodes };
+                        disassemble_function(entry, visited, source, references)
+                    }
                 };
                 if let Ok(d) = &result {
                     walked += d.instruction_count;
@@ -402,8 +450,11 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             },
         );
         drop(walk_visited);
+        drop(decoder);
+        let own = decodes.into_sorted();
         let Some(started) = started.into_inner() else {
             // (a short walk: all on this thread)
+            listing.add_unlisted_instructions(vec![vec![own]]);
             if let Some(reference_manager) = reference_manager.take() {
                 reference_manager.add_all_unpooled(&references);
             }
@@ -430,6 +481,15 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 decodes[k].push(run);
             }
         }
+        // (and the walk's own, cut the same way)
+        let cuts = shared.get().map_or(&[][..], |shared| &shared.cuts[..]);
+        decodes.resize_with(decodes.len().max(cuts.len() + 1), Vec::new);
+        let mut rest = own;
+        for (k, &cut) in cuts.iter().enumerate().rev() {
+            let at = rest.partition_point(|d| d.0 < cut);
+            decodes[k + 1].push(rest.split_off(at));
+        }
+        decodes[0].push(rest);
         listing.add_unlisted_instructions(decodes);
         let bodies = sets.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
         if let Err(e) = adding.join() {
@@ -775,21 +835,106 @@ trait Source {
     fn fetch(&mut self, addr: u64, hint: &mut Self::Hint) -> Option<Facts>;
 }
 
-/// The listing: an instruction not listed is decoded (with `decoder`) and listed.
+/// The listing and the walk's own decodes ([`Decodes`]): an instruction
+/// is decoded (with `decoder`), and kept to be listed when neither listed
+/// nor decoded before in the run.
 struct Listed<'a> {
     decoder: &'a mut dyn InstructionDecoder,
-    listing: &'a mut Listing,
+    listing: &'a Listing,
+    decodes: &'a mut Decodes,
 }
 
 impl Source for Listed<'_> {
     type Hint = ();
     fn fetch(&mut self, addr: u64, _: &mut ()) -> Option<Facts> {
-        // Decoding is a pure function of the bytes, and only this
-        // pass lists instructions: one listed at `addr` is the one
-        // decoding gives (a block starting inside code decoded
-        // before, or a later run of the pass).
-        let decoder = &mut *self.decoder;
-        self.listing.instruction_or_insert_with(addr, || decoder.decode(addr).ok()).map(Facts::of)
+        // Decoding is a pure function of the bytes, and only this pass
+        // lists instructions: one listed at `addr` (or decoded before in
+        // the run) is the one decoding gives — decoding it again costs
+        // about what looking it up did.
+        let (word, bit, run) = self.decodes.slot(self.listing, addr);
+        let known = *word & bit != 0;
+        *word |= bit;
+        let d = self.decoder.decode(addr).ok()?;
+        let facts = Facts::of(&d);
+        if !known {
+            run.push((addr, Box::new(d)));
+        }
+        Some(facts)
+    }
+}
+
+/// The instructions a discovery walk decoded itself, listed when it is
+/// done ([`Self::into_sorted`]) instead of one by one into the listing's
+/// map: the addresses listed or decoded so far, a bit per address in pages
+/// of [`PAGE`] addresses (as [`Visited`]), a page's listed ones marked when
+/// it is first used (the listing does not change during the walk), and the
+/// decodes kept, by page.
+struct Decodes {
+    base: u64,
+    pages: Vec<Option<(VisitedPage, InstructionRun)>>,
+    others: FxHashMap<u64, (VisitedPage, InstructionRun)>,
+}
+
+impl Decodes {
+    fn new(memory: &Memory) -> Self {
+        let (base, span) = code_span(memory);
+        Self { base, pages: (0..span.div_ceil(PAGE)).map(|_| None).collect(), others: FxHashMap::default() }
+    }
+
+    /// The word and bit of `addr` (set: listed or decoded before) and the
+    /// decodes kept in its page.
+    fn slot(&mut self, listing: &Listing, addr: u64) -> (&mut u64, u64, &mut InstructionRun) {
+        let fill = |lo: u64| {
+            let mut page: VisitedPage = Box::new([0; (PAGE / 64) as usize]);
+            for a in listing.instruction_addresses_in_range(lo, lo.saturating_add(PAGE)) {
+                let bit = a - lo;
+                page[(bit / 64) as usize] |= 1 << (bit % 64);
+            }
+            (page, Vec::new())
+        };
+        let ((page, run), bit) = match addr.checked_sub(self.base).filter(|&i| ((i / PAGE) as usize) < self.pages.len()) {
+            Some(i) => (self.pages[(i / PAGE) as usize].get_or_insert_with(|| fill(addr - i % PAGE)), i % PAGE),
+            None => (self.others.entry(addr / PAGE).or_insert_with(|| fill(addr - addr % PAGE)), addr % PAGE),
+        };
+        (&mut page[(bit / 64) as usize], 1 << (bit % 64), run)
+    }
+
+    /// The decodes kept, by address: page by page (each in the walk's
+    /// order, put in order through a table by the address in the page).
+    fn into_sorted(self) -> InstructionRun {
+        let mut all: InstructionRun =
+            Vec::with_capacity(self.pages.iter().flatten().chain(self.others.values()).map(|p| p.1.len()).sum());
+        // (the index in the page's run of each address in the page, and
+        // which are set)
+        let mut at = vec![0u32; PAGE as usize];
+        let mut set = [0u64; (PAGE / 64) as usize];
+        for (lo, run) in self.pages.into_iter().enumerate().filter_map(|(k, p)| Some((self.base + k as u64 * PAGE, p?.1))) {
+            let mut run: Vec<Option<(u64, Box<DecodedInstruction>)>> = run.into_iter().map(Some).collect();
+            for (i, d) in run.iter().enumerate() {
+                if let Some(d) = d {
+                    let off = (d.0 - lo) as usize;
+                    at[off] = i as u32;
+                    set[off / 64] |= 1 << (off % 64);
+                }
+            }
+            for (w, word) in set.iter_mut().enumerate() {
+                while *word != 0 {
+                    let off = w * 64 + word.trailing_zeros() as usize;
+                    *word &= *word - 1;
+                    all.extend(run[at[off] as usize].take());
+                }
+            }
+        }
+        // (outside the code: by page; few)
+        let mut others: Vec<_> = self.others.into_iter().flat_map(|(_, (_, run))| run).collect();
+        others.sort_unstable_by_key(|d| d.0);
+        // (code span pages hold every address from base up; the others are
+        // below or above it)
+        let below = others.partition_point(|d| d.0 < self.base);
+        let above = others.split_off(below);
+        others.extend(all);
+        others.extend(above);
+        others
     }
 }
 
@@ -797,8 +942,9 @@ impl Source for Listed<'_> {
 /// before, else in the code decoded from the entry at the address.
 struct Ahead<'a, 'l> {
     shared: &'a Shared<'a>,
-    listing: &'l mut Listing,
+    listing: &'l Listing,
     decoder: &'l mut dyn InstructionDecoder,
+    decodes: &'l mut Decodes,
 }
 
 impl Source for Ahead<'_, '_> {
@@ -827,7 +973,7 @@ impl Source for Ahead<'_, '_> {
             return Some(facts);
         }
         *hint = None;
-        Listed { decoder: &mut *self.decoder, listing: self.listing }.fetch(addr, &mut ())
+        Listed { decoder: &mut *self.decoder, listing: self.listing, decodes: &mut *self.decodes }.fetch(addr, &mut ())
     }
 }
 
@@ -1239,6 +1385,73 @@ mod tests {
                 panic!("{threads} threads: {a} != {b}");
             }
         }
+    }
+
+    /// `body_set` (runs merged) equals sorting and deduplicating, on
+    /// random walks: blocks of chained instructions, block starts walked
+    /// again, blocks run into the middle of an instruction.
+    #[test]
+    fn body_set_matches_sorting() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..3000 {
+            // the instruction lengths at each address (fixed: one per address)
+            let len: Vec<u64> = (0..400).map(|_| 1 + next(7)).collect();
+            let range = |a: u64| AddressRange::new(Address::new(SpaceId::RAM, a), len[a as usize]);
+            let mut body = Vec::new();
+            for _ in 0..1 + next(12) {
+                let mut a = next(300);
+                if next(3) == 0 && !body.is_empty() {
+                    // a block start walked again
+                    let r: &AddressRange = &body[next(body.len() as u64) as usize];
+                    a = r.start.offset;
+                }
+                for _ in 0..1 + next(15) {
+                    body.push(range(a));
+                    a += len[a as usize];
+                    if a >= 380 {
+                        break;
+                    }
+                }
+            }
+            let mut expected = body.clone();
+            expected.sort_by_key(|r| r.start.offset);
+            expected.dedup();
+            let expected: AddressSet = expected.into_iter().collect();
+            assert_eq!(format!("{:?}", body_set(body.clone())), format!("{expected:?}"), "{body:?}");
+        }
+    }
+
+    /// The walk's own decodes come out by address, once each, the listed
+    /// ones left out.
+    #[test]
+    fn decodes_sorted_by_address() {
+        let code = vec![0x90u8; 3 * PAGE as usize];
+        let program = make_x86_64_program(&code, 0x10000);
+        let mut listing = Listing::new();
+        let mut decoder = program.arch.instruction_decoder(&program.info.memory);
+        for a in [0x10005u64, 0x11003] {
+            listing.add_instruction(decoder.decode(a).unwrap());
+        }
+        let mut decodes = Decodes::new(&program.info.memory);
+        let mut seed = 12345u64;
+        let mut expected = BTreeSet::new();
+        for _ in 0..5000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // (some outside the code too)
+            let a = 0x10000 - 64 + (seed >> 33) % (3 * PAGE + 128);
+            let source = &mut Listed { decoder: &mut *decoder, listing: &listing, decodes: &mut decodes };
+            if source.fetch(a, &mut ()).is_some() && !listing.has_instruction(a) {
+                expected.insert(a);
+            }
+        }
+        let got: Vec<u64> = decodes.into_sorted().into_iter().map(|d| d.0).collect();
+        assert_eq!(got, expected.into_iter().collect::<Vec<_>>());
     }
 
     #[test]
