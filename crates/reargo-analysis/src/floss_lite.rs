@@ -214,12 +214,14 @@ fn decode_in_chunks(buf: &[u8], base_addr: u64, opts: &FlossOptions, chunk: usiz
     // The count of source bytes that are not printable, by prefix: the
     // conservative check of every run of every pass in O(1).
     let nonprintable = (opts.require_nonprintable_source && u32::try_from(buf.len()).is_ok()).then(|| {
-        let mut prefix = vec![0u32; buf.len() + 1];
+        let not_printable: [u32; 256] = std::array::from_fn(|b| u32::from(!is_printable(b as u8)));
+        let mut prefix = Vec::with_capacity(buf.len() + 1);
+        prefix.push(0);
         let mut count = 0u32;
-        for (p, &b) in prefix[1..].iter_mut().zip(buf) {
-            count += u32::from(!is_printable(b));
-            *p = count;
-        }
+        prefix.extend(buf.iter().map(|&b| {
+            count += not_printable[b as usize];
+            count
+        }));
         prefix
     });
     let nonprintable = nonprintable.as_deref();
@@ -407,7 +409,6 @@ fn scan_chunk(
     let (printable, letter) = (&group.printable, &group.letter);
     let mut w: Vec<u64> = buf[lo..last + m - 1].iter().map(|&b| printable[b as usize]).collect();
     window_and(&mut w, m, &mut Vec::new());
-    let letters = |k: usize| buf.get(k).map_or(0, |&b| letter[b as usize]);
     // the passes in a run of at least `m` bytes, the start of each run, and
     // the passes whose run holds a word so far
     let mut active = 0u64;
@@ -459,10 +460,12 @@ fn scan_chunk(
             }
             // a word at `t` for a pass of a run without one yet
             let open = active & !seen;
-            if open != 0 {
-                let l = open & letters(t) & letters(t + 1) & letters(t + 2);
+            if open != 0
+                && let Some(&[a, b, c]) = buf.get(t..t + 3)
+            {
+                let l = open & letter[a as usize] & letter[b as usize] & letter[c as usize];
                 if l != 0 {
-                    seen |= l & group.distinct(buf[t], buf[t + 1], buf[t + 2]);
+                    seen |= l & group.distinct(a, b, c);
                 }
             }
         }};
