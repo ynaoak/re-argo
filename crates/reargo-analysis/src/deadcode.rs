@@ -23,8 +23,6 @@
 //! listing. Downstream coverage / xref consumers may want to know
 //! the bytes exist even though no normal-flow caller reaches them.
 
-use std::collections::VecDeque;
-
 use rayon::prelude::*;
 use reargo_arch::FlowType;
 use reargo_program::comments::CommentType;
@@ -86,7 +84,8 @@ impl Analyzer for DeadCodeAnalyzer {
             };
 
             // Snapshot insns in body, sorted.
-            let mut insns: Vec<(u64, u32, FlowType, Option<u64>)> = Vec::new();
+            // (a body holds a range per instruction)
+            let mut insns: Vec<(u64, u32, FlowType, Option<u64>)> = Vec::with_capacity(snap.body.len());
             listing.for_each_body_instruction(snap.body, |_, i| {
                 insns.push((i.address, i.length, i.flow_type, i.branch_target));
             });
@@ -118,27 +117,32 @@ impl Analyzer for DeadCodeAnalyzer {
             block_starts.dedup();
 
             // Walk reachability from entry using fall-through +
-            // branch edges.
-            let mut reachable: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-            let mut queue: VecDeque<u64> = VecDeque::new();
-            queue.push_back(snap.entry);
-            while let Some(b) = queue.pop_front() {
-                if !reachable.insert(b) {
+            // branch edges (in any order: the set reached is the same).
+            // A block start reached is marked by its index, any other
+            // address in a set.
+            let mut reached_start = vec![false; block_starts.len()];
+            let mut reached_other: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+            let mut queue: Vec<u64> = vec![snap.entry];
+            while let Some(b) = queue.pop() {
+                let p = block_starts.partition_point(|&s| s <= b);
+                let fresh = if p > 0 && block_starts[p - 1] == b {
+                    !std::mem::replace(&mut reached_start[p - 1], true)
+                } else {
+                    reached_other.insert(b)
+                };
+                if !fresh {
                     continue;
                 }
                 // Walk insns from b until we hit a terminator or
                 // bump into the next block start.
                 let mut cur = b;
-                let next_start = block_starts
-                    .get(block_starts.partition_point(|&s| s <= b))
-                    .copied()
-                    .unwrap_or(u64::MAX);
+                let next_start = block_starts.get(p).copied().unwrap_or(u64::MAX);
                 let mut idx = insns.binary_search_by_key(&cur, |(a, _, _, _)| *a);
                 while let Ok(i) = idx {
                     let (addr, len, ft, tgt) = insns[i];
                     if addr >= next_start {
                         if in_body(addr) {
-                            queue.push_back(addr);
+                            queue.push(addr);
                         }
                         break;
                     }
@@ -149,7 +153,7 @@ impl Analyzer for DeadCodeAnalyzer {
                             if let Some(t) = tgt
                                 && in_body(t)
                             {
-                                queue.push_back(t);
+                                queue.push(t);
                             }
                             break;
                         }
@@ -157,10 +161,10 @@ impl Analyzer for DeadCodeAnalyzer {
                             if let Some(t) = tgt
                                 && in_body(t)
                             {
-                                queue.push_back(t);
+                                queue.push(t);
                             }
                             if in_body(after) {
-                                queue.push_back(after);
+                                queue.push(after);
                             }
                             break;
                         }
@@ -176,8 +180,8 @@ impl Analyzer for DeadCodeAnalyzer {
                 }
             }
 
-            for &start in &block_starts {
-                if !reachable.contains(&start) {
+            for (&start, &reached) in block_starts.iter().zip(&reached_start) {
+                if !reached {
                     unreachable.push(start);
                 }
             }

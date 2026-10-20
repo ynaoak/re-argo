@@ -1157,7 +1157,8 @@ fn disassemble_function<S: Source>(
 ) -> Result<FunctionDiscovery, AnalysisError> {
     let mut block_queue: VecDeque<(u64, S::Hint)> = VecDeque::new();
     let mut block_visited: FxHashSet<u64> = FxHashSet::default();
-    let mut body: Vec<AddressRange> = Vec::new();
+    // (room for most functions: a range per instruction)
+    let mut body: Vec<AddressRange> = Vec::with_capacity(64);
     let mut call_targets: BTreeSet<u64> = BTreeSet::new();
     let references_before = references.len();
     let mut instruction_count = 0;
