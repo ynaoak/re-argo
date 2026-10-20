@@ -186,9 +186,14 @@ pub struct LiftCache {
     lifted: Vec<Option<LiftedInstruction>>,
     /// The link, length and flags of each index.
     meta: Vec<Meta>,
-    /// The [`InsnShape`] of each index (only its address where the lift
-    /// failed).
-    shape: Vec<crate::lift::InsnShape>,
+    /// The [`InsnShape`] of each index, by field (only its address where
+    /// the lift failed): the shapes of a range of consecutive entries are
+    /// read in place ([`crate::lift::RangeShapes`]).
+    addr: Vec<u64>,
+    sflags: Vec<u8>,
+    target: Vec<u64>,
+    /// The indices whose shape has flags, ascending.
+    special: Vec<u32>,
     /// Instructions the last [`Self::trim`] kept.
     kept: usize,
     /// The lifts with the integer PF, of the ranges that need it
@@ -347,7 +352,7 @@ impl LiftCache {
         while self.head < self.lifted.len() {
             let p = self.head;
             if self.meta[p].flags & DEAD == 0 {
-                if self.shape[p].address >= start {
+                if self.addr[p] >= start {
                     break;
                 }
                 self.lifted[p] = None;
@@ -367,9 +372,16 @@ impl LiftCache {
         let h = self.head;
         self.lifted.drain(..h);
         self.meta.drain(..h);
-        self.shape.drain(..h);
+        self.addr.drain(..h);
+        self.sflags.drain(..h);
+        self.target.drain(..h);
         self.head = 0;
         let h = u32::try_from(h).expect("lift cache index");
+        let k = self.special.partition_point(|&i| i < h);
+        self.special.drain(..k);
+        for i in &mut self.special {
+            *i -= h;
+        }
         // (the live entries link only to live ones, all at or after `h`; a dead one's
         // link is not read)
         for m in &mut self.meta {
@@ -385,7 +397,9 @@ impl LiftCache {
         let n = (2 * n).max(CACHE_RESERVE);
         self.lifted.reserve(n);
         self.meta.reserve(n);
-        self.shape.reserve(n);
+        self.addr.reserve(n);
+        self.sflags.reserve(n);
+        self.target.reserve(n);
     }
 
     /// The instruction at index `i`, lifted.
@@ -397,6 +411,34 @@ impl LiftCache {
     /// The instructions at `idxs`, all lifted.
     fn insns(&self, idxs: &[u32]) -> Vec<&LiftedInstruction> {
         idxs.iter().map(|&i| self.insn(i)).collect()
+    }
+
+    /// The shapes of the instructions at `idxs`, read in place when they are
+    /// consecutive entries (as a range lifted after the one before it mostly is).
+    fn shapes(&self, idxs: &[u32]) -> crate::lift::RangeShapes<'_> {
+        let Some(&first) = idxs.first() else {
+            return crate::lift::RangeShapes::owned(Vec::new(), Vec::new(), Vec::new());
+        };
+        // (`first + k` for every `k`: compared without stopping early, which vectorises)
+        let consecutive = idxs.iter().zip(first..).fold(true, |ok, (&i, j)| ok & (i == j));
+        if consecutive {
+            let (lo, hi) = (first as usize, first as usize + idxs.len());
+            let end = first + idxs.len() as u32;
+            let a = self.special.partition_point(|&i| i < first);
+            let b = a + self.special[a..].partition_point(|&i| i < end);
+            return crate::lift::RangeShapes::borrowed(
+                &self.addr[lo..hi],
+                &self.sflags[lo..hi],
+                &self.target[lo..hi],
+                &self.special[a..b],
+                first,
+            );
+        }
+        crate::lift::RangeShapes::owned(
+            idxs.iter().map(|&i| self.addr[i as usize]).collect(),
+            idxs.iter().map(|&i| self.sflags[i as usize]).collect(),
+            idxs.iter().map(|&i| self.target[i as usize]).collect(),
+        )
     }
 
     /// The index of `addr`, lifting it (with `lifter`, decoding through
@@ -415,22 +457,36 @@ impl LiftCache {
         if self.lifted.len() == self.lifted.capacity() {
             self.reserve(self.live);
         }
-        let lifted =
-            lifter.decode_in_block(memory, addr, block).and_then(|insn| lifter.lift_decoded(insn, addr, None)).ok();
-        let (flags, len, shape) = match &lifted {
-            Some(insn) => {
-                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
-                let flags = if x87 { X87 } else { 0 } | if reads_outside_pf(insn) { READS_PF } else { 0 };
-                let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
-                (flags, len, crate::lift::InsnShape::of(insn))
-            }
-            None => (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() }),
-        };
         let i = u32::try_from(self.lifted.len()).expect("lift cache index");
         assert!(i != NO_INDEX, "lift cache index");
-        self.lifted.push(lifted);
+        let mut facts = OpFacts::default();
+        // (the lift pushed where it is matched, not moved through an `Option` first)
+        let (flags, len, shape) = match lifter
+            .decode_in_block(memory, addr, block)
+            .and_then(|insn| lifter.lift_decoded_facts(insn, addr, None, &mut facts))
+        {
+            Ok(insn) => {
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
+                let flags = if x87 { X87 } else { 0 } | if facts.reads_outside_pf { READS_PF } else { 0 };
+                let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
+                let shape = crate::lift::InsnShape { address: addr, target: facts.target, flags: facts.flags };
+                debug_assert_eq!(shape, crate::lift::InsnShape::of(&insn));
+                debug_assert_eq!(facts.reads_outside_pf, reads_outside_pf(&insn));
+                self.lifted.push(Some(insn));
+                (flags, len, shape)
+            }
+            Err(_) => {
+                self.lifted.push(None);
+                (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() })
+            }
+        };
         self.meta.push(Meta { next: NO_NEXT, len, flags });
-        self.shape.push(shape);
+        self.addr.push(shape.address);
+        self.sflags.push(shape.flags);
+        self.target.push(shape.target);
+        if shape.flags != 0 {
+            self.special.push(i);
+        }
         *self.map.slot(addr) = i;
         self.live += 1;
         i
@@ -1288,19 +1344,18 @@ impl X86Lifter {
         budgets: &[usize],
         with_shapes: bool,
         cache: &mut LiftCache,
-        mut g: impl FnMut(usize, &[&LiftedInstruction], Option<&[crate::lift::InsnShape]>) -> R,
+        mut g: impl FnMut(usize, &[&LiftedInstruction], Option<&crate::lift::RangeShapes>) -> R,
     ) -> Vec<R> {
         let max = budgets.iter().copied().max().unwrap_or(0);
         if let Ok(idxs) = self.walk_cached(memory, start, max, cache) {
             let insns = cache.insns(&idxs);
-            let shapes: Option<Vec<crate::lift::InsnShape>> =
-                with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
+            let shapes = with_shapes.then(|| cache.shapes(&idxs));
             return budgets
                 .iter()
                 .enumerate()
                 .map(|(k, &b)| {
                     let n = b.min(insns.len());
-                    g(k, &insns[..n], shapes.as_ref().map(|s| &s[..n]))
+                    g(k, &insns[..n], shapes.as_ref().map(|s| s.prefix(n)).as_ref())
                 })
                 .collect();
         }
@@ -1309,9 +1364,8 @@ impl X86Lifter {
             .enumerate()
             .map(|(k, &b)| match self.walk_cached(memory, start, b, cache) {
                 Ok(idxs) => {
-                    let shapes: Option<Vec<crate::lift::InsnShape>> =
-                        with_shapes.then(|| idxs.iter().map(|&i| cache.shape[i as usize]).collect());
-                    g(k, &cache.insns(&idxs), shapes.as_deref())
+                    let shapes = with_shapes.then(|| cache.shapes(&idxs));
+                    g(k, &cache.insns(&idxs), shapes.as_ref())
                 }
                 Err(idxs) => {
                     let insns = self.lift_range_from_cache(memory, start, b, &idxs, cache);
@@ -3476,8 +3530,20 @@ impl X86Lifter {
         address: u64,
         x87: Option<X87Ctx>,
     ) -> Result<LiftedInstruction, LiftError> {
+        self.lift_decoded_facts(insn, address, x87, &mut OpFacts::default())
+    }
+
+    /// [`Self::lift_decoded`], with `facts` set to what the walks read of the lift's ops
+    /// (found in the pass over them that finishes the lift).
+    fn lift_decoded_facts(
+        &self,
+        insn: iced_x86::Instruction,
+        address: u64,
+        x87: Option<X87Ctx>,
+        facts: &mut OpFacts,
+    ) -> Result<LiftedInstruction, LiftError> {
         let pcode_ops = self.lift_iced(&insn, address, x87)?;
-        let pcode_ops = self.finish_ops(pcode_ops, &insn);
+        let pcode_ops = self.finish_ops(pcode_ops, &insn, facts);
 
         Ok(LiftedInstruction {
             address,
@@ -3491,23 +3557,36 @@ impl X86Lifter {
     /// ([`zero_extend_gpr32_writes`], [`sync_xmm_views`]), in a vector of
     /// exactly their number: the lift holds no spare room, and the ops are
     /// moved once where only the GPR views are added.
-    fn finish_ops(&self, mut ops: Vec<PcodeOp>, insn: &iced_x86::Instruction) -> Vec<PcodeOp> {
+    fn finish_ops(&self, mut ops: Vec<PcodeOp>, insn: &iced_x86::Instruction, facts: &mut OpFacts) -> Vec<PcodeOp> {
         // (one pass: whether an XMM view is written and the XMM views need syncing, whether a
         // GPR view is written or a high byte read / written, and how many ops
-        // `zero_extend_gpr32_writes` adds)
+        // `zero_extend_gpr32_writes` adds; and the facts, which the views added do not change:
+        // they are copies of registers other than the flags)
         let (mut xmm, mut touches, mut extra) = (false, false, 0usize);
+        let mut shape = crate::lift::InsnShape::default();
+        // (PF read before it is written / written so far)
+        let (mut pf_read, mut pf_written) = (None, false);
         for op in &ops {
             let mut reads = 0;
             let mut last: Option<VarnodeData> = None;
-            for v in op.inputs.iter().filter(|v| high_byte(v)) {
-                if last != Some(*v) {
-                    reads += 1;
+            let mut reads_pf = false;
+            for v in op.inputs.iter() {
+                reads_pf |= is_pf(v);
+                if high_byte(v) {
+                    if last != Some(*v) {
+                        reads += 1;
+                    }
+                    last = Some(*v);
                 }
-                last = Some(*v);
             }
+            if reads_pf && pf_read.is_none() {
+                pf_read = Some(!pf_written);
+            }
+            shape.add(op);
             touches |= reads > 0;
             extra += reads;
             let Some(w) = op.output else { continue };
+            pf_written |= is_pf(&w);
             if w.space != REG_SPACE {
                 continue;
             }
@@ -3527,6 +3606,9 @@ impl X86Lifter {
                 };
             }
         }
+        facts.reads_outside_pf = pf_read == Some(true);
+        facts.flags = shape.flags;
+        facts.target = shape.target;
         if self.is_64 && touches {
             if extra == 0 {
                 for (i, op) in ops.iter_mut().enumerate() {
@@ -3885,6 +3967,23 @@ fn gpr_view(v: &VarnodeData) -> bool {
 }
 
 /// `ah`/`ch`/`dh`/`bh`: byte 1 of rax..rbx (WS84).
+/// PF, the parity flag.
+#[inline]
+fn is_pf(v: &VarnodeData) -> bool {
+    v.space == REG_SPACE && v.offset == PF_OFFSET
+}
+
+/// What a walk reads of an instruction's lift, found while the lift is finished
+/// ([`X86Lifter::lift_decoded_facts`]).
+#[derive(Clone, Copy, Default)]
+struct OpFacts {
+    /// [`reads_outside_pf`].
+    reads_outside_pf: bool,
+    /// The [`crate::lift::InsnShape`] flags and target.
+    flags: u8,
+    target: u64,
+}
+
 fn high_byte(v: &VarnodeData) -> bool {
     // (the size first: most varnodes are wider)
     v.size == 1 && v.offset % 8 == 1 && v.offset < 0x20 && v.space == REG_SPACE
@@ -5049,7 +5148,10 @@ mod tests {
             let got = lifter.lift_prefixes_cached(&mem, 0x1000 + start, &budgets, true, &mut prefix_cache, |k, v, shapes| {
                 // the shapes, when given, are the instructions' own
                 if let Some(shapes) = shapes {
-                    assert_eq!(shapes, v.iter().map(|i| crate::lift::InsnShape::of(i)).collect::<Vec<_>>());
+                    let of = crate::lift::RangeShapes::of(v);
+                    assert_eq!((0..shapes.len()).map(|i| shapes.shape(i)).collect::<Vec<_>>(), v.iter().map(|i| crate::lift::InsnShape::of(i)).collect::<Vec<_>>());
+                    assert_eq!(shapes.special().collect::<Vec<_>>(), of.special().collect::<Vec<_>>());
+                    assert_eq!(shapes.increasing, of.increasing);
                 }
                 (k, text(v))
             });
@@ -5065,6 +5167,44 @@ mod tests {
                 assert_eq!(text(&cached.iter().collect::<Vec<_>>()), text(&fresh.iter().collect::<Vec<_>>()), "retained start +{start:#x} count {count}");
             }
         }
+    }
+
+    /// The facts found while a lift is finished are the ones its ops give.
+    #[test]
+    fn lift_facts_match_ops() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut lifted = 0;
+        for round in 0..40_000u32 {
+            let mut bytes = [0u8; 16];
+            for b in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            // (a jump, a compare, a parity read or a call now and then)
+            match round % 8 {
+                0 => bytes[0] = 0x0f,
+                1 => bytes[0] = 0x7a,
+                2 => bytes[0] = 0xe8,
+                3 => bytes[0] = 0x66,
+                _ => {}
+            }
+            for lifter in [X86Lifter::new_64(), X86Lifter::new_64().without_parity(), X86Lifter::new_32()] {
+                let mut d = iced_x86::Decoder::with_ip(if lifter.is_64 { 64 } else { 32 }, &bytes, 0x1000, iced_x86::DecoderOptions::NONE);
+                let insn = d.decode();
+                if insn.is_invalid() {
+                    continue;
+                }
+                let mut facts = OpFacts::default();
+                let Ok(l) = lifter.lift_decoded_facts(insn, 0x1000, None, &mut facts) else { continue };
+                let shape = crate::lift::InsnShape::of(&l);
+                assert_eq!((facts.flags, facts.target), (shape.flags, shape.target), "{bytes:02x?}");
+                assert_eq!(facts.reads_outside_pf, reads_outside_pf(&l), "{bytes:02x?}");
+                lifted += 1;
+            }
+        }
+        assert!(lifted > 50_000, "{lifted}");
     }
 
     /// `plain_range` answers only when `lift_range` is the lifts of its addresses alone, and

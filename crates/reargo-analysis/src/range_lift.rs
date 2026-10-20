@@ -10,7 +10,7 @@
 
 use rayon::prelude::*;
 use reargo_lift::x86::{LiftCache, X86Lifter};
-use reargo_lift::{InsnShape, LiftedInstruction};
+use reargo_lift::{LiftedInstruction, RangeShapes};
 use reargo_loader::Memory;
 
 /// How many jobs past a full run [`span_chunks`] looks for the place to
@@ -178,7 +178,7 @@ impl RangeLifter<'_> {
         &mut self,
         entry: u64,
         budgets: &[usize],
-        g: impl FnMut(usize, &[&LiftedInstruction], Option<&[InsnShape]>) -> R,
+        g: impl FnMut(usize, &[&LiftedInstruction], Option<&RangeShapes>) -> R,
     ) -> Vec<R> {
         trim(&mut self.cache, entry);
         self.lifter.lift_prefixes_cached(self.memory, entry, budgets, true, &mut self.cache, g)

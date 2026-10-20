@@ -340,7 +340,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     entry: u64,
     max_insns: usize,
     insns: &[I],
-    shapes: Option<&[reargo_lift::InsnShape]>,
+    shapes: Option<&reargo_lift::RangeShapes>,
     with_snapshots: bool,
 ) -> FunctionResults {
     let next_entry = program.listing.next_function_after(entry).map(|f| f.entry_point);
@@ -388,28 +388,30 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         // both flows walk the same blocks (`in_extent` with the next
         // entry looked up once), keeping only the snapshots of the
         // calls the function owns
-        let blocks = match &marks {
+        // (of an increasing lift, only the blocks before `reach` can reach a call the
+        // function owns: the flows walk no other)
+        let (blocks, reach) = match &marks {
             Some(marks) => {
-                let mut blocks = crate::blockflow::Cfg::build_marked(&shape, marks, in_body);
+                let reach = marks.reach(&shape);
+                let mut blocks = crate::blockflow::Cfg::build_marked_upto(&shape, marks, in_body, reach);
                 blocks.keep_owned_calls(marks);
-                blocks
+                (blocks, reach)
             }
             None => {
                 let mut blocks = crate::blockflow::Cfg::build_shaped(&shape, &external, in_body);
                 blocks.keep_calls_at(insns.len(), |i| shape.has_call(i) && owns_call(shape.addrs[i]));
-                blocks
+                (blocks, insns.len())
             }
         };
-        let mut cfg = crate::cfg_const::function_snapshots_cfg(&blocks, insns);
-        let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, insns);
+        let mut cfg = crate::cfg_const::function_snapshots_cfg(&blocks, &insns[..reach]);
+        let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, &insns[..reach]);
         addrs.extend(cfg.iter().map(|(a, _)| *a));
         addrs.extend(vsa.iter().map(|(a, _)| *a));
         cfg.retain(|(a, _)| owner.owns(*a));
         vsa.retain(|(a, _)| owner.owns(*a));
         (cfg, vsa)
     });
-    let offsets: Option<Box<[u32]>> =
-        shape.addrs.iter().map(|a| a.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect();
+    let offsets = lift_offsets(&shape.addrs, shape.increasing, entry);
     // offsets increase (a linear lift), so the list is sorted (an
     // increasing lift's are)
     let reusable = offsets.as_ref().is_some_and(|o| shape.increasing || o.is_sorted_by(|a, b| a < b));
@@ -426,6 +428,20 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         next_entry,
         owned: addrs.into_iter().map(|a| (a, owns_call(a))).collect(),
     }
+}
+
+/// The offsets of `addrs` from `entry`, `None` when one does not fit (below
+/// `entry`, or too far past it).
+fn lift_offsets(addrs: &[u64], increasing: bool, entry: u64) -> Option<Box<[u32]>> {
+    // (an increasing lift's offsets all fit when its first and last do: one subtraction each)
+    if increasing
+        && let (Some(&first), Some(&last)) = (addrs.first(), addrs.last())
+        && first >= entry
+        && last - entry <= u64::from(u32::MAX)
+    {
+        return Some(addrs.iter().map(|&a| (a - entry) as u32).collect());
+    }
+    addrs.iter().map(|a| a.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect()
 }
 
 #[cfg(test)]
