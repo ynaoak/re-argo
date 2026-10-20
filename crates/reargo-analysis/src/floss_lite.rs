@@ -206,6 +206,11 @@ impl Default for FlossOptions {
 /// `max_per_section` ends the search (the hits are then returned
 /// truncated, not deduplicated).
 pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<DecodedString> {
+    decode_in_chunks(buf, base_addr, opts, CHUNK)
+}
+
+/// [`decode_section`], scanning the buffer `chunk` bytes per task.
+fn decode_in_chunks(buf: &[u8], base_addr: u64, opts: &FlossOptions, chunk: usize) -> Vec<DecodedString> {
     // The count of source bytes that are not printable, by prefix: the
     // conservative check of every run of every pass in O(1).
     let nonprintable = (opts.require_nonprintable_source && u32::try_from(buf.len()).is_ok()).then(|| {
@@ -229,11 +234,11 @@ pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<De
     };
     let mut hits: Vec<DecodedString> = Vec::new();
     for group in Group::all().iter().filter(|g| tried(&g.methods[0])) {
-        let chunk = |lo: usize| scan_chunk(buf, lo, (lo + CHUNK).min(buf.len()), nonprintable, opts, group);
-        let found: Vec<Vec<Vec<(usize, usize)>>> = if buf.len() <= CHUNK {
-            vec![chunk(0)]
+        let scan = |lo: usize| scan_chunk(buf, lo, (lo + chunk).min(buf.len()), nonprintable, opts, group);
+        let found: Vec<Vec<Vec<(usize, usize)>>> = if buf.len() <= chunk {
+            vec![scan(0)]
         } else {
-            (0..buf.len()).step_by(CHUNK).collect::<Vec<_>>().into_par_iter().map(chunk).collect()
+            (0..buf.len()).step_by(chunk).collect::<Vec<_>>().into_par_iter().map(scan).collect()
         };
         // The rest of the filter for the passes in order, a batch at a time
         // in parallel, and their hits up to the cap: the passes past the
@@ -245,7 +250,7 @@ pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<De
         };
         let passes: Vec<usize> = (0..group.methods.len()).collect();
         for batch in passes.chunks(rayon::current_num_threads().max(1) * 2) {
-            let per_pass: Vec<Vec<(usize, usize)>> = if buf.len() <= CHUNK {
+            let per_pass: Vec<Vec<(usize, usize)>> = if buf.len() <= chunk {
                 batch.iter().map(|&q| pass_runs(q)).collect()
             } else {
                 batch.par_iter().map(|&q| pass_runs(q)).collect()
@@ -293,8 +298,8 @@ pub fn decode_section(buf: &[u8], base_addr: u64, opts: &FlossOptions) -> Vec<De
 }
 
 /// The run starts a task of [`decode_section`] looks at (the runs may
-/// extend past them).
-const CHUNK: usize = 8 * 1024;
+/// extend past them, and its `w` holds a word per byte: 256 KiB).
+const CHUNK: usize = 32 * 1024;
 
 impl DecodeMethod {
     /// The decoded value of `b` (a bijection of the byte values).
@@ -882,12 +887,13 @@ mod tests {
             (state >> 33) as u32
         };
         let mut hits = 0usize;
+        // small chunks, so runs cross their ends
+        let chunk = 1000;
         for round in 0..48 {
-            // up to 3 chunks, so runs cross the chunk ends
             let len = match round % 4 {
                 0 => (next() % 600) as usize,
-                1 => CHUNK - 40 + (next() % 80) as usize,
-                _ => (next() % (5 * CHUNK as u32 / 2)) as usize,
+                1 => chunk - 40 + (next() % 80) as usize,
+                _ => (next() % 12_000) as usize,
             };
             let key = next() as u8;
             let buf: Vec<u8> = (0..len)
@@ -903,8 +909,9 @@ mod tests {
                 })
                 .collect();
             for opts in option_sets(50 + (next() % 400) as usize) {
-                let fast = decode_section(&buf, 0x1000, &opts);
+                let fast = decode_in_chunks(&buf, 0x1000, &opts, chunk);
                 assert_eq!(fast, decode_section_reference(&buf, 0x1000, &opts), "round {round} {opts:?}");
+                assert_eq!(fast, decode_section(&buf, 0x1000, &opts), "round {round} {opts:?}");
                 hits += fast.len();
             }
         }
@@ -922,11 +929,11 @@ mod tests {
         };
         let mut hits = 0usize;
         for round in 0..6 {
-            let len = (next() % (5 * CHUNK / 2)).min(exe.len());
+            let len = (next() % 40_000).min(exe.len());
             let at = next() % (exe.len() - len + 1);
             let buf = &exe[at..at + len];
             for opts in option_sets(200 + next() % 2000) {
-                let fast = decode_section(buf, 0x40_0000, &opts);
+                let fast = decode_in_chunks(buf, 0x40_0000, &opts, 4096);
                 assert_eq!(fast, decode_section_reference(buf, 0x40_0000, &opts), "round {round} at {at:#x} len {len} {opts:?}");
                 hits += fast.len();
             }
