@@ -44,6 +44,9 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 pub(crate) struct SectionMap {
     /// (start, end, is_executable)
     ranges: Vec<(u64, u64, bool)>,
+    /// The lowest start and highest end of `ranges`.
+    lo: u64,
+    hi: u64,
 }
 
 impl SectionMap {
@@ -61,7 +64,19 @@ impl SectionMap {
                 )
             })
             .collect();
-        Self { ranges }
+        Self::of_ranges(ranges)
+    }
+
+    fn of_ranges(ranges: Vec<(u64, u64, bool)>) -> Self {
+        let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+        let hi = ranges.iter().map(|r| r.1).max().unwrap_or(0);
+        Self { ranges, lo, hi }
+    }
+
+    /// Whether `addr` is in a section (`classify(addr).0`).
+    #[inline]
+    fn contains(&self, addr: u64) -> bool {
+        addr >= self.lo && addr < self.hi && self.classify(addr).0
     }
 
     /// `(in_section, in_executable_section)`.
@@ -177,43 +192,61 @@ pub(crate) struct Ahead(pub crate::range_lift::AheadMap<Vec<(u64, u64, RefType)>
 pub(crate) fn scan_lifted(lifted: &[&LiftedInstruction], sections: &SectionMap) -> Vec<(u64, u64, RefType)> {
     let mut out: Vec<(u64, u64, RefType)> = Vec::new();
     for insn in lifted {
-        for op in &insn.ops {
-            match op.opcode {
-                // `lea reg, [absolute]` / `mov reg, &global` after
-                // rip-relative resolution land here as a Copy whose
-                // source is a CONST varnode holding the absolute
-                // target.
-                OpCode::Copy => {
-                    if let Some(src) = op.inputs.first()
-                        && src.space == SpaceId::CONST
-                    {
-                        emit_if_in_section(insn.address, src.offset, sections, &mut out);
-                    }
-                }
-                // `mov reg, [rip+disp]` lifts to Load with the
-                // address as input[1] (input[0] is the space-id
-                // constant).
-                OpCode::Load => {
-                    if let Some(addr_vn) = op.inputs.get(1)
-                        && addr_vn.space == SpaceId::CONST
-                    {
-                        emit_load_store(insn.address, addr_vn.offset, RefType::DataRead, sections, &mut out);
-                    }
-                }
-                // `mov [rip+disp], reg` lifts to Store with the
-                // address as input[1].
-                OpCode::Store => {
-                    if let Some(addr_vn) = op.inputs.get(1)
-                        && addr_vn.space == SpaceId::CONST
-                    {
-                        emit_load_store(insn.address, addr_vn.offset, RefType::DataWrite, sections, &mut out);
-                    }
-                }
-                _ => {}
-            }
+        scan_insn(insn, sections, &mut out);
+    }
+    out
+}
+
+/// [`scan_lifted`] of a range from a lift cache: an instruction not lifted
+/// yet is lifted only when its decode shows a constant in a section that
+/// its lift may hold where the scan reads one (else it adds nothing).
+pub(crate) fn scan_range(insns: &[reargo_lift::x86::RangeInsn], sections: &SectionMap) -> Vec<(u64, u64, RefType)> {
+    let mut out: Vec<(u64, u64, RefType)> = Vec::new();
+    for insn in insns {
+        if let Some(insn) = insn.lifted_unless_no_const(|c| sections.contains(c)) {
+            scan_insn(insn, sections, &mut out);
         }
     }
     out
+}
+
+/// The references of one instruction's P-code (added to `out`).
+fn scan_insn(insn: &LiftedInstruction, sections: &SectionMap, out: &mut Vec<(u64, u64, RefType)>) {
+    for op in &insn.ops {
+        match op.opcode {
+            // `lea reg, [absolute]` / `mov reg, &global` after
+            // rip-relative resolution land here as a Copy whose
+            // source is a CONST varnode holding the absolute
+            // target.
+            OpCode::Copy => {
+                if let Some(src) = op.inputs.first()
+                    && src.space == SpaceId::CONST
+                {
+                    emit_if_in_section(insn.address, src.offset, sections, out);
+                }
+            }
+            // `mov reg, [rip+disp]` lifts to Load with the
+            // address as input[1] (input[0] is the space-id
+            // constant).
+            OpCode::Load => {
+                if let Some(addr_vn) = op.inputs.get(1)
+                    && addr_vn.space == SpaceId::CONST
+                {
+                    emit_load_store(insn.address, addr_vn.offset, RefType::DataRead, sections, out);
+                }
+            }
+            // `mov [rip+disp], reg` lifts to Store with the
+            // address as input[1].
+            OpCode::Store => {
+                if let Some(addr_vn) = op.inputs.get(1)
+                    && addr_vn.space == SpaceId::CONST
+                {
+                    emit_load_store(insn.address, addr_vn.offset, RefType::DataWrite, sections, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Generic CONST -> reference emit for Copy-style ops. Classifies
@@ -260,9 +293,7 @@ mod tests {
     use super::*;
 
     fn make_sections(ranges: &[(u64, u64, bool)]) -> SectionMap {
-        SectionMap {
-            ranges: ranges.to_vec(),
-        }
+        SectionMap::of_ranges(ranges.to_vec())
     }
 
     #[test]

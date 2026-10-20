@@ -160,7 +160,9 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
             };
             crate::range_lift::Span { entry: job.entry, insns, work: insns / 4 }
         };
-        let out = crate::range_lift::map_with_lifter(&program.info.memory, &jobs, span, |job, lifter| {
+        // (a lazy cache: P-code Reference's scan, whose budget is the largest, lifts an
+        // instruction only where its decode shows a constant in a section)
+        let out = crate::range_lift::map_with_lazy_lifter(&program.info.memory, &jobs, span, |job, lifter| {
             let entry = job.entry;
             let mut stack = None;
             let mut propagation = Vec::new();
@@ -180,12 +182,16 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
             } else {
                 &[STACK_LIFT_BUDGET]
             };
-            lifter.with_budgets(entry, budgets, |k, insns, shapes| match k {
+            fn lifted<'c>(insns: &[reargo_lift::x86::RangeInsn<'c>]) -> Vec<&'c reargo_lift::LiftedInstruction> {
+                insns.iter().map(|i| i.get()).collect()
+            }
+            lifter.with_budgets_lazy(entry, budgets, |k, insns, shapes| match k {
                 STACK => {
-                    stack = Some(stack_info_lifted(entry, insns));
-                    propagation = crate::propagation::analyse_lifted(insns, &valid_ranges);
+                    let insns = lifted(insns);
+                    stack = Some(stack_info_lifted(entry, &insns));
+                    propagation = crate::propagation::analyse_lifted(&insns, &valid_ranges);
                 }
-                PCODE => pcode = crate::pcoderef::scan_lifted(insns, &sections),
+                PCODE => pcode = crate::pcoderef::scan_range(insns, &sections),
                 INDIRECT => {
                     // Only a `CallInd` gives a result, and the walk runs
                     // forward: what follows the last one changes nothing.
@@ -196,7 +202,7 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
                     if got.is_some()
                         && let Some(last) = last
                     {
-                        indirect = crate::indirect_resolve::resolve_lifted(&insns[..=last], &plt_of_got);
+                        indirect = crate::indirect_resolve::resolve_lifted(&lifted(&insns[..=last]), &plt_of_got);
                     }
                 }
                 ARITY => arity = crate::arity::infer_arity(insns),

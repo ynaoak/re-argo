@@ -886,6 +886,58 @@ impl<'c> RangeInsn<'c> {
     }
 }
 
+impl<'c> RangeInsn<'c> {
+    /// The instruction lifted, unless its decode shows (without lifting it) that its lift holds
+    /// no constant `c` with `keep(c)` as a `COPY`'s source or a `LOAD` / `STORE`'s address:
+    /// `None` then. A lift puts there only its immediates and the absolute address of a memory
+    /// operand without a base (or with the instruction pointer) and index, and `0` / `1` (flags)
+    /// ([`any_const_ref_value`]).
+    #[inline]
+    pub fn lifted_unless_no_const(&self, keep: impl Fn(u64) -> bool) -> Option<&'c LiftedInstruction> {
+        match self.0 {
+            RangeInsnRepr::Lifted(l) => Some(l),
+            RangeInsnRepr::Cached(c, i) => match c.lifted[i as usize].get() {
+                Some(l) => Some(l),
+                None if !any_const_ref_value(&c.decoded[i as usize], keep) => None,
+                None => Some(c.insn(i)),
+            },
+        }
+    }
+}
+
+/// Whether `keep` holds for one of the constants the lift of `insn` (one
+/// [`X86Lifter::decoded_facts`] answers for) may hold as a `COPY`'s source or a `LOAD` /
+/// `STORE`'s address: `0`, `1` (flags set to a constant), each immediate (and its low 32, 16
+/// and 8 bits) and the displacement (and its low 32 bits) of a memory operand without an index
+/// whose base is none or the instruction pointer.
+fn any_const_ref_value(insn: &iced_x86::Instruction, keep: impl Fn(u64) -> bool) -> bool {
+    use iced_x86::{OpKind, Register};
+    if keep(0) || keep(1) {
+        return true;
+    }
+    (0..insn.op_count()).any(|i| match insn.op_kind(i) {
+        OpKind::Immediate8
+        | OpKind::Immediate16
+        | OpKind::Immediate32
+        | OpKind::Immediate64
+        | OpKind::Immediate8to16
+        | OpKind::Immediate8to32
+        | OpKind::Immediate8to64
+        | OpKind::Immediate32to64
+        | OpKind::Immediate8_2nd => {
+            let v = insn.immediate(i);
+            keep(v) || keep(u64::from(v as u32)) || keep(u64::from(v as u16)) || keep(u64::from(v as u8))
+        }
+        OpKind::Memory
+            if insn.memory_index() == Register::None && matches!(insn.memory_base(), Register::None | Register::RIP | Register::EIP) =>
+        {
+            let d = insn.memory_displacement64();
+            keep(d) || keep(u64::from(d as u32))
+        }
+        _ => false,
+    })
+}
+
 impl std::borrow::Borrow<LiftedInstruction> for RangeInsn<'_> {
     #[inline]
     fn borrow(&self) -> &LiftedInstruction {
@@ -5470,6 +5522,87 @@ mod tests {
         assert_eq!(pf, reads_outside_pf(&l), "{what:02x?} {insn}");
         assert!(!x87::is_x87(&insn));
         true
+    }
+
+    /// Every constant the lift of an instruction `decoded_facts` answers for puts as a `COPY`'s
+    /// source or a `LOAD` / `STORE`'s address is one `any_const_ref_value` tries (what
+    /// `RangeInsn::lifted_unless_no_const` reads instead of lifting): random bytes biased to
+    /// prefixes, escapes, moffs / immediate forms and memory operands, in 64- and 32-bit mode,
+    /// and every instruction of this test's own code.
+    #[test]
+    fn const_ref_values_cover_lift() {
+        fn check(insn: iced_x86::Instruction, is_64: bool) -> bool {
+            if X86Lifter::decoded_facts(&insn).is_none() {
+                return false;
+            }
+            let l = X86Lifter { is_64, parity: false }.lift_decoded(insn, insn.ip(), None).expect("it lifts");
+            for op in &l.ops {
+                let c = match op.opcode {
+                    OpCode::Copy => op.inputs.first(),
+                    OpCode::Load | OpCode::Store => op.inputs.get(1),
+                    _ => None,
+                };
+                if let Some(c) = c.filter(|c| c.space == SpaceId::CONST) {
+                    assert!(any_const_ref_value(&insn, |v| v == c.offset), "{insn} ({is_64}): {:#x}", c.offset);
+                }
+            }
+            true
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut checked = 0usize;
+        for round in 0..600_000u32 {
+            let mut bytes = [0u8; 16];
+            for b in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            match round % 20 {
+                0 => bytes[0] = 0x0f,
+                1 => bytes[0] = 0x66,
+                2 => bytes[0] = 0xf2,
+                3 => bytes[0] = 0xf3,
+                4 => bytes[0] = 0x67,
+                5 => (bytes[0], bytes[1]) = (0x66, 0x0f),
+                6 => (bytes[0], bytes[1]) = (0x48, 0xc7),
+                7 => bytes[0] = 0xa0 | (bytes[0] & 3),
+                8 => bytes[0] = 0x40 | (bytes[0] & 0xf),
+                9 => bytes[0] = 0xc5,
+                10 => bytes[0] = 0xc4,
+                11 => bytes[0] = 0xb8 | (bytes[0] & 7),
+                12 => (bytes[0], bytes[1]) = (0x48, 0xb8 | (bytes[1] & 7)),
+                // a memory operand: rip-relative, absolute (SIB without base / index), with a base
+                13 => (bytes[1], bytes[2]) = (0x05 | (bytes[2] & 0x38), bytes[2]),
+                14 => (bytes[1], bytes[2]) = (0x04 | (bytes[1] & 0x38), 0x25),
+                15 => bytes[1] = 0x80 | (bytes[1] & 0x3f),
+                16 => (bytes[0], bytes[1], bytes[2]) = (0x48, bytes[1] | 1, 0x05 | (bytes[2] & 0x38)),
+                17 => (bytes[0], bytes[1], bytes[2]) = (0x64, 0x48, 0x8b),
+                _ => {}
+            }
+            for is_64 in [true, false] {
+                let mut d = iced_x86::Decoder::with_ip(if is_64 { 64 } else { 32 }, &bytes, 0x40_1000, iced_x86::DecoderOptions::NONE);
+                let insn = d.decode();
+                if !insn.is_invalid() {
+                    checked += usize::from(check(insn, is_64));
+                }
+            }
+        }
+        assert!(checked > 600_000, "{checked}");
+        let exe = std::env::current_exe().expect("the test executable");
+        let info = reargo_loader::loader::BinaryLoader::load(&exe).expect("load it");
+        let mut real = 0usize;
+        for b in info.memory.blocks().filter(|b| b.flags.contains(reargo_loader::memory::MemoryFlags::EXECUTE)) {
+            let Some(data) = &b.data else { continue };
+            let code = &data[..data.len().min(b.size as usize)];
+            let mut d = iced_x86::Decoder::with_ip(64, code, b.start, iced_x86::DecoderOptions::NONE);
+            for insn in &mut d {
+                if !insn.is_invalid() {
+                    real += usize::from(check(insn, true));
+                }
+            }
+        }
+        assert!(real > 100_000, "{real}");
     }
 
     /// `decoded_facts` gives what the lift gives, on random bytes (biased to the prefixes,
