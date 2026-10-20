@@ -138,13 +138,22 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
         }
         None => (FxHashMap::default(), None),
     };
-    let jobs: Vec<(u64, usize, Option<FunctionResults>)> = function_jobs(program)
-        .into_iter()
-        .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
-        .collect();
-    // Argument Arity's budget of each function, in the same order.
-    let arity_budgets: Vec<usize> =
-        if with_snapshots { program.listing.functions().map(crate::arity::budget).collect() } else { Vec::new() };
+    // With nothing cached every function is computed: the jump index
+    // (below) is built meanwhile.
+    let none_cached = cached_funcs.is_empty();
+    let (early_jumps, (jobs, arity_budgets)) = rayon::join(
+        || none_cached.then(|| crate::func_lift::JumpIndex::new(program)),
+        || {
+            let jobs: Vec<(u64, usize, Option<FunctionResults>)> = function_jobs(program)
+                .into_iter()
+                .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
+                .collect();
+            // Argument Arity's budget of each function, in the same order.
+            let arity_budgets: Vec<usize> =
+                if with_snapshots { program.listing.functions().map(crate::arity::budget).collect() } else { Vec::new() };
+            (jobs, arity_budgets)
+        },
+    );
     drop(cached_funcs);
     // The cached results that still hold; the others are computed again.
     let jobs: Vec<(u64, usize, Option<FunctionResults>)> = jobs
@@ -159,7 +168,7 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     // Index the jump references when many functions are computed (else
     // a lookup per lifted instruction costs less than the index).
     let stale = jobs.iter().filter(|j| j.2.is_none()).count();
-    let jumps = (stale > jobs.len() / 8).then(|| crate::func_lift::JumpIndex::new(program));
+    let jumps = (stale > jobs.len() / 8).then(|| early_jumps.unwrap_or_else(|| crate::func_lift::JumpIndex::new(program)));
     // The consecutive functions a thread runs share a lift cache
     // ([`crate::range_lift::map_with_lifter`]): a function is lifted
     // linearly well past its end, over its neighbours

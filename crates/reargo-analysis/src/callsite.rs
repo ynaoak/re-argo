@@ -177,6 +177,50 @@ fn param_summaries<'a>(sites: impl Iterator<Item = &'a CallSite>) -> ParamSummar
     out
 }
 
+/// The summaries of [`param_summaries`] that seed something
+/// ([`seeds_anything`]), each parameter pinned to one value a set of
+/// it, the others `None` (the same walks: only a pinned parameter
+/// seeds one).
+fn seeding_summaries<'a>(sites: impl Iterator<Item = &'a CallSite>) -> ParamSummaries {
+    /// What the calls pass to one parameter.
+    #[derive(Clone, Copy)]
+    enum Passed {
+        Nothing,
+        One(u64),
+        /// Two values or more, or an unknown one.
+        NotOne,
+    }
+    let mut passed: FxHashMap<u64, [Passed; X86_64_SYSV_ARG_REGS.len()]> = FxHashMap::default();
+    for site in sites {
+        let Some(target) = site.call_target else {
+            continue;
+        };
+        let params = passed.entry(target).or_insert([Passed::Nothing; X86_64_SYSV_ARG_REGS.len()]);
+        for (param, arg) in params.iter_mut().zip(&site.args) {
+            *param = match (*param, arg.value) {
+                (_, None) | (Passed::NotOne, _) => Passed::NotOne,
+                (Passed::Nothing, Some(v)) => Passed::One(v),
+                (Passed::One(w), Some(v)) if w == v => Passed::One(w),
+                (Passed::One(_), Some(_)) => Passed::NotOne,
+            };
+        }
+    }
+    passed
+        .into_iter()
+        .filter(|(_, params)| params.iter().any(|p| matches!(p, Passed::One(_))))
+        .map(|(target, params)| {
+            let summary = params
+                .iter()
+                .map(|p| match *p {
+                    Passed::One(v) => Some(std::iter::once(v).collect()),
+                    _ => None,
+                })
+                .collect();
+            (target, summary)
+        })
+        .collect()
+}
+
 /// Drop the summary of every function that may be entered other than
 /// through the direct calls in `sites`: an exported one (other images
 /// call it), one with a reference that is not such a call (a jump /
@@ -485,9 +529,8 @@ pub fn resolve_call_sites_iterative_from(
     for _ in 0..max_iters {
         let summaries = {
             let sites = view(round0, &rewalked);
-            let mut summaries = param_summaries(sites.iter().copied());
             // (only a summary that seeds something changes a walk)
-            summaries.retain(|_, s| seeds_anything(Some(s)));
+            let mut summaries = seeding_summaries(sites.iter().copied());
             keep_closed_callers(program, &sites, &mut summaries);
             summaries
         };
@@ -498,7 +541,10 @@ pub fn resolve_call_sites_iterative_from(
         }
         prev_total_known = next_known;
     }
-    Ok(view(round0, &rewalked).into_iter().cloned().collect())
+    let sites = view(round0, &rewalked).par_iter().with_min_len(1024).map(|&s| s.clone()).collect();
+    // (the lifts and walks are freed on another thread)
+    rayon::spawn(move || drop((lifts, rewalked)));
+    Ok(sites)
 }
 
 /// [`resolve_call_sites_with_summaries`] from round-0 walks: re-lifts
