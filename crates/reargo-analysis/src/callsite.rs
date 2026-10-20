@@ -128,11 +128,14 @@ pub fn resolve_call_sites_in(
 /// one element, that parameter has that value at every call site we
 /// observed -- the inter-procedural propagator below uses that to
 /// extend the constant-tracking inside F.
-pub type ParamSummaries = FxHashMap<u64, Vec<Option<std::collections::HashSet<u64>>>>;
+///
+/// A set stops growing at two values (only a single value pins the
+/// parameter).
+pub type ParamSummaries = FxHashMap<u64, Vec<Option<rustc_hash::FxHashSet<u64>>>>;
 
 /// The value a summary pins a parameter to: the one value every
 /// observed call passes.
-fn pinned(param: &Option<std::collections::HashSet<u64>>) -> Option<u64> {
+fn pinned(param: &Option<rustc_hash::FxHashSet<u64>>) -> Option<u64> {
     match param {
         Some(set) if set.len() == 1 => set.iter().next().copied(),
         _ => None,
@@ -145,6 +148,11 @@ fn pinned(param: &Option<std::collections::HashSet<u64>>) -> Option<u64> {
 /// called with `&handler` can be analysed as if `handler` were a
 /// compile-time constant in its body.
 pub fn build_param_summaries(sites: &[CallSite]) -> ParamSummaries {
+    param_summaries(sites.iter())
+}
+
+/// [`build_param_summaries`] of the sites `sites` gives.
+fn param_summaries<'a>(sites: impl Iterator<Item = &'a CallSite>) -> ParamSummaries {
     let mut out: ParamSummaries = FxHashMap::default();
     for site in sites {
         let Some(target) = site.call_target else {
@@ -152,11 +160,14 @@ pub fn build_param_summaries(sites: &[CallSite]) -> ParamSummaries {
         };
         let entry = out
             .entry(target)
-            .or_insert_with(|| vec![Some(std::collections::HashSet::new()); X86_64_SYSV_ARG_REGS.len()]);
+            .or_insert_with(|| vec![Some(rustc_hash::FxHashSet::default()); X86_64_SYSV_ARG_REGS.len()]);
         for (i, arg) in site.args.iter().enumerate() {
             match (arg.value, &mut entry[i]) {
                 (Some(v), Some(set)) => {
-                    set.insert(v);
+                    // (two values pin nothing, nor do more)
+                    if set.len() < 2 {
+                        set.insert(v);
+                    }
                 }
                 (None, param) => *param = None,
                 (Some(_), None) => {}
@@ -173,14 +184,18 @@ pub fn build_param_summaries(sites: &[CallSite]) -> ParamSummaries {
 /// walked function owns), or one whose entry is passed as an argument
 /// (a callback). Its parameters can then take values no summary saw,
 /// so they must not be seeded.
-fn keep_closed_callers(program: &Program, sites: &[CallSite], summaries: &mut ParamSummaries) {
+fn keep_closed_callers(program: &Program, sites: &[&CallSite], summaries: &mut ParamSummaries) {
+    // (only the callers of the functions summarised, and the arguments
+    // that are one of their entries, matter)
     let mut callers: FxHashMap<u64, rustc_hash::FxHashSet<u64>> = FxHashMap::default();
     let mut escaped: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
     for site in sites {
-        if let Some(t) = site.call_target {
+        if let Some(t) = site.call_target
+            && summaries.contains_key(&t)
+        {
             callers.entry(t).or_default().insert(site.call_site);
         }
-        escaped.extend(site.args.iter().filter_map(|a| a.value));
+        escaped.extend(site.args.iter().filter_map(|a| a.value).filter(|v| summaries.contains_key(v)));
     }
     let pe_exports: rustc_hash::FxHashSet<u64> = program
         .info
@@ -252,11 +267,16 @@ fn resolve_inner(
 /// Keep each call site once, in listing order: the first function to
 /// own a site keeps it.
 pub(crate) fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<CallSite> {
+    dedup_site_refs(per_func).into_iter().cloned().collect()
+}
+
+/// [`dedup_sites`] without copying them.
+fn dedup_site_refs<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<&'a CallSite> {
     let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-    let mut out: Vec<CallSite> = Vec::new();
+    let mut out: Vec<&CallSite> = Vec::new();
     for site in per_func.flatten() {
         if seen.insert(site.call_site) {
-            out.push(site.clone());
+            out.push(site);
         }
     }
     out
@@ -367,7 +387,7 @@ pub(crate) fn walk_function_shaped<I: std::borrow::Borrow<LiftedInstruction>>(
 
 /// Whether `summary` pins any parameter (seeds the tracker). A walk
 /// with no seed is the round-0 walk.
-fn seeds_anything(summary: Option<&Vec<Option<std::collections::HashSet<u64>>>>) -> bool {
+fn seeds_anything(summary: Option<&Vec<Option<rustc_hash::FxHashSet<u64>>>>) -> bool {
     summary.is_some_and(|s| s.iter().any(|p| pinned(p).is_some()))
 }
 
@@ -453,23 +473,32 @@ pub fn resolve_call_sites_iterative_from(
     if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
         return Ok(Vec::new());
     }
-    let mut sites = dedup_sites(round0.iter().filter_map(|w| w.sites.as_deref()));
-    let mut prev_total_known = count_known_args(&sites);
+    // each function's walk of the round: its rewalk, else round 0's
+    let mut rewalked: Vec<Option<Vec<CallSite>>> = round0.iter().map(|_| None).collect();
+    fn view<'a>(round0: &'a [FunctionWalk], rewalked: &'a [Option<Vec<CallSite>>]) -> Vec<&'a CallSite> {
+        dedup_site_refs(round0.iter().zip(rewalked).filter_map(|(w, r)| r.as_deref().or(w.sites.as_deref())))
+    }
+    let mut prev_total_known = count_known_args(&view(round0, &rewalked));
     // the lifts of the functions rewalked, for the next rounds (mostly
     // the same functions)
     let mut lifts = RewalkLifts::default();
     for _ in 0..max_iters {
-        let mut summaries = build_param_summaries(&sites);
-        keep_closed_callers(program, &sites, &mut summaries);
-        let next = rewalk_round_with(lifter, program, round0, &summaries, &mut lifts);
-        let next_known = count_known_args(&next);
-        sites = next;
+        let summaries = {
+            let sites = view(round0, &rewalked);
+            let mut summaries = param_summaries(sites.iter().copied());
+            // (only a summary that seeds something changes a walk)
+            summaries.retain(|_, s| seeds_anything(Some(s)));
+            keep_closed_callers(program, &sites, &mut summaries);
+            summaries
+        };
+        rewalked = rewalk_functions(lifter, program, round0, &summaries, &mut lifts);
+        let next_known = count_known_args(&view(round0, &rewalked));
         if next_known == prev_total_known {
             break;
         }
         prev_total_known = next_known;
     }
-    Ok(sites)
+    Ok(view(round0, &rewalked).into_iter().cloned().collect())
 }
 
 /// [`resolve_call_sites_with_summaries`] from round-0 walks: re-lifts
@@ -480,7 +509,8 @@ pub fn rewalk_round(
     round0: &[FunctionWalk],
     summaries: &ParamSummaries,
 ) -> Vec<CallSite> {
-    rewalk_round_with(lifter, program, round0, summaries, &mut RewalkLifts::default())
+    let rewalked = rewalk_functions(lifter, program, round0, summaries, &mut RewalkLifts::default());
+    dedup_sites(round0.iter().zip(&rewalked).filter_map(|(w, r)| r.as_deref().or(w.sites.as_deref())))
 }
 
 /// A function's lift (`None` when it failed) and its
@@ -488,15 +518,16 @@ pub fn rewalk_round(
 type RewalkLifts =
     FxHashMap<(u64, usize), Option<(Vec<LiftedInstruction>, std::collections::BTreeSet<u64>)>>;
 
-/// [`rewalk_round`] reusing (and adding to) the lifts in `lifts`; the
+/// The walk of each function of `round0` that `summaries` seeds (`None`
+/// for the others), reusing (and adding to) the lifts in `lifts`; the
 /// program must not change between the rounds that share them.
-fn rewalk_round_with(
+fn rewalk_functions(
     lifter: &(dyn PcodeLift + Sync),
     program: &Program,
     round0: &[FunctionWalk],
     summaries: &ParamSummaries,
     lifts: &mut RewalkLifts,
-) -> Vec<CallSite> {
+) -> Vec<Option<Vec<CallSite>>> {
     let rewalk = |w: &FunctionWalk| w.sites.is_some() && seeds_anything(summaries.get(&w.entry));
     let missing: Vec<(u64, usize)> = round0
         .iter()
@@ -514,7 +545,7 @@ fn rewalk_round_with(
         .collect();
     lifts.extend(missing.into_iter().zip(lifted));
     let lifts = &*lifts;
-    let rewalked: Vec<Option<Vec<CallSite>>> = round0
+    round0
         .par_iter()
         .map(|w| {
             if !rewalk(w) {
@@ -523,16 +554,10 @@ fn rewalk_round_with(
             let (insns, external) = lifts.get(&(w.entry, w.max_insns))?.as_ref()?;
             Some(walk_function_with(program, w.entry, insns, summaries, external))
         })
-        .collect();
-    dedup_sites(
-        round0
-            .iter()
-            .zip(&rewalked)
-            .filter_map(|(w, r)| r.as_deref().or(w.sites.as_deref())),
-    )
+        .collect()
 }
 
-fn count_known_args(sites: &[CallSite]) -> usize {
+fn count_known_args(sites: &[&CallSite]) -> usize {
     sites
         .iter()
         .map(|s| s.args.iter().filter(|a| a.value.is_some()).count())
@@ -740,7 +765,7 @@ impl Tracker {
 
     /// Pre-seed register state from a function-entry summary built
     /// by the inter-procedural propagator.
-    fn seed_from_summary(&mut self, summary: &[Option<std::collections::HashSet<u64>>]) {
+    fn seed_from_summary(&mut self, summary: &[Option<rustc_hash::FxHashSet<u64>>]) {
         for (i, param) in summary.iter().enumerate() {
             if let Some(v) = pinned(param) {
                 self.regs.set64(X86_64_SYSV_ARG_REGS[i].0, v);
