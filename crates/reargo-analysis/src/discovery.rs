@@ -6,7 +6,7 @@ use reargo_program::function::Function;
 use reargo_program::reference::{RefType, Reference};
 use reargo_program::symbol::SymbolType;
 use reargo_program::Program;
-use reargo_program::listing::Listing;
+use reargo_program::listing::{InstructionRun, Listing};
 use reargo_program::symbol::SymbolTable;
 use reargo_program::reference::ReferenceManager;
 use reargo_arch::Architecture;
@@ -274,7 +274,14 @@ fn body_set(mut body: Vec<AddressRange>) -> AddressSet {
 /// decodes it itself — it never waits for them. Decoding is a pure
 /// function of the bytes and the address, so the result is the serial
 /// one, whatever the threads did. From then on the references and the
-/// bodies' sets are made on threads too, while the walk goes on.
+/// bodies' sets are made on threads too, while the walk goes on. When the
+/// walk starts from many entries ([`SEED_START`]: Late Discovery, which
+/// fills the bodies of the functions added since the first run), the
+/// threads start at once, taking those entries in the walk's order. The
+/// walk marks each decode it reads; at the end the threads hand over
+/// those, by address (sorted while they wait for the walk, once out of
+/// entries), cut into parts of the code that are listed on threads of
+/// their own.
 fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize, usize, usize) {
     let Program { arch, info, listing, symbol_table, references: reference_manager, .. } = &mut *program;
     let (arch, memory) = (&**arch, &info.memory);
@@ -294,8 +301,6 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         .take(SEED_START)
         .count()
         >= SEED_START;
-    let t0 = std::time::Instant::now();
-    let trace = std::env::var_os("LD_TRACE").is_some();
     let (counts, bodies) = std::thread::scope(|s| {
         // what the walk found that is not handed to a thread yet
         let mut references = Vec::new();
@@ -331,6 +336,11 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                         listed: listing.functions().map(|f| f.entry_point).collect(),
                         has_body: listing.functions().filter(|f| !f.body.is_empty()).map(|f| f.entry_point).collect(),
                         claims: Claims::new(memory),
+                        cuts: {
+                            let (base, span) = code_span(memory);
+                            let parts = rayon::current_num_threads() as u64;
+                            (1..parts).map(|k| base + span / parts * k).collect()
+                        },
                         walking: Claims::new(memory),
                         stop: AtomicBool::new(false),
                         queue: Mutex::new(Queue::default()),
@@ -388,7 +398,6 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             },
         );
         drop(walk_visited);
-        if trace { eprintln!("TRACE walk {:?} walked {} seeded {}", t0.elapsed(), walked, seeded); }
         let Some(started) = started.into_inner() else {
             // (a short walk: all on this thread)
             if let Some(reference_manager) = reference_manager.take() {
@@ -409,18 +418,19 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         if let Some(shared) = shared.get() {
             shared.release();
         }
-        if trace { eprintln!("TRACE released {:?}", t0.elapsed()); }
-        // (each sorted: one run per thread)
-        let decodes: Vec<Vec<(u64, Box<DecodedInstruction>)>> = read.iter().take(decoding).collect();
-        if trace { eprintln!("TRACE collected {:?} n={}", t0.elapsed(), decodes.iter().map(Vec::len).sum::<usize>()); }
+        // (by part of the code, then by thread: each run sorted)
+        let mut decodes: Vec<Vec<InstructionRun>> = Vec::new();
+        for parts in read.iter().take(decoding) {
+            decodes.resize_with(decodes.len().max(parts.len()), Vec::new);
+            for (k, run) in parts.into_iter().enumerate() {
+                decodes[k].push(run);
+            }
+        }
         listing.add_unlisted_instructions(decodes);
-        if trace { eprintln!("TRACE listed {:?}", t0.elapsed()); }
         let bodies = sets.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-        if trace { eprintln!("TRACE sets {:?}", t0.elapsed()); }
         if let Err(e) = adding.join() {
             std::panic::resume_unwind(e);
         }
-        if trace { eprintln!("TRACE adding {:?}", t0.elapsed()); }
         (counts, bodies)
     });
     for (entry, body) in bodies {
@@ -428,7 +438,6 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             f.body = body;
         }
     }
-    if trace { eprintln!("TRACE end {:?} miss {} hit1 {} hit2 {}", t0.elapsed(), MISS.swap(0, Ordering::Relaxed), HIT1.swap(0, Ordering::Relaxed), HIT2.swap(0, Ordering::Relaxed)); }
     counts
 }
 
@@ -438,8 +447,9 @@ struct Started<'scope> {
     bodies: std::sync::mpsc::Sender<Vec<(u64, Vec<AddressRange>)>>,
     adding: std::thread::ScopedJoinHandle<'scope, ()>,
     sets: std::thread::ScopedJoinHandle<'scope, Vec<(u64, AddressSet)>>,
-    /// What each decoding thread gives back: the decodes the walk read.
-    read: std::sync::mpsc::Receiver<Vec<(u64, Box<DecodedInstruction>)>>,
+    /// What each decoding thread gives back: the decodes the walk read, by
+    /// address, cut into parts at [`Shared::cuts`].
+    read: std::sync::mpsc::Receiver<Vec<InstructionRun>>,
     decoding: usize,
 }
 
@@ -526,6 +536,10 @@ struct Shared<'a> {
     /// function (only as another's code).
     has_body: FxHashSet<u64>,
     claims: Claims,
+    /// Where the decodes handed over are cut into parts, listed on
+    /// threads of their own ([`Listing::add_unlisted_instructions`]):
+    /// ascending addresses splitting the code into equal spans.
+    cuts: Vec<u64>,
     /// The entries the walk has started on (its own decodes): left to it.
     walking: Claims,
     /// Set when the walk is done: what the threads have not decoded yet,
@@ -563,15 +577,11 @@ struct Done {
 /// nothing left.
 fn speculate_loop(
     shared: &Shared,
-    read_out: std::sync::mpsc::Sender<Vec<(u64, Box<DecodedInstruction>)>>,
+    read_out: std::sync::mpsc::Sender<Vec<InstructionRun>>,
 ) {
     let mut entries = Vec::new();
     // the code this thread decoded
     let mut own: Vec<Arc<Spec>> = Vec::new();
-    let tt0 = std::time::Instant::now();
-    let mut nins = 0usize;
-    let mut busy = std::time::Duration::ZERO;
-    let mut skipped = 0usize;
     'work: loop {
         let entry = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -581,7 +591,6 @@ fn speculate_loop(
                 }
                 if let Some(entry) = queue.entries.pop_front() {
                     if shared.walking.claimed(entry) {
-                        skipped += 1;
                         continue;
                     }
                     queue.busy += 1;
@@ -594,10 +603,7 @@ fn speculate_loop(
             }
         };
         entries.clear();
-        let tb = std::time::Instant::now();
         let spec = Arc::new(speculate_one(shared, entry, &mut entries));
-        busy += tb.elapsed();
-        nins += spec.insns.len();
         if let Ok(mut done) = shared.done.write() {
             let index = done.specs.len() as u32;
             done.by_entry.insert(entry, index);
@@ -614,7 +620,6 @@ fn speculate_loop(
         drop(queue);
         shared.wake.notify_all();
     }
-    if std::env::var_os("LD_TRACE").is_some() { eprintln!("TRACE helper out {:?} busy {:?} specs {} insns {} skipped {} stop {}", tt0.elapsed(), busy, own.len(), nins, skipped, shared.stop.load(Ordering::Relaxed)); }
     // Out of work while the walk goes on: the order of its decodes by
     // address, made now (the walk reads none of this).
     let order = (!shared.stop.load(Ordering::Relaxed)).then(|| {
@@ -636,8 +641,6 @@ fn speculate_loop(
             queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
         }
     }
-    let tt = std::time::Instant::now();
-    let had_order = order.is_some();
     // (were one still held: its decodes copied)
     let mut specs: Vec<Result<Spec, Arc<Spec>>> = own.into_iter().map(Arc::try_unwrap).collect();
     let take = |spec: &mut Result<Spec, Arc<Spec>>, i: usize| match spec {
@@ -667,8 +670,16 @@ fn speculate_loop(
             read
         }
     };
-    if std::env::var_os("LD_TRACE").is_some() { eprintln!("TRACE helper collect {:?} n={} order {}", tt.elapsed(), read.len(), had_order); }
-    let _ = read_out.send(read);
+    // (cut into the parts, at `shared.cuts`)
+    let mut parts: Vec<InstructionRun> = Vec::with_capacity(shared.cuts.len() + 1);
+    let mut rest = read;
+    for &cut in shared.cuts.iter().rev() {
+        let at = rest.partition_point(|d| d.0 < cut);
+        parts.push(rest.split_off(at));
+    }
+    parts.push(rest);
+    parts.reverse();
+    let _ = read_out.send(parts);
     // (while the walk lists them)
     drop(specs);
     crate::release_free_memory();
@@ -796,7 +807,6 @@ impl Source for Ahead<'_, '_> {
                 insns.binary_search_by_key(&addr, |d| d.addr).ok()
             };
             if let Some(at) = at {
-                HIT1.fetch_add(1, Ordering::Relaxed);
                 *i = at as u32;
                 insns[at].read.store(true, Ordering::Relaxed);
                 return Some(insns[at].facts);
@@ -808,19 +818,14 @@ impl Source for Ahead<'_, '_> {
         {
             let facts = spec.insns[at].facts;
             spec.insns[at].read.store(true, Ordering::Relaxed);
-            HIT2.fetch_add(1, Ordering::Relaxed);
             *hint = Some((spec, at as u32));
             return Some(facts);
         }
         *hint = None;
-        MISS.fetch_add(1, Ordering::Relaxed);
         Listed { arch: self.shared.arch, memory: self.shared.memory, listing: self.listing }.fetch(addr, &mut ())
     }
 }
 
-static MISS: AtomicU64 = AtomicU64::new(0);
-static HIT1: AtomicU64 = AtomicU64::new(0);
-static HIT2: AtomicU64 = AtomicU64::new(0);
 /// An instruction [`speculate_one`] decoded.
 struct SpecInsn {
     addr: u64,
@@ -1155,6 +1160,17 @@ mod tests {
     /// what it gives on one thread.
     #[test]
     fn parallel_discovery_matches_serial() {
+        parallel_matches_serial(false);
+    }
+
+    /// The same with the threads seeded from the start: every function an
+    /// entry of the walk (a symbol), as in Late Discovery.
+    #[test]
+    fn seeded_parallel_discovery_matches_serial() {
+        parallel_matches_serial(true);
+    }
+
+    fn parallel_matches_serial(seeded: bool) {
         // Function k at 64 * k: 40 nops, then a call to function k + 1
         // and a ret, a jump into the middle of function k + 3 (every 7th),
         // or a conditional jump back into function k - 1 then a ret
@@ -1192,6 +1208,17 @@ mod tests {
         }
         let run = |threads: usize| {
             let mut program = make_x86_64_program(&code, base);
+            if seeded {
+                // (in reverse: the walk takes them in another order than the calls)
+                for k in (1..count).rev() {
+                    program.symbol_table.add(reargo_program::symbol::Symbol::new(
+                        format!("f{k}"),
+                        base + k * 64,
+                        SymbolType::Function,
+                        reargo_program::symbol::SourceType::Analysis,
+                    ));
+                }
+            }
             let mark = program.references.jump_mark();
             let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
             let result = pool.install(|| FunctionDiscoveryAnalyzer.analyze(&mut program)).unwrap();

@@ -13,6 +13,9 @@ pub struct Listing {
     functions: BTreeMap<u64, Function>,
 }
 
+/// Instructions by address (sorted), for [`Listing::add_unlisted_instructions`].
+pub type InstructionRun = Vec<(u64, Box<DecodedInstruction>)>;
+
 impl Listing {
     pub fn new() -> Self {
         Self::default()
@@ -34,52 +37,58 @@ impl Listing {
         self.instructions.insert(insn.address, Box::new(insn));
     }
 
-    /// List each instruction of `runs` at its address unless one is listed
-    /// there (as [`Self::instruction_or_insert_with`] does), in bulk: the
-    /// map is built again in one pass from both when the new ones are
-    /// many. Each run is sorted by address; an address may repeat, in a
-    /// run or across runs, with the same instruction (the first kept).
-    pub fn add_unlisted_instructions(&mut self, runs: Vec<Vec<(u64, Box<DecodedInstruction>)>>) {
-        debug_assert!(runs.iter().all(|r| r.windows(2).all(|w| w[0].0 <= w[1].0)));
-        let total: usize = runs.iter().map(Vec::len).sum();
+    /// List each instruction of `parts` at its address unless one is
+    /// listed there (as [`Self::instruction_or_insert_with`] does), in
+    /// bulk: the map is built again in one pass from both when the new ones
+    /// are many, each part merged on a thread of its own. The parts hold
+    /// ascending, disjoint address ranges (every address of a part below
+    /// every one of the next); each is a few runs sorted by address. An
+    /// address may repeat, in a run or across runs, with the same
+    /// instruction (the first kept).
+    pub fn add_unlisted_instructions(&mut self, parts: Vec<Vec<InstructionRun>>) {
+        type Run = InstructionRun;
+        debug_assert!(parts.iter().flatten().all(|r| r.windows(2).all(|w| w[0].0 <= w[1].0)));
+        let total: usize = parts.iter().flatten().map(Vec::len).sum();
         if total < self.instructions.len() {
-            for (a, i) in runs.into_iter().flatten() {
+            for (a, i) in parts.into_iter().flatten().flatten() {
                 self.instructions.entry(a).or_insert(i);
             }
             return;
         }
-        let tt = std::time::Instant::now();
-        let old = std::mem::take(&mut self.instructions);
-        let oldn = old.len();
-        let mut merged: Vec<(u64, Box<DecodedInstruction>)> = Vec::with_capacity(old.len() + total);
-        let mut old = old.into_iter().peekable();
-        let mut heads: Vec<_> = runs.into_iter().map(|r| r.into_iter().peekable()).collect();
-        loop {
-            // (the run whose next address is the lowest: few runs)
-            let mut lowest: Option<(usize, u64)> = None;
-            for (k, head) in heads.iter_mut().enumerate() {
-                if let Some(&(a, _)) = head.peek()
-                    && lowest.is_none_or(|(_, l)| a < l)
-                {
-                    lowest = Some((k, a));
-                }
-            }
-            let Some((k, a)) = lowest else { break };
-            let Some((_, i)) = heads[k].next() else { break };
-            while let Some(o) = old.next_if(|(oa, _)| *oa < a) {
-                merged.push(o);
-            }
-            // (a repeat: the one before kept)
-            if merged.last().is_some_and(|(la, _)| *la == a) {
-                continue;
-            }
-            // (the listed one kept)
-            merged.push(old.next_if(|(oa, _)| *oa == a).unwrap_or((a, i)));
+        // the parts that hold some, with the listed ones of their range
+        let mut parts: Vec<(Run, Vec<Run>)> =
+            parts.into_iter().filter(|p| p.iter().any(|r| !r.is_empty())).map(|p| (Vec::new(), p)).collect();
+        let mut old: Run = std::mem::take(&mut self.instructions).into_iter().collect();
+        for k in (1..parts.len()).rev() {
+            let low = parts[k].1.iter().filter_map(|r| r.first()).map(|f| f.0).min().unwrap_or(u64::MAX);
+            let at = old.partition_point(|o| o.0 < low);
+            parts[k].0 = old.split_off(at);
         }
-        merged.extend(old);
-        let t1 = tt.elapsed();
-        self.instructions = merged.into_iter().collect();
-        if std::env::var_os("LD_TRACE").is_some() { eprintln!("TRACE merge {:?} build {:?} old {}", t1, tt.elapsed(), oldn); }
+        if let Some(first) = parts.first_mut() {
+            first.0 = old;
+        } else {
+            parts.push((old, Vec::new()));
+        }
+        let merged: Vec<Run> = if parts.len() > 1 && total >= 1 << 16 {
+            std::thread::scope(|s| {
+                let mut parts = parts.into_iter();
+                let last = parts.next_back();
+                let threads: Vec<_> = parts.map(|(old, runs)| s.spawn(move || merge_runs(old, runs))).collect();
+                let last = last.map(|(old, runs)| merge_runs(old, runs));
+                threads
+                    .into_iter()
+                    .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                    .chain(last)
+                    .collect()
+            })
+        } else {
+            parts.into_iter().map(|(old, runs)| merge_runs(old, runs)).collect()
+        };
+        let mut all: Run = Vec::with_capacity(merged.iter().map(Vec::len).sum());
+        for m in merged {
+            all.extend(m);
+        }
+        self.instructions = all.into_iter().collect();
     }
 
     /// The instruction at `address`: the one listed, else `decode()`'s,
@@ -200,11 +209,72 @@ impl Listing {
     }
 }
 
+/// The instructions of `runs` (each sorted by address) merged by address
+/// into `old` (sorted, one per address): `old`'s kept where both have one,
+/// a repeated address once.
+fn merge_runs(old: InstructionRun, runs: Vec<InstructionRun>) -> InstructionRun {
+    let total = old.len() + runs.iter().map(Vec::len).sum::<usize>();
+    let mut merged: Vec<(u64, Box<DecodedInstruction>)> = Vec::with_capacity(total);
+    let mut old = old.into_iter().peekable();
+    let mut heads: Vec<_> = runs.into_iter().map(|r| r.into_iter().peekable()).collect();
+    loop {
+        // (the run whose next address is the lowest: few runs)
+        let mut lowest: Option<(usize, u64)> = None;
+        for (k, head) in heads.iter_mut().enumerate() {
+            if let Some(&(a, _)) = head.peek()
+                && lowest.is_none_or(|(_, l)| a < l)
+            {
+                lowest = Some((k, a));
+            }
+        }
+        let Some((k, a)) = lowest else { break };
+        let Some((_, i)) = heads[k].next() else { break };
+        while let Some(o) = old.next_if(|(oa, _)| *oa < a) {
+            merged.push(o);
+        }
+        // (a repeat: the one before kept)
+        if merged.last().is_some_and(|(la, _)| *la == a) {
+            continue;
+        }
+        // (the listed one kept)
+        merged.push(old.next_if(|(oa, _)| *oa == a).unwrap_or((a, i)));
+    }
+    merged.extend(old);
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use reargo_arch::FlowType;
     use reargo_core::address::{Address, AddressRange, AddressSet, SpaceId};
+
+    /// Instructions added in parts and runs (repeats in a run and across
+    /// runs, some listed already) are listed once each, the listed ones
+    /// kept, as one at a time would.
+    #[test]
+    fn add_unlisted_instructions_in_parts() {
+        let insn = |a: u64, len: u32| {
+            Box::new(DecodedInstruction::new(a, len, "nop".into(), String::new(), smallvec::smallvec![0x90; len as usize], FlowType::Fall, None))
+        };
+        for listed in [vec![(0x10u64, 7u32), (0x30, 7), (0x95, 7)], vec![]] {
+            let parts = || {
+                vec![
+                    vec![vec![(0x10, insn(0x10, 1)), (0x20, insn(0x20, 1)), (0x20, insn(0x20, 1))], vec![(0x18, insn(0x18, 1)), (0x20, insn(0x20, 1))]],
+                    vec![],
+                    vec![vec![(0x80, insn(0x80, 1)), (0x95, insn(0x95, 1))], vec![(0x90, insn(0x90, 1))]],
+                ]
+            };
+            let mut one = listing(&listed);
+            for (a, i) in parts().into_iter().flatten().flatten() {
+                one.instruction_or_insert_with(a, || Some(*i));
+            }
+            let mut bulk = listing(&listed);
+            bulk.add_unlisted_instructions(parts());
+            let state = |l: &Listing| l.instructions().map(|i| (i.address, i.length)).collect::<Vec<_>>();
+            assert_eq!(state(&one), state(&bulk));
+        }
+    }
 
     fn listing(insns: &[(u64, u32)]) -> Listing {
         let mut l = Listing::new();

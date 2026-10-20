@@ -216,17 +216,7 @@ impl AnalysisManager {
         // each split analyzer's prepared result, from the run it
         // prepared in to its place
         let mut ready: Vec<Option<(Prepared, std::time::Duration)>> = self.analyzers.iter().map(|_| None).collect();
-        let ptrace = std::env::var_os("PIPE_TRACE").is_some();
-        fn cpu_ms() -> f64 {
-            let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-            let f: Vec<&str> = s.rsplit(')').next().unwrap_or("").split_whitespace().collect();
-            let t = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-            (t(11) + t(12)) * 10.0
-        }
-        let pt0 = std::time::Instant::now();
         for window in self.windows() {
-            let wt = std::time::Instant::now();
-            let wc = if ptrace { cpu_ms() } else { 0.0 };
             // The prepares run at the same time, on the program as it is
             // here; each one's result is the same as at its analyzer's
             // own place (nothing in between writes what it reads).
@@ -247,10 +237,6 @@ impl AnalysisManager {
                     ready[i] = slot;
                 }
             }
-            if ptrace {
-                let names: Vec<String> = window.prepared.iter().map(|&i| format!("{}={:.1}", self.analyzers[i].name(), ready[i].as_ref().map_or(0.0, |r| r.1.as_secs_f64() * 1e3))).collect();
-                eprintln!("PIPE window at {:.1} prepares {:.1}ms cpu {:.0}ms [{}]", (wt - pt0).as_secs_f64() * 1e3, wt.elapsed().as_secs_f64() * 1e3, cpu_ms() - wc, names.join(", "));
-            }
             for i in window.analyzers {
                 let analyzer = &self.analyzers[i];
                 let t = std::time::Instant::now();
@@ -259,9 +245,6 @@ impl AnalysisManager {
                     Some((p, d)) => (analyzer.apply(program, p), d),
                     None => (analyzer.analyze(program), std::time::Duration::ZERO),
                 };
-                if ptrace {
-                    eprintln!("PIPE   {} {:.2}ms{}", analyzer.name(), t.elapsed().as_secs_f64() * 1e3, if extra.is_zero() { "" } else { " (apply)" });
-                }
                 results.push((analyzer.name(), t.elapsed() + extra, r));
             }
         }
