@@ -47,7 +47,7 @@ use rayon::prelude::*;
 use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
-use crate::callsite::{walk_function_shaped, CallSite, ParamSummaries};
+use crate::callsite::{walk_function_shaped, walk_prefix, CallSite, ParamSummaries, WalkPrefix};
 use crate::func_lift::function_jobs;
 
 /// One function's results.
@@ -59,6 +59,9 @@ pub(crate) struct FunctionResults {
     /// Its round-0 call sites ([`crate::callsite::walk_function`] with
     /// no summaries), or `None` when the lift failed.
     pub walk: Option<Vec<CallSite>>,
+    /// What the walk read of the lift (an increasing lift), for the
+    /// resolver's rewalks.
+    pub prefix: Option<WalkPrefix>,
     /// Its owned `cfg_const` and VSA call snapshots, when computed
     /// (empty for a failed lift).
     pub snapshots: Option<(crate::cfg_const::CallSnapshots, crate::vsa::CallSnapshots)>,
@@ -352,29 +355,51 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         Some(jumps) => jumps.external_entries_ordered(program, &shape.addrs, shape.increasing),
         None => crate::func_lift::external_entries_at(program, &shape.addrs),
     };
-    // Who owns each call instruction, asked once: the walk, the blocks
-    // the flows keep and the check of a cached result all ask.
-    let calls: Vec<(u64, bool)> = shape
-        .has_call
-        .iter()
-        .zip(&shape.addrs)
-        .filter(|(call, _)| **call)
-        .map(|(_, &a)| (a, owner.owns(a)))
-        .collect();
+    let in_body = |a: u64| a >= entry && next_entry.is_none_or(|n| a < n);
+    // Of an increasing lift (all but a range wrapping around), what the
+    // walk and the blocks both need, found in one pass: jump targets,
+    // external entries, and who owns each call instruction (the walk,
+    // the blocks the flows keep and the check of a cached result all
+    // ask).
+    let mut marks = shape
+        .increasing
+        .then(|| crate::blockflow::LiftMarks::new(&shape, &external, |i| owner.owns(shape.addrs[i])));
+    let calls: Vec<(u64, bool)> = match &mut marks {
+        Some(marks) => std::mem::take(&mut marks.calls),
+        None => (0..shape.addrs.len())
+            .filter(|&i| shape.has_call(i))
+            .map(|i| (shape.addrs[i], owner.owns(shape.addrs[i])))
+            .collect(),
+    };
     let owns_call = |a: u64| match calls.binary_search_by_key(&a, |c| c.0) {
         Ok(k) => calls[k].1,
         Err(_) => owner.owns(a),
     };
-    let walk = walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call);
+    // (a lift through the cache is plain: lifted instruction by
+    // instruction)
+    let prefix = marks.as_ref().map(|marks| WalkPrefix::of_marks(&shape, marks, shapes.is_some()));
+    let walk = match &prefix {
+        Some(prefix) => walk_prefix(entry, insns, &prefix.flags, &ParamSummaries::default()),
+        None => walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call),
+    };
     // The walk asks who owns each call instruction.
     let mut addrs: BTreeSet<u64> = calls.iter().map(|c| c.0).collect();
     let snapshots = with_snapshots.then(|| {
         // both flows walk the same blocks (`in_extent` with the next
-        // entry looked up once)
-        let mut blocks =
-            crate::blockflow::Cfg::build_shaped(&shape, &external, |a| a >= entry && next_entry.is_none_or(|n| a < n));
-        // only the snapshots of the calls the function owns are kept
-        blocks.keep_calls_at(insns.len(), |i| shape.has_call[i] && owns_call(shape.addrs[i]));
+        // entry looked up once), keeping only the snapshots of the
+        // calls the function owns
+        let blocks = match &marks {
+            Some(marks) => {
+                let mut blocks = crate::blockflow::Cfg::build_marked(&shape, marks, in_body);
+                blocks.keep_owned_calls(marks);
+                blocks
+            }
+            None => {
+                let mut blocks = crate::blockflow::Cfg::build_shaped(&shape, &external, in_body);
+                blocks.keep_calls_at(insns.len(), |i| shape.has_call(i) && owns_call(shape.addrs[i]));
+                blocks
+            }
+        };
         let mut cfg = crate::cfg_const::function_snapshots_cfg(&blocks, insns);
         let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, insns);
         addrs.extend(cfg.iter().map(|(a, _)| *a));
@@ -385,13 +410,15 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     });
     let offsets: Option<Box<[u32]>> =
         shape.addrs.iter().map(|a| a.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect();
-    // offsets increase (a linear lift), so the list is sorted
-    let reusable = offsets.as_ref().is_some_and(|o| o.is_sorted_by(|a, b| a < b));
+    // offsets increase (a linear lift), so the list is sorted (an
+    // increasing lift's are)
+    let reusable = offsets.as_ref().is_some_and(|o| shape.increasing || o.is_sorted_by(|a, b| a < b));
     let lifted = Some(offsets.unwrap_or_default());
     FunctionResults {
         entry,
         max_insns,
         walk: Some(walk),
+        prefix,
         snapshots,
         lifted,
         external: external.into_iter().collect(),

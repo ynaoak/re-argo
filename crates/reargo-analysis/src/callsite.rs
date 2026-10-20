@@ -386,7 +386,8 @@ pub(crate) fn walk_function_shaped<I: std::borrow::Borrow<LiftedInstruction>>(
     // *its* tracker state (e.g. all unresolved), and the dedup would
     // block the real owner from re-recording it with the correct
     // seeded state.
-    let owned: Vec<bool> = shape.has_call.iter().zip(&shape.addrs).map(|(&call, &a)| call && owns_call(a)).collect();
+    let owned: Vec<bool> =
+        (0..shape.addrs.len()).map(|i| shape.has_call(i) && owns_call(shape.addrs[i])).collect();
     // Nothing after the last owned call is recorded: the walk stops there.
     let Some(last) = owned.iter().rposition(|&o| o) else {
         return out;
@@ -399,6 +400,93 @@ pub(crate) fn walk_function_shaped<I: std::borrow::Borrow<LiftedInstruction>>(
         if join {
             tracker.reset();
         }
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Call | OpCode::CallInd => {
+                    if owned {
+                        let target = direct_call_target(op);
+                        let args = X86_64_SYSV_ARG_REGS
+                            .iter()
+                            .map(|&(offset, name)| ResolvedArg {
+                                reg_offset: offset,
+                                reg_name: name,
+                                value: tracker.reg64(offset),
+                            })
+                            .collect();
+                        out.push(CallSite {
+                            call_site: insn.address,
+                            caller_function: entry,
+                            call_target: target,
+                            args,
+                        });
+                    }
+                    tracker.clear_for_call();
+                }
+                _ => tracker.apply(op),
+            }
+        }
+    }
+    out
+}
+
+/// What a walk of a function reads of its lift besides the P-code: for
+/// each instruction up to the last call the function owns (where the
+/// walk stops), whether the state reaching it along the previous one is
+/// not the only one (a join point: [`WalkPrefix::JOIN`]) and whether it
+/// is a call the function owns ([`WalkPrefix::OWNED`]). Kept from the
+/// round-0 walk, so a rewalk lifts no more than that prefix (when
+/// `plain`) and finds none of it again.
+pub struct WalkPrefix {
+    /// Per instruction of the prefix.
+    pub flags: Box<[u8]>,
+    /// The lift's instructions up to there are `lift_range` of that
+    /// many instructions (the lift was made instruction by instruction:
+    /// no x87 stack or parity flag read across instructions); otherwise
+    /// a rewalk lifts the whole budget and keeps the prefix.
+    pub plain: bool,
+}
+
+impl WalkPrefix {
+    pub const JOIN: u8 = 1;
+    pub const OWNED: u8 = 2;
+
+    /// The prefix of an increasing lift from its marks.
+    pub(crate) fn of_marks(shape: &crate::blockflow::LiftShape, marks: &crate::blockflow::LiftMarks, plain: bool) -> WalkPrefix {
+        use crate::blockflow::LiftMarks;
+        let n = marks.owned_calls.last().map_or(0, |&last| last + 1);
+        let flags = (0..n)
+            .map(|i| {
+                let f = marks.flags[i];
+                // a jump target, an external entry, or after an
+                // instruction with no fall-through
+                let join = f & (LiftMarks::TARGET | LiftMarks::EXTERNAL) != 0 || (i > 0 && shape.stops(i - 1));
+                let owned = f & LiftMarks::OWNED_CALL != 0;
+                (u8::from(join) * Self::JOIN) | (u8::from(owned) * Self::OWNED)
+            })
+            .collect();
+        WalkPrefix { flags, plain }
+    }
+}
+
+/// The walk of the first `flags.len()` instructions of a lift with
+/// their [`WalkPrefix`] flags: [`walk_function_shaped`] when they are
+/// the prefix of that lift.
+pub(crate) fn walk_prefix<I: std::borrow::Borrow<LiftedInstruction>>(
+    entry: u64,
+    insns: &[I],
+    flags: &[u8],
+    summaries: &ParamSummaries,
+) -> Vec<CallSite> {
+    let mut out = Vec::new();
+    let mut tracker = Tracker::new();
+    if let Some(summary) = summaries.get(&entry) {
+        tracker.seed_from_summary(summary);
+    }
+    for (insn, &f) in insns.iter().map(std::borrow::Borrow::borrow).zip(flags) {
+        if f & WalkPrefix::JOIN != 0 {
+            tracker.reset();
+        }
+        let owned = f & WalkPrefix::OWNED != 0;
         for op in &insn.ops {
             match op.opcode {
                 OpCode::Call | OpCode::CallInd => {
@@ -444,6 +532,9 @@ pub struct FunctionWalk {
     /// Its call sites from [`walk_function`] with no summaries, or
     /// `None` when its lift failed (the function is skipped).
     pub sites: Option<Vec<CallSite>>,
+    /// What the walk read of the lift, when kept: a rewalk then lifts
+    /// and walks only that prefix.
+    pub prefix: Option<WalkPrefix>,
 }
 
 /// Iterate the propagator to fixpoint (or until `max_iters`). On
@@ -468,7 +559,7 @@ pub fn resolve_call_sites_iterative(
     let round0: Vec<FunctionWalk> = jobs
         .iter()
         .zip(walks)
-        .map(|(&(entry, max_insns), sites)| FunctionWalk { entry, max_insns, sites })
+        .map(|(&(entry, max_insns), sites)| FunctionWalk { entry, max_insns, sites, prefix: None })
         .collect();
     resolve_call_sites_iterative_from(lifter, program, &round0, max_iters)
 }
@@ -572,9 +663,11 @@ pub fn rewalk_round(
 }
 
 /// A function's lift (`None` when it failed) and its
-/// [`crate::func_lift::external_entries`], by `(entry, budget)`.
+/// [`crate::func_lift::external_entries`] (`None` for a function with a
+/// [`WalkPrefix`], whose lift is cut to the prefix), by `(entry,
+/// budget)`.
 type RewalkLifts =
-    FxHashMap<(u64, usize), Option<(Vec<LiftedInstruction>, std::collections::BTreeSet<u64>)>>;
+    FxHashMap<(u64, usize), Option<(Vec<LiftedInstruction>, Option<std::collections::BTreeSet<u64>>)>>;
 
 /// The walk of each function of `round0` that `summaries` seeds (`None`
 /// for the others), reusing (and adding to) the lifts in `lifts`; the
@@ -587,21 +680,32 @@ fn rewalk_functions(
     lifts: &mut RewalkLifts,
 ) -> Vec<Option<Vec<CallSite>>> {
     let rewalk = |w: &FunctionWalk| w.sites.is_some() && seeds_anything(summaries.get(&w.entry));
-    let missing: Vec<(u64, usize)> = round0
+    let missing: Vec<(u64, usize, Option<&WalkPrefix>)> = round0
         .iter()
         .filter(|w| rewalk(w) && !lifts.contains_key(&(w.entry, w.max_insns)))
-        .map(|w| (w.entry, w.max_insns))
+        .map(|w| (w.entry, w.max_insns, w.prefix.as_ref()))
         .collect();
     let lifted: Vec<_> = missing
         .par_iter()
-        .map(|&(entry, max_insns)| {
-            lift_function(lifter, program, entry, max_insns).map(|insns| {
+        .map(|&(entry, max_insns, prefix)| match prefix {
+            // the walk reads only the prefix: lift that much (exactly the
+            // whole lift's first instructions when it is plain)
+            Some(p) => {
+                let n = p.flags.len();
+                if n == 0 {
+                    return Some((Vec::new(), None));
+                }
+                let mut insns = lift_function(lifter, program, entry, if p.plain { n } else { max_insns })?;
+                insns.truncate(n);
+                Some((insns, None))
+            }
+            None => lift_function(lifter, program, entry, max_insns).map(|insns| {
                 let external = crate::func_lift::external_entries(program, &insns);
-                (insns, external)
-            })
+                (insns, Some(external))
+            }),
         })
         .collect();
-    lifts.extend(missing.into_iter().zip(lifted));
+    lifts.extend(missing.into_iter().map(|(e, m, _)| (e, m)).zip(lifted));
     let lifts = &*lifts;
     round0
         .par_iter()
@@ -610,7 +714,13 @@ fn rewalk_functions(
                 return None;
             }
             let (insns, external) = lifts.get(&(w.entry, w.max_insns))?.as_ref()?;
-            Some(walk_function_with(program, w.entry, insns, summaries, external))
+            Some(match (&w.prefix, external) {
+                (Some(p), _) => walk_prefix(w.entry, insns, &p.flags, summaries),
+                (None, Some(external)) => walk_function_with(program, w.entry, insns, summaries, external),
+                (None, None) => {
+                    walk_function_with(program, w.entry, insns, summaries, &crate::func_lift::external_entries(program, insns))
+                }
+            })
         })
         .collect()
 }
@@ -881,8 +991,8 @@ fn join_points_shaped(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
                 out[i] = true;
             }
         }
-        for (o, &stop) in out.iter_mut().skip(1).zip(&shape.stops) {
-            *o |= stop;
+        for (o, &f) in out.iter_mut().skip(1).zip(&shape.flags) {
+            *o |= f & reargo_lift::InsnShape::STOPS != 0;
         }
         return out;
     }
@@ -896,7 +1006,7 @@ fn join_points_hashed(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
     let mut after_terminator = false;
     for (i, &a) in shape.addrs.iter().enumerate() {
         out[i] = after_terminator || targets.contains(&a);
-        after_terminator = shape.stops[i];
+        after_terminator = shape.stops(i);
     }
     out
 }
@@ -940,14 +1050,11 @@ mod tests {
                 .map(|_| (next(n.max(1) as u64) as usize, 0xff8 + next(a - 0xff0)))
                 .collect::<Vec<_>>();
             let stops = (0..n).map(|_| next(4) == 0).collect::<Vec<_>>();
-            let shape = crate::blockflow::LiftShape {
-                increasing: true,
-                has_call: vec![false; n],
-                ends_block: stops.clone(),
-                addrs,
-                branches,
-                stops,
-            };
+            let flags = stops
+                .iter()
+                .map(|&s| if s { reargo_lift::InsnShape::STOPS | reargo_lift::InsnShape::ENDS } else { 0 })
+                .collect();
+            let shape = crate::blockflow::LiftShape { increasing: true, flags, addrs, branches };
             assert_eq!(join_points_shaped(&shape), join_points_hashed(&shape));
         }
     }

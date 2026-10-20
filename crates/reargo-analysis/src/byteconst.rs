@@ -292,18 +292,126 @@ impl RegFile {
     }
 }
 
+/// REGISTER space as [`RegFile`] holds it, kept as a list of the
+/// registers with a known byte, sorted by base offset: for the flow
+/// states, which are cloned, compared and joined at every block while
+/// they hold few values (about one register at a join), where a clone
+/// or a join of [`RegFile`] goes over every general-purpose register.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegList {
+    regs: smallvec::SmallVec<[(u64, ByteConst); 4]>,
+}
+
+impl RegList {
+    fn slot(&self, base: u64) -> ByteConst {
+        for (b, v) in &self.regs {
+            if *b >= base {
+                return if *b == base { *v } else { ByteConst::UNKNOWN };
+            }
+        }
+        ByteConst::UNKNOWN
+    }
+
+    fn set_slot(&mut self, base: u64, v: ByteConst) {
+        let k = self.regs.partition_point(|e| e.0 < base);
+        match self.regs.get(k) {
+            Some(e) if e.0 == base => {
+                if v.is_unknown() {
+                    self.regs.remove(k);
+                } else {
+                    self.regs[k].1 = v;
+                }
+            }
+            _ if v.is_unknown() => {}
+            _ => self.regs.insert(k, (base, v)),
+        }
+    }
+
+    /// The `size` bytes at `offset` ([`RegFile::read`]).
+    pub fn read(&self, offset: u64, size: u32) -> ByteConst {
+        match split(offset, size) {
+            Some((base, pos)) => self.slot(base).bytes_at(pos, size),
+            None => ByteConst::UNKNOWN,
+        }
+    }
+
+    /// Write `size` bytes at `offset` ([`RegFile::write`]).
+    pub fn write(&mut self, offset: u64, size: u32, v: ByteConst) {
+        let Some((base, pos)) = split(offset, size) else {
+            self.forget(offset, size);
+            return;
+        };
+        let next = self.slot(base).merge(pos, size, v);
+        self.set_slot(base, next);
+    }
+
+    /// Forget the bytes `offset..offset + size` ([`RegFile::forget`]).
+    pub fn forget(&mut self, offset: u64, size: u32) {
+        let end = offset.saturating_add(u64::from(size.max(1)));
+        let lo = offset & !7;
+        for e in self.regs.iter_mut().filter(|e| e.0 >= lo && e.0 < end) {
+            let b = e.0;
+            let (from, to) = (offset.max(b), end.min(b + 8));
+            e.1 = e.1.merge((from - b) as u32, (to - from) as u32, ByteConst::UNKNOWN);
+        }
+        self.regs.retain(|e| !e.1.is_unknown());
+    }
+
+    /// The full 8-byte value of the register at `base`, when known.
+    pub fn get64(&self, base: u64) -> Option<u64> {
+        self.slot(base).get(8)
+    }
+
+    /// Set the full 8-byte register at `base`.
+    pub fn set64(&mut self, base: u64, v: u64) {
+        self.write(base, 8, ByteConst::konst(v, 8));
+    }
+
+    pub fn clear(&mut self) {
+        self.regs.clear();
+    }
+
+    /// Every register whose 8 bytes are all known, as `(base, value)`,
+    /// by base.
+    pub fn full_values(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.regs.iter().filter_map(|(b, s)| s.get(8).map(|v| (*b, v)))
+    }
+
+    /// Per-byte intersection with `other` (a CFG join).
+    pub fn intersect(&self, other: &RegList) -> RegList {
+        let mut out = RegList::default();
+        let mut k = 0;
+        for &(base, a) in &self.regs {
+            while k < other.regs.len() && other.regs[k].0 < base {
+                k += 1;
+            }
+            match other.regs.get(k) {
+                Some(&(ob, b)) if ob == base => {
+                    let j = a.intersect(b);
+                    if !j.is_unknown() {
+                        out.regs.push((base, j));
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        out
+    }
+}
+
 /// Non-REGISTER storage (UNIQUE temporaries, stack slots, …): entries of
 /// at most 8 bytes keyed by `(space, offset)` with their size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ByteMem<K: Ord + Copy> {
-    map: BTreeMap<(K, i64), (u32, ByteConst)>,
+    /// `(key, offset, size, bytes)`, by `(key, offset)`; no entry is
+    /// unknown.
+    entries: Vec<(K, i64, u32, ByteConst)>,
 }
 
 impl<K: Ord + Copy> Default for ByteMem<K> {
     fn default() -> Self {
-        Self {
-            map: BTreeMap::new(),
-        }
+        Self { entries: Vec::new() }
     }
 }
 
@@ -315,8 +423,11 @@ impl<K: Ord + Copy> ByteMem<K> {
     /// The `size` bytes at `offset`: an entry starting there at least as
     /// wide gives its low bytes; anything else is unknown.
     pub fn read(&self, space: K, offset: i64, size: u32) -> ByteConst {
-        match self.map.get(&(space, offset)) {
-            Some(&(sz, v)) if sz >= size => v.trunc(size),
+        if self.entries.is_empty() {
+            return ByteConst::UNKNOWN;
+        }
+        match self.entries.binary_search_by(|e| (e.0, e.1).cmp(&(space, offset))) {
+            Ok(k) if self.entries[k].2 >= size => self.entries[k].3.trunc(size),
             _ => ByteConst::UNKNOWN,
         }
     }
@@ -326,38 +437,55 @@ impl<K: Ord + Copy> ByteMem<K> {
     pub fn write(&mut self, space: K, offset: i64, size: u32, v: ByteConst) {
         let end = offset.saturating_add(i64::from(size.max(1)));
         let lo = offset.saturating_sub(8);
-        let overlapping: smallvec::SmallVec<[(K, i64); 4]> = self
-            .map
-            .range((space, lo)..(space, end))
-            .filter(|((_, o), (sz, _))| o.saturating_add(i64::from(*sz)) > offset)
-            .map(|(k, _)| *k)
-            .collect();
-        for k in overlapping {
-            self.map.remove(&k);
+        if !self.entries.is_empty() {
+            // (an entry is at most 8 bytes wide: one overlapping the
+            // write starts after `offset - 8`)
+            let from = self.entries.partition_point(|e| (e.0, e.1) < (space, lo));
+            let to = self.entries.partition_point(|e| (e.0, e.1) < (space, end));
+            if from < to {
+                let mut w = from;
+                for r in from..to {
+                    let (o, sz) = (self.entries[r].1, self.entries[r].2);
+                    if o.saturating_add(i64::from(sz)) <= offset {
+                        self.entries.swap(w, r);
+                        w += 1;
+                    }
+                }
+                self.entries.drain(w..to);
+            }
         }
         if size <= 8 && !v.trunc(size).is_unknown() {
-            self.map.insert((space, offset), (size, v.trunc(size)));
+            let e = (space, offset, size, v.trunc(size));
+            match self.entries.binary_search_by(|e| (e.0, e.1).cmp(&(space, offset))) {
+                Ok(k) => self.entries[k] = e,
+                Err(k) => self.entries.insert(k, e),
+            }
         }
     }
 
     pub fn clear(&mut self) {
-        self.map.clear();
+        self.entries.clear();
     }
 
     /// Entries equal in both (a CFG join).
     pub fn intersect(&self, other: &Self) -> Self {
-        let mut map = BTreeMap::new();
-        for (k, (sz, v)) in &self.map {
-            if let Some((osz, ov)) = other.map.get(k)
+        let mut entries = Vec::new();
+        let mut k = 0;
+        for &(space, off, sz, v) in &self.entries {
+            while k < other.entries.len() && (other.entries[k].0, other.entries[k].1) < (space, off) {
+                k += 1;
+            }
+            if let Some(&(os, oo, osz, ov)) = other.entries.get(k)
+                && (os, oo) == (space, off)
                 && osz == sz
             {
-                let j = v.intersect(*ov);
+                let j = v.intersect(ov);
                 if !j.is_unknown() {
-                    map.insert(*k, (*sz, j));
+                    entries.push((space, off, sz, j));
                 }
             }
         }
-        Self { map }
+        Self { entries }
     }
 }
 
@@ -620,6 +748,161 @@ pub(crate) mod testseq {
 mod tests {
     use super::*;
     use reargo_core::address::Address;
+
+    /// [`ByteMem`] as it was, on a `BTreeMap`: the reference for
+    /// [`list_storage_matches_maps`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OldByteMem<K: Ord + Copy> {
+        map: BTreeMap<(K, i64), (u32, ByteConst)>,
+    }
+
+    impl<K: Ord + Copy> Default for OldByteMem<K> {
+        fn default() -> Self {
+            Self {
+                map: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl<K: Ord + Copy> OldByteMem<K> {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The `size` bytes at `offset`: an entry starting there at least as
+        /// wide gives its low bytes; anything else is unknown.
+        pub fn read(&self, space: K, offset: i64, size: u32) -> ByteConst {
+            match self.map.get(&(space, offset)) {
+                Some(&(sz, v)) if sz >= size => v.trunc(size),
+                _ => ByteConst::UNKNOWN,
+            }
+        }
+
+        /// Store `size` bytes at `offset`, forgetting every entry it
+        /// overlaps.
+        pub fn write(&mut self, space: K, offset: i64, size: u32, v: ByteConst) {
+            let end = offset.saturating_add(i64::from(size.max(1)));
+            let lo = offset.saturating_sub(8);
+            let overlapping: smallvec::SmallVec<[(K, i64); 4]> = self
+                .map
+                .range((space, lo)..(space, end))
+                .filter(|((_, o), (sz, _))| o.saturating_add(i64::from(*sz)) > offset)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in overlapping {
+                self.map.remove(&k);
+            }
+            if size <= 8 && !v.trunc(size).is_unknown() {
+                self.map.insert((space, offset), (size, v.trunc(size)));
+            }
+        }
+
+        pub fn clear(&mut self) {
+            self.map.clear();
+        }
+
+        /// Entries equal in both (a CFG join).
+        pub fn intersect(&self, other: &Self) -> Self {
+            let mut map = BTreeMap::new();
+            for (k, (sz, v)) in &self.map {
+                if let Some((osz, ov)) = other.map.get(k)
+                    && osz == sz
+                {
+                    let j = v.intersect(*ov);
+                    if !j.is_unknown() {
+                        map.insert(*k, (*sz, j));
+                    }
+                }
+            }
+            Self { map }
+        }
+    }
+
+    /// [`RegList`] behaves exactly as [`RegFile`] and [`ByteMem`] as
+    /// [`OldByteMem`] on random writes, forgets, clears and joins.
+    #[test]
+    fn list_storage_matches_maps() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const BASES: [u64; 10] = [0x0, 0x8, 0x38, 0xb8, 0xc0, 0x200, 0x218, 0x220, 0x1200, 0x1208];
+        const SIZES: [u32; 7] = [0, 1, 2, 4, 8, 8, 16];
+        let all_bases: Vec<u64> = (0..0x1220u64).step_by(8).collect();
+        let (mut joins, mut full) = (0, 0);
+        for _ in 0..200 {
+            let mut pool: Vec<(RegFile, RegList, OldByteMem<u8>, ByteMem<u8>)> =
+                vec![(RegFile::new(), RegList::default(), OldByteMem::new(), ByteMem::new())];
+            for _ in 0..150 {
+                let i = (next() as usize) % pool.len();
+                let off = BASES[(next() % 10) as usize] + if next().is_multiple_of(3) { next() % 8 } else { 0 };
+                let size = SIZES[(next() % 7) as usize];
+                let v = ByteConst::new(next() % 4, next() as u8);
+                match next() % 10 {
+                    0 if pool.len() > 1 => {
+                        let j = (next() as usize) % pool.len();
+                        let n = (
+                            pool[i].0.intersect(&pool[j].0),
+                            pool[i].1.intersect(&pool[j].1),
+                            pool[i].2.intersect(&pool[j].2),
+                            pool[i].3.intersect(&pool[j].3),
+                        );
+                        joins += 1;
+                        pool.push(n);
+                    }
+                    1 => {
+                        pool[i].0.forget(off, size);
+                        pool[i].1.forget(off, size);
+                    }
+                    2 if next().is_multiple_of(4) => {
+                        pool[i].0.clear();
+                        pool[i].1.clear();
+                        pool[i].2.clear();
+                        pool[i].3.clear();
+                    }
+                    3 => {
+                        let c = pool[i].clone();
+                        pool.push(c);
+                    }
+                    _ => {
+                        pool[i].0.write(off, size, v);
+                        pool[i].1.write(off, size, v);
+                        let (sp, o) = ((next() % 2) as u8, (next() % 40) as i64 - 8);
+                        pool[i].2.write(sp, o, size, v);
+                        pool[i].3.write(sp, o, size, v);
+                    }
+                }
+                for (f, l, om, m) in &pool {
+                    for &b in &all_bases {
+                        assert_eq!(f.slot(b), l.slot(b), "base {b:#x}");
+                    }
+                    let mut fv: Vec<_> = f.full_values().collect();
+                    fv.sort_unstable();
+                    assert_eq!(fv, l.full_values().collect::<Vec<_>>());
+                    full += fv.len();
+                    let olds: Vec<_> = om.map.iter().map(|(k, (sz, v))| (k.0, k.1, *sz, *v)).collect();
+                    assert_eq!(olds, m.entries);
+                    for sp in 0..2u8 {
+                        for o in -8..32 {
+                            for sz in [1, 2, 4, 8] {
+                                assert_eq!(om.read(sp, o, sz), m.read(sp, o, sz));
+                            }
+                        }
+                    }
+                }
+                let (a, b) = ((next() as usize) % pool.len(), (next() as usize) % pool.len());
+                assert_eq!(pool[a].0 == pool[b].0, pool[a].1 == pool[b].1);
+                assert_eq!(pool[a].2 == pool[b].2, pool[a].3 == pool[b].3);
+                if pool.len() > 10 {
+                    pool.remove((next() as usize) % pool.len());
+                }
+            }
+        }
+        assert!(joins > 1000 && full > 1000, "{joins} {full}");
+    }
 
     #[test]
     fn nonzero_bytes_matches_per_byte() {
