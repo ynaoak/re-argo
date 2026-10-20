@@ -23,8 +23,6 @@
 //! listing. Downstream coverage / xref consumers may want to know
 //! the bytes exist even though no normal-flow caller reaches them.
 
-use std::collections::VecDeque;
-
 use rayon::prelude::*;
 use reargo_arch::FlowType;
 use reargo_program::comments::CommentType;
@@ -59,22 +57,10 @@ impl Analyzer for DeadCodeAnalyzer {
     fn prepare(&self, program: &Program) -> Prepared {
         struct FuncSnap<'a> {
             entry: u64,
-            ranges: Vec<(u64, u64)>,
             body: &'a reargo_core::address::AddressSet,
         }
-        let snaps: Vec<FuncSnap> = program
-            .listing
-            .functions()
-            .map(|f| FuncSnap {
-                entry: f.entry_point,
-                body: &f.body,
-                ranges: f
-                    .body
-                    .ranges()
-                    .map(|r| (r.start.offset, r.start.offset + r.size))
-                    .collect(),
-            })
-            .collect();
+        let snaps: Vec<FuncSnap> =
+            program.listing.functions().map(|f| FuncSnap { entry: f.entry_point, body: &f.body }).collect();
 
         // Functions are independent: walk them in parallel, keeping
         // the results in function order.
@@ -91,18 +77,21 @@ impl Analyzer for DeadCodeAnalyzer {
             // A body holds one range per instruction: test membership
             // by a binary search over the merged ranges instead of a
             // scan of all of them.
-            let merged = merge_ranges(&snap.ranges);
+            let merged = merge_body_ranges(snap.body);
             let in_body = |a: u64| {
                 let i = merged.partition_point(|&(s, _)| s <= a);
                 i > 0 && a < merged[i - 1].1
             };
 
             // Snapshot insns in body, sorted.
-            let mut insns: Vec<(u64, u32, FlowType, Option<u64>)> = Vec::new();
+            // (a body holds a range per instruction)
+            let mut insns: Vec<(u64, u32, FlowType, Option<u64>)> = Vec::with_capacity(snap.body.len());
             listing.for_each_body_instruction(snap.body, |_, i| {
                 insns.push((i.address, i.length, i.flow_type, i.branch_target));
             });
-            insns.sort_by_key(|(a, _, _, _)| *a);
+            if !insns.is_sorted_by_key(|(a, _, _, _)| *a) {
+                insns.sort_by_key(|(a, _, _, _)| *a);
+            }
 
             let mut prev_was_terminator = false;
             for (addr, _len, ft, tgt) in &insns {
@@ -128,27 +117,32 @@ impl Analyzer for DeadCodeAnalyzer {
             block_starts.dedup();
 
             // Walk reachability from entry using fall-through +
-            // branch edges.
-            let mut reachable: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-            let mut queue: VecDeque<u64> = VecDeque::new();
-            queue.push_back(snap.entry);
-            while let Some(b) = queue.pop_front() {
-                if !reachable.insert(b) {
+            // branch edges (in any order: the set reached is the same).
+            // A block start reached is marked by its index, any other
+            // address in a set.
+            let mut reached_start = vec![false; block_starts.len()];
+            let mut reached_other: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+            let mut queue: Vec<u64> = vec![snap.entry];
+            while let Some(b) = queue.pop() {
+                let p = block_starts.partition_point(|&s| s <= b);
+                let fresh = if p > 0 && block_starts[p - 1] == b {
+                    !std::mem::replace(&mut reached_start[p - 1], true)
+                } else {
+                    reached_other.insert(b)
+                };
+                if !fresh {
                     continue;
                 }
                 // Walk insns from b until we hit a terminator or
                 // bump into the next block start.
                 let mut cur = b;
-                let next_start = block_starts
-                    .get(block_starts.partition_point(|&s| s <= b))
-                    .copied()
-                    .unwrap_or(u64::MAX);
+                let next_start = block_starts.get(p).copied().unwrap_or(u64::MAX);
                 let mut idx = insns.binary_search_by_key(&cur, |(a, _, _, _)| *a);
                 while let Ok(i) = idx {
                     let (addr, len, ft, tgt) = insns[i];
                     if addr >= next_start {
                         if in_body(addr) {
-                            queue.push_back(addr);
+                            queue.push(addr);
                         }
                         break;
                     }
@@ -159,7 +153,7 @@ impl Analyzer for DeadCodeAnalyzer {
                             if let Some(t) = tgt
                                 && in_body(t)
                             {
-                                queue.push_back(t);
+                                queue.push(t);
                             }
                             break;
                         }
@@ -167,10 +161,10 @@ impl Analyzer for DeadCodeAnalyzer {
                             if let Some(t) = tgt
                                 && in_body(t)
                             {
-                                queue.push_back(t);
+                                queue.push(t);
                             }
                             if in_body(after) {
-                                queue.push_back(after);
+                                queue.push(after);
                             }
                             break;
                         }
@@ -186,8 +180,8 @@ impl Analyzer for DeadCodeAnalyzer {
                 }
             }
 
-            for &start in &block_starts {
-                if !reachable.contains(&start) {
+            for (&start, &reached) in block_starts.iter().zip(&reached_start) {
+                if !reached {
                     unreachable.push(start);
                 }
             }
@@ -213,6 +207,30 @@ impl Analyzer for DeadCodeAnalyzer {
     }
 }
 
+/// [`merge_ranges`] of the body's ranges `(start, start + size)`, in
+/// one pass when they come sorted by `(start, end)` (a body in one
+/// space: always).
+fn merge_body_ranges(body: &reargo_core::address::AddressSet) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    let mut last: Option<(u64, u64)> = None;
+    for r in body.ranges() {
+        let (s, e) = (r.start.offset, r.start.offset + r.size);
+        if s >= e {
+            continue;
+        }
+        if last.is_some_and(|l| (s, e) < l) {
+            let ranges: Vec<(u64, u64)> = body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).collect();
+            return merge_ranges(&ranges);
+        }
+        last = Some((s, e));
+        match merged.last_mut() {
+            Some(m) if s <= m.1 => m.1 = m.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
 /// `ranges` (half-open) sorted and merged where they overlap or touch:
 /// an address is in one of them exactly when it is in one of these.
 pub(crate) fn merge_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
@@ -235,6 +253,25 @@ mod tests {
     #[test]
     fn module_compiles() {
         let _ = DeadCodeAnalyzer;
+    }
+
+    /// The one-pass merge of a body equals the sorting one (ranges in
+    /// two spaces, empty, nested, touching).
+    #[test]
+    fn body_merge_matches_merge_ranges() {
+        use reargo_core::address::{Address, AddressRange, AddressSet, SpaceId};
+        let r = |sp: SpaceId, off: u64, size: u64| AddressRange::new(Address::new(sp, off), size);
+        let ram = SpaceId::RAM;
+        let other = SpaceId(ram.0 + 1);
+        let bodies: Vec<AddressSet> = vec![
+            [r(ram, 0x10, 2), r(ram, 0x12, 3), r(ram, 0x20, 0), r(ram, 0x20, 8), r(ram, 0x21, 2), r(ram, 0x30, 1)].into_iter().collect(),
+            [r(ram, 0x40, 4), r(other, 0x10, 2), r(other, 0x44, 1)].into_iter().collect(),
+            AddressSet::new(),
+        ];
+        for body in &bodies {
+            let ranges: Vec<(u64, u64)> = body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).collect();
+            assert_eq!(merge_body_ranges(body), merge_ranges(&ranges), "{body:?}");
+        }
     }
 
     #[test]

@@ -103,25 +103,42 @@ impl Analyzer for StringXrefAnnotator {
 }
 
 fn read_c_string(program: &Program, addr: u64) -> Option<String> {
-    let mut buf = [0u8; 64];
-    let read_len = [64, 48, 32, 24, 16, 14, 12, 10, 8, 6, 4]
-        .into_iter()
-        .find(|&n| program.info.memory.read_bytes(addr, &mut buf[..n]).is_ok())?;
-    let slice = &buf[..read_len];
-    let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    // The bytes `Memory::read_bytes` reads: the longest of the probe
+    // lengths the block holding `addr` has initialized bytes for, read
+    // in place.
+    let block = program.info.memory.find_block(addr)?;
+    let data = block.data.as_deref()?;
+    let avail = data.len().checked_sub(usize::try_from(addr - block.start).ok()?)?;
+    let read_len = [64, 48, 32, 24, 16, 14, 12, 10, 8, 6, 4].into_iter().find(|&n| n <= avail)?;
+    let start = data.len() - avail;
+    let slice = &data[start..start + read_len];
+    let nul = memchr::memchr(0, slice).unwrap_or(slice.len());
     if nul < 3 {
         return None;
     }
     let s = &slice[..nul];
-    let printable = s
-        .iter()
-        .filter(|&&b| (b' '..=b'~').contains(&b) || b == b'\n' || b == b'\t')
-        .count();
     // Require ≥ 80 % printable so we don't drag random binary blobs
     // (vtable padding, function pointers, etc.) into the comment
-    // stream just because they happened to be referenced.
-    if printable * 5 < s.len() * 4 {
-        return None;
+    // stream just because they happened to be referenced: at most a
+    // fifth of the bytes may be others (stops at the first one over).
+    const OTHER: [bool; 256] = {
+        let mut t = [true; 256];
+        let mut b = b' ';
+        while b <= b'~' {
+            t[b as usize] = false;
+            b += 1;
+        }
+        t[b'\n' as usize] = false;
+        t[b'\t' as usize] = false;
+        t
+    };
+    let max_others = s.len() / 5;
+    let mut others = 0usize;
+    for &b in s {
+        others += usize::from(OTHER[b as usize]);
+        if others > max_others {
+            return None;
+        }
     }
     Some(String::from_utf8_lossy(s).into_owned())
 }

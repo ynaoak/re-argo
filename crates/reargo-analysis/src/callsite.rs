@@ -316,9 +316,12 @@ pub(crate) fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) ->
 
 /// [`dedup_sites`] without copying them.
 pub(crate) fn dedup_site_refs<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<&'a CallSite> {
-    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-    let mut out: Vec<&CallSite> = Vec::new();
-    for site in per_func.flatten() {
+    // (the sets sized for all of them at once: no growing)
+    let per_func: Vec<&[CallSite]> = per_func.collect();
+    let n = per_func.iter().map(|f| f.len()).sum();
+    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(n, Default::default());
+    let mut out: Vec<&CallSite> = Vec::with_capacity(n);
+    for site in per_func.into_iter().flatten() {
         if seen.insert(site.call_site) {
             out.push(site);
         }
@@ -482,10 +485,25 @@ pub(crate) fn walk_prefix<I: std::borrow::Borrow<LiftedInstruction>>(
     if let Some(summary) = summaries.get(&entry) {
         tracker.seed_from_summary(summary);
     }
-    for (insn, &f) in insns.iter().map(std::borrow::Borrow::borrow).zip(flags) {
+    let n = insns.len().min(flags.len());
+    let mut i = 0;
+    while i < n {
+        let f = flags[i];
         if f & WalkPrefix::JOIN != 0 {
             tracker.reset();
+            // A run up to the next join with no call the function owns
+            // gives nothing when what a reset keeps is set already (it is
+            // only ever set): the next join resets all the rest.
+            if tracker.escaped && tracker.rbp_written {
+                let end = flags[i + 1..n].iter().position(|&g| g & WalkPrefix::JOIN != 0).map_or(n, |k| i + 1 + k);
+                if flags[i..end].iter().all(|&g| g & WalkPrefix::OWNED == 0) {
+                    i = end;
+                    continue;
+                }
+            }
         }
+        let insn: &LiftedInstruction = insns[i].borrow();
+        i += 1;
         let owned = f & WalkPrefix::OWNED != 0;
         for op in &insn.ops {
             match op.opcode {
@@ -625,26 +643,35 @@ pub fn resolve_call_sites_iterative_from(
     fn view<'a>(round0: &'a [FunctionWalk], rewalked: &'a [Option<Vec<CallSite>>]) -> Vec<&'a CallSite> {
         dedup_site_refs(round0.iter().zip(rewalked).filter_map(|(w, r)| r.as_deref().or(w.sites.as_deref())))
     }
-    let mut prev_total_known = count_known_args(&view(round0, &rewalked));
+    let summaries_of = |sites: &[&CallSite]| {
+        // (only a summary that seeds something changes a walk)
+        let mut summaries = seeding_summaries(sites.iter().copied());
+        keep_closed_callers(program, sites, &mut summaries);
+        summaries
+    };
+    let owned = |sites: &[&CallSite]| -> Vec<CallSite> { sites.par_iter().with_min_len(1024).map(|&s| s.clone()).collect() };
+    // Each round's view of the call sites read once: its count, then the
+    // next round's summaries (or the result).
+    let first = view(round0, &rewalked);
+    let mut prev_total_known = count_known_args(&first);
+    let mut summaries = (max_iters > 0).then(|| summaries_of(&first));
+    let mut sites = if max_iters == 0 { owned(&first) } else { Vec::new() };
+    drop(first);
     // the lifts of the functions rewalked, for the next rounds (mostly
     // the same functions)
     let mut lifts = RewalkLifts::default();
-    for _ in 0..max_iters {
-        let summaries = {
-            let sites = view(round0, &rewalked);
-            // (only a summary that seeds something changes a walk)
-            let mut summaries = seeding_summaries(sites.iter().copied());
-            keep_closed_callers(program, &sites, &mut summaries);
-            summaries
-        };
-        rewalked = rewalk_functions(lifter, program, round0, &summaries, &mut lifts);
-        let next_known = count_known_args(&view(round0, &rewalked));
-        if next_known == prev_total_known {
+    for round in 0..max_iters {
+        let Some(round_summaries) = summaries.take() else { break };
+        rewalked = rewalk_functions(lifter, program, round0, &round_summaries, &mut lifts);
+        let current = view(round0, &rewalked);
+        let next_known = count_known_args(&current);
+        if next_known == prev_total_known || round + 1 == max_iters {
+            sites = owned(&current);
             break;
         }
         prev_total_known = next_known;
+        summaries = Some(summaries_of(&current));
     }
-    let sites = view(round0, &rewalked).par_iter().with_min_len(1024).map(|&s| s.clone()).collect();
     // (the lifts and walks are freed on another thread)
     rayon::spawn(move || drop((lifts, rewalked)));
     Ok(sites)

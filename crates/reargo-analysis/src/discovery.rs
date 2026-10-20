@@ -854,11 +854,14 @@ impl Source for Listed<'_> {
         let (word, bit, run) = self.decodes.slot(self.listing, addr);
         let known = *word & bit != 0;
         *word |= bit;
+        if known {
+            // (only its facts read)
+            let (length, flow, target) = self.decoder.decode_flow(addr).ok()?;
+            return Some(Facts { target: target.unwrap_or(0), length, flow, has_target: target.is_some() });
+        }
         let d = self.decoder.decode(addr).ok()?;
         let facts = Facts::of(&d);
-        if !known {
-            run.push((addr, Box::new(d)));
-        }
+        run.push((addr, Box::new(d)));
         Some(facts)
     }
 }

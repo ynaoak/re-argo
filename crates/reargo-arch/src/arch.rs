@@ -325,6 +325,12 @@ pub trait InstructionDecoder {
     /// The instruction at `address`, exactly as [`Architecture::decode_instruction`] gives
     /// it.
     fn decode(&mut self, address: u64) -> Result<DecodedInstruction, DisasmError>;
+
+    /// The length, flow and branch target of [`Self::decode`]'s instruction
+    /// (an error when it gives one), for a caller that reads only those.
+    fn decode_flow(&mut self, address: u64) -> Result<(u32, FlowType, Option<u64>), DisasmError> {
+        self.decode(address).map(|d| (d.length, d.flow_type, d.branch_target))
+    }
 }
 
 /// [`InstructionDecoder`] calling [`Architecture::decode_instruction`] for each.
