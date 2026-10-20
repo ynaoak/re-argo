@@ -171,34 +171,56 @@ impl JumpIndex {
         addrs: &[u64],
         increasing: bool,
     ) -> std::collections::BTreeSet<u64> {
-        use reargo_program::RefType;
-        if !increasing {
-            // [`external_entries_at`] (the index holds exactly the jump references the
-            // program's lists hold, in the order added for each target)
-            let lifted = |a: u64| addrs.binary_search(&a).is_ok();
-            return addrs
-                .iter()
-                .copied()
-                .filter(|&a| {
-                    let lo = self.refs.partition_point(|r| r.0 < a);
-                    self.refs[lo..].iter().take_while(|r| r.0 == a).any(|&(_, from, ty)| match ty {
-                        RefType::IndirectJump => true,
-                        RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(from),
-                        _ => false,
-                    })
-                })
-                .collect();
+        if increasing {
+            let mut found = Vec::new();
+            self.external_entries_increasing(addrs, &mut found);
+            return found.into_iter().collect();
         }
-        let mut out = std::collections::BTreeSet::new();
+        self.external_entries_unordered(addrs)
+    }
+
+    /// [`JumpIndex::external_entries_ordered`] as an ascending list, put in
+    /// `out` (emptied first).
+    pub fn external_entries_sorted_into(&self, program: &Program, addrs: &[u64], increasing: bool, out: &mut Vec<u64>) {
+        out.clear();
+        if increasing {
+            self.external_entries_increasing(addrs, out);
+        } else {
+            out.extend(self.external_entries_ordered(program, addrs, false));
+        }
+    }
+
+    /// [`JumpIndex::external_entries_ordered`] of addresses that do not strictly increase.
+    fn external_entries_unordered(&self, addrs: &[u64]) -> std::collections::BTreeSet<u64> {
+        use reargo_program::RefType;
+        // [`external_entries_at`] (the index holds exactly the jump references the
+        // program's lists hold, in the order added for each target)
+        let lifted = |a: u64| addrs.binary_search(&a).is_ok();
+        addrs
+            .iter()
+            .copied()
+            .filter(|&a| {
+                let lo = self.refs.partition_point(|r| r.0 < a);
+                self.refs[lo..].iter().take_while(|r| r.0 == a).any(|&(_, from, ty)| match ty {
+                    RefType::IndirectJump => true,
+                    RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(from),
+                    _ => false,
+                })
+            })
+            .collect()
+    }
+
+    /// [`JumpIndex::external_entries_ordered`] of strictly increasing addresses, ascending.
+    fn external_entries_increasing(&self, addrs: &[u64], found: &mut Vec<u64>) {
+        use reargo_program::RefType;
         let (Some(&first), Some(&last)) = (addrs.first(), addrs.last()) else {
-            return out;
+            return;
         };
         let lifted = |a: u64| a >= first && a <= last && addrs.binary_search(&a).is_ok();
         let start = self.refs.partition_point(|r| r.0 < first);
         // (the targets ascend: whether one is lifted is found by stepping through the
         // addresses alongside)
         let mut at = 0;
-        let mut found = Vec::new();
         for &(to, from, ty) in self.refs[start..].iter().take_while(|r| r.0 <= last) {
             if !matches!(ty, RefType::IndirectJump | RefType::UnconditionalJump | RefType::ConditionalJump) {
                 continue;
@@ -213,8 +235,6 @@ impl JumpIndex {
                 found.push(to);
             }
         }
-        out.extend(found);
-        out
     }
 }
 

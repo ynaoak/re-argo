@@ -119,6 +119,24 @@ pub(crate) fn function_snapshots_cfg<I: std::borrow::Borrow<LiftedInstruction>>(
     blockflow::propagate_cfg::<State, _, _>(cfg, insns, |st| st.regs.full_values().collect())
 }
 
+/// [`function_snapshots_cfg`] keeping the snapshots of the calls of the
+/// instructions `want` accepts ([`blockflow::propagate_cfg_with`]).
+pub(crate) fn function_snapshots_cfg_with<I: std::borrow::Borrow<LiftedInstruction>>(
+    cfg: &blockflow::Cfg,
+    insns: &[I],
+    want: impl Fn(usize) -> bool,
+    scratch: &mut FlowScratch,
+) -> CallSnapshots {
+    if insns.is_empty() {
+        return Vec::new();
+    }
+    blockflow::propagate_cfg_with::<State, _, _>(cfg, insns, |st| st.regs.full_values().collect(), want, &mut scratch.0)
+}
+
+/// The buffers of [`function_snapshots_cfg_with`], kept between runs.
+#[derive(Default)]
+pub(crate) struct FlowScratch(blockflow::FlowScratch<State>);
+
 /// Fold one function's call snapshots into the program-wide map.
 pub fn merge_snapshots(out: &mut CallConstants, snaps: CallSnapshots) {
     for (addr, regs) in snaps {
