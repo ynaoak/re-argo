@@ -194,6 +194,8 @@ fn fit(v: AbstractValue, size: u32) -> AbstractValue {
     let m = bit_mask(size);
     normalize(match v {
         AbstractValue::Const(c) => AbstractValue::Const(c & m),
+        // (a set that fits stays as it is)
+        AbstractValue::Set(s) if s.iter().all(|&x| x & m == x) => AbstractValue::Set(s),
         AbstractValue::Set(s) => AbstractValue::Set(s.into_iter().map(|x| x & m).collect()),
         AbstractValue::Range(lo, hi) if hi <= m => AbstractValue::Range(lo, hi),
         AbstractValue::Range(..) => AbstractValue::Top,

@@ -410,8 +410,9 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     });
     let offsets: Option<Box<[u32]>> =
         shape.addrs.iter().map(|a| a.checked_sub(entry).and_then(|d| u32::try_from(d).ok())).collect();
-    // offsets increase (a linear lift), so the list is sorted
-    let reusable = offsets.as_ref().is_some_and(|o| o.is_sorted_by(|a, b| a < b));
+    // offsets increase (a linear lift), so the list is sorted (an
+    // increasing lift's are)
+    let reusable = offsets.as_ref().is_some_and(|o| shape.increasing || o.is_sorted_by(|a, b| a < b));
     let lifted = Some(offsets.unwrap_or_default());
     FunctionResults {
         entry,
