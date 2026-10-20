@@ -854,11 +854,14 @@ impl Source for Listed<'_> {
         let (word, bit, run) = self.decodes.slot(self.listing, addr);
         let known = *word & bit != 0;
         *word |= bit;
+        if known {
+            // (only its facts read)
+            let (length, flow, target) = self.decoder.decode_flow(addr).ok()?;
+            return Some(Facts { target: target.unwrap_or(0), length, flow, has_target: target.is_some() });
+        }
         let d = self.decoder.decode(addr).ok()?;
         let facts = Facts::of(&d);
-        if !known {
-            run.push((addr, Box::new(d)));
-        }
+        run.push((addr, Box::new(d)));
         Some(facts)
     }
 }
@@ -1157,8 +1160,7 @@ fn disassemble_function<S: Source>(
 ) -> Result<FunctionDiscovery, AnalysisError> {
     let mut block_queue: VecDeque<(u64, S::Hint)> = VecDeque::new();
     let mut block_visited: FxHashSet<u64> = FxHashSet::default();
-    // (room for most functions: a range per instruction)
-    let mut body: Vec<AddressRange> = Vec::with_capacity(64);
+    let mut body: Vec<AddressRange> = Vec::new();
     let mut call_targets: BTreeSet<u64> = BTreeSet::new();
     let references_before = references.len();
     let mut instruction_count = 0;

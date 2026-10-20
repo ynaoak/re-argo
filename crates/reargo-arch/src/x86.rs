@@ -351,8 +351,11 @@ impl<'a> BlockDecoder<'a> {
     }
 }
 
-impl crate::arch::InstructionDecoder for X86Decoder<'_> {
-    fn decode(&mut self, address: u64) -> Result<DecodedInstruction, DisasmError> {
+impl X86Decoder<'_> {
+    /// Decodes the instruction at `address` into `self.instruction` through the block
+    /// decoder, giving its offset in the block's data; `None` when the block decoder
+    /// cannot (then [`X86Arch::decode_instruction`] decodes it).
+    fn decode_in_block(&mut self, address: u64) -> Option<usize> {
         if !self.block.as_ref().is_some_and(|b| b.holds(address)) {
             self.block = BlockDecoder::new(self.memory, address, self.arch.bitness());
         }
@@ -370,10 +373,31 @@ impl crate::arch::InstructionDecoder for X86Decoder<'_> {
             {
                 b.decoder.set_ip(address);
                 b.decoder.decode_out(&mut self.instruction);
-                return self.arch.finish(&self.instruction, &b.data[offset..], address);
+                return Some(offset);
             }
         }
-        self.arch.decode_instruction(self.memory, address)
+        None
+    }
+}
+
+impl crate::arch::InstructionDecoder for X86Decoder<'_> {
+    fn decode(&mut self, address: u64) -> Result<DecodedInstruction, DisasmError> {
+        match (self.decode_in_block(address), &self.block) {
+            (Some(offset), Some(b)) => self.arch.finish(&self.instruction, &b.data[offset..], address),
+            _ => self.arch.decode_instruction(self.memory, address),
+        }
+    }
+
+    fn decode_flow(&mut self, address: u64) -> Result<(u32, FlowType, Option<u64>), DisasmError> {
+        if self.decode_in_block(address).is_none() {
+            return self.arch.decode_instruction(self.memory, address).map(|d| (d.length, d.flow_type, d.branch_target));
+        }
+        // (what `finish` gives of it)
+        let instruction = &self.instruction;
+        if instruction.is_invalid() {
+            return Err(DisasmError::DecodeError { address, reason: "invalid instruction".into() });
+        }
+        Ok((instruction.len() as u32, classify_flow(instruction), extract_branch_target(instruction)))
     }
 }
 

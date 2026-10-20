@@ -112,7 +112,7 @@ fn read_c_string(program: &Program, addr: u64) -> Option<String> {
     let read_len = [64, 48, 32, 24, 16, 14, 12, 10, 8, 6, 4].into_iter().find(|&n| n <= avail)?;
     let start = data.len() - avail;
     let slice = &data[start..start + read_len];
-    let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let nul = memchr::memchr(0, slice).unwrap_or(slice.len());
     if nul < 3 {
         return None;
     }
@@ -121,13 +121,23 @@ fn read_c_string(program: &Program, addr: u64) -> Option<String> {
     // (vtable padding, function pointers, etc.) into the comment
     // stream just because they happened to be referenced: at most a
     // fifth of the bytes may be others (stops at the first one over).
+    const OTHER: [bool; 256] = {
+        let mut t = [true; 256];
+        let mut b = b' ';
+        while b <= b'~' {
+            t[b as usize] = false;
+            b += 1;
+        }
+        t[b'\n' as usize] = false;
+        t[b'\t' as usize] = false;
+        t
+    };
+    let max_others = s.len() / 5;
     let mut others = 0usize;
     for &b in s {
-        if !((b' '..=b'~').contains(&b) || b == b'\n' || b == b'\t') {
-            others += 1;
-            if others * 5 > s.len() {
-                return None;
-            }
+        others += usize::from(OTHER[b as usize]);
+        if others > max_others {
+            return None;
         }
     }
     Some(String::from_utf8_lossy(s).into_owned())

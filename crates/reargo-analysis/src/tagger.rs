@@ -236,23 +236,30 @@ const CI_ITANIUM_ABI: usize = 7;
 /// (ASCII) matches no other byte. One pass, trying at each position the
 /// needles starting with its letter.
 fn ci_needles_found(text: &str) -> u8 {
+    // The needles starting with each byte, either case.
+    const FIRST: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut k = 0;
+        while k < CI_NEEDLES.len() {
+            let c = CI_NEEDLES[k][0];
+            t[c as usize] |= 1 << k;
+            t[c.to_ascii_uppercase() as usize] |= 1 << k;
+            k += 1;
+        }
+        t
+    };
     let b = text.as_bytes();
     let mut found = 0u8;
-    for i in 0..b.len() {
-        // (every needle starts with a letter: `| 0x20` is its lower case
-        // exactly for that letter in either case)
-        let candidates: &[usize] = match b[i] | 0x20 {
-            b's' => &[CI_STACK_PROTECTED],
-            b'c' => &[CI_CANARY_LOAD],
-            b'a' => &[CI_ANTI_DEBUG],
-            b'r' => &[CI_RDTSC],
-            b'i' => &[CI_INT3, CI_ISDEBUGGERPRESENT, CI_ITANIUM_ABI],
-            b'p' => &[CI_PTRACE],
-            _ => continue,
-        };
-        for &k in candidates {
+    for (i, &c) in b.iter().enumerate() {
+        let mut candidates = FIRST[c as usize] & !found;
+        while candidates != 0 {
+            let k = candidates.trailing_zeros() as usize;
+            candidates &= candidates - 1;
             let needle = CI_NEEDLES[k];
-            if found & (1 << k) == 0 && b[i..].get(..needle.len()).is_some_and(|w| w.eq_ignore_ascii_case(needle)) {
+            // (the second byte first: every needle's is a letter)
+            if b.get(i + 1).is_some_and(|&d| d | 0x20 == needle[1])
+                && b.get(i..i + needle.len()).is_some_and(|w| w.eq_ignore_ascii_case(needle))
+            {
                 found |= 1 << k;
             }
         }

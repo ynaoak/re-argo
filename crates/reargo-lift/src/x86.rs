@@ -562,6 +562,9 @@ struct AddrIndex {
     by_page: rustc_hash::FxHashMap<u64, u32>,
     /// The page looked up last and its position (`None`: none yet).
     last: Option<(u64, u32)>,
+    /// Pages [`Self::shift_down`] emptied (every slot [`NO_INDEX`]), for
+    /// [`Self::page_of`] to use again.
+    spare: Vec<Box<[u32; INDEX_PAGE as usize]>>,
 }
 
 impl AddrIndex {
@@ -583,7 +586,8 @@ impl AddrIndex {
         let next = u32::try_from(self.pages.len()).expect("lift cache pages");
         let at = *self.by_page.entry(page).or_insert(next);
         if at == next {
-            self.pages.push(Box::new([NO_INDEX; INDEX_PAGE as usize]));
+            let page = self.spare.pop().unwrap_or_else(|| Box::new([NO_INDEX; INDEX_PAGE as usize]));
+            self.pages.push(page);
         }
         self.last = Some((page, at));
         at
@@ -603,6 +607,8 @@ impl AddrIndex {
             if any {
                 kept.insert(at as u32, self.pages.len() as u32);
                 self.pages.push(page);
+            } else {
+                self.spare.push(page);
             }
         }
         self.by_page.retain(|_, at| match kept.get(at) {
