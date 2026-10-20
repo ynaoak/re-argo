@@ -102,7 +102,8 @@ impl<'a> LiftShape<'a> {
     /// (read in place: only the instructions with flags are looked at).
     pub fn from_shapes<I: Borrow<LiftedInstruction>>(insns: &[I], shapes: &'a RangeShapes<'_>) -> LiftShape<'a> {
         debug_assert_eq!(insns.len(), shapes.len());
-        let mut branches = Vec::new();
+        // (a jump has one target but for a few instructions)
+        let mut branches = Vec::with_capacity(shapes.special().len());
         let mut special = Vec::with_capacity(shapes.special().len());
         for i in shapes.special() {
             special.push(i as u32);
@@ -197,14 +198,16 @@ impl LiftMarks {
                 flags[i] |= Self::EXTERNAL;
             }
         }
-        let mut owned_calls = Vec::new();
-        let mut calls = Vec::new();
+        let mut ncalls = 0;
         for &i in &shape.special {
             let i = i as usize;
             if shape.ends_block(i) && i + 1 < addrs.len() {
                 flags[i + 1] |= Self::AFTER_END;
             }
+            ncalls += usize::from(shape.has_call(i));
         }
+        let mut owned_calls = Vec::with_capacity(ncalls);
+        let mut calls = Vec::with_capacity(ncalls);
         for i in shape.special.iter().map(|&i| i as usize).filter(|&i| shape.has_call(i)) {
             let owned = owns(i);
             if owned {
@@ -607,6 +610,48 @@ pub fn propagate_cfg<S: FlowState, T, I: Borrow<LiftedInstruction>>(
     insns: &[I],
     snapshot: impl Fn(&S) -> T,
 ) -> Vec<(u64, T)> {
+    propagate_cfg_with(cfg, insns, snapshot, |_| true, &mut FlowScratch::default())
+}
+
+/// The buffers of a [`propagate_cfg_with`], kept between runs (by a thread
+/// running many) so that they are not allocated and grown again for each.
+pub struct FlowScratch<S> {
+    /// Edges into each block: (from block, state on the edge), by `from`
+    /// (the first `nb` empty between runs).
+    in_edges: Vec<Vec<(usize, S)>>,
+    /// Edges out of the block being walked, by `to`.
+    out: Vec<(usize, S)>,
+    visits: Vec<usize>,
+    saturated: Vec<bool>,
+    queued: Vec<bool>,
+    worklist: VecDeque<usize>,
+}
+
+impl<S> Default for FlowScratch<S> {
+    fn default() -> Self {
+        FlowScratch {
+            in_edges: Vec::new(),
+            out: Vec::new(),
+            visits: Vec::new(),
+            saturated: Vec::new(),
+            queued: Vec::new(),
+            worklist: VecDeque::new(),
+        }
+    }
+}
+
+/// [`propagate_cfg`] recording the snapshots of the calls of the
+/// instructions (by index in `insns`) that `want` accepts only (the
+/// others are left out, as a filter of the result would; `want` is not
+/// asked of a lift whose addresses do not strictly increase: all are
+/// kept), with the buffers of `scratch`.
+pub fn propagate_cfg_with<S: FlowState, T, I: Borrow<LiftedInstruction>>(
+    cfg: &Cfg,
+    insns: &[I],
+    snapshot: impl Fn(&S) -> T,
+    want: impl Fn(usize) -> bool,
+    scratch: &mut FlowScratch<S>,
+) -> Vec<(u64, T)> {
     if cfg.legacy {
         return propagate_legacy(insns, &cfg.external, |a| cfg.in_body_blocks.contains(&a), snapshot);
     }
@@ -617,19 +662,25 @@ pub fn propagate_cfg<S: FlowState, T, I: Borrow<LiftedInstruction>>(
     }
     let n = insns.len();
     let block_of = |a: u64| cfg.start_addr.binary_search(&a).ok();
-    // edges into each block: (from block, state on the edge), by `from`
-    let mut in_edges: Vec<Vec<(usize, S)>> = (0..nb).map(|_| Vec::new()).collect();
-    let mut visits: Vec<usize> = vec![0; nb];
-    let mut saturated: Vec<bool> = vec![false; nb];
+    let FlowScratch { in_edges, out, visits, saturated, queued, worklist } = scratch;
+    // (every `in_edges[..nb]` is empty: emptied at the end of the last run)
+    if in_edges.len() < nb {
+        in_edges.resize_with(nb, Vec::new);
+    }
+    let in_edges = &mut in_edges[..nb];
+    visits.clear();
+    visits.resize(nb, 0);
+    saturated.clear();
+    saturated.resize(nb, false);
     let relevant = |b: usize| cfg.relevant.as_ref().is_none_or(|r| r[b]);
-    let mut worklist: VecDeque<usize> = VecDeque::new();
+    worklist.clear();
     worklist.extend((0..nb).filter(|&b| (b == 0 || cfg.unknown_entry[b]) && relevant(b)));
-    let mut queued: Vec<bool> = vec![false; nb];
-    for &b in &worklist {
+    queued.clear();
+    queued.resize(nb, false);
+    for &b in worklist.iter() {
         queued[b] = true;
     }
-    // edges out of the block being walked, by `to`
-    let mut out: Vec<(usize, S)> = Vec::new();
+    out.clear();
 
     while let Some(b) = worklist.pop_front() {
         queued[b] = false;
@@ -654,6 +705,7 @@ pub fn propagate_cfg<S: FlowState, T, I: Borrow<LiftedInstruction>>(
             incoming.fold(first.clone(), |acc, s| acc.join(s))
         };
 
+        let start = cfg.start_idx[b];
         let end = cfg.start_idx.get(b + 1).copied().unwrap_or(n);
         out.clear();
         let add_edge = |out: &mut Vec<(usize, S)>, to: usize, s: &S| match out.iter_mut().find(|(t, _)| *t == to) {
@@ -661,22 +713,24 @@ pub fn propagate_cfg<S: FlowState, T, I: Borrow<LiftedInstruction>>(
             None => out.push((to, s.clone())),
         };
         let mut falls_through = true;
-        for insn in &insns[cfg.start_idx[b]..end] {
+        for (i, insn) in (start..end).zip(&insns[start..end]) {
             let insn = insn.borrow();
             for op in &insn.ops {
                 match op.opcode {
                     OpCode::Call | OpCode::CallInd => {
-                        snaps.push((insn.address, snapshot(&st)));
+                        if want(i) {
+                            snaps.push((insn.address, snapshot(&st)));
+                        }
                         st.after_call();
                     }
                     OpCode::CBranch => {
                         if let Some(t) = target(op).and_then(block_of) {
-                            add_edge(&mut out, t, &st);
+                            add_edge(out, t, &st);
                         }
                     }
                     OpCode::Branch => {
                         if let Some(t) = target(op).and_then(block_of) {
-                            add_edge(&mut out, t, &st);
+                            add_edge(out, t, &st);
                         }
                         falls_through = false;
                     }
@@ -719,6 +773,10 @@ pub fn propagate_cfg<S: FlowState, T, I: Borrow<LiftedInstruction>>(
                 }
             }
         }
+    }
+    // (the states are not kept between runs: only the buffers)
+    for edges in in_edges.iter_mut() {
+        edges.clear();
     }
     snaps
 }

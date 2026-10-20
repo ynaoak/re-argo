@@ -660,9 +660,12 @@ pub fn resolve_call_sites_iterative_from(
     // the lifts of the functions rewalked, for the next rounds (mostly
     // the same functions)
     let mut lifts = RewalkLifts::default();
+    // the summaries of the round before (its walks are `rewalked`)
+    let mut prev_summaries: Option<ParamSummaries> = None;
     for round in 0..max_iters {
         let Some(round_summaries) = summaries.take() else { break };
-        rewalked = rewalk_functions(lifter, program, round0, &round_summaries, &mut lifts);
+        let prev = prev_summaries.as_ref().map(|s| (s, std::mem::take(&mut rewalked)));
+        rewalked = rewalk_functions(lifter, program, round0, &round_summaries, &mut lifts, prev);
         let current = view(round0, &rewalked);
         let next_known = count_known_args(&current);
         if next_known == prev_total_known || round + 1 == max_iters {
@@ -671,6 +674,8 @@ pub fn resolve_call_sites_iterative_from(
         }
         prev_total_known = next_known;
         summaries = Some(summaries_of(&current));
+        drop(current);
+        prev_summaries = Some(round_summaries);
     }
     // (the lifts and walks are freed on another thread)
     rayon::spawn(move || drop((lifts, rewalked)));
@@ -685,7 +690,7 @@ pub fn rewalk_round(
     round0: &[FunctionWalk],
     summaries: &ParamSummaries,
 ) -> Vec<CallSite> {
-    let rewalked = rewalk_functions(lifter, program, round0, summaries, &mut RewalkLifts::default());
+    let rewalked = rewalk_functions(lifter, program, round0, summaries, &mut RewalkLifts::default(), None);
     dedup_sites(round0.iter().zip(&rewalked).filter_map(|(w, r)| r.as_deref().or(w.sites.as_deref())))
 }
 
@@ -693,23 +698,45 @@ pub fn rewalk_round(
 /// [`crate::func_lift::external_entries`] (`None` for a function with a
 /// [`WalkPrefix`], whose lift is cut to the prefix), by `(entry,
 /// budget)`.
-type RewalkLifts =
-    FxHashMap<(u64, usize), Option<(Vec<LiftedInstruction>, Option<std::collections::BTreeSet<u64>>)>>;
+type RewalkLifts = FxHashMap<(u64, usize), Option<(RewalkInsns, Option<std::collections::BTreeSet<u64>>)>>;
+
+/// A rewalk's lift: a plain prefix's instructions lifted when the walk
+/// first reads them (it steps over some: [`walk_prefix`]), kept for the
+/// next rounds.
+enum RewalkInsns {
+    Eager(Vec<LiftedInstruction>),
+    Lazy(Vec<reargo_lift::x86::LazyInsn>),
+}
 
 /// The walk of each function of `round0` that `summaries` seeds (`None`
 /// for the others), reusing (and adding to) the lifts in `lifts`; the
-/// program must not change between the rounds that share them.
+/// program must not change between the rounds that share them. `prev`:
+/// the summaries of the round before and its walks (by function of
+/// `round0`), taken for the functions whose summary is the same (a walk
+/// reads only its own function's summary).
 fn rewalk_functions(
     lifter: &(dyn PcodeLift + Sync),
     program: &Program,
     round0: &[FunctionWalk],
     summaries: &ParamSummaries,
     lifts: &mut RewalkLifts,
+    prev: Option<(&ParamSummaries, Vec<Option<Vec<CallSite>>>)>,
 ) -> Vec<Option<Vec<CallSite>>> {
     let rewalk = |w: &FunctionWalk| w.sites.is_some() && seeds_anything(summaries.get(&w.entry));
+    let (prev_summaries, mut prev_walks) = match prev {
+        Some((s, walks)) => (Some(s), walks),
+        None => (None, Vec::new()),
+    };
+    prev_walks.resize_with(round0.len(), || None);
+    // (a walk of the round before with the same summary is this round's)
+    let same = |w: &FunctionWalk, walked: &Option<Vec<CallSite>>| {
+        walked.is_some() && prev_summaries.is_some_and(|p| p.get(&w.entry) == summaries.get(&w.entry))
+    };
     let missing: Vec<(u64, usize, Option<&WalkPrefix>)> = round0
         .iter()
-        .filter(|w| rewalk(w) && !lifts.contains_key(&(w.entry, w.max_insns)))
+        .zip(&prev_walks)
+        .filter(|(w, walked)| rewalk(w) && !same(w, walked) && !lifts.contains_key(&(w.entry, w.max_insns)))
+        .map(|(w, _)| w)
         .map(|w| (w.entry, w.max_insns, w.prefix.as_ref()))
         .collect();
     let lifted: Vec<_> = missing
@@ -720,15 +747,23 @@ fn rewalk_functions(
             Some(p) => {
                 let n = p.flags.len();
                 if n == 0 {
-                    return Some((Vec::new(), None));
+                    return Some((RewalkInsns::Eager(Vec::new()), None));
                 }
-                let mut insns = lift_function(lifter, program, entry, if p.plain { n } else { max_insns })?;
+                if p.plain {
+                    // (a prefix is of the x86-64 lift: the shared lift's)
+                    let insns = match reargo_lift::x86::X86Lifter::new_64().lift_range_lazy(&program.info.memory, entry, n) {
+                        reargo_lift::x86::LazyRange::Lazy(v) => RewalkInsns::Lazy(v),
+                        reargo_lift::x86::LazyRange::Eager(v) => RewalkInsns::Eager(v),
+                    };
+                    return Some((insns, None));
+                }
+                let mut insns = lift_function(lifter, program, entry, max_insns)?;
                 insns.truncate(n);
-                Some((insns, None))
+                Some((RewalkInsns::Eager(insns), None))
             }
             None => lift_function(lifter, program, entry, max_insns).map(|insns| {
                 let external = crate::func_lift::external_entries(program, &insns);
-                (insns, Some(external))
+                (RewalkInsns::Eager(insns), Some(external))
             }),
         })
         .collect();
@@ -736,15 +771,21 @@ fn rewalk_functions(
     let lifts = &*lifts;
     round0
         .par_iter()
-        .map(|w| {
+        .zip(prev_walks)
+        .map(|(w, walked)| {
             if !rewalk(w) {
                 return None;
             }
+            if same(w, &walked) {
+                return walked;
+            }
             let (insns, external) = lifts.get(&(w.entry, w.max_insns))?.as_ref()?;
-            Some(match (&w.prefix, external) {
-                (Some(p), _) => walk_prefix(w.entry, insns, &p.flags, summaries),
-                (None, Some(external)) => walk_function_with(program, w.entry, insns, summaries, external),
-                (None, None) => {
+            Some(match (&w.prefix, external, insns) {
+                (Some(p), _, RewalkInsns::Lazy(insns)) => walk_prefix(w.entry, insns, &p.flags, summaries),
+                (Some(p), _, RewalkInsns::Eager(insns)) => walk_prefix(w.entry, insns, &p.flags, summaries),
+                (None, _, RewalkInsns::Lazy(_)) => unreachable!("only a prefix is lifted lazily"),
+                (None, Some(external), RewalkInsns::Eager(insns)) => walk_function_with(program, w.entry, insns, summaries, external),
+                (None, None, RewalkInsns::Eager(insns)) => {
                     walk_function_with(program, w.entry, insns, summaries, &crate::func_lift::external_entries(program, insns))
                 }
             })
