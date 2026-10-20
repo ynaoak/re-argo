@@ -428,6 +428,63 @@ pub(crate) fn walk_function_shaped<I: std::borrow::Borrow<LiftedInstruction>>(
     out
 }
 
+/// [`walk_function_shaped`] of an increasing lift from its
+/// [`crate::blockflow::LiftMarks`] (made with the same external entries
+/// and call ownership).
+pub(crate) fn walk_function_marked<I: std::borrow::Borrow<LiftedInstruction>>(
+    entry: u64,
+    insns: &[I],
+    shape: &crate::blockflow::LiftShape,
+    marks: &crate::blockflow::LiftMarks,
+    summaries: &ParamSummaries,
+) -> Vec<CallSite> {
+    use crate::blockflow::LiftMarks;
+    let mut out = Vec::new();
+    let mut tracker = Tracker::new();
+    if let Some(summary) = summaries.get(&entry) {
+        tracker.seed_from_summary(summary);
+    }
+    // Nothing after the last owned call is recorded: the walk stops there.
+    let Some(&last) = marks.owned_calls.last() else {
+        return out;
+    };
+    for (i, insn) in insns[..=last].iter().map(std::borrow::Borrow::borrow).enumerate() {
+        let flags = marks.flags[i];
+        // a join point: a jump target, an external entry, or after an
+        // instruction with no fall-through
+        if flags & (LiftMarks::TARGET | LiftMarks::EXTERNAL) != 0 || (i > 0 && shape.stops[i - 1]) {
+            tracker.reset();
+        }
+        let owned = flags & LiftMarks::OWNED_CALL != 0;
+        for op in &insn.ops {
+            match op.opcode {
+                OpCode::Call | OpCode::CallInd => {
+                    if owned {
+                        let target = direct_call_target(op);
+                        let args = X86_64_SYSV_ARG_REGS
+                            .iter()
+                            .map(|&(offset, name)| ResolvedArg {
+                                reg_offset: offset,
+                                reg_name: name,
+                                value: tracker.reg64(offset),
+                            })
+                            .collect();
+                        out.push(CallSite {
+                            call_site: insn.address,
+                            caller_function: entry,
+                            call_target: target,
+                            args,
+                        });
+                    }
+                    tracker.clear_for_call();
+                }
+                _ => tracker.apply(op),
+            }
+        }
+    }
+    out
+}
+
 /// Whether `summary` pins any parameter (seeds the tracker). A walk
 /// with no seed is the round-0 walk.
 fn seeds_anything(summary: Option<&Vec<Option<rustc_hash::FxHashSet<u64>>>>) -> bool {

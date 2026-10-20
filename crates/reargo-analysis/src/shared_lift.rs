@@ -47,7 +47,7 @@ use rayon::prelude::*;
 use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
-use crate::callsite::{walk_function_shaped, CallSite, ParamSummaries};
+use crate::callsite::{walk_function_marked, walk_function_shaped, CallSite, ParamSummaries};
 use crate::func_lift::function_jobs;
 
 /// One function's results.
@@ -352,29 +352,51 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         Some(jumps) => jumps.external_entries_ordered(program, &shape.addrs, shape.increasing),
         None => crate::func_lift::external_entries_at(program, &shape.addrs),
     };
-    // Who owns each call instruction, asked once: the walk, the blocks
-    // the flows keep and the check of a cached result all ask.
-    let calls: Vec<(u64, bool)> = shape
-        .has_call
-        .iter()
-        .zip(&shape.addrs)
-        .filter(|(call, _)| **call)
-        .map(|(_, &a)| (a, owner.owns(a)))
-        .collect();
+    let in_body = |a: u64| a >= entry && next_entry.is_none_or(|n| a < n);
+    // Of an increasing lift (all but a range wrapping around), what the
+    // walk and the blocks both need, found in one pass: jump targets,
+    // external entries, and who owns each call instruction (the walk,
+    // the blocks the flows keep and the check of a cached result all
+    // ask).
+    let mut marks = shape
+        .increasing
+        .then(|| crate::blockflow::LiftMarks::new(&shape, &external, |i| owner.owns(shape.addrs[i])));
+    let calls: Vec<(u64, bool)> = match &mut marks {
+        Some(marks) => std::mem::take(&mut marks.calls),
+        None => shape
+            .has_call
+            .iter()
+            .zip(&shape.addrs)
+            .filter(|(call, _)| **call)
+            .map(|(_, &a)| (a, owner.owns(a)))
+            .collect(),
+    };
     let owns_call = |a: u64| match calls.binary_search_by_key(&a, |c| c.0) {
         Ok(k) => calls[k].1,
         Err(_) => owner.owns(a),
     };
-    let walk = walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call);
+    let walk = match &marks {
+        Some(marks) => walk_function_marked(entry, insns, &shape, marks, &ParamSummaries::default()),
+        None => walk_function_shaped(entry, insns, &shape, &ParamSummaries::default(), &external, owns_call),
+    };
     // The walk asks who owns each call instruction.
     let mut addrs: BTreeSet<u64> = calls.iter().map(|c| c.0).collect();
     let snapshots = with_snapshots.then(|| {
         // both flows walk the same blocks (`in_extent` with the next
-        // entry looked up once)
-        let mut blocks =
-            crate::blockflow::Cfg::build_shaped(&shape, &external, |a| a >= entry && next_entry.is_none_or(|n| a < n));
-        // only the snapshots of the calls the function owns are kept
-        blocks.keep_calls_at(insns.len(), |i| shape.has_call[i] && owns_call(shape.addrs[i]));
+        // entry looked up once), keeping only the snapshots of the
+        // calls the function owns
+        let blocks = match &marks {
+            Some(marks) => {
+                let mut blocks = crate::blockflow::Cfg::build_marked(&shape, marks, in_body);
+                blocks.keep_owned_calls(marks);
+                blocks
+            }
+            None => {
+                let mut blocks = crate::blockflow::Cfg::build_shaped(&shape, &external, in_body);
+                blocks.keep_calls_at(insns.len(), |i| shape.has_call[i] && owns_call(shape.addrs[i]));
+                blocks
+            }
+        };
         let mut cfg = crate::cfg_const::function_snapshots_cfg(&blocks, insns);
         let mut vsa = crate::vsa::function_snapshots_cfg(&blocks, insns);
         addrs.extend(cfg.iter().map(|(a, _)| *a));
