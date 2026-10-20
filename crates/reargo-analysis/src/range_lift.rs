@@ -46,10 +46,10 @@ impl Span {
 /// cache. A function's lift runs well past its end, over the next
 /// functions, which a run lifts once: a job costs the instructions it
 /// lifts that the jobs before it in its run did not, plus its own work.
-/// Each run is filled to an even share of the total cost split many
+/// Each run is filled up to an even share of the total cost split many
 /// ways per thread (so no thread is left with a run of large functions
-/// at the end), then ended, among the next [`CHUNK`] jobs, before the
-/// one whose lift the run covers least — the next run lifts again what
+/// at the end), then ended, among the next [`CHUNK`] jobs (up to half
+/// a share more), before the one whose lift the run covers least — the next run lifts again what
 /// the run lifted from that job's entry on (the end of a large
 /// function's lift, the functions after it read).
 pub(crate) fn span_chunks(spans: &[Span]) -> Vec<std::ops::Range<usize>> {
@@ -73,9 +73,9 @@ fn span_chunks_for(spans: &[Span], threads: usize) -> Vec<std::ops::Range<usize>
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < spans.len() {
-        // fill the run to its share
+        // fill the run up to its share
         let (mut reach, mut cost, mut k) = (0u64, 0usize, start);
-        while k < spans.len() && (k == start || cost < cap) {
+        while k < spans.len() && (k == start || cost + spans[k].cost(reach) <= cap) {
             cost += spans[k].cost(reach);
             reach = reach.max(spans[k].end());
             k += 1;
@@ -83,8 +83,12 @@ fn span_chunks_for(spans: &[Span], threads: usize) -> Vec<std::ops::Range<usize>
         // then end it before the job (of the next ones) whose lift it
         // covers least, or with the last job
         let mut cut = (k, reach.saturating_sub(spans.get(k).map_or(u64::MAX, |s| s.entry)));
-        let mut j = k;
+        let (mut j, mut more) = (k, 0);
         while j < spans.len() && j < k + CHUNK && cut.1 > 0 {
+            more += spans[j].cost(reach);
+            if more > cap / 2 {
+                break;
+            }
             reach = reach.max(spans[j].end());
             j += 1;
             let overlap = spans.get(j).map_or(0, |s| reach.saturating_sub(s.entry));
