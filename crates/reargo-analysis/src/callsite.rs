@@ -490,18 +490,21 @@ where
                 .iter()
                 .map(|&(entry, max_insns)| crate::range_lift::Span { entry, insns: max_insns, work: max_insns })
                 .collect();
-            crate::range_lift::span_chunks(&spans)
+            // (the runs one rayon job takes, in order, share one cache)
+            let runs: Vec<Vec<Option<T>>> = crate::range_lift::span_chunks(&spans)
                 .into_par_iter()
-                .flat_map_iter(|run| {
-                    let mut cache = reargo_lift::x86::LiftCache::new();
-                    let f = &f;
-                    jobs[run].iter().map(move |&(entry, max_insns)| {
-                        crate::range_lift::trim(&mut cache, entry);
-                        let range = x86.lift_range_cached(memory, entry, max_insns, &mut cache);
-                        Some(f(entry, &range.insns()))
-                    })
+                .map_init(reargo_lift::x86::LiftCache::new, |cache, run| {
+                    jobs[run]
+                        .iter()
+                        .map(|&(entry, max_insns)| {
+                            crate::range_lift::trim(cache, entry);
+                            let range = x86.lift_range_cached(memory, entry, max_insns, cache);
+                            Some(f(entry, &range.insns()))
+                        })
+                        .collect()
                 })
-                .collect()
+                .collect();
+            runs.into_iter().flatten().collect()
         }
         None => jobs
             .par_iter()
@@ -869,8 +872,27 @@ fn join_points<I: std::borrow::Borrow<LiftedInstruction>>(insns: &[I]) -> Vec<bo
 /// instructions: the targets of their `Branch` / `CBranch` ops, and
 /// the instructions after a `Branch` / `BranchInd` / `Return`.
 fn join_points_shaped(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
-    let targets: rustc_hash::FxHashSet<u64> = shape.branches.iter().map(|&(_, t)| t).collect();
     let mut out = vec![false; shape.addrs.len()];
+    if shape.increasing {
+        // (one address per instruction: each target is the address of at most one, found
+        // by its place among the ascending addresses)
+        for &(_, t) in &shape.branches {
+            if let Ok(i) = shape.addrs.binary_search(&t) {
+                out[i] = true;
+            }
+        }
+        for (o, &stop) in out.iter_mut().skip(1).zip(&shape.stops) {
+            *o |= stop;
+        }
+        return out;
+    }
+    join_points_hashed(shape)
+}
+
+/// [`join_points_shaped`] for any lift (the addresses need not increase).
+fn join_points_hashed(shape: &crate::blockflow::LiftShape) -> Vec<bool> {
+    let mut out = vec![false; shape.addrs.len()];
+    let targets: rustc_hash::FxHashSet<u64> = shape.branches.iter().map(|&(_, t)| t).collect();
     let mut after_terminator = false;
     for (i, &a) in shape.addrs.iter().enumerate() {
         out[i] = after_terminator || targets.contains(&a);
@@ -894,6 +916,41 @@ fn direct_call_target(op: &reargo_core::pcode::PcodeOp) -> Option<u64> {
 mod tests {
     use super::*;
     use reargo_core::pcode::{PcodeOp, SeqNum};
+
+    /// The join points found by the ascending addresses are the ones the hashed targets
+    /// give.
+    #[test]
+    fn join_points_increasing_match_hashed() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..200 {
+            let n = next(60) as usize;
+            let mut addrs = Vec::with_capacity(n);
+            let mut a = 0x1000 + next(8);
+            for _ in 0..n {
+                addrs.push(a);
+                a += 1 + next(7);
+            }
+            let branches = (0..next(12))
+                .map(|_| (next(n.max(1) as u64) as usize, 0xff8 + next(a - 0xff0)))
+                .collect::<Vec<_>>();
+            let stops = (0..n).map(|_| next(4) == 0).collect::<Vec<_>>();
+            let shape = crate::blockflow::LiftShape {
+                increasing: true,
+                has_call: vec![false; n],
+                ends_block: stops.clone(),
+                addrs,
+                branches,
+                stops,
+            };
+            assert_eq!(join_points_shaped(&shape), join_points_hashed(&shape));
+        }
+    }
     use smallvec::SmallVec;
 
     fn const_vn(value: u64) -> VarnodeData {

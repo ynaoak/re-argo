@@ -228,8 +228,9 @@ fn build_buckets(data: &[u8]) -> ([u32; 128], u8) {
                 .map(|c| {
                     let mut b = [0u32; 128];
                     let end = ((c + 1) * CHUNK).min(windows);
+                    let first = FirstLookups::new();
                     for w in data[c * CHUNK..end + 4].windows(5) {
-                        bucket_window(&mut b, w);
+                        first.bucket_window(&mut b, w);
                     }
                     b
                 })
@@ -259,7 +260,34 @@ fn build_buckets(data: &[u8]) -> ([u32; 128], u8) {
     )
 }
 
-/// Count the 6 bucket updates of one 5-byte window `p`.
+/// The first two lookups of [`b_mapping`] for each salt of [`bucket_window`] (they
+/// depend on the salt and the window's first byte alone): `V[V[salt] ^ a]` by `a`.
+struct FirstLookups([[u8; 256]; 6]);
+
+impl FirstLookups {
+    const SALTS: [u8; 6] = [2, 3, 5, 7, 11, 13];
+
+    fn new() -> Self {
+        Self(std::array::from_fn(|s| {
+            std::array::from_fn(|a| V_TABLE[(V_TABLE[Self::SALTS[s] as usize] ^ a as u8) as usize])
+        }))
+    }
+
+    /// [`bucket_window`].
+    #[inline]
+    fn bucket_window(&self, buckets: &mut [u32; 128], p: &[u8]) {
+        let a = p[0] as usize;
+        let rest = [(p[1], p[2]), (p[1], p[3]), (p[2], p[3]), (p[2], p[4]), (p[1], p[4]), (p[3], p[4])];
+        for (first, (b, c)) in self.0.iter().zip(rest) {
+            let idx = V_TABLE[(V_TABLE[(first[a] ^ b) as usize] ^ c) as usize];
+            buckets[(idx & 0x7F) as usize] += 1;
+        }
+    }
+}
+
+/// Count the 6 bucket updates of one 5-byte window `p` (the reference form of
+/// [`FirstLookups::bucket_window`]).
+#[cfg(test)]
 fn bucket_window(buckets: &mut [u32; 128], p: &[u8]) {
     // The TLSH bucket-mapping function pairs the salts with
     // specific byte positions to spread information across the
@@ -278,6 +306,7 @@ fn bucket_window(buckets: &mut [u32; 128], p: &[u8]) {
 
 /// Pearson hash with salt — see TLSH reference. Three inputs are
 /// mapped through the 256-byte Pearson permutation table.
+#[cfg(test)]
 fn b_mapping(salt: u8, i: u8, j: u8, k: u8) -> u8 {
     let mut h = 0u8;
     h = V_TABLE[(h ^ salt) as usize];

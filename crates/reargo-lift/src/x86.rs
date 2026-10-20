@@ -419,7 +419,7 @@ impl LiftCache {
             lifter.decode_in_block(memory, addr, block).and_then(|insn| lifter.lift_decoded(insn, addr, None)).ok();
         let (flags, len, shape) = match &lifted {
             Some(insn) => {
-                let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
                 let flags = if x87 { X87 } else { 0 } | if reads_outside_pf(insn) { READS_PF } else { 0 };
                 let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
                 (flags, len, crate::lift::InsnShape::of(insn))
@@ -789,6 +789,45 @@ impl X86Lifter {
         fast.decode_in_block(memory, addr, &mut cursor.0).and_then(|insn| fast.lift_decoded(insn, addr, None))
     }
 
+    /// Of the instruction at `addr` (decoded through `cursor`): its length, whether
+    /// [`Self::lift_alone_with`] gives a `Return` / `BranchInd` op, and its iced flow control;
+    /// `None` when that lift fails. Instructions alike but for their memory displacement or
+    /// branch target ([`Self::alike_key`]) lift to the same ops but for those values, so
+    /// whether one lifts and ends the flow is lifted once per thread for them all.
+    pub fn ends_alone_with<'m>(
+        &self,
+        memory: &'m Memory,
+        addr: u64,
+        cursor: &mut DecodeCursor<'m>,
+    ) -> Option<(u32, bool, iced_x86::FlowControl)> {
+        thread_local! {
+            /// Whether the lift ends the flow (`None`: it fails), by [`X86Lifter::alike_key`].
+            static ENDS_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<(bool, iced_x86::Instruction), Option<bool>>> =
+                std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+        }
+        let fast = X86Lifter { is_64: self.is_64, parity: false };
+        let insn = fast.decode_in_block(memory, addr, &mut cursor.0).ok()?;
+        let key = fast.alike_key(&insn);
+        let ends = match ENDS_MEMO.with(|m| m.borrow().get(&key).copied()) {
+            Some(ends) => ends,
+            None => {
+                let ends = fast
+                    .lift_decoded(insn, addr, None)
+                    .ok()
+                    .map(|l| l.ops.iter().any(|o| matches!(o.opcode, OpCode::Return | OpCode::BranchInd)));
+                ENDS_MEMO.with(|m| {
+                    let mut m = m.borrow_mut();
+                    if m.len() >= FACT_MEMO_CAP {
+                        m.clear();
+                    }
+                    m.insert(key, ends);
+                });
+                ends
+            }
+        };
+        Some((insn.len() as u32, ends?, insn.flow_control()))
+    }
+
     /// The instruction [`Self::lift_alone_with`] lifts at `addr` (decoded through `cursor`).
     pub fn decode_alone_with<'m>(&self, memory: &'m Memory, addr: u64, cursor: &mut DecodeCursor<'m>) -> Result<iced_x86::Instruction, LiftError> {
         self.decode_in_block(memory, addr, &mut cursor.0)
@@ -869,7 +908,7 @@ impl X86Lifter {
             Ok(insn) => {
                 let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
                 let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
-                let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
                 let control = insn.ops.iter().any(|o| {
                     matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Call | OpCode::CallInd | OpCode::Return)
                 });
@@ -1289,21 +1328,13 @@ impl X86Lifter {
     /// lift would stop, so `false` means no `CallInd` in the lifted range.
     pub fn range_has_indirect_call(&self, memory: &Memory, start: u64, count: usize) -> bool {
         use iced_x86::OpKind;
-        let bitness = if self.is_64 { 64 } else { 32 };
-        let mut buf = [0u8; 15];
-        let mut insn = iced_x86::Instruction::default();
+        let mut block = None;
         let mut addr = start;
         for _ in 0..count {
-            let read_len = memory.read_instruction_bytes(addr, &mut buf);
-            if read_len == 0 {
+            // (an unreadable or invalid instruction: an error)
+            let Ok(insn) = self.decode_in_block(memory, addr, &mut block) else {
                 return false;
-            }
-            let mut decoder =
-                iced_x86::Decoder::with_ip(bitness, &buf[..read_len], addr, iced_x86::DecoderOptions::NONE);
-            decoder.decode_out(&mut insn);
-            if insn.is_invalid() {
-                return false;
-            }
+            };
             if insn.mnemonic() == iced_x86::Mnemonic::Call
                 && !matches!(insn.op_kind(0), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64)
             {
@@ -3532,12 +3563,12 @@ impl X86Lifter {
         // Only a range with an x87 instruction (checked on the decoded
         // instructions first: formatting the text costs more) and an
         // instruction whose text starts with `f` is rewritten.
-        if !lifted.iter().any(|l| l.borrow().mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87)) {
+        if !lifted.iter().any(|l| l.borrow().mnemonic.x86_instruction().is_none_or(x87::is_x87)) {
             return None;
         }
         // (the texts of the x87 ones first: they are the ones that start
         // with `f`, and each text is formatted when first read)
-        let maybe_x87 = |l: &LiftedInstruction| l.mnemonic.x86_instruction().is_none_or(|i| x87::kind(i) != x87::Kind::NotX87);
+        let maybe_x87 = |l: &LiftedInstruction| l.mnemonic.x86_instruction().is_none_or(x87::is_x87);
         if !lifted.iter().map(|l| l.borrow()).filter(|l| maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
             && !lifted.iter().map(|l| l.borrow()).filter(|l| !maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
         {
@@ -3559,7 +3590,7 @@ impl X86Lifter {
                 (!insn.is_invalid()).then_some(insn)
             })
             .collect();
-        if !decoded.iter().flatten().any(|d| x87::kind(d) != x87::Kind::NotX87) {
+        if !decoded.iter().flatten().any(x87::is_x87) {
             return None;
         }
         let flow = x87::flow(lifted, &decoded);
@@ -3567,7 +3598,7 @@ impl X86Lifter {
         for (i, l) in lifted.iter().enumerate() {
             let l = l.borrow();
             let Some(d) = &decoded[i] else { continue };
-            if x87::kind(d) != x87::Kind::NotX87 {
+            if x87::is_x87(d) {
                 if let Ok((again, _)) = self.lift_one(memory, l.address, flow.ctx[i]) {
                     changes.push((i, X87Change::Relift(again)));
                 }
@@ -3855,7 +3886,8 @@ fn gpr_view(v: &VarnodeData) -> bool {
 
 /// `ah`/`ch`/`dh`/`bh`: byte 1 of rax..rbx (WS84).
 fn high_byte(v: &VarnodeData) -> bool {
-    v.space == REG_SPACE && v.offset < 0x20 && v.offset % 8 == 1 && v.size == 1
+    // (the size first: most varnodes are wider)
+    v.size == 1 && v.offset % 8 == 1 && v.offset < 0x20 && v.space == REG_SPACE
 }
 
 /// The XMM register a 4 / 8 / 16-byte view of it starts.
@@ -4070,6 +4102,36 @@ mod tests {
             data: Some(Arc::from(data)),
         });
         mem
+    }
+
+    /// [`X86Lifter::ends_alone_with`] (memoised per alike instruction) gives the length and
+    /// end of [`X86Lifter::lift_alone_with`] and the flow of the decoded instruction, at
+    /// every address of random code mixed with common opcodes and RIP-relative / branch
+    /// operands (alike instructions at other addresses).
+    #[test]
+    fn ends_alone_matches_lift_alone() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        const COMMON: [u8; 16] = [0xc3, 0xff, 0xe8, 0xe9, 0x48, 0x8b, 0x05, 0x0f, 0x84, 0x25, 0xd9, 0xdd, 0xf3, 0x66, 0x41, 0xeb];
+        let code: Vec<u8> = (0..0x4000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed.is_multiple_of(2) { COMMON[(seed >> 8) as usize % COMMON.len()] } else { (seed >> 16) as u8 }
+            })
+            .collect();
+        let mem = make_memory(&code, 0x10000);
+        for lifter in [X86Lifter::new_64(), X86Lifter::new_32()] {
+            let (mut c1, mut c2) = (DecodeCursor::default(), DecodeCursor::default());
+            for addr in 0x10000..0x10000 + code.len() as u64 {
+                let want = lifter.lift_alone_with(&mem, addr, &mut c1).ok().map(|l| {
+                    let ends = l.ops.iter().any(|o| matches!(o.opcode, OpCode::Return | OpCode::BranchInd));
+                    let flow = lifter.decode_alone_with(&mem, addr, &mut c2).expect("lifted").flow_control();
+                    (l.length, ends, flow)
+                });
+                assert_eq!(lifter.ends_alone_with(&mem, addr, &mut c2), want, "at {addr:#x}");
+            }
+        }
     }
 
     /// Decoding through a block decoder reads what `read_instruction_bytes`

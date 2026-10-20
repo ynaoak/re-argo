@@ -38,7 +38,6 @@
 use std::collections::BTreeSet;
 
 use reargo_arch::FlowType;
-use reargo_lift::PcodeLift;
 use reargo_program::function::Function;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
@@ -84,16 +83,8 @@ impl Analyzer for LinearSweepAnalyzer {
         // function body so we can reject candidates that fall
         // inside known territory.
         // (A body's runs of adjacent ranges cover what its ranges do.)
-        let mut raw_ranges: Vec<(u64, u64)> = Vec::new();
-        for f in program.listing.functions() {
-            raw_ranges.extend(f.body.runs());
-        }
-        let covered = Covered::from_ranges(raw_ranges);
-        // the bodies the sweep adds, apart (mostly appended in address
-        // order, where the known bodies' intervals would have to move)
-        let mut added_bodies = Covered::default();
-        let is_covered = |added: &Covered, a: u64| covered.contains(a) || added.contains(a);
-
+        // Meanwhile the 16-byte boundaries starting with a prologue are found (those
+        // covered are dropped after).
         let exec_sections: Vec<(u64, u64)> = program
             .info
             .sections
@@ -101,6 +92,20 @@ impl Analyzer for LinearSweepAnalyzer {
             .filter(|s| s.flags.contains(reargo_loader::SectionFlags::EXECUTE))
             .map(|s| (s.address, s.address + s.size))
             .collect();
+        let (covered, prologues) = rayon::join(
+            || {
+                let mut raw_ranges: Vec<(u64, u64)> = Vec::new();
+                for f in program.listing.functions() {
+                    raw_ranges.extend(f.body.runs());
+                }
+                Covered::from_ranges(raw_ranges)
+            },
+            || prologue_entries(program, &exec_sections),
+        );
+        // the bodies the sweep adds, apart (mostly appended in address
+        // order, where the known bodies' intervals would have to move)
+        let mut added_bodies = Covered::default();
+        let is_covered = |added: &Covered, a: u64| covered.contains(a) || added.contains(a);
 
         let lifter = reargo_lift::x86::X86Lifter::new_64().without_parity();
         let mut new_functions: Vec<(u64, u64)> = Vec::new();
@@ -108,7 +113,7 @@ impl Analyzer for LinearSweepAnalyzer {
         // The candidates the sweep can try and what validating each
         // finds when nothing it looks at is covered, computed ahead in
         // parallel (see [`Candidate`]).
-        let candidates = candidates(program, &lifter, &exec_sections, &covered);
+        let candidates = candidates(program, &lifter, prologues, &covered);
         // Every 16-byte boundary of the executable sections in order;
         // those that are no candidate are skipped here whatever happens
         // (covered before the sweep, or no prologue).
@@ -332,17 +337,9 @@ impl Candidate {
     }
 }
 
-/// Every [`Candidate`] of the executable sections, in the sweep's
-/// order, with its walk computed in parallel. The walk is a pure
-/// function of the bytes and the listing (which the sweep does not
-/// change); only the covered bodies, which grow as it goes, are left
-/// to the sweep.
-fn candidates(
-    program: &Program,
-    lifter: &reargo_lift::x86::X86Lifter,
-    exec_sections: &[(u64, u64)],
-    covered: &Covered,
-) -> Vec<Candidate> {
+/// The 16-byte boundaries `addr` of the executable sections (in order) with
+/// `addr + 8` in the section that start with a prologue (16 bytes read there).
+fn prologue_entries(program: &Program, exec_sections: &[(u64, u64)]) -> Vec<u64> {
     use rayon::prelude::*;
     let mut entries: Vec<u64> = Vec::new();
     for &(sec_start, sec_end) in exec_sections {
@@ -353,21 +350,37 @@ fn candidates(
             let addr = first + 16 * k as u64;
             // Pull 16 bytes to test against the prologue dict.
             let mut probe = [0u8; 16];
-            (!covered.contains(addr)
-                && program.info.memory.read_bytes(addr, &mut probe).is_ok()
-                && looks_like_prologue(&probe))
-            .then_some(addr)
+            (program.info.memory.read_bytes(addr, &mut probe).is_ok() && looks_like_prologue(&probe)).then_some(addr)
         }));
     }
+    entries
+}
+
+/// Every [`Candidate`] of `entries` (the [`prologue_entries`] of the executable sections)
+/// not covered by the known bodies, in the sweep's
+/// order, with its walk computed in parallel. The walk is a pure
+/// function of the bytes and the listing (which the sweep does not
+/// change); only the covered bodies, which grow as it goes, are left
+/// to the sweep.
+fn candidates(
+    program: &Program,
+    lifter: &reargo_lift::x86::X86Lifter,
+    mut entries: Vec<u64>,
+    covered: &Covered,
+) -> Vec<Candidate> {
+    use rayon::prelude::*;
+    entries.retain(|&addr| !covered.contains(addr));
     entries
         .par_chunks(64)
         .map(|chunk| {
             // neighbouring candidates walk the same instructions
-            let mut lifts = Lifts::default();
+            // (neighbouring walks: hundreds of instructions or a few thousand)
+            let mut lifts = Lifts::with_capacity_and_hasher(2048, Default::default());
+            let mut cursor = reargo_lift::x86::DecodeCursor::default();
             chunk
                 .iter()
                 .map(|&entry| {
-                    let mut candidate = walk_candidate(lifter, program, entry, &mut lifts);
+                    let mut candidate = walk_candidate(lifter, program, entry, &mut lifts, &mut cursor);
                     candidate.known = covered.hits(&candidate.checked);
                     candidate
                 })
@@ -381,13 +394,19 @@ fn candidates(
 
 /// The [`Candidate`] at `entry`: [`validate_candidate_with_extent`]
 /// with the covered checks left out.
-fn walk_candidate(lifter: &dyn PcodeLift, program: &Program, entry: u64, lifts: &mut Lifts) -> Candidate {
+fn walk_candidate<'m>(
+    lifter: &reargo_lift::x86::X86Lifter,
+    program: &'m Program,
+    entry: u64,
+    lifts: &mut Lifts,
+    cursor: &mut reargo_lift::x86::DecodeCursor<'m>,
+) -> Candidate {
     let mut checked = Vec::new();
     let mut count = 0usize;
     let mut addr = entry;
     let mut end: Option<u64> = None;
     while count < VALIDATE_BUDGET {
-        let Some((length, terminates)) = lift_at(lifter, program, addr, lifts) else { break };
+        let Some((length, terminates)) = lift_at(lifter, program, addr, lifts, cursor) else { break };
         count += 1;
         let next = addr + length as u64;
         if end.is_none() {
@@ -407,29 +426,36 @@ fn walk_candidate(lifter: &dyn PcodeLift, program: &Program, entry: u64, lifts: 
 /// Instructions [`validate_candidate_with_extent`] lifts at most.
 const VALIDATE_BUDGET: usize = 256;
 
-/// The lift of `addr` for [`Lifts`], from `lifts` or lifted now.
-fn lift_at(lifter: &dyn PcodeLift, program: &Program, addr: u64, lifts: &mut Lifts) -> Option<(u32, bool)> {
+/// The lift of `addr` for [`Lifts`], from `lifts` or lifted now (alone, without the
+/// integer PF, which adds no `Return` / `BranchInd`; decoded through `cursor`).
+fn lift_at<'m>(
+    lifter: &reargo_lift::x86::X86Lifter,
+    program: &'m Program,
+    addr: u64,
+    lifts: &mut Lifts,
+    cursor: &mut reargo_lift::x86::DecodeCursor<'m>,
+) -> Option<(u32, bool)> {
     *lifts.entry(addr).or_insert_with(|| {
-        lifter.lift_instruction(&program.info.memory, addr).ok().map(|insn| {
-            // Look at the underlying `DecodedInstruction.flow_type` via
-            // the listing if the address is decoded, else inspect
-            // the P-code op to detect a Return. The lifter's
-            // `LiftedInstruction` carries the raw bytes + ops but not
-            // the high-level flow_type, so we check op opcode directly.
-            let pcode_terminates = insn.ops.iter().any(|op| {
-                matches!(op.opcode, reargo_core::pcode::OpCode::Return | reargo_core::pcode::OpCode::BranchInd)
-            });
-            let flow_terminates = program.listing.get_instruction(addr).is_some_and(|m| {
-                matches!(m.flow_type, FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall)
-            });
-            (insn.length, pcode_terminates || flow_terminates)
+        lifter.ends_alone_with(&program.info.memory, addr, cursor).map(|(length, pcode_terminates, flow)| {
+            // The lifter's `LiftedInstruction` carries the ops but not the high-level flow
+            // type: a `Return` / `BranchInd` op ends the flow, and so does a returning or
+            // indirect-flow instruction the listing has at the address. The listing's
+            // instructions are the decodes of the same bytes (Function Discovery's), so
+            // its flow type there is this instruction's: only a `ret` or an indirect jump
+            // or call is looked up.
+            use iced_x86::FlowControl;
+            let flow_terminates = matches!(flow, FlowControl::Return | FlowControl::IndirectBranch | FlowControl::IndirectCall)
+                && program.listing.get_instruction(addr).is_some_and(|m| {
+                    matches!(m.flow_type, FlowType::Return | FlowType::IndirectJump | FlowType::IndirectCall)
+                });
+            (length, pcode_terminates || flow_terminates)
         })
     })
 }
 
 #[cfg(test)]
 fn validate_candidate_with_extent(
-    lifter: &dyn PcodeLift,
+    lifter: &reargo_lift::x86::X86Lifter,
     program: &Program,
     entry: u64,
     covered: &Covered,
@@ -445,8 +471,9 @@ fn validate_candidate_with_extent(
     let mut count = 0usize;
     let mut addr = entry;
     let mut end: Option<u64> = None;
+    let mut cursor = reargo_lift::x86::DecodeCursor::default();
     while count < BUDGET {
-        let lifted = lift_at(lifter, program, addr, lifts);
+        let lifted = lift_at(lifter, program, addr, lifts, &mut cursor);
         let Some((length, terminates)) = lifted else { break };
         count += 1;
         let next = addr + length as u64;
@@ -616,7 +643,7 @@ mod tests {
                 .collect();
             let covered = Covered::from_ranges(ranges);
             let entry = base + u64::from(next() % 380);
-            let walk = walk_candidate(&lifter, &program, entry, &mut Lifts::default());
+            let walk = walk_candidate(&lifter, &program, entry, &mut Lifts::default(), &mut Default::default());
             let want = validate_candidate_with_extent(&lifter, &program, entry, &covered, &mut Lifts::default());
             assert_eq!(walk.validate(|a| covered.contains(a)), want, "round {round} entry {entry:#x}");
             assert_eq!(covered.hits(&walk.checked), walk.checked.iter().any(|&a| covered.contains(a)));

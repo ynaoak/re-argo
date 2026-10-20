@@ -141,14 +141,16 @@ where
     F: Fn(&J, &mut RangeLifter) -> T + Sync,
 {
     let spans: Vec<Span> = jobs.iter().map(span).collect();
-    span_chunks(&spans)
+    // (the runs one rayon job takes, in order, share one cache: a run lifts again only what
+    // the run before it did not — its ranges overlap the next run's start)
+    let runs: Vec<Vec<T>> = span_chunks(&spans)
         .into_par_iter()
-        .flat_map_iter(|run| {
-            let mut lifter = RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() };
-            let f = &f;
-            jobs[run].iter().map(move |job| f(job, &mut lifter))
-        })
-        .collect()
+        .map_init(
+            || RangeLifter { lifter: X86Lifter::new_64(), memory, cache: LiftCache::new() },
+            |lifter, run| jobs[run].iter().map(|job| f(job, lifter)).collect(),
+        )
+        .collect();
+    runs.into_iter().flatten().collect()
 }
 
 /// Lifts ranges through one [`LiftCache`].

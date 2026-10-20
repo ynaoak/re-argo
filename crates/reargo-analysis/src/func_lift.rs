@@ -100,17 +100,35 @@ pub fn external_entries_at(program: &Program, addrs: &[u64]) -> std::collections
     use reargo_program::RefType;
     // a linear lift: addresses increase
     let lifted = |a: u64| addrs.binary_search(&a).is_ok();
-    addrs
-        .iter()
-        .copied()
-        .filter(|&a| {
-            program.references.get_refs_to(a).iter().any(|r| match r.ref_type {
-                RefType::IndirectJump => true,
-                RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
-                _ => false,
-            })
+    let enters = |refs: &[reargo_program::Reference]| {
+        refs.iter().any(|r| match r.ref_type {
+            RefType::IndirectJump => true,
+            RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
+            _ => false,
         })
-        .collect()
+    };
+    if let (Some(&first), Some(&last)) = (addrs.first(), addrs.last())
+        && addrs.windows(2).all(|w| w[0] < w[1])
+    {
+        // (the addresses with references in the lift's span, stepped through beside the
+        // lifted ones, instead of a lookup per lifted address)
+        let mut at = 0;
+        let mut out = std::collections::BTreeSet::new();
+        for (to, refs) in program.references.refs_to_range(first, last.saturating_add(1)) {
+            while addrs[at] < to {
+                at += 1;
+            }
+            if addrs[at] == to && enters(refs) {
+                out.insert(to);
+            }
+        }
+        // (`last` is `u64::MAX`: its references are not in the range)
+        if last == u64::MAX && enters(program.references.get_refs_to(last)) {
+            out.insert(last);
+        }
+        return out;
+    }
+    addrs.iter().copied().filter(|&a| enters(program.references.get_refs_to(a))).collect()
 }
 
 /// The jump references of a program by target, to compute
@@ -142,26 +160,60 @@ impl JumpIndex {
     /// [`JumpIndex::external_entries`] of a lift given by the addresses
     /// of its instructions, in lift order.
     pub fn external_entries_at(&self, program: &Program, addrs: &[u64]) -> std::collections::BTreeSet<u64> {
+        self.external_entries_ordered(program, addrs, addrs.windows(2).all(|w| w[0] < w[1]))
+    }
+
+    /// [`JumpIndex::external_entries_at`], `increasing` saying whether the addresses
+    /// strictly increase.
+    pub fn external_entries_ordered(
+        &self,
+        _program: &Program,
+        addrs: &[u64],
+        increasing: bool,
+    ) -> std::collections::BTreeSet<u64> {
         use reargo_program::RefType;
-        if !addrs.windows(2).all(|w| w[0] < w[1]) {
-            return external_entries_at(program, addrs);
+        if !increasing {
+            // [`external_entries_at`] (the index holds exactly the jump references the
+            // program's lists hold, in the order added for each target)
+            let lifted = |a: u64| addrs.binary_search(&a).is_ok();
+            return addrs
+                .iter()
+                .copied()
+                .filter(|&a| {
+                    let lo = self.refs.partition_point(|r| r.0 < a);
+                    self.refs[lo..].iter().take_while(|r| r.0 == a).any(|&(_, from, ty)| match ty {
+                        RefType::IndirectJump => true,
+                        RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(from),
+                        _ => false,
+                    })
+                })
+                .collect();
         }
         let mut out = std::collections::BTreeSet::new();
         let (Some(&first), Some(&last)) = (addrs.first(), addrs.last()) else {
             return out;
         };
-        let lifted = |a: u64| addrs.binary_search(&a).is_ok();
+        let lifted = |a: u64| a >= first && a <= last && addrs.binary_search(&a).is_ok();
         let start = self.refs.partition_point(|r| r.0 < first);
+        // (the targets ascend: whether one is lifted is found by stepping through the
+        // addresses alongside)
+        let mut at = 0;
+        let mut found = Vec::new();
         for &(to, from, ty) in self.refs[start..].iter().take_while(|r| r.0 <= last) {
-            let enters = match ty {
-                RefType::IndirectJump => true,
-                RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(from),
-                _ => false,
-            };
-            if enters && lifted(to) {
-                out.insert(to);
+            if !matches!(ty, RefType::IndirectJump | RefType::UnconditionalJump | RefType::ConditionalJump) {
+                continue;
+            }
+            while addrs[at] < to {
+                at += 1;
+            }
+            if addrs[at] != to || found.last() == Some(&to) {
+                continue;
+            }
+            if ty == RefType::IndirectJump || !lifted(from) {
+                found.push(to);
             }
         }
+        out.extend(found);
         out
     }
 }
@@ -172,4 +224,67 @@ impl JumpIndex {
 /// followed).
 pub fn in_extent(program: &Program, entry: u64, addr: u64) -> bool {
     addr >= entry && program.listing.next_function_after(entry).is_none_or(|f| addr < f.entry_point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reargo_program::{RefType, Reference};
+
+    /// The index gives what the program's reference lists give, for ascending lifts and
+    /// others.
+    #[test]
+    fn jump_index_matches_reference_lookups() {
+        let mut program = crate::testutil::helpers::make_x86_64_program(&[0xc3; 0x200], 0x1000);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let types = [
+            RefType::IndirectJump,
+            RefType::UnconditionalJump,
+            RefType::ConditionalJump,
+            RefType::UnconditionalCall,
+            RefType::FallThrough,
+        ];
+        for _ in 0..400 {
+            let r = Reference::new(0x1000 + next(0x80), 0x1000 + next(0x80), types[next(5) as usize]);
+            program.references.add(r);
+        }
+        let index = JumpIndex::new(&program);
+        for round in 0..300 {
+            let n = next(40) as usize;
+            let mut addrs: Vec<u64> = Vec::with_capacity(n);
+            let mut a = 0x1000 + next(16);
+            for _ in 0..n {
+                addrs.push(a);
+                a += 1 + next(5);
+            }
+            if round % 3 == 0 && n > 2 {
+                // (not ascending)
+                let k = next(n as u64) as usize;
+                addrs[k] = 0x1000 + next(0x80);
+            }
+            let increasing = addrs.windows(2).all(|w| w[0] < w[1]);
+            // (a lookup per lifted address)
+            let lifted = |a: u64| addrs.binary_search(&a).is_ok();
+            let want: std::collections::BTreeSet<u64> = addrs
+                .iter()
+                .copied()
+                .filter(|&a| {
+                    program.references.get_refs_to(a).iter().any(|r| match r.ref_type {
+                        RefType::IndirectJump => true,
+                        RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
+                        _ => false,
+                    })
+                })
+                .collect();
+            assert_eq!(external_entries_at(&program, &addrs), want, "{addrs:x?}");
+            assert_eq!(index.external_entries_at(&program, &addrs), want, "{addrs:x?}");
+            assert_eq!(index.external_entries_ordered(&program, &addrs, increasing), want);
+        }
+    }
 }

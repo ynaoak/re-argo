@@ -197,53 +197,57 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
         .into_iter()
         .map(|r| jobs.by_ref().take(r.len()).collect())
         .collect();
-    let computed: Vec<(FunctionResults, Extra)> = chunks
+    // (the runs one rayon job takes, in order, share one cache: a run lifts again only what
+    // the run before it did not)
+    let computed: Vec<Vec<(FunctionResults, Extra)>> = chunks
         .into_par_iter()
-        .flat_map_iter(|chunk| {
+        .map_init(reargo_lift::x86::LiftCache::new, |cache, chunk| {
             let (x86, jumps) = (&x86, jumps.as_ref());
-            let mut cache = reargo_lift::x86::LiftCache::new();
-            chunk.into_iter().map(move |(entry, max_insns, kept, arity_budget)| {
-                let cache = &mut cache;
-                if let Some(kept) = kept {
-                    return (kept, None);
-                }
-                crate::range_lift::trim(cache, entry);
-                let memory = &program.info.memory;
-                // The function's lift and, from the same walk (exactly
-                // their own linear lifts), Argument Arity's and Calling
-                // Convention's.
-                let mut results = None;
-                let mut arity = 0;
-                let mut convention = None;
-                let budgets: &[usize] = if with_snapshots {
-                    &[max_insns, arity_budget, crate::callingconv::LIFT_BUDGET]
-                } else {
-                    &[max_insns]
-                };
-                x86.lift_prefixes_cached(memory, entry, budgets, true, cache, |k, insns, shapes| match k {
-                    0 => {
-                        results = Some(compute_lifted(
-                            program,
-                            jumps,
-                            entry,
-                            max_insns,
-                            insns,
-                            shapes,
-                            with_snapshots,
-                        ))
+            chunk
+                .into_iter()
+                .map(|(entry, max_insns, kept, arity_budget)| {
+                    if let Some(kept) = kept {
+                        return (kept, None);
                     }
-                    1 => arity = crate::arity::infer_arity(insns),
-                    _ => convention = crate::callingconv::convention_lifted(entry, insns),
-                });
-                let results = results.expect("the function's lift");
-                let extra = with_snapshots.then_some((entry, arity_budget, arity, convention));
-                (results, extra)
-            })
+                    crate::range_lift::trim(cache, entry);
+                    let memory = &program.info.memory;
+                    // The function's lift and, from the same walk (exactly
+                    // their own linear lifts), Argument Arity's and Calling
+                    // Convention's.
+                    let mut results = None;
+                    let mut arity = 0;
+                    let mut convention = None;
+                    let budgets: &[usize] = if with_snapshots {
+                        &[max_insns, arity_budget, crate::callingconv::LIFT_BUDGET]
+                    } else {
+                        &[max_insns]
+                    };
+                    x86.lift_prefixes_cached(memory, entry, budgets, true, cache, |k, insns, shapes| match k {
+                        0 => {
+                            results = Some(compute_lifted(
+                                program,
+                                jumps,
+                                entry,
+                                max_insns,
+                                insns,
+                                shapes,
+                                with_snapshots,
+                            ))
+                        }
+                        1 => arity = crate::arity::infer_arity(insns),
+                        _ => convention = crate::callingconv::convention_lifted(entry, insns),
+                    });
+                    let results = results.expect("the function's lift");
+                    let extra = with_snapshots.then_some((entry, arity_budget, arity, convention));
+                    (results, extra)
+                    })
+                .collect()
         })
         .collect();
     let mut ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
     let funcs: Vec<FunctionResults> = computed
         .into_iter()
+        .flatten()
         .map(|(f, extra)| {
             if let (Some((arity, convention)), Some((entry, arity_budget, a, c))) = (ahead.as_mut(), extra) {
                 arity.insert((entry, arity_budget), a);
@@ -345,7 +349,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         None => crate::blockflow::LiftShape::of(insns),
     };
     let external = match jumps {
-        Some(jumps) => jumps.external_entries_at(program, &shape.addrs),
+        Some(jumps) => jumps.external_entries_ordered(program, &shape.addrs, shape.increasing),
         None => crate::func_lift::external_entries_at(program, &shape.addrs),
     };
     // Who owns each call instruction, asked once: the walk, the blocks

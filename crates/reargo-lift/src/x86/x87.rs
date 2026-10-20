@@ -91,6 +91,24 @@ fn has_memory(insn: &Instruction) -> bool {
     (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory)
 }
 
+/// Whether [`kind`] of `insn` is not [`Kind::NotX87`]: that depends on its mnemonic alone,
+/// looked up in a table made once from [`kind`] of an instruction of every code.
+pub(crate) fn is_x87(insn: &Instruction) -> bool {
+    static TABLE: std::sync::OnceLock<Box<[bool]>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = vec![false; Mnemonic::values().len()];
+        for code in iced_x86::Code::values() {
+            let mut insn = Instruction::default();
+            insn.set_code(code);
+            if kind(&insn) != Kind::NotX87 {
+                table[insn.mnemonic() as usize] = true;
+            }
+        }
+        table.into_boxed_slice()
+    });
+    table[insn.mnemonic() as usize]
+}
+
 pub(crate) fn kind(insn: &Instruction) -> Kind {
     use Mnemonic::*;
     // (the deepest register named, read only for an x87 instruction: most are none)
@@ -696,6 +714,29 @@ pub(crate) fn flow<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L], deco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`is_x87`] is [`kind`] not being [`Kind::NotX87`], on decoded instructions (the x87
+    /// opcodes and random bytes).
+    #[test]
+    fn is_x87_matches_kind() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut x87 = 0;
+        for n in 0..200_000u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut bytes = seed.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&[0; 8]);
+            if n % 2 == 0 {
+                // (an x87 escape opcode, 0xd8..=0xdf, or `wait`)
+                bytes[0] = if n % 16 == 0 { 0x9b } else { 0xd8 + (bytes[0] & 7) };
+            }
+            let insn = iced_x86::Decoder::new(64, &bytes, iced_x86::DecoderOptions::NONE).decode();
+            assert_eq!(is_x87(&insn), kind(&insn) != Kind::NotX87, "{bytes:02x?}");
+            x87 += usize::from(is_x87(&insn));
+        }
+        assert!(x87 > 10_000);
+    }
     use crate::PcodeLift;
     use reargo_core::address::Endian;
     use reargo_loader::memory::{MemoryBlock, MemoryFlags};
