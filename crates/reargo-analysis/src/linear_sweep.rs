@@ -88,7 +88,11 @@ impl Analyzer for LinearSweepAnalyzer {
         for f in program.listing.functions() {
             raw_ranges.extend(f.body.runs());
         }
-        let mut covered = Covered::from_ranges(raw_ranges);
+        let covered = Covered::from_ranges(raw_ranges);
+        // the bodies the sweep adds, apart (mostly appended in address
+        // order, where the known bodies' intervals would have to move)
+        let mut added_bodies = Covered::default();
+        let is_covered = |added: &Covered, a: u64| covered.contains(a) || added.contains(a);
 
         let exec_sections: Vec<(u64, u64)> = program
             .info
@@ -116,7 +120,7 @@ impl Analyzer for LinearSweepAnalyzer {
             // past `visited.insert` for the dominant case, so
             // `visited` never populated and we re-walked every
             // address.
-            if covered.contains(addr) || !visited.insert(addr) {
+            if is_covered(&added_bodies, addr) || !visited.insert(addr) {
                 continue;
             }
             // Speculatively lift up to 256 insns. Accept the
@@ -126,9 +130,10 @@ impl Analyzer for LinearSweepAnalyzer {
             // candidates inside the newly-found body get skipped
             // by the next iteration's `is_inside_function_body`
             // check (and not re-validated).
-            if let Some(end) = candidate.validate(&covered) {
+            // (the known bodies were checked ahead)
+            if let Some(end) = candidate.validate_added(&added_bodies) {
                 new_functions.push((addr, end));
-                covered.insert(addr, end);
+                added_bodies.insert(addr, end);
             }
         }
 
@@ -183,6 +188,30 @@ impl Covered {
             }
         }
         Self { ranges }
+    }
+
+    /// Whether one of the addresses `points` (sorted) lies in a range.
+    fn hits(&self, points: &[u64]) -> bool {
+        let (Some(&first), Some(&last)) = (points.first(), points.last()) else {
+            return false;
+        };
+        if !points.is_sorted() {
+            return points.iter().any(|&a| self.contains(a));
+        }
+        // the ranges from the first ending after `first` to the last
+        // starting at or before `last`, each asked for a point in it
+        let mut i = self.ranges.partition_point(|&(_, e)| e <= first);
+        while let Some(&(s, e)) = self.ranges.get(i) {
+            if s > last {
+                return false;
+            }
+            let k = points.partition_point(|&p| p < s);
+            if points.get(k).is_some_and(|&p| p < e) {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// True iff `addr` lies in `[s, e)` of some range that was added.
@@ -284,13 +313,22 @@ struct Candidate {
     checked: Vec<u64>,
     /// ... and its answer when none is covered.
     end: Option<u64>,
+    /// Whether one of `checked` is in the bodies known before the sweep.
+    known: bool,
 }
 
 impl Candidate {
     /// [`validate_candidate_with_extent`] of the candidate with the
-    /// bodies `covered`.
-    fn validate(&self, covered: &Covered) -> Option<u64> {
-        if self.checked.iter().any(|&a| covered.contains(a)) { None } else { self.end }
+    /// bodies covering the addresses `covered` says.
+    #[cfg(test)]
+    fn validate(&self, covered: impl Fn(u64) -> bool) -> Option<u64> {
+        if self.checked.iter().any(|&a| covered(a)) { None } else { self.end }
+    }
+
+    /// [`Candidate::validate`] with the bodies known before the sweep
+    /// (`known`) and `added`.
+    fn validate_added(&self, added: &Covered) -> Option<u64> {
+        if self.known || added.hits(&self.checked) { None } else { self.end }
     }
 }
 
@@ -308,18 +346,18 @@ fn candidates(
     use rayon::prelude::*;
     let mut entries: Vec<u64> = Vec::new();
     for &(sec_start, sec_end) in exec_sections {
-        let mut addr = (sec_start + 15) & !15;
-        while addr + 8 < sec_end {
+        let first = (sec_start + 15) & !15;
+        // the 16-byte boundaries `addr` with `addr + 8 < sec_end`
+        let steps = if first + 8 < sec_end { (sec_end - 9 - first) / 16 + 1 } else { 0 };
+        entries.par_extend((0..steps as usize).into_par_iter().with_min_len(4096).filter_map(|k| {
+            let addr = first + 16 * k as u64;
             // Pull 16 bytes to test against the prologue dict.
             let mut probe = [0u8; 16];
-            if !covered.contains(addr)
+            (!covered.contains(addr)
                 && program.info.memory.read_bytes(addr, &mut probe).is_ok()
-                && looks_like_prologue(&probe)
-            {
-                entries.push(addr);
-            }
-            addr += 16;
-        }
+                && looks_like_prologue(&probe))
+            .then_some(addr)
+        }));
     }
     entries
         .par_chunks(64)
@@ -328,7 +366,11 @@ fn candidates(
             let mut lifts = Lifts::default();
             chunk
                 .iter()
-                .map(|&entry| walk_candidate(lifter, program, entry, &mut lifts))
+                .map(|&entry| {
+                    let mut candidate = walk_candidate(lifter, program, entry, &mut lifts);
+                    candidate.known = covered.hits(&candidate.checked);
+                    candidate
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<Vec<Candidate>>>()
@@ -359,7 +401,7 @@ fn walk_candidate(lifter: &dyn PcodeLift, program: &Program, entry: u64, lifts: 
         }
         addr = next;
     }
-    Candidate { entry, checked, end: if count < 3 { None } else { end } }
+    Candidate { entry, checked, end: if count < 3 { None } else { end }, known: false }
 }
 
 /// Instructions [`validate_candidate_with_extent`] lifts at most.
@@ -576,7 +618,10 @@ mod tests {
             let entry = base + u64::from(next() % 380);
             let walk = walk_candidate(&lifter, &program, entry, &mut Lifts::default());
             let want = validate_candidate_with_extent(&lifter, &program, entry, &covered, &mut Lifts::default());
-            assert_eq!(walk.validate(&covered), want, "round {round} entry {entry:#x}");
+            assert_eq!(walk.validate(|a| covered.contains(a)), want, "round {round} entry {entry:#x}");
+            assert_eq!(covered.hits(&walk.checked), walk.checked.iter().any(|&a| covered.contains(a)));
+            let ahead = Candidate { known: covered.hits(&walk.checked), ..walk };
+            assert_eq!(ahead.validate_added(&Covered::default()), want);
             accepted += usize::from(want.is_some());
         }
         assert!(accepted > 20, "{accepted}");
