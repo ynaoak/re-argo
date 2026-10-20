@@ -1289,21 +1289,13 @@ impl X86Lifter {
     /// lift would stop, so `false` means no `CallInd` in the lifted range.
     pub fn range_has_indirect_call(&self, memory: &Memory, start: u64, count: usize) -> bool {
         use iced_x86::OpKind;
-        let bitness = if self.is_64 { 64 } else { 32 };
-        let mut buf = [0u8; 15];
-        let mut insn = iced_x86::Instruction::default();
+        let mut block = None;
         let mut addr = start;
         for _ in 0..count {
-            let read_len = memory.read_instruction_bytes(addr, &mut buf);
-            if read_len == 0 {
+            // (an unreadable or invalid instruction: an error)
+            let Ok(insn) = self.decode_in_block(memory, addr, &mut block) else {
                 return false;
-            }
-            let mut decoder =
-                iced_x86::Decoder::with_ip(bitness, &buf[..read_len], addr, iced_x86::DecoderOptions::NONE);
-            decoder.decode_out(&mut insn);
-            if insn.is_invalid() {
-                return false;
-            }
+            };
             if insn.mnemonic() == iced_x86::Mnemonic::Call
                 && !matches!(insn.op_kind(0), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64)
             {

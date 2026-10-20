@@ -150,18 +150,27 @@ impl JumpIndex {
         let (Some(&first), Some(&last)) = (addrs.first(), addrs.last()) else {
             return out;
         };
-        let lifted = |a: u64| addrs.binary_search(&a).is_ok();
+        let lifted = |a: u64| a >= first && a <= last && addrs.binary_search(&a).is_ok();
         let start = self.refs.partition_point(|r| r.0 < first);
+        // (the targets ascend: whether one is lifted is found by stepping through the
+        // addresses alongside)
+        let mut at = 0;
+        let mut found = Vec::new();
         for &(to, from, ty) in self.refs[start..].iter().take_while(|r| r.0 <= last) {
-            let enters = match ty {
-                RefType::IndirectJump => true,
-                RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(from),
-                _ => false,
-            };
-            if enters && lifted(to) {
-                out.insert(to);
+            if !matches!(ty, RefType::IndirectJump | RefType::UnconditionalJump | RefType::ConditionalJump) {
+                continue;
+            }
+            while addrs[at] < to {
+                at += 1;
+            }
+            if addrs[at] != to || found.last() == Some(&to) {
+                continue;
+            }
+            if ty == RefType::IndirectJump || !lifted(from) {
+                found.push(to);
             }
         }
+        out.extend(found);
         out
     }
 }

@@ -262,6 +262,14 @@ pub trait Architecture: Send + Sync {
         address: u64,
     ) -> Result<DecodedInstruction, DisasmError>;
 
+    /// A decoder of instructions of `memory`, one at a time, each exactly as
+    /// [`Architecture::decode_instruction`] decodes it, for a pass decoding many: it may
+    /// keep what one decode set up for the next (x86: one iced decoder over the memory
+    /// block, instead of one built per instruction).
+    fn instruction_decoder<'a>(&'a self, memory: &'a Memory) -> Box<dyn InstructionDecoder + 'a> {
+        Box::new(EachDecoder { arch: self, memory })
+    }
+
     fn decode_block(
         &self,
         memory: &Memory,
@@ -310,6 +318,25 @@ pub trait Architecture: Send + Sync {
     fn calling_conventions(&self) -> &[CallingConvention];
     fn default_calling_convention(&self) -> Option<&CallingConvention>;
     fn stack_pointer(&self) -> Option<&RegisterInfo>;
+}
+
+/// Decodes instructions one at a time ([`Architecture::instruction_decoder`]).
+pub trait InstructionDecoder {
+    /// The instruction at `address`, exactly as [`Architecture::decode_instruction`] gives
+    /// it.
+    fn decode(&mut self, address: u64) -> Result<DecodedInstruction, DisasmError>;
+}
+
+/// [`InstructionDecoder`] calling [`Architecture::decode_instruction`] for each.
+struct EachDecoder<'a, A: ?Sized> {
+    arch: &'a A,
+    memory: &'a Memory,
+}
+
+impl<A: Architecture + ?Sized> InstructionDecoder for EachDecoder<'_, A> {
+    fn decode(&mut self, address: u64) -> Result<DecodedInstruction, DisasmError> {
+        self.arch.decode_instruction(self.memory, address)
+    }
 }
 
 pub fn create_architecture(

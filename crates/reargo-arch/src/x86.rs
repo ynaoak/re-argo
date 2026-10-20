@@ -274,11 +274,24 @@ impl X86Arch {
     ) -> Result<DecodedInstruction, DisasmError> {
         use iced_x86::{Decoder, DecoderOptions, Instruction};
 
-        let bitness = if self.is_64 { 64 } else { 32 };
+        let bitness = self.bitness();
         let mut decoder = Decoder::with_ip(bitness, data, address, DecoderOptions::NONE);
         let mut instruction = Instruction::default();
         decoder.decode_out(&mut instruction);
+        self.finish(&instruction, data, address)
+    }
 
+    fn bitness(&self) -> u32 {
+        if self.is_64 { 64 } else { 32 }
+    }
+
+    /// The instruction `instruction` decoded from `data` (its bytes first) at `address`.
+    fn finish(
+        &self,
+        instruction: &iced_x86::Instruction,
+        data: &[u8],
+        address: u64,
+    ) -> Result<DecodedInstruction, DisasmError> {
         if instruction.is_invalid() {
             return Err(DisasmError::DecodeError {
                 address,
@@ -289,11 +302,78 @@ impl X86Arch {
         let len = instruction.len() as u32;
         let bytes: SmallVec<[u8; 16]> = SmallVec::from_slice(&data[..len as usize]);
 
-        let flow_type = classify_flow(&instruction);
-        let branch_target = extract_branch_target(&instruction);
+        let flow_type = classify_flow(instruction);
+        let branch_target = extract_branch_target(instruction);
 
         // The text is formatted from `bytes` when first read (`format_text`).
-        Ok(DecodedInstruction::new_x86_lazy(address, len, bytes, flow_type, branch_target, bitness))
+        Ok(DecodedInstruction::new_x86_lazy(address, len, bytes, flow_type, branch_target, self.bitness()))
+    }
+}
+
+/// The x86 [`InstructionDecoder`]: one iced decoder over the bytes of the memory block
+/// the last instruction was in, positioned at each address, instead of one built per
+/// instruction ([`X86Arch::decode_instruction`] reads the bytes of the address's block
+/// into a buffer and decodes them with a decoder of its own).
+struct X86Decoder<'a> {
+    arch: &'a X86Arch,
+    memory: &'a Memory,
+    block: Option<BlockDecoder<'a>>,
+    instruction: iced_x86::Instruction,
+}
+
+/// An iced decoder over the data of one memory block.
+struct BlockDecoder<'a> {
+    start: u64,
+    size: u64,
+    /// The addresses `start .. start + end` read from this block ([`Memory::find_block`]:
+    /// no other block starts before `start + end`).
+    end: u64,
+    /// The block's data (all of it).
+    data: &'a [u8],
+    /// Over `data[..min(size, data.len())]`.
+    decoder: iced_x86::Decoder<'a>,
+}
+
+impl<'a> BlockDecoder<'a> {
+    /// A decoder over the block `address` reads from, when it has data.
+    fn new(memory: &'a Memory, address: u64, bitness: u32) -> Option<Self> {
+        let block = memory.find_block(address)?;
+        let data: &'a [u8] = block.data.as_deref()?;
+        let next = memory.blocks().map(|b| b.start).filter(|&s| s > block.start).min();
+        let end = next.map_or(block.size, |n| (n - block.start).min(block.size));
+        let limit = usize::try_from(block.size.min(data.len() as u64)).ok()?;
+        let decoder = iced_x86::Decoder::try_with_ip(bitness, &data[..limit], block.start, iced_x86::DecoderOptions::NONE).ok()?;
+        Some(Self { start: block.start, size: block.size, end, data, decoder })
+    }
+
+    fn holds(&self, address: u64) -> bool {
+        address >= self.start && address - self.start < self.end
+    }
+}
+
+impl crate::arch::InstructionDecoder for X86Decoder<'_> {
+    fn decode(&mut self, address: u64) -> Result<DecodedInstruction, DisasmError> {
+        if !self.block.as_ref().is_some_and(|b| b.holds(address)) {
+            self.block = BlockDecoder::new(self.memory, address, self.arch.bitness());
+        }
+        if let Some(b) = &mut self.block
+            && b.holds(address)
+        {
+            // `decode_instruction` decodes the `min(15, size - offset)` bytes from the
+            // offset, read from the data when it has them all: these same bytes are the
+            // first of the decoder's from there (it reads at most 15).
+            let offset = address - b.start;
+            let read = 15.min(b.size - offset);
+            if let Ok(offset) = usize::try_from(offset)
+                && offset as u64 + read <= b.data.len() as u64
+                && b.decoder.set_position(offset).is_ok()
+            {
+                b.decoder.set_ip(address);
+                b.decoder.decode_out(&mut self.instruction);
+                return self.arch.finish(&self.instruction, &b.data[offset..], address);
+            }
+        }
+        self.arch.decode_instruction(self.memory, address)
     }
 }
 
@@ -414,6 +494,10 @@ impl Architecture for X86Arch {
             return Err(DisasmError::UnreadableAddress(address));
         }
         self.decode_with_iced(&buf[..read_len], address)
+    }
+
+    fn instruction_decoder<'a>(&'a self, memory: &'a Memory) -> Box<dyn crate::arch::InstructionDecoder + 'a> {
+        Box::new(X86Decoder { arch: self, memory, block: None, instruction: iced_x86::Instruction::default() })
     }
 
     fn calling_conventions(&self) -> &[CallingConvention] {
@@ -550,6 +634,60 @@ mod tests {
         let mem = make_memory(&code, 0x1000);
         let insns = arch.decode_block(&mem, 0x1000, 100).unwrap();
         assert_eq!(insns.len(), 2);
+    }
+
+    /// [`Architecture::instruction_decoder`] gives what [`Architecture::decode_instruction`]
+    /// gives at every address, in any order: across block ends, overlapping blocks, data
+    /// shorter than its block, a block without data, unmapped addresses.
+    #[test]
+    fn instruction_decoder_matches_decode_instruction() {
+        // (a fixed pseudo-random byte mix with common opcodes)
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut bytes = |n: usize| -> Vec<u8> {
+            const COMMON: [u8; 12] = [0x48, 0x89, 0x8b, 0xe8, 0xc3, 0x0f, 0x66, 0xf3, 0x74, 0xeb, 0xff, 0x90];
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    if seed % 3 == 0 { COMMON[(seed >> 8) as usize % COMMON.len()] } else { (seed >> 16) as u8 }
+                })
+                .collect()
+        };
+        let block = |name: &str, start: u64, size: u64, data: Option<Vec<u8>>| MemoryBlock {
+            name: name.into(),
+            start,
+            size,
+            flags: MemoryFlags::READ | MemoryFlags::EXECUTE,
+            data: data.map(Arc::from),
+        };
+        let mut mem = Memory::new(SpaceId(1), Endian::Little);
+        mem.add_block(block("a", 0x1000, 0x200, Some(bytes(0x200))));
+        // right after `a`
+        mem.add_block(block("b", 0x1200, 0x40, Some(bytes(0x40))));
+        // starting inside `c`, which goes on past it
+        mem.add_block(block("c", 0x2000, 0x100, Some(bytes(0x100))));
+        mem.add_block(block("d", 0x2080, 0x10, Some(bytes(0x10))));
+        // data shorter than the block
+        mem.add_block(block("e", 0x3000, 0x80, Some(bytes(0x40))));
+        // no data
+        mem.add_block(block("f", 0x4000, 0x20, None));
+        for arch in [X86Arch::new_64(), X86Arch::new_32()] {
+            let key = |d: Result<DecodedInstruction, DisasmError>| {
+                d.map(|d| (d.address, d.length, d.bytes.clone(), d.flow_type, d.branch_target, d.mnemonic().to_string(), d.operands().to_string()))
+                    .map_err(|e| e.to_string())
+            };
+            let addrs: Vec<u64> = [(0xff0u64, 0x1260u64), (0x1ff0, 0x2110), (0x2ff0, 0x3090), (0x3ff0, 0x4030)]
+                .into_iter()
+                .flat_map(|(lo, hi)| lo..hi)
+                .collect();
+            let mut decoder = arch.instruction_decoder(&mem);
+            // in order, backwards, and jumping between the blocks
+            let mixed = addrs.iter().copied().step_by(7).chain(addrs.iter().rev().copied().step_by(3));
+            for a in addrs.iter().copied().chain(mixed) {
+                assert_eq!(key(decoder.decode(a)), key(arch.decode_instruction(&mem, a)), "at {a:#x}");
+            }
+        }
     }
 
     #[test]

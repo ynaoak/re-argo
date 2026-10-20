@@ -9,7 +9,7 @@ use reargo_program::Program;
 use reargo_program::listing::{InstructionRun, Listing};
 use reargo_program::symbol::SymbolTable;
 use reargo_program::reference::ReferenceManager;
-use reargo_arch::Architecture;
+use reargo_arch::{Architecture, InstructionDecoder};
 use reargo_loader::memory::Memory;
 
 use reargo_arch::DecodedInstruction;
@@ -122,6 +122,7 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
             let Program { arch, info, listing, symbol_table, .. } = &mut *program;
             let (arch, memory) = (&**arch, &info.memory);
             let Found { references, bodies } = &mut found;
+            let mut decoder = arch.instruction_decoder(memory);
             let counts = discover(
                 listing,
                 symbol_table,
@@ -130,9 +131,10 @@ impl Analyzer for FunctionDiscoveryAnalyzer {
                 references,
                 |entry, body| bodies.push((entry, body)),
                 |listing, _, entry, visited, references| {
-                    disassemble_function(entry, visited, &mut Listed { arch, memory, listing }, references)
+                    disassemble_function(entry, visited, &mut Listed { decoder: &mut *decoder, listing }, references)
                 },
             );
+            drop(decoder);
             found.apply(program);
             counts
         };
@@ -314,6 +316,8 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         // (should the walk panic: the threads let go, not waited for forever)
         let _release = ReleaseOnDrop(shared);
         let mut walk_visited = Visited::new(memory);
+        // (the walk's own decodes)
+        let mut decoder = arch.instruction_decoder(memory);
         let counts = discover(
             listing,
             symbol_table,
@@ -369,10 +373,10 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 let result = match shared.get().filter(|_| is_started) {
                     Some(shared) => {
                         shared.walking.claim(entry);
-                        disassemble_function(entry, visited, &mut Ahead { shared, listing }, references)
+                        disassemble_function(entry, visited, &mut Ahead { shared, listing, decoder: &mut *decoder }, references)
                     }
                     // (before the threads start there is nothing decoded ahead)
-                    None => disassemble_function(entry, visited, &mut Listed { arch, memory, listing }, references),
+                    None => disassemble_function(entry, visited, &mut Listed { decoder: &mut *decoder, listing }, references),
                 };
                 if let Ok(d) = &result {
                     walked += d.instruction_count;
@@ -580,6 +584,7 @@ fn speculate_loop(
     read_out: std::sync::mpsc::Sender<Vec<InstructionRun>>,
 ) {
     let mut entries = Vec::new();
+    let mut decoder = shared.arch.instruction_decoder(shared.memory);
     // the code this thread decoded
     let mut own: Vec<Arc<Spec>> = Vec::new();
     'work: loop {
@@ -603,7 +608,7 @@ fn speculate_loop(
             }
         };
         entries.clear();
-        let spec = Arc::new(speculate_one(shared, entry, &mut entries));
+        let spec = Arc::new(speculate_one(shared, &mut *decoder, entry, &mut entries));
         if let Ok(mut done) = shared.done.write() {
             let index = done.specs.len() as u32;
             done.by_entry.insert(entry, index);
@@ -770,10 +775,9 @@ trait Source {
     fn fetch(&mut self, addr: u64, hint: &mut Self::Hint) -> Option<Facts>;
 }
 
-/// The listing: an instruction not listed is decoded and listed.
+/// The listing: an instruction not listed is decoded (with `decoder`) and listed.
 struct Listed<'a> {
-    arch: &'a dyn Architecture,
-    memory: &'a Memory,
+    decoder: &'a mut dyn InstructionDecoder,
     listing: &'a mut Listing,
 }
 
@@ -784,8 +788,8 @@ impl Source for Listed<'_> {
         // pass lists instructions: one listed at `addr` is the one
         // decoding gives (a block starting inside code decoded
         // before, or a later run of the pass).
-        let (arch, memory) = (self.arch, self.memory);
-        self.listing.instruction_or_insert_with(addr, || arch.decode_instruction(memory, addr).ok()).map(Facts::of)
+        let decoder = &mut *self.decoder;
+        self.listing.instruction_or_insert_with(addr, || decoder.decode(addr).ok()).map(Facts::of)
     }
 }
 
@@ -794,6 +798,7 @@ impl Source for Listed<'_> {
 struct Ahead<'a, 'l> {
     shared: &'a Shared<'a>,
     listing: &'l mut Listing,
+    decoder: &'l mut dyn InstructionDecoder,
 }
 
 impl Source for Ahead<'_, '_> {
@@ -822,7 +827,7 @@ impl Source for Ahead<'_, '_> {
             return Some(facts);
         }
         *hint = None;
-        Listed { arch: self.shared.arch, memory: self.shared.memory, listing: self.listing }.fetch(addr, &mut ())
+        Listed { decoder: &mut *self.decoder, listing: self.listing }.fetch(addr, &mut ())
     }
 }
 
@@ -898,7 +903,7 @@ impl Claims {
 /// added to `entries` (with whether by a call). The walk reads about
 /// these (it stops where the run walked before, which depends on the
 /// order); what is not here, it decodes itself.
-fn speculate_one(shared: &Shared, entry: u64, entries: &mut Vec<(u64, bool)>) -> Spec {
+fn speculate_one(shared: &Shared, decoder: &mut dyn InstructionDecoder, entry: u64, entries: &mut Vec<(u64, bool)>) -> Spec {
     thread_local! {
         /// A thread's working sets, kept for its next entry.
         static SCRATCH: std::cell::RefCell<(Vec<SpecInsn>, FxHashSet<u64>, Vec<u64>)> = Default::default();
@@ -925,7 +930,7 @@ fn speculate_one(shared: &Shared, entry: u64, entries: &mut Vec<(u64, bool)>) ->
                 if !seen.insert(addr) {
                     break;
                 }
-                let Ok(d) = shared.arch.decode_instruction(shared.memory, addr) else {
+                let Ok(d) = decoder.decode(addr) else {
                     break;
                 };
                 let facts = Facts::of(&d);

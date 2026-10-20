@@ -38,7 +38,6 @@
 use std::collections::BTreeSet;
 
 use reargo_arch::FlowType;
-use reargo_lift::PcodeLift;
 use reargo_program::function::Function;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
@@ -364,10 +363,11 @@ fn candidates(
         .map(|chunk| {
             // neighbouring candidates walk the same instructions
             let mut lifts = Lifts::default();
+            let mut cursor = reargo_lift::x86::DecodeCursor::default();
             chunk
                 .iter()
                 .map(|&entry| {
-                    let mut candidate = walk_candidate(lifter, program, entry, &mut lifts);
+                    let mut candidate = walk_candidate(lifter, program, entry, &mut lifts, &mut cursor);
                     candidate.known = covered.hits(&candidate.checked);
                     candidate
                 })
@@ -381,13 +381,19 @@ fn candidates(
 
 /// The [`Candidate`] at `entry`: [`validate_candidate_with_extent`]
 /// with the covered checks left out.
-fn walk_candidate(lifter: &dyn PcodeLift, program: &Program, entry: u64, lifts: &mut Lifts) -> Candidate {
+fn walk_candidate<'m>(
+    lifter: &reargo_lift::x86::X86Lifter,
+    program: &'m Program,
+    entry: u64,
+    lifts: &mut Lifts,
+    cursor: &mut reargo_lift::x86::DecodeCursor<'m>,
+) -> Candidate {
     let mut checked = Vec::new();
     let mut count = 0usize;
     let mut addr = entry;
     let mut end: Option<u64> = None;
     while count < VALIDATE_BUDGET {
-        let Some((length, terminates)) = lift_at(lifter, program, addr, lifts) else { break };
+        let Some((length, terminates)) = lift_at(lifter, program, addr, lifts, cursor) else { break };
         count += 1;
         let next = addr + length as u64;
         if end.is_none() {
@@ -407,10 +413,17 @@ fn walk_candidate(lifter: &dyn PcodeLift, program: &Program, entry: u64, lifts: 
 /// Instructions [`validate_candidate_with_extent`] lifts at most.
 const VALIDATE_BUDGET: usize = 256;
 
-/// The lift of `addr` for [`Lifts`], from `lifts` or lifted now.
-fn lift_at(lifter: &dyn PcodeLift, program: &Program, addr: u64, lifts: &mut Lifts) -> Option<(u32, bool)> {
+/// The lift of `addr` for [`Lifts`], from `lifts` or lifted now (alone, without the
+/// integer PF, which adds no `Return` / `BranchInd`; decoded through `cursor`).
+fn lift_at<'m>(
+    lifter: &reargo_lift::x86::X86Lifter,
+    program: &'m Program,
+    addr: u64,
+    lifts: &mut Lifts,
+    cursor: &mut reargo_lift::x86::DecodeCursor<'m>,
+) -> Option<(u32, bool)> {
     *lifts.entry(addr).or_insert_with(|| {
-        lifter.lift_instruction(&program.info.memory, addr).ok().map(|insn| {
+        lifter.lift_alone_with(&program.info.memory, addr, cursor).ok().map(|insn| {
             // Look at the underlying `DecodedInstruction.flow_type` via
             // the listing if the address is decoded, else inspect
             // the P-code op to detect a Return. The lifter's
@@ -429,7 +442,7 @@ fn lift_at(lifter: &dyn PcodeLift, program: &Program, addr: u64, lifts: &mut Lif
 
 #[cfg(test)]
 fn validate_candidate_with_extent(
-    lifter: &dyn PcodeLift,
+    lifter: &reargo_lift::x86::X86Lifter,
     program: &Program,
     entry: u64,
     covered: &Covered,
@@ -445,8 +458,9 @@ fn validate_candidate_with_extent(
     let mut count = 0usize;
     let mut addr = entry;
     let mut end: Option<u64> = None;
+    let mut cursor = reargo_lift::x86::DecodeCursor::default();
     while count < BUDGET {
-        let lifted = lift_at(lifter, program, addr, lifts);
+        let lifted = lift_at(lifter, program, addr, lifts, &mut cursor);
         let Some((length, terminates)) = lifted else { break };
         count += 1;
         let next = addr + length as u64;
@@ -616,7 +630,7 @@ mod tests {
                 .collect();
             let covered = Covered::from_ranges(ranges);
             let entry = base + u64::from(next() % 380);
-            let walk = walk_candidate(&lifter, &program, entry, &mut Lifts::default());
+            let walk = walk_candidate(&lifter, &program, entry, &mut Lifts::default(), &mut Default::default());
             let want = validate_candidate_with_extent(&lifter, &program, entry, &covered, &mut Lifts::default());
             assert_eq!(walk.validate(|a| covered.contains(a)), want, "round {round} entry {entry:#x}");
             assert_eq!(covered.hits(&walk.checked), walk.checked.iter().any(|&a| covered.contains(a)));
