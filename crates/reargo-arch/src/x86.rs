@@ -650,7 +650,7 @@ mod tests {
                     seed ^= seed << 13;
                     seed ^= seed >> 7;
                     seed ^= seed << 17;
-                    if seed % 3 == 0 { COMMON[(seed >> 8) as usize % COMMON.len()] } else { (seed >> 16) as u8 }
+                    if seed.is_multiple_of(3) { COMMON[(seed >> 8) as usize % COMMON.len()] } else { (seed >> 16) as u8 }
                 })
                 .collect()
         };

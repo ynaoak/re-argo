@@ -419,7 +419,7 @@ impl LiftCache {
             lifter.decode_in_block(memory, addr, block).and_then(|insn| lifter.lift_decoded(insn, addr, None)).ok();
         let (flags, len, shape) = match &lifted {
             Some(insn) => {
-                let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::is_x87(i));
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
                 let flags = if x87 { X87 } else { 0 } | if reads_outside_pf(insn) { READS_PF } else { 0 };
                 let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
                 (flags, len, crate::lift::InsnShape::of(insn))
@@ -908,7 +908,7 @@ impl X86Lifter {
             Ok(insn) => {
                 let pf = |v: &VarnodeData| v.space == REG_SPACE && v.offset == PF_OFFSET;
                 let flag = |v: &VarnodeData| v.space == REG_SPACE && (0x200..0x210).contains(&v.offset);
-                let x87 = insn.mnemonic.x86_instruction().is_none_or(|i| x87::is_x87(i));
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
                 let control = insn.ops.iter().any(|o| {
                     matches!(o.opcode, OpCode::Branch | OpCode::BranchInd | OpCode::Call | OpCode::CallInd | OpCode::Return)
                 });
@@ -3563,12 +3563,12 @@ impl X86Lifter {
         // Only a range with an x87 instruction (checked on the decoded
         // instructions first: formatting the text costs more) and an
         // instruction whose text starts with `f` is rewritten.
-        if !lifted.iter().any(|l| l.borrow().mnemonic.x86_instruction().is_none_or(|i| x87::is_x87(i))) {
+        if !lifted.iter().any(|l| l.borrow().mnemonic.x86_instruction().is_none_or(x87::is_x87)) {
             return None;
         }
         // (the texts of the x87 ones first: they are the ones that start
         // with `f`, and each text is formatted when first read)
-        let maybe_x87 = |l: &LiftedInstruction| l.mnemonic.x86_instruction().is_none_or(|i| x87::is_x87(i));
+        let maybe_x87 = |l: &LiftedInstruction| l.mnemonic.x86_instruction().is_none_or(x87::is_x87);
         if !lifted.iter().map(|l| l.borrow()).filter(|l| maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
             && !lifted.iter().map(|l| l.borrow()).filter(|l| !maybe_x87(l)).any(|l| l.mnemonic.starts_with('f'))
         {
@@ -3590,7 +3590,7 @@ impl X86Lifter {
                 (!insn.is_invalid()).then_some(insn)
             })
             .collect();
-        if !decoded.iter().flatten().any(|d| x87::is_x87(d)) {
+        if !decoded.iter().flatten().any(x87::is_x87) {
             return None;
         }
         let flow = x87::flow(lifted, &decoded);
@@ -4117,7 +4117,7 @@ mod tests {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                if seed % 2 == 0 { COMMON[(seed >> 8) as usize % COMMON.len()] } else { (seed >> 16) as u8 }
+                if seed.is_multiple_of(2) { COMMON[(seed >> 8) as usize % COMMON.len()] } else { (seed >> 16) as u8 }
             })
             .collect();
         let mem = make_memory(&code, 0x10000);

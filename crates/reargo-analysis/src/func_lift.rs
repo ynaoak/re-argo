@@ -100,17 +100,35 @@ pub fn external_entries_at(program: &Program, addrs: &[u64]) -> std::collections
     use reargo_program::RefType;
     // a linear lift: addresses increase
     let lifted = |a: u64| addrs.binary_search(&a).is_ok();
-    addrs
-        .iter()
-        .copied()
-        .filter(|&a| {
-            program.references.get_refs_to(a).iter().any(|r| match r.ref_type {
-                RefType::IndirectJump => true,
-                RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
-                _ => false,
-            })
+    let enters = |refs: &[reargo_program::Reference]| {
+        refs.iter().any(|r| match r.ref_type {
+            RefType::IndirectJump => true,
+            RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
+            _ => false,
         })
-        .collect()
+    };
+    if let (Some(&first), Some(&last)) = (addrs.first(), addrs.last())
+        && addrs.windows(2).all(|w| w[0] < w[1])
+    {
+        // (the addresses with references in the lift's span, stepped through beside the
+        // lifted ones, instead of a lookup per lifted address)
+        let mut at = 0;
+        let mut out = std::collections::BTreeSet::new();
+        for (to, refs) in program.references.refs_to_range(first, last.saturating_add(1)) {
+            while addrs[at] < to {
+                at += 1;
+            }
+            if addrs[at] == to && enters(refs) {
+                out.insert(to);
+            }
+        }
+        // (`last` is `u64::MAX`: its references are not in the range)
+        if last == u64::MAX && enters(program.references.get_refs_to(last)) {
+            out.insert(last);
+        }
+        return out;
+    }
+    addrs.iter().copied().filter(|&a| enters(program.references.get_refs_to(a))).collect()
 }
 
 /// The jump references of a program by target, to compute
@@ -251,11 +269,22 @@ mod tests {
                 addrs[k] = 0x1000 + next(0x80);
             }
             let increasing = addrs.windows(2).all(|w| w[0] < w[1]);
-            assert_eq!(index.external_entries_at(&program, &addrs), external_entries_at(&program, &addrs), "{addrs:x?}");
-            assert_eq!(
-                index.external_entries_ordered(&program, &addrs, increasing),
-                external_entries_at(&program, &addrs)
-            );
+            // (a lookup per lifted address)
+            let lifted = |a: u64| addrs.binary_search(&a).is_ok();
+            let want: std::collections::BTreeSet<u64> = addrs
+                .iter()
+                .copied()
+                .filter(|&a| {
+                    program.references.get_refs_to(a).iter().any(|r| match r.ref_type {
+                        RefType::IndirectJump => true,
+                        RefType::UnconditionalJump | RefType::ConditionalJump => !lifted(r.from),
+                        _ => false,
+                    })
+                })
+                .collect();
+            assert_eq!(external_entries_at(&program, &addrs), want, "{addrs:x?}");
+            assert_eq!(index.external_entries_at(&program, &addrs), want, "{addrs:x?}");
+            assert_eq!(index.external_entries_ordered(&program, &addrs, increasing), want);
         }
     }
 }

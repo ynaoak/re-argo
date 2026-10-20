@@ -302,6 +302,14 @@ impl ReferenceManager {
         jumps
     }
 
+    /// Each address in `start..end` with references to it, and those
+    /// references (as `get_refs_to` gives them), in address order; nothing
+    /// when `start >= end`.
+    pub fn refs_to_range(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, &[Reference])> {
+        let range = (start < end).then(|| self.refs_to.range(start..end));
+        range.into_iter().flatten().map(|(&a, v)| (a, v.as_slice()))
+    }
+
     /// The references from each address in `start..end` that has any,
     /// in address order (as `get_refs_from` of each address in turn
     /// gives them); nothing when `start >= end`.
