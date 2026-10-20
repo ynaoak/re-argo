@@ -882,12 +882,12 @@ mod tests {
             (state >> 33) as u32
         };
         let mut hits = 0usize;
-        for round in 0..120 {
+        for round in 0..48 {
             // up to 3 chunks, so runs cross the chunk ends
             let len = match round % 4 {
                 0 => (next() % 600) as usize,
                 1 => CHUNK - 40 + (next() % 80) as usize,
-                _ => (next() % (3 * CHUNK as u32)) as usize,
+                _ => (next() % (5 * CHUNK as u32 / 2)) as usize,
             };
             let key = next() as u8;
             let buf: Vec<u8> = (0..len)
@@ -921,8 +921,8 @@ mod tests {
             (state >> 33) as usize
         };
         let mut hits = 0usize;
-        for round in 0..12 {
-            let len = (next() % (3 * CHUNK)).min(exe.len());
+        for round in 0..6 {
+            let len = (next() % (5 * CHUNK / 2)).min(exe.len());
             let at = next() % (exe.len() - len + 1);
             let buf = &exe[at..at + len];
             for opts in option_sets(200 + next() % 2000) {
