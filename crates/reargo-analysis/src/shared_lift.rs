@@ -342,6 +342,8 @@ pub(crate) struct Scratch {
     cfg: crate::cfg_const::FlowScratch,
     vsa: crate::vsa::FlowScratch,
     external: Vec<u64>,
+    /// [`crate::blockflow::Cfg::build_marked_upto_with`]'s.
+    block_at: Vec<u32>,
 }
 
 /// The results of the function at `entry` from its lift (the x86
@@ -413,7 +415,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
         match (&marks, &external_set) {
             (Some(marks), _) => {
                 let reach = marks.reach(&shape);
-                let mut blocks = crate::blockflow::Cfg::build_marked_upto(&shape, marks, in_body, reach);
+                let mut blocks = crate::blockflow::Cfg::build_marked_upto_with(&shape, marks, in_body, reach, &mut scratch.block_at);
                 blocks.keep_owned_calls(marks);
                 // (the snapshots of the calls the function does not own are not made)
                 let owned = |i: usize| marks.flags[i] & crate::blockflow::LiftMarks::OWNED_CALL != 0;

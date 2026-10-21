@@ -507,15 +507,15 @@ pub fn is_view_refresh(op: &PcodeOp) -> bool {
     if op.opcode != OpCode::Subpiece {
         return false;
     }
-    let (Some(out), Some(src), Some(k)) = (op.output.as_ref(), op.inputs.first(), op.inputs.get(1))
-    else {
+    // (the inputs read once, the conditions combined without branches)
+    let (Some(out), [src, k, ..]) = (op.output.as_ref(), op.inputs.as_slice()) else {
         return false;
     };
-    out.space == SpaceId::REGISTER
-        && src.space == SpaceId::REGISTER
-        && k.space == SpaceId::CONST
-        && out.offset == src.offset.wrapping_add(k.offset)
-        && k.offset.saturating_add(u64::from(out.size)) <= u64::from(src.size)
+    (out.space == SpaceId::REGISTER)
+        & (src.space == SpaceId::REGISTER)
+        & (k.space == SpaceId::CONST)
+        & (out.offset == src.offset.wrapping_add(k.offset))
+        & (k.offset.saturating_add(u64::from(out.size)) <= u64::from(src.size))
 }
 
 /// Evaluate `op`'s output over byte-partial values, `read` giving each

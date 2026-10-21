@@ -34,6 +34,14 @@ pub trait FlowState: Clone + PartialEq + Default {
     fn after_call(&mut self);
 }
 
+/// The blocks `unknown_entry` marks, ascending.
+fn unknown_blocks(unknown_entry: &[bool]) -> Vec<usize> {
+    unknown_entry.iter().enumerate().filter(|(_, u)| **u).map(|(b, _)| b).collect()
+}
+
+/// No block ([`Cfg`]'s jump targets).
+const NO_BLOCK: u32 = u32::MAX;
+
 /// Jump target of a `Branch` / `CBranch` inside the lift.
 fn target(op: &PcodeOp) -> Option<u64> {
     InsnShape::branch_target(op)
@@ -54,10 +62,13 @@ pub struct LiftShape<'a> {
     /// `(instruction index, target)` of every `Branch` / `CBranch` with
     /// a jump target in the lift's space ([`target`]), in op order.
     pub branches: Vec<(usize, u64)>,
-    /// The indices of the instructions with flags (a call, a jump, a
+    /// The indices plus `special_base` of the instructions with flags (a call, a jump, a
     /// return), ascending: the passes that look only at those step
-    /// through them instead of every instruction.
-    pub special: Vec<u32>,
+    /// through them instead of every instruction ([`LiftShape::special`]).
+    special: Cow<'a, [u32]>,
+    special_base: u32,
+    /// How many of them have a call.
+    ncalls: usize,
     /// Finds the position of each address through the lift cache's index
     /// (for shapes borrowed from a cache: [`RangeShapes::positions`]).
     finder: Option<PositionFinder<'a>>,
@@ -69,6 +80,12 @@ impl<'a> LiftShape<'a> {
     /// ([`RangeShapes::positions`]).
     pub fn finder(&self) -> Option<&PositionFinder<'a>> {
         self.finder.as_ref()
+    }
+
+    /// The indices of the instructions with flags (a call, a jump, a return), ascending.
+    pub fn special(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        let base = self.special_base;
+        self.special.iter().map(move |&p| (p - base) as usize)
     }
 
     /// Instruction `i` has a `Call` / `CallInd` op.
@@ -96,16 +113,27 @@ impl<'a> LiftShape<'a> {
         let (mut addrs, mut flags) = (Vec::with_capacity(n), Vec::with_capacity(n));
         let mut branches = Vec::new();
         let mut special = Vec::new();
+        let mut ncalls = 0;
         for (i, insn) in insns.iter().enumerate() {
             let s = InsnShape::of(insn.borrow());
             if s.flags != 0 {
                 special.push(i as u32);
+                ncalls += usize::from(s.flags & InsnShape::CALL != 0);
                 push_branches(&mut branches, i, s, || insn.borrow());
             }
             addrs.push(s.address);
             flags.push(s.flags);
         }
-        LiftShape { increasing: increasing(&addrs), addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, finder: None }
+        LiftShape {
+            increasing: increasing(&addrs),
+            addrs: Cow::Owned(addrs),
+            flags: Cow::Owned(flags),
+            branches,
+            special: Cow::Owned(special),
+            special_base: 0,
+            ncalls,
+            finder: None,
+        }
     }
 
     /// [`LiftShape::of`] from the [`RangeShapes`] of the instructions
@@ -114,17 +142,21 @@ impl<'a> LiftShape<'a> {
         debug_assert_eq!(insns.len(), shapes.len());
         // (a jump has one target but for a few instructions)
         let mut branches = Vec::with_capacity(shapes.special().len());
-        let mut special = Vec::with_capacity(shapes.special().len());
-        for i in shapes.special() {
-            special.push(i as u32);
-            push_branches(&mut branches, i, shapes.shape(i), || insns[i].borrow());
+        let mut ncalls = 0;
+        for (i, flags, target) in shapes.special_shapes() {
+            ncalls += usize::from(flags & InsnShape::CALL != 0);
+            // (the address is not read)
+            push_branches(&mut branches, i, InsnShape { address: 0, target, flags }, || insns[i].borrow());
         }
+        let (special, special_base) = shapes.special_raw();
         LiftShape {
             increasing: shapes.increasing,
             addrs: Cow::Borrowed(&shapes.addrs),
             flags: Cow::Borrowed(&shapes.flags),
             branches,
-            special,
+            special: Cow::Borrowed(special),
+            special_base,
+            ncalls,
             finder: shapes.positions().map(|p| p.finder()),
         }
     }
@@ -132,8 +164,18 @@ impl<'a> LiftShape<'a> {
     /// A shape from its parts (`special` found from `flags`).
     #[cfg(test)]
     pub fn from_parts(increasing: bool, addrs: Vec<u64>, flags: Vec<u8>, branches: Vec<(usize, u64)>) -> LiftShape<'static> {
-        let special = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect();
-        LiftShape { increasing, addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, finder: None }
+        let special: Vec<u32> = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect();
+        let ncalls = special.iter().filter(|&&i| flags[i as usize] & InsnShape::CALL != 0).count();
+        LiftShape {
+            increasing,
+            addrs: Cow::Owned(addrs),
+            flags: Cow::Owned(flags),
+            branches,
+            special: Cow::Owned(special),
+            special_base: 0,
+            ncalls,
+            finder: None,
+        }
     }
 }
 
@@ -219,23 +261,21 @@ impl LiftMarks {
                 flags[i] |= Self::EXTERNAL;
             }
         }
-        let mut ncalls = 0;
-        for &i in &shape.special {
-            let i = i as usize;
+        // (one pass over the instructions with flags: the block ends and the calls)
+        let mut owned_calls = Vec::with_capacity(shape.ncalls);
+        let mut calls = Vec::with_capacity(shape.ncalls);
+        for i in shape.special() {
             if shape.ends_block(i) && i + 1 < addrs.len() {
                 flags[i + 1] |= Self::AFTER_END;
             }
-            ncalls += usize::from(shape.has_call(i));
-        }
-        let mut owned_calls = Vec::with_capacity(ncalls);
-        let mut calls = Vec::with_capacity(ncalls);
-        for i in shape.special.iter().map(|&i| i as usize).filter(|&i| shape.has_call(i)) {
-            let owned = owns(i);
-            if owned {
-                flags[i] |= Self::OWNED_CALL;
-                owned_calls.push(i);
+            if shape.has_call(i) {
+                let owned = owns(i);
+                if owned {
+                    flags[i] |= Self::OWNED_CALL;
+                    owned_calls.push(i);
+                }
+                calls.push((addrs[i], owned));
             }
-            calls.push((addrs[i], owned));
         }
         LiftMarks { flags, target_idx, owned_calls, calls }
     }
@@ -308,9 +348,17 @@ pub struct Cfg {
     /// Blocks walked from the empty state (entered from somewhere
     /// unknown), other than the entry block 0.
     unknown_entry: Vec<bool>,
+    /// The blocks of `unknown_entry`, ascending.
+    unknown_blocks: Vec<usize>,
     /// Static successors: block `b`'s are `succs[succ_at[b]..succ_at[b + 1]]`.
     succs: Vec<usize>,
     succ_at: Vec<usize>,
+    /// The block each jump of [`LiftShape::branches`] (those of the blocks, in order)
+    /// targets, [`NO_BLOCK`] where it targets none: block `b`'s jumps are
+    /// `br_block[br_at[b]..br_at[b + 1]]` ([`propagate_cfg_with`] reads them instead of
+    /// searching the target addresses).
+    br_block: Vec<u32>,
+    br_at: Vec<usize>,
     /// Blocks that can reach a call whose snapshot is wanted (all when
     /// `None`): see [`Cfg::keep_calls`].
     relevant: Option<Vec<bool>>,
@@ -345,8 +393,11 @@ impl Cfg {
                 start_idx: Vec::new(),
                 start_addr: Vec::new(),
                 unknown_entry: Vec::new(),
+                unknown_blocks: Vec::new(),
                 succs: Vec::new(),
                 succ_at: Vec::new(),
+                br_block: Vec::new(),
+                br_at: Vec::new(),
                 relevant: None,
                 legacy: true,
                 external: external.clone(),
@@ -383,15 +434,21 @@ impl Cfg {
         // (block `b`'s successors are `succs[succ_at[b]..succ_at[b + 1]]`)
         let mut succs: Vec<usize> = Vec::with_capacity(nb + targets.len());
         let mut succ_at: Vec<usize> = Vec::with_capacity(nb + 1);
+        let mut br_block: Vec<u32> = Vec::with_capacity(targets.len());
+        let mut br_at: Vec<usize> = Vec::with_capacity(nb + 1);
         let mut ti = 0;
         for b in 0..nb {
             succ_at.push(succs.len());
             let last = start_idx.get(b + 1).copied().unwrap_or(n) - 1;
             while ti < targets.len() && targets[ti].0 < start_idx[b] {
+                br_block.push(NO_BLOCK);
                 ti += 1;
             }
+            br_at.push(br_block.len());
             while ti < targets.len() && targets[ti].0 <= last {
-                succs.extend(block_of(targets[ti].1));
+                let t = block_of(targets[ti].1);
+                succs.extend(t);
+                br_block.push(t.map_or(NO_BLOCK, |t| t as u32));
                 ti += 1;
             }
             if !shape.stops(last) && b + 1 < nb {
@@ -399,6 +456,7 @@ impl Cfg {
             }
         }
         succ_at.push(succs.len());
+        br_at.push(br_block.len());
         let mut reached = vec![false; nb];
         reached[0] = true;
         let mut stack = vec![0usize];
@@ -413,12 +471,16 @@ impl Cfg {
         let unknown_entry: Vec<bool> = (0..nb)
             .map(|b| b != 0 && (external.contains(&start_addr[b]) || (!reached[b] && in_body(start_addr[b]))))
             .collect();
+        let unknown_blocks = unknown_blocks(&unknown_entry);
         Cfg {
             start_idx,
             start_addr,
             unknown_entry,
+            unknown_blocks,
             succs,
             succ_at,
+            br_block,
+            br_at,
             relevant: None,
             legacy: false,
             external: BTreeSet::new(),
@@ -438,6 +500,18 @@ impl Cfg {
     /// and `end` starts a block (or is the end of the lift) — what
     /// [`LiftMarks::reach`] finds.
     pub fn build_marked_upto(shape: &LiftShape, marks: &LiftMarks, in_body: impl Fn(u64) -> bool, end: usize) -> Cfg {
+        Cfg::build_marked_upto_with(shape, marks, in_body, end, &mut Vec::new())
+    }
+
+    /// [`Cfg::build_marked_upto`] with `block_at` a buffer (kept by a thread building many):
+    /// the block of each instruction that starts one is read there.
+    pub fn build_marked_upto_with(
+        shape: &LiftShape,
+        marks: &LiftMarks,
+        in_body: impl Fn(u64) -> bool,
+        end: usize,
+        block_at: &mut Vec<u32>,
+    ) -> Cfg {
         debug_assert!(shape.increasing);
         let addrs = &shape.addrs[..end];
         let n = addrs.len();
@@ -471,20 +545,38 @@ impl Cfg {
         }
         let start_addr: Vec<u64> = start_idx.iter().map(|&i| addrs[i]).collect();
         let nb = start_idx.len();
-        // (a jump target is a block start)
-        let block_of = |i: usize| start_idx.binary_search(&i).ok();
+        // (a jump target before `end` is a block start: its block is read from `block_at`, set
+        // at every block start; the other entries are stale, never read)
+        if block_at.len() < n {
+            block_at.resize(n, 0);
+        }
+        for (b, &i) in start_idx.iter().enumerate() {
+            block_at[i] = b as u32;
+        }
+        let block_of = |i: usize| {
+            (i < n).then(|| {
+                debug_assert_eq!(start_idx.binary_search(&i), Ok(block_at[i] as usize));
+                block_at[i]
+            })
+        };
         let targets = &shape.branches[..shape.branches.partition_point(|t| t.0 < n)];
         let mut succs: Vec<usize> = Vec::with_capacity(nb + targets.len());
         let mut succ_at: Vec<usize> = Vec::with_capacity(nb + 1);
+        let mut br_block: Vec<u32> = Vec::with_capacity(targets.len());
+        let mut br_at: Vec<usize> = Vec::with_capacity(nb + 1);
         let mut ti = 0;
         for b in 0..nb {
             succ_at.push(succs.len());
             let last = start_idx.get(b + 1).copied().unwrap_or(n) - 1;
             while ti < targets.len() && targets[ti].0 < start_idx[b] {
+                br_block.push(NO_BLOCK);
                 ti += 1;
             }
+            br_at.push(br_block.len());
             while ti < targets.len() && targets[ti].0 <= last {
-                succs.extend(marks.target_idx[ti].and_then(block_of));
+                let t = marks.target_idx[ti].and_then(block_of);
+                succs.extend(t.map(|t| t as usize));
+                br_block.push(t.unwrap_or(NO_BLOCK));
                 ti += 1;
             }
             if !shape.stops(last) && b + 1 < nb {
@@ -492,6 +584,7 @@ impl Cfg {
             }
         }
         succ_at.push(succs.len());
+        br_at.push(br_block.len());
         let mut reached = vec![false; nb];
         reached[0] = true;
         let mut stack = vec![0usize];
@@ -509,12 +602,16 @@ impl Cfg {
                     && (flags[start_idx[b]] & LiftMarks::EXTERNAL != 0 || (!reached[b] && in_body(start_addr[b])))
             })
             .collect();
+        let unknown_blocks = unknown_blocks(&unknown_entry);
         Cfg {
             start_idx,
             start_addr,
             unknown_entry,
+            unknown_blocks,
             succs,
             succ_at,
+            br_block,
+            br_at,
             relevant: None,
             legacy: false,
             external: BTreeSet::new(),
@@ -695,7 +792,8 @@ pub fn propagate_cfg_with<S: FlowState, T, I: Borrow<LiftedInstruction>>(
     saturated.resize(nb, false);
     let relevant = |b: usize| cfg.relevant.as_ref().is_none_or(|r| r[b]);
     worklist.clear();
-    worklist.extend((0..nb).filter(|&b| (b == 0 || cfg.unknown_entry[b]) && relevant(b)));
+    // (the entry block, then the blocks entered from somewhere unknown, ascending)
+    worklist.extend(std::iter::once(0).chain(cfg.unknown_blocks.iter().copied()).filter(|&b| relevant(b)));
     queued.clear();
     queued.resize(nb, false);
     for &b in worklist.iter() {
@@ -734,6 +832,15 @@ pub fn propagate_cfg_with<S: FlowState, T, I: Borrow<LiftedInstruction>>(
             None => out.push((to, s.clone())),
         };
         let mut falls_through = true;
+        // the blocks the block's jumps with a target go to, in op order (`block_of` of the
+        // targets)
+        let mut jumps = cfg.br_block[cfg.br_at[b]..cfg.br_at[b + 1]].iter();
+        let mut jump_block = |op: &PcodeOp| {
+            let t = target(op)?;
+            let k = *jumps.next().expect("a jump of the block's");
+            debug_assert_eq!(block_of(t), (k != NO_BLOCK).then_some(k as usize));
+            (k != NO_BLOCK).then_some(k as usize)
+        };
         for (i, insn) in (start..end).zip(&insns[start..end]) {
             let insn = insn.borrow();
             for op in &insn.ops {
@@ -745,12 +852,12 @@ pub fn propagate_cfg_with<S: FlowState, T, I: Borrow<LiftedInstruction>>(
                         st.after_call();
                     }
                     OpCode::CBranch => {
-                        if let Some(t) = target(op).and_then(block_of) {
+                        if let Some(t) = jump_block(op) {
                             add_edge(out, t, &st);
                         }
                     }
                     OpCode::Branch => {
-                        if let Some(t) = target(op).and_then(block_of) {
+                        if let Some(t) = jump_block(op) {
                             add_edge(out, t, &st);
                         }
                         falls_through = false;
@@ -771,22 +878,24 @@ pub fn propagate_cfg_with<S: FlowState, T, I: Borrow<LiftedInstruction>>(
             }
         }
         out.sort_unstable_by_key(|(to, _)| *to);
-        for (to, s) in out.drain(..) {
+        // (the states compared in place, and moved only onto an edge they change)
+        for (to, s) in out.iter_mut() {
+            let to = *to;
             if !relevant(to) {
                 continue;
             }
             let edges = &mut in_edges[to];
             match edges.binary_search_by_key(&b, |(from, _)| *from) {
-                Ok(i) if edges[i].1 == s => {}
+                Ok(i) if edges[i].1 == *s => {}
                 Ok(i) => {
-                    edges[i].1 = s;
+                    edges[i].1 = std::mem::take(s);
                     if !queued[to] {
                         queued[to] = true;
                         worklist.push_back(to);
                     }
                 }
                 Err(i) => {
-                    edges.insert(i, (b, s));
+                    edges.insert(i, (b, std::mem::take(s)));
                     if !queued[to] {
                         queued[to] = true;
                         worklist.push_back(to);
@@ -794,6 +903,7 @@ pub fn propagate_cfg_with<S: FlowState, T, I: Borrow<LiftedInstruction>>(
                 }
             }
         }
+        out.clear();
     }
     // (the states are not kept between runs: only the buffers)
     for edges in in_edges.iter_mut() {
@@ -1128,7 +1238,10 @@ mod tests {
             let insns = random_lift(&mut seed, n);
             let shapes = RangeShapes::of(&insns);
             let (a, b) = (LiftShape::of(&insns), LiftShape::from_shapes(&insns, &shapes));
-            assert_eq!((a.increasing, &a.addrs, &a.flags, &a.branches, &a.special), (b.increasing, &b.addrs, &b.flags, &b.branches, &b.special));
+            assert_eq!(
+                (a.increasing, &a.addrs, &a.flags, &a.branches, a.special().collect::<Vec<_>>(), a.ncalls),
+                (b.increasing, &b.addrs, &b.flags, &b.branches, b.special().collect::<Vec<_>>(), b.ncalls)
+            );
         }
     }
 

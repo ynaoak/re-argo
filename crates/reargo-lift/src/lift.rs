@@ -91,8 +91,9 @@ pub struct RangeShapes<'c> {
     pub addrs: std::borrow::Cow<'c, [u64]>,
     /// Each instruction's [`InsnShape`] flags.
     pub flags: std::borrow::Cow<'c, [u8]>,
-    /// Each instruction's [`InsnShape`] target.
-    targets: std::borrow::Cow<'c, [u64]>,
+    /// The [`InsnShape`] target of each instruction of `special`, in its order (an
+    /// instruction without flags has none: 0).
+    special_targets: std::borrow::Cow<'c, [u64]>,
     /// The positions plus `base` of the instructions with flags,
     /// ascending (the others have none).
     special: std::borrow::Cow<'c, [u32]>,
@@ -107,14 +108,14 @@ pub struct RangeShapes<'c> {
 impl<'c> RangeShapes<'c> {
     /// Shapes borrowed from arrays by cache index: the entries
     /// `start..start + n`, `special` the cache indices of those with flags
-    /// in that range.
+    /// in that range and `special_targets` their targets.
     /// (a range's instructions follow each other: each address is the one before plus its
     /// length, so they strictly increase unless they wrap around, when the last is below the
     /// first)
     pub(crate) fn borrowed(
         addrs: &'c [u64],
         flags: &'c [u8],
-        targets: &'c [u64],
+        special_targets: &'c [u64],
         special: &'c [u32],
         start: u32,
         index: &'c crate::x86::AddrIndex,
@@ -124,7 +125,7 @@ impl<'c> RangeShapes<'c> {
         RangeShapes {
             addrs: Borrowed(addrs),
             flags: Borrowed(flags),
-            targets: Borrowed(targets),
+            special_targets: Borrowed(special_targets),
             special: Borrowed(special),
             base: start,
             increasing,
@@ -139,10 +140,36 @@ impl<'c> RangeShapes<'c> {
         Self::owned_with(addrs, flags, targets, increasing)
     }
 
+    /// [`Self::owned`] with the targets of the instructions with flags only, in order.
+    pub(crate) fn owned_special(addrs: Vec<u64>, flags: Vec<u8>, special_targets: Vec<u64>) -> RangeShapes<'static> {
+        let increasing = chain_increasing(&addrs);
+        let special = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect::<Vec<_>>();
+        debug_assert_eq!(special.len(), special_targets.len());
+        use std::borrow::Cow::Owned;
+        RangeShapes {
+            addrs: Owned(addrs),
+            flags: Owned(flags),
+            special_targets: Owned(special_targets),
+            special: Owned(special),
+            base: 0,
+            increasing,
+            index: None,
+        }
+    }
+
     fn owned_with(addrs: Vec<u64>, flags: Vec<u8>, targets: Vec<u64>, increasing: bool) -> RangeShapes<'static> {
         let special = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect::<Vec<_>>();
+        let special_targets = special.iter().map(|&i| targets[i as usize]).collect();
         use std::borrow::Cow::Owned;
-        RangeShapes { addrs: Owned(addrs), flags: Owned(flags), targets: Owned(targets), special: Owned(special), base: 0, increasing, index: None }
+        RangeShapes {
+            addrs: Owned(addrs),
+            flags: Owned(flags),
+            special_targets: Owned(special_targets),
+            special: Owned(special),
+            base: 0,
+            increasing,
+            index: None,
+        }
     }
 
     /// The shapes of `insns`, read from their ops.
@@ -171,7 +198,7 @@ impl<'c> RangeShapes<'c> {
         RangeShapes {
             addrs: Borrowed(&self.addrs[..n]),
             flags: Borrowed(&self.flags[..n]),
-            targets: Borrowed(&self.targets[..n]),
+            special_targets: Borrowed(&self.special_targets[..k]),
             special: Borrowed(&self.special[..k]),
             base: self.base,
             // (a prefix of an increasing range increases; of one wrapping around, may)
@@ -196,9 +223,29 @@ impl<'c> RangeShapes<'c> {
         self.special.iter().map(move |&p| (p - base) as usize)
     }
 
-    /// The [`InsnShape`] of instruction `i`.
+    /// The [`InsnShape`] of instruction `i` (its target searched among the flagged ones).
     pub fn shape(&self, i: usize) -> InsnShape {
-        InsnShape { address: self.addrs[i], target: self.targets[i], flags: self.flags[i] }
+        let target = match self.special.binary_search(&(self.base + i as u32)) {
+            Ok(k) => self.special_targets[k],
+            Err(_) => 0,
+        };
+        InsnShape { address: self.addrs[i], target, flags: self.flags[i] }
+    }
+
+    /// The positions plus a base of the instructions with flags, ascending, and that base
+    /// ([`Self::special`] without the subtraction).
+    pub fn special_raw(&self) -> (&[u32], u32) {
+        (&self.special, self.base)
+    }
+
+    /// The position, [`InsnShape`] flags and target of each instruction with flags,
+    /// ascending.
+    pub fn special_shapes(&self) -> impl ExactSizeIterator<Item = (usize, u8, u64)> + '_ {
+        let base = self.base;
+        self.special.iter().zip(self.special_targets.iter()).map(move |(&p, &target)| {
+            let i = (p - base) as usize;
+            (i, self.flags[i], target)
+        })
     }
 }
 
