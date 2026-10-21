@@ -6494,6 +6494,18 @@ mod tests {
                 return false;
             }
             let l = X86Lifter { is_64, parity: false }.lift_decoded(insn, insn.ip(), None).expect("it lifts");
+            // `lifted_unless_no_const`'s test, `keep(0) || keep(1)` asked once by `ConstKeep`,
+            // answers as `any_const_ref_value`
+            let imm = (0..insn.op_count()).find_map(|i| match insn.op_kind(i) {
+                iced_x86::OpKind::Memory => Some(insn.memory_displacement64()),
+                _ => insn.try_immediate(i).ok(),
+            });
+            let imm = imm.unwrap_or(0);
+            let keeps: [&dyn Fn(u64) -> bool; 5] = [&|v| v == 0, &|v| v == 1, &|v| v == imm, &|v| v == imm & 0xff && v > 1, &|v| v > 0x1000];
+            for keep in keeps {
+                let k = ConstKeep::new(keep);
+                assert_eq!(k.flags || any_operand_const_ref_value(&insn, &k.keep), any_const_ref_value(&insn, keep), "{insn} ({is_64})");
+            }
             for op in &l.ops {
                 let c = match op.opcode {
                     OpCode::Copy => op.inputs.first(),
