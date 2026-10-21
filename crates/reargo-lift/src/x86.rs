@@ -164,6 +164,76 @@ fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
     })
 }
 
+/// What [`X86Lifter::decoded_facts`] reads of an instruction's code ([`fact_tables`]) and of
+/// a register operand.
+mod fact_class {
+    /// An x87 instruction ([`super::x87::is_x87`]).
+    pub(super) const X87: u8 = 0;
+    /// None of the others.
+    pub(super) const OTHER: u8 = 1;
+    pub(super) const CALL: u8 = 2;
+    pub(super) const JMP: u8 = 3;
+    pub(super) const RET: u8 = 4;
+    /// A conditional jump not on the parity.
+    pub(super) const JCC: u8 = 5;
+    /// `jp` / `jnp`.
+    pub(super) const JCC_PF: u8 = 6;
+    /// `setp` / `setnp` / `cmovp` / `cmovnp` / `lahf`.
+    pub(super) const READS_PF: u8 = 7;
+    /// A float → integer conversion, routed to the SSE lift without an XMM operand.
+    pub(super) const CVT_TO_INT: u8 = 8;
+    /// A register the lift cannot map.
+    pub(super) const REG_NONE: u8 = 0;
+    /// A register the integer lift maps ([`super::iced_reg_to_varnode`]).
+    pub(super) const REG_GPR: u8 = 1;
+    /// An XMM register ([`super::iced_xmm_offset`]).
+    pub(super) const REG_XMM: u8 = 2;
+}
+
+/// The [`fact_class`] of each code (by its mnemonic) and of each register.
+type FactTables = (Box<[u8]>, Box<[u8]>);
+
+/// The [`FactTables`], made once.
+#[inline]
+fn fact_tables() -> &'static FactTables {
+    static TABLES: std::sync::OnceLock<FactTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        use fact_class::*;
+        use iced_x86::Mnemonic::*;
+        let codes = iced_x86::Code::values()
+            .map(|code| {
+                let mut insn = iced_x86::Instruction::default();
+                insn.set_code(code);
+                if x87::is_x87(&insn) {
+                    return X87;
+                }
+                match insn.mnemonic() {
+                    Call => CALL,
+                    Jmp => JMP,
+                    Ret => RET,
+                    Je | Jne | Jl | Jge | Jb | Jae | Js | Jns | Jo | Jno | Ja | Jbe | Jle | Jg => JCC,
+                    Jp | Jnp => JCC_PF,
+                    Setp | Setnp | Cmovp | Cmovnp | Lahf => READS_PF,
+                    Cvttss2si | Cvttsd2si | Cvtss2si | Cvtsd2si => CVT_TO_INT,
+                    _ => OTHER,
+                }
+            })
+            .collect();
+        let regs = iced_x86::Register::values()
+            .map(|r| {
+                if iced_xmm_offset(r).is_some() {
+                    REG_XMM
+                } else if iced_reg_to_varnode(r).is_some() {
+                    REG_GPR
+                } else {
+                    REG_NONE
+                }
+            })
+            .collect();
+        (codes, regs)
+    })
+}
+
 /// Memo for [`X86Lifter::lift_range_cached`]: the lift of each address alone,
 /// without the integer PF (`None` where it fails).
 ///
@@ -205,6 +275,8 @@ pub struct LiftCache {
     ring_origin: u32,
     /// The ring's length (0 before the first entry).
     ring_cap: usize,
+    /// `ring_cap - 1` (a slot's mask).
+    ring_mask: usize,
     /// The lifter's mode, for the lifts made when first read.
     is_64: bool,
     /// Lift an instruction whose facts the decode gives when it is first read ([`Self::lazy`]).
@@ -369,7 +441,7 @@ impl LiftCache {
     /// The slot of index `i` in the ring.
     #[inline]
     fn slot(&self, i: u32) -> usize {
-        i.wrapping_sub(self.ring_origin) as usize & (self.ring_cap - 1)
+        i.wrapping_sub(self.ring_origin) as usize & self.ring_mask
     }
 
     /// The slot of new entry `i`, made when the ring is still filling (the next one), else
@@ -433,7 +505,8 @@ impl LiftCache {
                     break;
                 }
                 let s = self.slot(self.base + p as u32);
-                self.lifted[s].take();
+                // (dropped in place, not moved out first)
+                self.lifted[s] = std::cell::OnceCell::new();
                 self.meta[p] = Meta { next: NO_NEXT, len: 0, flags: DEAD };
                 self.live -= 1;
             }
@@ -507,6 +580,7 @@ impl LiftCache {
         self.decoded = decoded;
         self.ring_origin = self.base;
         self.ring_cap = n;
+        self.ring_mask = n - 1;
     }
 
     /// The decoded instruction of entry `i` (the default in a cache that is not lazy).
@@ -584,7 +658,8 @@ impl LiftCache {
         addr: u64,
         block: &mut Option<BlockDecoder<'m>>,
     ) -> u32 {
-        let i = *self.map.slot(addr);
+        let at = self.map.page_at(addr);
+        let i = self.map.get_in(at, addr);
         // (an index below `base` has left the arrays; `NO_INDEX` is past them)
         if i != NO_INDEX && i >= self.base && self.meta[(i - self.base) as usize].flags & DEAD == 0 {
             return i;
@@ -598,42 +673,33 @@ impl LiftCache {
         let i = self.base + u32::try_from(self.meta.len()).expect("lift cache index");
         assert!(i != NO_INDEX, "lift cache index");
         let s = self.new_slot(i);
-        let decoded = lifter.decode_in_block(memory, addr, block);
         // an instruction whose facts the decode gives is lifted when first read (only by the
-        // lifter without the integer PF, the one `Self::lift_entry` lifts with)
-        let lazy = match &decoded {
-            Ok(insn) if self.lazy && !lifter.parity => X86Lifter::decoded_facts(insn).map(|f| (*insn, f)),
-            _ => None,
-        };
-        let (flags, len, shape) = if let Some((insn, (sflags, target, reads_pf))) = lazy {
-            self.is_64 = lifter.is_64;
-            let len = u8::try_from(insn.len()).expect("an x86 instruction is at most 15 bytes");
-            self.decoded[s] = insn;
-            (if reads_pf { READS_PF } else { 0 }, len, crate::lift::InsnShape { address: addr, target, flags: sflags })
-        } else {
-            let mut facts = OpFacts::default();
-            // (the lift put where it is matched, not moved through an `Option` first)
-            match decoded.and_then(|insn| lifter.lift_decoded_facts(insn, addr, None, &mut facts)) {
-                Ok(insn) => {
-                    let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
-                    let flags = if x87 { X87 } else { 0 } | if facts.reads_outside_pf { READS_PF } else { 0 };
-                    let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
-                    let shape = crate::lift::InsnShape { address: addr, target: facts.target, flags: facts.flags };
-                    debug_assert_eq!(shape, crate::lift::InsnShape::of(&insn));
-                    debug_assert_eq!(facts.reads_outside_pf, reads_outside_pf(&insn));
-                    self.lifted[s] = std::cell::OnceCell::from(insn);
-                    if self.lazy {
-                        self.decoded[s] = iced_x86::Instruction::default();
+        // lifter without the integer PF, the one `Self::lift_entry` lifts with): decoded in
+        // its slot, and taken from there to be lifted when the decode does not give them
+        let (flags, len, shape) = if self.lazy && !lifter.parity {
+            match lifter.decode_in_block_into(memory, addr, block, &mut self.decoded[s]) {
+                Ok(()) => match X86Lifter::decoded_facts(&self.decoded[s]) {
+                    Some((sflags, target, reads_pf)) => {
+                        self.is_64 = lifter.is_64;
+                        let len = u8::try_from(self.decoded[s].len()).expect("an x86 instruction is at most 15 bytes");
+                        (if reads_pf { READS_PF } else { 0 }, len, crate::lift::InsnShape { address: addr, target, flags: sflags })
                     }
-                    (flags, len, shape)
-                }
-                Err(_) => {
-                    if self.lazy {
-                        self.decoded[s] = iced_x86::Instruction::default();
+                    None => {
+                        let insn = std::mem::take(&mut self.decoded[s]);
+                        self.lift_new(s, lifter, Ok(insn), addr)
                     }
-                    (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() })
+                },
+                Err(e) => {
+                    self.decoded[s] = iced_x86::Instruction::default();
+                    self.lift_new(s, lifter, Err(e), addr)
                 }
             }
+        } else {
+            let decoded = lifter.decode_in_block(memory, addr, block);
+            if self.lazy {
+                self.decoded[s] = iced_x86::Instruction::default();
+            }
+            self.lift_new(s, lifter, decoded, addr)
         };
         self.meta.push(Meta { next: NO_NEXT, len, flags });
         self.addr.push(shape.address);
@@ -642,9 +708,36 @@ impl LiftCache {
         if shape.flags != 0 {
             self.special.push(i);
         }
-        self.map.set(addr, i);
+        self.map.set_in(at, addr, i);
         self.live += 1;
         i
+    }
+
+    /// The flags, length and shape of new entry `s` (the slot of its index) at `addr`, its
+    /// decode `decoded` lifted with `lifter` into its slot (its decoded instruction left as it
+    /// is: the default in a lazy cache).
+    fn lift_new(
+        &mut self,
+        s: usize,
+        lifter: &X86Lifter,
+        decoded: Result<iced_x86::Instruction, LiftError>,
+        addr: u64,
+    ) -> (u8, u8, crate::lift::InsnShape) {
+        let mut facts = OpFacts::default();
+        // (the lift put where it is matched, not moved through an `Option` first)
+        match decoded.and_then(|insn| lifter.lift_decoded_facts(insn, addr, None, &mut facts)) {
+            Ok(insn) => {
+                let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
+                let flags = if x87 { X87 } else { 0 } | if facts.reads_outside_pf { READS_PF } else { 0 };
+                let len = u8::try_from(insn.length).expect("an x86 instruction is at most 15 bytes");
+                let shape = crate::lift::InsnShape { address: addr, target: facts.target, flags: facts.flags };
+                debug_assert_eq!(shape, crate::lift::InsnShape::of(&insn));
+                debug_assert_eq!(facts.reads_outside_pf, reads_outside_pf(&insn));
+                self.lifted[s] = std::cell::OnceCell::from(insn);
+                (flags, len, shape)
+            }
+            Err(_) => (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() }),
+        }
     }
 }
 
@@ -696,16 +789,24 @@ impl AddrIndex {
 
     /// The slot of `addr` ([`NO_INDEX`] when it has none), its page made
     /// when it has none.
-    #[inline]
-    fn slot(&mut self, addr: u64) -> &mut u32 {
+    #[cfg(test)]
+    fn slot(&mut self, addr: u64) -> u32 {
         let at = self.page_at(addr);
-        &mut self.pages[at as usize][(addr % INDEX_PAGE) as usize]
+        self.get_in(at, addr)
     }
 
-    /// Sets the slot of `addr` to `i`, the largest index written yet.
+    /// The slot of `addr` ([`NO_INDEX`] when it has none) in the page at position `at` (its
+    /// page: [`Self::page_at`]).
     #[inline]
-    fn set(&mut self, addr: u64, i: u32) {
-        let at = self.page_at(addr) as usize;
+    fn get_in(&self, at: u32, addr: u64) -> u32 {
+        self.pages[at as usize][(addr % INDEX_PAGE) as usize]
+    }
+
+    /// Sets the slot of `addr` to `i`, the largest index written yet, in the page at
+    /// position `at` (`addr`'s page: [`Self::page_at`]).
+    #[inline]
+    fn set_in(&mut self, at: u32, addr: u64, i: u32) {
+        let at = at as usize;
         self.pages[at][(addr % INDEX_PAGE) as usize] = i;
         self.last_index[at] = i;
     }
@@ -1295,22 +1396,22 @@ impl X86Lifter {
     #[inline(always)]
     fn decoded_facts(insn: &iced_x86::Instruction) -> Option<(u8, u64, bool)> {
         use crate::lift::InsnShape as S;
-        use iced_x86::Mnemonic::*;
         use iced_x86::OpKind;
-        if x87::is_x87(insn) {
+        let (codes, regs) = fact_tables();
+        let class = codes[insn.code() as usize];
+        if class == fact_class::X87 {
             return None;
         }
         // (an XMM register routes the instruction to the SSE lift, so it is liftable wherever
         // it is named; the integer lift names no XMM register)
         let mut sse = false;
         for i in 0..insn.op_count() {
-            let liftable = match insn.op_kind(i) {
-                OpKind::Register => {
-                    let r = insn.op_register(i);
-                    let xmm = iced_xmm_offset(r).is_some();
-                    sse |= xmm;
-                    xmm || iced_reg_to_varnode(r).is_some()
-                }
+            match insn.op_kind(i) {
+                OpKind::Register => match regs[insn.op_register(i) as usize] {
+                    fact_class::REG_GPR => {}
+                    fact_class::REG_XMM => sse = true,
+                    _ => return None,
+                },
                 OpKind::Immediate8
                 | OpKind::Immediate16
                 | OpKind::Immediate32
@@ -1322,29 +1423,29 @@ impl X86Lifter {
                 | OpKind::Memory
                 | OpKind::NearBranch16
                 | OpKind::NearBranch32
-                | OpKind::NearBranch64 => true,
-                _ => false,
-            };
-            if !liftable {
-                return None;
+                | OpKind::NearBranch64 => {}
+                _ => return None,
             }
         }
-        if sse || matches!(insn.mnemonic(), Cvttss2si | Cvttsd2si | Cvtss2si | Cvtsd2si) {
+        if sse || class == fact_class::CVT_TO_INT {
             debug_assert!(insn_touches_xmm(insn));
             return Some((0, 0, false));
         }
         debug_assert!(!insn_touches_xmm(insn));
-        let near = insn.op_count() > 0 && matches!(insn.op0_kind(), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64);
+        let near = || insn.op_count() > 0 && matches!(insn.op0_kind(), OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64);
         let jump = |pf: bool| Some((S::ENDS | S::TARGET, insn.near_branch_target(), pf));
-        match insn.mnemonic() {
-            Call if near => Some((S::CALL, 0, false)),
-            Call => Some((S::CALL | S::CALLIND, 0, false)),
-            Jmp if near => Some((S::ENDS | S::STOPS | S::TARGET, insn.near_branch_target(), false)),
-            Jmp | Ret => Some((S::ENDS | S::STOPS, 0, false)),
-            Je | Jne | Jl | Jge | Jb | Jae | Js | Jns | Jo | Jno | Ja | Jbe | Jle | Jg => jump(false),
-            Jp | Jnp => jump(true),
-            Setp | Setnp | Cmovp | Cmovnp | Lahf => Some((0, 0, true)),
-            _ => Some((0, 0, false)),
+        match class {
+            fact_class::OTHER => Some((0, 0, false)),
+            fact_class::CALL if near() => Some((S::CALL, 0, false)),
+            fact_class::CALL => Some((S::CALL | S::CALLIND, 0, false)),
+            fact_class::JMP if near() => Some((S::ENDS | S::STOPS | S::TARGET, insn.near_branch_target(), false)),
+            fact_class::JMP | fact_class::RET => Some((S::ENDS | S::STOPS, 0, false)),
+            fact_class::JCC => jump(false),
+            fact_class::JCC_PF => jump(true),
+            _ => {
+                debug_assert_eq!(class, fact_class::READS_PF);
+                Some((0, 0, true))
+            }
         }
     }
 
@@ -3975,8 +4076,47 @@ impl X86Lifter {
 
     /// [`Self::decode_one`] through `block`, a decoder over the bytes of
     /// the memory block the last address was in: positioning a decoder
-    /// costs less than making one for every instruction.
+    /// costs less than making one for every instruction. (Inlined: the decode in the
+    /// block the last address was in; [`Self::decode_in_block_slow`] otherwise.)
+    #[inline(always)]
     fn decode_in_block<'m>(
+        &self,
+        memory: &'m Memory,
+        address: u64,
+        block: &mut Option<BlockDecoder<'m>>,
+    ) -> Result<iced_x86::Instruction, LiftError> {
+        let mut insn = iced_x86::Instruction::default();
+        self.decode_in_block_into(memory, address, block, &mut insn).map(|()| insn)
+    }
+
+    /// [`Self::decode_in_block`] into `insn` (left as it is, or any instruction, on an error).
+    #[inline(always)]
+    fn decode_in_block_into<'m>(
+        &self,
+        memory: &'m Memory,
+        address: u64,
+        block: &mut Option<BlockDecoder<'m>>,
+        insn: &mut iced_x86::Instruction,
+    ) -> Result<(), LiftError> {
+        if let Some(b) = block.as_mut().filter(|b| b.holds(address)) {
+            // (as below)
+            let offset = address - b.start;
+            let read_len = b.size.saturating_sub(offset).min(15);
+            if read_len != 0 && offset + read_len <= b.limit && b.decoder.set_position(offset as usize).is_ok() {
+                b.decoder.set_ip(address);
+                b.decoder.decode_out(insn);
+                if !insn.is_invalid() {
+                    return Ok(());
+                }
+            }
+        }
+        *insn = self.decode_in_block_slow(memory, address, block)?;
+        Ok(())
+    }
+
+    /// [`Self::decode_in_block`] the long way.
+    #[inline(never)]
+    fn decode_in_block_slow<'m>(
         &self,
         memory: &'m Memory,
         address: u64,
@@ -4014,7 +4154,14 @@ impl X86Lifter {
         address: u64,
         x87: Option<X87Ctx>,
     ) -> Result<LiftedInstruction, LiftError> {
-        self.lift_decoded_facts(insn, address, x87, &mut OpFacts::default())
+        let pcode_ops = self.lift_iced(&insn, address, x87)?;
+        let pcode_ops = self.finish_ops::<false>(pcode_ops, &insn, &mut OpFacts::default());
+        Ok(LiftedInstruction {
+            address,
+            length: insn.len() as u32,
+            mnemonic: crate::lift::InsnText::x86_lazy(insn),
+            ops: pcode_ops,
+        })
     }
 
     /// [`Self::lift_decoded`], with `facts` set to what the walks read of the lift's ops
@@ -4027,7 +4174,7 @@ impl X86Lifter {
         facts: &mut OpFacts,
     ) -> Result<LiftedInstruction, LiftError> {
         let pcode_ops = self.lift_iced(&insn, address, x87)?;
-        let pcode_ops = self.finish_ops(pcode_ops, &insn, facts);
+        let pcode_ops = self.finish_ops::<true>(pcode_ops, &insn, facts);
 
         Ok(LiftedInstruction {
             address,
@@ -4040,22 +4187,27 @@ impl X86Lifter {
     /// The ops `lift_iced` built, with the register views kept coherent
     /// ([`zero_extend_gpr32_writes`], [`sync_xmm_views`]), in a vector of
     /// exactly their number: the lift holds no spare room, and the ops are
-    /// moved once where only the GPR views are added.
-    fn finish_ops(&self, mut ops: Vec<PcodeOp>, insn: &iced_x86::Instruction, facts: &mut OpFacts) -> Vec<PcodeOp> {
-        // (one pass: whether an XMM view is written and the XMM views need syncing, whether a
-        // GPR view is written or a high byte read / written, and how many ops
-        // `zero_extend_gpr32_writes` adds; and the facts, which the views added do not change:
-        // they are copies of registers other than the flags)
-        let (mut xmm, mut touches, mut extra) = (false, false, 0usize);
+    /// moved once where only the GPR views are added. With `FACTS`, `facts` is set to what
+    /// the walks read of the ops (else left alone: a lift whose facts the decode gave).
+    fn finish_ops<const FACTS: bool>(&self, mut ops: Vec<PcodeOp>, insn: &iced_x86::Instruction, facts: &mut OpFacts) -> Vec<PcodeOp> {
+        // (one pass: whether an XMM view is written and the XMM views need syncing, which ops
+        // write a GPR view or read / write a high byte (`touch`, by op; all when there are more
+        // than 64) and how many ops `zero_extend_gpr32_writes` adds; and the facts, which the
+        // views added do not change: they are copies of registers other than the flags)
+        let (mut xmm, mut extra) = (false, 0usize);
+        let mut touch = 0u64;
         let mut shape = crate::lift::InsnShape::default();
         // (PF read before it is written / written so far)
         let (mut pf_read, mut pf_written) = (None, false);
-        for op in &ops {
+        for (k, op) in ops.iter().enumerate() {
+            let bit = 1u64 << k.min(63);
             let mut reads = 0;
             let mut last: Option<VarnodeData> = None;
             let mut reads_pf = false;
             for v in op.inputs.iter() {
-                reads_pf |= is_pf(v);
+                if FACTS {
+                    reads_pf |= is_pf(v);
+                }
                 if high_byte(v) {
                     if last != Some(*v) {
                         reads += 1;
@@ -4063,23 +4215,29 @@ impl X86Lifter {
                     last = Some(*v);
                 }
             }
-            if reads_pf && pf_read.is_none() {
-                pf_read = Some(!pf_written);
+            if FACTS {
+                if reads_pf && pf_read.is_none() {
+                    pf_read = Some(!pf_written);
+                }
+                shape.add(op);
             }
-            shape.add(op);
-            touches |= reads > 0;
+            if reads > 0 {
+                touch |= bit;
+            }
             extra += reads;
             let Some(w) = op.output else { continue };
-            pf_written |= is_pf(&w);
+            if FACTS {
+                pf_written |= is_pf(&w);
+            }
             if w.space != REG_SPACE {
                 continue;
             }
             xmm |= xmm_view(&w).is_some();
             if high_byte(&w) {
-                touches = true;
+                touch |= bit;
                 extra += 4;
             } else if gpr_view(&w) {
-                touches = true;
+                touch |= bit;
                 let is_rsp = w.offset == 0x20;
                 extra += match w.size {
                     8 if !is_rsp => 3,
@@ -4090,17 +4248,21 @@ impl X86Lifter {
                 };
             }
         }
-        facts.reads_outside_pf = pf_read == Some(true);
-        facts.flags = shape.flags;
-        facts.target = shape.target;
-        if self.is_64 && touches {
+        if FACTS {
+            facts.reads_outside_pf = pf_read == Some(true);
+            facts.flags = shape.flags;
+            facts.target = shape.target;
+        }
+        if self.is_64 && touch != 0 {
             if extra == 0 {
                 for (i, op) in ops.iter_mut().enumerate() {
                     op.seq.order = i as u32;
                 }
             } else {
+                // (past 64 ops, every op from the 64th on is looked at)
+                let touch = if ops.len() > 64 { touch | !0u64 << 63 } else { touch };
                 let out = if xmm { scratch::take() } else { Vec::with_capacity(ops.len() + extra) };
-                let out = zero_extend_gpr32_writes(&mut ops, out);
+                let out = zero_extend_gpr32_writes(&mut ops, out, touch);
                 scratch::give(std::mem::replace(&mut ops, out));
                 if !xmm {
                     return ops;
@@ -4486,11 +4648,20 @@ fn xmm_view(v: &VarnodeData) -> Option<u64> {
 
 /// The ops of `ops` (drained) with the GPR views kept coherent, in `out`
 /// (empty; `ops` writes a GPR view or reads / writes a high byte).
-fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>) -> Vec<PcodeOp> {
+fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>, touch: u64) -> Vec<PcodeOp> {
     let gpr = |v: &VarnodeData| gpr_view(v).then_some(*v);
     let high = high_byte;
     let mut tmp = 0x7e00u64;
-    for op in ops.drain(..) {
+    let mut ops = ops.drain(..);
+    // (the ops before the next one `touch` marks are moved as they are; bit 63 marks every op
+    // from the 64th on)
+    let mut k = 0u32;
+    loop {
+        let next = if k >= 63 { k } else { (touch >> k << k).trailing_zeros().min(63) };
+        out.extend(ops.by_ref().take((next - k) as usize));
+        k = next;
+        let Some(op) = ops.next() else { break };
+        k = (k + 1).min(63);
         let at = op.seq.addr;
         let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
             opcode,
@@ -5810,7 +5981,7 @@ mod tests {
                 }
                 assert_eq!(new.special.iter().map(|&i| i - b).collect::<Vec<_>>(), old.special);
                 for t in (at..at + code.len() as u64).step_by(1 + (next() % 7) as usize) {
-                    let i = *new.map.slot(t);
+                    let i = new.map.slot(t);
                     let got = (i != NO_INDEX && i >= b && new.meta[(i - b) as usize].flags & DEAD == 0).then(|| i - b);
                     assert_eq!(got, old.lookup(t), "round {round} step {step} {t:#x}");
                 }

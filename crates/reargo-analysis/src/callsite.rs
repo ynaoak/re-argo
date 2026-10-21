@@ -927,7 +927,9 @@ impl Tracker {
         self.regs.get64(offset)
     }
 
-    /// Apply one P-code op's effect to the tracker state.
+    /// Apply one P-code op's effect to the tracker state (inlined: the ops that change
+    /// nothing, a view refresh or an op without an output, return before a call).
+    #[inline(always)]
     fn apply(&mut self, op: &reargo_core::pcode::PcodeOp) {
         if is_unmodeled(op) {
             // may write any register, and memory through them
@@ -937,6 +939,20 @@ impl Tracker {
         // Handle stores first -- they have no output but do mutate
         // tracked state (stack slots).
         if op.opcode == OpCode::Store {
+            self.apply_store(op);
+            return;
+        }
+        let Some(out) = op.output else { return };
+        if is_view_refresh(op) {
+            return;
+        }
+        self.apply_output(op, out);
+    }
+
+    /// [`Self::apply`] of a `STORE`.
+    #[inline(never)]
+    fn apply_store(&mut self, op: &reargo_core::pcode::PcodeOp) {
+        {
             // STORE space, addr, value -- inputs[0]=space-id,
             // inputs[1]=address, inputs[2]=value.
             let (Some(addr), Some(value)) = (op.inputs.get(1), op.inputs.get(2)) else { return };
@@ -952,13 +968,12 @@ impl Tracker {
                 // pointer that may point into the frame
                 self.stack.clear();
             }
-            return;
         }
+    }
 
-        let Some(out) = op.output else { return };
-        if is_view_refresh(op) {
-            return;
-        }
+    /// [`Self::apply`] of an op (not a `STORE`, not a view refresh) that writes `out`.
+    #[inline(never)]
+    fn apply_output(&mut self, op: &reargo_core::pcode::PcodeOp, out: VarnodeData) {
         // a load's input is an address, not a value it passes on
         let reads_stack_address =
             op.opcode != OpCode::Load && op.inputs.iter().any(|vn| self.is_stack_address(vn));

@@ -269,8 +269,20 @@ impl FirstLookups {
     }
 
     /// The bucket counts of every 5-byte window of `data`
-    /// ([`bucket_window`] of each).
+    /// ([`bucket_window`] of each): [`Self::count_vbmi`] where the CPU has AVX-512 VBMI, else
+    /// [`Self::count_scalar`].
     fn count(&self, data: &[u8]) -> [u32; 128] {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx512vbmi") && std::arch::is_x86_feature_detected!("avx512bw") {
+            // SAFETY: the CPU has the features `count_vbmi` is compiled for.
+            return unsafe { self.count_vbmi(data) };
+        }
+        self.count_scalar(data)
+    }
+
+    /// The bucket counts of every 5-byte window of `data` ([`bucket_window`] of each), one
+    /// window at a time.
+    fn count_scalar(&self, data: &[u8]) -> [u32; 128] {
         // The last lookup gives the bucket (its low 7 bits) as an index
         // into 256 counters: no mask and no bounds check per update.
         const LOW: [u8; 256] = {
@@ -295,6 +307,66 @@ impl FirstLookups {
             counts[last(f5[a], p3, p4)] += 1;
         }
         std::array::from_fn(|i| counts[i])
+    }
+
+    /// [`Self::count_scalar`] 64 windows at a time: each of the three lookups of a salt is a
+    /// lookup of 64 bytes at once in a 256-byte table (two `vpermi2b` over its halves of 128
+    /// bytes, the index's top bit choosing between them), the buckets stored and counted
+    /// (the counts are sums, so in any order: four sets of counters, the updates of
+    /// neighbouring buckets independent); the windows past the last 64 one at a time.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    fn count_vbmi(&self, data: &[u8]) -> [u32; 128] {
+        use std::arch::x86_64::*;
+        /// A 256-byte table in four registers.
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+        fn table(t: &[u8; 256]) -> [__m512i; 4] {
+            // SAFETY: each load reads 64 of the table's 256 bytes.
+            std::array::from_fn(|k| unsafe { _mm512_loadu_si512(t[64 * k..].as_ptr().cast()) })
+        }
+        /// `t[x]` for each byte `x` of `idx`.
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+        fn lookup(t: &[__m512i; 4], idx: __m512i) -> __m512i {
+            let lo = _mm512_permutex2var_epi8(t[0], idx, t[1]);
+            let hi = _mm512_permutex2var_epi8(t[2], idx, t[3]);
+            _mm512_mask_blend_epi8(_mm512_movepi8_mask(idx), lo, hi)
+        }
+        const LOW: [u8; 256] = {
+            let mut t = [0u8; 256];
+            let mut i = 0;
+            while i < 256 {
+                t[i] = V_TABLE[i] & 0x7F;
+                i += 1;
+            }
+            t
+        };
+        let windows = data.len().saturating_sub(4);
+        let (v, low) = (table(&V_TABLE), table(&LOW));
+        let first: [[__m512i; 4]; 6] = std::array::from_fn(|s| table(&self.0[s]));
+        let mut counts = [[0u32; 256]; 4];
+        let mut buckets = [0u8; 6 * 64];
+        let mut at = 0;
+        while at + 64 <= windows {
+            // (the 64 windows from `at` read the bytes up to `at + 67 < data.len()`)
+            // SAFETY: each load reads 64 bytes of `data` from `at + k`, `k ≤ 4`.
+            let p: [__m512i; 5] = std::array::from_fn(|k| unsafe { _mm512_loadu_si512(data[at + k..].as_ptr().cast()) });
+            for (s, (b, c)) in [(1, 2), (1, 3), (2, 3), (2, 4), (1, 4), (3, 4)].into_iter().enumerate() {
+                let x = lookup(&first[s], p[0]);
+                let x = lookup(&v, _mm512_xor_si512(x, p[b]));
+                let x = lookup(&low, _mm512_xor_si512(x, p[c]));
+                // SAFETY: stores 64 bytes into `buckets[64 * s..64 * (s + 1)]`.
+                unsafe { _mm512_storeu_si512(buckets[64 * s..].as_mut_ptr().cast(), x) };
+            }
+            for q in buckets.chunks_exact(4) {
+                counts[0][q[0] as usize] += 1;
+                counts[1][q[1] as usize] += 1;
+                counts[2][q[2] as usize] += 1;
+                counts[3][q[3] as usize] += 1;
+            }
+            at += 64;
+        }
+        let tail = if at < windows { self.count_scalar(&data[at..]) } else { [0u32; 128] };
+        std::array::from_fn(|i| tail[i] + counts[0][i] + counts[1][i] + counts[2][i] + counts[3][i])
     }
 }
 
@@ -449,6 +521,22 @@ mod tests {
                 (s >> 33) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn vector_counts_match_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx512vbmi") && std::arch::is_x86_feature_detected!("avx512bw") {
+            let f = FirstLookups::new();
+            for len in (5..300).chain([4096, 4096 + 67, 4096 + 68, 4096 + 69, 100_003]) {
+                let data = random_bytes(len, len as u64);
+                // SAFETY: the CPU has the features.
+                assert_eq!(unsafe { f.count_vbmi(&data) }, f.count_scalar(&data), "len {len}");
+            }
+            // skewed data: few distinct buckets, many updates of one counter
+            let data: Vec<u8> = (0..70_000u32).map(|i| (i % 3) as u8).collect();
+            assert_eq!(unsafe { f.count_vbmi(&data) }, f.count_scalar(&data));
+        }
     }
 
     #[test]
