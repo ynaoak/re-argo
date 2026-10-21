@@ -330,13 +330,16 @@ impl<'a> CalleeParams<'a> {
         if self.returns.len() < 2 {
             return ReturnKind::Unknown;
         }
-        let memo = |s: &Self| s.ret_memo.lock().ok().and_then(|m| m.get(&(target, depth_left)).copied());
-        if let Some(r) = memo(self) {
+        if let Some(r) = self.ret_memo.lock().ok().and_then(|m| m.get(&(target, depth_left)).copied()) {
             return r;
         }
-        // the parameter analysis lifts the body once and answers this too
-        self.params_at(target, depth_left);
-        memo(self).unwrap_or(ReturnKind::Unknown)
+        // (from the summary the parameter analysis shares; found only when asked, not with
+        // every parameter answer: most bodies summarised are only asked their parameters)
+        let kind = self.summary(target).map_or(ReturnKind::Unknown, |s| self.return_kind_of(&s.ret_sites, depth_left));
+        if let Ok(mut m) = self.ret_memo.lock() {
+            m.insert((target, depth_left), kind);
+        }
+        kind
     }
 
     /// What each `ret` of a lifted body returns (see `return_kind`): the return register it
@@ -707,10 +710,6 @@ impl<'a> CalleeParams<'a> {
             && let Ok(mut m) = self.fields_memo.lock()
         {
             m.entry(target).or_insert_with(|| fields.clone());
-        }
-        let kind = self.return_kind_of(&s.ret_sites, depth_left);
-        if let Ok(mut m) = self.ret_memo.lock() {
-            m.insert((target, depth_left), kind);
         }
         let mut reads = s.reads;
         let all = (1u32 << self.args.len()) - 1;
@@ -2008,10 +2007,29 @@ mod tests {
             }
             Some(ParamInfo { mask: reads, complete: s.complete })
         }
+
+        /// [`Self::return_kind_at`] without the memo.
+        fn return_kind_unmemoised(&self, target: u64, depth_left: u32) -> ReturnKind {
+            let Some(s) = self.summary(target) else { return ReturnKind::Unknown };
+            let kinds: Vec<ReturnKind> = s
+                .ret_sites
+                .iter()
+                .map(|site| match *site {
+                    RetSite::Kind(k) => k,
+                    RetSite::Call(Some(t)) if depth_left > 0 => self.return_kind_unmemoised(t, depth_left - 1),
+                    RetSite::Call(_) => ReturnKind::Unknown,
+                })
+                .collect();
+            match (kinds.contains(&ReturnKind::Int), kinds.contains(&ReturnKind::Float)) {
+                (true, false) => ReturnKind::Int,
+                (false, true) => ReturnKind::Float,
+                _ => ReturnKind::Unknown,
+            }
+        }
     }
 
     #[test]
-    fn calls_skipped_once_every_argument_is_settled_change_no_answer() {
+    fn skipped_calls_and_lazy_return_kinds_change_no_answer() {
         // random functions of argument writes / reads, calls (to each other, recursive ones
         // too, and to nowhere), a branch over a part and an indirect call
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -2032,7 +2050,7 @@ mod tests {
                 let mut code: Vec<u8> = Vec::new();
                 for _ in 0..next(9) {
                     let r = ARGS[next(4) as usize];
-                    match next(7) {
+                    match next(8) {
                         0 | 1 => code.extend([0xb8 + r, 1, 0, 0, 0]), // mov r32, 1
                         2 => code.extend([0x89, 0xc0 | (r << 3)]),     // mov eax, r32
                         3 | 4 => {
@@ -2043,10 +2061,18 @@ mod tests {
                             code.extend((t.wrapping_sub(from) as u32).to_le_bytes());
                         }
                         5 => code.extend([0x85, 0xc0, 0x74, 0x05, 0xb8 + r, 2, 0, 0, 0]), // test; je over a mov
-                        _ => code.extend([0xff, 0xd0]),                                     // call rax
+                        6 => code.extend([0xff, 0xd0]),                                     // call rax
+                        _ => code.extend([0xf2, 0x0f, 0x2a, 0xc7]),                         // cvtsi2sd xmm0, edi
                     }
                 }
-                code.push(0xc3);
+                // (`ret`, or a tail jump to one of the functions)
+                if next(3) == 0 {
+                    let from = at(k) + code.len() as u64 + 5;
+                    code.push(0xe9);
+                    code.extend((at(next(n)).wrapping_sub(from) as u32).to_le_bytes());
+                } else {
+                    code.push(0xc3);
+                }
                 assert!(code.len() < 0x100);
                 parts.push((at(k), code));
             }
@@ -2059,12 +2085,20 @@ mod tests {
                     let p = CalleeParams::new(&lifter, &mem).unwrap();
                     if compact { p.with_entries(Vec::new()) } else { p }
                 };
+                // (one oracle asked the parameters first, one the return kinds first)
+                let (params_first, kinds_first) = (oracle(), oracle());
                 for k in 0..n {
                     for depth in 0..=MAX_DEPTH {
                         let want = oracle().params_looking_at_every_call(at(k), depth);
                         assert_eq!(oracle().params_at(at(k), depth), want, "{:#x} at depth {depth} (compact: {compact}): {refs:x?}", at(k));
+                        assert_eq!(params_first.params_at(at(k), depth), want);
+                        let kind = oracle().return_kind_unmemoised(at(k), depth);
+                        assert_eq!(kinds_first.return_kind_at(at(k), depth), kind, "return kind of {:#x} at depth {depth}", at(k));
+                        assert_eq!(kinds_first.params_at(at(k), depth), want);
+                        assert_eq!(params_first.return_kind_at(at(k), depth), kind);
                         checked += 1;
                     }
+                    assert_eq!(params_first.param_use(at(k)), kinds_first.param_use(at(k)));
                 }
             }
         }

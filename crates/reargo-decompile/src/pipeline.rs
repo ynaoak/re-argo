@@ -1702,13 +1702,11 @@ pub fn decompile_all_with_options(
                 || {
                     // Largest first, each worker taking the next function when it is done: the
                     // big functions do not end up last on one thread (the results keep the
-                    // listing order).
+                    // listing order); and callees before their callers (`callee_first_order`).
                     let size = |e: u64| program.listing.get_function(e).map_or(0, |f| f.body.ranges().map(|r| r.size).sum::<u64>());
                     // (the sizes summed in parallel: a body holds a range per instruction)
                     let sizes: Vec<u64> = entries.par_iter().with_min_len(256).map(|&e| size(e)).collect();
-                    let mut order: Vec<usize> = (0..entries.len()).collect();
-                    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
-                    order
+                    callee_first_order(&sizes, &direct_callees(program, &entries))
                 },
             )
         },
@@ -1750,6 +1748,87 @@ pub fn decompile_all_with_options(
             (e, r)
         })
         .collect()
+}
+
+/// The functions each function calls or jumps to (`entries` in increasing order), by index:
+/// `(callers' list starts, callees)`, the callees of `i` at `starts[i]..starts[i + 1]` — from
+/// the call and jump references to each entry, a reference's function the last entry at or
+/// before it. (Only the decompile order reads it, so it need not be exact.)
+fn direct_callees(program: &Program, entries: &[u64]) -> (Vec<u32>, Vec<u32>) {
+    let n = entries.len();
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    if entries.is_sorted() {
+        for (t, &e) in entries.iter().enumerate() {
+            for r in program.references.get_refs_to(e) {
+                if !(r.ref_type.is_call() || r.ref_type.is_jump()) {
+                    continue;
+                }
+                let Some(caller) = entries.partition_point(|&a| a <= r.from).checked_sub(1) else { continue };
+                if caller != t {
+                    pairs.push((caller as u32, t as u32));
+                }
+            }
+        }
+    }
+    let mut starts = vec![0u32; n + 1];
+    for &(c, _) in &pairs {
+        starts[c as usize + 1] += 1;
+    }
+    for i in 0..n {
+        starts[i + 1] += starts[i];
+    }
+    let mut at = starts.clone();
+    let mut callees = vec![0u32; pairs.len()];
+    for &(c, t) in &pairs {
+        callees[at[c as usize] as usize] = t;
+        at[c as usize] += 1;
+    }
+    (starts, callees)
+}
+
+/// The order a batch decompiles its functions in (indices into `sizes`): a depth-first walk of
+/// the calls (`(starts, callees)` of [`direct_callees`]) from each function not placed yet,
+/// the largest first, placing every function after the functions it calls (but those on the
+/// walk's path: a cycle). A function's parameter summary is then made from the lifts of its
+/// own decompile (`CalleeParams::seed_summary`) before a caller asks for it, instead of from
+/// a lift of its own; and a function placed after the walk from `f` began is no larger than
+/// `f` (any larger one began a walk before), so the big functions still come early and the
+/// small ones last, where the workers taking the next one balance the threads. The order
+/// changes no output: the memos hold the same answers whoever fills them.
+fn callee_first_order(sizes: &[u64], (starts, callees): &(Vec<u32>, Vec<u32>)) -> Vec<usize> {
+    let n = sizes.len();
+    let mut roots: Vec<usize> = (0..n).collect();
+    roots.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+    if callees.is_empty() {
+        return roots;
+    }
+    // (0: not reached, 1: on the walk's path, 2: placed)
+    let mut state = vec![0u8; n];
+    let mut order = Vec::with_capacity(n);
+    // (a function on the path, and the position of its next callee)
+    let mut path: Vec<(usize, usize)> = Vec::new();
+    for r in roots {
+        if state[r] != 0 {
+            continue;
+        }
+        state[r] = 1;
+        path.push((r, starts[r] as usize));
+        while let Some((f, next)) = path.last_mut() {
+            if *next < starts[*f + 1] as usize {
+                let c = callees[*next] as usize;
+                *next += 1;
+                if state[c] == 0 {
+                    state[c] = 1;
+                    path.push((c, starts[c] as usize));
+                }
+            } else {
+                state[*f] = 2;
+                order.push(*f);
+                path.pop();
+            }
+        }
+    }
+    order
 }
 
 /// Result of taint-tracking a function from its parameters.
@@ -2198,6 +2277,64 @@ mod tests {
     use reargo_lift::x86::X86Lifter;
     use reargo_loader::memory::{Memory, MemoryBlock, MemoryFlags};
     use std::sync::Arc;
+
+    #[test]
+    fn callee_first_order_places_callees_first_and_big_functions_early() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..500 {
+            let n = 1 + next(40) as usize;
+            let sizes: Vec<u64> = (0..n).map(|_| next(20)).collect();
+            let mut pairs: Vec<(u32, u32)> = (0..next(3 * n as u64)).map(|_| (next(n as u64) as u32, next(n as u64) as u32)).filter(|(c, t)| c != t).collect();
+            pairs.sort_unstable_by_key(|p| p.0);
+            let mut starts = vec![0u32; n + 1];
+            for &(c, _) in &pairs {
+                starts[c as usize + 1] += 1;
+            }
+            for i in 0..n {
+                starts[i + 1] += starts[i];
+            }
+            let graph = (starts, pairs.iter().map(|p| p.1).collect::<Vec<u32>>());
+            let order = callee_first_order(&sizes, &graph);
+            // a permutation
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..n).collect::<Vec<_>>());
+            let mut place = vec![0; n];
+            for (k, &f) in order.iter().enumerate() {
+                place[f] = k;
+            }
+            // (whether `from` reaches `to` by calls: then a call `to -> from` may close a cycle)
+            let reaches = |from: usize, to: usize| {
+                let mut seen = vec![false; n];
+                let mut stack = vec![from];
+                while let Some(f) = stack.pop() {
+                    if f == to {
+                        return true;
+                    }
+                    if !std::mem::replace(&mut seen[f], true) {
+                        stack.extend(pairs.iter().filter(|p| p.0 as usize == f).map(|p| p.1 as usize));
+                    }
+                }
+                false
+            };
+            for &(c, t) in &pairs {
+                assert!(place[t as usize] < place[c as usize] || reaches(t as usize, c as usize), "{t} called by {c} placed after it: {order:?}");
+            }
+            let mut by_size: Vec<usize> = (0..n).collect();
+            by_size.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+            // the first walk is the largest function's: what is placed up to it, it reaches
+            let largest = by_size[0];
+            assert!(order[..=place[largest]].iter().all(|&f| reaches(largest, f)));
+            // without calls: largest first, as before
+            assert_eq!(callee_first_order(&sizes, &(vec![0; n + 1], Vec::new())), by_size);
+        }
+    }
 
     fn make_memory(data: &[u8], addr: u64) -> Memory {
         let mut mem = Memory::new(SpaceId(1), Endian::Little);
