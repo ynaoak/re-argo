@@ -58,7 +58,9 @@ impl Analyzer for CrtPatternAnalyzer {
         Some(State::NONE)
     }
     fn writes(&self) -> State {
-        State::SYMBOLS.union(State::COMMENTS).union(State::FUNCTIONS)
+        // (and the results computed ahead for the functions it adds,
+        // left in the analysis cache)
+        State::SYMBOLS.union(State::COMMENTS).union(State::FUNCTIONS).union(State::CACHE)
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
         let prepared = self.prepare(program);
@@ -71,7 +73,7 @@ impl Analyzer for CrtPatternAnalyzer {
     /// `apply`, at this analyzer's place.
     fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
-            return Box::new(Vec::<(u64, &'static str)>::new());
+            return Box::new(Found::default());
         }
         let matcher = Matcher::new();
         // Walk in 16-byte steps. The linker aligns every CRT helper to
@@ -97,10 +99,33 @@ impl Analyzer for CrtPatternAnalyzer {
             .with_min_len(4096)
             .filter_map(|&entry| matcher.at(program, entry).map(|name| (entry, name)))
             .collect();
-        Box::new(found)
+        // The functions `apply` adds at them have no body (P-code
+        // Reference and the Indirect Call Resolver lift them later, with
+        // their budgets' floors): their results computed here, from the
+        // bytes, with the others'.
+        let entries: Vec<u64> = found.iter().map(|&(entry, _)| entry).collect();
+        let ahead = (!entries.is_empty()).then(|| crate::stack::ahead_for_new(program, &entries));
+        Box::new(Found { at_steps: found, ahead })
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
-        let at_steps: Vec<(u64, &'static str)> = crate::analyzer::prepared(prepared);
+        let Found { at_steps, ahead } = crate::analyzer::prepared(prepared);
+        if let Some((pcode, indirect)) = ahead {
+            // (with the ones the Stack Frame analyzer computed: one of the
+            // same key is the same result)
+            let mut held = program.analysis_cache.take::<crate::pcoderef::Ahead>().map_or_else(Default::default, |a| a.0);
+            for (k, v) in pcode {
+                held.entry(k).or_insert(v);
+            }
+            program.analysis_cache.insert(crate::pcoderef::Ahead(held));
+            if let Some(indirect) = indirect {
+                let mut held =
+                    program.analysis_cache.take::<crate::indirect_resolve::Ahead>().map_or_else(Default::default, |a| a.0);
+                for (k, v) in indirect {
+                    held.entry(k).or_insert(v);
+                }
+                program.analysis_cache.insert(crate::indirect_resolve::Ahead(held));
+            }
+        }
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
             return Ok(AnalysisResult {
                 analyzer_name: self.name().into(),
@@ -158,6 +183,15 @@ impl Analyzer for CrtPatternAnalyzer {
             instructions_decoded: 0,
         })
     }
+}
+
+/// What [`CrtPatternAnalyzer`]'s `prepare` finds: the helpers at the
+/// 16-byte steps, by address, and the results computed ahead for
+/// functions there ([`crate::stack::ahead_for_new`]).
+#[derive(Default)]
+struct Found {
+    at_steps: Vec<(u64, &'static str)>,
+    ahead: Option<crate::stack::NewAhead>,
 }
 
 /// The patterns, and the first bytes one can start with.

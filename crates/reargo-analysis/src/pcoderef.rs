@@ -154,9 +154,7 @@ impl Analyzer for PcodeReferenceAnalyzer {
                 scan_lifted(insns, &sections)
             })
         })
-        .into_iter()
-        .flatten()
-        .collect();
+        .concat();
 
         crate::tr!(tt, "pcoderef candidates {}", candidates.len());
         // Phase 2: dedup against existing refs and apply — each candidate

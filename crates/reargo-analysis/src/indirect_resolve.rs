@@ -92,14 +92,18 @@ impl Analyzer for IndirectCallResolver {
         // `Branch` placeholders so the P-code walk below would miss
         // them; resolving at the instruction-byte level here catches
         // the common case while staying provably correct.
-        let mut resolved: Vec<(u64, u64)> = Vec::new();
-        for insn in program.listing.instructions() {
-            if let Some(target_got) = parse_call_rip_disp32(insn.address, insn.length, &insn.bytes)
-                && let Some(plt) = plt_of_got(target_got)
-            {
-                resolved.push((insn.address, plt));
-            }
-        }
+        // (the listing's parts in parallel, in order)
+        let mut resolved: Vec<(u64, u64)> = program
+            .listing
+            .map_instruction_parts(|insns| {
+                insns
+                    .filter_map(|insn| {
+                        let target_got = parse_call_rip_disp32(insn.address, insn.length, &insn.bytes)?;
+                        Some((insn.address, plt_of_got(target_got)?))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .concat();
 
         // (2) P-code walk for `call <reg>` patterns where the lifter
         // does emit `CallInd`, per function over its linear lift

@@ -31,6 +31,7 @@ use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
 use reargo_lift::LiftedInstruction;
 use reargo_program::comments::CommentType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
@@ -76,6 +77,7 @@ impl Analyzer for ArgumentArityAnalyzer {
 
         // Every candidate's linear lift (in parallel, neighbours sharing
         // lifted instructions), then the writes in function order.
+        let tt = std::time::Instant::now();
         let jobs: Vec<(u64, usize)> = crate::func_lift::map_functions(program, |f| {
             (f.name.starts_with("FUN_") && !f.is_thunk).then(|| (f.entry_point, budget(f)))
         })
@@ -85,26 +87,41 @@ impl Analyzer for ArgumentArityAnalyzer {
         // A function's arity depends only on its lift: those the Stack
         // Frame analyzer computed ahead ([`Ahead`]) are taken as they are.
         let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
+        crate::tr!(tt, "arity jobs {}", jobs.len());
         let arities: Vec<usize> = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
+            crate::tr!(tt, "arity missing {}", missing.len());
             crate::range_lift::map_lifted_ranges(&program.info.memory, missing, |_, lifted| infer_arity(lifted))
         });
         let arities: Vec<(u64, usize)> = jobs.iter().map(|j| j.0).zip(arities).collect();
 
-        let mut annotated = 0usize;
-        for (entry, arity) in arities {
-            program.metadata.set_property(
-                format!("func_{:x}_arity", entry),
-                arity.to_string(),
-            );
-            if program.comments.get(entry, CommentType::Eol).is_none() {
-                program.comments.set(
-                    entry,
-                    CommentType::Eol,
-                    format!("inferred arity: {}", arity),
-                );
-                annotated += 1;
-            }
-        }
+        crate::tr!(tt, "arity lifted");
+        // (the texts made in parallel; the properties and the comments,
+        // two maps of their own, set at the same time, each in function
+        // order)
+        let (properties, notes): (Vec<(String, String)>, Vec<String>) = arities
+            .par_iter()
+            .with_min_len(512)
+            .map(|&(entry, arity)| ((format!("func_{:x}_arity", entry), arity.to_string()), format!("inferred arity: {}", arity)))
+            .unzip();
+        let Program { metadata, comments, .. } = program;
+        let ((), annotated) = rayon::join(
+            || {
+                for (key, value) in properties {
+                    metadata.set_property(key, value);
+                }
+            },
+            || {
+                let mut annotated = 0usize;
+                for (&(entry, _), text) in arities.iter().zip(notes) {
+                    if comments.get(entry, CommentType::Eol).is_none() {
+                        comments.set(entry, CommentType::Eol, text);
+                        annotated += 1;
+                    }
+                }
+                annotated
+            },
+        );
+        crate::tr!(tt, "arity set");
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

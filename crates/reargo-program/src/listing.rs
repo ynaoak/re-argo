@@ -299,6 +299,18 @@ impl Listing {
         self.instructions.iter().map(|(_, b)| &**b)
     }
 
+    /// `f` of the instructions in address order cut into parts (the
+    /// listing's maps, see `Instructions`), on the rayon pool; the results
+    /// in order. For a scan of every instruction whose result for the
+    /// whole is the results of its parts in order.
+    pub fn map_instruction_parts<T: Send>(
+        &self,
+        f: impl Fn(&mut dyn Iterator<Item = &DecodedInstruction>) -> T + Sync,
+    ) -> Vec<T> {
+        use rayon::prelude::*;
+        self.instructions.maps.par_iter().map(|m| f(&mut m.values().map(|b| &**b))).collect()
+    }
+
     /// The addresses of the instructions listed in `start..end`, ascending.
     pub fn instruction_addresses_in_range(&self, start: u64, end: u64) -> impl Iterator<Item = u64> + '_ {
         self.instructions.range(start, end).map(|(&a, _)| a)

@@ -1,6 +1,7 @@
 use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
 use reargo_lift::PcodeLift;
+use reargo_program::function::Function;
 use reargo_program::Program;
 use rayon::prelude::*;
 
@@ -178,9 +179,6 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
             } else {
                 &[STACK_LIFT_BUDGET]
             };
-            fn lifted<'c>(insns: &[reargo_lift::x86::RangeInsn<'c>]) -> Vec<&'c reargo_lift::LiftedInstruction> {
-                insns.iter().map(|i| i.get()).collect()
-            }
             /// The instructions up to the first whose lift returns, lifted.
             fn lifted_to_return<'c>(insns: &[reargo_lift::x86::RangeInsn<'c>]) -> Vec<&'c reargo_lift::LiftedInstruction> {
                 let mut out = Vec::with_capacity(insns.len());
@@ -203,16 +201,8 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
                 }
                 PCODE => pcode = crate::pcoderef::scan_range(insns, &sections),
                 INDIRECT => {
-                    // Only a `CallInd` gives a result, and the walk runs
-                    // forward: what follows the last one changes nothing.
-                    let last = match shapes {
-                        Some(shapes) => shapes.special().rev().find(|&i| shapes.flags[i] & reargo_lift::InsnShape::CALLIND != 0),
-                        None => insns.len().checked_sub(1),
-                    };
-                    if got.is_some()
-                        && let Some(last) = last
-                    {
-                        indirect = crate::indirect_resolve::resolve_lifted(&lifted(&insns[..=last]), &plt_of_got);
+                    if got.is_some() {
+                        indirect = indirect_of(insns, shapes, &plt_of_got);
                     }
                 }
                 ARITY => arity = crate::arity::infer_arity(insns),
@@ -253,6 +243,67 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
         program.analysis_cache.insert(crate::arity::Ahead(arity));
     }
     stack
+}
+
+/// The Indirect Call Resolver's result of a lift (`resolve_lifted`):
+/// only a `CallInd` gives one, and the walk runs forward, so what follows
+/// the last one is not lifted for it.
+fn indirect_of(
+    insns: &[reargo_lift::x86::RangeInsn<'_>],
+    shapes: Option<&reargo_lift::RangeShapes>,
+    plt_of_got: &dyn Fn(u64) -> Option<u64>,
+) -> Vec<(u64, u64)> {
+    let last = match shapes {
+        Some(shapes) => shapes.special().rev().find(|&i| shapes.flags[i] & reargo_lift::InsnShape::CALLIND != 0),
+        None => insns.len().checked_sub(1),
+    };
+    let Some(last) = last else {
+        return Vec::new();
+    };
+    let lifted: Vec<&reargo_lift::LiftedInstruction> = insns[..=last].iter().map(|i| i.get()).collect();
+    crate::indirect_resolve::resolve_lifted(&lifted, plt_of_got)
+}
+
+/// P-code Reference's and the Indirect Call Resolver's results
+/// ([`crate::pcoderef::Ahead`], [`crate::indirect_resolve::Ahead`]) for
+/// functions with no body at `entries` (their budgets the floors, 500
+/// and 200), from the same lifts as theirs: for functions an analyzer
+/// adds after the Stack Frame analyzer computed the others (the CRT
+/// Pattern analyzer's, in its `prepare`), each taken by `(entry, budget)`
+/// like those. The second is `None` when the program imports nothing.
+pub(crate) type NewAhead = (
+    crate::range_lift::AheadMap<Vec<(u64, u64, reargo_program::RefType)>>,
+    Option<crate::range_lift::AheadMap<Vec<(u64, u64)>>>,
+);
+
+pub(crate) fn ahead_for_new(program: &Program, entries: &[u64]) -> NewAhead {
+    let empty = Function::new(0, String::new());
+    let (pcode_budget, indirect_budget) = (crate::pcoderef::budget(&empty), crate::indirect_resolve::budget(&empty));
+    let sections = crate::pcoderef::SectionMap::from(program);
+    let got = crate::indirect_resolve::GotMap::new(program);
+    let plt_of_got = |g: u64| got.as_ref().and_then(|got| got.plt_of_got(g));
+    let insns = pcode_budget.max(indirect_budget);
+    let span = |&entry: &u64| crate::range_lift::Span { entry, insns, work: insns / 4 };
+    let out: Vec<(Vec<(u64, u64, reargo_program::RefType)>, Vec<(u64, u64)>)> =
+        crate::range_lift::map_with_lazy_lifter(&program.info.memory, entries, span, |&entry, lifter| {
+            let (mut pcode, mut indirect) = (Vec::new(), Vec::new());
+            lifter.with_budgets_lazy(entry, &[pcode_budget, indirect_budget], |k, insns, shapes| match k {
+                0 => pcode = crate::pcoderef::scan_range(insns, &sections),
+                _ => {
+                    if got.is_some() {
+                        indirect = indirect_of(insns, shapes, &plt_of_got);
+                    }
+                }
+            });
+            (pcode, indirect)
+        });
+    let mut pcode = crate::range_lift::AheadMap::default();
+    let mut indirect = crate::range_lift::AheadMap::default();
+    for (&entry, (p, i)) in entries.iter().zip(out) {
+        pcode.insert((entry, pcode_budget), p);
+        indirect.insert((entry, indirect_budget), i);
+    }
+    (pcode, got.is_some().then_some(indirect))
 }
 
 /// Per-function analysis output. Carries only what `apply` needs to
