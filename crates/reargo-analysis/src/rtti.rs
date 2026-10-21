@@ -162,9 +162,8 @@ impl Analyzer for RttiAnalyzer {
             .par_iter()
             .flat_map_iter(|&(first, last, start)| {
                 let all_set = &all_set;
-                (0..=(last - first) / ptr_size).filter_map(move |k| {
-                    let addr = first + k * ptr_size;
-                    let name_ptr = program.info.memory.read_u64(addr).ok()?;
+                slot_values(&program.info.memory, first, last).filter_map(move |(addr, name_ptr)| {
+                    let name_ptr = name_ptr?;
                     if !all_set.contains(name_ptr) {
                         return None;
                     }
@@ -211,16 +210,16 @@ impl Analyzer for RttiAnalyzer {
         // convention -- common RTTI walkers in Ghidra/IDA report the
         // header address, the C++ linker reports +ptr_size, and we
         // want xref to succeed at both.
-        let chunks = slot_chunks(&data_sections, ptr_size, ptr_size * 2);
+        // (no type_info found: no slot holds one)
+        let chunks =
+            if typeinfos.is_empty() { Vec::new() } else { slot_chunks(&data_sections, ptr_size, ptr_size * 2) };
         let vtables: Vec<(u64, u64, String)> = chunks
             .par_iter()
             .flat_map_iter(|&(first, last, _)| {
                 let typeinfos = &typeinfos;
                 let code_set = &code_set;
-                (0..=(last - first) / ptr_size).filter_map(move |k| {
-                    let addr = first + k * ptr_size;
-                    let val = program.info.memory.read_u64(addr).ok()?;
-                    let class_name = typeinfos.get(&val)?;
+                slot_values(&program.info.memory, first, last).filter_map(move |(addr, val)| {
+                    let class_name = typeinfos.get(&val?)?;
                     let vt_addr = addr + ptr_size;
                     let first_vfunc = program.info.memory.read_u64(vt_addr).ok()?;
                     code_set.contains(first_vfunc).then(|| (addr, vt_addr, class_name.clone()))
@@ -313,6 +312,26 @@ fn slot_chunks(sections: &[(u64, u64)], ptr_size: u64, need: u64) -> Vec<(u64, u
         }
     }
     out
+}
+
+/// The 8-byte slots `first, first + 8, …, last` with what `Memory::read_u64` reads
+/// at each (`None`: the read fails): from one slice of the block when the
+/// block holds them all (the same bytes, see `Memory::slice`), else slot by slot.
+fn slot_values(memory: &reargo_loader::Memory, first: u64, last: u64) -> impl Iterator<Item = (u64, Option<u64>)> + '_ {
+    let big = matches!(memory.endian(), reargo_core::address::Endian::Big);
+    let bytes = memory.slice(first, last - first + 8);
+    let from_slice = bytes.into_iter().flat_map(move |b| {
+        b.chunks_exact(8).enumerate().map(move |(k, w)| {
+            let w: [u8; 8] = w.try_into().unwrap();
+            (first + 8 * k as u64, Some(if big { u64::from_be_bytes(w) } else { u64::from_le_bytes(w) }))
+        })
+    });
+    let by_slot = bytes
+        .is_none()
+        .then(|| (0..=(last - first) / 8).map(move |k| (first + 8 * k, memory.read_u64(first + 8 * k).ok())))
+        .into_iter()
+        .flatten();
+    from_slice.chain(by_slot)
 }
 
 /// Membership in the union of `[s, e)` ranges, as a binary search over

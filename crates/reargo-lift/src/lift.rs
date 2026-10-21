@@ -374,7 +374,12 @@ impl InsnText {
         use iced_x86::Mnemonic::*;
         match &self.src {
             TextSource::Given => true,
-            TextSource::X86(i) => matches!(i.mnemonic(), Pop | Add | Lea | Mov | Ret | Retf | Leave | Vzeroupper),
+            // (an `add` / `lea` / `mov` prints its first operand first: `rsp,` only for that register)
+            TextSource::X86(i) => match i.mnemonic() {
+                Pop | Ret | Retf | Leave | Vzeroupper => true,
+                Add | Lea | Mov => i.op0_kind() == iced_x86::OpKind::Register && i.op0_register() == iced_x86::Register::RSP,
+                _ => false,
+            },
             TextSource::Arm { len, thumb, word, .. } => crate::arm32::may_be_pop(*word, *len, *thumb),
         }
     }

@@ -69,7 +69,11 @@ pub fn is_epilogue(insn: &LiftedInstruction) -> bool {
 
 /// [`is_epilogue`] of an instruction's text.
 pub fn is_epilogue_insn(mnemonic: &str) -> bool {
-    let m = mnemonic.trim();
+    // (a text starting and ending with a visible ASCII character has no whitespace to trim)
+    let m = match mnemonic.as_bytes() {
+        [f, .., l] if f.is_ascii_graphic() && l.is_ascii_graphic() => mnemonic,
+        _ => mnemonic.trim(),
+    };
     m.starts_with("pop ")
         || m.starts_with("add rsp,")
         || m.starts_with("lea rsp,")
