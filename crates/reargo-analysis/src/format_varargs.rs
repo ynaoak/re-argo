@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
+use rayon::prelude::*;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 
@@ -66,32 +67,29 @@ impl Analyzer for FormatVarargsAnalyzer {
         let sites = shared.round0_sites();
         let b = t.elapsed().as_secs_f64()*1e3;
 
+        // What each printf-family call's format holds, found in parallel
+        // (in site order): the callee's name and the count of its specs.
+        let found: Vec<(u64, String, usize)> = sites
+            .par_iter()
+            .with_min_len(1024)
+            .filter_map(|site| {
+                let target = site.call_target?;
+                let sym = program.symbol_table.primary_at(target)?;
+                let raw_name = sym.name.strip_suffix("@plt").unwrap_or(&sym.name);
+                let fmt_idx = printf_family_format_index(raw_name)?;
+                if fmt_idx >= site.args.len() {
+                    return None;
+                }
+                let fmt_addr = site.args[fmt_idx].value?;
+                let fmt = read_c_string(program, fmt_addr)?;
+                Some((site.call_site, raw_name.to_string(), count_format_specs(&fmt)))
+            })
+            .collect();
+
         let mut per_callee_max: BTreeMap<String, usize> = BTreeMap::new();
         let mut emitted = 0usize;
 
-        for site in sites.iter().copied() {
-            let Some(target) = site.call_target else {
-                continue;
-            };
-            let Some(sym) = program.symbol_table.primary_at(target) else {
-                continue;
-            };
-            let raw_name = sym.name.strip_suffix("@plt").unwrap_or(&sym.name);
-            let Some(fmt_idx) = printf_family_format_index(raw_name) else {
-                continue;
-            };
-            let raw_name = raw_name.to_string();
-            if fmt_idx >= site.args.len() {
-                continue;
-            }
-            let Some(fmt_addr) = site.args[fmt_idx].value else {
-                continue;
-            };
-            let Some(fmt) = read_c_string(program, fmt_addr) else {
-                continue;
-            };
-            let count = count_format_specs(&fmt);
-
+        for (call_site, raw_name, count) in found {
             let entry = per_callee_max.entry(raw_name.clone()).or_insert(0);
             if count > *entry {
                 *entry = count;
@@ -99,9 +97,9 @@ impl Analyzer for FormatVarargsAnalyzer {
 
             // Compact, post-pre annotation. Goes on Post slot so it
             // doesn't fight CallSiteAnnotator's Pre comment.
-            if program.comments.get(site.call_site, CommentType::Post).is_none() {
+            if program.comments.get(call_site, CommentType::Post).is_none() {
                 program.comments.set(
-                    site.call_site,
+                    call_site,
                     CommentType::Post,
                     format!("{}: {} varargs from format", raw_name, count),
                 );
@@ -109,7 +107,6 @@ impl Analyzer for FormatVarargsAnalyzer {
             }
         }
 
-        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     fv compute {:.1} sites {:.1} loop {:.1} n {}", a, b-a, t.elapsed().as_secs_f64()*1e3-b, sites.len()); }
         // (freed on another thread)
         drop(sites);
         rayon::spawn(move || drop(shared));

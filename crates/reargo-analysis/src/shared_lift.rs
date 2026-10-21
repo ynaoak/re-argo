@@ -181,6 +181,12 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     // a lookup per lifted instruction costs less than the index).
     if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       shared-lift valid {:.1}", t_start.elapsed().as_secs_f64()*1e3); }
     let stale = jobs.iter().filter(|j| j.2.is_none()).count();
+    if stale == 0 {
+        // (every result kept: nothing to lift, no results ahead)
+        let funcs = jobs.into_iter().filter_map(|j| j.2).collect();
+        let ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
+        return SharedLift { funcs, jump_mark, ahead };
+    }
     let jumps = (stale > jobs.len() / 8).then(|| early_jumps.unwrap_or_else(|| crate::func_lift::JumpIndex::new(program)));
     // The consecutive functions a thread runs share a lift cache
     // ([`crate::range_lift::map_with_lifter`]): a function is lifted

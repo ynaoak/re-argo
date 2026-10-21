@@ -22,7 +22,7 @@
 //!   when their text matches a known pattern, so override workflows
 //!   get tagging for free.
 
-use reargo_program::tags::TagKind;
+use reargo_program::tags::{AddressTagBatch, TagKind};
 use rayon::prelude::*;
 use reargo_program::Program;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -135,13 +135,14 @@ impl Analyzer for TagAnalyzer {
                 }
             }
         }
-        Box::new((derived, function_tags))
+        // (the address tags grouped here, added at `apply`)
+        let tag_count = derived.len() + function_tags.len();
+        Box::new((AddressTagBatch::new(derived, true), function_tags, tag_count))
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         type Tags = Vec<(u64, TagKind, String)>;
-        let (derived, function_tags): (Tags, Tags) = crate::analyzer::prepared(prepared);
-        let tag_count = derived.len() + function_tags.len();
-        program.tags.add_addresses(derived, true);
+        let (derived, function_tags, tag_count): (AddressTagBatch, Tags, usize) = crate::analyzer::prepared(prepared);
+        program.tags.add_address_batch(derived);
         for (entry, cat, text) in function_tags {
             program.tags.add_function(entry, cat, text, true);
         }

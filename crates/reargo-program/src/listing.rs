@@ -116,7 +116,9 @@ impl Listing {
         // the parts that hold some, with the listed ones of their range
         let mut parts: Vec<(Run, Vec<Run>)> =
             parts.into_iter().filter(|p| p.iter().any(|r| !r.is_empty())).map(|p| (Vec::new(), p)).collect();
+        let t0 = std::time::Instant::now();
         let mut old: Run = std::mem::take(&mut self.instructions).into_iter().collect();
+        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     listing old-to-vec {:.1} n {}", t0.elapsed().as_secs_f64()*1e3, old.len()); }
         for k in (1..parts.len()).rev() {
             let low = parts[k].1.iter().filter_map(|r| r.first()).map(|f| f.0).min().unwrap_or(u64::MAX);
             let at = old.partition_point(|o| o.0 < low);
@@ -142,11 +144,14 @@ impl Listing {
         } else {
             parts.into_iter().map(|(old, runs)| merge_runs(old, runs)).collect()
         };
+        let tt = std::time::Instant::now();
         let mut all: Run = Vec::with_capacity(merged.iter().map(Vec::len).sum());
         for m in merged {
             all.extend(m);
         }
+        let a = tt.elapsed().as_secs_f64()*1e3;
         self.instructions = all.into_iter().collect();
+        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     listing concat {:.1} build {:.1} n {}", a, tt.elapsed().as_secs_f64()*1e3 - a, self.instructions.len()); }
     }
 
     /// The instruction at `address`: the one listed, else `decode()`'s,

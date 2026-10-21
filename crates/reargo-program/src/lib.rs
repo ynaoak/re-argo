@@ -23,4 +23,4 @@ pub use project::ProjectSummary;
 pub use overrides::OverrideSet;
 pub use diff::ProgramDiff;
 pub use symbol::{Symbol, SymbolTable, SymbolType};
-pub use tags::{Tag, TagKind, TagManager};
+pub use tags::{AddressTagBatch, Tag, TagKind, TagManager};
