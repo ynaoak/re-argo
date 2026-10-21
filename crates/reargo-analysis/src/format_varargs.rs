@@ -61,11 +61,8 @@ impl Analyzer for FormatVarargsAnalyzer {
         // The round-0 call sites, reusing the walks the Call Site
         // Annotator (750) left for the functions unchanged since. The
         // last reader: the shared results are dropped here.
-        let t = std::time::Instant::now();
         let shared = crate::shared_lift::compute(program, false);
-        let a = t.elapsed().as_secs_f64()*1e3;
         let sites = shared.round0_sites();
-        let b = t.elapsed().as_secs_f64()*1e3;
 
         // What each printf-family call's format holds, found in parallel
         // (in site order): the callee's name and the count of its specs.

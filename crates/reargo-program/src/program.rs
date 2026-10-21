@@ -74,6 +74,13 @@ pub fn leak_on_drop() {
     LEAK_ON_DROP.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether [`leak_on_drop`] was set: other large results made for a
+/// program just before the process exits (a whole-program decompile's
+/// memos) may be left allocated too.
+pub fn leaks_on_drop() -> bool {
+    LEAK_ON_DROP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Drop for Program {
     fn drop(&mut self) {
         if LEAK_ON_DROP.load(std::sync::atomic::Ordering::Relaxed) {

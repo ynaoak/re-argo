@@ -150,11 +150,7 @@ pub struct JumpIndex {
 impl JumpIndex {
     pub fn new(program: &Program) -> Self {
         // sorted by target already
-        let t = std::time::Instant::now();
-        let v = program.references.jump_refs_sorted_by_target();
-        let a = t.elapsed().as_secs_f64()*1e3;
-        let refs: Vec<_> = v.into_iter().map(|r| (r.to, r.from, r.ref_type)).collect();
-        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE        jumpindex n {} sort {:.1} map {:.1}", refs.len(), a, t.elapsed().as_secs_f64()*1e3 - a); }
+        let refs = program.references.jump_refs_sorted_by_target().into_iter().map(|r| (r.to, r.from, r.ref_type)).collect();
         Self { refs }
     }
 

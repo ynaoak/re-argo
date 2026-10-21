@@ -81,13 +81,10 @@ impl Analyzer for CallSiteAnnotator {
         if crate::shared_lift::has_stored(program) {
             return Box::new(Step::Later);
         }
-        let t = std::time::Instant::now();
         let shared = crate::shared_lift::compute_from(program, None, true);
-        let a = t.elapsed().as_secs_f64()*1e3;
         let (shared, sites) = resolve(program, shared);
         // (the program is as at the analyzer's place: its run starts here)
         let found = sites.map(|sites| annotations(program, &sites));
-        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     csa compute_from {:.1} resolve {:.1}", a, t.elapsed().as_secs_f64()*1e3 - a); }
         Box::new(Step::Resolved(shared, found))
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
@@ -107,16 +104,10 @@ impl Analyzer for CallSiteAnnotator {
             }
             Step::Resolved(shared, found) => (shared, found),
         };
-        let t = std::time::Instant::now();
         crate::shared_lift::store_ahead(program, &mut shared);
-        let a = t.elapsed().as_secs_f64()*1e3;
         let found = found?;
         crate::shared_lift::store(program, shared);
-        let b = t.elapsed().as_secs_f64()*1e3;
-        let n = found.len();
-        let r = self.annotate(program, found);
-        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     csa apply ahead {:.1} store {:.1} annotate {:.1} sites {}", a, b-a, t.elapsed().as_secs_f64()*1e3-b, n); }
-        r
+        self.annotate(program, found)
     }
 }
 
@@ -129,6 +120,23 @@ enum Step {
     /// The per-function results (the walks given back) and the
     /// annotations of the call sites resolved.
     Resolved(crate::shared_lift::SharedLift, Result<Vec<Annotation>, AnalysisError>),
+}
+
+/// The call snapshots `all` (of every function, in order) merged as
+/// `merge` of them gives it: when no address repeats (each call is its
+/// own function's), the map built from them at once.
+fn merge_all<V>(
+    all: Vec<(u64, V)>,
+    merge: impl FnOnce(&mut std::collections::BTreeMap<u64, V>, Vec<(u64, V)>),
+) -> std::collections::BTreeMap<u64, V> {
+    let mut addrs: Vec<u64> = all.iter().map(|s| s.0).collect();
+    addrs.sort_unstable();
+    if addrs.windows(2).any(|w| w[0] == w[1]) {
+        let mut out = std::collections::BTreeMap::new();
+        merge(&mut out, all);
+        return out;
+    }
+    all.into_iter().collect()
 }
 
 /// What the annotator writes for one call site: its pre-comment, its C
@@ -183,7 +191,6 @@ fn resolve(
     program: &Program,
     mut shared: crate::shared_lift::SharedLift,
 ) -> (crate::shared_lift::SharedLift, Result<Vec<crate::callsite::CallSite>, AnalysisError>) {
-    let tr0 = std::time::Instant::now();
     let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
     // Each function's round-0 call-site walk, CFG constant tracker
     // and VSA snapshots, from one lift per function (dropped as soon
@@ -197,18 +204,14 @@ fn resolve(
     }
     // (the snapshots merge, in listing order, on another thread while
     // the call sites are resolved)
-    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       resolve split {:.1}", tr0.elapsed().as_secs_f64()*1e3); }
     let ((cfg_constants, vsa_constants), sites) = rayon::join(
         move || {
-            let t = std::time::Instant::now();
-            let mut cfg_constants = crate::cfg_const::CallConstants::new();
-            let mut vsa_constants = crate::vsa::VsaResult::new();
-            for (cfg_snaps, vsa_snaps) in snapshots {
-                crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
-                crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
-            }
-            if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       snapshot merge {:.1} n {} {}", t.elapsed().as_secs_f64()*1e3, cfg_constants.len(), vsa_constants.len()); }
-            (cfg_constants, vsa_constants)
+            // (the CFG tracker's and VSA's apart, at the same time)
+            let (cfg_snaps, vsa_snaps): (Vec<_>, Vec<_>) = snapshots.into_iter().unzip();
+            rayon::join(
+                || merge_all(cfg_snaps.into_iter().flatten().collect(), crate::cfg_const::merge_snapshots),
+                || merge_all(vsa_snaps.into_iter().flatten().collect(), crate::vsa::merge_snapshots),
+            )
         },
         // Iterative inter-procedural resolver: a function whose
         // parameter has a *single* observed value across all
@@ -223,7 +226,6 @@ fn resolve(
         Ok(sites) => sites,
         Err(e) => return (shared, Err(e)),
     };
-    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       resolve joined {:.1}", tr0.elapsed().as_secs_f64()*1e3); }
     // Give the walks back for Format Varargs (780).
     for (f, w) in shared.funcs.iter_mut().zip(round0) {
         f.walk = w.sites;
@@ -265,6 +267,8 @@ fn resolve(
             }
         }
     });
+    // (freed on another thread)
+    rayon::spawn(move || drop((cfg_constants, vsa_constants)));
     (shared, Ok(sites))
 }
 
@@ -588,6 +592,39 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The snapshots merged at once (no repeated address) or in turn
+    /// (repeats: intersected) give what `merge_snapshots` of each
+    /// function's in turn gives.
+    #[test]
+    fn merged_snapshots_match_merging_in_turn() {
+        use std::collections::BTreeMap;
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (functions, span) in [(0usize, 100u64), (50, 1 << 30), (50, 40), (300, 1 << 20), (300, 200)] {
+            let lists: Vec<crate::cfg_const::CallSnapshots> = (0..functions)
+                .map(|_| {
+                    (0..next() % 8)
+                        .map(|_| {
+                            let regs: BTreeMap<u64, u64> = (0..next() % 4).map(|_| (next() % 6 * 8, next() % 3)).collect();
+                            (next() % span, regs)
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut expected = crate::cfg_const::CallConstants::new();
+            for l in lists.clone() {
+                crate::cfg_const::merge_snapshots(&mut expected, l);
+            }
+            let got = merge_all(lists.into_iter().flatten().collect(), crate::cfg_const::merge_snapshots);
+            assert_eq!(got, expected, "{functions} {span}");
+        }
+    }
 
     #[test]
     fn pointer_type_detection() {

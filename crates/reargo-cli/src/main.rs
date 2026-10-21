@@ -2945,6 +2945,7 @@ fn cmd_decompile_all(
     structs_per_function: bool,
     use_index: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
     let program = analyze_binary(path)?;
 
     let lifter = match make_lifter(&program.info, thumb) {
@@ -2998,6 +2999,8 @@ fn cmd_decompile_all(
 
     let mut ok = 0usize;
     let mut err = 0usize;
+    // (stdout written through one large buffer: the code is many lines)
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
     for (entry, result) in &results {
         let name = program.function_name_at(*entry);
         match result {
@@ -3021,24 +3024,28 @@ fn cmd_decompile_all(
                         }
                     }
                     None => {
-                        println!("// === {} @ 0x{:x} ===", name, entry);
-                        print!("{}{}", own_defs(r, false), r.c_code);
+                        writeln!(out, "// === {} @ 0x{:x} ===", name, entry)?;
+                        write!(out, "{}{}", own_defs(r, false), r.c_code)?;
                         if show_rust {
-                            println!("// --- rust ---");
-                            print!("{}{}", own_defs(r, true), r.rust_code);
+                            writeln!(out, "// --- rust ---")?;
+                            write!(out, "{}{}", own_defs(r, true), r.rust_code)?;
                         }
-                        println!();
+                        writeln!(out)?;
                     }
                 }
             }
             Err(e) => {
                 err += 1;
                 if !skip_errors {
+                    // (in order with what was printed before it)
+                    out.flush()?;
                     eprintln!("// decompile failed @ 0x{:x} ({}): {}", entry, name, e);
                 }
             }
         }
     }
+    out.flush()?;
+    drop(out);
 
     eprintln!(
         "// decompile-all: {} ok, {} errors, {} total in {}",
@@ -3050,6 +3057,11 @@ fn cmd_decompile_all(
             None => "stdout".to_string(),
         }
     );
+    // (a process about to exit leaves the results to the exit, as it does
+    // the program)
+    if reargo_program::program::leaks_on_drop() {
+        std::mem::forget(results);
+    }
     Ok(())
 }
 
