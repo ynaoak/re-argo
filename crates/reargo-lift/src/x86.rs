@@ -7,6 +7,8 @@ use smallvec::SmallVec;
 use crate::lift::{LiftError, LiftedInstruction, PcodeLift};
 
 mod bits;
+#[cfg(test)]
+mod old_cache;
 mod x87;
 
 pub use x87::X87Ctx;
@@ -165,37 +167,51 @@ fn insn_touches_xmm(insn: &iced_x86::Instruction) -> bool {
 /// Memo for [`X86Lifter::lift_range_cached`]: the lift of each address alone,
 /// without the integer PF (`None` where it fails).
 ///
-/// What a range walk reads of each entry (the link to the next instruction,
-/// the length, the flags) is kept in one dense array beside the lifted
-/// instructions, so walking a range already lifted touches only that.
+/// Each entry keeps its index for the cache's life (until [`Self::rebase`]): the map, the
+/// links and the list of entries with flags hold indices that never change. What a range
+/// walk reads of each entry (the link to the next instruction, the length, the flags) and
+/// its shape are kept in dense arrays by position (the index less [`Self::base`]) beside
+/// the lifted instructions, which are kept in a ring by index, so walking a range already
+/// lifted touches only those arrays, and a range of consecutive entries reads its shapes in
+/// place.
 ///
-/// Dropping entries ([`Self::retain_from`]) only marks the oldest ones
-/// [`DEAD`] (a pass lifting in ascending order drops the oldest entries
-/// first); they are removed from the arrays once they are half of them, the
-/// links and the map then shifted, so each entry is moved and the map
-/// rebuilt a bounded number of times on average.
+/// Dropping entries ([`Self::retain_from`]) only marks the oldest ones [`DEAD`] (a pass
+/// lifting in ascending order drops the oldest entries first); they leave the arrays by
+/// position once they are half of them (the others moved down, `base` raised), and their
+/// slots in the ring are used again by later entries: the lifted instructions are never
+/// moved but when the ring grows, and nothing is renumbered.
 #[derive(Default)]
 pub struct LiftCache {
-    /// Index of each address held (and of some dropped: [`DEAD`] in `meta`).
+    /// Index of each address held (and of some dropped: [`DEAD`] in `meta`, or below `base`).
     map: AddrIndex,
-    /// The entries before it are all dead.
+    /// The index of the entry at position 0 of the arrays by position.
+    base: u32,
+    /// The entries before this position are all dead.
     head: usize,
     /// Entries held (not dead).
     live: usize,
-    /// The lift of each index (none where it failed, [`FAILED`], or was dropped, [`DEAD`]),
-    /// made when the entry is added or, for an instruction whose facts the decode gives
+    /// The lift of each index, in a ring (slot: the index less `ring_origin`, modulo
+    /// `ring_cap`, a power of two that holds every entry from `base` on, doubled when they
+    /// fill it; filled up to `ring_cap` as the entries come, so the memory not used yet is
+    /// not touched; none where it failed, [`FAILED`], or was dropped, [`DEAD`]), made when
+    /// the entry is added or, for an instruction whose facts the decode gives
     /// ([`X86Lifter::decoded_facts`]), when first read ([`Self::insn`]): a range's walk reads
     /// the facts of every instruction, its passes the ops of a few.
     lifted: Vec<std::cell::OnceCell<LiftedInstruction>>,
-    /// The decoded instruction of each index lifted when first read (the default elsewhere).
+    /// The decoded instruction of each index lifted when first read (the default elsewhere),
+    /// in a ring as `lifted` (empty, all default, in a cache that is not [`Self::lazy`]).
     decoded: Vec<iced_x86::Instruction>,
+    /// The index at slot 0 of the ring (the first entry when it last grew).
+    ring_origin: u32,
+    /// The ring's length (0 before the first entry).
+    ring_cap: usize,
     /// The lifter's mode, for the lifts made when first read.
     is_64: bool,
     /// Lift an instruction whose facts the decode gives when it is first read ([`Self::lazy`]).
     lazy: bool,
-    /// The link, length and flags of each index.
+    /// The link, length and flags of each position.
     meta: Vec<Meta>,
-    /// The [`InsnShape`] of each index, by field (only its address where
+    /// The [`InsnShape`] of each position, by field (only its address where
     /// the lift failed): the shapes of a range of consecutive entries are
     /// read in place ([`crate::lift::RangeShapes`]).
     addr: Vec<u64>,
@@ -311,8 +327,15 @@ pub struct DecodeCursor<'m>(Option<BlockDecoder<'m>>);
 /// Instructions a [`LiftCache`] makes room for at once.
 const CACHE_RESERVE: usize = 2048;
 
-/// [`LiftCache::next`] not known yet.
+/// [`Meta::next`] not known yet.
 const NO_NEXT: u32 = u32::MAX;
+
+/// A [`LiftCache`]'s indices are renumbered from 0 ([`LiftCache::rebase`]) once they pass
+/// this: far below [`NO_INDEX`], so the entries lifted until the next [`LiftCache::trim`] fit.
+#[cfg(not(test))]
+const REBASE_AT: u64 = 1 << 31;
+#[cfg(test)]
+const REBASE_AT: u64 = u32::MAX as u64 - (1 << 20);
 
 impl LiftCache {
     pub fn new() -> Self {
@@ -337,6 +360,39 @@ impl LiftCache {
         self.live == 0
     }
 
+    /// The position of index `i` in the arrays by position.
+    #[inline]
+    fn pos(&self, i: u32) -> usize {
+        (i - self.base) as usize
+    }
+
+    /// The slot of index `i` in the ring.
+    #[inline]
+    fn slot(&self, i: u32) -> usize {
+        i.wrapping_sub(self.ring_origin) as usize & (self.ring_cap - 1)
+    }
+
+    /// The slot of new entry `i`, made when the ring is still filling (the next one), else
+    /// one whose entry left the arrays (its lift taken when it was dropped): empty.
+    #[inline]
+    fn new_slot(&mut self, i: u32) -> usize {
+        let s = self.slot(i);
+        if s == self.lifted.len() {
+            self.lifted.push(std::cell::OnceCell::new());
+            if self.lazy {
+                self.decoded.push(iced_x86::Instruction::default());
+            }
+        }
+        debug_assert!(self.lifted[s].get().is_none());
+        s
+    }
+
+    /// What a walk reads of entry `i`.
+    #[inline]
+    fn meta(&self, i: u32) -> Meta {
+        self.meta[self.pos(i)]
+    }
+
     /// [`Self::retain_from`] `start` once the cache holds more than
     /// `at` instructions and twice what the last call kept: a pass
     /// lifting ranges in ascending order of their starts bounds the
@@ -349,9 +405,13 @@ impl LiftCache {
         // (nearly full: the dead entries at the front make room when they are a quarter of
         // the arrays, moving the live ones once instead of the whole arrays into larger ones;
         // not during a walk, which holds indices)
-        let (len, cap) = (self.lifted.len(), self.lifted.capacity());
+        let (len, cap) = (self.meta.len(), self.meta.capacity());
         if self.head > 0 && 4 * self.head >= len && 4 * (cap - len) < len {
             self.compact();
+        }
+        // (not during a walk either)
+        if u64::from(self.base) + self.meta.len() as u64 > REBASE_AT {
+            self.rebase();
         }
         if let Some(p) = &mut self.parity {
             p.trim(start, at);
@@ -364,48 +424,58 @@ impl LiftCache {
     /// kept is unchanged (a link always leads to a higher address, so no kept instruction
     /// links to one forgotten).
     pub fn retain_from(&mut self, start: u64) {
-        // (the map keeps its entries for them until they leave the arrays: a lookup checks
-        // that the entry it finds is not dead)
-        while self.head < self.lifted.len() {
+        // (the map keeps its entries for them: a lookup checks that the entry it finds is
+        // not dead and has not left the arrays)
+        while self.head < self.meta.len() {
             let p = self.head;
             if self.meta[p].flags & DEAD == 0 {
                 if self.addr[p] >= start {
                     break;
                 }
-                self.lifted[p].take();
+                let s = self.slot(self.base + p as u32);
+                self.lifted[s].take();
                 self.meta[p] = Meta { next: NO_NEXT, len: 0, flags: DEAD };
                 self.live -= 1;
             }
             self.head += 1;
         }
-        // (the dead entries at the front removed once they are half of the arrays)
-        if self.head > 0 && 2 * self.head >= self.lifted.len() {
+        // (the dead entries at the front leave the arrays once they are half of them)
+        if self.head > 0 && 2 * self.head >= self.meta.len() {
             self.compact();
         }
     }
 
-    /// Removes the dead entries at the front of the arrays, shifting the links and the map.
+    /// Removes the dead entries at the front of the arrays by position (their slots in the
+    /// ring are free then); no index changes.
     fn compact(&mut self) {
         let h = self.head;
-        self.lifted.drain(..h);
-        self.decoded.drain(..h);
         self.meta.drain(..h);
         self.addr.drain(..h);
         self.sflags.drain(..h);
         self.target.drain(..h);
         self.head = 0;
-        let h = u32::try_from(h).expect("lift cache index");
-        let k = self.special.partition_point(|&i| i < h);
+        self.base += u32::try_from(h).expect("lift cache index");
+        let k = self.special.partition_point(|&i| i < self.base);
         self.special.drain(..k);
+        // (a link or a map entry below `base` reads as none)
+        self.map.drop_below(self.base);
+    }
+
+    /// Renumbers the entries from 0 (the arrays' first one): the indices only grow, and
+    /// would otherwise reach [`NO_INDEX`] in a cache living long enough.
+    #[cold]
+    fn rebase(&mut self) {
+        let b = self.base;
+        // (each entry keeps its slot)
+        self.ring_origin = self.ring_origin.wrapping_sub(b);
         for i in &mut self.special {
-            *i -= h;
+            *i -= b;
         }
-        // (the live entries link only to live ones, all at or after `h`; a dead one's
-        // link is not read)
         for m in &mut self.meta {
-            m.next = if m.next == NO_NEXT || m.next < h { NO_NEXT } else { m.next - h };
+            m.next = if m.next == NO_NEXT || m.next < b { NO_NEXT } else { m.next - b };
         }
-        self.map.shift_down(h);
+        self.map.rebase(b);
+        self.base = 0;
     }
 
     /// Room for `n` instructions and as many again (at least
@@ -413,32 +483,56 @@ impl LiftCache {
     /// arrays one doubling at a time moved them over and over.
     fn reserve(&mut self, n: usize) {
         let n = (2 * n).max(CACHE_RESERVE);
-        self.lifted.reserve(n);
-        self.decoded.reserve(n);
         self.meta.reserve(n);
         self.addr.reserve(n);
         self.sflags.reserve(n);
         self.target.reserve(n);
     }
 
+    /// The ring twice as long (at least [`CACHE_RESERVE`] slots), the entries moved to its
+    /// first slots in order (its origin the first entry).
+    #[cold]
+    fn grow_ring(&mut self) {
+        let n = (2 * self.ring_cap).max(CACHE_RESERVE);
+        let mut lifted: Vec<std::cell::OnceCell<LiftedInstruction>> = Vec::with_capacity(n);
+        let mut decoded: Vec<iced_x86::Instruction> = Vec::with_capacity(if self.lazy { n } else { 0 });
+        for k in 0..self.meta.len() {
+            let s = self.slot(self.base + k as u32);
+            lifted.push(std::mem::take(&mut self.lifted[s]));
+            if self.lazy {
+                decoded.push(self.decoded[s]);
+            }
+        }
+        self.lifted = lifted;
+        self.decoded = decoded;
+        self.ring_origin = self.base;
+        self.ring_cap = n;
+    }
+
+    /// The decoded instruction of entry `i` (the default in a cache that is not lazy).
+    #[inline]
+    fn decoded(&self, i: u32) -> iced_x86::Instruction {
+        self.decoded.get(self.slot(i)).copied().unwrap_or_default()
+    }
+
     /// The instruction at index `i` (not failed or dropped), lifted (now when it was not yet).
     #[inline]
     fn insn(&self, i: u32) -> &LiftedInstruction {
-        self.lifted[i as usize].get_or_init(|| self.lift_entry(i))
+        self.lifted[self.slot(i)].get_or_init(|| self.lift_entry(i))
     }
 
     /// The lift alone, without the integer PF, of entry `i`'s decoded instruction.
     #[cold]
     fn lift_entry(&self, i: u32) -> LiftedInstruction {
-        debug_assert!(self.meta[i as usize].flags & (FAILED | DEAD) == 0);
+        debug_assert!(self.meta(i).flags & (FAILED | DEAD) == 0);
         X86Lifter { is_64: self.is_64, parity: false }
-            .lift_decoded(self.decoded[i as usize], self.addr[i as usize], None)
+            .lift_decoded(self.decoded(i), self.addr[self.pos(i)], None)
             .expect("an instruction `decoded_facts` answers for lifts")
     }
 
     /// The lift of entry `i`, `None` where it failed (or was dropped).
     fn lifted(&self, i: u32) -> Option<&LiftedInstruction> {
-        (self.meta[i as usize].flags & (FAILED | DEAD) == 0).then(|| self.insn(i))
+        (self.meta(i).flags & (FAILED | DEAD) == 0).then(|| self.insn(i))
     }
 
     /// The instructions at `idxs` as [`RangeInsn`]s, each lifted when first read.
@@ -460,7 +554,8 @@ impl LiftCache {
         // (`first + k` for every `k`: compared without stopping early, which vectorises)
         let consecutive = idxs.iter().zip(first..).fold(true, |ok, (&i, j)| ok & (i == j));
         if consecutive {
-            let (lo, hi) = (first as usize, first as usize + idxs.len());
+            let lo = self.pos(first);
+            let hi = lo + idxs.len();
             let end = first + idxs.len() as u32;
             let a = self.special.partition_point(|&i| i < first);
             let b = a + self.special[a..].partition_point(|&i| i < end);
@@ -470,12 +565,13 @@ impl LiftCache {
                 &self.target[lo..hi],
                 &self.special[a..b],
                 first,
+                &self.map,
             );
         }
         crate::lift::RangeShapes::owned(
-            idxs.iter().map(|&i| self.addr[i as usize]).collect(),
-            idxs.iter().map(|&i| self.sflags[i as usize]).collect(),
-            idxs.iter().map(|&i| self.target[i as usize]).collect(),
+            idxs.iter().map(|&i| self.addr[self.pos(i)]).collect(),
+            idxs.iter().map(|&i| self.sflags[self.pos(i)]).collect(),
+            idxs.iter().map(|&i| self.target[self.pos(i)]).collect(),
         )
     }
 
@@ -489,14 +585,19 @@ impl LiftCache {
         block: &mut Option<BlockDecoder<'m>>,
     ) -> u32 {
         let i = *self.map.slot(addr);
-        if i != NO_INDEX && self.meta[i as usize].flags & DEAD == 0 {
+        // (an index below `base` has left the arrays; `NO_INDEX` is past them)
+        if i != NO_INDEX && i >= self.base && self.meta[(i - self.base) as usize].flags & DEAD == 0 {
             return i;
         }
-        if self.lifted.len() == self.lifted.capacity() {
+        if self.meta.len() == self.meta.capacity() {
             self.reserve(self.live);
         }
-        let i = u32::try_from(self.lifted.len()).expect("lift cache index");
+        if self.meta.len() == self.ring_cap {
+            self.grow_ring();
+        }
+        let i = self.base + u32::try_from(self.meta.len()).expect("lift cache index");
         assert!(i != NO_INDEX, "lift cache index");
+        let s = self.new_slot(i);
         let decoded = lifter.decode_in_block(memory, addr, block);
         // an instruction whose facts the decode gives is lifted when first read (only by the
         // lifter without the integer PF, the one `Self::lift_entry` lifts with)
@@ -507,12 +608,11 @@ impl LiftCache {
         let (flags, len, shape) = if let Some((insn, (sflags, target, reads_pf))) = lazy {
             self.is_64 = lifter.is_64;
             let len = u8::try_from(insn.len()).expect("an x86 instruction is at most 15 bytes");
-            self.lifted.push(std::cell::OnceCell::new());
-            self.decoded.push(insn);
+            self.decoded[s] = insn;
             (if reads_pf { READS_PF } else { 0 }, len, crate::lift::InsnShape { address: addr, target, flags: sflags })
         } else {
             let mut facts = OpFacts::default();
-            // (the lift pushed where it is matched, not moved through an `Option` first)
+            // (the lift put where it is matched, not moved through an `Option` first)
             match decoded.and_then(|insn| lifter.lift_decoded_facts(insn, addr, None, &mut facts)) {
                 Ok(insn) => {
                     let x87 = insn.mnemonic.x86_instruction().is_none_or(x87::is_x87);
@@ -521,13 +621,16 @@ impl LiftCache {
                     let shape = crate::lift::InsnShape { address: addr, target: facts.target, flags: facts.flags };
                     debug_assert_eq!(shape, crate::lift::InsnShape::of(&insn));
                     debug_assert_eq!(facts.reads_outside_pf, reads_outside_pf(&insn));
-                    self.lifted.push(std::cell::OnceCell::from(insn));
-                    self.decoded.push(iced_x86::Instruction::default());
+                    self.lifted[s] = std::cell::OnceCell::from(insn);
+                    if self.lazy {
+                        self.decoded[s] = iced_x86::Instruction::default();
+                    }
                     (flags, len, shape)
                 }
                 Err(_) => {
-                    self.lifted.push(std::cell::OnceCell::new());
-                    self.decoded.push(iced_x86::Instruction::default());
+                    if self.lazy {
+                        self.decoded[s] = iced_x86::Instruction::default();
+                    }
                     (FAILED, 0, crate::lift::InsnShape { address: addr, ..Default::default() })
                 }
             }
@@ -539,14 +642,14 @@ impl LiftCache {
         if shape.flags != 0 {
             self.special.push(i);
         }
-        *self.map.slot(addr) = i;
+        self.map.set(addr, i);
         self.live += 1;
         i
     }
 }
 
 /// Addresses per page of an [`AddrIndex`].
-const INDEX_PAGE: u64 = 1024;
+pub(crate) const INDEX_PAGE: u64 = 1024;
 
 /// The emptied pages an [`AddrIndex`] keeps for reuse, at most.
 const MAX_SPARE_PAGES: usize = 128;
@@ -558,29 +661,63 @@ const NO_INDEX: u32 = u32::MAX;
 /// address, in pages of [`INDEX_PAGE`] addresses made on first use. Most
 /// lookups are of an address near the one before (a range walk steps
 /// through its instructions), in the page looked up last: no hashing then.
+///
+/// The indices written only grow, so a page's last one is its largest: a page whose last
+/// index is below the cache's first one ([`Self::drop_below`]) holds none of its entries.
 #[derive(Default)]
-struct AddrIndex {
+pub(crate) struct AddrIndex {
     pages: Vec<Box<[u32; INDEX_PAGE as usize]>>,
+    /// The last index written in each page.
+    last_index: Vec<u32>,
     /// The position in `pages` of each page (by address / [`INDEX_PAGE`]).
     by_page: rustc_hash::FxHashMap<u64, u32>,
     /// The page looked up last and its position (`None`: none yet).
     last: Option<(u64, u32)>,
-    /// Pages [`Self::shift_down`] emptied (every slot [`NO_INDEX`]), for
-    /// [`Self::page_of`] to use again (up to [`MAX_SPARE_PAGES`]).
+    /// Pages [`Self::drop_below`] freed (every slot [`NO_INDEX`] or an index below the cache's
+    /// first, which reads as none), for [`Self::page_of`] to use again (up to
+    /// [`MAX_SPARE_PAGES`]).
     spare: Vec<Box<[u32; INDEX_PAGE as usize]>>,
 }
 
+impl std::fmt::Debug for AddrIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddrIndex").field("pages", &self.pages.len()).finish_non_exhaustive()
+    }
+}
+
 impl AddrIndex {
+    /// The page of addresses holding `lo` and the index's page of each page of addresses from
+    /// it up to the one holding `hi` (none where it has none).
+    pub(crate) fn pages_over(&self, lo: u64, hi: u64) -> (u64, Vec<Option<&[u32; INDEX_PAGE as usize]>>) {
+        let (first, last) = (lo / INDEX_PAGE, hi / INDEX_PAGE);
+        let pages = (first..=last).map(|p| self.by_page.get(&p).map(|&at| &*self.pages[at as usize])).collect();
+        (first, pages)
+    }
+
     /// The slot of `addr` ([`NO_INDEX`] when it has none), its page made
     /// when it has none.
     #[inline]
     fn slot(&mut self, addr: u64) -> &mut u32 {
+        let at = self.page_at(addr);
+        &mut self.pages[at as usize][(addr % INDEX_PAGE) as usize]
+    }
+
+    /// Sets the slot of `addr` to `i`, the largest index written yet.
+    #[inline]
+    fn set(&mut self, addr: u64, i: u32) {
+        let at = self.page_at(addr) as usize;
+        self.pages[at][(addr % INDEX_PAGE) as usize] = i;
+        self.last_index[at] = i;
+    }
+
+    /// The position of the page of `addr`, made when missing.
+    #[inline]
+    fn page_at(&mut self, addr: u64) -> u32 {
         let page = addr / INDEX_PAGE;
-        let at = match self.last {
+        match self.last {
             Some((p, at)) if p == page => at,
             _ => self.page_of(page),
-        };
-        &mut self.pages[at as usize][(addr % INDEX_PAGE) as usize]
+        }
     }
 
     /// The position of page `page` in `pages`, made when missing.
@@ -591,37 +728,51 @@ impl AddrIndex {
         if at == next {
             let page = self.spare.pop().unwrap_or_else(|| Box::new([NO_INDEX; INDEX_PAGE as usize]));
             self.pages.push(page);
+            self.last_index.push(0);
         }
         self.last = Some((page, at));
         at
     }
 
-    /// The indices below `h` dropped, the others lowered by `h` (the
-    /// entries before `h` left the arrays); the pages left empty freed.
-    fn shift_down(&mut self, h: u32) {
+    /// The pages holding no index from `base` on freed (the indices below `base` read as
+    /// none: their entries left the cache).
+    fn drop_below(&mut self, base: u32) {
+        if self.last_index.iter().all(|&m| m >= base) {
+            return;
+        }
         let pages = std::mem::take(&mut self.pages);
-        let mut kept: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
-        for (at, mut page) in pages.into_iter().enumerate() {
-            let mut any = false;
-            for i in page.iter_mut() {
-                *i = if *i == NO_INDEX || *i < h { NO_INDEX } else { *i - h };
-                any |= *i != NO_INDEX;
-            }
-            if any {
-                kept.insert(at as u32, self.pages.len() as u32);
+        let last_index = std::mem::take(&mut self.last_index);
+        let mut moved: Vec<u32> = Vec::with_capacity(pages.len());
+        for (page, m) in pages.into_iter().zip(last_index) {
+            if m >= base {
+                moved.push(self.pages.len() as u32);
                 self.pages.push(page);
-            } else if self.spare.len() < MAX_SPARE_PAGES {
-                self.spare.push(page);
+                self.last_index.push(m);
+            } else {
+                moved.push(NO_INDEX);
+                if self.spare.len() < MAX_SPARE_PAGES {
+                    self.spare.push(page);
+                }
             }
         }
-        self.by_page.retain(|_, at| match kept.get(at) {
-            Some(&new) => {
-                *at = new;
-                true
-            }
-            None => false,
+        self.by_page.retain(|_, at| {
+            *at = moved[*at as usize];
+            *at != NO_INDEX
         });
         self.last = None;
+    }
+
+    /// The indices lowered by `b` ([`LiftCache::rebase`]), those below it dropped.
+    #[cold]
+    fn rebase(&mut self, b: u32) {
+        for (page, m) in self.pages.iter_mut().zip(&mut self.last_index) {
+            for i in page.iter_mut() {
+                *i = if *i == NO_INDEX || *i < b { NO_INDEX } else { *i - b };
+            }
+            *m = m.saturating_sub(b);
+        }
+        // (their stale indices would read as entries)
+        self.spare.clear();
     }
 }
 
@@ -905,9 +1056,9 @@ impl<'c> RangeInsn<'c> {
     pub fn lifted_unless_no_const(&self, keep: impl Fn(u64) -> bool) -> Option<&'c LiftedInstruction> {
         match self.0 {
             RangeInsnRepr::Lifted(l) => Some(l),
-            RangeInsnRepr::Cached(c, i) => match c.lifted[i as usize].get() {
+            RangeInsnRepr::Cached(c, i) => match c.lifted[c.slot(i)].get() {
                 Some(l) => Some(l),
-                None if !any_const_ref_value(&c.decoded[i as usize], keep) => None,
+                None if !any_const_ref_value(&c.decoded(i), keep) => None,
                 None => Some(c.insn(i)),
             },
         }
@@ -1527,27 +1678,35 @@ impl X86Lifter {
         let mut idxs: Vec<u32> = Vec::with_capacity(count.min(4096));
         let mut addr = start;
         let mut any = 0u8;
-        // the index of the previous instruction of the range
-        let mut prev: Option<u32> = None;
+        // the position of the previous instruction of the range (the cache's `base` does not
+        // change during a walk)
+        let mut prev: Option<usize> = None;
+        let base = cache.base;
         let mut block = None;
         for _ in 0..count {
-            let i = match prev.map(|p| cache.meta[p as usize].next) {
-                Some(i) if i != NO_NEXT => i,
-                _ => {
+            // (a link not known, `NO_NEXT`, or to an entry that left the arrays, below `base`,
+            // is past the arrays' positions)
+            let linked = prev.and_then(|p| {
+                let q = cache.meta[p].next.wrapping_sub(base) as usize;
+                cache.meta.get(q).map(|&m| (q, m))
+            });
+            let (q, m) = match linked {
+                Some(qm) => qm,
+                None => {
                     let i = cache.index_of(&fast, memory, addr, &mut block);
                     if let Some(p) = prev {
-                        cache.meta[p as usize].next = i;
+                        cache.meta[p].next = i;
                     }
-                    i
+                    let q = (i - base) as usize;
+                    (q, cache.meta[q])
                 }
             };
-            let m = cache.meta[i as usize];
             if m.flags & FAILED != 0 {
                 break;
             }
-            prev = Some(i);
+            prev = Some(q);
             any |= m.flags;
-            idxs.push(i);
+            idxs.push(base + q as u32);
             addr += u64::from(m.len);
         }
         // The x87 pass rewrites nothing in a range without an x87
@@ -1559,7 +1718,7 @@ impl X86Lifter {
         if self.parity && any & READS_PF != 0 {
             // (the instructions looked back over are lifted, no other)
             let insns = cache.range_insns(&idxs);
-            if parity_needed(&insns, |k| cache.meta[idxs[k] as usize].flags & READS_PF != 0) {
+            if parity_needed(&insns, |k| cache.meta(idxs[k]).flags & READS_PF != 0) {
                 return Err(idxs);
             }
         }
@@ -5554,6 +5713,186 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The cache behaves exactly as the one whose arrays moved and renumbered their entries
+    /// ([`old_cache::OldCache`]): the same random sequences of walks, trims and drops on random
+    /// code give, after each step, the same entries at the same positions (an index less
+    /// `base`) with the same links, lengths, flags, shapes and lifts, the same entries with
+    /// flags and the same map; lazy caches and eager ones, starting at index 0 or just below
+    /// [`REBASE_AT`] (renumbered from 0 on the way).
+    #[test]
+    fn cache_matches_old_cache() {
+        use old_cache::OldCache;
+        let mut seed = 0x7a11_ce55_0bad_f00d_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pieces: &[&[u8]] = &[
+            &[0x48, 0x89, 0xc3],                   // mov rbx, rax
+            &[0x75, 0x04],                         // jne
+            &[0xeb, 0xf0],                         // jmp back
+            &[0xe8, 0x10, 0, 0, 0],                // call
+            &[0xc3],                               // ret
+            &[0x8e, 0xd8],                         // mov ds, ax (fails to lift)
+            &[0xd9, 0x07],                         // fld dword [rdi]
+            &[0x0f, 0x9a, 0xc0],                   // setp al
+            &[0x48, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8], // mov rax, imm64
+            &[0x48, 0x8d, 0x05, 0x10, 0, 0, 0],    // lea rax, [rip+0x10]
+        ];
+        let fast = X86Lifter { is_64: true, parity: false };
+        let ops = |l: &LiftedInstruction| format!("{:?} {} {:?}", l.address, l.length, l.ops);
+        let mut renumbered = 0;
+        for round in 0..40 {
+            let size = 64 + (next() % 4000) as usize;
+            let mut code = Vec::new();
+            while code.len() < size {
+                if next() % 5 == 0 {
+                    code.extend((0..1 + next() % 6).map(|_| next() as u8));
+                } else {
+                    code.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+                }
+            }
+            let at = 0x40_0000 + (next() % 4096);
+            let mem = make_memory(&code, at);
+            let lazy = round % 2 == 0;
+            let mut new = if lazy { LiftCache::lazy() } else { LiftCache::new() };
+            if round % 4 >= 2 {
+                new.base = (REBASE_AT - 200) as u32;
+            }
+            let mut old = OldCache::new(lazy);
+            let mut start = 0u64;
+            for step in 0..400 {
+                let a = at + start;
+                match next() % 10 {
+                    0..=5 => {
+                        let count = 1 + (next() % 300) as usize;
+                        let got = fast.walk_cached(&mem, a, count, &mut new).unwrap_or_else(|e| e);
+                        let want = old.walk(&fast, &mem, a, count);
+                        assert_eq!(got.len(), want.len(), "round {round} step {step}");
+                        for (&i, &j) in got.iter().zip(&want) {
+                            assert_eq!(i - new.base, j, "round {round} step {step}");
+                            // (a range starting below what was dropped may link into a dropped entry,
+                            // as it did)
+                            if new.meta(i).flags & (FAILED | DEAD) == 0 {
+                                assert_eq!(ops(new.insn(i)), ops(old.insn(j)), "round {round} step {step}");
+                            }
+                        }
+                    }
+                    6..=8 => {
+                        let before = new.base;
+                        let keep = 8 + (next() % 600) as usize;
+                        new.trim(a, keep);
+                        old.trim(a, keep);
+                        if new.base < before {
+                            renumbered += 1;
+                        }
+                    }
+                    _ => {
+                        new.retain_from(a);
+                        old.retain_from(a);
+                    }
+                }
+                let (b, n) = (new.base, new.meta.len());
+                assert_eq!((new.len(), new.head, n), (old.live, old.head, old.meta.len()), "round {round} step {step}");
+                for p in 0..n {
+                    let (m, o) = (new.meta[p], old.meta[p]);
+                    let link = if m.next == NO_NEXT || m.next < b { NO_NEXT } else { m.next - b };
+                    assert_eq!((link, m.len, m.flags), (o.next, o.len, o.flags), "round {round} step {step} position {p}");
+                    assert_eq!((new.addr[p], new.sflags[p], new.target[p]), (old.addr[p], old.sflags[p], old.target[p]));
+                    let i = b + p as u32;
+                    if m.flags & (FAILED | DEAD) == 0 && step % 16 == 0 {
+                        assert_eq!(ops(new.insn(i)), ops(old.insn(p as u32)), "round {round} step {step} position {p}");
+                    }
+                }
+                assert_eq!(new.special.iter().map(|&i| i - b).collect::<Vec<_>>(), old.special);
+                for t in (at..at + code.len() as u64).step_by(1 + (next() % 7) as usize) {
+                    let i = *new.map.slot(t);
+                    let got = (i != NO_INDEX && i >= b && new.meta[(i - b) as usize].flags & DEAD == 0).then(|| i - b);
+                    assert_eq!(got, old.lookup(t), "round {round} step {step} {t:#x}");
+                }
+                // mostly ascending, sometimes back
+                start = if next() % 8 == 0 { start.saturating_sub(next() % 200) } else { (start + next() % 40) % code.len() as u64 };
+            }
+        }
+        assert!(renumbered > 0);
+    }
+
+    /// The positions a cache's shapes find through its index of addresses
+    /// ([`crate::lift::RangeShapes::positions`]) are what a binary search of the range's
+    /// addresses finds, for every address around the range: random code (biased to jumps,
+    /// failing instructions and long instructions) over several index pages, ranges walked
+    /// at ascending starts, the cache trimmed and dropping entries
+    /// as it goes, lazy caches and eager ones.
+    #[test]
+    fn cache_positions_match_binary_search() {
+        let mut seed = 0x0dd5_eed5_1234_8765_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pieces: &[&[u8]] = &[
+            &[0x48, 0x89, 0xc3],                               // mov rbx, rax
+            &[0x75, 0x04],                                     // jne
+            &[0xeb, 0xf0],                                     // jmp back
+            &[0xe8, 0x10, 0, 0, 0],                            // call
+            &[0xc3],                                           // ret
+            &[0x8e, 0xd8],                                     // mov ds, ax (fails to lift)
+            &[0x48, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8],             // mov rax, imm64
+            &[0x0f, 0x84, 0x00, 0x01, 0, 0],                   // je far ahead
+            &[0x48, 0x8d, 0x05, 0x10, 0, 0, 0],                // lea rax, [rip+0x10]
+        ];
+        let lifter = X86Lifter::new_64();
+        let mut checked = 0usize;
+        for round in 0..60 {
+            let size = 64 + (next() % 3000) as usize;
+            let mut code = Vec::new();
+            while code.len() < size {
+                if next() % 5 == 0 {
+                    code.extend((0..1 + next() % 6).map(|_| next() as u8));
+                } else {
+                    code.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+                }
+            }
+            let base = 0x1000 + (next() % 2048);
+            let mem = make_memory(&code, base);
+            let mut cache = if round % 2 == 0 { LiftCache::lazy() } else { LiftCache::new() };
+            let mut start = 0u64;
+            while start < code.len() as u64 {
+                let at = base + start;
+                cache.trim(at, 16 + (next() % 200) as usize);
+                if next() % 7 == 0 {
+                    cache.retain_from(at);
+                }
+                let budgets = [1 + (next() % 400) as usize, 1 + (next() % 50) as usize];
+                let mut check = |v: usize, shapes: Option<&crate::lift::RangeShapes>| {
+                    let Some(shapes) = shapes else { return };
+                    assert_eq!(shapes.len(), v);
+                    let Some(pos) = shapes.positions() else { return };
+                    let finder = pos.finder();
+                    let addrs = &shapes.addrs;
+                    let (lo, hi) = (addrs[0].saturating_sub(40), addrs[addrs.len() - 1] + 40);
+                    for t in lo..=hi {
+                        assert_eq!(finder.find(t), addrs.binary_search(&t).ok(), "round {round} at {at:#x} t {t:#x}");
+                        checked += 1;
+                    }
+                };
+                if round % 2 == 0 {
+                    lifter.lift_prefixes_lazy(&mem, at, &budgets, &mut cache, |_, v, shapes| check(v.len(), shapes));
+                } else {
+                    lifter.lift_prefixes_cached(&mem, at, &budgets, true, &mut cache, |_, v, shapes| check(v.len(), shapes));
+                }
+                // (ascending, as the passes lift: a range starting below what was dropped may
+                // link into a dropped entry)
+                start += 1 + next() % 24;
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
     }
 
     /// `lift_range_lazy` read in random orders equals `lift_range` (x87, PF readers and

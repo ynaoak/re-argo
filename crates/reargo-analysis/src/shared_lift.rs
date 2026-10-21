@@ -368,7 +368,7 @@ fn compute_lifted<I: std::borrow::Borrow<reargo_lift::LiftedInstruction>>(
     // (ascending)
     let mut external = std::mem::take(&mut scratch.external);
     match jumps {
-        Some(jumps) => jumps.external_entries_sorted_into(program, &shape.addrs, shape.increasing, &mut external),
+        Some(jumps) => jumps.external_entries_sorted_into(program, &shape.addrs, shape.increasing, shape.finder(), &mut external),
         None => {
             external.clear();
             external.extend(crate::func_lift::external_entries_at(program, &shape.addrs));
