@@ -1144,7 +1144,7 @@ pub fn store(entry: &Entry, program: &Program) -> Result<(), String> {
     let (sym_addr, sym_name) = state.symbol_table.cache_parts();
     let (refs_from, refs_to, jumps) = state.references.cache_parts();
     let (tags_addr, tags_func) = state.tags.cache_parts();
-    let insns: Vec<_> = insns.iter().map(|(k, v)| (k, &**v)).collect();
+    let insns: Vec<_> = insns.collect();
     let funcs: Vec<_> = funcs.iter().collect();
     let sym_addr: Vec<_> = sym_addr.iter().collect();
     let sym_name: Vec<_> = sym_name.iter().collect();

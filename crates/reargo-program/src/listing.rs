@@ -9,7 +9,7 @@ pub type InstructionMap = BTreeMap<u64, Box<DecodedInstruction>>;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Listing {
-    instructions: BTreeMap<u64, Box<DecodedInstruction>>,
+    instructions: Instructions,
     functions: BTreeMap<u64, Function>,
     /// The instructions in address order ([`Self::sorted_instructions`]): made when first
     /// asked for, dropped when an instruction is listed (not saved).
@@ -40,11 +40,11 @@ impl std::fmt::Debug for Sorted {
 }
 
 impl Sorted {
-    fn of(instructions: &InstructionMap) -> Self {
+    fn of(instructions: &Instructions) -> Self {
         // (one walk of the map for both)
         let mut addrs = Vec::with_capacity(instructions.len());
         let mut insns = Vec::with_capacity(instructions.len());
-        for (&a, b) in instructions {
+        for (&a, b) in instructions.iter() {
             addrs.push(a);
             insns.push(std::ptr::NonNull::from(&**b));
         }
@@ -67,6 +67,112 @@ pub type InstructionRun = Vec<(u64, Box<DecodedInstruction>)>;
 /// instructions in, in order: an instruction, or `None` (left by a repeat).
 type Slot = Option<(u64, Box<DecodedInstruction>)>;
 
+/// The listing's instructions by address: maps of ascending, disjoint
+/// address ranges, read as one map — one map, or one for each part of the
+/// bulk add that listed them last
+/// ([`Listing::add_unlisted_instructions_cut`]: each part's map is built
+/// on a thread of its own, std's `BTreeMap` having no way to join maps but
+/// to build one again).
+struct Instructions {
+    maps: Vec<InstructionMap>,
+    /// The lowest address each map may hold (the first 0), ascending:
+    /// every address of `maps[k]` is below `starts[k + 1]`.
+    starts: Vec<u64>,
+}
+
+impl Default for Instructions {
+    fn default() -> Self {
+        Self::of(InstructionMap::new())
+    }
+}
+
+impl Instructions {
+    fn of(map: InstructionMap) -> Self {
+        Self { maps: vec![map], starts: vec![0] }
+    }
+
+    /// The index of the map that holds `address` (if any does).
+    #[inline]
+    fn map_of(&self, address: u64) -> usize {
+        if self.starts.len() == 1 { 0 } else { self.starts.partition_point(|&s| s <= address) - 1 }
+    }
+
+    fn get(&self, address: u64) -> Option<&DecodedInstruction> {
+        self.maps[self.map_of(address)].get(&address).map(|b| &**b)
+    }
+
+    fn contains_key(&self, address: u64) -> bool {
+        self.maps[self.map_of(address)].contains_key(&address)
+    }
+
+    fn insert(&mut self, address: u64, insn: Box<DecodedInstruction>) {
+        let k = self.map_of(address);
+        self.maps[k].insert(address, insn);
+    }
+
+    fn entry(&mut self, address: u64) -> std::collections::btree_map::Entry<'_, u64, Box<DecodedInstruction>> {
+        let k = self.map_of(address);
+        self.maps[k].entry(address)
+    }
+
+    fn len(&self) -> usize {
+        self.maps.iter().map(BTreeMap::len).sum()
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&u64, &Box<DecodedInstruction>)> {
+        self.maps.iter().flat_map(|m| m.iter())
+    }
+
+    /// The instructions at `start..end` (a `BTreeMap::range`).
+    fn range(&self, start: u64, end: u64) -> impl DoubleEndedIterator<Item = (&u64, &Box<DecodedInstruction>)> {
+        let lo = self.map_of(start);
+        let hi = if end > start { self.map_of(end - 1) } else { lo };
+        self.maps[lo..=hi].iter().flat_map(move |m| m.range(start..end))
+    }
+
+    /// The instructions at `start..`.
+    fn range_from(&self, start: u64) -> impl Iterator<Item = (&u64, &Box<DecodedInstruction>)> {
+        self.maps[self.map_of(start)..].iter().flat_map(move |m| m.range(start..))
+    }
+
+    /// All the instructions, in address order.
+    fn into_run(self) -> InstructionRun {
+        if self.maps.len() == 1 {
+            return self.maps.into_iter().flatten().collect();
+        }
+        let mut run = Vec::with_capacity(self.len());
+        for m in self.maps {
+            run.extend(m);
+        }
+        run
+    }
+}
+
+impl std::fmt::Debug for Instructions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // (as the one map they read as)
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl serde::Serialize for Instructions {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // (as the one map they read as)
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (k, v) in self.iter() {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Instructions {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        InstructionMap::deserialize(deserializer).map(Self::of)
+    }
+}
+
 impl Listing {
     pub fn new() -> Self {
         Self::default()
@@ -75,13 +181,15 @@ impl Listing {
     /// The instruction and function maps, for the on-disk analysis cache
     /// (which stores them in chunks and rebuilds them with
     /// [`Self::from_cache_parts`]).
-    pub fn cache_parts(&self) -> (&InstructionMap, &BTreeMap<u64, Function>) {
-        (&self.instructions, &self.functions)
+    pub fn cache_parts(
+        &self,
+    ) -> (impl ExactSizeIterator<Item = (&u64, &DecodedInstruction)> + '_, &BTreeMap<u64, Function>) {
+        (ExactLen(self.instructions.iter().map(|(a, i)| (a, &**i)), self.instructions.len()), &self.functions)
     }
 
     /// A listing of the maps [`Self::cache_parts`] returned.
     pub fn from_cache_parts(instructions: InstructionMap, functions: BTreeMap<u64, Function>) -> Self {
-        Self { instructions, functions, sorted: std::sync::OnceLock::new() }
+        Self { instructions: Instructions::of(instructions), functions, sorted: std::sync::OnceLock::new() }
     }
 
     pub fn add_instruction(&mut self, insn: DecodedInstruction) {
@@ -129,7 +237,7 @@ impl Listing {
             return;
         }
         // Each part with the listed ones of its range.
-        let mut old: Run = std::mem::take(&mut self.instructions).into_iter().collect();
+        let mut old: Run = std::mem::take(&mut self.instructions).into_run();
         let mut parts: Vec<(Run, Vec<Run>)> = parts.into_iter().map(|p| (Vec::new(), p)).collect();
         for k in (1..parts.len()).rev() {
             let at = old.partition_point(|o| o.0 < cuts[k - 1]);
@@ -139,49 +247,27 @@ impl Listing {
             Some(first) => first.0 = old,
             None => parts.push((old, Vec::new())),
         }
-        // Each part put in order straight into its share of one buffer (as
-        // many slots as it has instructions, the ones a repeat leaves
-        // empty `None`), so no part's instructions are moved again before
-        // the map is built from it.
-        let bounds: Vec<usize> = parts.iter().map(|(old, runs)| old.len() + runs.iter().map(Vec::len).sum::<usize>()).collect();
-        let slots: usize = bounds.iter().sum();
-        let mut all: Vec<Slot> = Vec::with_capacity(slots);
-        {
-            let mut rest = &mut all.spare_capacity_mut()[..slots];
-            let mut shares = Vec::with_capacity(parts.len());
-            for &n in &bounds {
-                let (share, after) = std::mem::take(&mut rest).split_at_mut(n);
-                shares.push(share);
-                rest = after;
-            }
-            let work = parts.into_iter().zip(shares);
-            if work.len() > 1 && total >= 1 << 16 {
-                std::thread::scope(|s| {
-                    let mut work = work;
-                    let last = work.next_back();
-                    let threads: Vec<_> = work.map(|((old, runs), share)| s.spawn(move || put_in_order(old, runs, share))).collect();
-                    if let Some(((old, runs), share)) = last {
-                        put_in_order(old, runs, share);
-                    }
-                    for t in threads {
-                        t.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-                    }
-                });
-            } else {
-                for ((old, runs), share) in work {
-                    put_in_order(old, runs, share);
-                }
-            }
-        }
-        // SAFETY: the shares cover the first `slots` slots, and each part's
-        // placing wrote every slot of its share (a panic in one is passed on
-        // above, before this).
-        unsafe { all.set_len(slots) };
-        // (`filter_map`, unlike `flatten`, collects in place: the buffer
-        // is the one the map is built from)
-        #[allow(clippy::filter_map_identity)]
-        let listed = all.into_iter().filter_map(|slot| slot);
-        self.instructions = listed.collect();
+        // Each part put in order straight into a buffer (as many slots as
+        // it has instructions, the ones a repeat leaves empty `None`) and
+        // its map built from it, on a thread of its own: the maps of the
+        // parts' ranges.
+        let starts: Vec<u64> = std::iter::once(0).chain(cuts.iter().copied()).take(parts.len()).collect();
+        let maps: Vec<InstructionMap> = if parts.len() > 1 && total >= 1 << 16 {
+            std::thread::scope(|s| {
+                let mut work = parts.into_iter();
+                let last = work.next_back();
+                let threads: Vec<_> = work.map(|part| s.spawn(move || part_map(part))).collect();
+                let last = last.map(part_map);
+                let mut maps: Vec<InstructionMap> =
+                    threads.into_iter().map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect();
+                maps.extend(last);
+                maps
+            })
+        } else {
+            parts.into_iter().map(part_map).collect()
+        };
+        if std::env::var_os("REARGO_TRACE").is_some() && total > 100000 { eprintln!("TRACE        listing: maps {:?} built", maps.iter().map(|m| m.len()).collect::<Vec<_>>()); }
+        self.instructions = Instructions { maps, starts };
     }
 
     /// The instruction at `address`: the one listed, else `decode()`'s,
@@ -202,20 +288,20 @@ impl Listing {
     }
 
     pub fn get_instruction(&self, address: u64) -> Option<&DecodedInstruction> {
-        self.instructions.get(&address).map(|b| &**b)
+        self.instructions.get(address)
     }
 
     pub fn has_instruction(&self, address: u64) -> bool {
-        self.instructions.contains_key(&address)
+        self.instructions.contains_key(address)
     }
 
     pub fn instructions(&self) -> impl Iterator<Item = &DecodedInstruction> {
-        self.instructions.values().map(|b| &**b)
+        self.instructions.iter().map(|(_, b)| &**b)
     }
 
     /// The addresses of the instructions listed in `start..end`, ascending.
     pub fn instruction_addresses_in_range(&self, start: u64, end: u64) -> impl Iterator<Item = u64> + '_ {
-        self.instructions.range(start..end).map(|(&a, _)| a)
+        self.instructions.range(start, end).map(|(&a, _)| a)
     }
 
     pub fn instructions_in_range(
@@ -223,7 +309,7 @@ impl Listing {
         start: u64,
         end: u64,
     ) -> impl DoubleEndedIterator<Item = &DecodedInstruction> {
-        self.instructions.range(start..end).map(|(_, v)| &**v)
+        self.instructions.range(start, end).map(|(_, v)| &**v)
     }
 
     /// Calls `f(first, insn)` for the instructions of every range of
@@ -248,7 +334,7 @@ impl Listing {
         while let Some((start, mut end)) = ranges.next() {
             // the run of ranges from `start`: one lookup, read up to the
             // end of each in turn
-            let mut it = self.instructions.range(start..).peekable();
+            let mut it = self.instructions.range_from(start).peekable();
             loop {
                 let mut first = true;
                 while let Some((_, insn)) = it.next_if(|(a, _)| **a < end) {
@@ -346,9 +432,38 @@ fn for_each_sorted_body_instruction<'a>(
     }
 }
 
-/// The instructions of `runs` (each sorted by address) merged by address
-/// into `old` (sorted, one per address): `old`'s kept where both have one,
-/// a repeated address once.
+/// The map of a part's instructions: `old` (sorted, the listed ones) and
+/// the runs, each address once ([`put_in_order`]).
+fn part_map((old, runs): (InstructionRun, Vec<InstructionRun>)) -> InstructionMap {
+    let n = old.len() + runs.iter().map(Vec::len).sum::<usize>();
+    let mut all: Vec<Slot> = Vec::with_capacity(n);
+    put_in_order(old, runs, &mut all.spare_capacity_mut()[..n]);
+    // SAFETY: `put_in_order` wrote every one of the first `n` slots.
+    unsafe { all.set_len(n) };
+    // (`filter_map`, unlike `flatten`, collects in place: the buffer is
+    // the one the map is built from)
+    #[allow(clippy::filter_map_identity)]
+    let listed = all.into_iter().filter_map(|slot| slot);
+    listed.collect()
+}
+
+/// An iterator of a known length.
+struct ExactLen<I>(I, usize);
+
+impl<I: Iterator> Iterator for ExactLen<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<I::Item> {
+        let item = self.0.next()?;
+        self.1 -= 1;
+        Some(item)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.1, Some(self.1))
+    }
+}
+
+impl<I: Iterator> ExactSizeIterator for ExactLen<I> {}
+
 /// The instructions of `old` (sorted by address, the listed ones) and
 /// `runs` (in any order), each address once — the first of it in that
 /// order —, put in address order into the first slots of `share` (at

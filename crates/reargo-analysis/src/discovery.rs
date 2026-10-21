@@ -449,9 +449,12 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
                 result
             },
         );
+        let tt = std::time::Instant::now();
+        let tr = std::env::var_os("REARGO_TRACE").is_some();
         drop(walk_visited);
         drop(decoder);
         let own = decodes.into_sorted();
+        if tr { eprintln!("TRACE        disc: walk ended; own sorted {:.1}", tt.elapsed().as_secs_f64()*1e3); }
         let Some(started) = started.into_inner() else {
             // (a short walk: all on this thread)
             listing.add_unlisted_instructions(vec![vec![own]]);
@@ -473,6 +476,7 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         if let Some(shared) = shared.get() {
             shared.release();
         }
+        if tr { eprintln!("TRACE        disc: released {:.1}", tt.elapsed().as_secs_f64()*1e3); }
         // (by part of the code, then by thread: each in the order decoded)
         let mut decodes: Vec<Vec<InstructionRun>> = Vec::new();
         for parts in read.iter().take(decoding) {
@@ -490,18 +494,24 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             decodes[k + 1].push(rest.split_off(at));
         }
         decodes[0].push(rest);
+        if tr { eprintln!("TRACE        disc: decodes gathered {:.1}", tt.elapsed().as_secs_f64()*1e3); }
         listing.add_unlisted_instructions_cut(cuts, decodes);
+        if tr { eprintln!("TRACE        disc: listed {:.1}", tt.elapsed().as_secs_f64()*1e3); }
         let bodies = sets.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        if tr { eprintln!("TRACE        disc: sets {:.1}", tt.elapsed().as_secs_f64()*1e3); }
         if let Err(e) = adding.join() {
             std::panic::resume_unwind(e);
         }
+        if tr { eprintln!("TRACE        disc: refs added {:.1}", tt.elapsed().as_secs_f64()*1e3); }
         (counts, bodies)
     });
+    let tt = std::time::Instant::now();
     for (entry, body) in bodies {
         if let Some(f) = listing.get_function_mut(entry) {
             f.body = body;
         }
     }
+    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE        disc: bodies set {:.1}", tt.elapsed().as_secs_f64()*1e3); }
     counts
 }
 
@@ -530,9 +540,18 @@ impl<'scope> Started<'scope> {
         // (the references in the order found)
         let (references, references_in) = std::sync::mpsc::channel::<Vec<Reference>>();
         let adding = s.spawn(move || {
-            for batch in references_in {
+            let t0 = std::time::Instant::now(); let mut busy = std::time::Duration::ZERO; let mut n = 0; let mut nb = 0; let mut big = 0;
+            while let Ok(mut batch) = references_in.recv() {
+                // (the batches waiting added with it: one bulk add, the
+                // two maps at the same time when there are many)
+                while let Ok(more) = references_in.try_recv() {
+                    batch.extend_from_slice(&more);
+                }
+                let t = std::time::Instant::now();
                 reference_manager.add_all_unpooled(&batch);
+                busy += t.elapsed(); n += batch.len(); nb += 1; big = big.max(batch.len());
             }
+            if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE        refs thread: {} refs {} adds (largest {}) busy {:.1} of {:.1}", n, nb, big, busy.as_secs_f64()*1e3, t0.elapsed().as_secs_f64()*1e3); }
         });
         let (bodies, bodies_in) = std::sync::mpsc::channel::<Vec<(u64, Vec<AddressRange>)>>();
         let sets = s.spawn(move || {
@@ -685,9 +704,7 @@ fn speculate_loop(
         drop(queue);
         shared.wake.notify_all();
     }
-    // Once the walk is done and holds none of the code decoded: the
-    // decodes it read (at the addresses it visited), for the listing; the
-    // others freed here, and what this thread freed given back.
+    let tw = std::time::Instant::now();
     {
         let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         while !queue.collect {
@@ -720,7 +737,9 @@ fn speculate_loop(
             }
         }
     }
+    let tsend = std::time::Instant::now();
     let _ = read_out.send(parts);
+    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE        helper: work ended -> handed {:.1} (collect wait+cut)", (tsend - tw).as_secs_f64()*1e3); }
     // (while the walk lists them)
     drop(specs);
     crate::release_free_memory();

@@ -92,6 +92,7 @@ impl Analyzer for LinearSweepAnalyzer {
             .filter(|s| s.flags.contains(reargo_loader::SectionFlags::EXECUTE))
             .map(|s| (s.address, s.address + s.size))
             .collect();
+        let tt = std::time::Instant::now(); let tr = std::env::var_os("REARGO_TRACE").is_some();
         let (covered, prologues) = rayon::join(
             || {
                 // (the bodies' runs made in parallel, in listing order)
@@ -115,7 +116,9 @@ impl Analyzer for LinearSweepAnalyzer {
         // The candidates the sweep can try and what validating each
         // finds when nothing it looks at is covered, computed ahead in
         // parallel (see [`Candidate`]).
+        if tr { eprintln!("TRACE        ls: covered+prologues {:.1} ({} prologues)", tt.elapsed().as_secs_f64()*1e3, prologues.len()); }
         let candidates = candidates(program, &lifter, prologues, &covered);
+        if tr { eprintln!("TRACE        ls: candidates {:.1} ({})", tt.elapsed().as_secs_f64()*1e3, candidates.len()); }
         // Every 16-byte boundary of the executable sections in order;
         // those that are no candidate are skipped here whatever happens
         // (covered before the sweep, or no prologue).
@@ -144,6 +147,7 @@ impl Analyzer for LinearSweepAnalyzer {
             }
         }
 
+        if tr { eprintln!("TRACE        ls: sweep {:.1} ({} new)", tt.elapsed().as_secs_f64()*1e3, new_functions.len()); }
         let mut added = 0usize;
         for (entry, _end) in &new_functions {
             if program.listing.has_function(*entry) {

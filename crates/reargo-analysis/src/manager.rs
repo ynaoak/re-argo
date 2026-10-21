@@ -220,7 +220,15 @@ impl AnalysisManager {
         // each split analyzer's prepared result, from the run it
         // prepared in to its place
         let mut ready: Vec<Option<(Prepared, std::time::Duration)>> = self.analyzers.iter().map(|_| None).collect();
+        let tr = std::env::var_os("REARGO_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+        let c0 = trace_cpu();
         for window in self.windows() {
+            if tr {
+                let names: Vec<&str> = window.prepared.iter().map(|&i| self.analyzers[i].name()).collect();
+                eprintln!("TRACE window {:?} prepares {:?} at {:.1}", window.analyzers, names, t0.elapsed().as_secs_f64()*1e3);
+            }
+            let (pw, pc) = (std::time::Instant::now(), trace_cpu());
             // The prepares run at the same time, on the program as it is
             // here; each one's result is the same as at its analyzer's
             // own place (nothing in between writes what it reads).
@@ -234,12 +242,19 @@ impl AnalysisManager {
                         s.spawn(move |_| {
                             let t = std::time::Instant::now();
                             *slot = Some((analyzer.prepare(shared), t.elapsed()));
+                            if tr {
+                                eprintln!("TRACE     prep {:<28} start {:>7.1} dur {:>7.1} thr {:?}", analyzer.name(), t.duration_since(pw).as_secs_f64()*1e3, t.elapsed().as_secs_f64()*1e3, rayon::current_thread_index());
+                            }
                         });
                     }
                 });
                 for (i, slot) in slots {
                     ready[i] = slot;
                 }
+            }
+            if tr && window.prepared.len() >= 2 {
+                let w = pw.elapsed().as_secs_f64()*1e3; let c = (trace_cpu()-pc)*1e3;
+                eprintln!("TRACE   prepare-phase wall {:.1} cpu {:.1} par {:.2}", w, c, c/w);
             }
             for i in window.analyzers {
                 let analyzer = &self.analyzers[i];
@@ -249,11 +264,16 @@ impl AnalysisManager {
                     continue;
                 }
                 let t = std::time::Instant::now();
+                let ct = trace_cpu();
                 // a prepared analyzer counts its prepare's time too
                 let (r, extra) = match ready[i].take() {
                     Some((p, d)) => (analyzer.apply(program, p), d),
                     None => (analyzer.analyze(program), std::time::Duration::ZERO),
                 };
+                if tr {
+                    let w = t.elapsed().as_secs_f64()*1e3; let c = (trace_cpu()-ct)*1e3;
+                    eprintln!("TRACE   {:>8.1} {:<32} wall {:>7.1} cpu {:>7.1} par {:.2}{}", t.duration_since(t0).as_secs_f64()*1e3, analyzer.name(), w, c, c/w.max(0.001), if extra.is_zero() {""} else {" (prepared)"});
+                }
                 results.push(Some((analyzer.name(), t.elapsed() + extra, r)));
             }
         }
@@ -261,7 +281,12 @@ impl AnalysisManager {
             let analyzer = &self.analyzers[i];
             let t = std::time::Instant::now();
             let r = analyzer.analyze(program);
+            if tr { eprintln!("TRACE   {:>8.1} {:<32} wall {:>7.1} (last)", t.duration_since(t0).as_secs_f64()*1e3, analyzer.name(), t.elapsed().as_secs_f64()*1e3); }
             results[i] = Some((analyzer.name(), t.elapsed(), r));
+        }
+        if tr {
+            let w = t0.elapsed().as_secs_f64()*1e3; let c = (trace_cpu()-c0)*1e3;
+            eprintln!("TRACE total wall {:.1} cpu {:.1} par {:.2}", w, c, c/w);
         }
         results.into_iter().map(|r| r.expect("every analyzer ran")).collect()
     }
@@ -499,4 +524,13 @@ mod tests {
         let after = prepared_at(&m).into_iter().find(|(n, _)| n == annotator).unwrap().1;
         assert!(after <= before + 1, "{after} vs {before}");
     }
+}
+
+fn trace_cpu() -> f64 {
+    #[repr(C)]
+    struct Ts { s: i64, ns: i64 }
+    unsafe extern "C" { fn clock_gettime(c: i32, t: *mut Ts) -> i32; }
+    let mut t = Ts { s: 0, ns: 0 };
+    unsafe { clock_gettime(2, &mut t) };
+    t.s as f64 + t.ns as f64 * 1e-9
 }
