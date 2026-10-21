@@ -60,8 +60,12 @@ impl Sorted {
     }
 }
 
-/// Instructions by address (sorted), for [`Listing::add_unlisted_instructions`].
+/// Instructions with their addresses, for [`Listing::add_unlisted_instructions`].
 pub type InstructionRun = Vec<(u64, Box<DecodedInstruction>)>;
+
+/// A slot of the buffer [`Listing::add_unlisted_instructions_cut`] puts the
+/// instructions in, in order: an instruction, or `None` (left by a repeat).
+type Slot = Option<(u64, Box<DecodedInstruction>)>;
 
 impl Listing {
     pub fn new() -> Self {
@@ -141,7 +145,7 @@ impl Listing {
         // the map is built from it.
         let bounds: Vec<usize> = parts.iter().map(|(old, runs)| old.len() + runs.iter().map(Vec::len).sum::<usize>()).collect();
         let slots: usize = bounds.iter().sum();
-        let mut all: Vec<Option<(u64, Box<DecodedInstruction>)>> = Vec::with_capacity(slots);
+        let mut all: Vec<Slot> = Vec::with_capacity(slots);
         {
             let mut rest = &mut all.spare_capacity_mut()[..slots];
             let mut shares = Vec::with_capacity(parts.len());
@@ -349,7 +353,7 @@ fn for_each_sorted_body_instruction<'a>(
 /// `runs` (in any order), each address once — the first of it in that
 /// order —, put in address order into the first slots of `share` (at
 /// least as many as they hold); the slots after them `None`.
-fn put_in_order(old: InstructionRun, runs: Vec<InstructionRun>, share: &mut [std::mem::MaybeUninit<Option<(u64, Box<DecodedInstruction>)>>]) {
+fn put_in_order(old: InstructionRun, runs: Vec<InstructionRun>, share: &mut [std::mem::MaybeUninit<Slot>]) {
     let (lo, hi) = std::iter::once(&old)
         .chain(&runs)
         .flatten()

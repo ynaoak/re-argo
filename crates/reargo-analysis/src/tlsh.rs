@@ -246,15 +246,7 @@ fn build_buckets(data: &[u8]) -> ([u32; 128], u8) {
     // `c = V[h]` with `h = V[V[V[c] ^ w[0]] ^ w[1]]`. The chain runs on
     // `h` instead, `h = V[V[VV[h] ^ w[0]] ^ w[1]]` (`VV = V[V[x]]`):
     // three dependent lookups per byte, not four.
-    let checksum = || {
-        let vv: [u8; 256] = std::array::from_fn(|x| V_TABLE[V_TABLE[x] as usize]);
-        let step = |first: u8, a: u8, b: u8| V_TABLE[(V_TABLE[(first ^ a) as usize] ^ b) as usize];
-        let mut h = step(V_TABLE[0], data[0], data[1]);
-        for i in 1..windows {
-            h = step(vv[h as usize], data[i], data[i + 1]);
-        }
-        V_TABLE[h as usize]
-    };
+    let checksum = || chain_checksum(data, windows);
     if windows <= CHUNK {
         return (counts(), checksum());
     }
@@ -267,6 +259,22 @@ fn build_buckets(data: &[u8]) -> ([u32; 128], u8) {
         let checksum = checksum();
         (counts.join().unwrap_or_else(|e| std::panic::resume_unwind(e)), checksum)
     })
+}
+
+/// The checksum of the `windows` 5-byte windows of `data`: `c =
+/// b_mapping(c, w[0], w[1], 0)` per window, i.e. `c = V[h]` with `h =
+/// V[V[V[c] ^ w[0]] ^ w[1]]`. The chain runs on `h` instead, `h =
+/// V[V[VV[h] ^ w[0]] ^ w[1]]` (`VV = V[V[x]]`): three dependent lookups per
+/// byte, not four.
+fn chain_checksum(data: &[u8], windows: usize) -> u8 {
+    let vv: [u8; 256] = std::array::from_fn(|x| V_TABLE[V_TABLE[x] as usize]);
+    let step = |first: u8, a: u8, b: u8| V_TABLE[(V_TABLE[(first ^ a) as usize] ^ b) as usize];
+    let mut h = step(V_TABLE[0], data[0], data[1]);
+    // (the pairs `data[i], data[i + 1]` for `i` in `1..windows`)
+    for (&a, &b) in data[1..windows].iter().zip(&data[2..=windows]) {
+        h = step(vv[h as usize], a, b);
+    }
+    V_TABLE[h as usize]
 }
 
 /// The first two lookups of [`b_mapping`] for each salt of [`bucket_window`] (they

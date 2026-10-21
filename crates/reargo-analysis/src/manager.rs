@@ -73,6 +73,10 @@ use crate::vtable::VTableAnalyzer;
 use crate::wrapper::WrapperFunctionAnalyzer;
 use crate::xref_report::{CrossReferenceReportAnalyzer, UnreferencedFunctionAnalyzer};
 
+/// An analyzer's name, wall-clock time and result
+/// ([`AnalysisManager::run_all_timed`]).
+pub type Timed<'a> = (&'a str, std::time::Duration, Result<AnalysisResult, AnalysisError>);
+
 /// A run of consecutive analyzers (indices into the pipeline) and the
 /// ones among them that prepare at its start, in order.
 struct Window {
@@ -205,17 +209,13 @@ impl AnalysisManager {
     /// Like [`run_all`](Self::run_all), but also reports each analyzer's
     /// name and wall-clock time. One entry per analyzer, in run
     /// (priority) order. Drives the per-analyzer table in `bench`.
-    pub fn run_all_timed(
-        &self,
-        program: &mut Program,
-    ) -> Vec<(&str, std::time::Duration, Result<AnalysisResult, AnalysisError>)> {
+    pub fn run_all_timed(&self, program: &mut Program) -> Vec<Timed<'_>> {
         for analyzer in &self.analyzers {
             analyzer.start_early(program);
         }
         // (by analyzer: filled in run order, the ones that run last at
         // the end)
-        let mut results: Vec<Option<(&str, std::time::Duration, Result<AnalysisResult, AnalysisError>)>> =
-            Vec::with_capacity(self.analyzers.len());
+        let mut results: Vec<Option<Timed<'_>>> = Vec::with_capacity(self.analyzers.len());
         let mut last = Vec::new();
         // each split analyzer's prepared result, from the run it
         // prepared in to its place
