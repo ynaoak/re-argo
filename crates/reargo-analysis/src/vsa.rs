@@ -435,13 +435,26 @@ impl State {
                     let b = self.reg_bytes(base).merge(pos, out.size, ByteConst::UNKNOWN);
                     self.set_reg(base, Slot::Bytes(b));
                 }
+                Val::Bytes(b) if self.abs.is_empty() => {
+                    // (`reg_bytes` then `set_bytes`, the register found once)
+                    let k = self.regs.iter().position(|e| e.0 >= base).unwrap_or(self.regs.len());
+                    match self.regs.get_mut(k) {
+                        Some(e) if e.0 == base => {
+                            let b = e.1.merge(pos, out.size, b);
+                            if b.is_unknown() {
+                                self.regs.remove(k);
+                            } else {
+                                e.1 = b;
+                            }
+                        }
+                        // (no byte known before: known where `b` is, none when it knows none)
+                        _ if b.trunc(out.size).is_unknown() => {}
+                        _ => self.regs.insert(k, (base, ByteConst::UNKNOWN.merge(pos, out.size, b))),
+                    }
+                }
                 Val::Bytes(b) => {
                     let b = self.reg_bytes(base).merge(pos, out.size, b);
-                    if self.abs.is_empty() {
-                        self.set_bytes(base, b);
-                    } else {
-                        self.set_reg(base, Slot::Bytes(b));
-                    }
+                    self.set_reg(base, Slot::Bytes(b));
                 }
             }
             return;
@@ -563,7 +576,9 @@ impl State {
         }
     }
 
-    /// Apply one non-call op.
+    /// Apply one non-call op (inlined: the ops that change nothing, a view refresh or an op
+    /// without an output, return before the call to [`Self::apply_output`]).
+    #[inline(always)]
     fn apply(&mut self, op: &PcodeOp) {
         if is_unmodeled(op) {
             *self = State::default();
@@ -575,6 +590,12 @@ impl State {
         if is_view_refresh(op) {
             return;
         }
+        self.apply_output(op, out);
+    }
+
+    /// [`Self::apply`] of an op that writes `out`.
+    #[inline(never)]
+    fn apply_output(&mut self, op: &PcodeOp, out: &VarnodeData) {
         let v = self.eval(op);
         self.write(out, v);
     }
@@ -784,6 +805,7 @@ impl FlowState for State {
     fn join(&self, other: &Self) -> Self {
         State::join(self, other)
     }
+    #[inline]
     fn apply(&mut self, op: &PcodeOp) {
         State::apply(self, op);
     }

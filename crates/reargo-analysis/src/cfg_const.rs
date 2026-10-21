@@ -185,6 +185,7 @@ impl State {
     /// Apply one non-call op: view refreshes change nothing, the
     /// ops [`eval`] models compute their output, anything else
     /// (loads included) makes it unknown.
+    #[inline(always)]
     fn apply(&mut self, op: &PcodeOp) {
         if is_unmodeled(op) {
             *self = State::default();
@@ -196,6 +197,13 @@ impl State {
         if is_view_refresh(op) {
             return;
         }
+        self.apply_output(op, out);
+    }
+
+    /// [`Self::apply`] of an op that writes `out` (out of line: the ops that change nothing
+    /// return before the call).
+    #[inline(never)]
+    fn apply_output(&mut self, op: &PcodeOp, out: &VarnodeData) {
         let v = if op.opcode == OpCode::Load {
             // The IndirectCallResolver picks up the (Load of CONST
             // RAM address → GOT slot → import) chain in its own pass.
@@ -231,6 +239,7 @@ impl FlowState for State {
     fn join(&self, other: &Self) -> Self {
         self.intersect(other)
     }
+    #[inline]
     fn apply(&mut self, op: &PcodeOp) {
         State::apply(self, op);
     }

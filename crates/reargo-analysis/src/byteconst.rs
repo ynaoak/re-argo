@@ -40,12 +40,11 @@ pub fn bit_mask(size: u32) -> u64 {
 }
 
 /// Byte-known mask of the low `size` bytes (`size` ≤ 8).
+#[inline]
 fn byte_mask(size: u32) -> u8 {
-    if size >= 8 {
-        0xff
-    } else {
-        ((1u16 << size) - 1) as u8
-    }
+    // (by table: one load where the shift and the select took several instructions)
+    const MASKS: [u8; 9] = [0x00, 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff];
+    MASKS[size.min(8) as usize]
 }
 
 /// Bit mask of the bytes set in a byte-known mask.
@@ -124,6 +123,7 @@ impl ByteConst {
 
     /// `self` with its bytes `pos..pos + size` replaced by the low
     /// `size` bytes of `v` (known where `v` is).
+    #[inline]
     pub fn merge(self, pos: u32, size: u32, v: ByteConst) -> Self {
         let m = byte_mask(size) << pos;
         let v = v.trunc(size);
@@ -312,21 +312,6 @@ impl RegList {
         ByteConst::UNKNOWN
     }
 
-    fn set_slot(&mut self, base: u64, v: ByteConst) {
-        let k = self.regs.partition_point(|e| e.0 < base);
-        match self.regs.get(k) {
-            Some(e) if e.0 == base => {
-                if v.is_unknown() {
-                    self.regs.remove(k);
-                } else {
-                    self.regs[k].1 = v;
-                }
-            }
-            _ if v.is_unknown() => {}
-            _ => self.regs.insert(k, (base, v)),
-        }
-    }
-
     /// The `size` bytes at `offset` ([`RegFile::read`]).
     pub fn read(&self, offset: u64, size: u32) -> ByteConst {
         match split(offset, size) {
@@ -341,8 +326,21 @@ impl RegList {
             self.forget(offset, size);
             return;
         };
-        let next = self.slot(base).merge(pos, size, v);
-        self.set_slot(base, next);
+        // (the slot found once, set to the bytes merged in: removed when none is known)
+        let k = self.regs.iter().position(|e| e.0 >= base).unwrap_or(self.regs.len());
+        match self.regs.get_mut(k) {
+            Some(e) if e.0 == base => {
+                let next = e.1.merge(pos, size, v);
+                if next.is_unknown() {
+                    self.regs.remove(k);
+                } else {
+                    e.1 = next;
+                }
+            }
+            // (no byte known before: known where `v` is, none when it knows none)
+            _ if v.trunc(size).is_unknown() => {}
+            _ => self.regs.insert(k, (base, ByteConst::UNKNOWN.merge(pos, size, v))),
+        }
     }
 
     /// Forget the bytes `offset..offset + size` ([`RegFile::forget`]).
@@ -534,13 +532,16 @@ pub fn eval(op: &PcodeOp, read: impl Fn(&VarnodeData) -> ByteConst) -> Option<By
     }
     let osz = out.size;
     let input = |i: usize| op.inputs.get(i);
-    let val = |i: usize| -> Option<ByteConst> {
-        let vn = input(i)?;
+    /// Input `i` of `op` through `read` (inlined: a call per input cost more than the read).
+    #[inline(always)]
+    fn value(op: &PcodeOp, i: usize, read: &impl Fn(&VarnodeData) -> ByteConst) -> Option<ByteConst> {
+        let vn = op.inputs.get(i)?;
         if vn.size == 0 || vn.size > 8 {
             return None;
         }
         Some(read(vn).trunc(vn.size))
-    };
+    }
+    let val = |i: usize| value(op, i, &read);
     let full = |i: usize| -> Option<u64> { val(i)?.get(input(i)?.size) };
     let r = match op.opcode {
         OpCode::Copy => val(0)?,
