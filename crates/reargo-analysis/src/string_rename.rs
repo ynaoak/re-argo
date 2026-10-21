@@ -50,53 +50,61 @@ impl Analyzer for StringHintRenameAnalyzer {
         740
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        // Collect existing names so we don't propose a colliding rename
-        // (the existing ones borrowed, the renames proposed below owned).
-        let existing: rustc_hash::FxHashSet<&str> = program
-            .listing
-            .functions()
-            .map(|f| f.name.as_str())
-            .chain(program.symbol_table.iter().map(|s| s.name.as_str()))
-            .collect();
-        let mut proposed_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-
         struct Candidate {
             entry: u64,
             // The body's addresses, as runs of adjacent ranges.
             runs: Vec<(u64, u64)>,
         }
-        let candidates: Vec<Candidate> = program
-            .listing
-            .functions()
-            .filter(|f| f.name.starts_with("FUN_") && !f.is_thunk)
-            .map(|f| Candidate { entry: f.entry_point, runs: f.body.runs() })
-            .collect();
-
-        // References whose source is inside each function and whose
-        // target dereferences to a printable string, with the name it
-        // proposes: those from each body address in turn. Found for
-        // every function in parallel; which one is taken depends on the
-        // names taken before, so that is decided in order below.
-        let found: Vec<Vec<(u64, String)>> = candidates
-            .par_iter()
-            .map(|cand| {
-                let mut found = Vec::new();
-                for (start, end) in &cand.runs {
-                    for refs in program.references.refs_from_range(*start, *end) {
-                        for r in refs {
-                            let Some(s) = read_c_string(program, r.to) else {
-                                continue;
-                            };
-                            let Some(slug) = sanitize_slug(&s) else {
-                                continue;
-                            };
-                            found.push((r.to, format!("f_{}", slug)));
+        // The existing names (so no colliding rename is proposed: the
+        // existing ones borrowed, the renames proposed below owned) are
+        // gathered while the candidates' strings are found.
+        let (existing, (candidates, found)) = rayon::join(
+            || -> rustc_hash::FxHashSet<&str> {
+                program
+                    .listing
+                    .functions()
+                    .map(|f| f.name.as_str())
+                    .chain(program.symbol_table.iter().map(|s| s.name.as_str()))
+                    .collect()
+            },
+            || {
+                // (the bodies' runs made in parallel, in listing order)
+                let candidates: Vec<Candidate> = crate::func_lift::map_functions(program, |f| {
+                    (f.name.starts_with("FUN_") && !f.is_thunk).then(|| Candidate { entry: f.entry_point, runs: f.body.runs() })
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+                // References whose source is inside each function and
+                // whose target dereferences to a printable string, with
+                // the name it proposes: those from each body address in
+                // turn. Found for every function in parallel; which one is
+                // taken depends on the names taken before, so that is
+                // decided in order below.
+                let found: Vec<Vec<(u64, String)>> = candidates
+                    .par_iter()
+                    .map(|cand| {
+                        let mut found = Vec::new();
+                        for (start, end) in &cand.runs {
+                            for refs in program.references.refs_from_range(*start, *end) {
+                                for r in refs {
+                                    let Some(s) = read_c_string(program, r.to) else {
+                                        continue;
+                                    };
+                                    let Some(slug) = sanitize_slug(&s) else {
+                                        continue;
+                                    };
+                                    found.push((r.to, format!("f_{}", slug)));
+                                }
+                            }
                         }
-                    }
-                }
-                found
-            })
-            .collect();
+                        found
+                    })
+                    .collect();
+                (candidates, found)
+            },
+        );
+        let mut proposed_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
 
         let mut renames: Vec<(u64, String)> = Vec::new();
         for (cand, found) in candidates.iter().zip(found) {

@@ -212,7 +212,11 @@ impl AnalysisManager {
         for analyzer in &self.analyzers {
             analyzer.start_early(program);
         }
-        let mut results = Vec::with_capacity(self.analyzers.len());
+        // (by analyzer: filled in run order, the ones that run last at
+        // the end)
+        let mut results: Vec<Option<(&str, std::time::Duration, Result<AnalysisResult, AnalysisError>)>> =
+            Vec::with_capacity(self.analyzers.len());
+        let mut last = Vec::new();
         // each split analyzer's prepared result, from the run it
         // prepared in to its place
         let mut ready: Vec<Option<(Prepared, std::time::Duration)>> = self.analyzers.iter().map(|_| None).collect();
@@ -239,16 +243,27 @@ impl AnalysisManager {
             }
             for i in window.analyzers {
                 let analyzer = &self.analyzers[i];
+                if self.overlap && analyzer.runs_last() {
+                    last.push(i);
+                    results.push(None);
+                    continue;
+                }
                 let t = std::time::Instant::now();
                 // a prepared analyzer counts its prepare's time too
                 let (r, extra) = match ready[i].take() {
                     Some((p, d)) => (analyzer.apply(program, p), d),
                     None => (analyzer.analyze(program), std::time::Duration::ZERO),
                 };
-                results.push((analyzer.name(), t.elapsed() + extra, r));
+                results.push(Some((analyzer.name(), t.elapsed() + extra, r)));
             }
         }
-        results
+        for i in last {
+            let analyzer = &self.analyzers[i];
+            let t = std::time::Instant::now();
+            let r = analyzer.analyze(program);
+            results[i] = Some((analyzer.name(), t.elapsed(), r));
+        }
+        results.into_iter().map(|r| r.expect("every analyzer ran")).collect()
     }
 
     /// The pipeline cut into runs of consecutive analyzers, each with

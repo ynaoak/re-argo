@@ -1686,22 +1686,35 @@ pub fn decompile_all_with_options(
     // count, multiplied by M parallel functions == O(N*M) redundant
     // work. `decompile_function_with_maps` is the same code path
     // minus the rebuild.
-    let (symbols, string_literals) = build_program_maps(program);
-    let annotations = build_annotations(program);
-    // one callee-parameter memo for the whole batch
-    let oracle = CalleeParams::new(lifter, &program.info.memory)
-        .map(|o| o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index().with_entries(entries.clone()));
+    // (the maps, the comments, the callee-parameter memo and the order made
+    // at the same time)
+    use rayon::prelude::*;
+    let (((symbols, string_literals), annotations), (oracle, order)) = rayon::join(
+        || rayon::join(|| build_program_maps(program), || build_annotations(program)),
+        || {
+            rayon::join(
+                // one callee-parameter memo for the whole batch
+                || {
+                    CalleeParams::new(lifter, &program.info.memory).map(|o| {
+                        o.with_unwind_table(unwind_table(&program.info.sections)).with_call_index().with_entries(entries.clone())
+                    })
+                },
+                || {
+                    // Largest first, each worker taking the next function when it is done: the
+                    // big functions do not end up last on one thread (the results keep the
+                    // listing order).
+                    let size = |e: u64| program.listing.get_function(e).map_or(0, |f| f.body.ranges().map(|r| r.size).sum::<u64>());
+                    // (the sizes summed in parallel: a body holds a range per instruction)
+                    let sizes: Vec<u64> = entries.par_iter().with_min_len(256).map(|&e| size(e)).collect();
+                    let mut order: Vec<usize> = (0..entries.len()).collect();
+                    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+                    order
+                },
+            )
+        },
+    );
     // (the no-return answers shared by the batch, for a lifter without an oracle)
     let batch_flow = oracle.is_none().then(crate::noreturn::FlowCache::new);
-
-    // Largest first, each worker taking the next function when it is done: the big
-    // functions do not end up last on one thread (the results keep the listing order).
-    let size = |e: u64| program.listing.get_function(e).map_or(0, |f| f.body.ranges().map(|r| r.size).sum::<u64>());
-    // (the sizes summed in parallel: a body holds a range per instruction)
-    use rayon::prelude::*;
-    let sizes: Vec<u64> = entries.par_iter().with_min_len(256).map(|&e| size(e)).collect();
-    let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Option<Result<DecompileResult, String>>>> =
         (0..entries.len()).map(|_| std::sync::Mutex::new(None)).collect();

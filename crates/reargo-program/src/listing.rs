@@ -95,16 +95,27 @@ impl Listing {
     }
 
     /// List each instruction of `parts` at its address unless one is
-    /// listed there (as [`Self::instruction_or_insert_with`] does), in
-    /// bulk: the map is built again in one pass from both when the new ones
-    /// are many, each part merged on a thread of its own. The parts hold
-    /// ascending, disjoint address ranges (every address of a part below
-    /// every one of the next); each is a few runs sorted by address. An
-    /// address may repeat, in a run or across runs, with the same
-    /// instruction (the first kept).
+    /// listed there (as [`Self::instruction_or_insert_with`] does, in
+    /// order: of an address that repeats the first is kept), in bulk: the
+    /// map is built again in one pass from both when the new ones are many,
+    /// each part placed on a thread of its own. The parts hold ascending,
+    /// disjoint address ranges (every address of a part below every one of
+    /// the next); each is a few runs, in any order.
     pub fn add_unlisted_instructions(&mut self, parts: Vec<Vec<InstructionRun>>) {
+        // (each part from its lowest address)
+        let parts: Vec<Vec<InstructionRun>> = parts.into_iter().filter(|p| p.iter().any(|r| !r.is_empty())).collect();
+        let cuts: Vec<u64> =
+            parts.iter().skip(1).map(|p| p.iter().flatten().map(|i| i.0).min().unwrap_or(u64::MAX)).collect();
+        self.add_unlisted_instructions_cut(&cuts, parts);
+    }
+
+    /// [`Self::add_unlisted_instructions`] of parts cut at `cuts`
+    /// (ascending): `parts[k]` holds addresses from `cuts[k - 1]` (the
+    /// first, any below) up to `cuts[k]` (the last, any above).
+    pub fn add_unlisted_instructions_cut(&mut self, cuts: &[u64], parts: Vec<Vec<InstructionRun>>) {
         type Run = InstructionRun;
-        debug_assert!(parts.iter().flatten().all(|r| r.windows(2).all(|w| w[0].0 <= w[1].0)));
+        debug_assert!(cuts.windows(2).all(|w| w[0] <= w[1]));
+        debug_assert!(parts.len() <= cuts.len() + 1);
         self.sorted.take();
         let total: usize = parts.iter().flatten().map(Vec::len).sum();
         if total < self.instructions.len() {
@@ -113,40 +124,60 @@ impl Listing {
             }
             return;
         }
-        // the parts that hold some, with the listed ones of their range
-        let mut parts: Vec<(Run, Vec<Run>)> =
-            parts.into_iter().filter(|p| p.iter().any(|r| !r.is_empty())).map(|p| (Vec::new(), p)).collect();
+        // Each part with the listed ones of its range.
         let mut old: Run = std::mem::take(&mut self.instructions).into_iter().collect();
+        let mut parts: Vec<(Run, Vec<Run>)> = parts.into_iter().map(|p| (Vec::new(), p)).collect();
         for k in (1..parts.len()).rev() {
-            let low = parts[k].1.iter().filter_map(|r| r.first()).map(|f| f.0).min().unwrap_or(u64::MAX);
-            let at = old.partition_point(|o| o.0 < low);
+            let at = old.partition_point(|o| o.0 < cuts[k - 1]);
             parts[k].0 = old.split_off(at);
         }
-        if let Some(first) = parts.first_mut() {
-            first.0 = old;
-        } else {
-            parts.push((old, Vec::new()));
+        match parts.first_mut() {
+            Some(first) => first.0 = old,
+            None => parts.push((old, Vec::new())),
         }
-        let merged: Vec<Run> = if parts.len() > 1 && total >= 1 << 16 {
-            std::thread::scope(|s| {
-                let mut parts = parts.into_iter();
-                let last = parts.next_back();
-                let threads: Vec<_> = parts.map(|(old, runs)| s.spawn(move || merge_runs(old, runs))).collect();
-                let last = last.map(|(old, runs)| merge_runs(old, runs));
-                threads
-                    .into_iter()
-                    .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-                    .chain(last)
-                    .collect()
-            })
-        } else {
-            parts.into_iter().map(|(old, runs)| merge_runs(old, runs)).collect()
-        };
-        let mut all: Run = Vec::with_capacity(merged.iter().map(Vec::len).sum());
-        for m in merged {
-            all.extend(m);
+        // Each part put in order straight into its share of one buffer (as
+        // many slots as it has instructions, the ones a repeat leaves
+        // empty `None`), so no part's instructions are moved again before
+        // the map is built from it.
+        let bounds: Vec<usize> = parts.iter().map(|(old, runs)| old.len() + runs.iter().map(Vec::len).sum::<usize>()).collect();
+        let slots: usize = bounds.iter().sum();
+        let mut all: Vec<Option<(u64, Box<DecodedInstruction>)>> = Vec::with_capacity(slots);
+        {
+            let mut rest = &mut all.spare_capacity_mut()[..slots];
+            let mut shares = Vec::with_capacity(parts.len());
+            for &n in &bounds {
+                let (share, after) = std::mem::take(&mut rest).split_at_mut(n);
+                shares.push(share);
+                rest = after;
+            }
+            let work = parts.into_iter().zip(shares);
+            if work.len() > 1 && total >= 1 << 16 {
+                std::thread::scope(|s| {
+                    let mut work = work;
+                    let last = work.next_back();
+                    let threads: Vec<_> = work.map(|((old, runs), share)| s.spawn(move || put_in_order(old, runs, share))).collect();
+                    if let Some(((old, runs), share)) = last {
+                        put_in_order(old, runs, share);
+                    }
+                    for t in threads {
+                        t.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                    }
+                });
+            } else {
+                for ((old, runs), share) in work {
+                    put_in_order(old, runs, share);
+                }
+            }
         }
-        self.instructions = all.into_iter().collect();
+        // SAFETY: the shares cover the first `slots` slots, and each part's
+        // placing wrote every slot of its share (a panic in one is passed on
+        // above, before this).
+        unsafe { all.set_len(slots) };
+        // (`filter_map`, unlike `flatten`, collects in place: the buffer
+        // is the one the map is built from)
+        #[allow(clippy::filter_map_identity)]
+        let listed = all.into_iter().filter_map(|slot| slot);
+        self.instructions = listed.collect();
     }
 
     /// The instruction at `address`: the one listed, else `decode()`'s,
@@ -314,35 +345,64 @@ fn for_each_sorted_body_instruction<'a>(
 /// The instructions of `runs` (each sorted by address) merged by address
 /// into `old` (sorted, one per address): `old`'s kept where both have one,
 /// a repeated address once.
-fn merge_runs(old: InstructionRun, runs: Vec<InstructionRun>) -> InstructionRun {
-    let total = old.len() + runs.iter().map(Vec::len).sum::<usize>();
-    let mut merged: Vec<(u64, Box<DecodedInstruction>)> = Vec::with_capacity(total);
-    let mut old = old.into_iter().peekable();
-    let mut heads: Vec<_> = runs.into_iter().map(|r| r.into_iter().peekable()).collect();
-    loop {
-        // (the run whose next address is the lowest: few runs)
-        let mut lowest: Option<(usize, u64)> = None;
-        for (k, head) in heads.iter_mut().enumerate() {
-            if let Some(&(a, _)) = head.peek()
-                && lowest.is_none_or(|(_, l)| a < l)
-            {
-                lowest = Some((k, a));
+/// The instructions of `old` (sorted by address, the listed ones) and
+/// `runs` (in any order), each address once — the first of it in that
+/// order —, put in address order into the first slots of `share` (at
+/// least as many as they hold); the slots after them `None`.
+fn put_in_order(old: InstructionRun, runs: Vec<InstructionRun>, share: &mut [std::mem::MaybeUninit<Option<(u64, Box<DecodedInstruction>)>>]) {
+    let (lo, hi) = std::iter::once(&old)
+        .chain(&runs)
+        .flatten()
+        .fold((u64::MAX, 0), |(lo, hi), i| (lo.min(i.0), hi.max(i.0)));
+    let count = old.len() + runs.iter().map(Vec::len).sum::<usize>();
+    let filled = if lo > hi {
+        0
+    } else if ((hi - lo) >> 6) as usize <= count.saturating_mul(4).saturating_add(1024) && count < u32::MAX as usize {
+        // (dense: each address's place is its rank among the addresses
+        // there, from a bit per address)
+        let words = ((hi - lo) >> 6) as usize + 1;
+        let mut there = vec![0u64; words];
+        for i in std::iter::once(&old).chain(&runs).flatten() {
+            let at = i.0 - lo;
+            there[(at >> 6) as usize] |= 1 << (at & 63);
+        }
+        // (the addresses in the words before each)
+        let mut before: Vec<u32> = Vec::with_capacity(words);
+        let mut n = 0u32;
+        for w in &there {
+            before.push(n);
+            n += w.count_ones();
+        }
+        // (an address's bit cleared once its first instruction is placed)
+        let mut open = there.clone();
+        for i in std::iter::once(old).chain(runs).flatten() {
+            let at = i.0 - lo;
+            let (w, bit) = ((at >> 6) as usize, 1u64 << (at & 63));
+            if open[w] & bit != 0 {
+                open[w] &= !bit;
+                let rank = before[w] + (there[w] & (bit - 1)).count_ones();
+                share[rank as usize].write(Some(i));
             }
         }
-        let Some((k, a)) = lowest else { break };
-        let Some((_, i)) = heads[k].next() else { break };
-        while let Some(o) = old.next_if(|(oa, _)| *oa < a) {
-            merged.push(o);
+        n as usize
+    } else {
+        // (sparse: sorted stably, the first of each address kept)
+        let mut all: InstructionRun = Vec::with_capacity(count);
+        all.extend(old);
+        for r in runs {
+            all.extend(r);
         }
-        // (a repeat: the one before kept)
-        if merged.last().is_some_and(|(la, _)| *la == a) {
-            continue;
+        all.sort_by_key(|i| i.0);
+        all.dedup_by(|later, first| later.0 == first.0);
+        let n = all.len();
+        for (slot, i) in share.iter_mut().zip(all) {
+            slot.write(Some(i));
         }
-        // (the listed one kept)
-        merged.push(old.next_if(|(oa, _)| *oa == a).unwrap_or((a, i)));
+        n
+    };
+    for slot in &mut share[filled..] {
+        slot.write(None);
     }
-    merged.extend(old);
-    merged
 }
 
 #[cfg(test)]
@@ -376,6 +436,58 @@ mod tests {
             let state = |l: &Listing| l.instructions().map(|i| (i.address, i.length)).collect::<Vec<_>>();
             assert_eq!(state(&one), state(&bulk));
         }
+    }
+
+    /// Many instructions (the parts placed on threads of their own), in
+    /// runs in any order, dense and sparse: listed as one at a time would
+    /// list them, the listed ones and the first of each repeat kept (told
+    /// apart by their lengths), with the parts cut at their lowest
+    /// addresses or at given cuts.
+    #[test]
+    fn many_unlisted_instructions_in_parts_match_one_by_one() {
+        let insn = |a: u64, len: u32| {
+            Box::new(DecodedInstruction::new(a, len, "nop".into(), String::new(), smallvec::smallvec![0x90; len as usize], FlowType::Fall, None))
+        };
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let listed: Vec<(u64, u32)> = (0..2000u64).map(|k| (k * 97 % 200_000, 9)).chain([(250_000, 9), (u64::MAX - 5, 9)]).collect();
+        // (four parts: three of 50000 addresses, one spread over 2^40; each
+        // a few runs with repeats, some sorted)
+        let parts: Vec<Vec<Vec<(u64, u32)>>> = (0..4u64)
+            .map(|p| {
+                (0..3u32)
+                    .map(|r| {
+                        let mut run: Vec<(u64, u32)> = (0..12000)
+                            .map(|_| if p == 3 { (300_000 + next() % (1 << 40), r + 1) } else { (p * 50_000 + next() % 50_000, r + 1) })
+                            .collect();
+                        if r == 0 {
+                            run.sort_by_key(|x| x.0);
+                        }
+                        run
+                    })
+                    .collect()
+            })
+            .collect();
+        let boxed = || -> Vec<Vec<InstructionRun>> {
+            parts.iter().map(|p| p.iter().map(|r| r.iter().map(|&(a, len)| (a, insn(a, len))).collect()).collect()).collect()
+        };
+        let mut one = listing(&listed);
+        for (a, i) in boxed().into_iter().flatten().flatten() {
+            one.instruction_or_insert_with(a, || Some(*i));
+        }
+        let state = |l: &Listing| l.instructions().map(|i| (i.address, i.length)).collect::<Vec<_>>();
+        let mut bulk = listing(&listed);
+        bulk.add_unlisted_instructions(boxed());
+        assert!(state(&bulk).len() > 1 << 16);
+        assert_eq!(state(&one), state(&bulk));
+        let mut cut = listing(&listed);
+        cut.add_unlisted_instructions_cut(&[50_000, 100_000, 200_000], boxed());
+        assert_eq!(state(&one), state(&cut));
     }
 
     fn listing(insns: &[(u64, u32)]) -> Listing {

@@ -80,7 +80,7 @@ impl Analyzer for ComplexityAnalyzer {
         // (the body walks read the instructions sorted: no instruction is
         // listed after this analyzer)
         listing.sorted_instructions();
-        let computed: Vec<(u64, FunctionMetrics)> = funcs
+        let computed: Vec<(String, String)> = funcs
             .par_iter()
             .map(|f| {
                 let entry = f.entry_point;
@@ -129,28 +129,30 @@ impl Analyzer for ComplexityAnalyzer {
                     fan_out: f.call_targets.len(),
                     stack_size: f.stack_frame.local_size,
                 };
-                (entry, metrics)
+                // (the property formatted here, in parallel: `apply` only
+                // sets it)
+                (
+                    format!("func_{:x}_metrics", entry),
+                    format!(
+                        "insns={} blocks={} mccabe={} fan_in={} fan_out={} stack={}",
+                        metrics.instructions,
+                        metrics.basic_blocks,
+                        metrics.cyclomatic,
+                        metrics.fan_in,
+                        metrics.fan_out,
+                        metrics.stack_size
+                    ),
+                )
             })
             .collect();
         drop(funcs);
         Box::new(computed)
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
-        let computed: Vec<(u64, FunctionMetrics)> = crate::analyzer::prepared(prepared);
+        let computed: Vec<(String, String)> = crate::analyzer::prepared(prepared);
         let mut counted = 0usize;
-        for (entry, metrics) in computed {
-            program.metadata.set_property(
-                format!("func_{:x}_metrics", entry),
-                format!(
-                    "insns={} blocks={} mccabe={} fan_in={} fan_out={} stack={}",
-                    metrics.instructions,
-                    metrics.basic_blocks,
-                    metrics.cyclomatic,
-                    metrics.fan_in,
-                    metrics.fan_out,
-                    metrics.stack_size
-                ),
-            );
+        for (key, value) in computed {
+            program.metadata.set_property(key, value);
             counted += 1;
         }
 

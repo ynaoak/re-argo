@@ -94,9 +94,11 @@ impl Analyzer for LinearSweepAnalyzer {
             .collect();
         let (covered, prologues) = rayon::join(
             || {
-                let mut raw_ranges: Vec<(u64, u64)> = Vec::new();
-                for f in program.listing.functions() {
-                    raw_ranges.extend(f.body.runs());
+                // (the bodies' runs made in parallel, in listing order)
+                let runs = crate::func_lift::map_functions(program, |f| f.body.runs());
+                let mut raw_ranges: Vec<(u64, u64)> = Vec::with_capacity(runs.iter().map(Vec::len).sum());
+                for r in runs {
+                    raw_ranges.extend(r);
                 }
                 Covered::from_ranges(raw_ranges)
             },

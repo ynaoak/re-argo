@@ -323,25 +323,15 @@ fn present_tags(program: &Program) -> BTreeSet<String> {
 }
 
 fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaContext {
-    // Every import name and symbol name (without `@plt`), sorted and
-    // deduplicated.
-    let mut imports: Vec<&str> = program.info.imports.iter().map(|imp| imp.name.as_str()).collect();
-    imports.extend(program.symbol_table.iter().map(|sym| sym.name.strip_suffix("@plt").unwrap_or(&sym.name)));
-    imports.par_sort_unstable();
-    imports.dedup();
-    // For each lower-cased name, the first name (in sorted order) that
-    // lower-cases to it: a stable sort by the lower-cased name keeps
-    // that one first.
-    let mut lowered: Vec<(String, &str)> = imports.par_iter().map(|s| (s.to_ascii_lowercase(), *s)).collect();
-    lowered.par_sort_by(|a, b| a.0.cmp(&b.0));
-    lowered.dedup_by(|later, first| later.0 == first.0);
-    // (sorted by the lower-cased name: the order of a set of them)
-    let mut imports_lower = Haystack::default();
-    let mut original_import: Vec<String> = Vec::with_capacity(lowered.len());
-    for (lower, s) in lowered {
-        imports_lower.push(lower.as_bytes());
-        original_import.push(s.to_string());
-    }
+    // Every import name and symbol name (without `@plt`).
+    let names: Vec<&str> = program
+        .info
+        .imports
+        .iter()
+        .map(|imp| imp.name.as_str())
+        .chain(program.symbol_table.iter().map(|sym| sym.name.strip_suffix("@plt").unwrap_or(&sym.name)))
+        .collect();
+    let (imports_lower, original_import) = import_haystack(&names);
 
     // Pull strings from inline comments / immediate-string annotations
     // (every string the analyzer cared about flows through these).
@@ -367,6 +357,37 @@ fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaConte
         strings_lower,
         present_tags,
     }
+}
+
+/// The distinct lower-cased `names`, sorted, and for each the first name
+/// (in sorted order) that lower-cases to it.
+fn import_haystack(names: &[&str]) -> (Haystack, Vec<String>) {
+    // (the names lower-cased into one buffer)
+    let mut lowered_bytes: Vec<u8> = Vec::with_capacity(names.iter().map(|s| s.len()).sum());
+    for s in names {
+        lowered_bytes.extend_from_slice(s.as_bytes());
+    }
+    lowered_bytes.make_ascii_lowercase();
+    let mut at = 0;
+    let mut lowered: Vec<(&[u8], &str)> = names
+        .iter()
+        .map(|s| {
+            at += s.len();
+            (&lowered_bytes[at - s.len()..at], *s)
+        })
+        .collect();
+    // Sorted by the lower-cased name, then the name (one sort: a name
+    // repeated is the same pair), the first of each lower-cased name
+    // kept.
+    lowered.par_sort_unstable();
+    lowered.dedup_by(|later, first| later.0 == first.0);
+    let mut imports_lower = Haystack::default();
+    let mut original_import: Vec<String> = Vec::with_capacity(lowered.len());
+    for (lower, s) in lowered {
+        imports_lower.push(lower);
+        original_import.push(s.to_string());
+    }
+    (imports_lower, original_import)
 }
 
 fn eval(p: &Predicate, ctx: &CapaContext, evidence: &mut Vec<String>) -> bool {
@@ -664,6 +685,41 @@ mod tests {
         for needle in ["abcdef", "fedcba", "aaaaaaa", "ffffffff", "abcabcabc", "zz", "a", "eeeeeeeeeeee"] {
             let expected = strings.iter().position(|s| s.contains(needle));
             assert_eq!(whole.first_containing(needle.as_bytes()), expected, "{needle}");
+        }
+    }
+
+    /// The import haystack from one sort equals the names sorted and
+    /// deduplicated, then sorted stably by their lower-cased form with the
+    /// first of each kept.
+    #[test]
+    fn import_haystack_matches_two_sorts() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in [0usize, 1, 5, 300, 5000] {
+            let names: Vec<String> = (0..n)
+                .map(|_| {
+                    let len = 1 + next() % 6;
+                    (0..len).map(|_| b"aAbBc_C1"[(next() % 8) as usize] as char).collect()
+                })
+                .collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut imports = names.clone();
+            imports.sort_unstable();
+            imports.dedup();
+            let mut lowered: Vec<(String, &str)> = imports.iter().map(|s| (s.to_ascii_lowercase(), *s)).collect();
+            lowered.sort_by(|a, b| a.0.cmp(&b.0));
+            lowered.dedup_by(|later, first| later.0 == first.0);
+            let (haystack, original) = import_haystack(&names);
+            assert_eq!(original, lowered.iter().map(|l| l.1.to_string()).collect::<Vec<_>>(), "{n}");
+            assert_eq!(haystack.starts.len(), lowered.len());
+            for (i, (lower, _)) in lowered.iter().enumerate() {
+                assert_eq!(haystack.get(i), lower.as_bytes());
+            }
         }
     }
 
