@@ -263,10 +263,13 @@ fn seeding_summaries(sites: &[&CallSite]) -> ParamSummaries {
 fn keep_closed_callers(program: &Program, sites: &[&CallSite], summaries: &mut ParamSummaries) {
     // (only the callers of the functions summarised, and the arguments
     // that are one of their entries, matter)
-    // (the sites read in parallel, in parts)
-    let (calls, escaped): (Vec<(u64, u64)>, Vec<u64>) = {
+    // (the sites read in parallel, in parts: the calls of the functions
+    // summarised, `(callee, call site)`, and the arguments that are one of
+    // their entries)
+    type Read = (Vec<(u64, u64)>, Vec<u64>);
+    let (calls, escaped): Read = {
         let summaries = &*summaries;
-        let parts: Vec<(Vec<(u64, u64)>, Vec<u64>)> = sites
+        let parts: Vec<Read> = sites
             .par_chunks(1 << 13)
             .map(|sites| {
                 let mut calls = Vec::new();
@@ -1229,7 +1232,7 @@ mod tests {
                 .collect();
             let got: FxHashMap<u64, Vec<Option<u64>>> = seeding_summaries(&refs)
                 .into_iter()
-                .map(|(t, params)| (t, params.iter().map(|p| pinned(p)).collect()))
+                .map(|(t, params)| (t, params.iter().map(pinned).collect()))
                 .collect();
             assert_eq!(got, expected, "{n} {targets} {values}");
             let kept = dedup_site_refs(std::iter::once(&sites[..]));
