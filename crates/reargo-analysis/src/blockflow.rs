@@ -16,7 +16,7 @@ use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use reargo_core::pcode::{OpCode, PcodeOp};
-use reargo_lift::{InsnShape, LiftedInstruction, RangeShapes};
+use reargo_lift::{AddrPositions, InsnShape, LiftedInstruction, RangeShapes};
 
 /// Per-block visit cap, so an irreducible / cycle-heavy CFG cannot
 /// loop forever; reducible CFGs converge in a few visits. A block
@@ -58,6 +58,9 @@ pub struct LiftShape<'a> {
     /// return), ascending: the passes that look only at those step
     /// through them instead of every instruction.
     pub special: Vec<u32>,
+    /// The position of each address, looked up in the lift cache's index
+    /// (for shapes borrowed from a cache: [`RangeShapes::positions`]).
+    positions: Option<AddrPositions<'a>>,
 }
 
 impl<'a> LiftShape<'a> {
@@ -95,7 +98,7 @@ impl<'a> LiftShape<'a> {
             addrs.push(s.address);
             flags.push(s.flags);
         }
-        LiftShape { increasing: increasing(&addrs), addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special }
+        LiftShape { increasing: increasing(&addrs), addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, positions: None }
     }
 
     /// [`LiftShape::of`] from the [`RangeShapes`] of the instructions
@@ -115,6 +118,7 @@ impl<'a> LiftShape<'a> {
             flags: Cow::Borrowed(&shapes.flags),
             branches,
             special,
+            positions: shapes.positions(),
         }
     }
 
@@ -122,7 +126,7 @@ impl<'a> LiftShape<'a> {
     #[cfg(test)]
     pub fn from_parts(increasing: bool, addrs: Vec<u64>, flags: Vec<u8>, branches: Vec<(usize, u64)>) -> LiftShape<'static> {
         let special = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect();
-        LiftShape { increasing, addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special }
+        LiftShape { increasing, addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, positions: None }
     }
 }
 
@@ -184,17 +188,27 @@ impl LiftMarks {
         debug_assert!(shape.increasing);
         let addrs = &shape.addrs;
         let mut flags = vec![0u8; addrs.len()];
+        // (looked up in the lift cache's index of addresses when the shape is the cache's:
+        // what the searches find)
+        let finder = shape.positions.map(|p| p.finder());
         let target_idx: Vec<Option<usize>> = shape
             .branches
             .iter()
             .map(|&(from, t)| {
-                let i = find_near(addrs, from, t)?;
+                let i = match &finder {
+                    Some(f) => f.find(t),
+                    None => find_near(addrs, from, t),
+                }?;
                 flags[i] |= Self::TARGET;
                 Some(i)
             })
             .collect();
-        for a in external {
-            if let Ok(i) = addrs.binary_search(a) {
+        for &a in external {
+            let i = match &finder {
+                Some(f) => f.find(a),
+                None => addrs.binary_search(&a).ok(),
+            };
+            if let Some(i) = i {
                 flags[i] |= Self::EXTERNAL;
             }
         }

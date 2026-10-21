@@ -99,6 +99,9 @@ pub struct RangeShapes<'c> {
     base: u32,
     /// The addresses strictly increase.
     pub increasing: bool,
+    /// The cache's index of each address, when borrowed from a cache: the
+    /// instruction at an address is found there ([`Self::positions`]).
+    index: Option<&'c crate::x86::AddrIndex>,
 }
 
 impl<'c> RangeShapes<'c> {
@@ -108,10 +111,25 @@ impl<'c> RangeShapes<'c> {
     /// (a range's instructions follow each other: each address is the one before plus its
     /// length, so they strictly increase unless they wrap around, when the last is below the
     /// first)
-    pub(crate) fn borrowed(addrs: &'c [u64], flags: &'c [u8], targets: &'c [u64], special: &'c [u32], start: u32) -> Self {
+    pub(crate) fn borrowed(
+        addrs: &'c [u64],
+        flags: &'c [u8],
+        targets: &'c [u64],
+        special: &'c [u32],
+        start: u32,
+        index: &'c crate::x86::AddrIndex,
+    ) -> Self {
         use std::borrow::Cow::Borrowed;
         let increasing = chain_increasing(addrs);
-        RangeShapes { addrs: Borrowed(addrs), flags: Borrowed(flags), targets: Borrowed(targets), special: Borrowed(special), base: start, increasing }
+        RangeShapes {
+            addrs: Borrowed(addrs),
+            flags: Borrowed(flags),
+            targets: Borrowed(targets),
+            special: Borrowed(special),
+            base: start,
+            increasing,
+            index: Some(index),
+        }
     }
 
     /// Shapes copied out by instruction, of a range (`increasing` as
@@ -124,7 +142,7 @@ impl<'c> RangeShapes<'c> {
     fn owned_with(addrs: Vec<u64>, flags: Vec<u8>, targets: Vec<u64>, increasing: bool) -> RangeShapes<'static> {
         let special = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect::<Vec<_>>();
         use std::borrow::Cow::Owned;
-        RangeShapes { addrs: Owned(addrs), flags: Owned(flags), targets: Owned(targets), special: Owned(special), base: 0, increasing }
+        RangeShapes { addrs: Owned(addrs), flags: Owned(flags), targets: Owned(targets), special: Owned(special), base: 0, increasing, index: None }
     }
 
     /// The shapes of `insns`, read from their ops.
@@ -158,7 +176,17 @@ impl<'c> RangeShapes<'c> {
             base: self.base,
             // (a prefix of an increasing range increases; of one wrapping around, may)
             increasing: self.increasing || chain_increasing(&self.addrs[..n]),
+            index: self.index,
         }
+    }
+
+    /// The position of each address among the instructions, looked up in the cache's index
+    /// of addresses, when the shapes are borrowed from a cache and their addresses
+    /// strictly increase (`None` otherwise).
+    pub fn positions(&self) -> Option<AddrPositions<'c>> {
+        let index = self.index?;
+        let (&lo, &hi) = (self.addrs.first()?, self.addrs.last()?);
+        self.increasing.then(|| AddrPositions { index, base: self.base, len: self.addrs.len() as u32, lo, hi })
     }
 
     /// The positions of the instructions with flags (a call, a jump, a
@@ -171,6 +199,51 @@ impl<'c> RangeShapes<'c> {
     /// The [`InsnShape`] of instruction `i`.
     pub fn shape(&self, i: usize) -> InsnShape {
         InsnShape { address: self.addrs[i], target: self.targets[i], flags: self.flags[i] }
+    }
+}
+
+/// The position of each address among the instructions of a [`RangeShapes`] borrowed from a
+/// cache ([`RangeShapes::positions`]): the cache's index gives each address held its entry,
+/// and the range's instructions are the entries `base..base + len`, so the position of an
+/// address is its entry less `base` when that is below `len` (what a binary search of the
+/// increasing addresses finds), without searching.
+#[derive(Clone, Copy)]
+pub struct AddrPositions<'c> {
+    index: &'c crate::x86::AddrIndex,
+    base: u32,
+    len: u32,
+    /// The first and last addresses.
+    lo: u64,
+    hi: u64,
+}
+
+impl<'c> AddrPositions<'c> {
+    /// A finder of the positions (the index's pages over the range's addresses looked up once).
+    pub fn finder(&self) -> PositionFinder<'c> {
+        let (first_page, pages) = self.index.pages_over(self.lo, self.hi);
+        PositionFinder { at: *self, first_page, pages }
+    }
+}
+
+/// Looks up positions for [`AddrPositions`]: what `addrs.binary_search(&t).ok()` gives.
+pub struct PositionFinder<'c> {
+    at: AddrPositions<'c>,
+    first_page: u64,
+    /// The index's page of each page of addresses from `first_page` (none where it has none).
+    pages: Vec<Option<&'c [u32; crate::x86::INDEX_PAGE as usize]>>,
+}
+
+impl PositionFinder<'_> {
+    /// The position of the instruction at `t`, when one is.
+    #[inline]
+    pub fn find(&self, t: u64) -> Option<usize> {
+        if t < self.at.lo || t > self.at.hi {
+            return None;
+        }
+        let page = self.pages[((t / crate::x86::INDEX_PAGE) - self.first_page) as usize]?;
+        // (an entry outside the range, none ([`u32::MAX`]) or an older one wraps past `len`)
+        let k = page[(t % crate::x86::INDEX_PAGE) as usize].wrapping_sub(self.at.base);
+        (k < self.at.len).then_some(k as usize)
     }
 }
 

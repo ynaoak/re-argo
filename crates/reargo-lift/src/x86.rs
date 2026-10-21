@@ -470,6 +470,7 @@ impl LiftCache {
                 &self.target[lo..hi],
                 &self.special[a..b],
                 first,
+                &self.map,
             );
         }
         crate::lift::RangeShapes::owned(
@@ -546,7 +547,7 @@ impl LiftCache {
 }
 
 /// Addresses per page of an [`AddrIndex`].
-const INDEX_PAGE: u64 = 1024;
+pub(crate) const INDEX_PAGE: u64 = 1024;
 
 /// The emptied pages an [`AddrIndex`] keeps for reuse, at most.
 const MAX_SPARE_PAGES: usize = 128;
@@ -559,7 +560,7 @@ const NO_INDEX: u32 = u32::MAX;
 /// lookups are of an address near the one before (a range walk steps
 /// through its instructions), in the page looked up last: no hashing then.
 #[derive(Default)]
-struct AddrIndex {
+pub(crate) struct AddrIndex {
     pages: Vec<Box<[u32; INDEX_PAGE as usize]>>,
     /// The position in `pages` of each page (by address / [`INDEX_PAGE`]).
     by_page: rustc_hash::FxHashMap<u64, u32>,
@@ -570,7 +571,21 @@ struct AddrIndex {
     spare: Vec<Box<[u32; INDEX_PAGE as usize]>>,
 }
 
+impl std::fmt::Debug for AddrIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddrIndex").field("pages", &self.pages.len()).finish_non_exhaustive()
+    }
+}
+
 impl AddrIndex {
+    /// The page of addresses holding `lo` and the index's page of each page of addresses from
+    /// it up to the one holding `hi` (none where it has none).
+    pub(crate) fn pages_over(&self, lo: u64, hi: u64) -> (u64, Vec<Option<&[u32; INDEX_PAGE as usize]>>) {
+        let (first, last) = (lo / INDEX_PAGE, hi / INDEX_PAGE);
+        let pages = (first..=last).map(|p| self.by_page.get(&p).map(|&at| &*self.pages[at as usize])).collect();
+        (first, pages)
+    }
+
     /// The slot of `addr` ([`NO_INDEX`] when it has none), its page made
     /// when it has none.
     #[inline]
@@ -5554,6 +5569,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The positions a cache's shapes find through its index of addresses
+    /// ([`crate::lift::RangeShapes::positions`]) are what a binary search of the range's
+    /// addresses finds, for every address around the range: random code (biased to jumps,
+    /// failing instructions and long instructions) over several index pages, ranges walked
+    /// in a random order of starts mostly ascending, the cache trimmed and dropping entries
+    /// (and moving them) as it goes, lazy caches and eager ones.
+    #[test]
+    fn cache_positions_match_binary_search() {
+        let mut seed = 0x0dd5_eed5_1234_8765_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pieces: &[&[u8]] = &[
+            &[0x48, 0x89, 0xc3],                               // mov rbx, rax
+            &[0x75, 0x04],                                     // jne
+            &[0xeb, 0xf0],                                     // jmp back
+            &[0xe8, 0x10, 0, 0, 0],                            // call
+            &[0xc3],                                           // ret
+            &[0x8e, 0xd8],                                     // mov ds, ax (fails to lift)
+            &[0x48, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8],             // mov rax, imm64
+            &[0x0f, 0x84, 0x00, 0x01, 0, 0],                   // je far ahead
+            &[0x48, 0x8d, 0x05, 0x10, 0, 0, 0],                // lea rax, [rip+0x10]
+        ];
+        let lifter = X86Lifter::new_64();
+        let mut checked = 0usize;
+        for round in 0..60 {
+            let size = 64 + (next() % 3000) as usize;
+            let mut code = Vec::new();
+            while code.len() < size {
+                if next() % 5 == 0 {
+                    code.extend((0..1 + next() % 6).map(|_| next() as u8));
+                } else {
+                    code.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+                }
+            }
+            let base = 0x1000 + (next() % 2048);
+            let mem = make_memory(&code, base);
+            let mut cache = if round % 2 == 0 { LiftCache::lazy() } else { LiftCache::new() };
+            let mut start = 0u64;
+            while start < code.len() as u64 {
+                let at = base + start;
+                cache.trim(at, 16 + (next() % 200) as usize);
+                if next() % 7 == 0 {
+                    cache.retain_from(at);
+                }
+                let budgets = [1 + (next() % 400) as usize, 1 + (next() % 50) as usize];
+                let mut check = |v: usize, shapes: Option<&crate::lift::RangeShapes>| {
+                    let Some(shapes) = shapes else { return };
+                    assert_eq!(shapes.len(), v);
+                    let Some(pos) = shapes.positions() else { return };
+                    let finder = pos.finder();
+                    let addrs = &shapes.addrs;
+                    let (lo, hi) = (addrs[0].saturating_sub(40), addrs[addrs.len() - 1] + 40);
+                    for t in lo..=hi {
+                        assert_eq!(finder.find(t), addrs.binary_search(&t).ok(), "round {round} at {at:#x} t {t:#x}");
+                        checked += 1;
+                    }
+                };
+                if round % 2 == 0 {
+                    lifter.lift_prefixes_lazy(&mem, at, &budgets, &mut cache, |_, v, shapes| check(v.len(), shapes));
+                } else {
+                    lifter.lift_prefixes_cached(&mem, at, &budgets, true, &mut cache, |_, v, shapes| check(v.len(), shapes));
+                }
+                // mostly ascending, sometimes back a little
+                start = if next() % 9 == 0 { start.saturating_sub(next() % 64) } else { start + 1 + next() % 24 };
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
     }
 
     /// `lift_range_lazy` read in random orders equals `lift_range` (x87, PF readers and
