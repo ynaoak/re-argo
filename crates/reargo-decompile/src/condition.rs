@@ -205,15 +205,7 @@ pub fn value_key(func: &SsaFunction, v: VarId) -> ValueKey {
 
 /// The live ops reading each value (by [`ValueKey`], so every name of a value counts).
 #[derive(Clone)]
-pub struct Readers(std::sync::Arc<ReaderLists>);
-
-/// [`Readers`]' lists: the value keys read, each with the readers at `ops[starts[g]..starts[g + 1]]`
-/// for its group `g` (in op order, each op once).
-struct ReaderLists {
-    groups: FxHashMap<ValueKey, u32>,
-    starts: Vec<u32>,
-    ops: Vec<OpIdx>,
-}
+pub struct Readers(std::sync::Arc<FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>>>);
 
 thread_local! {
     /// The readers of the functions a [`FrozenReaders`] holds on this thread (by address).
@@ -248,82 +240,32 @@ impl Readers {
         Self::build(func)
     }
 
-    /// The readers of every value the live ops read: a key looked up once per varnode read (the
-    /// group of a varnode kept by its id), not once per read, and the lists laid out in one
-    /// array (counted, then filled in op order) instead of a vector per value.
-    pub(crate) fn build(func: &SsaFunction) -> Self {
-        const NONE: u32 = u32::MAX;
-        // (the group of each varnode read, `NONE` until read)
-        let mut group = vec![NONE; func.varnodes.len()];
-        let mut groups: FxHashMap<ValueKey, u32> = FxHashMap::default();
-        // (per group: how many readers, then where the next goes; and the op it last counted)
-        let mut count: Vec<u32> = Vec::new();
-        let mut last: Vec<u32> = Vec::new();
-        let mut reads = 0usize;
-        for op in &func.ops {
-            if op.dead {
-                continue;
-            }
+    fn build(func: &SsaFunction) -> Self {
+        // (about a value read per live op: sized once, not grown op by op)
+        let live = func.ops.iter().filter(|o| !o.dead).count();
+        let mut m: FxHashMap<ValueKey, smallvec::SmallVec<[OpIdx; 2]>> = FxHashMap::with_capacity_and_hasher(live + 16, Default::default());
+        for op in func.ops.iter().filter(|o| !o.dead) {
             for &i in &op.inputs {
-                let g = match group[i as usize] {
-                    NONE => {
-                        if func.varnodes[i as usize].data.space == reargo_core::address::SpaceId::CONST {
-                            continue;
-                        }
-                        let n = groups.len() as u32;
-                        let g = *groups.entry(value_key(func, i)).or_insert(n);
-                        if g == n {
-                            count.push(0);
-                            last.push(NONE);
-                        }
-                        group[i as usize] = g;
-                        g
-                    }
-                    g => g,
-                };
-                if last[g as usize] != op.index as u32 {
-                    last[g as usize] = op.index as u32;
-                    count[g as usize] += 1;
-                    reads += 1;
+                if func.varnodes[i as usize].data.space == reargo_core::address::SpaceId::CONST {
+                    continue;
+                }
+                let r = m.entry(value_key(func, i)).or_default();
+                if r.last() != Some(&op.index) {
+                    r.push(op.index);
                 }
             }
         }
-        let mut starts = Vec::with_capacity(count.len() + 1);
-        let mut at = 0u32;
-        starts.push(0);
-        for c in &mut count {
-            at += *c;
-            starts.push(at);
-            // (now where the group's next reader goes)
-            *c = at - *c;
-        }
-        let mut ops = vec![0; reads];
-        last.fill(NONE);
-        for op in &func.ops {
-            if op.dead {
-                continue;
-            }
-            for &i in &op.inputs {
-                let g = group[i as usize];
-                if g != NONE && last[g as usize] != op.index as u32 {
-                    last[g as usize] = op.index as u32;
-                    ops[count[g as usize] as usize] = op.index;
-                    count[g as usize] += 1;
-                }
-            }
-        }
-        Readers(std::sync::Arc::new(ReaderLists { groups, starts, ops }))
+        Readers(std::sync::Arc::new(m))
     }
 
     /// The live ops reading `v`.
     pub fn of(&self, func: &SsaFunction, v: VarId) -> &[OpIdx] {
-        self.of_key(&value_key(func, v))
+        self.0.get(&value_key(func, v)).map_or(&[], |r| r.as_slice())
     }
 
     /// The live ops reading the value `k`.
     pub fn of_key(&self, k: &ValueKey) -> &[OpIdx] {
-        let r = &self.0;
-        r.groups.get(k).map_or(&[], |&g| &r.ops[r.starts[g as usize] as usize..r.starts[g as usize + 1] as usize])
+        self.0.get(k).map_or(&[], |r| r.as_slice())
     }
 }
 
@@ -1051,49 +993,6 @@ pub(crate) fn assignment_rhs(mut line: String, dst: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// [`Readers::build`] as a map from each value's key to a vector of its readers (before the
-    /// lists by group).
-    fn readers_by_map(func: &SsaFunction) -> FxHashMap<ValueKey, Vec<OpIdx>> {
-        let mut m: FxHashMap<ValueKey, Vec<OpIdx>> = FxHashMap::default();
-        for op in func.ops.iter().filter(|o| !o.dead) {
-            for &i in &op.inputs {
-                if func.varnodes[i as usize].data.space == reargo_core::address::SpaceId::CONST {
-                    continue;
-                }
-                let r = m.entry(value_key(func, i)).or_default();
-                if r.last() != Some(&op.index) {
-                    r.push(op.index);
-                }
-            }
-        }
-        m
-    }
-
-    /// The readers by group are those of the map, before the passes and after them (when CSE
-    /// has given several varnodes one key), for every key read and for the keys of the values
-    /// nothing reads.
-    #[test]
-    fn grouped_readers_match_the_map() {
-        let mut checked = 0;
-        for (start, body) in crate::ssa::test_executable_bodies(1500) {
-            let mut func = SsaFunction::from_cfg(String::new(), start, crate::cfg::ControlFlowGraph::build_owned(body));
-            for pass in 0..2 {
-                if pass == 1 {
-                    crate::optimize::run_optimization_passes(&mut func);
-                }
-                let (map, readers) = (readers_by_map(&func), Readers::build(&func));
-                for (k, want) in &map {
-                    assert_eq!(readers.of_key(k), want.as_slice(), "readers of {k:x?} in {start:#x}");
-                }
-                for v in 0..func.varnodes.len() as VarId {
-                    assert_eq!(readers.of(&func, v), map.get(&value_key(&func, v)).map_or(&[][..], |r| r.as_slice()));
-                }
-                checked += 1;
-            }
-        }
-        assert!(checked > 1000, "{checked}");
-    }
 
     #[test]
     fn negate_pushes_down() {

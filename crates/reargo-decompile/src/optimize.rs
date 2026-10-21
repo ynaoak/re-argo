@@ -714,17 +714,22 @@ fn cse_in_blocks(func: &mut SsaFunction, scan: Option<&[bool]>, mut rescan: Opti
     // `rbx`). The readers of each value, and how many live ops write each slot.
     // (built when a duplicate is first found: no op has died in this pass yet then, and most
     // passes find none)
-    type Readers = crate::condition::Readers;
+    type Readers = rustc_hash::FxHashMap<ValueKey, SmallVec<[usize; 4]>>;
     type Writers = rustc_hash::FxHashMap<(u32, u64, u32), u32>;
     let build = |func: &SsaFunction| -> (Readers, Writers) {
-        // (a constant is never a duplicate's value: not listed)
-        let readers = crate::condition::Readers::build(func);
-        // (sized once from the live ops)
+        // (sized once from the live ops; a constant is never a duplicate's value: not listed)
         let live = func.ops.iter().filter(|o| !o.dead).count();
+        let mut readers: Readers = rustc_hash::FxHashMap::with_capacity_and_hasher(live, Default::default());
         let mut writers: Writers = rustc_hash::FxHashMap::with_capacity_and_hasher(live / 2, Default::default());
-        for op in &func.ops {
+        for (k, op) in func.ops.iter().enumerate() {
             if op.dead {
                 continue;
+            }
+            for &v in &op.inputs {
+                if func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST {
+                    continue;
+                }
+                readers.entry(value_key(func, v)).or_default().push(k);
             }
             if let Some(o) = op.output {
                 let d = &func.varnodes[o as usize].data;
@@ -755,16 +760,18 @@ fn cse_in_blocks(func: &mut SsaFunction, scan: Option<&[bool]>, mut rescan: Opti
                     (d.space.0, d.offset, d.size) == slot
                 })
         };
-        readers.of_key(&dup).iter().all(|&r| {
-            let ro = &func.ops[r];
-            if ro.dead {
-                return true;
-            }
-            if ro.block == func.ops[i].block && r > i {
-                !func.ops[i + 1..r].iter().any(writes_slot) && !phantom_between(&slot, 4 * i + 2, 4 * r + 2)
-            } else {
-                writers.get(&slot).copied().unwrap_or(0) <= 1
-            }
+        readers.get(&dup).is_none_or(|rs| {
+            rs.iter().all(|&r| {
+                let ro = &func.ops[r];
+                if ro.dead {
+                    return true;
+                }
+                if ro.block == func.ops[i].block && r > i {
+                    !func.ops[i + 1..r].iter().any(writes_slot) && !phantom_between(&slot, 4 * i + 2, 4 * r + 2)
+                } else {
+                    writers.get(&slot).copied().unwrap_or(0) <= 1
+                }
+            })
         })
     };
     for i in 0..func.ops.len() {
@@ -832,7 +839,7 @@ fn cse_in_blocks(func: &mut SsaFunction, scan: Option<&[bool]>, mut rescan: Opti
                 // blocks are looked at, in this pass from here on and in the next)
                 if let Some((readers, _)) = &maps {
                     for k in [value_key(func, out_id), out_key] {
-                        for &r in readers.of_key(&k) {
+                        for &r in readers.get(&k).into_iter().flatten() {
                             let b = func.ops[r].block;
                             if let Some(s) = scan.as_mut() {
                                 s[b] = true;
