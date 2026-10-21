@@ -9,6 +9,8 @@ use crate::lift::{LiftError, LiftedInstruction, PcodeLift};
 mod bits;
 #[cfg(test)]
 mod old_cache;
+#[cfg(test)]
+mod old_finish;
 mod x87;
 
 pub use x87::X87Ctx;
@@ -43,88 +45,82 @@ fn unique(offset: u64, size: u32) -> VarnodeData {
 fn rax(sz: u32) -> VarnodeData { reg(0x00, sz) }
 fn rcx(sz: u32) -> VarnodeData { reg(0x08, sz) }
 fn rdx(sz: u32) -> VarnodeData { reg(0x10, sz) }
-fn rbx(sz: u32) -> VarnodeData { reg(0x18, sz) }
 fn rsp(sz: u32) -> VarnodeData { reg(0x20, sz) }
-fn rbp(sz: u32) -> VarnodeData { reg(0x28, sz) }
 fn rsi(sz: u32) -> VarnodeData { reg(0x30, sz) }
 fn rdi(sz: u32) -> VarnodeData { reg(0x38, sz) }
 
 fn iced_reg_to_varnode(r: iced_x86::Register) -> Option<VarnodeData> {
-    use std::sync::OnceLock;
-    use iced_x86::Register;
-
-    /// Indexed by the register's number: a table lookup instead of a
-    /// SipHash map (the lifter maps every register operand).
-    struct RegTable(Vec<Option<VarnodeData>>);
-    impl RegTable {
-        fn insert(&mut self, r: Register, v: VarnodeData) {
-            let i = r as usize;
-            if self.0.len() <= i {
-                self.0.resize(i + 1, None);
-            }
-            self.0[i] = Some(v);
-        }
-    }
-    static REG_MAP: OnceLock<RegTable> = OnceLock::new();
-    let map = REG_MAP.get_or_init(|| {
-        let mut m = RegTable(Vec::new());
-        // AH/CH/DH/BH = byte 1 of rax/rcx/rdx/rbx (Ghidra's offsets). They were missing, so
-        // `movzx eax, ah` failed to lift and the function stopped there (WS84). Reads and
-        // writes are tied to the full register by `zero_extend_gpr32_writes`.
-        m.insert(Register::AH, reg(0x01, 1)); m.insert(Register::CH, reg(0x09, 1));
-        m.insert(Register::DH, reg(0x11, 1)); m.insert(Register::BH, reg(0x19, 1));
-        m.insert(Register::RAX, rax(8)); m.insert(Register::EAX, rax(4));
-        m.insert(Register::AX, rax(2)); m.insert(Register::AL, rax(1));
-        m.insert(Register::RCX, rcx(8)); m.insert(Register::ECX, rcx(4));
-        m.insert(Register::CX, rcx(2)); m.insert(Register::CL, rcx(1));
-        m.insert(Register::RDX, rdx(8)); m.insert(Register::EDX, rdx(4));
-        m.insert(Register::DX, rdx(2)); m.insert(Register::DL, rdx(1));
-        m.insert(Register::RBX, rbx(8)); m.insert(Register::EBX, rbx(4));
-        m.insert(Register::BX, rbx(2)); m.insert(Register::BL, rbx(1));
-        m.insert(Register::RSP, rsp(8)); m.insert(Register::ESP, rsp(4));
-        m.insert(Register::SP, rsp(2));
-        m.insert(Register::RBP, rbp(8)); m.insert(Register::EBP, rbp(4));
-        m.insert(Register::BP, rbp(2));
-        m.insert(Register::RSI, rsi(8)); m.insert(Register::ESI, rsi(4));
-        m.insert(Register::SI, rsi(2));
-        m.insert(Register::RDI, rdi(8)); m.insert(Register::EDI, rdi(4));
-        m.insert(Register::DI, rdi(2));
-        m.insert(Register::R8, reg(0x80, 8)); m.insert(Register::R8D, reg(0x80, 4));
-        m.insert(Register::R9, reg(0x88, 8)); m.insert(Register::R9D, reg(0x88, 4));
-        m.insert(Register::R10, reg(0x90, 8)); m.insert(Register::R10D, reg(0x90, 4));
-        m.insert(Register::R11, reg(0x98, 8)); m.insert(Register::R11D, reg(0x98, 4));
-        m.insert(Register::R12, reg(0xA0, 8)); m.insert(Register::R12D, reg(0xA0, 4));
-        m.insert(Register::R13, reg(0xA8, 8)); m.insert(Register::R13D, reg(0xA8, 4));
-        m.insert(Register::R14, reg(0xB0, 8)); m.insert(Register::R14D, reg(0xB0, 4));
-        m.insert(Register::R15, reg(0xB8, 8)); m.insert(Register::R15D, reg(0xB8, 4));
-        // Byte views of rsp/rbp/rsi/rdi (REX) and the 16/8-bit views of r8..r15.
-        // Without them `mov r13w, 7FFFh`, `movzx esi, bpl`, `test r8b, dil`
-        // failed to lift and `lift_range` stopped there, so the decompiler saw
-        // the function only up to that instruction (BDS aquifer `computeFluid`
-        // 0x4bd0820: 20 of ~350 instructions).
-        m.insert(Register::SPL, rsp(1)); m.insert(Register::BPL, rbp(1));
-        m.insert(Register::SIL, rsi(1)); m.insert(Register::DIL, rdi(1));
-        for (i, (w, b)) in [
-            (Register::R8W, Register::R8L),
-            (Register::R9W, Register::R9L),
-            (Register::R10W, Register::R10L),
-            (Register::R11W, Register::R11L),
-            (Register::R12W, Register::R12L),
-            (Register::R13W, Register::R13L),
-            (Register::R14W, Register::R14L),
-            (Register::R15W, Register::R15L),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let off = 0x80 + 8 * i as u64;
-            m.insert(w, reg(off, 2));
-            m.insert(b, reg(off, 1));
-        }
-        m
-    });
-    map.0.get(r as usize).copied().flatten()
+    REG_TABLE[r as usize]
 }
+
+/// The varnode of each iced register the lifter maps, indexed by the register's number (a
+/// table built at compile time: the lifter maps every register operand).
+static REG_TABLE: [Option<VarnodeData>; 256] = {
+    use iced_x86::Register;
+    const fn r(offset: u64, size: u32) -> Option<VarnodeData> {
+        Some(VarnodeData { space: REG_SPACE, offset, size })
+    }
+    let mut m: [Option<VarnodeData>; 256] = [None; 256];
+    // AH/CH/DH/BH = byte 1 of rax/rcx/rdx/rbx (Ghidra's offsets). They were missing, so
+    // `movzx eax, ah` failed to lift and the function stopped there (WS84). Reads and
+    // writes are tied to the full register by `zero_extend_gpr32_writes`.
+    m[Register::AH as usize] = r(0x01, 1);
+    m[Register::CH as usize] = r(0x09, 1);
+    m[Register::DH as usize] = r(0x11, 1);
+    m[Register::BH as usize] = r(0x19, 1);
+    // rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi and their 32 / 16-bit views; the low bytes of
+    // the first four
+    let wide = [
+        [Register::RAX, Register::EAX, Register::AX, Register::AL],
+        [Register::RCX, Register::ECX, Register::CX, Register::CL],
+        [Register::RDX, Register::EDX, Register::DX, Register::DL],
+        [Register::RBX, Register::EBX, Register::BX, Register::BL],
+        [Register::RSP, Register::ESP, Register::SP, Register::None],
+        [Register::RBP, Register::EBP, Register::BP, Register::None],
+        [Register::RSI, Register::ESI, Register::SI, Register::None],
+        [Register::RDI, Register::EDI, Register::DI, Register::None],
+    ];
+    let mut i = 0;
+    while i < 8 {
+        let off = 8 * i as u64;
+        m[wide[i][0] as usize] = r(off, 8);
+        m[wide[i][1] as usize] = r(off, 4);
+        m[wide[i][2] as usize] = r(off, 2);
+        if i < 4 {
+            m[wide[i][3] as usize] = r(off, 1);
+        }
+        i += 1;
+    }
+    // Byte views of rsp/rbp/rsi/rdi (REX) and the 16/8-bit views of r8..r15.
+    // Without them `mov r13w, 7FFFh`, `movzx esi, bpl`, `test r8b, dil`
+    // failed to lift and `lift_range` stopped there, so the decompiler saw
+    // the function only up to that instruction (BDS aquifer `computeFluid`
+    // 0x4bd0820: 20 of ~350 instructions).
+    m[Register::SPL as usize] = r(0x20, 1);
+    m[Register::BPL as usize] = r(0x28, 1);
+    m[Register::SIL as usize] = r(0x30, 1);
+    m[Register::DIL as usize] = r(0x38, 1);
+    let high = [
+        [Register::R8, Register::R8D, Register::R8W, Register::R8L],
+        [Register::R9, Register::R9D, Register::R9W, Register::R9L],
+        [Register::R10, Register::R10D, Register::R10W, Register::R10L],
+        [Register::R11, Register::R11D, Register::R11W, Register::R11L],
+        [Register::R12, Register::R12D, Register::R12W, Register::R12L],
+        [Register::R13, Register::R13D, Register::R13W, Register::R13L],
+        [Register::R14, Register::R14D, Register::R14W, Register::R14L],
+        [Register::R15, Register::R15D, Register::R15W, Register::R15L],
+    ];
+    let mut i = 0;
+    while i < 8 {
+        let off = 0x80 + 8 * i as u64;
+        m[high[i][0] as usize] = r(off, 8);
+        m[high[i][1] as usize] = r(off, 4);
+        m[high[i][2] as usize] = r(off, 2);
+        m[high[i][3] as usize] = r(off, 1);
+        i += 1;
+    }
+    m
+};
 
 /// XMM register file base in REGISTER space. Mirrors Ghidra's x86-64 SLEIGH
 /// layout (xmm registers begin at 0x1200, stride 0x10). Scalar SSE ops view
@@ -191,7 +187,7 @@ mod fact_class {
 }
 
 /// The [`fact_class`] of each code (by its mnemonic) and of each register.
-type FactTables = (Box<[u8]>, Box<[u8]>);
+type FactTables = (Box<[u8]>, Box<[u8]>, Box<[u8]>);
 
 /// The [`FactTables`], made once.
 #[inline]
@@ -230,8 +226,63 @@ fn fact_tables() -> &'static FactTables {
                 }
             })
             .collect();
-        (codes, regs)
+        // the lift `lift_iced` routes each code to ([`route`])
+        let routes = iced_x86::Code::values()
+            .map(|code| {
+                let mut insn = iced_x86::Instruction::default();
+                insn.set_code(code);
+                let mut r = 0;
+                if x87::is_x87(&insn) {
+                    r |= route::X87;
+                }
+                if matches!(insn.mnemonic(), Cvttss2si | Cvttsd2si | Cvtss2si | Cvtsd2si) {
+                    r |= route::CVT_TO_INT;
+                }
+                if bits::is_bits(insn.mnemonic()) {
+                    r |= route::BITS;
+                }
+                r
+            })
+            .collect();
+        (codes, regs, routes)
     })
+}
+
+/// [`Vec::push`] of an op, inlined at each place (the lifts build their ops at well over a
+/// hundred places, where the standard one was left out of line: a call and a copy per op).
+trait PushOp {
+    fn push_op(&mut self, op: PcodeOp);
+}
+
+impl PushOp for Vec<PcodeOp> {
+    #[inline(always)]
+    fn push_op(&mut self, op: PcodeOp) {
+        if self.len() == self.capacity() {
+            grow_ops(self);
+        }
+        // SAFETY: there is room for one more op.
+        unsafe {
+            self.as_mut_ptr().add(self.len()).write(op);
+            self.set_len(self.len() + 1);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn grow_ops(ops: &mut Vec<PcodeOp>) {
+    ops.reserve(1);
+}
+
+/// Which lifts [`X86Lifter::lift_iced`] may route a code to (bits of the third table of
+/// [`fact_tables`]).
+mod route {
+    /// [`super::x87::is_x87`]: the x87 lift.
+    pub(super) const X87: u8 = 1;
+    /// A float → integer conversion (the SSE lift without an XMM operand: [`super::insn_touches_xmm`]).
+    pub(super) const CVT_TO_INT: u8 = 2;
+    /// [`super::bits::is_bits`]: [`super::X86Lifter::lift_bits`].
+    pub(super) const BITS: u8 = 4;
 }
 
 /// Memo for [`X86Lifter::lift_range_cached`]: the lift of each address alone,
@@ -1455,7 +1506,7 @@ impl X86Lifter {
     fn decoded_facts(insn: &iced_x86::Instruction) -> Option<(u8, u64, bool)> {
         use crate::lift::InsnShape as S;
         use iced_x86::OpKind;
-        let (codes, regs) = fact_tables();
+        let (codes, regs, _) = fact_tables();
         let class = codes[insn.code() as usize];
         if class == fact_class::X87 {
             return None;
@@ -2074,8 +2125,13 @@ impl X86Lifter {
         x87: Option<X87Ctx>,
     ) -> Result<Vec<PcodeOp>, LiftError> {
         use iced_x86::Mnemonic::*;
+        // (the lifts an instruction may go to, read from a table by its code)
+        let (_, regs, routes) = fact_tables();
+        let routed = routes[insn.code() as usize];
         // WS89: x87, with the stack depth `lift_range` found
-        if let Some(lifted) = self.lift_x87(insn, address, x87) {
+        if routed & route::X87 != 0
+            && let Some(lifted) = self.lift_x87(insn, address, x87)
+        {
             return lifted;
         }
         let seq = |order: u32| SeqNum::new(Address::new(RAM_SPACE, address), order);
@@ -2083,11 +2139,17 @@ impl X86Lifter {
         // SSE / scalar-float instructions are lifted to FLOAT_* p-code so the
         // SSA/dataflow passes can track noise/biome math (the BDS world-gen is
         // almost entirely scalar SSE). Routed by XMM-operand presence, which
-        // also disambiguates `movsd`/`movss` from the string instruction.
-        if insn_touches_xmm(insn) {
+        // also disambiguates `movsd`/`movss` from the string instruction
+        // ([`insn_touches_xmm`], with the register table).
+        let xmm = |i: u32| regs[insn.op_register(i) as usize] == fact_class::REG_XMM && insn.op_kind(i) == iced_x86::OpKind::Register;
+        if routed & route::CVT_TO_INT != 0 || (0..insn.op_count()).any(xmm) {
+            debug_assert!(insn_touches_xmm(insn));
             return self.lift_sse(insn, address);
         }
-        if let Some(lifted) = self.lift_bits(insn, address) {
+        debug_assert!(!insn_touches_xmm(insn));
+        if routed & route::BITS != 0
+            && let Some(lifted) = self.lift_bits(insn, address)
+        {
             return lifted;
         }
         // The ops are built in a reused buffer ([`scratch::take`]); the
@@ -2110,7 +2172,7 @@ impl X86Lifter {
                 let acc = VarnodeData::new(full.space, full.offset, 4);
                 let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
                 let tag = reargo_core::pcode::intrinsic::packed_tag("crc32").expect("named");
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CallOther,
                     seq: seq(seq_base),
                     output: Some(full),
@@ -2144,7 +2206,7 @@ impl X86Lifter {
                     };
                     let addr_vn =
                         self.compute_memory_address(insn, &mut ops, &mut seq_base, address)?;
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::Store,
                         seq: seq(seq_base),
                         output: None,
@@ -2158,7 +2220,7 @@ impl X86Lifter {
                 } else {
                     let (dst, src) =
                         self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::Copy,
                         seq: seq(seq_base),
                         output: Some(dst),
@@ -2174,19 +2236,19 @@ impl X86Lifter {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
                 let tmp = unique(0x560, dst.size);
-                ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(tmp),
+                ops.push_op(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(tmp),
                     inputs: SmallVec::from_slice(&[dst]) });
                 seq_base += 1;
                 // dst = src (Store back if dst is memory).
                 if insn.op_kind(0) == iced_x86::OpKind::Memory {
                     self.write_back_if_memory(insn, 0, src, &mut ops, &mut seq_base, address)?;
                 } else {
-                    ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(dst),
+                    ops.push_op(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(dst),
                         inputs: SmallVec::from_slice(&[src]) });
                     seq_base += 1;
                 }
                 // src = tmp (src is a register for the reg/mem forms).
-                ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(src),
+                ops.push_op(PcodeOp { opcode: OpCode::Copy, seq: seq(seq_base), output: Some(src),
                     inputs: SmallVec::from_slice(&[tmp]) });
                 seq_base += 1;
             }
@@ -2194,14 +2256,14 @@ impl X86Lifter {
             Push => {
                 let src = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let sp = self.sp();
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSub,
                     seq: seq(seq_base),
                     output: Some(sp),
                     inputs: SmallVec::from_slice(&[sp, constant(src.size as u64, ps)]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Store,
                     seq: seq(seq_base),
                     output: None,
@@ -2218,21 +2280,21 @@ impl X86Lifter {
                     ps
                 };
                 let loaded = unique(seq_base as u64 * 0x10 + 0x700, pop_size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Load,
                     seq: seq(seq_base),
                     output: Some(loaded),
                     inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), sp]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Copy,
                     seq: seq(seq_base),
                     output: Some(dst),
                     inputs: SmallVec::from_slice(&[loaded]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAdd,
                     seq: seq(seq_base),
                     output: Some(sp),
@@ -2259,7 +2321,7 @@ impl X86Lifter {
                     Sub => self.emit_sub_carry_flags(dst, src, &mut ops, &mut seq_base, address),
                     _ => {}
                 }
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2284,7 +2346,7 @@ impl X86Lifter {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
                 let old = unique(0x720, dst.size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Copy,
                     seq: seq(seq_base),
                     output: Some(old),
@@ -2294,7 +2356,7 @@ impl X86Lifter {
                 // Carry/overflow from the pre-op operands (like ADD).
                 self.emit_add_carry_flags(dst, src, &mut ops, &mut seq_base, address);
                 let sum = unique(0x730, dst.size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAdd,
                     seq: seq(seq_base),
                     output: Some(sum),
@@ -2306,7 +2368,7 @@ impl X86Lifter {
                 if insn.op_kind(0) == iced_x86::OpKind::Memory {
                     self.write_back_if_memory(insn, 0, sum, &mut ops, &mut seq_base, address)?;
                 } else {
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::Copy,
                         seq: seq(seq_base),
                         output: Some(dst),
@@ -2315,7 +2377,7 @@ impl X86Lifter {
                     seq_base += 1;
                 }
                 // src = old.
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Copy,
                     seq: seq(seq_base),
                     output: Some(src),
@@ -2344,7 +2406,7 @@ impl X86Lifter {
                     // byte form: AX / src, quotient -> AL, remainder -> AH (WS84: the
                     // dividend was AL and the remainder was written to a constant)
                     let mut push = |opcode: OpCode, out: VarnodeData, ins: &[VarnodeData]| {
-                        ops.push(PcodeOp { opcode, seq: seq(seq_base), output: Some(out), inputs: SmallVec::from_slice(ins) });
+                        ops.push_op(PcodeOp { opcode, seq: seq(seq_base), output: Some(out), inputs: SmallVec::from_slice(ins) });
                         seq_base += 1;
                     };
                     let wide = unique(0x740, 2);
@@ -2364,7 +2426,7 @@ impl X86Lifter {
                 let acc = iced_reg_to_varnode(acc_r).unwrap_or_else(|| constant(0, ps));
                 let hi = iced_reg_to_varnode(hi_r).unwrap_or_else(|| constant(0, ps));
                 let old = unique(0x740, acc.size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Copy,
                     seq: seq(seq_base),
                     output: Some(old),
@@ -2390,7 +2452,7 @@ impl X86Lifter {
 
             Not => {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntNegate,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2405,7 +2467,7 @@ impl X86Lifter {
             Neg => {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 self.emit_sub_carry_flags(constant(0, dst.size), dst, &mut ops, &mut seq_base, address);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Int2Comp,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2420,14 +2482,14 @@ impl X86Lifter {
                 // INC sets OF/SF/ZF (and PF/AF) but leaves CF unchanged.
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let one = constant(1, dst.size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSCarry,
                     seq: seq(seq_base),
                     output: Some(reg(OF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[dst, one]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAdd,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2442,14 +2504,14 @@ impl X86Lifter {
                 // DEC sets OF/SF/ZF (and PF/AF) but leaves CF unchanged.
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let one = constant(1, dst.size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSBorrow,
                     seq: seq(seq_base),
                     output: Some(reg(OF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[dst, one]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSub,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2463,7 +2525,7 @@ impl X86Lifter {
             Cmp => {
                 let (left, right) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                 let tmp = unique(0x100, left.size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSub,
                     seq: seq(seq_base),
                     output: Some(tmp),
@@ -2471,7 +2533,7 @@ impl X86Lifter {
                 });
                 seq_base += 1;
                 let zf = reg(ZF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntEqual,
                     seq: seq(seq_base),
                     output: Some(zf),
@@ -2479,7 +2541,7 @@ impl X86Lifter {
                 });
                 seq_base += 1;
                 let sf = reg(SF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSLess,
                     seq: seq(seq_base),
                     output: Some(sf),
@@ -2490,7 +2552,7 @@ impl X86Lifter {
                     emit_pf(tmp, &mut ops, &mut seq_base, address);
                 }
                 let cf = reg(CF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntLess,
                     seq: seq(seq_base),
                     output: Some(cf),
@@ -2500,7 +2562,7 @@ impl X86Lifter {
                 // OF for CMP: signed-borrow of (left - right). Without
                 // this, JL / JGE silently flipped on signed overflow (the
                 // canonical `cmp INT_MIN, 1; jl L` failure mode).
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSBorrow,
                     seq: seq(seq_base),
                     output: Some(reg(OF_OFFSET, 1)),
@@ -2511,7 +2573,7 @@ impl X86Lifter {
             Test => {
                 let (left, right) = self.lift_two_operands(insn, &mut ops, &mut seq_base, address)?;
                 let tmp = unique(0x100, left.size);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAnd,
                     seq: seq(seq_base),
                     output: Some(tmp),
@@ -2519,7 +2581,7 @@ impl X86Lifter {
                 });
                 seq_base += 1;
                 let zf = reg(ZF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntEqual,
                     seq: seq(seq_base),
                     output: Some(zf),
@@ -2527,7 +2589,7 @@ impl X86Lifter {
                 });
                 seq_base += 1;
                 let sf = reg(SF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSLess,
                     seq: seq(seq_base),
                     output: Some(sf),
@@ -2545,7 +2607,7 @@ impl X86Lifter {
             Lea => {
                 let dst = self.lift_operand_no_load(insn, 0, &mut ops, &mut seq_base, address)?;
                 let addr_vn = self.compute_memory_address(insn, &mut ops, &mut seq_base, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Copy,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2556,7 +2618,7 @@ impl X86Lifter {
             Movzx => {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntZExt,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2567,7 +2629,7 @@ impl X86Lifter {
             Movsx | Movsxd => {
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
                 let src = self.lift_operand(insn, 1, &mut ops, &mut seq_base, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSExt,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2588,7 +2650,7 @@ impl X86Lifter {
                 };
                 let dst = iced_reg_to_varnode(dst_r).unwrap_or_else(|| constant(0, ps));
                 let src = iced_reg_to_varnode(src_r).unwrap_or_else(|| constant(0, ps));
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSExt,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2609,7 +2671,7 @@ impl X86Lifter {
                 };
                 let acc = iced_reg_to_varnode(acc_r).unwrap_or_else(|| constant(0, ps));
                 let hi = iced_reg_to_varnode(hi_r).unwrap_or_else(|| constant(0, ps));
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntSRight,
                     seq: seq(seq_base),
                     output: Some(hi),
@@ -2641,7 +2703,7 @@ impl X86Lifter {
                 );
                 if is_direct {
                     let target = insn.near_branch_target();
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::Call,
                         seq: seq(seq_base),
                         output: None,
@@ -2650,7 +2712,7 @@ impl X86Lifter {
                 } else {
                     let target =
                         self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::CallInd,
                         seq: seq(seq_base),
                         output: None,
@@ -2662,21 +2724,21 @@ impl X86Lifter {
             Ret => {
                 let sp = self.sp();
                 let ret_tmp = unique(0x300, ps);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Load,
                     seq: seq(seq_base),
                     output: Some(ret_tmp),
                     inputs: SmallVec::from_slice(&[constant(RAM_SPACE.0 as u64, 4), sp]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAdd,
                     seq: seq(seq_base),
                     output: Some(sp),
                     inputs: SmallVec::from_slice(&[sp, constant(ps as u64, ps)]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Return,
                     seq: seq(seq_base),
                     output: None,
@@ -2696,7 +2758,7 @@ impl X86Lifter {
                     OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
                 ) {
                     let target = insn.near_branch_target();
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::Branch,
                         seq: seq(seq_base),
                         output: None,
@@ -2704,7 +2766,7 @@ impl X86Lifter {
                     });
                 } else {
                     let target = self.lift_operand(insn, 0, &mut ops, &mut seq_base, address)?;
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::BranchInd,
                         seq: seq(seq_base),
                         output: None,
@@ -2716,7 +2778,7 @@ impl X86Lifter {
             Je => {
                 let target = insn.near_branch_target();
                 let zf = reg(ZF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2728,14 +2790,14 @@ impl X86Lifter {
                 let target = insn.near_branch_target();
                 let zf = reg(ZF_OFFSET, 1);
                 let not_zf = unique(0x410, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::BoolNegate,
                     seq: seq(seq_base),
                     output: Some(not_zf),
                     inputs: SmallVec::from_slice(&[zf]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2749,7 +2811,7 @@ impl X86Lifter {
                 // subtraction signed-overflowed.
                 let target = insn.near_branch_target();
                 let cond = self.emit_sf_xor_of(&mut ops, &mut seq_base, address);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2764,7 +2826,7 @@ impl X86Lifter {
                     self.emit_sf_xor_of(&mut ops, &mut seq_base, address),
                     0x424, &mut ops, &mut seq_base, address,
                 );
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2775,7 +2837,7 @@ impl X86Lifter {
             Jb => {
                 let target = insn.near_branch_target();
                 let cf = reg(CF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2786,7 +2848,7 @@ impl X86Lifter {
             Jae => {
                 let target = insn.near_branch_target();
                 let cond = self.emit_not(reg(CF_OFFSET, 1), 0x430, &mut ops, &mut seq_base, address);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2800,7 +2862,7 @@ impl X86Lifter {
             Js => {
                 let target = insn.near_branch_target();
                 let sf = reg(SF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2810,7 +2872,7 @@ impl X86Lifter {
             Jns => {
                 let target = insn.near_branch_target();
                 let cond = self.emit_not(reg(SF_OFFSET, 1), 0x440, &mut ops, &mut seq_base, address);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2823,7 +2885,7 @@ impl X86Lifter {
             Jo => {
                 let target = insn.near_branch_target();
                 let of = reg(OF_OFFSET, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2833,7 +2895,7 @@ impl X86Lifter {
             Jno => {
                 let target = insn.near_branch_target();
                 let cond = self.emit_not(reg(OF_OFFSET, 1), 0x450, &mut ops, &mut seq_base, address);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2846,7 +2908,7 @@ impl X86Lifter {
                 let target = insn.near_branch_target();
                 // !(CF | ZF) == (!CF & !ZF) by De Morgan.
                 let cf_or_zf = unique(0x460, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::BoolOr,
                     seq: seq(seq_base),
                     output: Some(cf_or_zf),
@@ -2854,7 +2916,7 @@ impl X86Lifter {
                 });
                 seq_base += 1;
                 let cond = self.emit_not(cf_or_zf, 0x464, &mut ops, &mut seq_base, address);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2864,14 +2926,14 @@ impl X86Lifter {
             Jbe => {
                 let target = insn.near_branch_target();
                 let cond = unique(0x468, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::BoolOr,
                     seq: seq(seq_base),
                     output: Some(cond),
                     inputs: SmallVec::from_slice(&[reg(CF_OFFSET, 1), reg(ZF_OFFSET, 1)]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2884,14 +2946,14 @@ impl X86Lifter {
                 let target = insn.near_branch_target();
                 let sf_xor_of = self.emit_sf_xor_of(&mut ops, &mut seq_base, address);
                 let cond = unique(0x470, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::BoolOr,
                     seq: seq(seq_base),
                     output: Some(cond),
                     inputs: SmallVec::from_slice(&[reg(ZF_OFFSET, 1), sf_xor_of]),
                 });
                 seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2902,7 +2964,7 @@ impl X86Lifter {
                 let target = insn.near_branch_target();
                 let sf_xor_of = self.emit_sf_xor_of(&mut ops, &mut seq_base, address);
                 let zf_or_sxo = unique(0x478, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::BoolOr,
                     seq: seq(seq_base),
                     output: Some(zf_or_sxo),
@@ -2910,7 +2972,7 @@ impl X86Lifter {
                 });
                 seq_base += 1;
                 let cond = self.emit_not(zf_or_sxo, 0x47c, &mut ops, &mut seq_base, address);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2927,7 +2989,7 @@ impl X86Lifter {
                 let cond = self
                     .cc_condition(insn.condition_code(), &mut ops, &mut seq_base, address)
                     .unwrap_or_else(|| constant(0, 1));
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Copy,
                     seq: seq(seq_base),
                     output: Some(dst),
@@ -2948,7 +3010,7 @@ impl X86Lifter {
                 } else {
                     reg(PF_OFFSET, 1)
                 };
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CBranch,
                     seq: seq(seq_base),
                     output: None,
@@ -2962,10 +3024,10 @@ impl X86Lifter {
             Sahf => {
                 for (flag, bit) in [(SF_OFFSET, 7u64), (ZF_OFFSET, 6), (PF_OFFSET, 2), (CF_OFFSET, 0)] {
                     let sh = unique(0x5a0 + bit * 0x10, 1);
-                    ops.push(PcodeOp { opcode: OpCode::IntRight, seq: seq(seq_base), output: Some(sh),
+                    ops.push_op(PcodeOp { opcode: OpCode::IntRight, seq: seq(seq_base), output: Some(sh),
                         inputs: SmallVec::from_slice(&[reg(0x01, 1), constant(bit, 1)]) });
                     seq_base += 1;
-                    ops.push(PcodeOp { opcode: OpCode::IntAnd, seq: seq(seq_base), output: Some(reg(flag, 1)),
+                    ops.push_op(PcodeOp { opcode: OpCode::IntAnd, seq: seq(seq_base), output: Some(reg(flag, 1)),
                         inputs: SmallVec::from_slice(&[sh, constant(1, 1)]) });
                     seq_base += 1;
                 }
@@ -2974,11 +3036,11 @@ impl X86Lifter {
                 let mut acc = constant(2, 1);
                 for (k, (flag, bit)) in [(SF_OFFSET, 7u64), (ZF_OFFSET, 6), (PF_OFFSET, 2), (CF_OFFSET, 0)].into_iter().enumerate() {
                     let sh = unique(0x5a0 + k as u64 * 0x20, 1);
-                    ops.push(PcodeOp { opcode: OpCode::IntLeft, seq: seq(seq_base), output: Some(sh),
+                    ops.push_op(PcodeOp { opcode: OpCode::IntLeft, seq: seq(seq_base), output: Some(sh),
                         inputs: SmallVec::from_slice(&[reg(flag, 1), constant(bit, 1)]) });
                     seq_base += 1;
                     let out = if k == 3 { reg(0x01, 1) } else { unique(0x5b0 + k as u64 * 0x20, 1) };
-                    ops.push(PcodeOp { opcode: OpCode::IntOr, seq: seq(seq_base), output: Some(out),
+                    ops.push_op(PcodeOp { opcode: OpCode::IntOr, seq: seq(seq_base), output: Some(out),
                         inputs: SmallVec::from_slice(&[acc, sh]) });
                     seq_base += 1;
                     acc = out;
@@ -2986,7 +3048,7 @@ impl X86Lifter {
             }
 
             Int3 => {
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CallOther,
                     seq: seq(seq_base),
                     output: None,
@@ -2995,7 +3057,7 @@ impl X86Lifter {
             }
 
             _ => {
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CallOther,
                     seq: seq(seq_base),
                     output: None,
@@ -3128,13 +3190,13 @@ impl X86Lifter {
             } else {
                 SmallVec::from_slice(&[constant(tag, 8), src])
             };
-            ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: Some(dst), inputs });
+            ops.push_op(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: Some(dst), inputs });
             return Ok(ops);
         }
         if let Some(opcode) = float_bin {
             let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
             let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
-            ops.push(PcodeOp {
+            ops.push_op(PcodeOp {
                 opcode,
                 seq: seq(sb),
                 output: Some(dst),
@@ -3147,7 +3209,7 @@ impl X86Lifter {
         if let Some(tag) = packed_int_name(m).filter(|_| xmm_dst).and_then(reargo_core::pcode::intrinsic::packed_tag) {
             let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
             let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
-            ops.push(PcodeOp {
+            ops.push_op(PcodeOp {
                 opcode: OpCode::CallOther,
                 seq: seq(sb),
                 output: Some(dst),
@@ -3205,7 +3267,7 @@ impl X86Lifter {
             } else {
                 self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?
             };
-            ops.push(PcodeOp {
+            ops.push_op(PcodeOp {
                 opcode: OpCode::CallOther,
                 seq: seq(sb),
                 output: Some(dst),
@@ -3236,7 +3298,7 @@ impl X86Lifter {
             } else {
                 SmallVec::from_slice(&[constant(tag, 8), src, imm])
             };
-            ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: Some(dst), inputs });
+            ops.push_op(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: Some(dst), inputs });
             return Ok(ops);
         }
 
@@ -3245,7 +3307,7 @@ impl X86Lifter {
             Sqrtsd | Sqrtss => {
                 let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::FloatSqrt,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3263,7 +3325,7 @@ impl X86Lifter {
                 } else {
                     let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
                     let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::Copy,
                         seq: seq(sb),
                         output: Some(dst),
@@ -3276,7 +3338,7 @@ impl X86Lifter {
             Cvtsi2sd | Cvtsi2ss => {
                 let src = self.lift_operand(insn, 1, &mut ops, &mut sb, address)?;
                 let dst = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::FloatInt2Float,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3289,7 +3351,7 @@ impl X86Lifter {
                 let in_sz = if matches!(m, Cvttsd2si | Cvtsd2si) { 8 } else { 4 };
                 let src = self.sse_operand(insn, 1, in_sz, &mut ops, &mut sb, address)?;
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::FloatTrunc,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3303,7 +3365,7 @@ impl X86Lifter {
                 let out_sz = if m == Cvtsd2ss { 4 } else { 8 };
                 let src = self.sse_operand(insn, 1, in_sz, &mut ops, &mut sb, address)?;
                 let dst = self.sse_operand(insn, 0, out_sz, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::FloatFloat2Float,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3317,7 +3379,7 @@ impl X86Lifter {
                 let a = self.sse_operand(insn, 0, sz, &mut ops, &mut sb, address)?;
                 let b = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
                 let eq = unique(0x54e, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::FloatEqual,
                     seq: seq(sb),
                     output: Some(eq),
@@ -3327,14 +3389,14 @@ impl X86Lifter {
                 // CF = "below or unordered" = !(b <= a) (WS84: `a < b` was false for a NaN,
                 // so `ucomiss; ja` read as taken).
                 let ge = unique(0x54c, 1);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::FloatLessEqual,
                     seq: seq(sb),
                     output: Some(ge),
                     inputs: SmallVec::from_slice(&[b, a]),
                 });
                 sb += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::BoolNegate,
                     seq: seq(sb),
                     output: Some(reg(CF_OFFSET, 1)),
@@ -3345,19 +3407,19 @@ impl X86Lifter {
                 // float compare (the NaN guard) branch on a real condition
                 // instead of an opaque CallOther.
                 let na = unique(0x540, 1);
-                ops.push(PcodeOp { opcode: OpCode::FloatNan, seq: seq(sb), output: Some(na),
+                ops.push_op(PcodeOp { opcode: OpCode::FloatNan, seq: seq(sb), output: Some(na),
                     inputs: SmallVec::from_slice(&[a]) });
                 sb += 1;
                 let nb = unique(0x542, 1);
-                ops.push(PcodeOp { opcode: OpCode::FloatNan, seq: seq(sb), output: Some(nb),
+                ops.push_op(PcodeOp { opcode: OpCode::FloatNan, seq: seq(sb), output: Some(nb),
                     inputs: SmallVec::from_slice(&[b]) });
                 sb += 1;
-                ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(PF_OFFSET, 1)),
+                ops.push_op(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(PF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[na, nb]) });
                 sb += 1;
                 // ZF = equal or unordered (WS85: it was the plain `a == b`, 0 for a NaN, so a
                 // `je` / `sete` alone read the opposite of the CPU for a NaN)
-                ops.push(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(ZF_OFFSET, 1)),
+                ops.push_op(PcodeOp { opcode: OpCode::BoolOr, seq: seq(sb), output: Some(reg(ZF_OFFSET, 1)),
                     inputs: SmallVec::from_slice(&[eq, reg(PF_OFFSET, 1)]) });
                 sb += 1;
                 // OF and SF are cleared (WS84: they kept an earlier integer op's value)
@@ -3371,10 +3433,10 @@ impl X86Lifter {
                 let src = self.sse_operand(insn, 1, sz, &mut ops, &mut sb, address)?;
                 let c = unique(0x548, 1);
                 let (x, y) = if matches!(m, Minss | Minsd) { (dst, src) } else { (src, dst) };
-                ops.push(PcodeOp { opcode: OpCode::FloatLess, seq: seq(sb), output: Some(c),
+                ops.push_op(PcodeOp { opcode: OpCode::FloatLess, seq: seq(sb), output: Some(c),
                     inputs: SmallVec::from_slice(&[x, y]) });
                 sb += 1;
-                ops.push(PcodeOp { opcode: OpCode::Select, seq: seq(sb), output: Some(dst),
+                ops.push_op(PcodeOp { opcode: OpCode::Select, seq: seq(sb), output: Some(dst),
                     inputs: SmallVec::from_slice(&[c, dst, src]) });
             }
 
@@ -3385,7 +3447,7 @@ impl X86Lifter {
                 if insn.op_kind(1) == iced_x86::OpKind::Register
                     && insn.op_register(0) == insn.op_register(1)
                 {
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::Copy,
                         seq: seq(sb),
                         output: Some(dst),
@@ -3393,7 +3455,7 @@ impl X86Lifter {
                     });
                 } else {
                     let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::IntXor,
                         seq: seq(sb),
                         output: Some(dst),
@@ -3412,7 +3474,7 @@ impl X86Lifter {
                     let val = if high {
                         let x = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
                         let h = unique(0x7a0, 8);
-                        ops.push(PcodeOp {
+                        ops.push_op(PcodeOp {
                             opcode: OpCode::Subpiece,
                             seq: seq(sb),
                             output: Some(h),
@@ -3428,7 +3490,7 @@ impl X86Lifter {
                     let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
                     let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
                     let tag = reargo_core::pcode::intrinsic::packed_tag("movhps").expect("named");
-                    ops.push(PcodeOp {
+                    ops.push_op(PcodeOp {
                         opcode: OpCode::CallOther,
                         seq: seq(sb),
                         output: Some(dst),
@@ -3437,7 +3499,7 @@ impl X86Lifter {
                 } else {
                     let src = self.sse_operand(insn, 1, 8, &mut ops, &mut sb, address)?;
                     let dst = self.sse_operand(insn, 0, 8, &mut ops, &mut sb, address)?;
-                    ops.push(PcodeOp { opcode: OpCode::Copy, seq: seq(sb), output: Some(dst), inputs: SmallVec::from_slice(&[src]) });
+                    ops.push_op(PcodeOp { opcode: OpCode::Copy, seq: seq(sb), output: Some(dst), inputs: SmallVec::from_slice(&[src]) });
                 }
             }
 
@@ -3451,7 +3513,7 @@ impl X86Lifter {
                 } else {
                     OpCode::IntOr
                 };
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3464,14 +3526,14 @@ impl X86Lifter {
                 let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
                 let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
                 let ndst = unique(0x780, 16);
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntNegate,
                     seq: seq(sb),
                     output: Some(ndst),
                     inputs: SmallVec::from_slice(&[dst]),
                 });
                 sb += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAnd,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3500,12 +3562,12 @@ impl X86Lifter {
                     let dst = self.sse_operand(insn, 0, lane, &mut ops, &mut sb, address)?;
                     let src = self.sse_operand(insn, 1, lane, &mut ops, &mut sb, address)?;
                     let cmp = unique(0x790, 1);
-                    ops.push(PcodeOp { opcode: cmp_op, seq: seq(sb), output: Some(cmp),
+                    ops.push_op(PcodeOp { opcode: cmp_op, seq: seq(sb), output: Some(cmp),
                         inputs: SmallVec::from_slice(&[dst, src]) });
                     sb += 1;
                     let bit = if negate {
                         let nb = unique(0x792, 1);
-                        ops.push(PcodeOp { opcode: OpCode::BoolNegate, seq: seq(sb), output: Some(nb),
+                        ops.push_op(PcodeOp { opcode: OpCode::BoolNegate, seq: seq(sb), output: Some(nb),
                             inputs: SmallVec::from_slice(&[cmp]) });
                         sb += 1;
                         nb
@@ -3513,13 +3575,13 @@ impl X86Lifter {
                         cmp
                     };
                     let z = unique(0x794, lane);
-                    ops.push(PcodeOp { opcode: OpCode::IntZExt, seq: seq(sb), output: Some(z),
+                    ops.push_op(PcodeOp { opcode: OpCode::IntZExt, seq: seq(sb), output: Some(z),
                         inputs: SmallVec::from_slice(&[bit]) });
                     sb += 1;
-                    ops.push(PcodeOp { opcode: OpCode::Int2Comp, seq: seq(sb), output: Some(dst),
+                    ops.push_op(PcodeOp { opcode: OpCode::Int2Comp, seq: seq(sb), output: Some(dst),
                         inputs: SmallVec::from_slice(&[z]) });
                 } else {
-                    ops.push(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: None,
+                    ops.push_op(PcodeOp { opcode: OpCode::CallOther, seq: seq(sb), output: None,
                         inputs: SmallVec::from_slice(&[constant(0, 4)]) });
                 }
             }
@@ -3531,7 +3593,7 @@ impl X86Lifter {
             Pmovmskb => {
                 let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
                 let dst = self.lift_operand(insn, 0, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CallOther,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3547,7 +3609,7 @@ impl X86Lifter {
                 })?;
                 let name = if m == Movmskps { "movmskps" } else { "movmskpd" };
                 let tag = reargo_core::pcode::intrinsic::packed_tag(name).expect("named");
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CallOther,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3557,7 +3619,7 @@ impl X86Lifter {
             Pcmpeqb => {
                 let dst = self.sse_operand(insn, 0, 16, &mut ops, &mut sb, address)?;
                 let src = self.sse_operand(insn, 1, 16, &mut ops, &mut sb, address)?;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CallOther,
                     seq: seq(sb),
                     output: Some(dst),
@@ -3567,7 +3629,7 @@ impl X86Lifter {
 
             // Unmodeled SSE (min/max, other lane ops): opaque, no decode error.
             _ => {
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::CallOther,
                     seq: seq(sb),
                     output: None,
@@ -3609,7 +3671,7 @@ impl X86Lifter {
                 let result = unique(*seq_base as u64 * 0x10 + 0x700, size);
                 let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
                 *seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Load,
                     seq,
                     output: Some(result),
@@ -3632,14 +3694,14 @@ impl X86Lifter {
     ) {
         let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
         let zero = constant(0, result.size);
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::IntEqual,
             seq: seq_at(*seq_base),
             output: Some(reg(ZF_OFFSET, 1)),
             inputs: SmallVec::from_slice(&[result, zero]),
         });
         *seq_base += 1;
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::IntSLess,
             seq: seq_at(*seq_base),
             output: Some(reg(SF_OFFSET, 1)),
@@ -3659,14 +3721,14 @@ impl X86Lifter {
         address: u64,
     ) {
         let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::Copy,
             seq: seq_at(*seq_base),
             output: Some(reg(CF_OFFSET, 1)),
             inputs: SmallVec::from_slice(&[constant(0, 1)]),
         });
         *seq_base += 1;
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::Copy,
             seq: seq_at(*seq_base),
             output: Some(reg(OF_OFFSET, 1)),
@@ -3678,7 +3740,7 @@ impl X86Lifter {
     /// `comiss`/`ucomiss` clear OF and SF (CF/ZF/PF carry the result).
     fn emit_clear_of_sf(&self, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, address: u64) {
         for off in [OF_OFFSET, SF_OFFSET] {
-            ops.push(PcodeOp {
+            ops.push_op(PcodeOp {
                 opcode: OpCode::Copy,
                 seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
                 output: Some(reg(off, 1)),
@@ -3698,14 +3760,14 @@ impl X86Lifter {
         address: u64,
     ) {
         let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::IntCarry,
             seq: seq_at(*seq_base),
             output: Some(reg(CF_OFFSET, 1)),
             inputs: SmallVec::from_slice(&[a, b]),
         });
         *seq_base += 1;
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::IntSCarry,
             seq: seq_at(*seq_base),
             output: Some(reg(OF_OFFSET, 1)),
@@ -3725,14 +3787,14 @@ impl X86Lifter {
         address: u64,
     ) {
         let seq_at = |s: u32| SeqNum::new(Address::new(RAM_SPACE, address), s);
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::IntLess,
             seq: seq_at(*seq_base),
             output: Some(reg(CF_OFFSET, 1)),
             inputs: SmallVec::from_slice(&[a, b]),
         });
         *seq_base += 1;
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::IntSBorrow,
             seq: seq_at(*seq_base),
             output: Some(reg(OF_OFFSET, 1)),
@@ -3751,7 +3813,7 @@ impl X86Lifter {
         address: u64,
     ) -> VarnodeData {
         let out = unique(0x480, 1);
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::BoolXor,
             seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
             output: Some(out),
@@ -3775,7 +3837,7 @@ impl X86Lifter {
         use iced_x86::ConditionCode as C;
         let bool_or = |a: VarnodeData, b: VarnodeData, off: u64, ops: &mut Vec<PcodeOp>, seq_base: &mut u32| {
             let out = unique(off, 1);
-            ops.push(PcodeOp {
+            ops.push_op(PcodeOp {
                 opcode: OpCode::BoolOr,
                 seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
                 output: Some(out),
@@ -3834,7 +3896,7 @@ impl X86Lifter {
         address: u64,
     ) -> VarnodeData {
         let out = unique(unique_offset, 1);
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode: OpCode::BoolNegate,
             seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
             output: Some(out),
@@ -3878,7 +3940,7 @@ impl X86Lifter {
                 let result = unique(*seq_base as u64 * 0x10 + 0x500, size);
                 let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
                 *seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::Load,
                     seq,
                     output: Some(result),
@@ -3959,7 +4021,7 @@ impl X86Lifter {
                 let scaled = unique(*seq_base as u64 * 0x10 + 0x600, ps);
                 let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
                 *seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntMult,
                     seq,
                     output: Some(scaled),
@@ -3968,7 +4030,7 @@ impl X86Lifter {
                 let added = unique(*seq_base as u64 * 0x10 + 0x600, ps);
                 let seq2 = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
                 *seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAdd,
                     seq: seq2,
                     output: Some(added),
@@ -3979,7 +4041,7 @@ impl X86Lifter {
                 let added = unique(*seq_base as u64 * 0x10 + 0x600, ps);
                 let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
                 *seq_base += 1;
-                ops.push(PcodeOp {
+                ops.push_op(PcodeOp {
                     opcode: OpCode::IntAdd,
                     seq,
                     output: Some(added),
@@ -3993,7 +4055,7 @@ impl X86Lifter {
             let with_disp = unique(*seq_base as u64 * 0x10 + 0x600, ps);
             let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
             *seq_base += 1;
-            ops.push(PcodeOp {
+            ops.push_op(PcodeOp {
                 opcode: OpCode::IntAdd,
                 seq,
                 output: Some(with_disp),
@@ -4035,7 +4097,7 @@ impl X86Lifter {
             let addr_vn = self.compute_memory_address(insn, ops, seq_base, address)?;
             let seq = SeqNum::new(Address::new(RAM_SPACE, address), *seq_base);
             *seq_base += 1;
-            ops.push(PcodeOp {
+            ops.push_op(PcodeOp {
                 opcode: OpCode::Store,
                 seq,
                 output: None,
@@ -4268,7 +4330,10 @@ impl X86Lifter {
         // (one pass: whether an XMM view is written and the XMM views need syncing, which ops
         // write a GPR view or read / write a high byte (`touch`, by op; all when there are more
         // than 64) and how many ops `zero_extend_gpr32_writes` adds; and the facts, which the
-        // views added do not change: they are copies of registers other than the flags)
+        // views added do not change: they are copies of registers other than the flags. The
+        // inputs are looked at only for the facts and when the instruction may touch a high
+        // byte at all, `may_touch_high_byte`.)
+        let high = may_touch_high_byte(insn);
         let (mut xmm, mut extra) = (false, 0usize);
         let mut touch = 0u64;
         let mut shape = crate::lift::InsnShape::default();
@@ -4276,30 +4341,32 @@ impl X86Lifter {
         let (mut pf_read, mut pf_written) = (None, false);
         for (k, op) in ops.iter().enumerate() {
             let bit = 1u64 << k.min(63);
-            let mut reads = 0;
-            let mut last: Option<VarnodeData> = None;
-            let mut reads_pf = false;
-            for v in op.inputs.iter() {
-                if FACTS {
-                    reads_pf |= is_pf(v);
-                }
-                if high_byte(v) {
-                    if last != Some(*v) {
-                        reads += 1;
+            if FACTS || high {
+                let mut reads = 0;
+                let mut last: Option<VarnodeData> = None;
+                let mut reads_pf = false;
+                for v in op.inputs.iter() {
+                    if FACTS {
+                        reads_pf |= is_pf(v);
                     }
-                    last = Some(*v);
+                    if high && high_byte(v) {
+                        if last != Some(*v) {
+                            reads += 1;
+                        }
+                        last = Some(*v);
+                    }
                 }
-            }
-            if FACTS {
-                if reads_pf && pf_read.is_none() {
-                    pf_read = Some(!pf_written);
+                if FACTS {
+                    if reads_pf && pf_read.is_none() {
+                        pf_read = Some(!pf_written);
+                    }
+                    shape.add(op);
                 }
-                shape.add(op);
+                if reads > 0 {
+                    touch |= bit;
+                }
+                extra += reads;
             }
-            if reads > 0 {
-                touch |= bit;
-            }
-            extra += reads;
             let Some(w) = op.output else { continue };
             if FACTS {
                 pf_written |= is_pf(&w);
@@ -4308,7 +4375,7 @@ impl X86Lifter {
                 continue;
             }
             xmm |= xmm_view(&w).is_some();
-            if high_byte(&w) {
+            if high && high_byte(&w) {
                 touch |= bit;
                 extra += 4;
             } else if gpr_view(&w) {
@@ -4337,7 +4404,7 @@ impl X86Lifter {
                 // (past 64 ops, every op from the 64th on is looked at)
                 let touch = if ops.len() > 64 { touch | !0u64 << 63 } else { touch };
                 let out = if xmm { scratch::take() } else { Vec::with_capacity(ops.len() + extra) };
-                let out = zero_extend_gpr32_writes(&mut ops, out, touch);
+                let out = zero_extend_gpr32_writes(&mut ops, out, touch, extra, high);
                 scratch::give(std::mem::replace(&mut ops, out));
                 if !xmm {
                     return ops;
@@ -4537,7 +4604,7 @@ const PARITY_TMP: std::ops::Range<u64> = 0x2e00..0x2f00;
 /// `(popcount((uint8_t)r) & 1) == 0`. Returns the boolean (a temporary).
 fn parity_of(result: VarnodeData, ops: &mut Vec<PcodeOp>, seq_base: &mut u32, address: u64) -> VarnodeData {
     let mut put = |opcode: OpCode, out: VarnodeData, inputs: &[VarnodeData], ops: &mut Vec<PcodeOp>| {
-        ops.push(PcodeOp {
+        ops.push_op(PcodeOp {
             opcode,
             seq: SeqNum::new(Address::new(RAM_SPACE, address), *seq_base),
             output: Some(out),
@@ -4643,40 +4710,81 @@ fn parity_needed<L: std::borrow::Borrow<LiftedInstruction>>(lifted: &[L], reads_
 /// size in spare capacity before.
 mod scratch {
     use super::PcodeOp;
-    use std::cell::Cell;
+    use std::cell::UnsafeCell;
 
     thread_local! {
-        static A: Cell<Vec<PcodeOp>> = const { Cell::new(Vec::new()) };
-        static B: Cell<Vec<PcodeOp>> = const { Cell::new(Vec::new()) };
+        /// The two buffers kept (one thread-local access per `take` / `give`).
+        static BUFFERS: UnsafeCell<[Vec<PcodeOp>; 2]> = const { UnsafeCell::new([Vec::new(), Vec::new()]) };
     }
 
     /// An empty buffer.
+    #[inline]
     pub(super) fn take() -> Vec<PcodeOp> {
-        let v = A.take();
-        if v.capacity() != 0 {
-            return v;
-        }
-        let v = B.take();
-        if v.capacity() != 0 { v } else { Vec::with_capacity(16) }
+        BUFFERS.with(|b| {
+            // SAFETY: the buffers are reached only here and in `give`, which call nothing that
+            // reaches them while they hold the reference.
+            let b = unsafe { &mut *b.get() };
+            if b[0].capacity() != 0 {
+                std::mem::take(&mut b[0])
+            } else if b[1].capacity() != 0 {
+                std::mem::take(&mut b[1])
+            } else {
+                Vec::with_capacity(16)
+            }
+        })
     }
 
     /// Return a buffer for reuse (two are kept per thread).
+    #[inline]
     pub(super) fn give(mut ops: Vec<PcodeOp>) {
         if ops.capacity() == 0 || ops.capacity() > 256 {
             return;
         }
-        ops.clear();
-        let old = A.replace(ops);
-        if old.capacity() != 0 {
-            B.set(old);
+        if !ops.is_empty() {
+            clear(&mut ops);
         }
+        BUFFERS.with(|b| {
+            // SAFETY: as in `take`.
+            let b = unsafe { &mut *b.get() };
+            let old = std::mem::replace(&mut b[0], ops);
+            if old.capacity() != 0 {
+                keep_second(b, old);
+            } else {
+                // (nothing to free)
+                std::mem::forget(old);
+            }
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn clear(ops: &mut Vec<PcodeOp>) {
+        ops.clear();
+    }
+
+    /// `old` kept as the second buffer (the one there freed).
+    #[cold]
+    #[inline(never)]
+    fn keep_second(b: &mut [Vec<PcodeOp>; 2], old: Vec<PcodeOp>) {
+        b[1] = old;
     }
 
     /// The ops of `ops` in a vector of exactly their size, the buffer
     /// returned for reuse.
+    #[inline]
     pub(super) fn finish(mut ops: Vec<PcodeOp>) -> Vec<PcodeOp> {
-        let mut exact: Vec<PcodeOp> = Vec::with_capacity(ops.len());
-        exact.append(&mut ops);
+        let n = ops.len();
+        let mut exact: Vec<PcodeOp> = Vec::with_capacity(n);
+        // (moved one op at a time: a copy of the op's fixed size, where `append` called
+        // `memcpy` for the few ops of a lift)
+        // SAFETY: the `n` ops move from `ops` (left empty) into `exact`'s room for them.
+        unsafe {
+            ops.set_len(0);
+            for i in 0..n {
+                std::ptr::copy_nonoverlapping(ops.as_ptr().add(i), exact.as_mut_ptr().add(i), 1);
+            }
+            exact.set_len(n);
+        }
         give(ops);
         exact
     }
@@ -4721,22 +4829,59 @@ fn xmm_view(v: &VarnodeData) -> Option<u64> {
         .then_some(v.offset)
 }
 
+/// Whether a lift of `insn` may read or write `ah` / `ch` / `dh` / `bh`: an operand is one,
+/// or the instruction reads / writes `ah` itself (`div` / `idiv` of a byte: the remainder,
+/// `lahf` / `sahf`). Else no op of its lift has a high byte (`finish_matches_old` checks it on
+/// random instructions), and their inputs need not be looked at for one.
+#[inline]
+fn may_touch_high_byte(insn: &iced_x86::Instruction) -> bool {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    // (AH, CH, DH, BH are consecutive)
+    let is_high = |r: Register| (r as u32).wrapping_sub(Register::AH as u32) < 4;
+    (0..insn.op_count()).any(|i| is_high(insn.op_register(i)) && insn.op_kind(i) == OpKind::Register)
+        || matches!(insn.mnemonic(), Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Lahf | Mnemonic::Sahf)
+}
+
 /// The ops of `ops` (drained) with the GPR views kept coherent, in `out`
-/// (empty; `ops` writes a GPR view or reads / writes a high byte).
-fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>, touch: u64) -> Vec<PcodeOp> {
-    let gpr = |v: &VarnodeData| gpr_view(v).then_some(*v);
-    let high = high_byte;
+/// (empty; `ops` writes a GPR view or reads / writes a high byte — read / written only when
+/// `high` — and the views add `extra` ops).
+fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>, touch: u64, extra: usize, high: bool) -> Vec<PcodeOp> {
+    let n = ops.len();
+    out.reserve_exact(n + extra);
+    // The ops are moved out of `ops` by reading them in order (its length is 0 from here, so
+    // none is dropped there) and written into `out`'s room, `n + extra` ops; each gets its
+    // order there as it is written.
+    // SAFETY: `ops` keeps its buffer and capacity; each of its first `n` ops is read exactly
+    // once (`OpsOut::copy` / `read`).
+    unsafe { ops.set_len(0) };
+    let src = ops.as_ptr();
+    let mut w = OpsOut { base: out.as_mut_ptr(), len: 0, limit: n + extra };
     let mut tmp = 0x7e00u64;
-    let mut ops = ops.drain(..);
+    let mut i = 0usize;
     // (the ops before the next one `touch` marks are moved as they are; bit 63 marks every op
     // from the 64th on)
-    let mut k = 0u32;
-    loop {
-        let next = if k >= 63 { k } else { (touch >> k << k).trailing_zeros().min(63) };
-        out.extend(ops.by_ref().take((next - k) as usize));
-        k = next;
-        let Some(op) = ops.next() else { break };
-        k = (k + 1).min(63);
+    while i < n {
+        let next = if i >= 63 { i } else { ((touch >> i << i).trailing_zeros() as usize).min(63).min(n) };
+        while i < next {
+            // SAFETY: `i < n`, read once.
+            unsafe { w.copy(src.add(i)) };
+            i += 1;
+        }
+        if i == n {
+            break;
+        }
+        if !high {
+            // (no high byte: the op is moved first, then its output looked at where it is)
+            // SAFETY: `i < n`, read once.
+            let op = unsafe { w.copy(src.add(i)) };
+            i += 1;
+            let (Some(v), at) = (op.output.filter(gpr_view), op.seq.addr) else { continue };
+            gpr_views(v, at, &mut w, &mut tmp);
+            continue;
+        }
+        // SAFETY: `i < n`, read once.
+        let op = unsafe { src.add(i).read() };
+        i += 1;
         let at = op.seq.addr;
         let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
             opcode,
@@ -4745,58 +4890,117 @@ fn zero_extend_gpr32_writes(ops: &mut Vec<PcodeOp>, mut out: Vec<PcodeOp>, touch
             inputs: SmallVec::from_slice(inputs),
         };
         // a high byte is read from its register: `ah = (uint8_t)(rax >> 8)` first
-        let mut read_high: Vec<VarnodeData> = op.inputs.iter().copied().filter(high).collect();
-        read_high.dedup();
-        for h in read_high {
-            out.push(mk(OpCode::Subpiece, h, &[reg(h.offset - 1, 8), constant(1, 4)]));
+        let mut last = None;
+        for h in op.inputs.iter().copied().filter(high_byte) {
+            if last != Some(h) {
+                w.push(mk(OpCode::Subpiece, h, &[reg(h.offset - 1, 8), constant(1, 4)]));
+            }
+            last = Some(h);
         }
-        let wrote_high = op.output.filter(high);
-        let w = op.output.as_ref().and_then(gpr);
-        out.push(op);
+        let wrote_high = op.output.filter(high_byte);
+        let v = op.output.filter(gpr_view);
+        w.push(op);
         if let Some(h) = wrote_high {
             // ax = ah:al, then rebuild rax from ax like a 16-bit write
             let base = h.offset - 1;
-            out.push(mk(OpCode::Piece, reg(base, 2), &[h, reg(base, 1)]));
+            w.push(mk(OpCode::Piece, reg(base, 2), &[h, reg(base, 1)]));
             let hi = unique(tmp, 6);
             tmp += 0x10;
-            out.push(mk(OpCode::Subpiece, hi, &[reg(base, 8), constant(2, 4)]));
-            out.push(mk(OpCode::Piece, reg(base, 8), &[hi, reg(base, 2)]));
-            out.push(mk(OpCode::Subpiece, reg(base, 4), &[reg(base, 8), constant(0, 4)]));
+            w.push(mk(OpCode::Subpiece, hi, &[reg(base, 8), constant(2, 4)]));
+            w.push(mk(OpCode::Piece, reg(base, 8), &[hi, reg(base, 2)]));
+            w.push(mk(OpCode::Subpiece, reg(base, 4), &[reg(base, 8), constant(0, 4)]));
             continue;
         }
-        let Some(w) = w else { continue };
-        let r = |sz: u32| reg(w.offset, sz);
-        let low = |out: &mut Vec<PcodeOp>, from: u32, sizes: &[u32]| {
-            for &sz in sizes {
-                out.push(mk(OpCode::Subpiece, r(sz), &[r(from), constant(0, 4)]));
-            }
-        };
-        // rsp is excluded: 64-bit code never reads esp/sp/spl, and push/pop/call/ret
-        // would otherwise each grow extra ops.
-        let is_rsp = w.offset == 0x20;
-        match w.size {
-            8 if !is_rsp => low(&mut out, 8, &[4, 2, 1]),
-            8 => {}
-            4 => {
-                out.push(mk(OpCode::IntZExt, r(8), &[r(4)]));
-                if !is_rsp {
-                    low(&mut out, 4, &[2, 1]);
-                }
-            }
-            n if !is_rsp => {
-                let hi = unique(tmp, 8 - n);
-                tmp += 0x10;
-                out.push(mk(OpCode::Subpiece, hi, &[r(8), constant(n as u64, 4)]));
-                out.push(mk(OpCode::Piece, r(8), &[hi, r(n)]));
-                low(&mut out, 8, if n == 2 { &[4, 1] } else { &[4, 2] });
-            }
-            _ => {}
+        let Some(v) = v else { continue };
+        gpr_views(v, at, &mut w, &mut tmp);
+    }
+    // SAFETY: the first `len` slots of `out` were written.
+    unsafe { out.set_len(w.len) };
+    out
+}
+
+/// The room of [`zero_extend_gpr32_writes`]'s result, filled in order: `limit` ops at `base`,
+/// the first `len` written; each op written gets its position as its order.
+struct OpsOut {
+    base: *mut PcodeOp,
+    len: usize,
+    limit: usize,
+}
+
+impl OpsOut {
+    #[inline(always)]
+    fn slot(&mut self) -> *mut PcodeOp {
+        assert!(self.len < self.limit, "zero_extend_gpr32_writes: more ops than counted");
+        // SAFETY: `len < limit`, and the room holds `limit` ops.
+        let at = unsafe { self.base.add(self.len) };
+        self.len += 1;
+        at
+    }
+
+    #[inline(always)]
+    fn push(&mut self, op: PcodeOp) {
+        let order = self.len as u32;
+        let at = self.slot();
+        // SAFETY: `at` is a slot of the room not written yet.
+        unsafe { at.write(PcodeOp { seq: SeqNum { order, ..op.seq }, ..op }) };
+    }
+
+    /// The op at `src` moved into the next slot (returned there).
+    ///
+    /// # Safety
+    /// `src` is a valid op that is not read or dropped again.
+    #[inline(always)]
+    unsafe fn copy(&mut self, src: *const PcodeOp) -> &PcodeOp {
+        let order = self.len as u32;
+        let at = self.slot();
+        // SAFETY: `at` is a slot of the room not written yet, `src` an op moved from.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, at, 1);
+            (*at).seq.order = order;
+            &*at
         }
     }
-    for (i, op) in out.iter_mut().enumerate() {
-        op.seq.order = i as u32;
+}
+
+/// The ops [`zero_extend_gpr32_writes`] adds after a write to the GPR view `w` by the op at
+/// `at` (written to `out`; `tmp` is the next temporary).
+#[inline(always)]
+fn gpr_views(w: VarnodeData, at: Address, out: &mut OpsOut, tmp: &mut u64) {
+    let mk = |opcode: OpCode, output: VarnodeData, inputs: &[VarnodeData]| PcodeOp {
+        opcode,
+        seq: SeqNum::new(at, 0),
+        output: Some(output),
+        inputs: SmallVec::from_slice(inputs),
+    };
+    let r = |sz: u32| reg(w.offset, sz);
+    let low = |from: u32, sz: u32| mk(OpCode::Subpiece, r(sz), &[r(from), constant(0, 4)]);
+    // rsp is excluded: 64-bit code never reads esp/sp/spl, and push/pop/call/ret
+    // would otherwise each grow extra ops.
+    let is_rsp = w.offset == 0x20;
+    match w.size {
+        8 if !is_rsp => {
+            out.push(low(8, 4));
+            out.push(low(8, 2));
+            out.push(low(8, 1));
+        }
+        8 => {}
+        4 => {
+            out.push(mk(OpCode::IntZExt, r(8), &[r(4)]));
+            if !is_rsp {
+                out.push(low(4, 2));
+                out.push(low(4, 1));
+            }
+        }
+        n if !is_rsp => {
+            let hi = unique(*tmp, 8 - n);
+            *tmp += 0x10;
+            out.push(mk(OpCode::Subpiece, hi, &[r(8), constant(n as u64, 4)]));
+            out.push(mk(OpCode::Piece, r(8), &[hi, r(n)]));
+            out.push(low(8, 4));
+            out.push(low(8, if n == 2 { 1 } else { 2 }));
+        }
+        _ => {}
     }
-    out
 }
 
 /// True when the instruction's XMM destination write clears the bits above
@@ -6392,6 +6596,102 @@ mod tests {
             for insn in &mut d {
                 if !insn.is_invalid() {
                     real += usize::from(check_decoded_facts(&lifter, insn, &insn.ip()));
+                }
+            }
+        }
+        assert!(real > 100_000, "{real}");
+    }
+
+    /// The route table sends each code where `lift_iced` sent it by asking each lift in turn:
+    /// x87 exactly where `x87::kind` knows the instruction, the bit lift exactly where it
+    /// answers.
+    #[test]
+    fn routes_match_lifts() {
+        let lifter = X86Lifter::new_64();
+        let (_, _, routes) = fact_tables();
+        for code in iced_x86::Code::values() {
+            let mut insn = iced_x86::Instruction::default();
+            insn.set_code(code);
+            let r = routes[code as usize];
+            assert_eq!(r & route::X87 != 0, x87::kind(&insn) != x87::Kind::NotX87, "{code:?}");
+            assert_eq!(r & route::BITS != 0, lifter.lift_bits(&insn, 0x1000).is_some(), "{code:?}");
+        }
+    }
+
+    /// The ops of a lift finished as they were before (`old_finish::old_finish_ops`), with and
+    /// without the facts, on random instructions (and the x87 ones with a stack depth) and this
+    /// executable's code; no lift of an instruction `may_touch_high_byte` rules out has a high
+    /// byte.
+    #[test]
+    fn finish_matches_old() {
+        fn check(lifter: &X86Lifter, insn: &iced_x86::Instruction, highs: &mut usize) -> bool {
+            let mut ok = false;
+            for x87 in [None, Some(X87Ctx { depth: 3, rc: Some(3) })] {
+                let Ok(ops) = lifter.lift_iced(insn, insn.ip(), x87) else { continue };
+                let has_high = ops.iter().any(|o| o.output.iter().chain(o.inputs.iter()).any(high_byte));
+                assert!(!has_high || may_touch_high_byte(insn), "{insn} {ops:?}");
+                *highs += usize::from(has_high);
+                let (mut fa, mut fb) = (OpFacts::default(), OpFacts::default());
+                let a = lifter.finish_ops::<true>(ops.clone(), insn, &mut fa);
+                let b = lifter.old_finish_ops::<true>(ops.clone(), insn, &mut fb);
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "{insn}");
+                assert_eq!(a.capacity(), b.capacity(), "{insn}");
+                assert_eq!((fa.reads_outside_pf, fa.flags, fa.target), (fb.reads_outside_pf, fb.flags, fb.target), "{insn}");
+                let a = lifter.finish_ops::<false>(ops.clone(), insn, &mut fa);
+                let b = lifter.old_finish_ops::<false>(ops, insn, &mut fb);
+                assert_eq!(format!("{a:?}"), format!("{b:?}"), "{insn}");
+                assert_eq!(a.capacity(), b.capacity(), "{insn}");
+                ok = true;
+            }
+            ok
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let (mut checked, mut highs) = (0usize, 0usize);
+        // (fewer in a debug build)
+        let rounds: u32 = if cfg!(debug_assertions) { 30_000 } else { 200_000 };
+        for round in 0..rounds {
+            let mut bytes = [0u8; 16];
+            for b in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            match round % 16 {
+                0 => bytes[0] = 0x0f,
+                1 => bytes[0] = 0x66,
+                2 => bytes[0] = 0xf2,
+                3 => bytes[0] = 0xf3,
+                4 => bytes[0] = 0xff,
+                5 => (bytes[0], bytes[1]) = (0x66, 0x0f),
+                6 => (bytes[0], bytes[1]) = (0xf2, 0x0f),
+                7 => (bytes[0], bytes[1]) = (0xf3, 0x0f),
+                8 => bytes[0] = 0x40 | (bytes[0] & 0xf),
+                9 => bytes[0] = 0xd8 | (bytes[0] & 7),
+                10 => bytes[0] = [0xf6, 0xf7, 0x9e, 0x9f, 0x86, 0x88, 0x8a, 0x0f][(bytes[0] & 7) as usize],
+                11 => bytes[0] = 0x70 | (bytes[0] & 0xf),
+                _ => {}
+            }
+            for lifter in [X86Lifter::new_64(), X86Lifter::new_32()] {
+                let mut d = iced_x86::Decoder::with_ip(if lifter.is_64 { 64 } else { 32 }, &bytes, 0x40_1000, iced_x86::DecoderOptions::NONE);
+                let insn = d.decode();
+                if !insn.is_invalid() {
+                    checked += usize::from(check(&lifter, &insn, &mut highs));
+                }
+            }
+        }
+        assert!(checked as u64 > u64::from(rounds) && highs > 100, "{checked} {highs}");
+        let exe = std::env::current_exe().expect("the test executable");
+        let info = reargo_loader::loader::BinaryLoader::load(&exe).expect("load it");
+        let lifter = X86Lifter::new_64();
+        let mut real = 0usize;
+        for b in info.memory.blocks().filter(|b| b.flags.contains(reargo_loader::memory::MemoryFlags::EXECUTE)) {
+            let Some(data) = &b.data else { continue };
+            let code = &data[..data.len().min(b.size as usize)];
+            let mut d = iced_x86::Decoder::with_ip(64, code, b.start, iced_x86::DecoderOptions::NONE);
+            for insn in &mut d {
+                if !insn.is_invalid() {
+                    real += usize::from(check(&lifter, &insn, &mut highs));
                 }
             }
         }
