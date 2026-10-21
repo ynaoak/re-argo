@@ -128,9 +128,12 @@ impl Analyzer for ScalarReferenceAnalyzer {
                 }
             }
         }
+        let tt = std::time::Instant::now();
         program.symbol_table.add_all(symbols);
+        crate::tr!(tt, "scalar symbols");
         let refs_found = refs.len();
         program.references.add_all(&refs);
+        crate::tr!(tt, "scalar refs {}", refs.len());
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
@@ -164,6 +167,7 @@ pub(crate) fn add_unless_keyed<K: Eq + std::hash::Hash + Send>(
             })
             .collect()
     };
+    let tt = std::time::Instant::now();
     let mut seen: rustc_hash::FxHashSet<(u64, K)> = rustc_hash::FxHashSet::default();
     let added: Vec<Reference> = candidates
         .into_iter()
@@ -171,7 +175,9 @@ pub(crate) fn add_unless_keyed<K: Eq + std::hash::Hash + Send>(
         .filter(|&(c, present)| !present && seen.insert((c.from, key(&c))))
         .map(|(c, _)| c)
         .collect();
+    crate::tr!(tt, "add_unless_keyed seen {} of {}", added.len(), references.len());
     references.add_all(&added);
+    crate::tr!(tt, "add_unless_keyed added");
     added.len()
 }
 

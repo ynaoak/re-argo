@@ -741,3 +741,4 @@ mod tests {
         assert_eq!(format!("{set:?}"), format!("AddressSet {{ ranges: {tree:?} }}"));
     }
 }
+

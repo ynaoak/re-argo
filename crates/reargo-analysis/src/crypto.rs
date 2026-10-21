@@ -24,7 +24,7 @@ use reargo_program::comments::CommentType;
 use reargo_program::symbol::{SourceType, Symbol, SymbolType};
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct CryptoConstantAnalyzer;
 
@@ -43,10 +43,20 @@ impl Analyzer for CryptoConstantAnalyzer {
         // see the new `crypto_*` symbols when they look up names.
         250
     }
+    fn prepare_reads(&self) -> Option<State> {
+        // (only the bytes: the symbols and comments are looked at in `apply`)
+        Some(State::NONE)
+    }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    /// Where each fingerprint is found in each data section (the first
+    /// place in its first 1 MiB), in section order, then fingerprint
+    /// order: the address and the fingerprint's index.
+    fn prepare(&self, program: &Program) -> Prepared {
+        use rayon::prelude::*;
         let fingerprints = fingerprints();
-        let mut found = 0usize;
-
         let data_sections: Vec<(u64, u64)> = program
             .info
             .sections
@@ -58,38 +68,52 @@ impl Analyzer for CryptoConstantAnalyzer {
             })
             .map(|s| (s.address, s.size))
             .collect();
-
-        for (start, size) in data_sections {
-            let read = size.min(0x100_000) as usize;
-            let mut buf = vec![0u8; read];
-            if program.info.memory.read_bytes(start, &mut buf).is_err() {
+        let hits: Vec<(u64, usize)> = data_sections
+            .par_iter()
+            .map(|&(start, size)| {
+                let read = size.min(0x100_000) as usize;
+                let mut buf = vec![0u8; read];
+                if program.info.memory.read_bytes(start, &mut buf).is_err() {
+                    return Vec::new();
+                }
+                fingerprints
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, fp)| find(&buf, fp.bytes).map(|pos| (start + pos as u64, k)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        Box::new(hits)
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let hits: Vec<(u64, usize)> = crate::analyzer::prepared(prepared);
+        let fingerprints = fingerprints();
+        let mut found = 0usize;
+        for (addr, k) in hits {
+            let fp = &fingerprints[k];
+            let already = program.symbol_table.primary_at(addr).is_some_and(|s| {
+                s.name.starts_with("crypto_")
+            });
+            if already {
                 continue;
             }
-            for fp in &fingerprints {
-                if let Some(pos) = find(&buf, fp.bytes) {
-                    let addr = start + pos as u64;
-                    let already = program.symbol_table.primary_at(addr).is_some_and(|s| {
-                        s.name.starts_with("crypto_")
-                    });
-                    if already {
-                        continue;
-                    }
-                    if program.comments.get(addr, CommentType::Plate).is_none() {
-                        program.comments.set(
-                            addr,
-                            CommentType::Plate,
-                            format!("crypto: {}", fp.label),
-                        );
-                    }
-                    program.symbol_table.add(Symbol::new(
-                        format!("crypto_{}", fp.id),
-                        addr,
-                        SymbolType::Data,
-                        SourceType::Analysis,
-                    ));
-                    found += 1;
-                }
+            if program.comments.get(addr, CommentType::Plate).is_none() {
+                program.comments.set(
+                    addr,
+                    CommentType::Plate,
+                    format!("crypto: {}", fp.label),
+                );
             }
+            program.symbol_table.add(Symbol::new(
+                format!("crypto_{}", fp.id),
+                addr,
+                SymbolType::Data,
+                SourceType::Analysis,
+            ));
+            found += 1;
         }
 
         Ok(AnalysisResult {

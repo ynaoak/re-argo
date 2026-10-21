@@ -65,8 +65,10 @@ impl Analyzer for TagAnalyzer {
     fn prepare(&self, program: &Program) -> Prepared {
         // The tags of every comment, derived in parallel (in comment
         // order), then added in that order.
+        let tt = std::time::Instant::now();
         let derived: Vec<(u64, TagKind, String)> = {
             let comments: Vec<(u64, &str)> = program.comments.iter_refs().map(|(a, _, t)| (a, t)).collect();
+            crate::tr!(tt, "tagger comments {}", comments.len());
             comments
                 .par_iter()
                 .flat_map_iter(|&(addr, text)| {
@@ -77,6 +79,7 @@ impl Analyzer for TagAnalyzer {
                 .collect()
         };
 
+        crate::tr!(tt, "tagger derived {}", derived.len());
         // Function-scope tags from Function flags (in parallel, in
         // function order).
         let mut function_tags: Vec<(u64, TagKind, String)> = crate::func_lift::map_functions(program, |f| {
@@ -136,8 +139,11 @@ impl Analyzer for TagAnalyzer {
             }
         }
         // (the address tags grouped here, added at `apply`)
+        crate::tr!(tt, "tagger function tags");
         let tag_count = derived.len() + function_tags.len();
-        Box::new((AddressTagBatch::new(derived, true), function_tags, tag_count))
+        let b = AddressTagBatch::new(derived, true);
+        crate::tr!(tt, "tagger batch");
+        Box::new((b, function_tags, tag_count))
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         type Tags = Vec<(u64, TagKind, String)>;

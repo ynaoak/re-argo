@@ -544,7 +544,7 @@ impl<'scope> Started<'scope> {
             while let Ok(mut batch) = references_in.recv() {
                 // (the batches waiting added with it: one bulk add, the
                 // two maps at the same time when there are many)
-                while let Ok(more) = references_in.try_recv() {
+                while std::env::var_os("REARGO_NODRAIN").is_none() && let Ok(more) = references_in.try_recv() {
                     batch.extend_from_slice(&more);
                 }
                 let t = std::time::Instant::now();
