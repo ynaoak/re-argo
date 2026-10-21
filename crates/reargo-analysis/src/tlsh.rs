@@ -55,6 +55,10 @@ impl Analyzer for TlshAnalyzer {
     fn writes(&self) -> State {
         State::METADATA
     }
+    fn runs_last(&self) -> bool {
+        // (only `metadata.tlsh`, which no analyzer reads)
+        true
+    }
     fn name(&self) -> &str {
         "TLSH"
     }
@@ -221,38 +225,56 @@ fn build_buckets(data: &[u8]) -> ([u32; 128], u8) {
     // runs alongside.
     let windows = data.len() - 4;
     const CHUNK: usize = 1 << 18;
-    rayon::join(
-        || {
-            (0..windows.div_ceil(CHUNK))
-                .into_par_iter()
-                .map(|c| {
-                    let end = ((c + 1) * CHUNK).min(windows);
-                    FirstLookups::new().count(&data[c * CHUNK..end + 4])
-                })
-                .reduce(
-                    || [0u32; 128],
-                    |mut a, b| {
-                        for (x, y) in a.iter_mut().zip(b) {
-                            *x += y;
-                        }
-                        a
-                    },
-                )
-        },
-        || {
-            // Checksum: `c = b_mapping(c, w[0], w[1], 0)` per window,
-            // i.e. `c = V[h]` with `h = V[V[V[c] ^ w[0]] ^ w[1]]`. The
-            // chain runs on `h` instead, `h = V[V[VV[h] ^ w[0]] ^ w[1]]`
-            // (`VV = V[V[x]]`): three dependent lookups per byte, not four.
-            let vv: [u8; 256] = std::array::from_fn(|x| V_TABLE[V_TABLE[x] as usize]);
-            let step = |first: u8, a: u8, b: u8| V_TABLE[(V_TABLE[(first ^ a) as usize] ^ b) as usize];
-            let mut h = step(V_TABLE[0], data[0], data[1]);
-            for i in 1..windows {
-                h = step(vv[h as usize], data[i], data[i + 1]);
-            }
-            V_TABLE[h as usize]
-        },
-    )
+    let counts = || {
+        (0..windows.div_ceil(CHUNK))
+            .into_par_iter()
+            .map(|c| {
+                let end = ((c + 1) * CHUNK).min(windows);
+                FirstLookups::new().count(&data[c * CHUNK..end + 4])
+            })
+            .reduce(
+                || [0u32; 128],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b) {
+                        *x += y;
+                    }
+                    a
+                },
+            )
+    };
+    // Checksum: `c = b_mapping(c, w[0], w[1], 0)` per window, i.e.
+    // `c = V[h]` with `h = V[V[V[c] ^ w[0]] ^ w[1]]`. The chain runs on
+    // `h` instead, `h = V[V[VV[h] ^ w[0]] ^ w[1]]` (`VV = V[V[x]]`):
+    // three dependent lookups per byte, not four.
+    let checksum = || chain_checksum(data, windows);
+    if windows <= CHUNK {
+        return (counts(), checksum());
+    }
+    // The chain is one long serial run: on this thread, never a job of
+    // the rayon pool (a worker waiting for a job of its own there, e.g.
+    // in a scope, could take it and be held up the whole chain long),
+    // while a thread of its own hands the counts to the pool.
+    std::thread::scope(|s| {
+        let counts = s.spawn(counts);
+        let checksum = checksum();
+        (counts.join().unwrap_or_else(|e| std::panic::resume_unwind(e)), checksum)
+    })
+}
+
+/// The checksum of the `windows` 5-byte windows of `data`: `c =
+/// b_mapping(c, w[0], w[1], 0)` per window, i.e. `c = V[h]` with `h =
+/// V[V[V[c] ^ w[0]] ^ w[1]]`. The chain runs on `h` instead, `h =
+/// V[V[VV[h] ^ w[0]] ^ w[1]]` (`VV = V[V[x]]`): three dependent lookups per
+/// byte, not four.
+fn chain_checksum(data: &[u8], windows: usize) -> u8 {
+    let vv: [u8; 256] = std::array::from_fn(|x| V_TABLE[V_TABLE[x] as usize]);
+    let step = |first: u8, a: u8, b: u8| V_TABLE[(V_TABLE[(first ^ a) as usize] ^ b) as usize];
+    let mut h = step(V_TABLE[0], data[0], data[1]);
+    // (the pairs `data[i], data[i + 1]` for `i` in `1..windows`)
+    for (&a, &b) in data[1..windows].iter().zip(&data[2..=windows]) {
+        h = step(vv[h as usize], a, b);
+    }
+    V_TABLE[h as usize]
 }
 
 /// The first two lookups of [`b_mapping`] for each salt of [`bucket_window`] (they

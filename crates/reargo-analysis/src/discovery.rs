@@ -473,7 +473,7 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
         if let Some(shared) = shared.get() {
             shared.release();
         }
-        // (by part of the code, then by thread: each run sorted)
+        // (by part of the code, then by thread: each in the order decoded)
         let mut decodes: Vec<Vec<InstructionRun>> = Vec::new();
         for parts in read.iter().take(decoding) {
             decodes.resize_with(decodes.len().max(parts.len()), Vec::new);
@@ -490,7 +490,7 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             decodes[k + 1].push(rest.split_off(at));
         }
         decodes[0].push(rest);
-        listing.add_unlisted_instructions(decodes);
+        listing.add_unlisted_instructions_cut(cuts, decodes);
         let bodies = sets.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
         if let Err(e) = adding.join() {
             std::panic::resume_unwind(e);
@@ -511,8 +511,8 @@ struct Started<'scope> {
     bodies: std::sync::mpsc::Sender<Vec<(u64, Vec<AddressRange>)>>,
     adding: std::thread::ScopedJoinHandle<'scope, ()>,
     sets: std::thread::ScopedJoinHandle<'scope, Vec<(u64, AddressSet)>>,
-    /// What each decoding thread gives back: the decodes the walk read, by
-    /// address, cut into parts at [`Shared::cuts`].
+    /// What each decoding thread gives back: the decodes the walk read, in
+    /// the order decoded, cut into parts at [`Shared::cuts`].
     read: std::sync::mpsc::Receiver<Vec<InstructionRun>>,
     decoding: usize,
 }
@@ -601,7 +601,7 @@ struct Shared<'a> {
     has_body: FxHashSet<u64>,
     claims: Claims,
     /// Where the decodes handed over are cut into parts, listed on
-    /// threads of their own ([`Listing::add_unlisted_instructions`]):
+    /// threads of their own ([`Listing::add_unlisted_instructions_cut`]):
     /// ascending addresses splitting the code into equal spans.
     cuts: Vec<u64>,
     /// The entries the walk has started on (its own decodes): left to it.
@@ -685,21 +685,9 @@ fn speculate_loop(
         drop(queue);
         shared.wake.notify_all();
     }
-    // Out of work while the walk goes on: the order of its decodes by
-    // address, made now (the walk reads none of this).
-    let order = (!shared.stop.load(Ordering::Relaxed)).then(|| {
-        let mut order: Vec<(u64, u32, u32)> = own
-            .iter()
-            .enumerate()
-            .flat_map(|(s, spec)| spec.insns.iter().enumerate().map(move |(i, d)| (d.addr, s as u32, i as u32)))
-            .collect();
-        order.sort_unstable();
-        order
-    });
     // Once the walk is done and holds none of the code decoded: the
-    // decodes it read (at the addresses it visited), for the listing, by
-    // address; the others freed here, and what this thread freed given
-    // back.
+    // decodes it read (at the addresses it visited), for the listing; the
+    // others freed here, and what this thread freed given back.
     {
         let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         while !queue.collect {
@@ -718,79 +706,24 @@ fn speculate_loop(
             if d.read.load(Ordering::Relaxed) { Some((d.addr, d.dec.clone()?)) } else { None }
         }
     };
-    let read: Vec<(u64, Box<DecodedInstruction>)> = match order {
-        Some(order) => order.into_iter().filter_map(|(_, s, i)| take(&mut specs[s as usize], i as usize)).collect(),
-        None => {
-            let read: Vec<_> = specs
-                .iter_mut()
-                .flat_map(|spec| {
-                    let n = match spec {
-                        Ok(s) => s.insns.len(),
-                        Err(s) => s.insns.len(),
-                    };
-                    (0..n).filter_map(|i| take(spec, i)).collect::<Vec<_>>()
-                })
-                .collect();
-            // (each spec's run ascends: a radix sort, not a comparison sort;
-            // an address decoded twice is the same decode either way)
-            sort_by_address(read)
+    // (in the order decoded, cut into the parts at `shared.cuts`: the
+    // listing puts them in order, part by part)
+    let mut parts: Vec<InstructionRun> = vec![Vec::new(); shared.cuts.len() + 1];
+    for spec in &mut specs {
+        let n = match spec {
+            Ok(s) => s.insns.len(),
+            Err(s) => s.insns.len(),
+        };
+        for i in 0..n {
+            if let Some(d) = take(spec, i) {
+                parts[shared.cuts.partition_point(|&c| c <= d.0)].push(d);
+            }
         }
-    };
-    // (cut into the parts, at `shared.cuts`)
-    let mut parts: Vec<InstructionRun> = Vec::with_capacity(shared.cuts.len() + 1);
-    let mut rest = read;
-    for &cut in shared.cuts.iter().rev() {
-        let at = rest.partition_point(|d| d.0 < cut);
-        parts.push(rest.split_off(at));
     }
-    parts.push(rest);
-    parts.reverse();
     let _ = read_out.send(parts);
     // (while the walk lists them)
     drop(specs);
     crate::release_free_memory();
-}
-
-/// `run` sorted by address, stably (as `sort_by_key` sorts it): many
-/// addresses within 2^32 of each other by a radix sort on the address,
-/// passes of up to 12 bits.
-fn sort_by_address(mut run: InstructionRun) -> InstructionRun {
-    let (min, max) = run.iter().fold((u64::MAX, 0), |(lo, hi), d| (lo.min(d.0), hi.max(d.0)));
-    let span = max.wrapping_sub(min);
-    if run.len() < 1 << 12 || min > max || span >> 32 != 0 {
-        run.sort_by_key(|d| d.0);
-        return run;
-    }
-    // (the address less `min`, with the index: ascending indices, kept in
-    // order by each stable pass)
-    let mut order: Vec<(u32, u32)> = run.iter().enumerate().map(|(i, d)| ((d.0 - min) as u32, i as u32)).collect();
-    let bits = 64 - span.leading_zeros();
-    let passes = bits.div_ceil(12);
-    let digit = bits.div_ceil(passes.max(1));
-    let mask = (1u32 << digit) - 1;
-    let mut buf: Vec<(u32, u32)> = vec![(0, 0); order.len()];
-    let mut counts = vec![0usize; 1 << digit];
-    for p in 0..passes {
-        let shift = p * digit;
-        counts.fill(0);
-        for &(k, _) in &order {
-            counts[(k >> shift & mask) as usize] += 1;
-        }
-        let mut at = 0;
-        for c in counts.iter_mut() {
-            let n = *c;
-            *c = at;
-            at += n;
-        }
-        for &e in &order {
-            let d = (e.0 >> shift & mask) as usize;
-            buf[counts[d]] = e;
-            counts[d] += 1;
-        }
-        std::mem::swap(&mut order, &mut buf);
-    }
-    let mut slots: Vec<Option<(u64, Box<DecodedInstruction>)>> = run.into_iter().map(Some).collect();
-    order.into_iter().filter_map(|(_, i)| slots[i as usize].take()).collect()
 }
 
 /// The instruction addresses a discovery run visited: a bit per
@@ -1498,35 +1431,6 @@ mod tests {
         }
         let got: Vec<u64> = decodes.into_sorted().into_iter().map(|d| d.0).collect();
         assert_eq!(got, expected.into_iter().collect::<Vec<_>>());
-    }
-
-    /// The radix sort of decodes by address orders them as the stable
-    /// sort does (repeated addresses in their order), for spans of
-    /// every size.
-    #[test]
-    fn sort_by_address_matches_stable_sort() {
-        let code = vec![0x90u8; 64];
-        let program = make_x86_64_program(&code, 0x10000);
-        let mut decoder = program.arch.instruction_decoder(&program.info.memory);
-        let mut seed = 0x9e3779b97f4a7c15u64;
-        for (n, span) in [(10usize, 100u64), (5000, 1), (5000, 1 << 12), (9000, 1 << 13), (20000, 1 << 24), (20000, u32::MAX as u64), (20000, 1 << 33)] {
-            let base = 0x400000u64;
-            let run: InstructionRun = (0..n)
-                .map(|i| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    // (the decode's own address tells the repeats apart)
-                    let mut d = decoder.decode(0x10000 + (i % 64) as u64).unwrap();
-                    d.address = i as u64;
-                    (base + seed % (span + 1), Box::new(d))
-                })
-                .collect();
-            let key = |r: &InstructionRun| r.iter().map(|d| (d.0, d.1.address)).collect::<Vec<_>>();
-            let mut expected = key(&run);
-            expected.sort_by_key(|d| d.0);
-            assert_eq!(key(&sort_by_address(run)), expected, "{n} {span}");
-        }
     }
 
     #[test]

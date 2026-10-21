@@ -42,10 +42,12 @@ impl Analyzer for StringSearchAnalyzer {
         };
 
         let mut strings_found = 0;
+        // (the symbols added at once, in order, after)
+        let mut symbols = Vec::with_capacity(per_section.iter().map(|s| s.2.len()).sum());
         for (section_name, size, found) in per_section {
             let count = found.len();
             for (string_addr, name) in found {
-                program.symbol_table.add(Symbol::new(name, string_addr, SymbolType::Data, SourceType::Analysis));
+                symbols.push(Symbol::new(name, string_addr, SymbolType::Data, SourceType::Analysis));
                 strings_found += 1;
             }
             if count > 0 {
@@ -58,6 +60,7 @@ impl Analyzer for StringSearchAnalyzer {
                 );
             }
         }
+        program.symbol_table.add_all(symbols);
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

@@ -34,6 +34,18 @@ pub trait Analyzer: Send + Sync {
     /// analyzers that leave cores idle.
     fn start_early(&self, _program: &mut Program) {}
 
+    /// Whether everything this analyzer changes is read by no analyzer
+    /// (metadata keys of its own: no analyzer reads them, and the
+    /// properties are kept by key, so the order they are set in does not
+    /// show). The pipeline then runs it after the last analyzer instead
+    /// of at its place, its result still listed at its place: a result
+    /// started early ([`start_early`](Self::start_early)) that is still
+    /// being computed holds up no analyzer (TLSH's checksum, one long
+    /// serial run). The output is the same either way.
+    fn runs_last(&self) -> bool {
+        false
+    }
+
     /// The program state this analyzer may change (in `analyze` /
     /// `apply`). The default, everything, is always correct; a narrower
     /// set lets the pipeline prepare later analyzers before this one
