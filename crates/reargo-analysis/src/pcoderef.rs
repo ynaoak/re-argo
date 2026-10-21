@@ -42,9 +42,11 @@ use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
 /// linear scan with bitflag tests.
 #[derive(Debug, Clone)]
 pub(crate) struct SectionMap {
-    /// (start, end, is_executable)
-    ranges: Vec<(u64, u64, bool)>,
-    /// The lowest start and highest end of `ranges`.
+    /// The starts of the intervals on which `classify` is constant, ascending, beginning at
+    /// 0, with its answer on each (the first range in section order holding the address).
+    starts: Vec<u64>,
+    class: Vec<(bool, bool)>,
+    /// The lowest start and highest end of the ranges.
     lo: u64,
     hi: u64,
 }
@@ -67,10 +69,19 @@ impl SectionMap {
         Self::of_ranges(ranges)
     }
 
+    /// `ranges`: (start, end, is_executable).
     fn of_ranges(ranges: Vec<(u64, u64, bool)>) -> Self {
         let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
         let hi = ranges.iter().map(|r| r.1).max().unwrap_or(0);
-        Self { ranges, lo, hi }
+        // the answer changes only at a range's start or end: one interval per boundary
+        let mut starts: Vec<u64> = std::iter::once(0).chain(ranges.iter().flat_map(|r| [r.0, r.1])).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let first_holding = |addr: u64| {
+            ranges.iter().find(|&&(s, e, _)| addr >= s && addr < e).map_or((false, false), |&(_, _, exec)| (true, exec))
+        };
+        let class = starts.iter().map(|&b| first_holding(b)).collect();
+        Self { starts, class, lo, hi }
     }
 
     /// Whether `addr` is in a section (`classify(addr).0`).
@@ -79,14 +90,11 @@ impl SectionMap {
         addr >= self.lo && addr < self.hi && self.classify(addr).0
     }
 
-    /// `(in_section, in_executable_section)`.
+    /// `(in_section, in_executable_section)`: of the first range (in section order) that
+    /// holds `addr`.
     fn classify(&self, addr: u64) -> (bool, bool) {
-        for &(s, e, exec) in &self.ranges {
-            if addr >= s && addr < e {
-                return (true, exec);
-            }
-        }
-        (false, false)
+        // (`starts[0]` is 0: an interval holds every address)
+        self.class[self.starts.partition_point(|&b| b <= addr) - 1]
     }
 }
 
@@ -306,6 +314,16 @@ mod tests {
     fn classify_inside_exec_section() {
         let s = make_sections(&[(0x400000, 0x500000, true)]);
         assert_eq!(s.classify(0x400010), (true, true));
+    }
+
+    #[test]
+    fn classify_matches_first_holding_range() {
+        let ranges = vec![(0x1000, 0x2000, false), (0x1800, 0x3000, true), (0x2800, 0x2900, false), (0x5000, 0x5000, true), (0x4000, 0x4800, true), (0x4800, 0x5000, false)];
+        let s = SectionMap::of_ranges(ranges.clone());
+        for a in (0..0x6000u64).step_by(3).chain([0, 0xfff, 0x1000, 0x17ff, 0x1800, 0x1fff, 0x2000, 0x27ff, 0x2800, 0x28ff, 0x2900, 0x2fff, 0x3000, 0x47ff, 0x4800, 0x4fff, 0x5000, u64::MAX]) {
+            let want = ranges.iter().find(|&&(s, e, _)| a >= s && a < e).map_or((false, false), |&(_, _, x)| (true, x));
+            assert_eq!(s.classify(a), want, "{a:#x}");
+        }
     }
 
     #[test]
