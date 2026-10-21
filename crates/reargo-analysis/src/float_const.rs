@@ -150,7 +150,7 @@ impl Analyzer for FloatConstantAnalyzer {
         // Decode every instruction once, in parallel against an
         // immutable view; the hits keep listing order and are applied
         // in that order.
-        let insns: Vec<&reargo_arch::DecodedInstruction> = program.listing.instructions().collect();
+        let insns = program.listing.sorted_instructions();
         let hits: Vec<(u64, Hit)> = insns
             .par_iter()
             .filter_map(|i| {

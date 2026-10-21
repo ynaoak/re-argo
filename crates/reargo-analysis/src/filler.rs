@@ -65,7 +65,10 @@ impl Analyzer for FillerBytesAnalyzer {
                     offset += 1;
                     continue;
                 }
-                let byte = program.info.memory.read_byte(current);
+                let byte = match section_bytes {
+                    Some(bytes) => Some(bytes[offset as usize]),
+                    None => program.info.memory.read_byte(current),
+                };
                 match byte {
                     Some(filler_byte @ (0xCC | 0x90 | 0x00)) => {
                         let start = current;

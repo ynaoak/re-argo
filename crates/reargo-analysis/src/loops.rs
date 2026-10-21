@@ -64,6 +64,9 @@ impl Analyzer for LoopAnalyzer {
         // in function order.
         let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
         let listing = &program.listing;
+        // (the body walks read the instructions sorted: no instruction is
+        // listed after this analyzer)
+        listing.sorted_instructions();
         let back_edges: Vec<(u64, u64, u64)> = funcs
             .par_iter()
             .flat_map_iter(|f| {

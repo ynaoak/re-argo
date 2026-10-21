@@ -168,12 +168,11 @@ impl Analyzer for MagicDivisionAnalyzer {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
             return Box::new(Vec::<(u64, u32)>::new());
         }
-        let insns: Vec<&reargo_arch::DecodedInstruction> = program.listing.instructions().collect();
+        let insns = program.listing.sorted_instructions();
         let hits: Vec<(u64, u32)> = insns
             .par_iter()
             .filter_map(|i| decode_magic_imul(i.address, &i.bytes).map(|d| (i.address, d)))
             .collect();
-        drop(insns);
         Box::new(hits)
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {

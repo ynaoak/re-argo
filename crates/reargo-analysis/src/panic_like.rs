@@ -88,6 +88,9 @@ impl Analyzer for PanicLikeAnalyzer {
         }
         let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
         let listing = &program.listing;
+        // (the body walks read the instructions sorted: no instruction is
+        // listed after this analyzer)
+        listing.sorted_instructions();
         let snaps: Vec<FuncSnap> = funcs
             .par_iter()
             .filter_map(|f| {

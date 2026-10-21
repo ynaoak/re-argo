@@ -65,6 +65,9 @@ impl Analyzer for DeadCodeAnalyzer {
         // Functions are independent: walk them in parallel, keeping
         // the results in function order.
         let listing = &program.listing;
+        // (the body walks read the instructions sorted: no instruction is
+        // listed after this analyzer)
+        listing.sorted_instructions();
         let per_function: Vec<Vec<u64>> = snaps.par_iter().map(|snap| {
             let mut unreachable: Vec<u64> = Vec::new();
             // Build the per-function block-start set by walking

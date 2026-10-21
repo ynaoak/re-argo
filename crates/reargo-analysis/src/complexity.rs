@@ -77,6 +77,9 @@ impl Analyzer for ComplexityAnalyzer {
         // function order.
         let funcs: Vec<&reargo_program::function::Function> = program.listing.functions().collect();
         let listing = &program.listing;
+        // (the body walks read the instructions sorted: no instruction is
+        // listed after this analyzer)
+        listing.sorted_instructions();
         let computed: Vec<(u64, FunctionMetrics)> = funcs
             .par_iter()
             .map(|f| {

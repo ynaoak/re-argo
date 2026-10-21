@@ -63,7 +63,9 @@ impl Analyzer for AntiDebugAnalyzer {
 
         // (1)+(2)+(3) — bytewise scan of every decoded instruction.
         let mut bytewise: Vec<(u64, &'static str)> = Vec::new();
-        for insn in program.listing.instructions() {
+        // (no instruction is listed after this analyzer: the sorted ones are
+        // kept for those after it)
+        for insn in program.listing.sorted_instructions() {
             if let Some(note) = bytewise_pattern(&insn.bytes) {
                 bytewise.push((insn.address, note));
             }

@@ -210,8 +210,9 @@ pub(crate) fn scan_lifted(lifted: &[&LiftedInstruction], sections: &SectionMap) 
 /// its lift may hold where the scan reads one (else it adds nothing).
 pub(crate) fn scan_range(insns: &[reargo_lift::x86::RangeInsn], sections: &SectionMap) -> Vec<(u64, u64, RefType)> {
     let mut out: Vec<(u64, u64, RefType)> = Vec::new();
+    let keep = reargo_lift::x86::ConstKeep::new(|c| sections.contains(c));
     for insn in insns {
-        if let Some(insn) = insn.lifted_unless_no_const(|c| sections.contains(c)) {
+        if let Some(insn) = insn.lifted_unless_no_const(&keep) {
             scan_insn(insn, sections, &mut out);
         }
     }

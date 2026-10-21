@@ -86,6 +86,9 @@ impl Analyzer for WrapperFunctionAnalyzer {
             .collect();
 
         let mut wrappers: Vec<(u64, u64)> = Vec::new();
+        // (the body walks read the instructions sorted: no instruction is
+        // listed after this analyzer)
+        program.listing.sorted_instructions();
         for snap in &snaps {
             if snap.is_thunk {
                 continue;
