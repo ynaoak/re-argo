@@ -106,7 +106,9 @@ impl State {
     /// The other function fields: `stack_frame`, `return_type`,
     /// `parameters`, `library`.
     pub const FUNC_OTHER: State = State(1 << 6);
-    pub const SYMBOLS: State = State(1 << 7);
+    /// The symbol table, [`STRING_SYMBOLS`](Self::STRING_SYMBOLS)
+    /// included.
+    pub const SYMBOLS: State = State(1 << 7).union(Self::STRING_SYMBOLS);
     pub const REFERENCES: State = State(1 << 8);
     pub const COMMENTS: State = State(1 << 9);
     pub const TAGS: State = State(1 << 10);
@@ -123,6 +125,13 @@ impl State {
     /// that looks for them reads it, so the pipeline never moves that
     /// `prepare` before an analyzer that stores or takes them.
     pub const SHARED_LIFT: State = State(1 << 15);
+    /// The `s_<address>` data symbols the Call Site Annotator adds at
+    /// the strings it read, each at an address that had no symbol (a
+    /// part of [`SYMBOLS`](Self::SYMBOLS)). A reader that only looks
+    /// for symbols by names of its own (none of the form `s_<hex>`), or
+    /// by the first symbol of an address whose name it then matches so,
+    /// does not read them: `SYMBOLS.difference(STRING_SYMBOLS)`.
+    pub const STRING_SYMBOLS: State = State(1 << 16);
     /// The instructions and the functions' code: [`INSNS`](Self::INSNS),
     /// [`FUNCS`](Self::FUNCS) and [`FUNC_THUNK`](Self::FUNC_THUNK).
     pub const CODE: State = Self::INSNS.union(Self::FUNCS).union(Self::FUNC_THUNK);

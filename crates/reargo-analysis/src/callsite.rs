@@ -316,9 +316,18 @@ pub(crate) fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) ->
 
 /// [`dedup_sites`] without copying them.
 pub(crate) fn dedup_site_refs<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<&'a CallSite> {
-    // (the sets sized for all of them at once: no growing)
     let per_func: Vec<&[CallSite]> = per_func.collect();
     let n = per_func.iter().map(|f| f.len()).sum();
+    // Sites in strictly increasing order have no repeats: all are kept,
+    // with no set (the usual case: a function walks only the calls it
+    // owns, after its entry and before the next one's).
+    let mut prev: Option<u64> = None;
+    if per_func.iter().flat_map(|f| f.iter()).all(|s| prev.replace(s.call_site).is_none_or(|p| p < s.call_site)) {
+        let mut out: Vec<&CallSite> = Vec::with_capacity(n);
+        out.extend(per_func.into_iter().flatten());
+        return out;
+    }
+    // (the sets sized for all of them at once: no growing)
     let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(n, Default::default());
     let mut out: Vec<&CallSite> = Vec::with_capacity(n);
     for site in per_func.into_iter().flatten() {
@@ -652,11 +661,15 @@ pub fn resolve_call_sites_iterative_from(
     let owned = |sites: &[&CallSite]| -> Vec<CallSite> { sites.par_iter().with_min_len(1024).map(|&s| s.clone()).collect() };
     // Each round's view of the call sites read once: its count, then the
     // next round's summaries (or the result).
+    let tt = std::time::Instant::now();
+    let trc = std::env::var_os("REARGO_TRACE").is_some();
     let first = view(round0, &rewalked);
+    if trc { eprintln!("TRACE       resolver view0 {:.1}", tt.elapsed().as_secs_f64()*1e3); }
     let mut prev_total_known = count_known_args(&first);
     let mut summaries = (max_iters > 0).then(|| summaries_of(&first));
     let mut sites = if max_iters == 0 { owned(&first) } else { Vec::new() };
     drop(first);
+    if trc { eprintln!("TRACE       resolver summaries0 {:.1}", tt.elapsed().as_secs_f64()*1e3); }
     // the lifts of the functions rewalked, for the next rounds (mostly
     // the same functions)
     let mut lifts = RewalkLifts::default();
@@ -666,17 +679,21 @@ pub fn resolve_call_sites_iterative_from(
         let Some(round_summaries) = summaries.take() else { break };
         let prev = prev_summaries.as_ref().map(|s| (s, std::mem::take(&mut rewalked)));
         rewalked = rewalk_functions(lifter, program, round0, &round_summaries, &mut lifts, prev);
+        if trc { eprintln!("TRACE       resolver round {} rewalked {:.1}", round, tt.elapsed().as_secs_f64()*1e3); }
         let current = view(round0, &rewalked);
         let next_known = count_known_args(&current);
+        if trc { eprintln!("TRACE       resolver round {} viewed {:.1}", round, tt.elapsed().as_secs_f64()*1e3); }
         if next_known == prev_total_known || round + 1 == max_iters {
             sites = owned(&current);
             break;
         }
         prev_total_known = next_known;
         summaries = Some(summaries_of(&current));
+        if trc { eprintln!("TRACE       resolver round {} summaries {:.1}", round, tt.elapsed().as_secs_f64()*1e3); }
         drop(current);
         prev_summaries = Some(round_summaries);
     }
+    if trc { eprintln!("TRACE       resolver done {:.1}", tt.elapsed().as_secs_f64()*1e3); }
     // (the lifts and walks are freed on another thread)
     rayon::spawn(move || drop((lifts, rewalked)));
     Ok(sites)

@@ -117,7 +117,7 @@ impl Analyzer for ArgumentArityAnalyzer {
 
 /// The instructions lifted from a function's entry.
 pub(crate) fn budget(f: &reargo_program::function::Function) -> usize {
-    f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200)
+    crate::func_lift::body_size(f).max(200)
 }
 
 /// [`infer_arity`] of functions, computed ahead of this analyzer from

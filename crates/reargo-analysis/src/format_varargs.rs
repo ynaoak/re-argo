@@ -60,8 +60,11 @@ impl Analyzer for FormatVarargsAnalyzer {
         // The round-0 call sites, reusing the walks the Call Site
         // Annotator (750) left for the functions unchanged since. The
         // last reader: the shared results are dropped here.
+        let t = std::time::Instant::now();
         let shared = crate::shared_lift::compute(program, false);
+        let a = t.elapsed().as_secs_f64()*1e3;
         let sites = shared.round0_sites();
+        let b = t.elapsed().as_secs_f64()*1e3;
 
         let mut per_callee_max: BTreeMap<String, usize> = BTreeMap::new();
         let mut emitted = 0usize;
@@ -106,6 +109,7 @@ impl Analyzer for FormatVarargsAnalyzer {
             }
         }
 
+        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     fv compute {:.1} sites {:.1} loop {:.1} n {}", a, b-a, t.elapsed().as_secs_f64()*1e3-b, sites.len()); }
         // (freed on another thread)
         drop(sites);
         rayon::spawn(move || drop(shared));

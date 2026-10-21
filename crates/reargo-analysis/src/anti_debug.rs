@@ -47,7 +47,8 @@ impl Analyzer for AntiDebugAnalyzer {
         795
     }
     fn prepare_reads(&self) -> Option<State> {
-        Some(State::CODE.union(State::REFERENCES).union(State::SYMBOLS))
+        // (the symbols of the debugger APIs it looks for by name)
+        Some(State::CODE.union(State::REFERENCES).union(State::SYMBOLS.difference(State::STRING_SYMBOLS)))
     }
     fn writes(&self) -> State {
         State::COMMENTS

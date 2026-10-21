@@ -59,8 +59,9 @@ impl Analyzer for CallSiteAnnotator {
         Some(State::ALL.difference(State::CACHE).union(State::SHARED_LIFT))
     }
     fn writes(&self) -> State {
-        // `apply` takes the shared results stored before and stores its own
-        State::SYMBOLS
+        // `apply` takes the shared results stored before and stores its
+        // own; the only symbols it adds are the strings' `s_<address>`
+        State::STRING_SYMBOLS
             .union(State::COMMENTS)
             .union(State::CALL_RENDERINGS)
             .union(State::CACHE)
@@ -80,11 +81,17 @@ impl Analyzer for CallSiteAnnotator {
         if crate::shared_lift::has_stored(program) {
             return Box::new(Step::Later);
         }
+        let t = std::time::Instant::now();
         let shared = crate::shared_lift::compute_from(program, None, true);
-        Box::new(Step::Resolved(resolve(program, shared)))
+        let a = t.elapsed().as_secs_f64()*1e3;
+        let (shared, sites) = resolve(program, shared);
+        // (the program is as at the analyzer's place: its run starts here)
+        let found = sites.map(|sites| annotations(program, &sites));
+        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     csa compute_from {:.1} resolve {:.1}", a, t.elapsed().as_secs_f64()*1e3 - a); }
+        Box::new(Step::Resolved(shared, found))
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
-        let (mut shared, sites) = match crate::analyzer::prepared::<Step>(prepared) {
+        let (mut shared, found) = match crate::analyzer::prepared::<Step>(prepared) {
             Step::NotX86 => {
                 return Ok(AnalysisResult {
                     analyzer_name: self.name().into(),
@@ -95,14 +102,21 @@ impl Analyzer for CallSiteAnnotator {
             }
             Step::Later => {
                 let shared = crate::shared_lift::compute(program, true);
-                resolve(program, shared)
+                let (shared, sites) = resolve(program, shared);
+                (shared, sites.map(|sites| annotations(program, &sites)))
             }
-            Step::Resolved(resolved) => resolved,
+            Step::Resolved(shared, found) => (shared, found),
         };
+        let t = std::time::Instant::now();
         crate::shared_lift::store_ahead(program, &mut shared);
-        let sites = sites?;
+        let a = t.elapsed().as_secs_f64()*1e3;
+        let found = found?;
         crate::shared_lift::store(program, shared);
-        self.annotate(program, sites)
+        let b = t.elapsed().as_secs_f64()*1e3;
+        let n = found.len();
+        let r = self.annotate(program, found);
+        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE     csa apply ahead {:.1} store {:.1} annotate {:.1} sites {}", a, b-a, t.elapsed().as_secs_f64()*1e3-b, n); }
+        r
     }
 }
 
@@ -112,9 +126,54 @@ enum Step {
     /// To compute at the analyzer's place: the analysis cache holds
     /// results to reuse (taking them changes it).
     Later,
-    /// The per-function results (the walks given back) and the call
-    /// sites resolved.
-    Resolved((crate::shared_lift::SharedLift, Result<Vec<crate::callsite::CallSite>, AnalysisError>)),
+    /// The per-function results (the walks given back) and the
+    /// annotations of the call sites resolved.
+    Resolved(crate::shared_lift::SharedLift, Result<Vec<Annotation>, AnalysisError>),
+}
+
+/// What the annotator writes for one call site: its pre-comment, its C
+/// rendering, and the addresses read as C strings for it.
+struct Annotation {
+    call_site: u64,
+    text: String,
+    rendering: String,
+    strings: Vec<u64>,
+}
+
+/// The annotation of each call site of `sites` (in order) whose target's
+/// first symbol names a function of the signature database and that has
+/// no pre-comment yet, formatted in parallel. (The sites are distinct, so
+/// none of them sets the pre-comment another one checks.)
+fn annotations(program: &Program, sites: &[crate::callsite::CallSite]) -> Vec<Annotation> {
+    let db = signature_db();
+    sites
+        .par_iter()
+        .with_min_len(1024)
+        // (the signature of each call target looked up once per thread:
+        // the symbols do not change meanwhile)
+        .map_init(rustc_hash::FxHashMap::<u64, Option<&FunctionSignature>>::default, |sig_of, site| {
+            let target = site.call_target?;
+            let found = *sig_of.entry(target).or_insert_with(|| {
+                let sym = program.symbol_table.primary_at(target)?;
+                db.lookup_by_name(&sym.name)
+            });
+            let sig = found?;
+            if program.comments.get(site.call_site, CommentType::Pre).is_some() {
+                return None;
+            }
+            let mut strings = Vec::new();
+            let (text, rendering) = format_call(sig, site, program, &mut strings);
+            Some(Annotation { call_site: site.call_site, text, rendering, strings })
+        })
+        .flatten()
+        .collect()
+}
+
+/// The signature database (built once).
+fn signature_db() -> &'static SignatureDatabase {
+    use std::sync::OnceLock;
+    static DB: OnceLock<SignatureDatabase> = OnceLock::new();
+    DB.get_or_init(SignatureDatabase::new)
 }
 
 /// The call sites of the program resolved from the per-function results
@@ -205,42 +264,18 @@ fn resolve(
 }
 
 impl CallSiteAnnotator {
-    /// The comments and renderings of the call sites `sites`.
-    fn annotate(&self, program: &mut Program, sites: Vec<crate::callsite::CallSite>) -> Result<AnalysisResult, AnalysisError> {
-        use std::sync::OnceLock;
-        static DB: OnceLock<SignatureDatabase> = OnceLock::new();
-        let db = DB.get_or_init(SignatureDatabase::new);
-
-        let mut annotated = 0usize;
+    /// Write the annotations `found` (in order): each one's pre-comment
+    /// and rendering.
+    fn annotate(&self, program: &mut Program, found: Vec<Annotation>) -> Result<AnalysisResult, AnalysisError> {
+        let annotated = found.len();
         let mut string_promotions: Vec<u64> = Vec::new();
-        // The signature of each call target, looked up once (the symbols
-        // do not change in the loop).
-        let mut sig_of: rustc_hash::FxHashMap<u64, Option<&FunctionSignature>> = rustc_hash::FxHashMap::default();
-        for site in &sites {
-            let Some(target) = site.call_target else {
-                continue;
-            };
-            let found = *sig_of.entry(target).or_insert_with(|| {
-                let sym = program.symbol_table.primary_at(target)?;
-                db.lookup_by_name(&sym.name)
-            });
-            let Some(sig) = found else {
-                continue;
-            };
-            if program
-                .comments
-                .get(site.call_site, CommentType::Pre)
-                .is_some()
-            {
-                continue;
-            }
-            let (text, rendering) = format_call(sig, site, program, &mut string_promotions);
-            program.comments.set(site.call_site, CommentType::Pre, text);
+        for a in found {
+            program.comments.set(a.call_site, CommentType::Pre, a.text);
             // Store the C-syntax form for the decompiler emitters to
             // pick up — they otherwise emit `printf@plt()` with no
             // arguments.
-            program.call_renderings.insert(site.call_site, rendering);
-            annotated += 1;
+            program.call_renderings.insert(a.call_site, a.rendering);
+            string_promotions.extend(a.strings);
         }
 
         // Light type-propagation: every address we successfully read as

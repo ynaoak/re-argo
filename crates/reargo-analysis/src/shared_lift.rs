@@ -48,7 +48,6 @@ use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
 use crate::callsite::{walk_function_shaped, walk_prefix, CallSite, ParamSummaries, WalkPrefix};
-use crate::func_lift::function_jobs;
 
 /// One function's results.
 pub(crate) struct FunctionResults {
@@ -127,6 +126,7 @@ pub(crate) fn has_stored(program: &Program) -> bool {
 /// [`compute`] reusing the results in `cached` (taken out of the
 /// program's analysis cache) that still hold.
 pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snapshots: bool) -> SharedLift {
+    let t_start = std::time::Instant::now();
     let jump_mark = program.references.jump_mark();
     // The jump references added since the cached results, by target.
     let (mut cached_funcs, changed): (FxHashMap<u64, FunctionResults>, Option<Vec<Reference>>) = match cached {
@@ -145,19 +145,28 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     // (below) is built meanwhile.
     let none_cached = cached_funcs.is_empty();
     let (early_jumps, (jobs, arity_budgets)) = rayon::join(
-        || none_cached.then(|| crate::func_lift::JumpIndex::new(program)),
+        || { let t = std::time::Instant::now(); let r = none_cached.then(|| crate::func_lift::JumpIndex::new(program)); if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       jumpindex {:.1}..{:.1}", t.duration_since(t_start).as_secs_f64()*1e3, t_start.elapsed().as_secs_f64()*1e3); } r },
         || {
-            let jobs: Vec<(u64, usize, Option<FunctionResults>)> = function_jobs(program)
-                .into_iter()
-                .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
-                .collect();
-            // Argument Arity's budget of each function, in the same order.
+            let t = std::time::Instant::now();
+            let _g = Tg(t, t_start);
+            // Each body's size, summed in parallel (in listing order):
+            // the lift budget and Argument Arity's budget of each
+            // function are made from it.
+            let functions: Vec<&reargo_program::Function> = program.listing.functions().collect();
+            let sizes: Vec<(u64, usize)> =
+                functions.par_iter().with_min_len(256).map(|f| (f.entry_point, crate::func_lift::body_size(f))).collect();
+            // (as `crate::func_lift::function_jobs`)
+            let jobs: Vec<(u64, usize, Option<FunctionResults>)> =
+                sizes.iter().map(|&(entry, size)| (entry, size.max(500), cached_funcs.remove(&entry))).collect();
+            // Argument Arity's budget of each function, in the same order
+            // (as `arity::budget`).
             let arity_budgets: Vec<usize> =
-                if with_snapshots { program.listing.functions().map(crate::arity::budget).collect() } else { Vec::new() };
+                if with_snapshots { sizes.iter().map(|&(_, size)| size.max(200)).collect() } else { Vec::new() };
             (jobs, arity_budgets)
         },
     );
     drop(cached_funcs);
+    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       shared-lift jobs {:.1}", t_start.elapsed().as_secs_f64()*1e3); }
     // The cached results that still hold; the others are computed again.
     let jobs: Vec<(u64, usize, Option<FunctionResults>)> = jobs
         .into_par_iter()
@@ -170,6 +179,7 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
         .collect();
     // Index the jump references when many functions are computed (else
     // a lookup per lifted instruction costs less than the index).
+    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       shared-lift valid {:.1}", t_start.elapsed().as_secs_f64()*1e3); }
     let stale = jobs.iter().filter(|j| j.2.is_none()).count();
     let jumps = (stale > jobs.len() / 8).then(|| early_jumps.unwrap_or_else(|| crate::func_lift::JumpIndex::new(program)));
     // The consecutive functions a thread runs share a lift cache
@@ -202,11 +212,19 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
         .collect();
     // (the runs one rayon job takes, in order, share one cache: a run lifts again only what
     // the run before it did not)
+    let tq = std::time::Instant::now();
+    let trc = std::env::var_os("REARGO_TRACE").is_some();
+    if trc { eprintln!("TRACE       shared-lift setup {:.1}", t_start.elapsed().as_secs_f64()*1e3); }
+    let nchunks = chunks.len();
+    let times: std::sync::Mutex<Vec<(f64,f64,usize,Option<usize>)>> = Default::default();
     let computed: Vec<Vec<(FunctionResults, Extra)>> = chunks
         .into_par_iter()
+        .enumerate()
         .map_init(
             || (reargo_lift::x86::LiftCache::lazy(), Scratch::default()),
-            |(cache, scratch), chunk| {
+            |(cache, scratch), (ci, chunk)| {
+                let st = tq.elapsed().as_secs_f64()*1e3;
+                let _g = TimeGuard(&times, st, ci, tq);
             let (x86, jumps) = (&x86, jumps.as_ref());
             chunk
                 .into_iter()
@@ -251,6 +269,15 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
             },
         )
         .collect();
+    if trc {
+        let mut t = times.into_inner().unwrap();
+        t.sort_by(|a,b| a.1.partial_cmp(&b.1).unwrap());
+        eprintln!("TRACE       shared-lift chunks {} done at {:.1}", nchunks, tq.elapsed().as_secs_f64()*1e3);
+        for x in t.iter().rev().take(6) { eprintln!("TRACE         chunk {} start {:.1} end {:.1} thr {:?}", x.2, x.0, x.1, x.3); }
+        let mut d: Vec<f64> = t.iter().map(|x| x.1-x.0).collect(); d.sort_by(|a,b| b.partial_cmp(a).unwrap());
+        eprintln!("TRACE         longest chunks {:?}", &d[..d.len().min(6)]);
+    }
+    let tm = std::time::Instant::now();
     let mut ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
     let funcs: Vec<FunctionResults> = computed
         .into_iter()
@@ -263,8 +290,11 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
             f
         })
         .collect();
+    if trc { eprintln!("TRACE       shared-lift merge {:.1}", tm.elapsed().as_secs_f64()*1e3); }
     SharedLift { funcs, jump_mark, ahead }
 }
+struct TimeGuard<'a>(&'a std::sync::Mutex<Vec<(f64,f64,usize,Option<usize>)>>, f64, usize, std::time::Instant);
+impl Drop for TimeGuard<'_> { fn drop(&mut self) { self.0.lock().unwrap().push((self.1, self.3.elapsed().as_secs_f64()*1e3, self.2, rayon::current_thread_index())); } }
 
 /// Leave the Argument Arity and Calling Convention results [`compute`]
 /// took from its lifts on the program for those analyzers (beside the
@@ -508,3 +538,6 @@ mod tests {
         assert!(!gained(Reference::new(0x2000, 0x1002, RefType::DataRead)));
     }
 }
+
+struct Tg(std::time::Instant, std::time::Instant);
+impl Drop for Tg { fn drop(&mut self) { if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       fjobs {:.1}..{:.1}", self.0.duration_since(self.1).as_secs_f64()*1e3, self.1.elapsed().as_secs_f64()*1e3); } } }

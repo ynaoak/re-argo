@@ -57,7 +57,9 @@ impl Analyzer for VulnAnalyzer {
         &["vuln-patterns"]
     }
     fn prepare_reads(&self) -> Option<State> {
-        Some(State::SYMBOLS.union(State::CODE))
+        // (the first symbol of each call target, matched against the
+        // names of the dangerous APIs: an `s_<address>` one matches none)
+        Some(State::SYMBOLS.difference(State::STRING_SYMBOLS).union(State::CODE))
     }
     fn writes(&self) -> State {
         State::TAGS

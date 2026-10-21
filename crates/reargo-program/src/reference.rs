@@ -336,10 +336,11 @@ impl ReferenceManager {
     /// order (by target, those to one target in the order added), from
     /// the log of jumps instead of a walk over every reference.
     pub fn jump_refs_sorted_by_target(&self) -> Vec<Reference> {
-        let mut jumps = self.jumps.clone();
         // stable: the references to one target stay in the order added
-        jumps.sort_by_key(|r| r.to);
-        jumps
+        // (by target, then index)
+        let mut order: Vec<(u64, u32)> = self.jumps.iter().enumerate().map(|(i, r)| (r.to, i as u32)).collect();
+        sort_keyed(&mut order);
+        order.into_iter().map(|(_, i)| self.jumps[i as usize]).collect()
     }
 
     /// Each address in `start..end` with references to it, and those

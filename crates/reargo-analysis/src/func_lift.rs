@@ -11,11 +11,13 @@ use reargo_program::Program;
 /// Instruction budget used for a function: the sum of its body range
 /// sizes in bytes, at least 500.
 pub fn lift_budget(func: &reargo_program::Function) -> usize {
-    func.body
-        .ranges()
-        .map(|r| r.size as usize)
-        .sum::<usize>()
-        .max(500)
+    body_size(func).max(500)
+}
+
+/// The bytes of a function's body ranges, summed (the lift budgets are
+/// made from it).
+pub fn body_size(func: &reargo_program::Function) -> usize {
+    func.body.ranges().map(|r| r.size as usize).sum::<usize>()
 }
 
 /// `(entry, instruction budget)` of every function, in
@@ -143,7 +145,11 @@ pub struct JumpIndex {
 impl JumpIndex {
     pub fn new(program: &Program) -> Self {
         // sorted by target already
-        let refs = program.references.jump_refs_sorted_by_target().into_iter().map(|r| (r.to, r.from, r.ref_type)).collect();
+        let t = std::time::Instant::now();
+        let v = program.references.jump_refs_sorted_by_target();
+        let a = t.elapsed().as_secs_f64()*1e3;
+        let refs: Vec<_> = v.into_iter().map(|r| (r.to, r.from, r.ref_type)).collect();
+        if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE        jumpindex n {} sort {:.1} map {:.1}", refs.len(), a, t.elapsed().as_secs_f64()*1e3 - a); }
         Self { refs }
     }
 

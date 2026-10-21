@@ -25,11 +25,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use reargo_program::comments::CommentType;
 use reargo_program::Program;
 
-use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
+use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, Prepared, State};
 
 pub struct ExceptionFlowAnalyzer;
 
+/// What [`ExceptionFlowAnalyzer::prepare`] found: each direct call of
+/// an EH helper from a listed instruction (in reference order) with
+/// its note, and each non-thunk function calling one, with its plate
+/// (the functions' names are checked at `apply`).
+type Found = (Vec<(u64, &'static str)>, Vec<(u64, String)>);
+
 impl Analyzer for ExceptionFlowAnalyzer {
+    fn prepare_reads(&self) -> Option<State> {
+        // (the symbols of the EH helpers it looks for by name)
+        Some(State::CODE.union(State::REFERENCES).union(State::SYMBOLS.difference(State::STRING_SYMBOLS)))
+    }
     fn writes(&self) -> State {
         State::COMMENTS
     }
@@ -45,6 +55,10 @@ impl Analyzer for ExceptionFlowAnalyzer {
         790
     }
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
+        let prepared = self.prepare(program);
+        self.apply(program, prepared)
+    }
+    fn prepare(&self, program: &Program) -> Prepared {
         // Index EH helper addresses by behaviour class.
         let mut throw_addrs: BTreeSet<u64> = BTreeSet::new();
         let mut catch_addrs: BTreeSet<u64> = BTreeSet::new();
@@ -68,12 +82,7 @@ impl Analyzer for ExceptionFlowAnalyzer {
             }
         }
         if throw_addrs.is_empty() && catch_addrs.is_empty() && unwind_addrs.is_empty() {
-            return Ok(AnalysisResult {
-                analyzer_name: self.name().into(),
-                functions_found: 0,
-                references_found: 0,
-                instructions_decoded: 0,
-            });
+            return Box::new(None::<Found>);
         }
 
         // Per-function aggregation of which classes were observed.
@@ -85,22 +94,14 @@ impl Analyzer for ExceptionFlowAnalyzer {
         }
         let mut per_func: BTreeMap<u64, EhUse> = BTreeMap::new();
 
-        // (1) Per-call-site Post comments.
-        let mut emitted = 0usize;
         // PLT stubs / thunks call EH primitives by construction
         // (a `printf@plt` "calls" the GOT slot which can resolve to
         // a libc that internally throws). Skip them — the EH plate
-        // is only meaningful on actual caller functions.
-        let func_targets: Vec<(u64, Vec<u64>)> = program
-            .listing
-            .functions()
-            .filter(|f| !f.is_thunk && !f.name.contains("@plt"))
-            .map(|f| (f.entry_point, f.call_targets.iter().copied().collect()))
-            .collect();
-
-        for (entry, targets) in &func_targets {
+        // is only meaningful on actual caller functions. (A name with
+        // `@plt` is skipped at `apply`, where the names are final.)
+        for f in program.listing.functions().filter(|f| !f.is_thunk) {
             let mut use_ = EhUse::default();
-            for t in targets {
+            for t in &f.call_targets {
                 if throw_addrs.contains(t) {
                     use_.throws = true;
                 }
@@ -112,7 +113,7 @@ impl Analyzer for ExceptionFlowAnalyzer {
                 }
             }
             if use_.throws || use_.catches || use_.unwinds {
-                per_func.insert(*entry, use_);
+                per_func.insert(f.entry_point, use_);
             }
         }
 
@@ -123,7 +124,7 @@ impl Analyzer for ExceptionFlowAnalyzer {
         // plumbing, and `IndirectCall` refs are produced by the
         // IndirectCallAnalyzer's coarse "nearest import" heuristic
         // and don't carry enough provenance to drive EH flagging.
-        let edges: Vec<(u64, u64)> = program
+        let edges: Vec<(u64, &'static str)> = program
             .references
             .all_refs()
             .filter(|r| {
@@ -138,26 +139,55 @@ impl Analyzer for ExceptionFlowAnalyzer {
                     || catch_addrs.contains(&r.to)
                     || unwind_addrs.contains(&r.to)
             })
-            .map(|r| (r.from, r.to))
-            .collect();
-
-        for (from, to) in edges {
             // Only annotate code references — GOT relocations etc.
             // also point at these symbols but aren't user-meaningful.
-            if program
-                .listing
-                .get_instruction(from)
-                .is_none()
-            {
-                continue;
-            }
-            let note = if throw_addrs.contains(&to) {
-                "C++ throw / allocate (Itanium ABI)"
-            } else if catch_addrs.contains(&to) {
-                "C++ catch entry / exit (Itanium ABI)"
-            } else {
-                "C++ unwind / personality (Itanium ABI)"
-            };
+            .filter(|r| program.listing.get_instruction(r.from).is_some())
+            .map(|r| {
+                let note = if throw_addrs.contains(&r.to) {
+                    "C++ throw / allocate (Itanium ABI)"
+                } else if catch_addrs.contains(&r.to) {
+                    "C++ catch entry / exit (Itanium ABI)"
+                } else {
+                    "C++ unwind / personality (Itanium ABI)"
+                };
+                (r.from, note)
+            })
+            .collect();
+
+        // Plate comments on each EH-using function summarising the
+        // role(s).
+        let plates: Vec<(u64, String)> = per_func
+            .into_iter()
+            .map(|(entry, use_)| {
+                let mut roles: Vec<&str> = Vec::new();
+                if use_.throws {
+                    roles.push("throws");
+                }
+                if use_.catches {
+                    roles.push("catches");
+                }
+                if use_.unwinds {
+                    roles.push("unwinds");
+                }
+                (entry, format!("C++ EH: {}", roles.join(" / ")))
+            })
+            .collect();
+        Box::new(Some::<Found>((edges, plates)))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let found: Option<Found> = crate::analyzer::prepared(prepared);
+        let Some((edges, plates)) = found else {
+            return Ok(AnalysisResult {
+                analyzer_name: self.name().into(),
+                functions_found: 0,
+                references_found: 0,
+                instructions_decoded: 0,
+            });
+        };
+        let mut emitted = 0usize;
+
+        // (1) Per-call-site Post comments.
+        for (from, note) in edges {
             if program.comments.get(from, CommentType::Post).is_some() {
                 continue;
             }
@@ -165,33 +195,23 @@ impl Analyzer for ExceptionFlowAnalyzer {
             emitted += 1;
         }
 
-        // (2) Plate comments on each EH-using function summarising
-        // the role(s).
-        for (entry, use_) in &per_func {
-            if program.comments.get(*entry, CommentType::Plate).is_some() {
+        // (2) The plates of the functions not named as a PLT stub.
+        let mut functions = 0usize;
+        for (entry, text) in plates {
+            if program.listing.get_function(entry).is_some_and(|f| f.name.contains("@plt")) {
                 continue;
             }
-            let mut roles: Vec<&str> = Vec::new();
-            if use_.throws {
-                roles.push("throws");
+            functions += 1;
+            if program.comments.get(entry, CommentType::Plate).is_some() {
+                continue;
             }
-            if use_.catches {
-                roles.push("catches");
-            }
-            if use_.unwinds {
-                roles.push("unwinds");
-            }
-            program.comments.set(
-                *entry,
-                CommentType::Plate,
-                format!("C++ EH: {}", roles.join(" / ")),
-            );
+            program.comments.set(entry, CommentType::Plate, text);
             emitted += 1;
         }
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
-            functions_found: per_func.len(),
+            functions_found: functions,
             references_found: 0,
             instructions_decoded: emitted,
         })
