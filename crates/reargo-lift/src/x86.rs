@@ -190,16 +190,21 @@ pub struct LiftCache {
     head: usize,
     /// Entries held (not dead).
     live: usize,
-    /// The lift of each index, in a ring (slot: the index modulo its length, a power of two
-    /// that holds every entry from `base` on, doubled when they fill it; none where it
-    /// failed, [`FAILED`], or was dropped, [`DEAD`]), made when the entry is added or, for an
-    /// instruction whose facts the decode gives ([`X86Lifter::decoded_facts`]), when first
-    /// read ([`Self::insn`]): a range's walk reads the facts of every instruction, its passes
-    /// the ops of a few.
+    /// The lift of each index, in a ring (slot: the index less `ring_origin`, modulo
+    /// `ring_cap`, a power of two that holds every entry from `base` on, doubled when they
+    /// fill it; filled up to `ring_cap` as the entries come, so the memory not used yet is
+    /// not touched; none where it failed, [`FAILED`], or was dropped, [`DEAD`]), made when
+    /// the entry is added or, for an instruction whose facts the decode gives
+    /// ([`X86Lifter::decoded_facts`]), when first read ([`Self::insn`]): a range's walk reads
+    /// the facts of every instruction, its passes the ops of a few.
     lifted: Vec<std::cell::OnceCell<LiftedInstruction>>,
     /// The decoded instruction of each index lifted when first read (the default elsewhere),
     /// in a ring as `lifted` (empty, all default, in a cache that is not [`Self::lazy`]).
     decoded: Vec<iced_x86::Instruction>,
+    /// The index at slot 0 of the ring (the first entry when it last grew).
+    ring_origin: u32,
+    /// The ring's length (0 before the first entry).
+    ring_cap: usize,
     /// The lifter's mode, for the lifts made when first read.
     is_64: bool,
     /// Lift an instruction whose facts the decode gives when it is first read ([`Self::lazy`]).
@@ -364,7 +369,22 @@ impl LiftCache {
     /// The slot of index `i` in the ring.
     #[inline]
     fn slot(&self, i: u32) -> usize {
-        i as usize & (self.lifted.len() - 1)
+        i.wrapping_sub(self.ring_origin) as usize & (self.ring_cap - 1)
+    }
+
+    /// The slot of new entry `i`, made when the ring is still filling (the next one), else
+    /// one whose entry left the arrays (its lift taken when it was dropped): empty.
+    #[inline]
+    fn new_slot(&mut self, i: u32) -> usize {
+        let s = self.slot(i);
+        if s == self.lifted.len() {
+            self.lifted.push(std::cell::OnceCell::new());
+            if self.lazy {
+                self.decoded.push(iced_x86::Instruction::default());
+            }
+        }
+        debug_assert!(self.lifted[s].get().is_none());
+        s
     }
 
     /// What a walk reads of entry `i`.
@@ -446,19 +466,8 @@ impl LiftCache {
     #[cold]
     fn rebase(&mut self) {
         let b = self.base;
-        let n = self.lifted.len();
-        let mut lifted: Vec<std::cell::OnceCell<LiftedInstruction>> = Vec::with_capacity(n);
-        lifted.resize_with(n, std::cell::OnceCell::new);
-        let mut decoded = vec![iced_x86::Instruction::default(); if self.lazy { n } else { 0 }];
-        for k in 0..self.meta.len() {
-            let s = self.slot(b + k as u32);
-            lifted[k & (n - 1)] = std::mem::take(&mut self.lifted[s]);
-            if self.lazy {
-                decoded[k & (n - 1)] = self.decoded[s];
-            }
-        }
-        self.lifted = lifted;
-        self.decoded = decoded;
+        // (each entry keeps its slot)
+        self.ring_origin = self.ring_origin.wrapping_sub(b);
         for i in &mut self.special {
             *i -= b;
         }
@@ -480,26 +489,24 @@ impl LiftCache {
         self.target.reserve(n);
     }
 
-    /// The ring twice as long (at least [`CACHE_RESERVE`] slots), each entry moved to its
-    /// slot there.
+    /// The ring twice as long (at least [`CACHE_RESERVE`] slots), the entries moved to its
+    /// first slots in order (its origin the first entry).
     #[cold]
     fn grow_ring(&mut self) {
-        let n = (2 * self.lifted.len()).max(CACHE_RESERVE);
+        let n = (2 * self.ring_cap).max(CACHE_RESERVE);
         let mut lifted: Vec<std::cell::OnceCell<LiftedInstruction>> = Vec::with_capacity(n);
-        lifted.resize_with(n, std::cell::OnceCell::new);
-        let mut decoded = vec![iced_x86::Instruction::default(); if self.lazy { n } else { 0 }];
-        if !self.lifted.is_empty() {
-            for k in 0..self.meta.len() {
-                let i = self.base + k as u32;
-                let s = self.slot(i);
-                lifted[i as usize & (n - 1)] = std::mem::take(&mut self.lifted[s]);
-                if self.lazy {
-                    decoded[i as usize & (n - 1)] = self.decoded[s];
-                }
+        let mut decoded: Vec<iced_x86::Instruction> = Vec::with_capacity(if self.lazy { n } else { 0 });
+        for k in 0..self.meta.len() {
+            let s = self.slot(self.base + k as u32);
+            lifted.push(std::mem::take(&mut self.lifted[s]));
+            if self.lazy {
+                decoded.push(self.decoded[s]);
             }
         }
         self.lifted = lifted;
         self.decoded = decoded;
+        self.ring_origin = self.base;
+        self.ring_cap = n;
     }
 
     /// The decoded instruction of entry `i` (the default in a cache that is not lazy).
@@ -585,12 +592,12 @@ impl LiftCache {
         if self.meta.len() == self.meta.capacity() {
             self.reserve(self.live);
         }
-        if self.meta.len() == self.lifted.len() {
+        if self.meta.len() == self.ring_cap {
             self.grow_ring();
         }
         let i = self.base + u32::try_from(self.meta.len()).expect("lift cache index");
         assert!(i != NO_INDEX, "lift cache index");
-        let s = self.slot(i);
+        let s = self.new_slot(i);
         let decoded = lifter.decode_in_block(memory, addr, block);
         // an instruction whose facts the decode gives is lifted when first read (only by the
         // lifter without the integer PF, the one `Self::lift_entry` lifts with)
@@ -598,11 +605,9 @@ impl LiftCache {
             Ok(insn) if self.lazy && !lifter.parity => X86Lifter::decoded_facts(insn).map(|f| (*insn, f)),
             _ => None,
         };
-        // (the slot's entry left the arrays: its lift was taken when it was dropped)
         let (flags, len, shape) = if let Some((insn, (sflags, target, reads_pf))) = lazy {
             self.is_64 = lifter.is_64;
             let len = u8::try_from(insn.len()).expect("an x86 instruction is at most 15 bytes");
-            debug_assert!(self.lifted[s].get().is_none() && self.lazy);
             self.decoded[s] = insn;
             (if reads_pf { READS_PF } else { 0 }, len, crate::lift::InsnShape { address: addr, target, flags: sflags })
         } else {
@@ -623,7 +628,6 @@ impl LiftCache {
                     (flags, len, shape)
                 }
                 Err(_) => {
-                    debug_assert!(self.lifted[s].get().is_none());
                     if self.lazy {
                         self.decoded[s] = iced_x86::Instruction::default();
                     }
