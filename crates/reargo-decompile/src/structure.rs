@@ -165,29 +165,43 @@ const MAX_COPY_DEPTH: usize = 2;
 /// (`pop`, `add rsp`, `ret`, see [`crate::cfg::is_epilogue_insn`]) prints nothing and does
 /// not count.
 fn return_tail(cfg: &ControlFlowGraph, code: &ControlFlowGraph, start: BlockId) -> Option<Vec<BlockId>> {
+    let mut chain = smallvec::SmallVec::<[BlockId; 8]>::new();
+    return_tail_into(cfg, code, start, &mut chain).then(|| chain.into_vec())
+}
+
+/// Whether [`return_tail`] finds a tail at `start` (without making its list).
+fn is_return_tail(cfg: &ControlFlowGraph, code: &ControlFlowGraph, start: BlockId) -> bool {
+    return_tail_into(cfg, code, start, &mut smallvec::SmallVec::<[BlockId; 8]>::new())
+}
+
+/// [`return_tail`] into `chain` (empty when called); `false`: no tail.
+fn return_tail_into(
+    cfg: &ControlFlowGraph,
+    code: &ControlFlowGraph,
+    start: BlockId,
+    chain: &mut smallvec::SmallVec<[BlockId; 8]>,
+) -> bool {
     use reargo_core::pcode::OpCode;
-    let mut chain = Vec::new();
     let (mut insns, mut calls) = (0, 0);
     let mut b = start;
     loop {
         let block = &code.blocks[b];
-        insns += block.instructions.iter().filter(|i| !crate::cfg::is_epilogue(i)).count();
-        calls += block
-            .instructions
-            .iter()
-            .filter(|i| i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)))
-            .count();
-        if insns > MAX_TAIL_INSNS || calls > MAX_TAIL_CALLS || chain.contains(&b) {
-            return None;
+        // (counted up to the first instruction past a limit: no tail then)
+        for i in &block.instructions {
+            insns += usize::from(!crate::cfg::is_epilogue(i));
+            calls += usize::from(i.ops.iter().any(|o| matches!(o.opcode, OpCode::Call | OpCode::CallInd)));
+            if insns > MAX_TAIL_INSNS || calls > MAX_TAIL_CALLS {
+                return false;
+            }
+        }
+        if chain.contains(&b) {
+            return false;
         }
         chain.push(b);
         match cfg.blocks[b].successors.as_slice() {
-            [] => {
-                let ends = block.is_return() || block.instructions.last().is_some_and(crate::cfg::is_trap);
-                return ends.then_some(chain);
-            }
+            [] => return block.is_return() || block.instructions.last().is_some_and(crate::cfg::is_trap),
             [next] => b = *next,
-            _ => return None,
+            _ => return false,
         }
     }
 }
@@ -252,6 +266,8 @@ struct Structurer<'a> {
     /// started: inside its cases `break` leaves the `switch`, so leaving those loops needs a
     /// `goto`.
     switch_marks: Vec<usize>,
+    /// [`is_return_tail`] of each block, once asked (0: not yet, 1: no, 2: yes).
+    tails: Vec<std::cell::Cell<u8>>,
 }
 
 impl<'a> Structurer<'a> {
@@ -354,6 +370,19 @@ impl<'a> Structurer<'a> {
             loop_stack: Vec::new(),
             follow_stack: Vec::new(),
             switch_marks: Vec::new(),
+            tails: vec![std::cell::Cell::new(0); n],
+        }
+    }
+
+    /// [`is_return_tail`] of `b` (a pure function of the block: memoised).
+    fn is_tail(&self, b: BlockId) -> bool {
+        match self.tails[b].get() {
+            0 => {
+                let t = is_return_tail(self.cfg, self.code, b);
+                self.tails[b].set(1 + u8::from(t));
+                t
+            }
+            v => v == 2,
         }
     }
 
@@ -451,7 +480,7 @@ impl<'a> Structurer<'a> {
                 Some(_) => return None,
                 None => {}
             }
-            if self.emitted[b] && return_tail(self.cfg, self.code, b).is_some() {
+            if self.emitted[b] && self.is_tail(b) {
                 return Some(vec![Goto(b)]);
             }
         }
@@ -686,7 +715,7 @@ impl<'a> Structurer<'a> {
     fn merge_join(&self, b: BlockId, t: BlockId, f: BlockId, join: Option<BlockId>) -> Option<BlockId> {
         const MAX_REGION: usize = 48;
         const MAX_CANDIDATES: usize = 6;
-        if t == f || join.is_some_and(|j| return_tail(self.cfg, self.code, j).is_none()) {
+        if t == f || join.is_some_and(|j| !self.is_tail(j)) {
             return None;
         }
         let at = self.reach_from(b, t, None, join, MAX_REGION)?;
@@ -745,7 +774,7 @@ impl<'a> Structurer<'a> {
             }
             match self.jump_for(x) {
                 Some(StructuredBlock::Break | StructuredBlock::Continue) => continue,
-                _ if return_tail(self.cfg, self.code, x).is_some() => continue,
+                _ if self.is_tail(x) => continue,
                 Some(_) => return None,
                 None => {}
             }

@@ -6546,6 +6546,51 @@ mod tests {
     /// `decoded_facts` gives what the lift gives, on random bytes (biased to the prefixes,
     /// escapes and jumps) and on every instruction of this test's own executable code.
     #[test]
+    fn epilogue_precheck_admits_every_epilogue_text() {
+        // `may_be_epilogue_text` may say `false` only for a text that is no frame restore
+        // (the text test of `reargo_decompile::cfg::is_epilogue_insn`)
+        let epilogue = |t: &str| {
+            let m = t.trim();
+            ["pop ", "add rsp,", "lea rsp,", "mov rsp,", "ret"].iter().any(|p| m.starts_with(p))
+                || m == "leave"
+                || m == "vzeroupper"
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let (mut seen, mut ruled_out) = (0usize, 0usize);
+        for round in 0..300_000u32 {
+            let mut bytes = [0u8; 16];
+            for b in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            // (biased to `mov` / `add` / `lea` / `pop` / `ret` / `leave`, with prefixes and REX)
+            let ops = [0x89, 0x8b, 0x01, 0x03, 0x81, 0x83, 0x8d, 0x58, 0x5c, 0xc3, 0xc2, 0xc9, 0xcb, 0xc7, 0xb8, 0xbc];
+            let op = ops[(round as usize / 4) % ops.len()];
+            match round % 4 {
+                0 => bytes[0] = op,
+                1 => (bytes[0], bytes[1]) = (0x48 | (bytes[0] & 7), op),
+                2 => (bytes[0], bytes[1], bytes[2]) = ([0x66, 0xf3, 0xf2, 0xf0][bytes[0] as usize & 3], 0x48 | (bytes[1] & 7), op),
+                _ => {}
+            }
+            for bitness in [64, 32] {
+                let insn = iced_x86::Decoder::with_ip(bitness, &bytes, 0x40_1000, iced_x86::DecoderOptions::NONE).decode();
+                if insn.is_invalid() {
+                    continue;
+                }
+                let text = crate::lift::InsnText::x86_lazy(insn);
+                let may = text.may_be_epilogue_text();
+                let is = epilogue(text.as_str());
+                assert!(may || !is, "{} ruled out", text.as_str());
+                seen += usize::from(is);
+                ruled_out += usize::from(!may);
+            }
+        }
+        assert!(seen > 10_000 && ruled_out > 100_000, "{seen} epilogues, {ruled_out} ruled out");
+    }
+
+    #[test]
     fn decoded_facts_match_lift() {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let mut checked = 0usize;

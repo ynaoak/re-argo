@@ -49,6 +49,11 @@ impl Analyzer for DataReferenceAnalyzer {
             .map(|i| (i.address, &i.bytes[..]))
             .collect();
 
+        // no section below `lowest` or at / above `highest`: most
+        // windows are rejected by these two compares
+        let lowest = valid_ranges.iter().map(|r| r.0).min().unwrap_or(0);
+        let highest = valid_ranges.iter().map(|r| r.1).max().unwrap_or(0);
+
         // Phase 1: scan windows in parallel, collect candidate refs.
         let candidates: Vec<(u64, u64)> = instructions
             .par_iter()
@@ -59,7 +64,7 @@ impl Analyzer for DataReferenceAnalyzer {
                         let val =
                             u32::from_le_bytes([window[0], window[1], window[2], window[3]])
                                 as u64;
-                        if crate::utils::is_valid_address(val, &valid_ranges) {
+                        if val >= lowest && val < highest && crate::utils::is_valid_address(val, &valid_ranges) {
                             out.push((*addr, val));
                         }
                     }

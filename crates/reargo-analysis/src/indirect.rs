@@ -29,13 +29,10 @@ impl Analyzer for IndirectCallAnalyzer {
         let candidates: Vec<(u64, u64)> = indirect_calls
             .par_iter()
             .filter_map(|&addr| {
+                // (looked up once: the references do not change in the scan)
+                let refs = program.references.get_refs_from(addr);
                 for import in &program.info.imports {
-                    if program
-                        .references
-                        .get_refs_from(addr)
-                        .iter()
-                        .any(|r| r.to == import.plt_address)
-                    {
+                    if refs.iter().any(|r| r.to == import.plt_address) {
                         continue;
                     }
                     let distance = import.got_address.abs_diff(addr);

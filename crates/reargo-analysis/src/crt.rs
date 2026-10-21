@@ -179,13 +179,26 @@ fn candidate_owners(
                 _ => false,
             }
         };
-        hits.par_extend(
-            (0..data.len())
-                .into_par_iter()
-                .with_min_len(1 << 16)
-                .filter(|&i| is_hit(i))
-                .map(|i| block.start.wrapping_add(i as u64)),
-        );
+        // Only an `E8` / `FF` byte can be a hit: the chunks (in order) are
+        // searched for the opcodes that can match, and each found tried.
+        const CHUNK: usize = 1 << 16;
+        let (e8, ff) = (!lsm_addrs.is_empty(), !lsm_slots.is_empty());
+        hits.par_extend((0..data.len().div_ceil(CHUNK)).into_par_iter().flat_map_iter(|c| {
+            let lo = c * CHUNK;
+            let part = &data[lo..data.len().min(lo + CHUNK)];
+            let mut out = Vec::new();
+            let mut try_at = |k: usize| {
+                if is_hit(lo + k) {
+                    out.push(block.start.wrapping_add((lo + k) as u64));
+                }
+            };
+            match (e8, ff) {
+                (true, true) => memchr::memchr2_iter(0xE8, 0xFF, part).for_each(&mut try_at),
+                (true, false) => memchr::memchr_iter(0xE8, part).for_each(&mut try_at),
+                _ => memchr::memchr_iter(0xFF, part).for_each(&mut try_at),
+            }
+            out
+        }));
     }
     let mut owners = rustc_hash::FxHashSet::default();
     for p in hits {

@@ -145,25 +145,50 @@ fn scan_section(
     sections: &[(u64, u64, bool)],
 ) -> Vec<(u64, u64, RefType)> {
     let mut out: Vec<(u64, u64, RefType)> = Vec::new();
-    let mut addr = start;
     // Step by pointer size, aligned. Tables are virtually always
     // pointer-aligned in real binaries (ABI / linker enforce this).
-    addr = (addr + ptr_size - 1) & !(ptr_size - 1);
+    let first = (start + ptr_size - 1) & !(ptr_size - 1);
+    // The slots `first + k * ptr_size` that end by `end`.
+    let n = end.saturating_sub(first) / ptr_size;
+    // What `read_ptr` reads at slot `k`: from one slice of the section's block when it
+    // holds them all (the same bytes, see `Memory::slice`), else slot by slot.
+    let memory = &program.info.memory;
+    let bytes = memory.slice(first, n * ptr_size).filter(|_| n > 0);
+    let big = matches!(memory.endian(), reargo_core::address::Endian::Big);
+    let read = |k: u64| -> Option<u64> {
+        let val = match bytes {
+            Some(b) => {
+                let at = (k * ptr_size) as usize;
+                if ptr_size == 8 {
+                    let w: [u8; 8] = b[at..at + 8].try_into().unwrap();
+                    if big { u64::from_be_bytes(w) } else { u64::from_le_bytes(w) }
+                } else {
+                    let w: [u8; 4] = b[at..at + 4].try_into().unwrap();
+                    u64::from(if big { u32::from_be_bytes(w) } else { u32::from_le_bytes(w) })
+                }
+            }
+            None => return read_ptr(program, first + k * ptr_size, ptr_size),
+        };
+        (val >= MIN_VALID_ADDR).then_some(val)
+    };
+    // `is_section_addr`: a binary search over the sections' ranges merged
+    let merged = merge_ranges(sections);
+    let in_sections = |a: u64| {
+        let i = merged.partition_point(|&(s, _)| s <= a);
+        i > 0 && a < merged[i - 1].1
+    };
 
-    while addr + ptr_size * (MIN_TABLE_LEN as u64) <= end {
-        // Try to collect a run starting here. read_ptr returns
+    let mut i = 0u64;
+    while i + MIN_TABLE_LEN as u64 <= n {
+        // Try to collect a run starting here. `read` returns
         // Option<u64>, with None for "couldn't read" or "below the
         // low-address cutoff" -- a NULL or junk entry ends the run.
         let mut run_len = 0u64;
-        loop {
-            let entry_addr = addr + run_len * ptr_size;
-            if entry_addr + ptr_size > end {
-                break;
-            }
-            let Some(val) = read_ptr(program, entry_addr, ptr_size) else {
+        while i + run_len < n {
+            let Some(val) = read(i + run_len) else {
                 break;
             };
-            if !is_section_addr(val, sections) {
+            if !in_sections(val) {
                 break;
             }
             run_len += 1;
@@ -171,23 +196,36 @@ fn scan_section(
 
         if run_len >= MIN_TABLE_LEN as u64 {
             // Emit one reference per entry.
-            for i in 0..run_len {
-                let entry_addr = addr + i * ptr_size;
+            for k in i..i + run_len {
                 // Safe to unwrap: we just verified read above.
-                let val = read_ptr(program, entry_addr, ptr_size).unwrap();
+                let val = read(k).unwrap();
                 let kind = ref_kind_for(val, sections);
-                out.push((entry_addr, val, kind));
+                out.push((first + k * ptr_size, val, kind));
             }
-            addr += run_len * ptr_size;
+            i += run_len;
         } else {
             // Slide forward one pointer slot. We don't try every
             // byte offset -- pointer-misaligned tables are very rare
             // in practice and the false-positive cost of unaligned
             // scanning is high.
-            addr += ptr_size;
+            i += 1;
         }
     }
     out
+}
+
+/// The union of the sections' `[s, e)` ranges, sorted and merged.
+fn merge_ranges(sections: &[(u64, u64, bool)]) -> Vec<(u64, u64)> {
+    let mut raw: Vec<(u64, u64)> = sections.iter().map(|&(s, e, _)| (s, e)).filter(|(s, e)| s < e).collect();
+    raw.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
+    for (s, e) in raw {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
 }
 
 /// Read a pointer of `ptr_size` bytes from `addr`. Returns None for
@@ -205,6 +243,7 @@ fn read_ptr(program: &Program, addr: u64, ptr_size: u64) -> Option<u64> {
     Some(val)
 }
 
+#[cfg(test)]
 fn is_section_addr(addr: u64, sections: &[(u64, u64, bool)]) -> bool {
     sections
         .iter()
@@ -252,6 +291,16 @@ mod tests {
     fn is_section_addr_inside() {
         assert!(is_section_addr(0x1500, &make_sections()));
         assert!(is_section_addr(0x2999, &make_sections()));
+    }
+
+    #[test]
+    fn merged_ranges_match_any_section() {
+        let sections = vec![(0x1000, 0x2000, true), (0x1800, 0x2800, false), (0x3000, 0x3000, false), (0x3000, 0x3100, false), (0x3100, 0x3200, true), (0x500, 0x600, false)];
+        let merged = merge_ranges(&sections);
+        for a in (0..0x4000u64).step_by(7).chain([0x5ff, 0x600, 0x1fff, 0x2000, 0x27ff, 0x2800, 0x30ff, 0x3100, 0x31ff, 0x3200]) {
+            let i = merged.partition_point(|&(s, _)| s <= a);
+            assert_eq!(i > 0 && a < merged[i - 1].1, is_section_addr(a, &sections), "{a:#x}");
+        }
     }
 
     #[test]
