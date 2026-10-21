@@ -159,6 +159,97 @@ fn cs_reg_to_varnode(r: RegId) -> Option<VarnodeData> {
 }
 
 // ---------------------------------------------------------------------------
+// Operands, read from Capstone's raw detail
+// ---------------------------------------------------------------------------
+
+/// The operands of `insn` (decoded with detail on), as `Arm64InsnDetail::operands` gives them
+/// for the operand kinds the lifter reads (register, immediate, memory, float, C-immediate),
+/// with the others (the system register of an MRS / MSR, a PSTATE field, a SYS, prefetch or
+/// barrier operation) as `Arm64OperandType::Invalid`, which the lifter treats alike.
+///
+/// The `capstone` crate's own conversion transmutes the system register number of an MRS /
+/// MSR operand into the `arm64_sysreg` enum, and an implementation-defined register such as
+/// `s3_7_c15_c6_6` (0xffb6) is no variant of it: undefined behaviour, which a debug build
+/// aborts on ("trying to construct an enum from an invalid value"). The operand fields are
+/// therefore read here as the integers Capstone's C code wrote, and only a field the lifter
+/// uses is turned into a Rust value.
+fn operands(insn: &capstone::Insn<'_>) -> Vec<Arm64Operand> {
+    use capstone_sys::{cs_arm64, cs_arm64_op, cs_detail, cs_insn};
+    use std::ptr::addr_of;
+    // `Insn` is `#[repr(transparent)]` over the `cs_insn` Capstone filled in (it is made from
+    // one by `Insn::from_raw`).
+    const _: () = assert!(std::mem::size_of::<capstone::Insn<'static>>() == std::mem::size_of::<cs_insn>());
+    let raw = std::ptr::from_ref(insn).cast::<cs_insn>();
+    // SAFETY: `raw` points to the `cs_insn` of a live `Insn`; its `detail` was filled in by
+    // `cs_disasm` because the decoder has detail on (`lift_bytes` read it already through
+    // `insn_detail`, which fails when it is null). Every field is read through a raw pointer
+    // as plain integers / floats, so no value is taken for an enum it is not a variant of.
+    unsafe {
+        let detail: *const cs_detail = (*raw).detail;
+        if detail.is_null() {
+            return Vec::new();
+        }
+        let arm64: *const cs_arm64 = addr_of!((*detail).__bindgen_anon_1.arm64);
+        let count = usize::from((*arm64).op_count).min(8);
+        let first: *const cs_arm64_op = addr_of!((*arm64).operands).cast();
+        (0..count)
+            .map(|i| {
+                let op = first.add(i);
+                let int = |p: *const u32| p.read();
+                let shift_value = (*op).shift.value;
+                let shift = match int(addr_of!((*op).shift.type_).cast()) {
+                    1 => Arm64Shift::Lsl(shift_value),
+                    2 => Arm64Shift::Msl(shift_value),
+                    3 => Arm64Shift::Lsr(shift_value),
+                    4 => Arm64Shift::Asr(shift_value),
+                    5 => Arm64Shift::Ror(shift_value),
+                    _ => Arm64Shift::Invalid,
+                };
+                let value = addr_of!((*op).__bindgen_anon_1);
+                let op_type = match int(addr_of!((*op).type_).cast()) {
+                    1 => Arm64OperandType::Reg(RegId(int(addr_of!((*value).reg)) as u16)),
+                    2 => Arm64OperandType::Imm(addr_of!((*value).imm).read()),
+                    3 => Arm64OperandType::Mem(mem_operand(addr_of!((*value).mem).read())),
+                    4 => Arm64OperandType::Fp(addr_of!((*value).fp).read()),
+                    64 => Arm64OperandType::Cimm(addr_of!((*value).imm).read()),
+                    _ => Arm64OperandType::Invalid,
+                };
+                // The arrangement (`ARM64_VAS_INVALID` = 0 ..= `ARM64_VAS_1Q` = 14) and the
+                // extender (`ARM64_EXT_INVALID` = 0 ..= `ARM64_EXT_SXTX` = 8) are dense enums.
+                let vas = match int(addr_of!((*op).vas).cast()) {
+                    v @ 0..=14 => std::mem::transmute::<u32, capstone_sys::arm64_vas>(v),
+                    _ => capstone_sys::arm64_vas::ARM64_VAS_INVALID,
+                };
+                let ext = match int(addr_of!((*op).ext).cast()) {
+                    e @ 0..=8 => std::mem::transmute::<u32, capstone_sys::arm64_extender>(e),
+                    _ => capstone_sys::arm64_extender::ARM64_EXT_INVALID,
+                };
+                Arm64Operand { vector_index: u32::try_from((*op).vector_index).ok(), vas, shift, ext, op_type }
+            })
+            .collect()
+    }
+}
+
+/// `mem` as the `Arm64OpMem` the `capstone` crate wraps it in (its field is private, so it is
+/// made through the crate's conversion of an operand holding only it, which reads no enum
+/// but the operand type).
+fn mem_operand(mem: capstone_sys::arm64_op_mem) -> Arm64OpMem {
+    let op = capstone_sys::cs_arm64_op {
+        vector_index: -1,
+        vas: capstone_sys::arm64_vas::ARM64_VAS_INVALID,
+        shift: capstone_sys::cs_arm64_op__bindgen_ty_1 { type_: capstone_sys::arm64_shifter::ARM64_SFT_INVALID, value: 0 },
+        ext: capstone_sys::arm64_extender::ARM64_EXT_INVALID,
+        type_: capstone_sys::arm64_op_type::ARM64_OP_MEM,
+        __bindgen_anon_1: capstone_sys::cs_arm64_op__bindgen_ty_2 { mem },
+        access: 0,
+    };
+    match Arm64Operand::from(&op).op_type {
+        Arm64OperandType::Mem(m) => m,
+        _ => unreachable!("a memory operand converts to one"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Aarch64Lifter
 // ---------------------------------------------------------------------------
 pub struct Aarch64Lifter {
@@ -746,7 +837,7 @@ impl Aarch64Lifter {
                     let test_reg = self.resolve_operand(&operands[0], address)?;
                     let target = self
                         .extract_branch_target(&operands[1..])
-                        .unwrap_or(address + insn_len);
+                        .unwrap_or(address.wrapping_add(insn_len));
 
                     let cmp_op = if insn_id == cs_insn::CBZ {
                         OpCode::IntEqual
@@ -829,7 +920,7 @@ impl Aarch64Lifter {
                     let bit_pos = self.resolve_operand(&operands[1], address)?;
                     let target = self
                         .extract_branch_target(&operands[2..])
-                        .unwrap_or(address + insn_len);
+                        .unwrap_or(address.wrapping_add(insn_len));
                     // bit = (Rt >> imm) & 1
                     let shifted = unique(s as u64 * 0x10 + 0x900, test_reg.size);
                     ops.push(PcodeOp {
@@ -1453,7 +1544,7 @@ impl Aarch64Lifter {
                     reason: "not arm64 detail".into(),
                 })?;
 
-        let operands: Vec<Arm64Operand> = arm64_detail.operands().collect();
+        let operands = operands(insn);
         let pcode_ops = self.lift_insn(insn, arm64_detail, &operands, address)?;
 
         Ok(LiftedInstruction {
@@ -1507,6 +1598,53 @@ mod tests {
             checked += usize::from(at_a.is_some());
         }
         assert!(checked > 10_000);
+    }
+
+    /// An MRS / MSR of an implementation-defined system register (no variant of Capstone's
+    /// `arm64_sysreg`) lifts without building an invalid enum value (debug builds abort on it).
+    #[test]
+    fn implementation_defined_system_registers_lift() {
+        let lifter = Aarch64Lifter::new();
+        // mrs x0, s3_7_c15_c6_6 (sysreg 0xffb6) / msr s3_7_c15_c6_6, x1.
+        for word in [0xd53f_f6c0u32, 0xd51f_f6c1] {
+            let l = CS.with(|cs| lifter.lift_bytes(cs, &word.to_le_bytes(), 0x1000)).unwrap();
+            assert!(l.mnemonic.contains("s3_7_c15_c6_6"), "{}", l.mnemonic);
+            assert_eq!(l.ops.len(), 1);
+            assert_eq!(l.ops[0].opcode, OpCode::CallOther);
+            let ops = CS.with(|cs| {
+                let insns = cs.disasm_count(&word.to_le_bytes(), 0x1000, 1).unwrap();
+                operands(insns.iter().next().unwrap())
+            });
+            let gpr = if word & 0x0020_0000 != 0 { 0 } else { 1 };
+            assert!(matches!(ops[gpr].op_type, Arm64OperandType::Reg(_)), "{ops:?}");
+            assert_eq!(ops[1 - gpr].op_type, Arm64OperandType::Invalid, "{ops:?}");
+        }
+    }
+
+    /// `operands` reads what the `capstone` crate's conversion gives for the operand kinds the
+    /// lifter uses (words with another kind are left out: the crate may build an invalid enum).
+    #[test]
+    fn operands_match_capstone_crate() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut compared = 0;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let word = (x >> 32) as u32;
+            CS.with(|cs| {
+                let Ok(insns) = cs.disasm_count(&word.to_le_bytes(), 0x1000, 1) else { return };
+                let Some(insn) = insns.iter().next() else { return };
+                let ours = operands(insn);
+                if ours.iter().any(|o| o.op_type == Arm64OperandType::Invalid) {
+                    return;
+                }
+                let detail = cs.insn_detail(insn).unwrap();
+                let arch = detail.arch_detail();
+                let theirs: Vec<Arm64Operand> = arch.arm64().unwrap().operands().collect();
+                assert_eq!(ours, theirs, "word {word:08x}");
+                compared += 1;
+            });
+        }
+        assert!(compared > 50_000, "{compared}");
     }
 
     /// The PC-relative branches and addresses lifted without Capstone lift as with it.
