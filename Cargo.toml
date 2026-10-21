@@ -39,6 +39,8 @@ smallvec = { version = "1", features = ["union"] }
 bitflags = "2"
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "encoder", "code_asm", "intel", "gas", "nasm", "instr_info"] }
 capstone = "0.13"
+# The raw detail of an instruction (`reargo-lift` reads AArch64 operands itself, see `aarch64::operands`).
+capstone-sys = "0.17"
 petgraph = "0.7"
 quick-xml = "0.37"
 gimli = "0.31"

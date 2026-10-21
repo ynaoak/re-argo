@@ -681,6 +681,7 @@ name = "reargo-lift"
 version = "0.1.0"
 dependencies = [
  "capstone",
+ "capstone-sys",
  "iced-x86",
  "mimalloc",
  "reargo-core",
