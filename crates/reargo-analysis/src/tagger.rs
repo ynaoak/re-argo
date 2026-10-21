@@ -77,27 +77,27 @@ impl Analyzer for TagAnalyzer {
                 .collect()
         };
 
-        let mut function_tags: Vec<(u64, TagKind, String)> = Vec::new();
-
-        // Function-scope tags from Function flags.
-        let func_facts: Vec<(u64, bool, bool, String)> = program
-            .listing
-            .functions()
-            .map(|f| (f.entry_point, f.no_return, f.is_thunk, f.name.clone()))
-            .collect();
-        for (entry, no_return, is_thunk, name) in func_facts {
-            if no_return {
-                function_tags.push((entry, TagKind::NoReturn, format!("{}: no-return", name)));
+        // Function-scope tags from Function flags (in parallel, in
+        // function order).
+        let mut function_tags: Vec<(u64, TagKind, String)> = crate::func_lift::map_functions(program, |f| {
+            let (entry, name) = (f.entry_point, &f.name);
+            let mut tags = Vec::new();
+            if f.no_return {
+                tags.push((entry, TagKind::NoReturn, format!("{}: no-return", name)));
             }
-            if is_thunk {
-                function_tags.push((entry, TagKind::Library, format!("{}: thunk", name)));
+            if f.is_thunk {
+                tags.push((entry, TagKind::Library, format!("{}: thunk", name)));
             }
             // Standard library names get a `library` tag so users can
             // filter their report to "what touches libc?"
             if name.contains("@plt") || name.contains("@GLIBC") || name.contains("@GOT") {
-                function_tags.push((entry, TagKind::Library, format!("{}: import", name)));
+                tags.push((entry, TagKind::Library, format!("{}: import", name)));
             }
-        }
+            tags
+        })
+        .into_iter()
+        .flatten()
+        .collect();
 
         // Metadata-derived: SCC cluster members get `recursive`.
         let scc_keys: Vec<String> = program

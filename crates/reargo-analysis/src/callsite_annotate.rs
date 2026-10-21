@@ -183,6 +183,7 @@ fn resolve(
     program: &Program,
     mut shared: crate::shared_lift::SharedLift,
 ) -> (crate::shared_lift::SharedLift, Result<Vec<crate::callsite::CallSite>, AnalysisError>) {
+    let tr0 = std::time::Instant::now();
     let lifter: Box<dyn PcodeLift + Sync> = Box::new(reargo_lift::x86::X86Lifter::new_64());
     // Each function's round-0 call-site walk, CFG constant tracker
     // and VSA snapshots, from one lift per function (dropped as soon
@@ -196,14 +197,17 @@ fn resolve(
     }
     // (the snapshots merge, in listing order, on another thread while
     // the call sites are resolved)
+    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       resolve split {:.1}", tr0.elapsed().as_secs_f64()*1e3); }
     let ((cfg_constants, vsa_constants), sites) = rayon::join(
         move || {
+            let t = std::time::Instant::now();
             let mut cfg_constants = crate::cfg_const::CallConstants::new();
             let mut vsa_constants = crate::vsa::VsaResult::new();
             for (cfg_snaps, vsa_snaps) in snapshots {
                 crate::cfg_const::merge_snapshots(&mut cfg_constants, cfg_snaps);
                 crate::vsa::merge_snapshots(&mut vsa_constants, vsa_snaps);
             }
+            if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       snapshot merge {:.1} n {} {}", t.elapsed().as_secs_f64()*1e3, cfg_constants.len(), vsa_constants.len()); }
             (cfg_constants, vsa_constants)
         },
         // Iterative inter-procedural resolver: a function whose
@@ -219,6 +223,7 @@ fn resolve(
         Ok(sites) => sites,
         Err(e) => return (shared, Err(e)),
     };
+    if std::env::var_os("REARGO_TRACE").is_some() { eprintln!("TRACE       resolve joined {:.1}", tr0.elapsed().as_secs_f64()*1e3); }
     // Give the walks back for Format Varargs (780).
     for (f, w) in shared.funcs.iter_mut().zip(round0) {
         f.walk = w.sites;
