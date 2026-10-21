@@ -713,7 +713,13 @@ impl<'a> CalleeParams<'a> {
             m.insert((target, depth_left), kind);
         }
         let mut reads = s.reads;
+        let all = (1u32 << self.args.len()) - 1;
         for c in &s.calls {
+            // (a call after which no argument is left undefined at it and unread adds nothing:
+            // its callee is not looked at — after an earlier call every argument is defined)
+            if (reads | c.defined) & all == all {
+                continue;
+            }
             reads |= self.inner_call_reads(c.target, c.window, depth_left) & !c.defined;
         }
         Some(ParamInfo { mask: reads, complete: s.complete })
@@ -1981,5 +1987,87 @@ mod tests {
         let code = [0x85, 0xc0, 0x74, 0x05, 0xbe, 0x01, 0, 0, 0, 0x89, 0xf0, 0xc3];
         assert_eq!(params(&[(0x2000, &code)], 0x2000).mask, RSI);
         let _ = RDX;
+    }
+
+    impl CalleeParams<'_> {
+        /// [`Self::analyze`]'s mask with every inner call's callee looked at (no call skipped
+        /// once its arguments are all defined or read), without the memo.
+        fn params_looking_at_every_call(&self, target: u64, depth_left: u32) -> Option<ParamInfo> {
+            let s = self.summary(target)?;
+            let mut reads = s.reads;
+            for c in &s.calls {
+                let inner = match c.target {
+                    Some(t) if depth_left > 0 => match self.params_looking_at_every_call(t, depth_left - 1) {
+                        Some(info) if info.complete => info.mask,
+                        Some(info) => info.mask | self.prefix_reads(c.window),
+                        None => self.prefix_reads(c.window),
+                    },
+                    _ => self.prefix_reads(c.window),
+                };
+                reads |= inner & !c.defined;
+            }
+            Some(ParamInfo { mask: reads, complete: s.complete })
+        }
+    }
+
+    #[test]
+    fn calls_skipped_once_every_argument_is_settled_change_no_answer() {
+        // random functions of argument writes / reads, calls (to each other, recursive ones
+        // too, and to nowhere), a branch over a part and an indirect call
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        // (eax ecx edx ebx esp ebp esi edi: the argument registers among them)
+        const ARGS: [u8; 4] = [7, 6, 2, 1];
+        let mut checked = 0;
+        for _ in 0..300 {
+            let n = 1 + next(6);
+            let at = |k: u64| 0x1000 + k * 0x100;
+            let mut parts: Vec<(u64, Vec<u8>)> = Vec::new();
+            for k in 0..n {
+                let mut code: Vec<u8> = Vec::new();
+                for _ in 0..next(9) {
+                    let r = ARGS[next(4) as usize];
+                    match next(7) {
+                        0 | 1 => code.extend([0xb8 + r, 1, 0, 0, 0]), // mov r32, 1
+                        2 => code.extend([0x89, 0xc0 | (r << 3)]),     // mov eax, r32
+                        3 | 4 => {
+                            // call one of the functions, or past them all
+                            let t = if next(5) == 0 { 0x9000 } else { at(next(n)) };
+                            let from = at(k) + code.len() as u64 + 5;
+                            code.push(0xe8);
+                            code.extend((t.wrapping_sub(from) as u32).to_le_bytes());
+                        }
+                        5 => code.extend([0x85, 0xc0, 0x74, 0x05, 0xb8 + r, 2, 0, 0, 0]), // test; je over a mov
+                        _ => code.extend([0xff, 0xd0]),                                     // call rax
+                    }
+                }
+                code.push(0xc3);
+                assert!(code.len() < 0x100);
+                parts.push((at(k), code));
+            }
+            parts.push((0x9000, vec![0x89, 0xf8, 0xc3]));
+            let refs: Vec<(u64, &[u8])> = parts.iter().map(|(a, c)| (*a, c.as_slice())).collect();
+            let lifter = X86Lifter::new_64();
+            let mem = memory(&refs);
+            for compact in [false, true] {
+                let oracle = || {
+                    let p = CalleeParams::new(&lifter, &mem).unwrap();
+                    if compact { p.with_entries(Vec::new()) } else { p }
+                };
+                for k in 0..n {
+                    for depth in 0..=MAX_DEPTH {
+                        let want = oracle().params_looking_at_every_call(at(k), depth);
+                        assert_eq!(oracle().params_at(at(k), depth), want, "{:#x} at depth {depth} (compact: {compact}): {refs:x?}", at(k));
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000);
     }
 }
