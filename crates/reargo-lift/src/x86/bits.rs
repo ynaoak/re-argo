@@ -195,6 +195,19 @@ fn positive_cc(cc: iced_x86::ConditionCode) -> (iced_x86::ConditionCode, bool) {
     }
 }
 
+/// Whether [`X86Lifter::lift_bits`] lifts an instruction of this mnemonic (it answers `None`
+/// for every other).
+pub(super) fn is_bits(m: iced_x86::Mnemonic) -> bool {
+    use iced_x86::Mnemonic::*;
+    matches!(
+        m,
+        Shl | Sal | Shr | Sar | Rol | Ror | Rcl | Rcr | Shld | Shrd | Adc | Sbb | Bt | Bts | Btr | Btc | Mul | Imul
+            | Cmpxchg | Bsf | Bsr | Tzcnt | Lzcnt | Popcnt | Bswap | Clc | Stc | Cmc | Cmova | Cmovae | Cmovb
+            | Cmovbe | Cmove | Cmovne | Cmovg | Cmovge | Cmovl | Cmovle | Cmovo | Cmovno | Cmovs | Cmovns | Cmovp
+            | Cmovnp
+    )
+}
+
 impl X86Lifter {
     /// The instructions lifted here, or None.
     pub(super) fn lift_bits(
