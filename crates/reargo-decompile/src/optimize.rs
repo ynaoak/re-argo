@@ -279,6 +279,17 @@ fn try_strength_reduce_op(func: &mut SsaFunction, i: usize) -> bool {
 /// Returns `(folded, simplified, reduced)` so the outer fixpoint can
 /// still update its per-pass counters.
 pub fn const_alg_strength(func: &mut SsaFunction) -> (usize, usize, usize) {
+    const_alg_strength_in(func, None)
+}
+
+/// [`const_alg_strength`], marking in `changed` the block of each op it rewrites (an op's
+/// rewrite changes that op alone: its opcode and inputs).
+fn const_alg_strength_in(func: &mut SsaFunction, mut changed: Option<&mut [bool]>) -> (usize, usize, usize) {
+    let mut mark = |func: &SsaFunction, i: usize| {
+        if let Some(c) = changed.as_deref_mut() {
+            c[func.ops[i].block] = true;
+        }
+    };
     let (mut folded, mut simplified, mut reduced) = (0usize, 0usize, 0usize);
     for i in 0..func.ops.len() {
         if func.ops[i].dead || func.ops[i].output.is_none() {
@@ -303,14 +314,17 @@ pub fn const_alg_strength(func: &mut SsaFunction) -> (usize, usize, usize) {
         }
         if try_constant_fold_op(func, i) {
             folded += 1;
+            mark(func, i);
             continue;
         }
         if try_algebraic_simplify_op(func, i) {
             simplified += 1;
+            mark(func, i);
             continue;
         }
         if try_strength_reduce_op(func, i) {
             reduced += 1;
+            mark(func, i);
         }
     }
     (folded, simplified, reduced)
@@ -472,6 +486,11 @@ pub fn constant_fold(func: &mut SsaFunction) -> usize {
 }
 
 pub fn copy_propagation(func: &mut SsaFunction) -> usize {
+    copy_propagation_in(func, None)
+}
+
+/// [`copy_propagation`], marking in `changed` the block of each op whose inputs it rewrites.
+fn copy_propagation_in(func: &mut SsaFunction, mut changed: Option<&mut [bool]>) -> usize {
     let mut propagated = 0;
 
     for i in 0..func.ops.len() {
@@ -504,10 +523,14 @@ pub fn copy_propagation(func: &mut SsaFunction) -> usize {
             if func.ops[use_idx].dead || func.ops[use_idx].opcode == OpCode::MultiEqual {
                 continue;
             }
-            for inp in &mut func.ops[use_idx].inputs {
+            let op = &mut func.ops[use_idx];
+            for inp in &mut op.inputs {
                 if *inp == out_id {
                     *inp = src_id;
                     propagated += 1;
+                    if let Some(c) = changed.as_deref_mut() {
+                        c[op.block] = true;
+                    }
                 }
             }
         }
@@ -599,6 +622,26 @@ pub fn common_subexpression_elimination(func: &mut SsaFunction) -> usize {
 /// removed or kept): with none, the pass changed nothing and finds nothing again until an op's
 /// opcode or inputs change.
 fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
+    cse_in_blocks(func, None, None)
+}
+
+/// [`cse_with_hits`] looking only at the ops of the blocks `scan` marks (all for `None`), and
+/// marking in `rescan` the blocks the next pass has to look at (when it runs after only
+/// [`dead_code_elimination`], or after rewrites whose blocks are marked too).
+///
+/// A pass finds a match only within a block (the block is part of the key), and an op's key
+/// is that of its opcode and inputs' values. So after a pass, a block can only have matches
+/// in a later pass if it had one in this pass (removed or kept) or an op of it has another key
+/// by then: one reading a value this pass redirected (its varnode is renamed at the end, and
+/// a reader later in this same pass already reads it redirected: its block is looked at from
+/// then on, every op of it — a block's ops follow each other, after the redirecting op) or one
+/// a fold / copy propagation rewrote. Dead code elimination only kills ops: the live ops left
+/// in a block without a match have distinct keys still. The ops of the other blocks add only
+/// their own blocks' keys and nothing else (the checks of a match read the whole function
+/// themselves), so the pass removes, keeps and counts exactly what the whole pass would.
+fn cse_in_blocks(func: &mut SsaFunction, scan: Option<&[bool]>, mut rescan: Option<&mut [bool]>) -> (usize, usize) {
+    // (grows with the readers of the values redirected)
+    let mut scan: Option<Vec<bool>> = scan.map(<[bool]>::to_vec);
     let mut hits = 0;
     use smallvec::SmallVec;
     let mut eliminated = 0;
@@ -732,7 +775,7 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
         })
     };
     for i in 0..func.ops.len() {
-        if func.ops[i].dead {
+        if func.ops[i].dead || scan.as_ref().is_some_and(|s| !s[func.ops[i].block]) {
             continue;
         }
         let opcode = func.ops[i].opcode;
@@ -785,10 +828,28 @@ fn cse_with_hits(func: &mut SsaFunction) -> (usize, usize) {
         // (one lookup: the earlier value, or the slot this one takes)
         if let Some(existing) = existing {
             hits += 1;
+            if let Some(r) = rescan.as_deref_mut() {
+                r[func.ops[i].block] = true;
+            }
             if !feeds_phi(func)
                 && name_still_holds(existing)
                 && holds_at_readers(func, maps.get_or_insert_with(|| build(func)), i, value_key(func, out_id), existing)
             {
+                // (the readers of the value redirected read another key from now on: their
+                // blocks are looked at, in this pass from here on and in the next)
+                if let Some((readers, _)) = &maps {
+                    for k in [value_key(func, out_id), out_key] {
+                        for &r in readers.get(&k).into_iter().flatten() {
+                            let b = func.ops[r].block;
+                            if let Some(s) = scan.as_mut() {
+                                s[b] = true;
+                            }
+                            if let Some(n) = rescan.as_deref_mut() {
+                                n[b] = true;
+                            }
+                        }
+                    }
+                }
                 redirects.insert(out_key, existing);
                 func.ops[i].dead = true;
                 eliminated += 1;
@@ -1328,6 +1389,10 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
     // live ops give no more matches. It runs every round (killing in another order can kill
     // more).
     let (mut fold_quiet, mut copies_quiet, mut cse_quiet) = (false, false, false);
+    // The blocks CSE has to look at (`cse_in_blocks`): after its first pass, those it marked
+    // and those whose ops the fold or copy propagation rewrote since.
+    let mut scan: Option<Vec<bool>> = None;
+    let mut changed = vec![false; func.cfg.blocks.len()];
     for round in 0..10 {
         // (none of them runs: nothing changed since the last dead code elimination, which
         // would find nothing again)
@@ -1347,16 +1412,29 @@ pub fn run_optimization_passes(func: &mut SsaFunction) -> OptimizationStats {
         // The fused variant has been removed; this comment is the
         // only record so the next person reaching for the same
         // optimisation doesn't re-do it without knowing the result.
-        let (cf, alg, sr) = if fold_quiet { (0, 0, 0) } else { const_alg_strength(func) };
+        let (cf, alg, sr) = if fold_quiet { (0, 0, 0) } else { const_alg_strength_in(func, Some(&mut changed)) };
         let folded = cf + alg + sr > 0;
         fold_quiet = !folded;
         copies_quiet &= !folded;
         cse_quiet &= !folded;
-        let cp = if copies_quiet { 0 } else { copy_propagation(func) };
+        let cp = if copies_quiet { 0 } else { copy_propagation_in(func, Some(&mut changed)) };
         copies_quiet = cp == 0;
         fold_quiet &= cp == 0;
         cse_quiet &= cp == 0;
-        let (cse, hits) = if cse_quiet { (0, 0) } else { cse_with_hits(func) };
+        let (cse, hits) = if cse_quiet {
+            (0, 0)
+        } else {
+            if let Some(s) = scan.as_mut() {
+                for (s, c) in s.iter_mut().zip(&changed) {
+                    *s |= *c;
+                }
+            }
+            let mut rescan = vec![false; changed.len()];
+            let r = cse_in_blocks(func, scan.as_deref(), Some(&mut rescan));
+            scan = Some(rescan);
+            changed.fill(false);
+            r
+        };
         cse_quiet = hits == 0;
         fold_quiet &= cse == 0;
         copies_quiet &= cse == 0;
@@ -1404,6 +1482,62 @@ mod tests {
     use reargo_core::pcode::{PcodeOp, SeqNum, VarnodeData};
     use reargo_lift::LiftedInstruction;
     use smallvec::SmallVec;
+
+    /// [`run_optimization_passes`] with CSE looking at every block each time it runs (as before
+    /// `cse_in_blocks`).
+    fn run_optimization_passes_whole(func: &mut SsaFunction) -> OptimizationStats {
+        let mut stats = OptimizationStats::default();
+        prune_call_args(func);
+        let (mut fold_quiet, mut copies_quiet, mut cse_quiet) = (false, false, false);
+        for round in 0..10 {
+            if round > 0 && fold_quiet && copies_quiet && cse_quiet {
+                break;
+            }
+            let (cf, alg, sr) = if fold_quiet { (0, 0, 0) } else { const_alg_strength(func) };
+            let folded = cf + alg + sr > 0;
+            fold_quiet = !folded;
+            copies_quiet &= !folded;
+            cse_quiet &= !folded;
+            let cp = if copies_quiet { 0 } else { copy_propagation(func) };
+            copies_quiet = cp == 0;
+            fold_quiet &= cp == 0;
+            cse_quiet &= cp == 0;
+            let (cse, hits) = if cse_quiet { (0, 0) } else { cse_with_hits(func) };
+            cse_quiet = hits == 0;
+            fold_quiet &= cse == 0;
+            copies_quiet &= cse == 0;
+            let dce = dead_code_elimination(func);
+            stats.constants_folded += cf;
+            stats.copies_propagated += cp;
+            stats.strength_reduced += sr;
+            stats.algebraic_simplified += alg;
+            stats.cse_eliminated += cse;
+            stats.dead_ops_removed += dce;
+            if cf == 0 && cp == 0 && dce == 0 && sr == 0 && alg == 0 && cse == 0 {
+                break;
+            }
+        }
+        stats
+    }
+
+    /// CSE restricted to the blocks that can match again gives every function of this test's
+    /// own executable (by its `.eh_frame_hdr`) the same ops, values and statistics as CSE over
+    /// the whole function each time.
+    #[test]
+    fn cse_in_marked_blocks_matches_whole_passes() {
+        let (mut checked, mut cse_seen) = (0usize, 0usize);
+        for (start, body) in crate::ssa::test_executable_bodies(3000) {
+            let ssa = |body: Vec<LiftedInstruction>| SsaFunction::from_cfg(String::new(), start, ControlFlowGraph::build_owned(body));
+            let (mut a, mut b) = (ssa(body.clone()), ssa(body));
+            let (sa, sb) = (run_optimization_passes(&mut a), run_optimization_passes_whole(&mut b));
+            assert_eq!(format!("{sa:?}"), format!("{sb:?}"), "statistics of {start:#x}");
+            assert_eq!(format!("{:?}", a.ops), format!("{:?}", b.ops), "ops of {start:#x}");
+            assert_eq!(format!("{:?}", a.varnodes), format!("{:?}", b.varnodes), "values of {start:#x}");
+            checked += 1;
+            cse_seen += usize::from(sa.cse_eliminated > 0);
+        }
+        assert!(checked > 500 && cse_seen > 20, "{checked} functions, {cse_seen} with CSE");
+    }
 
     fn make_lifted(addr: u64, ops: Vec<PcodeOp>) -> LiftedInstruction {
         LiftedInstruction {
