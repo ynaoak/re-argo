@@ -284,13 +284,15 @@ pub struct LiftCache {
     /// The link, length and flags of each position.
     meta: Vec<Meta>,
     /// The [`InsnShape`] of each position, by field (only its address where
-    /// the lift failed): the shapes of a range of consecutive entries are
-    /// read in place ([`crate::lift::RangeShapes`]).
+    /// the lift failed; the target only of the entries with flags, `special_target`): the
+    /// shapes of a range of consecutive entries are read in place
+    /// ([`crate::lift::RangeShapes`]).
     addr: Vec<u64>,
     sflags: Vec<u8>,
-    target: Vec<u64>,
     /// The indices whose shape has flags, ascending.
     special: Vec<u32>,
+    /// The shape's target of each of `special` (the others have none), in its order.
+    special_target: Vec<u64>,
     /// Instructions the last [`Self::trim`] kept.
     kept: usize,
     /// The lifts with the integer PF, of the ranges that need it
@@ -308,6 +310,42 @@ struct Meta {
     len: u8,
     /// [`X87`], [`READS_PF`], [`FAILED`], [`DEAD`].
     flags: u8,
+}
+
+/// What [`follow_links`] stepped through.
+struct LinkRun {
+    /// Entries written.
+    n: usize,
+    /// The position of the last one (the start when none).
+    last: usize,
+    /// Their flags, or-ed.
+    any: u8,
+    /// Their lengths, added.
+    bytes: u64,
+    /// It stopped at an entry whose lift failed (not written).
+    failed: bool,
+}
+
+/// Follows the links from the entry at position `p` of `meta` (the arrays by position, the
+/// first at index `base`) while they lead to an entry in the arrays whose lift did not fail,
+/// writing each one's index into `out` until it is full ([`X86Lifter::walk_cached`]).
+#[inline]
+fn follow_links(meta: &[Meta], base: u32, mut p: usize, out: &mut [std::mem::MaybeUninit<u32>]) -> LinkRun {
+    let (mut any, mut bytes) = (0u8, 0u64);
+    for (k, slot) in out.iter_mut().enumerate() {
+        let q = meta[p].next.wrapping_sub(base) as usize;
+        let Some(&m) = meta.get(q) else {
+            return LinkRun { n: k, last: p, any, bytes, failed: false };
+        };
+        if m.flags & FAILED != 0 {
+            return LinkRun { n: k, last: p, any, bytes, failed: true };
+        }
+        slot.write(base + q as u32);
+        p = q;
+        any |= m.flags;
+        bytes += u64::from(m.len);
+    }
+    LinkRun { n: out.len(), last: p, any, bytes, failed: false }
 }
 
 /// The x87 pass may rewrite the instruction.
@@ -525,11 +563,11 @@ impl LiftCache {
         self.meta.drain(..h);
         self.addr.drain(..h);
         self.sflags.drain(..h);
-        self.target.drain(..h);
         self.head = 0;
         self.base += u32::try_from(h).expect("lift cache index");
         let k = self.special.partition_point(|&i| i < self.base);
         self.special.drain(..k);
+        self.special_target.drain(..k);
         // (a link or a map entry below `base` reads as none)
         self.map.drop_below(self.base);
     }
@@ -559,7 +597,6 @@ impl LiftCache {
         self.meta.reserve(n);
         self.addr.reserve(n);
         self.sflags.reserve(n);
-        self.target.reserve(n);
     }
 
     /// The ring twice as long (at least [`CACHE_RESERVE`] slots), the entries moved to its
@@ -636,17 +673,35 @@ impl LiftCache {
             return crate::lift::RangeShapes::borrowed(
                 &self.addr[lo..hi],
                 &self.sflags[lo..hi],
-                &self.target[lo..hi],
+                &self.special_target[a..b],
                 &self.special[a..b],
                 first,
                 &self.map,
             );
         }
-        crate::lift::RangeShapes::owned(
-            idxs.iter().map(|&i| self.addr[self.pos(i)]).collect(),
-            idxs.iter().map(|&i| self.sflags[self.pos(i)]).collect(),
-            idxs.iter().map(|&i| self.target[self.pos(i)]).collect(),
-        )
+        let flags: Vec<u8> = idxs.iter().map(|&i| self.sflags[self.pos(i)]).collect();
+        // (the targets of the instructions with flags only)
+        // (looked up in `special` where the entry before with flags was, then searched)
+        let mut at = 0usize;
+        let special_targets = idxs
+            .iter()
+            .zip(&flags)
+            .filter(|(_, f)| **f != 0)
+            .map(|(&i, _)| {
+                if self.special.get(at) != Some(&i) {
+                    at = self.special.binary_search(&i).expect("an entry with flags is listed");
+                }
+                at += 1;
+                self.special_target[at - 1]
+            })
+            .collect();
+        crate::lift::RangeShapes::owned_special(idxs.iter().map(|&i| self.addr[self.pos(i)]).collect(), flags, special_targets)
+    }
+
+    /// The shape's target of entry `i` (0 without flags).
+    #[cfg(test)]
+    fn target(&self, i: u32) -> u64 {
+        self.special.binary_search(&i).map_or(0, |k| self.special_target[k])
     }
 
     /// The index of `addr`, lifting it (with `lifter`, decoding through
@@ -670,8 +725,11 @@ impl LiftCache {
         if self.meta.len() == self.ring_cap {
             self.grow_ring();
         }
-        let i = self.base + u32::try_from(self.meta.len()).expect("lift cache index");
-        assert!(i != NO_INDEX, "lift cache index");
+        // (the arrays hold fewer than 2^32 entries: `REBASE_AT` bounds the indices; the sum
+        // wraps to `NO_INDEX` or past it only beyond that, which the assertion stops)
+        debug_assert!(u32::try_from(self.meta.len()).is_ok());
+        let i = self.base.wrapping_add(self.meta.len() as u32);
+        assert!(i != NO_INDEX && i >= self.base, "lift cache index");
         let s = self.new_slot(i);
         // an instruction whose facts the decode gives is lifted when first read (only by the
         // lifter without the integer PF, the one `Self::lift_entry` lifts with): decoded in
@@ -704,9 +762,9 @@ impl LiftCache {
         self.meta.push(Meta { next: NO_NEXT, len, flags });
         self.addr.push(shape.address);
         self.sflags.push(shape.flags);
-        self.target.push(shape.target);
         if shape.flags != 0 {
             self.special.push(i);
+            self.special_target.push(shape.target);
         }
         self.map.set_in(at, addr, i);
         self.live += 1;
@@ -1784,31 +1842,48 @@ impl X86Lifter {
         let mut prev: Option<usize> = None;
         let base = cache.base;
         let mut block = None;
-        for _ in 0..count {
-            // (a link not known, `NO_NEXT`, or to an entry that left the arrays, below `base`,
-            // is past the arrays' positions)
-            let linked = prev.and_then(|p| {
-                let q = cache.meta[p].next.wrapping_sub(base) as usize;
-                cache.meta.get(q).map(|&m| (q, m))
-            });
-            let (q, m) = match linked {
-                Some(qm) => qm,
-                None => {
-                    let i = cache.index_of(&fast, memory, addr, &mut block);
-                    if let Some(p) = prev {
-                        cache.meta[p].next = i;
+        'walk: while idxs.len() < count {
+            // the links followed while they lead to entries in the arrays (a link not known,
+            // `NO_NEXT`, or to an entry that left the arrays, below `base`, is past the arrays'
+            // positions), into the spare room of `idxs`: no lift, so nothing else changes (an
+            // entry just lifted has no link yet: skipped)
+            if let Some(mut p) = prev
+                && cache.meta[p].next != NO_NEXT
+            {
+                loop {
+                    if idxs.len() == idxs.capacity() {
+                        idxs.reserve(1);
                     }
-                    let q = (i - base) as usize;
-                    (q, cache.meta[q])
+                    let room = (idxs.capacity() - idxs.len()).min(count - idxs.len());
+                    let len = idxs.len();
+                    let run = follow_links(&cache.meta, base, p, &mut idxs.spare_capacity_mut()[..room]);
+                    // SAFETY: `follow_links` wrote the first `run.n` of the spare room
+                    unsafe { idxs.set_len(len + run.n) };
+                    p = run.last;
+                    any |= run.any;
+                    addr = addr.wrapping_add(run.bytes);
+                    if run.failed || idxs.len() == count {
+                        break 'walk;
+                    }
+                    if run.n < room {
+                        break;
+                    }
                 }
-            };
+                prev = Some(p);
+            }
+            let i = cache.index_of(&fast, memory, addr, &mut block);
+            if let Some(p) = prev {
+                cache.meta[p].next = i;
+            }
+            let q = (i - base) as usize;
+            let m = cache.meta[q];
             if m.flags & FAILED != 0 {
                 break;
             }
             prev = Some(q);
             any |= m.flags;
-            idxs.push(base + q as u32);
-            addr += u64::from(m.len);
+            idxs.push(i);
+            addr = addr.wrapping_add(u64::from(m.len));
         }
         // The x87 pass rewrites nothing in a range without an x87
         // instruction, so such a range lifts as the cache has it.
@@ -5973,7 +6048,7 @@ mod tests {
                     let (m, o) = (new.meta[p], old.meta[p]);
                     let link = if m.next == NO_NEXT || m.next < b { NO_NEXT } else { m.next - b };
                     assert_eq!((link, m.len, m.flags), (o.next, o.len, o.flags), "round {round} step {step} position {p}");
-                    assert_eq!((new.addr[p], new.sflags[p], new.target[p]), (old.addr[p], old.sflags[p], old.target[p]));
+                    assert_eq!((new.addr[p], new.sflags[p], new.target(b + p as u32)), (old.addr[p], old.sflags[p], old.target[p]));
                     let i = b + p as u32;
                     if m.flags & (FAILED | DEAD) == 0 && step % 16 == 0 {
                         assert_eq!(ops(new.insn(i)), ops(old.insn(p as u32)), "round {round} step {step} position {p}");
