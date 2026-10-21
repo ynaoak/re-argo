@@ -136,7 +136,17 @@ pub fn find_strings(data: &[u8], base_addr: u64) -> Vec<(u64, String)> {
 }
 
 fn is_printable_ascii(b: u8) -> bool {
-    (0x20..=0x7e).contains(&b) || b == b'\t' || b == b'\n' || b == b'\r'
+    // (a table: the scan asks for every byte)
+    const PRINTABLE: [bool; 256] = {
+        let mut t = [false; 256];
+        let mut b = 0;
+        while b < 256 {
+            t[b] = (b >= 0x20 && b <= 0x7e) || b == b'\t' as usize || b == b'\n' as usize || b == b'\r' as usize;
+            b += 1;
+        }
+        t
+    };
+    PRINTABLE[b as usize]
 }
 
 fn sanitize_string_label(s: &str) -> String {

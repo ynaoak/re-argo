@@ -186,12 +186,18 @@ fn candidate_owners(
         hits.par_extend((0..data.len().div_ceil(CHUNK)).into_par_iter().flat_map_iter(|c| {
             let lo = c * CHUNK;
             let part = &data[lo..data.len().min(lo + CHUNK)];
-            let found: Box<dyn Iterator<Item = usize>> = match (e8, ff) {
-                (true, true) => Box::new(memchr::memchr2_iter(0xE8, 0xFF, part)),
-                (true, false) => Box::new(memchr::memchr_iter(0xE8, part)),
-                _ => Box::new(memchr::memchr_iter(0xFF, part)),
+            let mut out = Vec::new();
+            let mut try_at = |k: usize| {
+                if is_hit(lo + k) {
+                    out.push(block.start.wrapping_add((lo + k) as u64));
+                }
             };
-            found.map(move |k| lo + k).filter(|&i| is_hit(i)).map(|i| block.start.wrapping_add(i as u64))
+            match (e8, ff) {
+                (true, true) => memchr::memchr2_iter(0xE8, 0xFF, part).for_each(&mut try_at),
+                (true, false) => memchr::memchr_iter(0xE8, part).for_each(&mut try_at),
+                _ => memchr::memchr_iter(0xFF, part).for_each(&mut try_at),
+            }
+            out
         }));
     }
     let mut owners = rustc_hash::FxHashSet::default();

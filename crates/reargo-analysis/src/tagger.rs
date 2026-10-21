@@ -248,18 +248,36 @@ fn ci_needles_found(text: &str) -> u8 {
         }
         t
     };
+    // The needles whose second byte (a letter) a byte may be: `d | 0x20 == needle[1]`.
+    const SECOND: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut d = 0;
+        while d < 256 {
+            let mut k = 0;
+            while k < CI_NEEDLES.len() {
+                if (d as u8) | 0x20 == CI_NEEDLES[k][1] {
+                    t[d] |= 1 << k;
+                }
+                k += 1;
+            }
+            d += 1;
+        }
+        t
+    };
     let b = text.as_bytes();
     let mut found = 0u8;
     for (i, &c) in b.iter().enumerate() {
         let mut candidates = FIRST[c as usize] & !found;
+        if candidates == 0 {
+            continue;
+        }
+        // (the second byte first: every needle's is a letter)
+        candidates &= b.get(i + 1).map_or(0, |&d| SECOND[d as usize]);
         while candidates != 0 {
             let k = candidates.trailing_zeros() as usize;
             candidates &= candidates - 1;
             let needle = CI_NEEDLES[k];
-            // (the second byte first: every needle's is a letter)
-            if b.get(i + 1).is_some_and(|&d| d | 0x20 == needle[1])
-                && b.get(i..i + needle.len()).is_some_and(|w| w.eq_ignore_ascii_case(needle))
-            {
+            if b.get(i..i + needle.len()).is_some_and(|w| w.eq_ignore_ascii_case(needle)) {
                 found |= 1 << k;
             }
         }

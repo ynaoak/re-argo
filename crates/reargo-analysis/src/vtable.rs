@@ -51,7 +51,11 @@ impl Analyzer for VTableAnalyzer {
             .map(|s| (s.address, s.size))
             .collect();
 
+        let big = matches!(program.info.memory.endian(), reargo_core::address::Endian::Big);
         for &(section_addr, section_size) in &data_sections {
+            // The section's bytes, when one block holds them all (what the reads below read
+            // there, see `Memory::slice`); a read past them goes to the memory.
+            let bytes = program.info.memory.slice(section_addr, section_size).filter(|_| ptr_size == 8 || ptr_size == 4);
             let mut offset = 0u64;
             while offset + ptr_size * 3 <= section_size {
                 let addr = section_addr + offset;
@@ -59,10 +63,18 @@ impl Analyzer for VTableAnalyzer {
 
                 for i in 0..32u64 {
                     let entry_addr = addr + i * ptr_size;
-                    let ptr_val = if ptr_size == 8 {
-                        program.info.memory.read_u64(entry_addr).ok()
-                    } else {
-                        program.info.memory.read_u32(entry_addr).ok().map(|v| v as u64)
+                    let at = (entry_addr - section_addr) as usize;
+                    let ptr_val = match bytes.and_then(|b| b.get(at..at + ptr_size as usize)) {
+                        Some(w) if ptr_size == 8 => {
+                            let w: [u8; 8] = w.try_into().unwrap();
+                            Some(if big { u64::from_be_bytes(w) } else { u64::from_le_bytes(w) })
+                        }
+                        Some(w) => {
+                            let w: [u8; 4] = w.try_into().unwrap();
+                            Some(u64::from(if big { u32::from_be_bytes(w) } else { u32::from_le_bytes(w) }))
+                        }
+                        None if ptr_size == 8 => program.info.memory.read_u64(entry_addr).ok(),
+                        None => program.info.memory.read_u32(entry_addr).ok().map(|v| v as u64),
                     };
 
                     if let Some(val) = ptr_val {
