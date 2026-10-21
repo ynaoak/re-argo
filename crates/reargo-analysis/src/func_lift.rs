@@ -173,18 +173,27 @@ impl JumpIndex {
     ) -> std::collections::BTreeSet<u64> {
         if increasing {
             let mut found = Vec::new();
-            self.external_entries_increasing(addrs, &mut found);
+            self.external_entries_increasing(addrs, None, &mut found);
             return found.into_iter().collect();
         }
         self.external_entries_unordered(addrs)
     }
 
     /// [`JumpIndex::external_entries_ordered`] as an ascending list, put in
-    /// `out` (emptied first).
-    pub fn external_entries_sorted_into(&self, program: &Program, addrs: &[u64], increasing: bool, out: &mut Vec<u64>) {
+    /// `out` (emptied first). `finder`, when given, finds the position of an address among
+    /// `addrs` (of an increasing lift borrowed from a lift cache:
+    /// [`reargo_lift::RangeShapes::positions`]).
+    pub fn external_entries_sorted_into(
+        &self,
+        program: &Program,
+        addrs: &[u64],
+        increasing: bool,
+        finder: Option<&reargo_lift::PositionFinder>,
+        out: &mut Vec<u64>,
+    ) {
         out.clear();
         if increasing {
-            self.external_entries_increasing(addrs, out);
+            self.external_entries_increasing(addrs, finder, out);
         } else {
             out.extend(self.external_entries_ordered(program, addrs, false));
         }
@@ -210,12 +219,28 @@ impl JumpIndex {
             .collect()
     }
 
-    /// [`JumpIndex::external_entries_ordered`] of strictly increasing addresses, ascending.
-    fn external_entries_increasing(&self, addrs: &[u64], found: &mut Vec<u64>) {
+    /// [`JumpIndex::external_entries_ordered`] of strictly increasing addresses, ascending
+    /// (whether an address is lifted looked up through `finder` when given).
+    fn external_entries_increasing(&self, addrs: &[u64], finder: Option<&reargo_lift::PositionFinder>, found: &mut Vec<u64>) {
         use reargo_program::RefType;
         let (Some(&first), Some(&last)) = (addrs.first(), addrs.last()) else {
             return;
         };
+        if let Some(finder) = finder {
+            let start = self.refs.partition_point(|r| r.0 < first);
+            for &(to, from, ty) in self.refs[start..].iter().take_while(|r| r.0 <= last) {
+                if !matches!(ty, RefType::IndirectJump | RefType::UnconditionalJump | RefType::ConditionalJump) {
+                    continue;
+                }
+                if finder.find(to).is_none() || found.last() == Some(&to) {
+                    continue;
+                }
+                if ty == RefType::IndirectJump || finder.find(from).is_none() {
+                    found.push(to);
+                }
+            }
+            return;
+        }
         let lifted = |a: u64| a >= first && a <= last && addrs.binary_search(&a).is_ok();
         let start = self.refs.partition_point(|r| r.0 < first);
         // (the targets ascend: whether one is lifted is found by stepping through the
@@ -306,5 +331,63 @@ mod tests {
             assert_eq!(index.external_entries_at(&program, &addrs), want, "{addrs:x?}");
             assert_eq!(index.external_entries_ordered(&program, &addrs, increasing), want);
         }
+    }
+
+    /// The external entries found through a lift cache's index of addresses (the shapes of a
+    /// range borrowed from the cache: [`crate::blockflow::LiftShape::finder`]) are those the
+    /// addresses give: random code and jump references (to instructions, into them and
+    /// outside the ranges), ranges walked at ascending starts through one trimmed cache.
+    #[test]
+    fn external_entries_through_cache_index_match() {
+        let mut seed = 0x6b8b_4567_327b_23c6_u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let pieces: &[&[u8]] = &[
+            &[0x48, 0x89, 0xc3],          // mov rbx, rax
+            &[0x75, 0x04],                // jne
+            &[0xeb, 0xf0],                // jmp back
+            &[0xe8, 0x10, 0, 0, 0],       // call
+            &[0xc3],                      // ret
+            &[0x0f, 0x84, 0x10, 0, 0, 0], // je
+        ];
+        let types = [RefType::IndirectJump, RefType::UnconditionalJump, RefType::ConditionalJump, RefType::UnconditionalCall];
+        let mut found = 0;
+        for _ in 0..20 {
+            let mut code = Vec::new();
+            while code.len() < 3000 {
+                code.extend_from_slice(pieces[next(pieces.len() as u64) as usize]);
+            }
+            let base = 0x40_1000 + next(0x800);
+            let mut program = crate::testutil::helpers::make_x86_64_program(&code, base);
+            let span = code.len() as u64 + 64;
+            for _ in 0..1500 {
+                let r = Reference::new(base + next(span) - 32, base + next(span) - 32, types[next(4) as usize]);
+                program.references.add(r);
+            }
+            let index = JumpIndex::new(&program);
+            let lifter = reargo_lift::x86::X86Lifter::new_64();
+            let mut cache = reargo_lift::x86::LiftCache::lazy();
+            let mut start = 0;
+            while start < code.len() as u64 {
+                let at = base + start;
+                cache.trim(at, 64);
+                let budget = 1 + next(300) as usize;
+                lifter.lift_prefixes_lazy(&program.info.memory, at, &[budget], &mut cache, |_, insns, shapes| {
+                    let shape = crate::blockflow::LiftShape::from_shapes(insns, shapes.unwrap());
+                    let Some(finder) = shape.finder() else { return };
+                    let (mut with, mut without) = (Vec::new(), Vec::new());
+                    index.external_entries_sorted_into(&program, &shape.addrs, shape.increasing, Some(finder), &mut with);
+                    index.external_entries_sorted_into(&program, &shape.addrs, shape.increasing, None, &mut without);
+                    assert_eq!(with, without, "{at:#x}");
+                    found += with.len();
+                });
+                start += 1 + next(40);
+            }
+        }
+        assert!(found > 1000, "{found}");
     }
 }

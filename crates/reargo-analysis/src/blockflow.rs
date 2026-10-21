@@ -16,7 +16,7 @@ use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use reargo_core::pcode::{OpCode, PcodeOp};
-use reargo_lift::{AddrPositions, InsnShape, LiftedInstruction, RangeShapes};
+use reargo_lift::{InsnShape, LiftedInstruction, PositionFinder, RangeShapes};
 
 /// Per-block visit cap, so an irreducible / cycle-heavy CFG cannot
 /// loop forever; reducible CFGs converge in a few visits. A block
@@ -58,12 +58,19 @@ pub struct LiftShape<'a> {
     /// return), ascending: the passes that look only at those step
     /// through them instead of every instruction.
     pub special: Vec<u32>,
-    /// The position of each address, looked up in the lift cache's index
+    /// Finds the position of each address through the lift cache's index
     /// (for shapes borrowed from a cache: [`RangeShapes::positions`]).
-    positions: Option<AddrPositions<'a>>,
+    finder: Option<PositionFinder<'a>>,
 }
 
 impl<'a> LiftShape<'a> {
+    /// Finds the position of an address among the instructions through the lift cache's
+    /// index, for shapes borrowed from a cache whose addresses strictly increase
+    /// ([`RangeShapes::positions`]).
+    pub fn finder(&self) -> Option<&PositionFinder<'a>> {
+        self.finder.as_ref()
+    }
+
     /// Instruction `i` has a `Call` / `CallInd` op.
     #[inline]
     pub fn has_call(&self, i: usize) -> bool {
@@ -98,7 +105,7 @@ impl<'a> LiftShape<'a> {
             addrs.push(s.address);
             flags.push(s.flags);
         }
-        LiftShape { increasing: increasing(&addrs), addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, positions: None }
+        LiftShape { increasing: increasing(&addrs), addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, finder: None }
     }
 
     /// [`LiftShape::of`] from the [`RangeShapes`] of the instructions
@@ -118,7 +125,7 @@ impl<'a> LiftShape<'a> {
             flags: Cow::Borrowed(&shapes.flags),
             branches,
             special,
-            positions: shapes.positions(),
+            finder: shapes.positions().map(|p| p.finder()),
         }
     }
 
@@ -126,7 +133,7 @@ impl<'a> LiftShape<'a> {
     #[cfg(test)]
     pub fn from_parts(increasing: bool, addrs: Vec<u64>, flags: Vec<u8>, branches: Vec<(usize, u64)>) -> LiftShape<'static> {
         let special = flags.iter().enumerate().filter(|(_, f)| **f != 0).map(|(i, _)| i as u32).collect();
-        LiftShape { increasing, addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, positions: None }
+        LiftShape { increasing, addrs: Cow::Owned(addrs), flags: Cow::Owned(flags), branches, special, finder: None }
     }
 }
 
@@ -190,7 +197,7 @@ impl LiftMarks {
         let mut flags = vec![0u8; addrs.len()];
         // (looked up in the lift cache's index of addresses when the shape is the cache's:
         // what the searches find)
-        let finder = shape.positions.map(|p| p.finder());
+        let finder = &shape.finder;
         let target_idx: Vec<Option<usize>> = shape
             .branches
             .iter()
