@@ -120,12 +120,10 @@ impl Analyzer for AddressTableAnalyzer {
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         let candidates: Vec<(u64, u64, RefType)> = crate::analyzer::prepared(prepared);
-        let mut refs_found = 0usize;
-        for (from, to, kind) in candidates {
-            if program.references.add_unless(Reference::new(from, to, kind), |r| r.to == to && r.ref_type == kind) {
-                refs_found += 1;
-            }
-        }
+        // (each unless a reference from its source to its target of its kind
+        // is there, in bulk)
+        let candidates = candidates.into_iter().map(|(from, to, kind)| Reference::new(from, to, kind)).collect();
+        let refs_found = crate::references::add_unless_keyed(&mut program.references, candidates, |r| (r.to, r.ref_type));
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

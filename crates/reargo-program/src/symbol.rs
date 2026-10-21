@@ -81,6 +81,30 @@ impl SymbolTable {
         self.by_name.entry(name).or_default().push(addr);
     }
 
+    /// [`Self::add`] of each of `symbols` in turn, the name map filled on
+    /// a thread of its own while the address map is (when they are many).
+    pub fn add_all(&mut self, symbols: Vec<Symbol>) {
+        if symbols.len() < 1 << 12 {
+            for symbol in symbols {
+                self.add(symbol);
+            }
+            return;
+        }
+        let names: Vec<(String, u64)> = symbols.iter().map(|s| (s.name.clone(), s.address)).collect();
+        let (by_address, by_name) = (&mut self.by_address, &mut self.by_name);
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                by_name.reserve(names.len());
+                for (name, addr) in names {
+                    by_name.entry(name).or_default().push(addr);
+                }
+            });
+            for symbol in symbols {
+                by_address.entry(symbol.address).or_default().push(symbol);
+            }
+        });
+    }
+
     pub fn get_at(&self, address: u64) -> &[Symbol] {
         self.by_address.get(&address).map_or(&[], |v| v.as_slice())
     }
@@ -166,5 +190,29 @@ mod tests {
         assert_eq!(table.primary_at(0x1000).unwrap().name, "main");
         assert_eq!(table.get_by_name("printf").unwrap(), &[0x2000]);
         assert_eq!(table.function_symbols().count(), 2);
+    }
+
+    /// Many symbols added at once (names and addresses repeating) give the
+    /// maps `add` of each in turn gives.
+    #[test]
+    fn add_all_matches_add() {
+        for n in [5usize, 10_000] {
+            let symbols: Vec<Symbol> = (0..n as u64)
+                .map(|k| Symbol::new(format!("s_{}", k % 977), 0x1000 + (k * 7919) % 3001, SymbolType::Data, SourceType::Analysis))
+                .collect();
+            let mut one = SymbolTable::new();
+            one.add(Symbol::new("main".into(), 0x1000, SymbolType::Function, SourceType::Imported));
+            let mut bulk = SymbolTable::new();
+            bulk.add(Symbol::new("main".into(), 0x1000, SymbolType::Function, SourceType::Imported));
+            for s in symbols.clone() {
+                one.add(s);
+            }
+            bulk.add_all(symbols);
+            let parts = |t: &SymbolTable| {
+                let (a, n) = t.cache_parts();
+                (a.iter().map(|(k, v)| (*k, v.iter().map(|s| (s.name.clone(), s.address)).collect::<Vec<_>>())).collect::<Vec<_>>(), n.clone())
+            };
+            assert_eq!(parts(&one), parts(&bulk), "{n}");
+        }
     }
 }

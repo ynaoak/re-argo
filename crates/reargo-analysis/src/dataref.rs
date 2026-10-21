@@ -78,13 +78,10 @@ impl Analyzer for DataReferenceAnalyzer {
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         let candidates: Vec<(u64, u64)> = crate::analyzer::prepared(prepared);
-        // Phase 2: apply serially, deduplicating against existing refs.
-        let mut refs_found = 0;
-        for (addr, val) in candidates {
-            if program.references.add_unless(Reference::new(addr, val, RefType::DataRead), |r| r.to == val) {
-                refs_found += 1;
-            }
-        }
+        // Phase 2: each unless a reference from its source to its target is
+        // there (in bulk).
+        let candidates = candidates.into_iter().map(|(addr, val)| Reference::new(addr, val, RefType::DataRead)).collect();
+        let refs_found = crate::references::add_unless_keyed(&mut program.references, candidates, |r| r.to);
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

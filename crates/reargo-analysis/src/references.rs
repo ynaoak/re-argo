@@ -98,8 +98,11 @@ impl Analyzer for ScalarReferenceAnalyzer {
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         let instructions: Vec<(u64, Vec<Constant>)> = crate::analyzer::prepared(prepared);
-        // (the references in bulk, in the same order, after)
+        // (the references and the symbols in bulk, in the same order, after;
+        // a target named here counts as named for the ones after)
         let mut refs: Vec<Reference> = Vec::new();
+        let mut symbols: Vec<Symbol> = Vec::new();
+        let mut named: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
         for (insn_addr, constants) in &instructions {
             for (k, c) in constants.iter().enumerate() {
                 let target = c.target;
@@ -115,8 +118,8 @@ impl Analyzer for ScalarReferenceAnalyzer {
                 };
                 refs.push(Reference::new(*insn_addr, target, ref_type));
 
-                if c.string && program.symbol_table.primary_at(target).is_none() {
-                    program.symbol_table.add(Symbol::new(
+                if c.string && program.symbol_table.primary_at(target).is_none() && named.insert(target) {
+                    symbols.push(Symbol::new(
                         format!("DAT_{:x}", target),
                         target,
                         SymbolType::Data,
@@ -125,6 +128,7 @@ impl Analyzer for ScalarReferenceAnalyzer {
                 }
             }
         }
+        program.symbol_table.add_all(symbols);
         let refs_found = refs.len();
         program.references.add_all(&refs);
 
@@ -135,6 +139,40 @@ impl Analyzer for ScalarReferenceAnalyzer {
             instructions_decoded: 0,
         })
     }
+}
+
+/// Add each reference of `candidates` unless one from its source with the
+/// same `key` is there — as `ReferenceManager::add_unless` of each in turn
+/// with `key(r) == key(candidate)` as the test does (the ones it added
+/// before count) —, in bulk: whether one is there before looked up in
+/// parallel, the first of each repeat kept, the rest added at once
+/// (`ReferenceManager::add_all`, the same lists in the same order).
+/// Returns how many were added.
+pub(crate) fn add_unless_keyed<K: Eq + std::hash::Hash + Send>(
+    references: &mut reargo_program::reference::ReferenceManager,
+    candidates: Vec<Reference>,
+    key: impl Fn(&Reference) -> K + Sync,
+) -> usize {
+    let present: Vec<bool> = {
+        let references = &*references;
+        candidates
+            .par_iter()
+            .with_min_len(4096)
+            .map(|c| {
+                let k = key(c);
+                references.get_refs_from(c.from).iter().any(|r| key(r) == k)
+            })
+            .collect()
+    };
+    let mut seen: rustc_hash::FxHashSet<(u64, K)> = rustc_hash::FxHashSet::default();
+    let added: Vec<Reference> = candidates
+        .into_iter()
+        .zip(present)
+        .filter(|&(c, present)| !present && seen.insert((c.from, key(&c))))
+        .map(|(c, _)| c)
+        .collect();
+    references.add_all(&added);
+    added.len()
 }
 
 fn is_valid_pointer(val: u64, ranges: &[(u64, u64)]) -> bool {
@@ -259,6 +297,56 @@ impl Analyzer for NoReturnAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Adding in bulk unless a reference with the same key is there gives
+    /// the lists, the jump log and the count of `add_unless` one at a time,
+    /// for both keys the analyzers use.
+    #[test]
+    fn keyed_bulk_add_matches_add_unless() {
+        use reargo_program::reference::ReferenceManager;
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let kinds = [RefType::DataRead, RefType::UnconditionalJump, RefType::ConditionalJump, RefType::UnconditionalCall];
+        for n in [0usize, 10, 3000, 20000] {
+            let mut r = || Reference::new(0x1000 + next() % 400, 0x9000 + next() % 50, kinds[(next() % 4) as usize]);
+            let existing: Vec<Reference> = (0..n / 3).map(|_| r()).collect();
+            let candidates: Vec<Reference> = (0..n).map(|_| r()).collect();
+            let state = |m: &ReferenceManager| {
+                let all: Vec<Reference> = m.all_refs().copied().collect();
+                let to: Vec<Vec<Reference>> = (0x9000..0x9000 + 50).map(|t| m.get_refs_to(t).to_vec()).collect();
+                (all, to)
+            };
+            for by_kind in [true, false] {
+                let mut one = ReferenceManager::new();
+                one.add_all(&existing);
+                let mut bulk = ReferenceManager::new();
+                bulk.add_all(&existing);
+                let (one_mark, bulk_mark) = (one.jump_mark(), bulk.jump_mark());
+                let mut added = 0;
+                for &c in &candidates {
+                    if one.add_unless(c, |e| e.to == c.to && (!by_kind || e.ref_type == c.ref_type)) {
+                        added += 1;
+                    }
+                }
+                let got = if by_kind {
+                    add_unless_keyed(&mut bulk, candidates.clone(), |r| (r.to, Some(r.ref_type)))
+                } else {
+                    add_unless_keyed(&mut bulk, candidates.clone(), |r| (r.to, None::<RefType>))
+                };
+                assert_eq!(got, added, "{n} {by_kind}");
+                let (a, b) = (state(&one), state(&bulk));
+                assert_eq!(a.0, b.0, "{n} {by_kind}");
+                assert_eq!(a.1, b.1, "{n} {by_kind}");
+                assert_eq!(one.jumps_since(one_mark), bulk.jumps_since(bulk_mark), "{n} {by_kind}");
+                assert!(one.jumps_since(one_mark).is_some());
+            }
+        }
+    }
 
     #[test]
     fn valid_pointer_check() {
