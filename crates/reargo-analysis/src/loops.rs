@@ -24,7 +24,7 @@
 //! ```
 
 use reargo_arch::FlowType;
-use reargo_program::comments::CommentType;
+use reargo_program::comments::{CommentBatch, CommentType};
 use rayon::prelude::*;
 use reargo_program::Program;
 
@@ -133,17 +133,17 @@ impl Analyzer for LoopAnalyzer {
                 (target, text)
             })
             .collect();
-        Box::new((posts, plates))
-    }
-    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
-        type Comments = Vec<(u64, String)>;
-        let (posts, plates): (Comments, Comments) = crate::analyzer::prepared(prepared);
-        let emitted = program.comments.set_all_if_absent(
+        // (sorted into a map here, each set at `apply` where still free)
+        Box::new(CommentBatch::new(
             posts
                 .into_iter()
                 .map(|(branch, text)| (branch, CommentType::Post, text))
                 .chain(plates.into_iter().map(|(target, text)| (target, CommentType::Plate, text))),
-        );
+        ))
+    }
+    fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
+        let comments: CommentBatch = crate::analyzer::prepared(prepared);
+        let emitted = program.comments.set_batch_if_absent(comments);
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

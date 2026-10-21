@@ -322,12 +322,17 @@ pub fn decompile_function_with_options(
 /// the C / Rust emitters want. One BTreeMap per program; passed by
 /// reference into every decompile call so the cost is paid once.
 pub fn build_annotations(program: &Program) -> std::collections::BTreeMap<u64, Vec<String>> {
-    let mut out: std::collections::BTreeMap<u64, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for c in program.comments.iter() {
-        out.entry(c.address).or_default().push(c.text);
-    }
-    out
+    use rayon::prelude::*;
+    // The comments come by address (then type): grouped by address in
+    // one pass, their texts copied in parallel, the map built at once.
+    let comments: Vec<(u64, &str)> = program.comments.iter_refs().map(|(a, _, text)| (a, text)).collect();
+    let groups: Vec<&[(u64, &str)]> = comments.chunk_by(|a, b| a.0 == b.0).collect();
+    let grouped: Vec<(u64, Vec<String>)> = groups
+        .par_iter()
+        .with_min_len(1024)
+        .map(|g| (g[0].0, g.iter().map(|&(_, text)| text.to_string()).collect()))
+        .collect();
+    grouped.into_iter().collect()
 }
 
 /// Iterate `program.symbol_table` once and return the two
@@ -1692,8 +1697,11 @@ pub fn decompile_all_with_options(
     // Largest first, each worker taking the next function when it is done: the big
     // functions do not end up last on one thread (the results keep the listing order).
     let size = |e: u64| program.listing.get_function(e).map_or(0, |f| f.body.ranges().map(|r| r.size).sum::<u64>());
+    // (the sizes summed in parallel: a body holds a range per instruction)
+    use rayon::prelude::*;
+    let sizes: Vec<u64> = entries.par_iter().with_min_len(256).map(|&e| size(e)).collect();
     let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(size(entries[i])));
+    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Option<Result<DecompileResult, String>>>> =
         (0..entries.len()).map(|_| std::sync::Mutex::new(None)).collect();
@@ -1716,6 +1724,11 @@ pub fn decompile_all_with_options(
             *s = Some(r);
         }
     });
+    // (a process about to exit leaves the batch's memos to the exit: freeing
+    // them, filled on every thread, is slow)
+    if reargo_program::program::leaks_on_drop() {
+        std::mem::forget((oracle, batch_flow, symbols, string_literals, annotations));
+    }
     entries
         .into_iter()
         .zip(slots)

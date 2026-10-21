@@ -181,7 +181,7 @@ fn param_summaries<'a>(sites: impl Iterator<Item = &'a CallSite>) -> ParamSummar
 /// ([`seeds_anything`]), each parameter pinned to one value a set of
 /// it, the others `None` (the same walks: only a pinned parameter
 /// seeds one).
-fn seeding_summaries<'a>(sites: impl Iterator<Item = &'a CallSite>) -> ParamSummaries {
+fn seeding_summaries(sites: &[&CallSite]) -> ParamSummaries {
     /// What the calls pass to one parameter.
     #[derive(Clone, Copy)]
     enum Passed {
@@ -190,21 +190,53 @@ fn seeding_summaries<'a>(sites: impl Iterator<Item = &'a CallSite>) -> ParamSumm
         /// Two values or more, or an unknown one.
         NotOne,
     }
-    let mut passed: FxHashMap<u64, [Passed; X86_64_SYSV_ARG_REGS.len()]> = FxHashMap::default();
-    for site in sites {
-        let Some(target) = site.call_target else {
-            continue;
-        };
-        let params = passed.entry(target).or_insert([Passed::Nothing; X86_64_SYSV_ARG_REGS.len()]);
-        for (param, arg) in params.iter_mut().zip(&site.args) {
-            *param = match (*param, arg.value) {
-                (_, None) | (Passed::NotOne, _) => Passed::NotOne,
-                (Passed::Nothing, Some(v)) => Passed::One(v),
-                (Passed::One(w), Some(v)) if w == v => Passed::One(w),
-                (Passed::One(_), Some(_)) => Passed::NotOne,
-            };
+    impl Passed {
+        /// What the calls of `self` and of `other` together pass (the
+        /// same whichever are taken first).
+        fn and(self, other: Passed) -> Passed {
+            match (self, other) {
+                (Passed::Nothing, p) | (p, Passed::Nothing) => p,
+                (Passed::One(w), Passed::One(v)) if w == v => Passed::One(w),
+                _ => Passed::NotOne,
+            }
         }
     }
+    type Params = [Passed; X86_64_SYSV_ARG_REGS.len()];
+    let fold = |sites: &[&CallSite]| {
+        let mut passed: FxHashMap<u64, Params> = FxHashMap::default();
+        for site in sites {
+            let Some(target) = site.call_target else {
+                continue;
+            };
+            let params = passed.entry(target).or_insert([Passed::Nothing; X86_64_SYSV_ARG_REGS.len()]);
+            for (param, arg) in params.iter_mut().zip(&site.args) {
+                *param = match (*param, arg.value) {
+                    (_, None) | (Passed::NotOne, _) => Passed::NotOne,
+                    (Passed::Nothing, Some(v)) => Passed::One(v),
+                    (Passed::One(w), Some(v)) if w == v => Passed::One(w),
+                    (Passed::One(_), Some(_)) => Passed::NotOne,
+                };
+            }
+        }
+        passed
+    };
+    // (parts of the sites in parallel, their maps then joined: what one
+    // parameter is passed does not depend on the order of the calls)
+    let passed = sites
+        .par_chunks(1 << 13)
+        .map(fold)
+        .reduce(FxHashMap::default, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            for (target, params) in b {
+                let at = a.entry(target).or_insert([Passed::Nothing; X86_64_SYSV_ARG_REGS.len()]);
+                for (p, q) in at.iter_mut().zip(params) {
+                    *p = p.and(q);
+                }
+            }
+            a
+        });
     passed
         .into_iter()
         .filter(|(_, params)| params.iter().any(|p| matches!(p, Passed::One(_))))
@@ -231,16 +263,39 @@ fn seeding_summaries<'a>(sites: impl Iterator<Item = &'a CallSite>) -> ParamSumm
 fn keep_closed_callers(program: &Program, sites: &[&CallSite], summaries: &mut ParamSummaries) {
     // (only the callers of the functions summarised, and the arguments
     // that are one of their entries, matter)
+    // (the sites read in parallel, in parts: the calls of the functions
+    // summarised, `(callee, call site)`, and the arguments that are one of
+    // their entries)
+    type Read = (Vec<(u64, u64)>, Vec<u64>);
+    let (calls, escaped): Read = {
+        let summaries = &*summaries;
+        let parts: Vec<Read> = sites
+            .par_chunks(1 << 13)
+            .map(|sites| {
+                let mut calls = Vec::new();
+                let mut escaped = Vec::new();
+                for site in sites {
+                    if let Some(t) = site.call_target
+                        && summaries.contains_key(&t)
+                    {
+                        calls.push((t, site.call_site));
+                    }
+                    escaped.extend(site.args.iter().filter_map(|a| a.value).filter(|v| summaries.contains_key(v)));
+                }
+                (calls, escaped)
+            })
+            .collect();
+        parts.into_iter().fold((Vec::new(), Vec::new()), |(mut c, mut e), (pc, pe)| {
+            c.extend(pc);
+            e.extend(pe);
+            (c, e)
+        })
+    };
     let mut callers: FxHashMap<u64, rustc_hash::FxHashSet<u64>> = FxHashMap::default();
-    let mut escaped: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-    for site in sites {
-        if let Some(t) = site.call_target
-            && summaries.contains_key(&t)
-        {
-            callers.entry(t).or_default().insert(site.call_site);
-        }
-        escaped.extend(site.args.iter().filter_map(|a| a.value).filter(|v| summaries.contains_key(v)));
+    for (t, call_site) in calls {
+        callers.entry(t).or_default().insert(call_site);
     }
+    let escaped: rustc_hash::FxHashSet<u64> = escaped.into_iter().collect();
     let pe_exports: rustc_hash::FxHashSet<u64> = program
         .info
         .symbols
@@ -251,16 +306,22 @@ fn keep_closed_callers(program: &Program, sites: &[&CallSite], summaries: &mut P
     let exported = |entry: u64| {
         program.info.dynamic.exported_functions.binary_search(&entry).is_ok() || pe_exports.contains(&entry)
     };
-    summaries.retain(|entry, _| {
-        if escaped.contains(entry) || exported(*entry) {
-            return false;
-        }
-        let known = callers.get(entry);
-        program.references.get_refs_to(*entry).iter().all(|r| {
-            matches!(r.ref_type, RefType::UnconditionalCall | RefType::ConditionalCall)
-                && known.is_some_and(|k| k.contains(&r.from))
+    // (each summary's verdict found in parallel)
+    let dropped: rustc_hash::FxHashSet<u64> = summaries
+        .par_iter()
+        .filter(|&(entry, _)| {
+            if escaped.contains(entry) || exported(*entry) {
+                return true;
+            }
+            let known = callers.get(entry);
+            !program.references.get_refs_to(*entry).iter().all(|r| {
+                matches!(r.ref_type, RefType::UnconditionalCall | RefType::ConditionalCall)
+                    && known.is_some_and(|k| k.contains(&r.from))
+            })
         })
-    });
+        .map(|(&entry, _)| entry)
+        .collect();
+    summaries.retain(|entry, _| !dropped.contains(entry));
 }
 
 /// Re-resolve call sites with the given parameter summaries seeded
@@ -316,9 +377,18 @@ pub(crate) fn dedup_sites<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) ->
 
 /// [`dedup_sites`] without copying them.
 pub(crate) fn dedup_site_refs<'a>(per_func: impl Iterator<Item = &'a [CallSite]>) -> Vec<&'a CallSite> {
-    // (the sets sized for all of them at once: no growing)
     let per_func: Vec<&[CallSite]> = per_func.collect();
     let n = per_func.iter().map(|f| f.len()).sum();
+    // Sites in strictly increasing order have no repeats: all are kept,
+    // with no set (the usual case: a function walks only the calls it
+    // owns, after its entry and before the next one's).
+    let mut prev: Option<u64> = None;
+    if per_func.iter().flat_map(|f| f.iter()).all(|s| prev.replace(s.call_site).is_none_or(|p| p < s.call_site)) {
+        let mut out: Vec<&CallSite> = Vec::with_capacity(n);
+        out.extend(per_func.into_iter().flatten());
+        return out;
+    }
+    // (the sets sized for all of them at once: no growing)
     let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(n, Default::default());
     let mut out: Vec<&CallSite> = Vec::with_capacity(n);
     for site in per_func.into_iter().flatten() {
@@ -645,7 +715,7 @@ pub fn resolve_call_sites_iterative_from(
     }
     let summaries_of = |sites: &[&CallSite]| {
         // (only a summary that seeds something changes a walk)
-        let mut summaries = seeding_summaries(sites.iter().copied());
+        let mut summaries = seeding_summaries(sites);
         keep_closed_callers(program, sites, &mut summaries);
         summaries
     };
@@ -1109,6 +1179,71 @@ fn direct_call_target(op: &reargo_core::pcode::PcodeOp) -> Option<u64> {
 mod tests {
     use super::*;
     use reargo_core::pcode::{PcodeOp, SeqNum};
+
+    /// The seeding summaries made from parts in parallel are the ones one
+    /// pass over the sites in order makes (many sites, few targets and
+    /// values, unknown arguments), and the deduplication's fast path keeps
+    /// what the set keeps.
+    #[test]
+    fn seeding_summaries_match_one_pass() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for (n, targets, values) in [(0usize, 5u64, 3u64), (10, 3, 2), (30_000, 50, 2), (30_000, 2000, 4), (70_000, 300, 1)] {
+            let sites: Vec<CallSite> = (0..n)
+                .map(|i| CallSite {
+                    call_site: 0x1000 + i as u64 * 4,
+                    caller_function: 0,
+                    call_target: (next(10) != 0).then(|| next(targets)),
+                    args: X86_64_SYSV_ARG_REGS
+                        .iter()
+                        .map(|&(reg_offset, reg_name)| ResolvedArg { reg_offset, reg_name, value: (next(8) != 0).then(|| next(values)) })
+                        .collect(),
+                })
+                .collect();
+            let refs: Vec<&CallSite> = sites.iter().collect();
+            // (the summaries as one pass over the sites gives them)
+            let mut expected: FxHashMap<u64, Vec<Option<u64>>> = FxHashMap::default();
+            let mut unknown: FxHashMap<u64, Vec<bool>> = FxHashMap::default();
+            for s in &sites {
+                let Some(t) = s.call_target else { continue };
+                let e = expected.entry(t).or_insert_with(|| vec![None; 6]);
+                let u = unknown.entry(t).or_insert_with(|| vec![false; 6]);
+                for (k, a) in s.args.iter().enumerate() {
+                    match (a.value, e[k]) {
+                        (None, _) => u[k] = true,
+                        (Some(v), None) => e[k] = Some(v),
+                        (Some(v), Some(w)) if v != w => u[k] = true,
+                        _ => {}
+                    }
+                }
+            }
+            let expected: FxHashMap<u64, Vec<Option<u64>>> = expected
+                .into_iter()
+                .map(|(t, e)| {
+                    let u = &unknown[&t];
+                    (t, e.into_iter().zip(u).map(|(v, &u)| v.filter(|_| !u)).collect::<Vec<_>>())
+                })
+                .filter(|(_, e)| e.iter().any(Option::is_some))
+                .collect();
+            let got: FxHashMap<u64, Vec<Option<u64>>> = seeding_summaries(&refs)
+                .into_iter()
+                .map(|(t, params)| (t, params.iter().map(pinned).collect()))
+                .collect();
+            assert_eq!(got, expected, "{n} {targets} {values}");
+            let kept = dedup_site_refs(std::iter::once(&sites[..]));
+            assert_eq!(kept.len(), n);
+        }
+        // repeats (out of order) are kept once, the first
+        let s = |a: u64, t: u64| CallSite { call_site: a, caller_function: t, call_target: None, args: Vec::new() };
+        let (f1, f2) = (vec![s(8, 1), s(4, 1)], vec![s(4, 2), s(12, 2)]);
+        let kept: Vec<(u64, u64)> = dedup_site_refs([&f1[..], &f2[..]].into_iter()).iter().map(|s| (s.call_site, s.caller_function)).collect();
+        assert_eq!(kept, [(8, 1), (4, 1), (12, 2)]);
+    }
 
     /// The join points found by the ascending addresses are the ones the hashed targets
     /// give.

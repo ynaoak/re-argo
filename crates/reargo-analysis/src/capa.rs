@@ -203,6 +203,22 @@ impl Haystack {
         self.joined.push(0);
     }
 
+    /// The haystack of the strings of `parts`, in order.
+    fn concat(parts: Vec<Haystack>) -> Self {
+        let mut all = Haystack {
+            joined: Vec::with_capacity(parts.iter().map(|p| p.joined.len()).sum()),
+            starts: Vec::with_capacity(parts.iter().map(|p| p.starts.len()).sum()),
+            has_nul: false,
+        };
+        for part in parts {
+            let base = all.joined.len();
+            all.has_nul |= part.has_nul;
+            all.starts.extend(part.starts.iter().map(|&s| s + base));
+            all.joined.extend_from_slice(&part.joined);
+        }
+        all
+    }
+
     fn get(&self, i: usize) -> &[u8] {
         let end = self.starts.get(i + 1).map_or(self.joined.len(), |&e| e) - 1;
         &self.joined[self.starts[i]..end]
@@ -215,7 +231,28 @@ impl Haystack {
         if self.has_nul || needle.contains(&0) || needle.is_empty() {
             return (0..self.starts.len()).find(|&i| finder.find(self.get(i)).is_some());
         }
-        let at = finder.find(&self.joined)?;
+        // A large haystack is searched in parts in parallel, each part
+        // whole strings (a match holds no NUL: it lies in one part), the
+        // first part with a match giving the first one.
+        const PART: usize = 1 << 18;
+        let at = if self.joined.len() > 2 * PART {
+            let parts = self.joined.len().div_ceil(PART);
+            // (each part from the start of the first string at or past its
+            // share)
+            let bound = |k: usize| {
+                if k == parts {
+                    return self.joined.len();
+                }
+                let i = self.starts.partition_point(|&s| s < k * PART);
+                self.starts.get(i).copied().unwrap_or(self.joined.len())
+            };
+            (0..parts).into_par_iter().find_map_first(|k| {
+                let (lo, hi) = (bound(k), bound(k + 1));
+                (lo < hi).then(|| finder.find(&self.joined[lo..hi]).map(|at| lo + at)).flatten()
+            })?
+        } else {
+            finder.find(&self.joined)?
+        };
         Some(self.starts.partition_point(|&s| s <= at) - 1)
     }
 }
@@ -308,12 +345,21 @@ fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaConte
 
     // Pull strings from inline comments / immediate-string annotations
     // (every string the analyzer cared about flows through these).
-    let mut strings_lower = Haystack::default();
-    for (_, _, text) in program.comments.iter_refs() {
-        let at = strings_lower.joined.len();
-        strings_lower.push(text.as_bytes());
-        strings_lower.joined[at..].make_ascii_lowercase();
-    }
+    // (lower-cased in parts in parallel, then joined in order)
+    let texts: Vec<&str> = program.comments.iter_refs().map(|(_, _, text)| text).collect();
+    let parts: Vec<Haystack> = texts
+        .par_chunks(4096)
+        .map(|texts| {
+            let mut part = Haystack::default();
+            for text in texts {
+                let at = part.joined.len();
+                part.push(text.as_bytes());
+                part.joined[at..].make_ascii_lowercase();
+            }
+            part
+        })
+        .collect();
+    let strings_lower = Haystack::concat(parts);
 
     CapaContext {
         imports_lower,
@@ -577,6 +623,47 @@ mod tests {
                 let expected = set.iter().position(|s| s.contains(n));
                 assert_eq!(h.first_containing(n.as_bytes()), expected, "{set:?} {n:?}");
             }
+        }
+    }
+
+    /// A haystack searched in parts (large) or built from parts finds
+    /// the same first holder as a test of each string in order.
+    #[test]
+    fn large_haystack_finds_the_first_holder() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (many strings of letters, a few long ones spanning parts)
+        let strings: Vec<String> = (0..40_000)
+            .map(|i| {
+                let len = if i % 9973 == 0 { 300_000 } else { (next() % 40) as usize };
+                (0..len).map(|_| (b'a' + (next() % 6) as u8) as char).collect()
+            })
+            .collect();
+        let mut whole = Haystack::default();
+        for s in &strings {
+            whole.push(s.as_bytes());
+        }
+        let parts: Vec<Haystack> = strings
+            .chunks(777)
+            .map(|c| {
+                let mut h = Haystack::default();
+                for s in c {
+                    h.push(s.as_bytes());
+                }
+                h
+            })
+            .collect();
+        let joined = Haystack::concat(parts);
+        assert_eq!((&joined.joined, &joined.starts), (&whole.joined, &whole.starts));
+        assert!(whole.joined.len() > 1 << 20);
+        for needle in ["abcdef", "fedcba", "aaaaaaa", "ffffffff", "abcabcabc", "zz", "a", "eeeeeeeeeeee"] {
+            let expected = strings.iter().position(|s| s.contains(needle));
+            assert_eq!(whole.first_containing(needle.as_bytes()), expected, "{needle}");
         }
     }
 

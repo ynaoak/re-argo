@@ -111,6 +111,32 @@ pub struct Tag {
 /// Tags by address (or function entry).
 pub type TagMap = BTreeMap<u64, Vec<Tag>>;
 
+/// Address tags to add ([`TagManager::add_address_batch`]), made
+/// before: grouped by address when they come sorted by address.
+#[derive(Debug)]
+pub enum AddressTagBatch {
+    Grouped(TagMap),
+    Unsorted(Vec<(u64, TagKind, String)>, bool),
+}
+
+impl AddressTagBatch {
+    /// The batch of [`TagManager::add_addresses`]`(tags, auto)`.
+    pub fn new(tags: Vec<(u64, TagKind, String)>, auto: bool) -> Self {
+        if !tags.is_sorted_by_key(|t| t.0) {
+            return Self::Unsorted(tags, auto);
+        }
+        let mut grouped: Vec<(u64, Vec<Tag>)> = Vec::new();
+        for (address, kind, text) in tags {
+            let tag = Tag { kind, text, auto };
+            match grouped.last_mut() {
+                Some((a, v)) if *a == address => v.push(tag),
+                _ => grouped.push((address, vec![tag])),
+            }
+        }
+        Self::Grouped(grouped.into_iter().collect())
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TagManager {
     /// Address-scope tags: (address, [tags]).
@@ -170,6 +196,29 @@ impl TagManager {
         }
         let mut fresh: TagMap = fresh.into_iter().collect();
         self.by_address.append(&mut fresh);
+    }
+
+    /// [`Self::add_addresses`] of the tags an [`AddressTagBatch`] was
+    /// made from (made beforehand, off the program: grouped by address).
+    pub fn add_address_batch(&mut self, batch: AddressTagBatch) {
+        let mut added = match batch {
+            AddressTagBatch::Grouped(map) => map,
+            AddressTagBatch::Unsorted(tags, auto) => return self.add_addresses(tags, auto),
+        };
+        if self.by_address.len() > added.len() {
+            for (address, tags) in added {
+                self.by_address.entry(address).or_default().extend(tags);
+            }
+            return;
+        }
+        // (the map held has fewer: its tags put into the batch's, before
+        // the batch's own at an address both have)
+        for (address, tags) in std::mem::take(&mut self.by_address) {
+            let at = added.entry(address).or_default();
+            let new = std::mem::replace(at, tags);
+            at.extend(new);
+        }
+        self.by_address = added;
     }
 
     pub fn add_function(&mut self, entry: u64, kind: TagKind, text: impl Into<String>, auto: bool) {
@@ -238,6 +287,42 @@ impl TagManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch adds what `add_address` of each tag in turn adds (tags
+    /// there before, sorted and unsorted batches, more and fewer than
+    /// those held).
+    #[test]
+    fn address_batch_matches_one_by_one() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let kinds = [TagKind::Loop, TagKind::Crypto, TagKind::Library];
+        for (existing, items, sorted) in [(0usize, 10usize, true), (5, 300, true), (300, 50, true), (40, 40, false), (200, 600, true), (0, 0, true)] {
+            let mut base = TagManager::new();
+            for i in 0..existing {
+                let k = next();
+                base.add_address(k % 256, kinds[(k >> 20) as usize % 3].clone(), format!("old {i}"), false);
+            }
+            let mut tags: Vec<(u64, TagKind, String)> =
+                (0..items).map(|i| { let k = next(); (k % 256, kinds[(k >> 20) as usize % 3].clone(), format!("new {i}")) }).collect();
+            if sorted {
+                tags.sort_by_key(|t| t.0);
+            }
+            let fresh = |m: &TagManager| TagManager::from_cache_parts(m.cache_parts().0.clone(), m.cache_parts().1.clone());
+            let mut one = fresh(&base);
+            for (a, k, t) in tags.clone() {
+                one.add_address(a, k, t, true);
+            }
+            let mut batched = fresh(&base);
+            batched.add_address_batch(AddressTagBatch::new(tags, true));
+            let flat = |m: &TagManager| -> Vec<(u64, String, bool)> { m.iter_addresses().map(|(a, t)| (a, t.text.clone(), t.auto)).collect() };
+            assert_eq!(flat(&batched), flat(&one), "{existing} {items} {sorted}");
+        }
+    }
 
     #[test]
     fn add_and_query() {

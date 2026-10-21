@@ -135,8 +135,7 @@ impl Analyzer for PcodeReferenceAnalyzer {
 
         let sections = SectionMap::from(program);
 
-        let jobs: Vec<(u64, usize)> =
-            program.listing.functions().map(|f| (f.entry_point, budget(f))).collect();
+        let jobs: Vec<(u64, usize)> = crate::func_lift::map_functions(program, |f| (f.entry_point, budget(f)));
 
         // Phase 1 (parallel): per-function lift + scan. Each task
         // sees an immutable Program view and produces candidate
@@ -188,7 +187,7 @@ impl Analyzer for PcodeReferenceAnalyzer {
 /// decompile path, floored at 500 so a tiny discovery body still covers
 /// reachable lift.
 pub(crate) fn budget(f: &reargo_program::function::Function) -> usize {
-    f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(500)
+    crate::func_lift::body_size(f).max(500)
 }
 
 /// [`scan_lifted`] of functions, computed ahead of this analyzer from

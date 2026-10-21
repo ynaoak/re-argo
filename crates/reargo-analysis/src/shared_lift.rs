@@ -48,7 +48,6 @@ use reargo_program::{Program, RefType, Reference};
 use rustc_hash::FxHashMap;
 
 use crate::callsite::{walk_function_shaped, walk_prefix, CallSite, ParamSummaries, WalkPrefix};
-use crate::func_lift::function_jobs;
 
 /// One function's results.
 pub(crate) struct FunctionResults {
@@ -147,13 +146,18 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     let (early_jumps, (jobs, arity_budgets)) = rayon::join(
         || none_cached.then(|| crate::func_lift::JumpIndex::new(program)),
         || {
-            let jobs: Vec<(u64, usize, Option<FunctionResults>)> = function_jobs(program)
-                .into_iter()
-                .map(|(entry, max)| (entry, max, cached_funcs.remove(&entry)))
-                .collect();
-            // Argument Arity's budget of each function, in the same order.
+            // Each body's size, summed in parallel (in listing order):
+            // the lift budget and Argument Arity's budget of each
+            // function are made from it.
+            let sizes: Vec<(u64, usize)> =
+                crate::func_lift::map_functions(program, |f| (f.entry_point, crate::func_lift::body_size(f)));
+            // (as `crate::func_lift::function_jobs`)
+            let jobs: Vec<(u64, usize, Option<FunctionResults>)> =
+                sizes.iter().map(|&(entry, size)| (entry, size.max(500), cached_funcs.remove(&entry))).collect();
+            // Argument Arity's budget of each function, in the same order
+            // (as `arity::budget`).
             let arity_budgets: Vec<usize> =
-                if with_snapshots { program.listing.functions().map(crate::arity::budget).collect() } else { Vec::new() };
+                if with_snapshots { sizes.iter().map(|&(_, size)| size.max(200)).collect() } else { Vec::new() };
             (jobs, arity_budgets)
         },
     );
@@ -171,6 +175,12 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     // Index the jump references when many functions are computed (else
     // a lookup per lifted instruction costs less than the index).
     let stale = jobs.iter().filter(|j| j.2.is_none()).count();
+    if stale == 0 {
+        // (every result kept: nothing to lift, no results ahead)
+        let funcs = jobs.into_iter().filter_map(|j| j.2).collect();
+        let ahead = with_snapshots.then(|| (crate::range_lift::AheadMap::default(), crate::range_lift::AheadMap::default()));
+        return SharedLift { funcs, jump_mark, ahead };
+    }
     let jumps = (stale > jobs.len() / 8).then(|| early_jumps.unwrap_or_else(|| crate::func_lift::JumpIndex::new(program)));
     // The consecutive functions a thread runs share a lift cache
     // ([`crate::range_lift::map_with_lifter`]): a function is lifted
@@ -200,10 +210,12 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
         .into_iter()
         .map(|r| jobs.by_ref().take(r.len()).collect())
         .collect();
-    // (the runs one rayon job takes, in order, share one cache: a run lifts again only what
-    // the run before it did not)
+    // (a rayon job per run, so the last runs are spread over the threads:
+    // the jobs of a run share its cache, the runs are cut where the next
+    // relifts least)
     let computed: Vec<Vec<(FunctionResults, Extra)>> = chunks
         .into_par_iter()
+        .with_max_len(1)
         .map_init(
             || (reargo_lift::x86::LiftCache::lazy(), Scratch::default()),
             |(cache, scratch), chunk| {

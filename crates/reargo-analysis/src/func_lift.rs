@@ -11,21 +11,28 @@ use reargo_program::Program;
 /// Instruction budget used for a function: the sum of its body range
 /// sizes in bytes, at least 500.
 pub fn lift_budget(func: &reargo_program::Function) -> usize {
-    func.body
-        .ranges()
-        .map(|r| r.size as usize)
-        .sum::<usize>()
-        .max(500)
+    body_size(func).max(500)
+}
+
+/// The bytes of a function's body ranges, summed (the lift budgets are
+/// made from it).
+pub fn body_size(func: &reargo_program::Function) -> usize {
+    func.body.ranges().map(|r| r.size as usize).sum::<usize>()
 }
 
 /// `(entry, instruction budget)` of every function, in
 /// `program.listing.functions()` order.
 pub fn function_jobs(program: &Program) -> Vec<(u64, usize)> {
-    program
-        .listing
-        .functions()
-        .map(|f| (f.entry_point, lift_budget(f)))
-        .collect()
+    map_functions(program, |f| (f.entry_point, lift_budget(f)))
+}
+
+/// `f` of every function of `program`, in `program.listing.functions()`
+/// order, computed in parallel (a lift budget sums the body's ranges:
+/// one per instruction).
+pub fn map_functions<T: Send>(program: &Program, f: impl Fn(&reargo_program::Function) -> T + Sync) -> Vec<T> {
+    use rayon::prelude::*;
+    let functions: Vec<&reargo_program::Function> = program.listing.functions().collect();
+    functions.par_iter().with_min_len(256).map(|func| f(func)).collect()
 }
 
 /// Lift one function; `None` when the lift errors (the passes skip

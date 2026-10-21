@@ -76,12 +76,12 @@ impl Analyzer for ArgumentArityAnalyzer {
 
         // Every candidate's linear lift (in parallel, neighbours sharing
         // lifted instructions), then the writes in function order.
-        let jobs: Vec<(u64, usize)> = program
-            .listing
-            .functions()
-            .filter(|f| f.name.starts_with("FUN_") && !f.is_thunk)
-            .map(|f| (f.entry_point, budget(f)))
-            .collect();
+        let jobs: Vec<(u64, usize)> = crate::func_lift::map_functions(program, |f| {
+            (f.name.starts_with("FUN_") && !f.is_thunk).then(|| (f.entry_point, budget(f)))
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         // A function's arity depends only on its lift: those the Stack
         // Frame analyzer computed ahead ([`Ahead`]) are taken as they are.
         let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
@@ -117,7 +117,7 @@ impl Analyzer for ArgumentArityAnalyzer {
 
 /// The instructions lifted from a function's entry.
 pub(crate) fn budget(f: &reargo_program::function::Function) -> usize {
-    f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200)
+    crate::func_lift::body_size(f).max(200)
 }
 
 /// [`infer_arity`] of functions, computed ahead of this analyzer from

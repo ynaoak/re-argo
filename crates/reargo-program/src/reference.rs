@@ -336,10 +336,11 @@ impl ReferenceManager {
     /// order (by target, those to one target in the order added), from
     /// the log of jumps instead of a walk over every reference.
     pub fn jump_refs_sorted_by_target(&self) -> Vec<Reference> {
-        let mut jumps = self.jumps.clone();
         // stable: the references to one target stay in the order added
-        jumps.sort_by_key(|r| r.to);
-        jumps
+        // (by target, then index)
+        let mut order: Vec<(u64, u32)> = self.jumps.iter().enumerate().map(|(i, r)| (r.to, i as u32)).collect();
+        sort_keyed(&mut order);
+        order.into_iter().map(|(_, i)| self.jumps[i as usize]).collect()
     }
 
     /// Each address in `start..end` with references to it, and those
@@ -442,6 +443,28 @@ mod tests {
         // three references from one address: kept in the order added
         assert_eq!(mgr.get_refs_from(0x1000).iter().map(|r| r.to).collect::<Vec<_>>(), [0x2000, 0x1005, 0x2008]);
         assert_eq!(mgr.get_refs_to(0x3000).len(), 2);
+    }
+
+    /// Many jumps (the radix sort's size): the log sorted by target gives
+    /// the references the walk by target gives, in the same order.
+    #[test]
+    fn many_jumps_sorted_by_target_match_the_walk() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let kinds = [RefType::UnconditionalJump, RefType::ConditionalJump, RefType::IndirectJump, RefType::DataRead];
+        let mut mgr = ReferenceManager::new();
+        for _ in 0..20_000 {
+            let (from, to) = (0x40_0000 + next(1 << 20), 0x40_0000 + next(1 << 12));
+            mgr.add(Reference::new(from, to, kinds[next(4) as usize]));
+        }
+        let by_target: Vec<Reference> = mgr.jump_refs_by_target().copied().collect();
+        assert!(by_target.len() > 1 << 12);
+        assert_eq!(mgr.jump_refs_sorted_by_target(), by_target);
     }
 
     #[test]

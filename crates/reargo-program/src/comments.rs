@@ -79,6 +79,26 @@ impl CommentManager {
         set
     }
 
+    /// [`Self::set_all_if_absent`] of the items a [`CommentBatch`] was
+    /// made from (made beforehand, off the program: the items sorted and
+    /// their map built). Returns how many were set.
+    pub fn set_batch_if_absent(&mut self, batch: CommentBatch) -> usize {
+        let mut added = batch.0;
+        if self.comments.len() > added.len() {
+            return added.into_iter().map(|((a, t), s)| usize::from(self.set_if_absent(a, t, s))).sum();
+        }
+        // (the map held has fewer: its comments put into the batch's,
+        // over the batch's own where both have a key)
+        let mut set = added.len();
+        for (k, s) in std::mem::take(&mut self.comments) {
+            if added.insert(k, s).is_some() {
+                set -= 1;
+            }
+        }
+        self.comments = added;
+        set
+    }
+
     pub fn get(&self, address: u64, comment_type: CommentType) -> Option<&str> {
         self.comments.get(&(address, comment_type)).map(|s| s.as_str())
     }
@@ -113,6 +133,29 @@ impl CommentManager {
 
     pub fn is_empty(&self) -> bool {
         self.comments.is_empty()
+    }
+}
+
+/// Comments to set where absent ([`CommentManager::set_batch_if_absent`]),
+/// made before: the first item of each key, by key.
+#[derive(Debug, Default)]
+pub struct CommentBatch(BTreeMap<(u64, CommentType), String>);
+
+impl CommentBatch {
+    pub fn new<S: Into<String>>(items: impl IntoIterator<Item = (u64, CommentType, S)>) -> Self {
+        let mut new: Vec<((u64, CommentType), S)> = items.into_iter().map(|(a, t, s)| ((a, t), s)).collect();
+        // the first item of each key (a stable sort keeps their order)
+        new.sort_by_key(|(k, _)| *k);
+        new.dedup_by(|later, earlier| later.0 == earlier.0);
+        Self(new.into_iter().map(|(k, s)| (k, s.into())).collect())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -174,7 +217,7 @@ mod tests {
             seed
         };
         let types = [CommentType::Eol, CommentType::Post, CommentType::Plate];
-        for (existing, items) in [(0usize, 10usize), (5, 100), (300, 100), (1000, 20), (50, 2000)] {
+        for (existing, items) in [(0usize, 10usize), (5, 100), (300, 100), (1000, 20), (50, 2000), (400, 400), (0, 0)] {
             let mut base = CommentManager::new();
             for _ in 0..existing {
                 let k = next();
@@ -189,9 +232,13 @@ mod tests {
             let mut one = CommentManager::from_cache_parts(base.cache_parts().clone());
             let n_one: usize = list.iter().map(|(a, t, s)| usize::from(one.set_if_absent(*a, *t, s.clone()))).sum();
             let mut bulk = CommentManager::from_cache_parts(base.cache_parts().clone());
+            let mut batched = CommentManager::from_cache_parts(base.cache_parts().clone());
+            let n_batch = batched.set_batch_if_absent(CommentBatch::new(list.clone()));
             let n_bulk = bulk.set_all_if_absent(list);
             assert_eq!(n_bulk, n_one);
             assert_eq!(bulk.cache_parts(), one.cache_parts());
+            assert_eq!(n_batch, n_one);
+            assert_eq!(batched.cache_parts(), one.cache_parts());
         }
     }
 
