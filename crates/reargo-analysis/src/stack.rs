@@ -135,16 +135,12 @@ fn compute_ahead(program: &mut Program) -> Vec<FunctionStackInfo> {
         arity: usize,
     }
     let x86_64 = matches!(program.info.arch, reargo_loader::Architecture::X86_64);
-    let jobs: Vec<Job> = program
-        .listing
-        .functions()
-        .map(|f| Job {
-            entry: f.entry_point,
-            pcode: crate::pcoderef::budget(f),
-            indirect: crate::indirect_resolve::budget(f),
-            arity: crate::arity::budget(f),
-        })
-        .collect();
+    // (each body's size summed once: the three budgets are made from it,
+    // as `pcoderef::budget`, `indirect_resolve::budget`, `arity::budget`)
+    let jobs: Vec<Job> = crate::func_lift::map_functions(program, |f| {
+        let size = crate::func_lift::body_size(f);
+        Job { entry: f.entry_point, pcode: size.max(500), indirect: size.max(200), arity: size.max(200) }
+    });
     let (out, has_got): (Vec<Out>, bool) = {
         let program = &*program;
         let valid_ranges = crate::propagation::valid_ranges(program);

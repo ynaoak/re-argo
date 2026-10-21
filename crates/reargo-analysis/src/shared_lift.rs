@@ -152,9 +152,8 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
             // Each body's size, summed in parallel (in listing order):
             // the lift budget and Argument Arity's budget of each
             // function are made from it.
-            let functions: Vec<&reargo_program::Function> = program.listing.functions().collect();
             let sizes: Vec<(u64, usize)> =
-                functions.par_iter().with_min_len(256).map(|f| (f.entry_point, crate::func_lift::body_size(f))).collect();
+                crate::func_lift::map_functions(program, |f| (f.entry_point, crate::func_lift::body_size(f)));
             // (as `crate::func_lift::function_jobs`)
             let jobs: Vec<(u64, usize, Option<FunctionResults>)> =
                 sizes.iter().map(|&(entry, size)| (entry, size.max(500), cached_funcs.remove(&entry))).collect();
@@ -225,6 +224,7 @@ pub(crate) fn compute_from(program: &Program, cached: Option<Cached>, with_snaps
     let times: std::sync::Mutex<Vec<(f64,f64,usize,Option<usize>)>> = Default::default();
     let computed: Vec<Vec<(FunctionResults, Extra)>> = chunks
         .into_par_iter()
+        .with_max_len(1)
         .enumerate()
         .map_init(
             || (reargo_lift::x86::LiftCache::lazy(), Scratch::default()),

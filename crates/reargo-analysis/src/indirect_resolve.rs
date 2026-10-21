@@ -108,8 +108,7 @@ impl Analyzer for IndirectCallResolver {
         // A range without an indirect `call` has no `CallInd` and so
         // resolves nothing: only the ranges holding one (found by a
         // decode, much cheaper than the lift) are lifted.
-        let jobs: Vec<(u64, usize)> =
-            program.listing.functions().map(|f| (f.entry_point, budget(f))).collect();
+        let jobs: Vec<(u64, usize)> = crate::func_lift::map_functions(program, |f| (f.entry_point, budget(f)));
         let scanner = reargo_lift::x86::X86Lifter::new_64();
         let memory = &program.info.memory;
         let per_function = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
@@ -149,7 +148,7 @@ impl Analyzer for IndirectCallResolver {
 
 /// The instructions lifted from a function's entry.
 pub(crate) fn budget(f: &reargo_program::function::Function) -> usize {
-    f.body.ranges().map(|r| r.size as usize).sum::<usize>().max(200)
+    crate::func_lift::body_size(f).max(200)
 }
 
 /// [`resolve_lifted`] of functions, computed ahead of this analyzer
