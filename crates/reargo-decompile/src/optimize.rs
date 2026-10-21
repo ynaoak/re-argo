@@ -714,22 +714,17 @@ fn cse_in_blocks(func: &mut SsaFunction, scan: Option<&[bool]>, mut rescan: Opti
     // `rbx`). The readers of each value, and how many live ops write each slot.
     // (built when a duplicate is first found: no op has died in this pass yet then, and most
     // passes find none)
-    type Readers = rustc_hash::FxHashMap<ValueKey, SmallVec<[usize; 4]>>;
+    type Readers = crate::condition::Readers;
     type Writers = rustc_hash::FxHashMap<(u32, u64, u32), u32>;
     let build = |func: &SsaFunction| -> (Readers, Writers) {
-        // (sized once from the live ops; a constant is never a duplicate's value: not listed)
+        // (a constant is never a duplicate's value: not listed)
+        let readers = crate::condition::Readers::build(func);
+        // (sized once from the live ops)
         let live = func.ops.iter().filter(|o| !o.dead).count();
-        let mut readers: Readers = rustc_hash::FxHashMap::with_capacity_and_hasher(live, Default::default());
         let mut writers: Writers = rustc_hash::FxHashMap::with_capacity_and_hasher(live / 2, Default::default());
-        for (k, op) in func.ops.iter().enumerate() {
+        for op in &func.ops {
             if op.dead {
                 continue;
-            }
-            for &v in &op.inputs {
-                if func.varnodes[v as usize].data.space == reargo_core::address::SpaceId::CONST {
-                    continue;
-                }
-                readers.entry(value_key(func, v)).or_default().push(k);
             }
             if let Some(o) = op.output {
                 let d = &func.varnodes[o as usize].data;
@@ -760,18 +755,16 @@ fn cse_in_blocks(func: &mut SsaFunction, scan: Option<&[bool]>, mut rescan: Opti
                     (d.space.0, d.offset, d.size) == slot
                 })
         };
-        readers.get(&dup).is_none_or(|rs| {
-            rs.iter().all(|&r| {
-                let ro = &func.ops[r];
-                if ro.dead {
-                    return true;
-                }
-                if ro.block == func.ops[i].block && r > i {
-                    !func.ops[i + 1..r].iter().any(writes_slot) && !phantom_between(&slot, 4 * i + 2, 4 * r + 2)
-                } else {
-                    writers.get(&slot).copied().unwrap_or(0) <= 1
-                }
-            })
+        readers.of_key(&dup).iter().all(|&r| {
+            let ro = &func.ops[r];
+            if ro.dead {
+                return true;
+            }
+            if ro.block == func.ops[i].block && r > i {
+                !func.ops[i + 1..r].iter().any(writes_slot) && !phantom_between(&slot, 4 * i + 2, 4 * r + 2)
+            } else {
+                writers.get(&slot).copied().unwrap_or(0) <= 1
+            }
         })
     };
     for i in 0..func.ops.len() {
@@ -839,7 +832,7 @@ fn cse_in_blocks(func: &mut SsaFunction, scan: Option<&[bool]>, mut rescan: Opti
                 // blocks are looked at, in this pass from here on and in the next)
                 if let Some((readers, _)) = &maps {
                     for k in [value_key(func, out_id), out_key] {
-                        for &r in readers.get(&k).into_iter().flatten() {
+                        for &r in readers.of_key(&k) {
                             let b = func.ops[r].block;
                             if let Some(s) = scan.as_mut() {
                                 s[b] = true;
@@ -1525,22 +1518,8 @@ mod tests {
     /// the whole function each time.
     #[test]
     fn cse_in_marked_blocks_matches_whole_passes() {
-        let exe = std::env::current_exe().expect("the test executable");
-        let Ok(info) = reargo_loader::loader::BinaryLoader::load(&exe) else { return };
-        let Some(hdr) = info.sections.iter().find(|s| s.name == ".eh_frame_hdr").map(|s| s.address) else { return };
-        let fdes = reargo_loader::ehframe::fde_functions(&info.memory, hdr);
-        let lifter = reargo_lift::x86::X86Lifter::new_64();
         let (mut checked, mut cse_seen) = (0usize, 0usize);
-        let step = (fdes.len() / 3000).max(1);
-        for &(start, len) in fdes.iter().step_by(step) {
-            if len > 6000 {
-                continue;
-            }
-            let Ok(lifted) = reargo_lift::PcodeLift::lift_range(&lifter, &info.memory, start, len as usize) else { continue };
-            let body: Vec<LiftedInstruction> = lifted.into_iter().take_while(|i| i.address < start + len).collect();
-            if body.is_empty() {
-                continue;
-            }
+        for (start, body) in crate::ssa::test_executable_bodies(3000) {
             let ssa = |body: Vec<LiftedInstruction>| SsaFunction::from_cfg(String::new(), start, ControlFlowGraph::build_owned(body));
             let (mut a, mut b) = (ssa(body.clone()), ssa(body));
             let (sa, sb) = (run_optimization_passes(&mut a), run_optimization_passes_whole(&mut b));

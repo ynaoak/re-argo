@@ -954,3 +954,27 @@ mod tests {
         assert!(display.contains("0x63")); // 99 in hex
     }
 }
+
+/// The bodies of (some of) the functions of the running test executable, by its
+/// `.eh_frame_hdr`: `(entry, the lifts of its range's instructions)`, at most about `max`
+/// of them, spread over the code (none when the executable cannot be read).
+#[cfg(test)]
+pub(crate) fn test_executable_bodies(max: usize) -> Vec<(u64, Vec<reargo_lift::LiftedInstruction>)> {
+    let Ok(exe) = std::env::current_exe() else { return Vec::new() };
+    let Ok(info) = reargo_loader::loader::BinaryLoader::load(&exe) else { return Vec::new() };
+    let Some(hdr) = info.sections.iter().find(|s| s.name == ".eh_frame_hdr").map(|s| s.address) else { return Vec::new() };
+    let fdes = reargo_loader::ehframe::fde_functions(&info.memory, hdr);
+    let lifter = reargo_lift::x86::X86Lifter::new_64();
+    let mut out = Vec::new();
+    for &(start, len) in fdes.iter().step_by((fdes.len() / max.max(1)).max(1)) {
+        if len > 6000 {
+            continue;
+        }
+        let Ok(lifted) = reargo_lift::PcodeLift::lift_range(&lifter, &info.memory, start, len as usize) else { continue };
+        let body: Vec<reargo_lift::LiftedInstruction> = lifted.into_iter().take_while(|i| i.address < start + len).collect();
+        if !body.is_empty() {
+            out.push((start, body));
+        }
+    }
+    out
+}
