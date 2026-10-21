@@ -1261,17 +1261,32 @@ impl<'c> RangeInsn<'c> {
     /// no constant `c` with `keep(c)` as a `COPY`'s source or a `LOAD` / `STORE`'s address:
     /// `None` then. A lift puts there only its immediates and the absolute address of a memory
     /// operand without a base (or with the instruction pointer) and index, and `0` / `1` (flags)
-    /// ([`any_const_ref_value`]).
+    /// ([`any_operand_const_ref_value`]; `keep(0) || keep(1)` is asked once, by [`ConstKeep::new`]).
     #[inline]
-    pub fn lifted_unless_no_const(&self, keep: impl Fn(u64) -> bool) -> Option<&'c LiftedInstruction> {
+    pub fn lifted_unless_no_const(&self, keep: &ConstKeep<impl Fn(u64) -> bool>) -> Option<&'c LiftedInstruction> {
         match self.0 {
             RangeInsnRepr::Lifted(l) => Some(l),
             RangeInsnRepr::Cached(c, i) => match c.lifted[c.slot(i)].get() {
                 Some(l) => Some(l),
-                None if !any_const_ref_value(&c.decoded(i), keep) => None,
+                None if !keep.flags && !any_operand_const_ref_value(&c.decoded(i), &keep.keep) => None,
                 None => Some(c.insn(i)),
             },
         }
+    }
+}
+
+/// The `keep` of [`RangeInsn::lifted_unless_no_const`], with its answer for the constants
+/// every lift may hold (`0`, `1`: flags set to a constant) asked once, not per instruction.
+pub struct ConstKeep<F> {
+    keep: F,
+    /// `keep(0) || keep(1)`.
+    flags: bool,
+}
+
+impl<F: Fn(u64) -> bool> ConstKeep<F> {
+    pub fn new(keep: F) -> Self {
+        let flags = keep(0) || keep(1);
+        Self { keep, flags }
     }
 }
 
@@ -1280,11 +1295,16 @@ impl<'c> RangeInsn<'c> {
 /// `STORE`'s address: `0`, `1` (flags set to a constant), each immediate (and its low 32, 16
 /// and 8 bits) and the displacement (and its low 32 bits) of a memory operand without an index
 /// whose base is none or the instruction pointer.
+#[cfg(test)]
 fn any_const_ref_value(insn: &iced_x86::Instruction, keep: impl Fn(u64) -> bool) -> bool {
+    keep(0) || keep(1) || any_operand_const_ref_value(insn, &keep)
+}
+
+/// [`any_const_ref_value`] but for `0` / `1`: whether `keep` holds for one of the constants of
+/// `insn`'s operands its lift may hold so.
+#[inline]
+fn any_operand_const_ref_value(insn: &iced_x86::Instruction, keep: &impl Fn(u64) -> bool) -> bool {
     use iced_x86::{OpKind, Register};
-    if keep(0) || keep(1) {
-        return true;
-    }
     (0..insn.op_count()).any(|i| match insn.op_kind(i) {
         OpKind::Immediate8
         | OpKind::Immediate16
@@ -6474,6 +6494,18 @@ mod tests {
                 return false;
             }
             let l = X86Lifter { is_64, parity: false }.lift_decoded(insn, insn.ip(), None).expect("it lifts");
+            // `lifted_unless_no_const`'s test, `keep(0) || keep(1)` asked once by `ConstKeep`,
+            // answers as `any_const_ref_value`
+            let imm = (0..insn.op_count()).find_map(|i| match insn.op_kind(i) {
+                iced_x86::OpKind::Memory => Some(insn.memory_displacement64()),
+                _ => insn.try_immediate(i).ok(),
+            });
+            let imm = imm.unwrap_or(0);
+            let keeps: [&dyn Fn(u64) -> bool; 5] = [&|v| v == 0, &|v| v == 1, &|v| v == imm, &|v| v == imm & 0xff && v > 1, &|v| v > 0x1000];
+            for keep in keeps {
+                let k = ConstKeep::new(keep);
+                assert_eq!(k.flags || any_operand_const_ref_value(&insn, &k.keep), any_const_ref_value(&insn, keep), "{insn} ({is_64})");
+            }
             for op in &l.ops {
                 let c = match op.opcode {
                     OpCode::Copy => op.inputs.first(),

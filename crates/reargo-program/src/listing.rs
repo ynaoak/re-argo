@@ -11,6 +11,53 @@ pub type InstructionMap = BTreeMap<u64, Box<DecodedInstruction>>;
 pub struct Listing {
     instructions: BTreeMap<u64, Box<DecodedInstruction>>,
     functions: BTreeMap<u64, Function>,
+    /// The instructions in address order ([`Self::sorted_instructions`]): made when first
+    /// asked for, dropped when an instruction is listed (not saved).
+    #[serde(skip)]
+    sorted: std::sync::OnceLock<Sorted>,
+}
+
+/// A listing's instructions in address order, with their addresses beside
+/// them: what a walk of the map gives, read from two arrays.
+struct Sorted {
+    addrs: Box<[u64]>,
+    /// Each points to the boxed instruction the map holds at `addrs[i]`.
+    insns: Box<[std::ptr::NonNull<DecodedInstruction>]>,
+}
+
+// SAFETY: `Sorted` only reads, through shared references, the boxed
+// instructions of the listing that holds it, which outlive it: they are
+// neither dropped nor changed without `&mut Listing`, which drops it first
+// (every method that lists an instruction does); `DecodedInstruction` is
+// `Sync`.
+unsafe impl Send for Sorted {}
+unsafe impl Sync for Sorted {}
+
+impl std::fmt::Debug for Sorted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sorted").field("len", &self.addrs.len()).finish()
+    }
+}
+
+impl Sorted {
+    fn of(instructions: &InstructionMap) -> Self {
+        // (one walk of the map for both)
+        let mut addrs = Vec::with_capacity(instructions.len());
+        let mut insns = Vec::with_capacity(instructions.len());
+        for (&a, b) in instructions {
+            addrs.push(a);
+            insns.push(std::ptr::NonNull::from(&**b));
+        }
+        Self { addrs: addrs.into_boxed_slice(), insns: insns.into_boxed_slice() }
+    }
+
+    /// The instructions, borrowed for as long as the listing is.
+    fn insns(&self) -> &[&DecodedInstruction] {
+        // SAFETY: `NonNull<T>` and `&T` have the same layout; each points
+        // to an instruction of the listing, borrowed (see `Sorted`) for as
+        // long as `self` is.
+        unsafe { std::slice::from_raw_parts(self.insns.as_ptr().cast::<&DecodedInstruction>(), self.insns.len()) }
+    }
 }
 
 /// Instructions by address (sorted), for [`Listing::add_unlisted_instructions`].
@@ -30,11 +77,21 @@ impl Listing {
 
     /// A listing of the maps [`Self::cache_parts`] returned.
     pub fn from_cache_parts(instructions: InstructionMap, functions: BTreeMap<u64, Function>) -> Self {
-        Self { instructions, functions }
+        Self { instructions, functions, sorted: std::sync::OnceLock::new() }
     }
 
     pub fn add_instruction(&mut self, insn: DecodedInstruction) {
+        self.sorted.take();
         self.instructions.insert(insn.address, Box::new(insn));
+    }
+
+    /// The instructions in address order (what [`Self::instructions`]
+    /// gives), as a slice: made once (a walk of the map) and kept until an
+    /// instruction is listed. For the analyzers that run when no more are,
+    /// which walk them often; [`Self::for_each_body_instruction`] reads it
+    /// once it is made.
+    pub fn sorted_instructions(&self) -> &[&DecodedInstruction] {
+        self.sorted.get_or_init(|| Sorted::of(&self.instructions)).insns()
     }
 
     /// List each instruction of `parts` at its address unless one is
@@ -48,6 +105,7 @@ impl Listing {
     pub fn add_unlisted_instructions(&mut self, parts: Vec<Vec<InstructionRun>>) {
         type Run = InstructionRun;
         debug_assert!(parts.iter().flatten().all(|r| r.windows(2).all(|w| w[0].0 <= w[1].0)));
+        self.sorted.take();
         let total: usize = parts.iter().flatten().map(Vec::len).sum();
         if total < self.instructions.len() {
             for (a, i) in parts.into_iter().flatten().flatten() {
@@ -100,7 +158,11 @@ impl Listing {
     ) -> Option<&DecodedInstruction> {
         match self.instructions.entry(address) {
             std::collections::btree_map::Entry::Occupied(e) => Some(&**e.into_mut()),
-            std::collections::btree_map::Entry::Vacant(e) => Some(&**e.insert(Box::new(decode()?))),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let insn = Box::new(decode()?);
+                self.sorted.take();
+                Some(&**e.insert(insn))
+            }
         }
     }
 
@@ -143,6 +205,9 @@ impl Listing {
         body: &reargo_core::address::AddressSet,
         mut f: impl FnMut(bool, &'a DecodedInstruction),
     ) {
+        if let Some(sorted) = self.sorted.get() {
+            return for_each_sorted_body_instruction(&sorted.addrs, sorted.insns(), body, f);
+        }
         // (the ranges read as they come: no list of them is made)
         let mut ranges = body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).peekable();
         while let Some((start, mut end)) = ranges.next() {
@@ -211,6 +276,38 @@ impl Listing {
             .next_back()
             .map(|(_, f)| f)
             .filter(|f| f.body.contains(&reargo_core::address::Address::new(reargo_core::address::SpaceId::RAM, address)))
+    }
+}
+
+/// [`Listing::for_each_body_instruction`] over the instructions `insns` at
+/// the ascending addresses `addrs`: each run of ranges starting where the one
+/// before ends is found by a binary search (from the run before's, when it
+/// starts after it) and read in order.
+fn for_each_sorted_body_instruction<'a>(
+    addrs: &[u64],
+    insns: &[&'a DecodedInstruction],
+    body: &reargo_core::address::AddressSet,
+    mut f: impl FnMut(bool, &'a DecodedInstruction),
+) {
+    let mut ranges = body.ranges().map(|r| (r.start.offset, r.start.offset + r.size)).peekable();
+    // (the start and index of the run before)
+    let mut last: (u64, usize) = (0, 0);
+    while let Some((start, mut end)) = ranges.next() {
+        let from = if start >= last.0 { last.1 } else { 0 };
+        let mut i = from + addrs[from..].partition_point(|&a| a < start);
+        last = (start, i);
+        loop {
+            let mut first = true;
+            while i < addrs.len() && addrs[i] < end {
+                f(first, insns[i]);
+                first = false;
+                i += 1;
+            }
+            match ranges.next_if(|&(s, _)| s == end) {
+                Some((_, e)) => end = e,
+                None => break,
+            }
+        }
     }
 }
 
@@ -322,6 +419,79 @@ mod tests {
             let mut walked: Vec<(bool, u64)> = Vec::new();
             l.for_each_body_instruction(body, |first, insn| walked.push((first, insn.address)));
             assert_eq!(walked, expected, "{body:?}");
+        }
+        // and so does the walk of the sorted instructions, once made
+        let sorted: Vec<u64> = l.sorted_instructions().iter().map(|i| i.address).collect();
+        assert_eq!(sorted, l.instructions().map(|i| i.address).collect::<Vec<_>>());
+        for body in &bodies {
+            let mut expected: Vec<(bool, u64)> = Vec::new();
+            for range in body.ranges() {
+                let start = range.start.offset;
+                for (i, insn) in l.instructions_in_range(start, start + range.size).enumerate() {
+                    expected.push((i == 0, insn.address));
+                }
+            }
+            let mut walked: Vec<(bool, u64)> = Vec::new();
+            l.for_each_body_instruction(body, |first, insn| walked.push((first, insn.address)));
+            assert_eq!(walked, expected, "{body:?}");
+        }
+    }
+
+    /// Random bodies (sorted and not, overlapping, empty and adjacent
+    /// ranges) walk the same instructions through the sorted instructions as
+    /// through the map, and listing an instruction drops the sorted ones.
+    #[test]
+    fn sorted_body_walk_matches_map_walk() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let r = |off: u64, size: u64| AddressRange::new(Address::new(SpaceId::RAM, off), size);
+        for round in 0..300 {
+            let mut insns: Vec<(u64, u32)> = Vec::new();
+            let mut a = next(8);
+            while a < 400 {
+                let len = 1 + next(6) as u32;
+                insns.push((a, len));
+                a += u64::from(len) + if next(5) == 0 { next(20) } else { 0 };
+            }
+            let mut l = listing(&insns);
+            for _ in 0..20 {
+                let mut body = AddressSet::new();
+                for _ in 0..next(12) {
+                    let start = if next(2) == 0 && !insns.is_empty() { insns[next(insns.len() as u64) as usize].0 } else { next(420) };
+                    body.add(r(start, next(30)));
+                }
+                if next(3) == 0 {
+                    // a run of adjacent ranges, one per instruction
+                    let k = next(insns.len().max(1) as u64) as usize;
+                    for &(a, len) in insns.iter().skip(k).take(next(8) as usize) {
+                        body.add(r(a, u64::from(len)));
+                    }
+                }
+                let walk = |l: &Listing| {
+                    let mut out: Vec<(bool, u64)> = Vec::new();
+                    l.for_each_body_instruction(&body, |first, insn| out.push((first, insn.address)));
+                    out
+                };
+                let fresh = Listing::from_cache_parts(
+                    l.instructions().map(|i| (i.address, Box::new(i.clone()))).collect(),
+                    BTreeMap::new(),
+                );
+                let by_map = walk(&fresh);
+                l.sorted_instructions();
+                assert_eq!(walk(&l), by_map, "round {round}: {body:?}");
+            }
+            // a new instruction is seen by the next walk
+            l.add_instruction(DecodedInstruction::new(500, 1, "nop".into(), String::new(), smallvec::smallvec![0x90], FlowType::Fall, None));
+            assert_eq!(l.sorted_instructions().last().map(|i| i.address), Some(500));
+            l.instruction_or_insert_with(501, || {
+                Some(DecodedInstruction::new(501, 1, "nop".into(), String::new(), smallvec::smallvec![0x90], FlowType::Fall, None))
+            });
+            assert_eq!(l.sorted_instructions().last().map(|i| i.address), Some(501));
         }
     }
 
