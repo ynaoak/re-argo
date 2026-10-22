@@ -378,22 +378,22 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             },
             |listing, queue, entry, visited, references| {
                 if started.borrow().is_none() && (walked >= HELP_AFTER || seeded) {
-                    let shared = shared.get_or_init(|| Shared {
-                        arch,
-                        memory,
-                        listed: listing.functions().map(|f| f.entry_point).collect(),
-                        has_body: listing.functions().filter(|f| !f.body.is_empty()).map(|f| f.entry_point).collect(),
-                        claims: Claims::new(memory),
-                        cuts: {
-                            let (base, span) = code_span(memory);
-                            let parts = rayon::current_num_threads() as u64;
-                            (1..parts).map(|k| base + span / parts * k).collect()
-                        },
-                        walking: Claims::new(memory),
-                        stop: AtomicBool::new(false),
-                        queue: Mutex::new(Queue::default()),
-                        wake: Condvar::new(),
-                        done: RwLock::new(Done::default()),
+                    let shared = shared.get_or_init(|| {
+                        let cuts = part_cuts(listing, memory, rayon::current_num_threads());
+                        Shared {
+                            arch,
+                            memory,
+                            listed: listing.functions().map(|f| f.entry_point).collect(),
+                            has_body: listing.functions().filter(|f| !f.body.is_empty()).map(|f| f.entry_point).collect(),
+                            claims: Claims::new(memory),
+                            cuts: cuts.0,
+                            fixed: cuts.1,
+                            walking: Claims::new(memory),
+                            stop: AtomicBool::new(false),
+                            queue: Mutex::new(Queue::default()),
+                            wake: Condvar::new(),
+                            done: RwLock::new(Done::default()),
+                        }
                     });
                     // (the entries the walk takes next, in its order, then the
                     // calls it found)
@@ -490,7 +490,13 @@ fn discover_parallel(program: &mut Program, work_queue: VecDeque<u64>) -> (usize
             decodes[k + 1].push(rest.split_off(at));
         }
         decodes[0].push(rest);
-        listing.add_unlisted_instructions_cut(cuts, decodes);
+        // (the fine parts grouped into as many as threads, of about as
+        // many instructions each)
+        let (cuts, decodes) = match shared.get() {
+            Some(shared) if !shared.fixed => group_parts(cuts, decodes, rayon::current_num_threads()),
+            _ => (cuts.to_vec(), decodes),
+        };
+        listing.add_unlisted_instructions_cut(&cuts, decodes);
         let bodies = sets.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
         if let Err(e) = adding.join() {
             std::panic::resume_unwind(e);
@@ -622,8 +628,11 @@ struct Shared<'a> {
     claims: Claims,
     /// Where the decodes handed over are cut into parts, listed on
     /// threads of their own ([`Listing::add_unlisted_instructions_cut`]):
-    /// ascending addresses splitting the code into equal spans.
+    /// ascending addresses ([`part_cuts`]).
     cuts: Vec<u64>,
+    /// Whether `cuts` are the listing's parts (else finer ones, grouped by
+    /// their counts, [`group_parts`]).
+    fixed: bool,
     /// The entries the walk has started on (its own decodes): left to it.
     walking: Claims,
     /// Set when the walk is done: what the threads have not decoded yet,
@@ -787,6 +796,53 @@ impl Visited {
         };
         page[(bit / 64) as usize] |= 1 << (bit % 64);
     }
+}
+
+/// The parts per listing part ([`Shared::cuts`]) the decodes handed over
+/// are cut into, to be grouped by their counts ([`group_parts`]).
+const FINE_PARTS: usize = 16;
+
+/// Where to cut the code for the listing ([`Shared::cuts`]), and whether
+/// the parts are final: where its maps are cut when it has a map per part
+/// and is large (its instructions are listed into them where they are),
+/// else into [`FINE_PARTS`] equal spans per part, grouped later.
+fn part_cuts(listing: &Listing, memory: &Memory, parts: usize) -> (Vec<u64>, bool) {
+    let starts = listing.instruction_part_starts();
+    if parts <= 1 || (starts.len() == parts && listing.instruction_count() >= 1 << 16) {
+        return (starts[1..].iter().copied().take(parts.saturating_sub(1)).collect(), true);
+    }
+    let (base, span) = code_span(memory);
+    let n = (parts * FINE_PARTS) as u64;
+    ((1..n).map(|k| base + span / n * k).collect(), false)
+}
+
+/// The parts `fine` (cut at `cuts`, each a few runs) grouped into `groups`
+/// consecutive ones of about as many instructions each (the runs of a
+/// group in order: those of its first part, then the next's), with the
+/// cuts between the groups.
+fn group_parts(cuts: &[u64], fine: Vec<Vec<InstructionRun>>, groups: usize) -> (Vec<u64>, Vec<Vec<InstructionRun>>) {
+    debug_assert_eq!(fine.len(), cuts.len() + 1);
+    // (the instructions in the parts before each)
+    let mut before = Vec::with_capacity(fine.len() + 1);
+    let mut n = 0;
+    for part in &fine {
+        before.push(n);
+        n += part.iter().map(Vec::len).sum::<usize>();
+    }
+    before.push(n);
+    // each group's first part (the first group's 0), ascending
+    let mut firsts = vec![0];
+    for g in 1..groups.min(fine.len()) {
+        let target = n * g / groups;
+        let at = before.partition_point(|&b| b < target).clamp(firsts[g - 1] + 1, fine.len() - (groups.min(fine.len()) - g));
+        firsts.push(at);
+    }
+    let cuts = firsts[1..].iter().map(|&f| cuts[f - 1]).collect();
+    let mut grouped: Vec<Vec<InstructionRun>> = firsts.iter().map(|_| Vec::new()).collect();
+    for (k, part) in fine.into_iter().enumerate() {
+        grouped[firsts.partition_point(|&f| f <= k) - 1].extend(part);
+    }
+    (cuts, grouped)
 }
 
 /// The start and length of the span of `memory`'s executable blocks
@@ -1423,6 +1479,49 @@ mod tests {
             expected.dedup();
             let expected: AddressSet = expected.into_iter().collect();
             assert_eq!(format!("{:?}", body_set(body.clone())), format!("{expected:?}"), "{body:?}");
+        }
+    }
+
+    /// Fine parts grouped by their counts: the runs in the same order
+    /// (each address in its group's range, the runs of an address in the
+    /// order they had), as many groups as asked (or parts), ascending cuts
+    /// among the fine ones, the groups about even.
+    #[test]
+    fn fine_parts_grouped_by_count() {
+        let code = vec![0x90u8; 64];
+        let program = make_x86_64_program(&code, 0x10000);
+        let mut decoder = program.arch.instruction_decoder(&program.info.memory);
+        let nop = decoder.decode(0x10000).unwrap();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for (parts, groups) in [(64usize, 4usize), (64, 1), (3, 4), (16, 16), (64, 3)] {
+            let cuts: Vec<u64> = (1..parts as u64).map(|k| k * 1000).collect();
+            // (counts from none to many, a few runs each)
+            let fine: Vec<Vec<InstructionRun>> = (0..parts as u64)
+                .map(|k| {
+                    let n = if next(4) == 0 { 0 } else { next(3000) };
+                    (0..1 + next(3)).map(|_| (0..n / 2).map(|_| (k * 1000 + next(1000), Box::new(nop.clone()))).collect()).collect()
+                })
+                .collect();
+            let flat = |p: &Vec<Vec<InstructionRun>>| p.iter().flatten().flatten().map(|d| d.0).collect::<Vec<_>>();
+            let (group_cuts, grouped) = group_parts(&cuts, fine.clone(), groups);
+            assert_eq!(grouped.len(), groups.min(parts));
+            assert_eq!(group_cuts.len() + 1, grouped.len());
+            assert!(group_cuts.windows(2).all(|w| w[0] < w[1]) && group_cuts.iter().all(|c| cuts.contains(c)));
+            assert_eq!(flat(&grouped), flat(&fine));
+            let total = flat(&fine).len();
+            for (g, part) in grouped.iter().enumerate() {
+                let (lo, hi) = (if g == 0 { 0 } else { group_cuts[g - 1] }, group_cuts.get(g).copied().unwrap_or(u64::MAX));
+                assert!(part.iter().flatten().all(|d| lo <= d.0 && d.0 < hi));
+                // (within a fine part of the even share)
+                let n: usize = part.iter().map(Vec::len).sum();
+                assert!(groups > parts || n <= total / groups + 3000, "{parts} {groups}: {n} of {total}");
+            }
         }
     }
 

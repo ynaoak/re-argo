@@ -73,10 +73,12 @@ impl Analyzer for TagAnalyzer {
                 let derived: Vec<Vec<(u64, TagKind, String)>> = comments
                     .par_chunks(2048)
                     .map(|comments| {
+                        let found = ci_needles_found_all(comments);
                         comments
                             .iter()
-                            .flat_map(|&(addr, text)| {
-                                derive_tags(text)
+                            .zip(found)
+                            .flat_map(|(&(addr, text), found)| {
+                                derive_tags_with(text, found)
                                     .into_iter()
                                     .map(move |(cat, derived_text)| (addr, cat, derived_text.unwrap_or_else(|| text.to_string())))
                             })
@@ -171,7 +173,13 @@ impl Analyzer for TagAnalyzer {
 /// flagged both "stack-protected" and "wrapper" gets both tags.
 /// Returns `(kind, optional_replacement_text)` pairs; when the
 /// replacement is `None`, the original comment text is used.
+#[cfg(test)]
 fn derive_tags(text: &str) -> Vec<(TagKind, Option<String>)> {
+    derive_tags_with(text, ci_needles_found(text))
+}
+
+/// [`derive_tags`] of `text`, given its [`ci_needles_found`].
+fn derive_tags_with(text: &str, found: u8) -> Vec<(TagKind, Option<String>)> {
     let mut out = Vec::new();
 
     // Direct prefix / keyword matches against the analyzer output
@@ -212,9 +220,8 @@ fn derive_tags(text: &str) -> Vec<(TagKind, Option<String>)> {
         out.push((TagKind::Suspicious, None));
     }
 
-    // Case-insensitive needles, found in one pass over the text (as
-    // `text.to_ascii_lowercase().contains(needle)` finds them).
-    let found = ci_needles_found(text);
+    // Case-insensitive needles (as `text.to_ascii_lowercase().contains(needle)`
+    // finds them).
     let has = |needle: usize| found & (1 << needle) != 0;
     if has(CI_STACK_PROTECTED) || has(CI_CANARY_LOAD) {
         out.push((TagKind::StackProtected, None));
@@ -241,11 +248,34 @@ const CI_PTRACE: usize = 5;
 const CI_ISDEBUGGERPRESENT: usize = 6;
 const CI_ITANIUM_ABI: usize = 7;
 
+/// [`ci_needles_found`] of the text of each of `comments`, in bulk: the
+/// texts lower-cased into one buffer, each followed by a NUL (a needle
+/// holds none, so a match lies in one text), and each needle searched
+/// for over all of them at once.
+fn ci_needles_found_all(comments: &[(u64, &str)]) -> Vec<u8> {
+    let mut joined = Vec::with_capacity(comments.iter().map(|c| c.1.len() + 1).sum());
+    let mut starts = Vec::with_capacity(comments.len());
+    for (_, text) in comments {
+        starts.push(joined.len());
+        joined.extend_from_slice(text.as_bytes());
+        joined.push(0);
+    }
+    joined.make_ascii_lowercase();
+    let mut found = vec![0u8; comments.len()];
+    for (k, needle) in CI_NEEDLES.iter().enumerate() {
+        for at in memchr::memmem::find_iter(&joined, needle) {
+            found[starts.partition_point(|&s| s <= at) - 1] |= 1 << k;
+        }
+    }
+    found
+}
+
 /// A bit per needle of [`CI_NEEDLES`] that `text` contains ignoring
 /// ASCII case — `text.to_ascii_lowercase().contains(needle)`: the
 /// lower-casing changes only ASCII letters, in place, and a needle
 /// (ASCII) matches no other byte. One pass, trying at each position the
 /// needles starting with its letter.
+#[cfg(test)]
 fn ci_needles_found(text: &str) -> u8 {
     // The needles starting with each byte, either case.
     const FIRST: [u8; 256] = {
@@ -319,6 +349,9 @@ mod tests {
             }
             assert_eq!(ci_needles_found(t), expected, "{t:?}");
         }
+        // (and all of them at once)
+        let comments: Vec<(u64, &str)> = texts.iter().map(|&t| (0, t)).collect();
+        assert_eq!(ci_needles_found_all(&comments), texts.iter().map(|t| ci_needles_found(t)).collect::<Vec<_>>());
     }
 
     #[test]
