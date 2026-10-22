@@ -272,14 +272,13 @@ impl RefParts {
             self.starts = starts;
             slices = pieces;
         }
-        let merge = |(map, (start, slice)): (&mut RefMap, (u64, &[(u64, u32)]))| merge_part(map, start, slice, refs, share);
         let parallel = pooled && order.len() >= 1024 && self.maps.len() > 1;
-        let parts = self.maps.iter_mut().zip(self.starts.iter().copied().zip(slices));
+        let parts = self.maps.iter_mut().zip(self.starts.iter().copied()).zip(slices);
         let cut: Vec<Option<Vec<(u64, RefMap)>>> = if parallel {
             use rayon::prelude::*;
-            parts.collect::<Vec<_>>().into_par_iter().map(merge).collect()
+            parts.collect::<Vec<_>>().into_par_iter().map(|((map, start), slice)| merge_part(map, start, slice, refs, share)).collect()
         } else {
-            parts.map(merge).collect()
+            parts.map(|((map, start), slice)| merge_part(map, start, slice, refs, share)).collect()
         };
         if cut.iter().any(|c| c.is_some()) {
             let (mut maps, mut starts) = (Vec::new(), Vec::new());
