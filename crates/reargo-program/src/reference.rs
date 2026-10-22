@@ -133,41 +133,219 @@ fn sort_keyed(order: &mut Vec<(u64, u32)>) {
     }
 }
 
-fn add_grouped(map: &mut RefMap, refs: &[Reference], key: impl Fn(&Reference) -> u64) {
-    if refs.is_empty() {
-        return;
+/// The entries of a [`RefParts`] map from which a bulk add cuts it into
+/// parts (a part of fewer is never cut).
+const MIN_PART: usize = 1 << 12;
+
+/// The number of parts a bulk add keeps a [`RefParts`] map in, about: a
+/// part grown past twice its share (of the entries over this many parts,
+/// at least [`MIN_PART`]) is cut into parts of that share when the add
+/// changes it.
+const PARTS: usize = 16;
+
+/// References by source (or target) address, as a [`RefMap`] in parts:
+/// maps of ascending, disjoint address ranges read as one map — the same
+/// entries in the same order, serialized as one map. A bulk add
+/// ([`ReferenceManager::add_all`]) merges into each part on its own (in
+/// parallel) and cuts a part grown too large; the parts depend only on
+/// the adds, not on the threads.
+#[derive(Clone)]
+pub struct RefParts {
+    maps: Vec<RefMap>,
+    /// The lowest address each map may hold (the first 0), ascending:
+    /// every address of `maps[k]` is below `starts[k + 1]`.
+    starts: Vec<u64>,
+}
+
+impl Default for RefParts {
+    fn default() -> Self {
+        Self::of(RefMap::new())
     }
-    // (sorted by key with their order, not by a stable sort through the
-    // references: their keys read once, in order)
-    let mut order: Vec<(u64, u32)> = refs.iter().enumerate().map(|(i, r)| (key(r), i as u32)).collect();
-    sort_keyed(&mut order);
+}
+
+impl RefParts {
+    /// The parts of one map.
+    pub fn of(map: RefMap) -> Self {
+        Self { maps: vec![map], starts: vec![0] }
+    }
+
+    /// The index of the map that holds `address` (if any does).
+    #[inline]
+    fn part_of(&self, address: u64) -> usize {
+        if self.starts.len() == 1 { 0 } else { self.starts.partition_point(|&s| s <= address) - 1 }
+    }
+
+    pub fn get(&self, address: &u64) -> Option<&RefList> {
+        self.maps[self.part_of(*address)].get(address)
+    }
+
+    fn entry(&mut self, address: u64) -> std::collections::btree_map::Entry<'_, u64, RefList> {
+        let k = self.part_of(address);
+        self.maps[k].entry(address)
+    }
+
+    /// The entries in address order (as the one map's `iter`).
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &RefList)> {
+        self.maps.iter().flatten()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &RefList> {
+        self.maps.iter().flat_map(|m| m.values())
+    }
+
+    /// The entries of the addresses in `start..end` (`start < end`), in
+    /// address order.
+    fn range(&self, start: u64, end: u64) -> impl Iterator<Item = (&u64, &RefList)> {
+        let (a, b) = (self.part_of(start), self.part_of(end - 1));
+        self.maps[a..=b].iter().flat_map(move |m| m.range(start..end))
+    }
+
+    /// The number of addresses (entries).
+    pub fn len(&self) -> usize {
+        self.maps.iter().map(|m| m.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.maps.iter().all(|m| m.is_empty())
+    }
+
+    /// Append each of `refs` to the list at its `key`, in the order of
+    /// `refs` (as `entry(key).or_default().push` of each in turn): each
+    /// part merged with the references in its range — in parallel on the
+    /// rayon pool when `pooled` and there are many —, a part grown past
+    /// twice its share cut into parts of that share.
+    fn add_grouped(&mut self, refs: &[Reference], key: impl Fn(&Reference) -> u64, pooled: bool) {
+        if refs.is_empty() {
+            return;
+        }
+        // (sorted by key with their order, not by a stable sort through the
+        // references: their keys read once, in order)
+        let mut order: Vec<(u64, u32)> = refs.iter().enumerate().map(|(i, r)| (key(r), i as u32)).collect();
+        sort_keyed(&mut order);
+        // each part's share of them
+        let mut slices = Vec::with_capacity(self.maps.len());
+        let mut rest = &order[..];
+        for &start in &self.starts[1..] {
+            let (here, after) = rest.split_at(rest.partition_point(|e| e.0 < start));
+            slices.push(here);
+            rest = after;
+        }
+        slices.push(rest);
+        // (an estimate: each new key counted, repeats too)
+        let share = ((self.len() + order.len()) / PARTS).max(MIN_PART);
+        let merge = |(map, (start, slice)): (&mut RefMap, (u64, &[(u64, u32)]))| merge_part(map, start, slice, refs, share);
+        let parallel = pooled && order.len() >= 1024 && self.maps.len() > 1;
+        let parts = self.maps.iter_mut().zip(self.starts.iter().copied().zip(slices));
+        let cut: Vec<Option<Vec<(u64, RefMap)>>> = if parallel {
+            use rayon::prelude::*;
+            parts.collect::<Vec<_>>().into_par_iter().map(merge).collect()
+        } else {
+            parts.map(merge).collect()
+        };
+        if cut.iter().any(|c| c.is_some()) {
+            let (mut maps, mut starts) = (Vec::new(), Vec::new());
+            for ((map, start), cut) in std::mem::take(&mut self.maps).into_iter().zip(std::mem::take(&mut self.starts)).zip(cut) {
+                match cut {
+                    Some(parts) => {
+                        for (s, m) in parts {
+                            starts.push(s);
+                            maps.push(m);
+                        }
+                    }
+                    None => {
+                        starts.push(start);
+                        maps.push(map);
+                    }
+                }
+            }
+            self.maps = maps;
+            self.starts = starts;
+        }
+    }
+}
+
+/// Merge the references `order` gives (keys with their indices in `refs`,
+/// sorted) into `map`, the part starting at `start`: the lists appended in
+/// order. Returns the part cut into parts of about `share` entries (each
+/// with its start; the first `start`) when it has grown past twice that.
+fn merge_part(map: &mut RefMap, start: u64, order: &[(u64, u32)], refs: &[Reference], share: usize) -> Option<Vec<(u64, RefMap)>> {
+    if order.is_empty() {
+        return None;
+    }
     let groups = order.chunk_by(|a, b| a.0 == b.0);
     let list = |g: &[(u64, u32)]| g.iter().map(|&(_, i)| refs[i as usize]).collect::<RefList>();
-    if order.len() < map.len() {
+    let merged: Vec<(u64, RefList)> = if order.len() < map.len() {
         // (few: in address order, each lookup near the one before)
         for g in groups {
             map.entry(g[0].0).or_default().extend(g.iter().map(|&(_, i)| refs[i as usize]));
         }
-        return;
-    }
-    // Many: both merged in address order into a map built in one pass.
-    let mut old = std::mem::take(map).into_iter().peekable();
-    let mut merged: Vec<(u64, RefList)> = Vec::with_capacity(old.len() + order.len());
-    for g in groups {
-        let k = g[0].0;
-        while let Some(o) = old.next_if(|(ok, _)| *ok < k) {
-            merged.push(o);
+        if map.len() <= 4 * share {
+            return None;
         }
-        match old.next_if(|(ok, _)| *ok == k) {
-            Some((_, mut l)) => {
-                l.extend(g.iter().map(|&(_, i)| refs[i as usize]));
-                merged.push((k, l));
+        std::mem::take(map).into_iter().collect()
+    } else {
+        // Many: both merged in address order into a map built in one pass.
+        let mut old = std::mem::take(map).into_iter().peekable();
+        let mut merged: Vec<(u64, RefList)> = Vec::with_capacity(old.len() + order.len());
+        for g in groups {
+            let k = g[0].0;
+            while let Some(o) = old.next_if(|(ok, _)| *ok < k) {
+                merged.push(o);
             }
-            None => merged.push((k, list(g))),
+            match old.next_if(|(ok, _)| *ok == k) {
+                Some((_, mut l)) => {
+                    l.extend(g.iter().map(|&(_, i)| refs[i as usize]));
+                    merged.push((k, l));
+                }
+                None => merged.push((k, list(g))),
+            }
         }
+        merged.extend(old);
+        merged
+    };
+    if merged.len() <= 2 * share {
+        *map = merged.into_iter().collect();
+        return None;
     }
-    merged.extend(old);
-    *map = merged.into_iter().collect();
+    // (cut into parts of equal size, the first keeping the start)
+    let n = merged.len().div_ceil(merged.len().div_ceil(share));
+    let mut parts = Vec::with_capacity(merged.len().div_ceil(n));
+    let mut entries = merged.into_iter().peekable();
+    while let Some(&(first, _)) = entries.peek() {
+        let s = if parts.is_empty() { start } else { first };
+        parts.push((s, entries.by_ref().take(n).collect::<RefMap>()));
+    }
+    Some(parts)
+}
+
+impl PartialEq for RefParts {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl std::fmt::Debug for RefParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl serde::Serialize for RefParts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // (as the one map: its length, then its entries in order)
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (k, v) in self.iter() {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RefParts {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        RefMap::deserialize(deserializer).map(Self::of)
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -177,8 +355,8 @@ pub struct ReferenceManager {
     // Most addresses have one or two references each way (a call or a
     // conditional jump: the target and the fall-through): kept inline,
     // without an allocation (serialized as a sequence, like a `Vec`).
-    refs_from: BTreeMap<u64, RefList>,
-    refs_to: BTreeMap<u64, RefList>,
+    refs_from: RefParts,
+    refs_to: RefParts,
     // Every jump reference (`RefType::is_jump`), in the order added:
     // lets a cache of per-function results tell which code gained a
     // jump into it since a mark (references are only ever added,
@@ -200,8 +378,8 @@ fn next_manager_id() -> u64 {
 impl Default for ReferenceManager {
     fn default() -> Self {
         Self {
-            refs_from: BTreeMap::new(),
-            refs_to: BTreeMap::new(),
+            refs_from: RefParts::default(),
+            refs_to: RefParts::default(),
             jumps: Vec::new(),
             id: next_manager_id(),
         }
@@ -215,14 +393,14 @@ impl ReferenceManager {
 
     /// The from / to maps and the jump log, for the on-disk analysis
     /// cache.
-    pub fn cache_parts(&self) -> (&RefMap, &RefMap, &[Reference]) {
+    pub fn cache_parts(&self) -> (&RefParts, &RefParts, &[Reference]) {
         (&self.refs_from, &self.refs_to, &self.jumps)
     }
 
     /// A manager of the parts [`Self::cache_parts`] returned, with a fresh
     /// id (like a manager deserialised whole).
     pub fn from_cache_parts(refs_from: RefMap, refs_to: RefMap, jumps: Vec<Reference>) -> Self {
-        Self { refs_from, refs_to, jumps, id: next_manager_id() }
+        Self { refs_from: RefParts::of(refs_from), refs_to: RefParts::of(refs_to), jumps, id: next_manager_id() }
     }
 
     pub fn add(&mut self, reference: Reference) {
@@ -247,10 +425,10 @@ impl ReferenceManager {
         // (the two maps at the same time, when there are many)
         let (from, to) = (&mut self.refs_from, &mut self.refs_to);
         if refs.len() >= 1024 {
-            rayon::join(|| add_grouped(from, refs, |r| r.from), || add_grouped(to, refs, |r| r.to));
+            rayon::join(|| from.add_grouped(refs, |r| r.from, true), || to.add_grouped(refs, |r| r.to, true));
         } else {
-            add_grouped(from, refs, |r| r.from);
-            add_grouped(to, refs, |r| r.to);
+            from.add_grouped(refs, |r| r.from, false);
+            to.add_grouped(refs, |r| r.to, false);
         }
     }
 
@@ -263,12 +441,12 @@ impl ReferenceManager {
         let (from, to) = (&mut self.refs_from, &mut self.refs_to);
         if refs.len() >= 1 << 14 {
             std::thread::scope(|s| {
-                s.spawn(|| add_grouped(to, refs, |r| r.to));
-                add_grouped(from, refs, |r| r.from);
+                s.spawn(|| to.add_grouped(refs, |r| r.to, false));
+                from.add_grouped(refs, |r| r.from, false);
             });
         } else {
-            add_grouped(from, refs, |r| r.from);
-            add_grouped(to, refs, |r| r.to);
+            from.add_grouped(refs, |r| r.from, false);
+            to.add_grouped(refs, |r| r.to, false);
         }
     }
 
@@ -347,7 +525,7 @@ impl ReferenceManager {
     /// references (as `get_refs_to` gives them), in address order; nothing
     /// when `start >= end`.
     pub fn refs_to_range(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, &[Reference])> {
-        let range = (start < end).then(|| self.refs_to.range(start..end));
+        let range = (start < end).then(|| self.refs_to.range(start, end));
         range.into_iter().flatten().map(|(&a, v)| (a, v.as_slice()))
     }
 
@@ -355,7 +533,7 @@ impl ReferenceManager {
     /// in address order (as `get_refs_from` of each address in turn
     /// gives them); nothing when `start >= end`.
     pub fn refs_from_range(&self, start: u64, end: u64) -> impl Iterator<Item = &[Reference]> {
-        let range = (start < end).then(|| self.refs_from.range(start..end));
+        let range = (start < end).then(|| self.refs_from.range(start, end));
         range.into_iter().flatten().map(|(_, v)| v.as_slice())
     }
 
@@ -439,7 +617,83 @@ mod tests {
         }
     }
 
-#[test]
+/// Bulk adds into a map in parts (cut as it grows, merged per part — on
+    /// the pool or not —, with single adds and `add_unless` between) read as
+    /// one map built entry by entry: the same entries in the same order,
+    /// lookups and ranges, length, and the same serialization; a map read
+    /// back is the same.
+    #[test]
+    fn parted_maps_read_as_one_map() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let kinds = [RefType::UnconditionalCall, RefType::ConditionalJump, RefType::DataRead, RefType::FallThrough];
+        let mut one_from = RefMap::new();
+        let mut one_to = RefMap::new();
+        let mut jumps = Vec::new();
+        let mut plain = |r: Reference, from: &mut RefMap, to: &mut RefMap| {
+            if r.ref_type.is_jump() {
+                jumps.push(r);
+            }
+            from.entry(r.from).or_default().push(r);
+            to.entry(r.to).or_default().push(r);
+        };
+        let mut mgr = ReferenceManager::new();
+        for round in 0..24 {
+            // (batches of every size: few into large parts, many, a dense
+            // range of new keys that grows one part past its share)
+            let n = [3usize, 700, 5_000, 40_000][round % 4];
+            let span = if round % 5 == 4 { 1 << 12 } else { 1 << 22 };
+            let base = 0x40_0000 + (next() % 4) * (1 << 22);
+            let batch: Vec<Reference> = (0..n)
+                .map(|_| {
+                    let r = next();
+                    Reference::new(base + r % span, 0x40_0000 + (r >> 24) % (span * 3), kinds[(r >> 50) as usize % 4])
+                })
+                .collect();
+            for &r in &batch {
+                plain(r, &mut one_from, &mut one_to);
+            }
+            match round % 3 {
+                0 => mgr.add_all(&batch),
+                1 => mgr.add_all_unpooled(&batch),
+                _ => batch.iter().for_each(|&r| mgr.add(r)),
+            }
+            let r = Reference::new(base + next() % span, 0x40_0000 + next() % span, RefType::DataRead);
+            let present = |e: &Reference| e.to == r.to;
+            if !one_from.get(&r.from).is_some_and(|l| l.iter().any(present)) {
+                plain(r, &mut one_from, &mut one_to);
+            }
+            mgr.add_unless(r, present);
+        }
+        assert!(mgr.refs_from.maps.len() > 4 && mgr.refs_to.maps.len() > 4, "cut into parts");
+        assert!(mgr.refs_from.starts.windows(2).all(|w| w[0] < w[1]));
+        for (parts, one) in [(&mgr.refs_from, &one_from), (&mgr.refs_to, &one_to)] {
+            assert!(parts.iter().eq(one.iter()));
+            assert!(parts.values().eq(one.values()));
+            assert_eq!(parts.len(), one.len());
+            assert_eq!(serde_json::to_string(parts).unwrap(), serde_json::to_string(one).unwrap());
+            for _ in 0..200 {
+                let (a, b) = (0x40_0000 + next() % (1 << 24), 0x40_0000 + next() % (1 << 24));
+                assert_eq!(parts.get(&a), one.get(&a));
+                if a < b {
+                    assert!(parts.range(a, b).eq(one.range(a..b)));
+                }
+            }
+            let back: RefParts = serde_json::from_str(&serde_json::to_string(parts).unwrap()).unwrap();
+            assert!(back == *parts && back.maps.len() == 1);
+        }
+        assert_eq!(mgr.jumps, jumps);
+        assert_eq!(mgr.len(), one_from.values().map(|l| l.len()).sum::<usize>());
+        let back = ReferenceManager::from_cache_parts(one_from.clone(), one_to.clone(), jumps.clone());
+        assert!(back.refs_from == mgr.refs_from && back.refs_to == mgr.refs_to);
+    }
+
+    #[test]
     fn add_and_query_refs() {
         let mut mgr = ReferenceManager::new();
         mgr.add(Reference::new(0x1000, 0x2000, RefType::UnconditionalCall));
