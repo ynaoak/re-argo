@@ -116,19 +116,3 @@ pub(crate) fn release_free_memory() {
         release();
     }
 }
-
-#[doc(hidden)]
-pub fn trace_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("REARGO_TRACE").is_some())
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! tr {
-    ($t:expr, $($arg:tt)*) => {
-        if $crate::trace_on() {
-            eprintln!("TRACE          {} {:.1}", format!($($arg)*), $t.elapsed().as_secs_f64() * 1e3);
-        }
-    };
-}

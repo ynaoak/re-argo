@@ -133,11 +133,9 @@ impl Analyzer for PcodeReferenceAnalyzer {
             });
         }
 
-        let tt = std::time::Instant::now();
         let sections = SectionMap::from(program);
 
         let jobs: Vec<(u64, usize)> = crate::func_lift::map_functions(program, |f| (f.entry_point, budget(f)));
-        crate::tr!(tt, "pcoderef jobs {}", jobs.len());
 
         // Phase 1 (parallel): per-function lift + scan. Each task
         // sees an immutable Program view and produces candidate
@@ -147,16 +145,13 @@ impl Analyzer for PcodeReferenceAnalyzer {
         // sections: those the Stack Frame analyzer computed ahead
         // ([`Ahead`]) for the same lift are taken as they are.
         let ahead = program.analysis_cache.take::<Ahead>().map(|a| a.0);
-        crate::tr!(tt, "pcoderef ahead {}", ahead.as_ref().map_or(0, |a| a.len()));
         let candidates: Vec<(u64, u64, RefType)> = crate::range_lift::with_ahead(&jobs, ahead, |missing| {
-            crate::tr!(tt, "pcoderef missing {} budget {}", missing.len(), missing.iter().map(|m| m.1).sum::<usize>());
             crate::range_lift::map_lifted_ranges(&program.info.memory, missing, |_, insns| {
                 scan_lifted(insns, &sections)
             })
         })
         .concat();
 
-        crate::tr!(tt, "pcoderef candidates {}", candidates.len());
         // Phase 2: dedup against existing refs and apply — each candidate
         // added unless a reference from its source to its target of its
         // kind is there (before, or added for an earlier candidate): the
@@ -167,7 +162,6 @@ impl Analyzer for PcodeReferenceAnalyzer {
             .with_min_len(4096)
             .map(|&(from, to, kind)| references.get_refs_from(from).iter().any(|r| r.to == to && r.ref_type == kind))
             .collect();
-        crate::tr!(tt, "pcoderef present");
         let mut seen: rustc_hash::FxHashSet<(u64, u64, RefType)> = rustc_hash::FxHashSet::default();
         let added: Vec<Reference> = candidates
             .into_iter()
@@ -176,9 +170,7 @@ impl Analyzer for PcodeReferenceAnalyzer {
             .map(|((from, to, kind), _)| Reference::new(from, to, kind))
             .collect();
         let refs_found = added.len();
-        crate::tr!(tt, "pcoderef seen {}", added.len());
         program.references.add_all(&added);
-        crate::tr!(tt, "pcoderef added");
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

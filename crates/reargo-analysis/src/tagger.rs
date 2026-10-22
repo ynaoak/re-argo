@@ -63,7 +63,6 @@ impl Analyzer for TagAnalyzer {
     /// The address tags, then the function tags, in the order they are
     /// added.
     fn prepare(&self, program: &Program) -> Prepared {
-        let tt = std::time::Instant::now();
         // The tags of every comment, derived in parallel (in comment
         // order, in parts: grouped by address part by part, the batch
         // added at `apply`), and the function-scope tags from Function
@@ -85,9 +84,7 @@ impl Analyzer for TagAnalyzer {
                     })
                     .collect();
                 let count: usize = derived.iter().map(Vec::len).sum();
-                crate::tr!(tt, "tagger derived {}", count);
                 let batch = AddressTagBatch::from_parts(derived, true);
-                crate::tr!(tt, "tagger batch");
                 (batch, count)
             },
             || -> Vec<(u64, TagKind, String)> {
@@ -112,7 +109,6 @@ impl Analyzer for TagAnalyzer {
                 .collect()
             },
         );
-        crate::tr!(tt, "tagger function tags");
 
         // Metadata-derived: SCC cluster members get `recursive`.
         let scc_keys: Vec<String> = program

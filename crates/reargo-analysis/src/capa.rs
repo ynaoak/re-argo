@@ -105,9 +105,7 @@ impl Analyzer for CapaAnalyzer {
     /// The import and string predicates of every rule evaluated: they
     /// do not depend on the tags (which the Tagger, right before, adds).
     fn prepare(&self, program: &Program) -> Prepared {
-        let tt = std::time::Instant::now();
         let ctx = build_context(program, BTreeSet::new());
-        crate::tr!(tt, "capa context imports {} strings {} bytes {}", ctx.original_import.len(), ctx.strings_lower.starts.len(), ctx.strings_lower.joined.len());
         let mut found: Vec<&'static Predicate> = Vec::new();
         for rule in builtin_rules() {
             collect_leaves(&rule.predicate, &mut found);
@@ -120,7 +118,6 @@ impl Analyzer for CapaAnalyzer {
                 (leaf_key(p), (hit, evidence))
             })
             .collect();
-        crate::tr!(tt, "capa leaves {}", leaves.len());
         Box::new(leaves)
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
@@ -326,7 +323,6 @@ fn present_tags(program: &Program) -> BTreeSet<String> {
 }
 
 fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaContext {
-    let tt = std::time::Instant::now();
     // (the two haystacks made at the same time)
     let ((imports_lower, original_import), strings_lower) = rayon::join(
         || {
@@ -338,16 +334,13 @@ fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaConte
                 .map(|imp| imp.name.as_str())
                 .chain(program.symbol_table.iter().map(|sym| sym.name.strip_suffix("@plt").unwrap_or(&sym.name)))
                 .collect();
-            let r = import_haystack(&names);
-            crate::tr!(tt, "capa import haystack");
-            r
+            import_haystack(&names)
         },
         || {
             // Pull strings from inline comments / immediate-string annotations
             // (every string the analyzer cared about flows through these).
             // (lower-cased in parts in parallel, then joined in order)
             let texts: Vec<&str> = program.comments.iter_refs().map(|(_, _, text)| text).collect();
-            crate::tr!(tt, "capa texts {}", texts.len());
             let parts: Vec<Haystack> = texts
                 .par_chunks(4096)
                 .map(|texts| {

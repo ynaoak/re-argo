@@ -306,7 +306,6 @@ impl Listing {
         } else {
             parts.into_iter().map(part_map).collect()
         };
-        if std::env::var_os("REARGO_TRACE").is_some() && total > 100000 { eprintln!("TRACE        listing: maps {:?} built", maps.iter().map(|m| m.len()).collect::<Vec<_>>()); }
         self.instructions = Instructions { maps, starts };
     }
 
