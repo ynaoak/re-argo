@@ -16,10 +16,13 @@ impl Analyzer for IndirectCallAnalyzer {
     fn priority(&self) -> u32 { 580 }
 
     fn analyze(&self, program: &mut Program) -> Result<AnalysisResult, AnalysisError> {
-        let indirect_calls: Vec<u64> = program.listing.instructions()
-            .filter(|i| i.flow_type == FlowType::IndirectCall)
-            .map(|i| i.address)
-            .collect();
+        // (the listing's parts in parallel, in order)
+        let indirect_calls: Vec<u64> = program
+            .listing
+            .map_instruction_parts(|insns| {
+                insns.filter(|i| i.flow_type == FlowType::IndirectCall).map(|i| i.address).collect::<Vec<_>>()
+            })
+            .concat();
 
         // Phase 1: per indirect-call site, find the first import
         // close enough to its address to plausibly be the target.
@@ -101,11 +104,11 @@ impl Analyzer for StringReferenceAnalyzer {
         // Snapshot per-instruction bytes once so the per-instruction
         // scan can run in parallel against an immutable view.
         // (borrowed: the program does not change while it is read)
+        // (the listing's parts in parallel, in order)
         let insn_snapshot: Vec<(u64, &[u8])> = program
             .listing
-            .instructions()
-            .map(|i| (i.address, &i.bytes[..]))
-            .collect();
+            .map_instruction_parts(|insns| insns.map(|i| (i.address, &i.bytes[..])).collect::<Vec<_>>())
+            .concat();
 
         // Phase 1: scan each instruction's bytes against the address
         // hash in parallel; report (insn_addr, string_addr) candidate

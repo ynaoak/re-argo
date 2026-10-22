@@ -530,8 +530,23 @@ impl<'scope> Started<'scope> {
         // (the references in the order found)
         let (references, references_in) = std::sync::mpsc::channel::<Vec<Reference>>();
         let adding = s.spawn(move || {
-            for batch in references_in {
-                reference_manager.add_all_unpooled(&batch);
+            while let Ok(batch) = references_in.recv() {
+                // (lagging behind the walk — its batches waiting —, this
+                // thread adds them with this one in one bulk add, the two
+                // maps at the same time: it caught up later, and at the
+                // walk's end it could still be adding ~20 ms after the
+                // listing was built)
+                let mut waiting = vec![batch];
+                while let Ok(more) = references_in.try_recv() {
+                    waiting.push(more);
+                }
+                if waiting.len() >= JOIN_WAITING {
+                    reference_manager.add_all_unpooled(&waiting.concat());
+                } else {
+                    for batch in waiting {
+                        reference_manager.add_all_unpooled(&batch);
+                    }
+                }
             }
         });
         let (bodies, bodies_in) = std::sync::mpsc::channel::<Vec<(u64, Vec<AddressRange>)>>();
@@ -576,6 +591,11 @@ impl Drop for ReleaseOnDrop<'_> {
 /// The references the walk gathers before they are added, in
 /// [`discover_parallel`].
 const REFERENCE_BATCH: usize = 1 << 13;
+
+/// The reference batches waiting (with the one taken) from which the
+/// thread adding them adds them together ([`discover_parallel`]): the
+/// same lists in the same order either way.
+const JOIN_WAITING: usize = 3;
 
 /// The bodies the walk gathers before their sets are made, in
 /// [`discover_parallel`].

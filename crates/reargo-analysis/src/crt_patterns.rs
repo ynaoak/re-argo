@@ -54,7 +54,8 @@ impl Analyzer for CrtPatternAnalyzer {
         470
     }
     fn prepare_reads(&self) -> Option<State> {
-        Some(State::FUNCS.union(State::FUNC_NAME))
+        // (only the bytes: the functions are looked at in `apply`)
+        Some(State::NONE)
     }
     fn writes(&self) -> State {
         State::SYMBOLS.union(State::COMMENTS).union(State::FUNCTIONS)
@@ -63,89 +64,90 @@ impl Analyzer for CrtPatternAnalyzer {
         let prepared = self.prepare(program);
         self.apply(program, prepared)
     }
-    /// The CRT helpers found and their names, by address. Renaming one
-    /// changes only the function at its own address, so each is found
-    /// as it would be after the renames before it.
+    /// The CRT helpers found at the 16-byte steps of the executable
+    /// sections, by address, from the bytes alone (what a pattern
+    /// matches at an address depends on nothing else); the functions
+    /// still `FUN_*` and the ones already named are looked at in
+    /// `apply`, at this analyzer's place.
     fn prepare(&self, program: &Program) -> Prepared {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
             return Box::new(Vec::<(u64, &'static str)>::new());
         }
-
-        let patterns = patterns();
-
-        // Two scan sources, deduped:
-        // (a) every existing FUN_* function — covers the common case
-        //     where Discovery found the function but couldn't name it.
-        // (b) 16-byte-aligned candidate offsets inside every
-        //     executable section — covers stripped binaries where
-        //     Discovery never reaches the CRT helper at all (e.g.,
-        //     `.init_array` is unmapped in our memory model so
-        //     `frame_dummy` is never queued).
-        // (in address order, each once; the 16-byte steps of a section
-        // are matched in parallel)
-        let mut candidates: Vec<u64> = program
-            .listing
-            .functions()
-            .filter(|f| f.name.starts_with("FUN_"))
-            .map(|f| f.entry_point)
-            .collect();
+        let matcher = Matcher::new();
+        // Walk in 16-byte steps. The linker aligns every CRT helper to
+        // 16 bytes, so a candidate that isn't on a 16-byte boundary
+        // can't be one of these.
+        let mut steps: Vec<u64> = Vec::new();
         for sec in &program.info.sections {
             if !sec.flags.contains(reargo_loader::SectionFlags::EXECUTE) {
                 continue;
             }
-            // Walk in 16-byte steps. The linker aligns every CRT
-            // helper to 16 bytes, so a candidate that isn't on a
-            // 16-byte boundary can't be one of these.
             let base = sec.address;
             let end = sec.address + sec.size;
             let first = (base + 15) & !15;
             if first + 24 <= end {
-                candidates.extend((first..=end - 24).step_by(16));
+                steps.extend((first..=end - 24).step_by(16));
             }
         }
         // (a few ascending runs: the stable sort merges them)
-        candidates.sort();
-        candidates.dedup();
-
-        // The first bytes a pattern can start with (every byte for one
-        // whose first byte is masked out).
-        let mut first_byte = [false; 256];
-        for pattern in &patterns {
-            match (pattern.prefix.first(), pattern.mask.first()) {
-                (Some(&p), Some(&m)) if m != 0 => first_byte[p as usize] = true,
-                _ => first_byte = [true; 256],
-            }
-        }
-        let found: Vec<(u64, &'static str)> = candidates
+        steps.sort();
+        steps.dedup();
+        let found: Vec<(u64, &'static str)> = steps
             .par_iter()
             .with_min_len(4096)
-            .filter_map(|&entry| {
-                let mut buf = [0u8; 24];
-                let n = [24, 16, 12, 8]
-                    .iter()
-                    .copied()
-                    .find(|&n| program.info.memory.read_bytes(entry, &mut buf[..n]).is_ok())?;
-                let bytes = &buf[..n];
-                if !first_byte[bytes[0] as usize] {
-                    return None;
-                }
-                let pattern = patterns.iter().find(|pattern| matches_pattern(bytes, pattern.prefix, pattern.mask))?;
-                // Skip candidates that already host a function with a
-                // non-generic name (user / DWARF / earlier analyzer wins).
-                let already_named = program
-                    .listing
-                    .get_function(entry)
-                    .is_some_and(|f| !f.name.starts_with("FUN_"));
-                if already_named {
-                    return None;
-                }
-                Some((entry, pattern.name))
-            })
+            .filter_map(|&entry| matcher.at(program, entry).map(|name| (entry, name)))
             .collect();
         Box::new(found)
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
-        let found: Vec<(u64, &'static str)> = crate::analyzer::prepared(prepared);
+        let at_steps: Vec<(u64, &'static str)> = crate::analyzer::prepared(prepared);
+        if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
+            return Ok(AnalysisResult {
+                analyzer_name: self.name().into(),
+                functions_found: 0,
+                references_found: 0,
+                instructions_decoded: 0,
+            });
+        }
+        // Two scan sources, deduped:
+        // (a) every existing FUN_* function — covers the common case
+        //     where Discovery found the function but couldn't name it.
+        // (b) 16-byte-aligned candidate offsets inside every
+        //     executable section (matched in `prepare`) — covers
+        //     stripped binaries where Discovery never reaches the CRT
+        //     helper at all (e.g., `.init_array` is unmapped in our
+        //     memory model so `frame_dummy` is never queued).
+        // (both in address order, merged, each address once: its
+        // pattern is the same from either)
+        let matcher = Matcher::new();
+        let at_functions: Vec<(u64, &'static str)> = program
+            .listing
+            .functions()
+            .filter(|f| f.name.starts_with("FUN_"))
+            .filter_map(|f| matcher.at(program, f.entry_point).map(|name| (f.entry_point, name)))
+            .collect();
+        let mut found: Vec<(u64, &'static str)> = Vec::with_capacity(at_steps.len() + at_functions.len());
+        let (mut a, mut b) = (at_functions.into_iter().peekable(), at_steps.into_iter().peekable());
+        loop {
+            let next = match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) if x.0 == y.0 => {
+                    b.next();
+                    a.next()
+                }
+                (Some(x), Some(y)) if x.0 < y.0 => a.next(),
+                (Some(_), None) => a.next(),
+                _ => b.next(),
+            };
+            match next {
+                Some(hit) => found.push(hit),
+                None => break,
+            }
+        }
+        // Skip candidates that already host a function with a
+        // non-generic name (user / DWARF / earlier analyzer wins).
+        // (Renaming one changes only the function at its own address, so
+        // each is found as it would be after the renames before it.)
+        found.retain(|&(entry, _)| !program.listing.get_function(entry).is_some_and(|f| !f.name.starts_with("FUN_")));
         let recovered = found.len();
         for (entry, name) in found {
             apply_rename(program, entry, name);
@@ -157,6 +159,39 @@ impl Analyzer for CrtPatternAnalyzer {
             references_found: 0,
             instructions_decoded: 0,
         })
+    }
+}
+
+/// The patterns, and the first bytes one can start with.
+struct Matcher {
+    patterns: Vec<Pattern>,
+    /// (every byte for a pattern whose first byte is masked out)
+    first_byte: [bool; 256],
+}
+
+impl Matcher {
+    fn new() -> Self {
+        let patterns = patterns();
+        let mut first_byte = [false; 256];
+        for pattern in &patterns {
+            match (pattern.prefix.first(), pattern.mask.first()) {
+                (Some(&p), Some(&m)) if m != 0 => first_byte[p as usize] = true,
+                _ => first_byte = [true; 256],
+            }
+        }
+        Self { patterns, first_byte }
+    }
+
+    /// The name of the first pattern the bytes at `entry` match (24 read,
+    /// else 16, 12 or 8).
+    fn at(&self, program: &Program, entry: u64) -> Option<&'static str> {
+        let mut buf = [0u8; 24];
+        let n = [24, 16, 12, 8].iter().copied().find(|&n| program.info.memory.read_bytes(entry, &mut buf[..n]).is_ok())?;
+        let bytes = &buf[..n];
+        if !self.first_byte[bytes[0] as usize] {
+            return None;
+        }
+        self.patterns.iter().find(|pattern| matches_pattern(bytes, pattern.prefix, pattern.mask)).map(|p| p.name)
     }
 }
 

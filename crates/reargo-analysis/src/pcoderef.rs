@@ -150,9 +150,7 @@ impl Analyzer for PcodeReferenceAnalyzer {
                 scan_lifted(insns, &sections)
             })
         })
-        .into_iter()
-        .flatten()
-        .collect();
+        .concat();
 
         // Phase 2: dedup against existing refs and apply — each candidate
         // added unless a reference from its source to its target of its

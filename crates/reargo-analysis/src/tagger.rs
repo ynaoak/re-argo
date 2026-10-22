@@ -64,40 +64,51 @@ impl Analyzer for TagAnalyzer {
     /// added.
     fn prepare(&self, program: &Program) -> Prepared {
         // The tags of every comment, derived in parallel (in comment
-        // order), then added in that order.
-        let derived: Vec<(u64, TagKind, String)> = {
-            let comments: Vec<(u64, &str)> = program.comments.iter_refs().map(|(a, _, t)| (a, t)).collect();
-            comments
-                .par_iter()
-                .flat_map_iter(|&(addr, text)| {
-                    derive_tags(text)
-                        .into_iter()
-                        .map(move |(cat, derived_text)| (addr, cat, derived_text.unwrap_or_else(|| text.to_string())))
+        // order, in parts: grouped by address part by part, the batch
+        // added at `apply`), and the function-scope tags from Function
+        // flags (in parallel, in function order), at the same time.
+        let ((derived, derived_count), mut function_tags) = rayon::join(
+            || {
+                let comments: Vec<(u64, &str)> = program.comments.iter_refs().map(|(a, _, t)| (a, t)).collect();
+                let derived: Vec<Vec<(u64, TagKind, String)>> = comments
+                    .par_chunks(2048)
+                    .map(|comments| {
+                        comments
+                            .iter()
+                            .flat_map(|&(addr, text)| {
+                                derive_tags(text)
+                                    .into_iter()
+                                    .map(move |(cat, derived_text)| (addr, cat, derived_text.unwrap_or_else(|| text.to_string())))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let count: usize = derived.iter().map(Vec::len).sum();
+                let batch = AddressTagBatch::from_parts(derived, true);
+                (batch, count)
+            },
+            || -> Vec<(u64, TagKind, String)> {
+                crate::func_lift::map_functions(program, |f| {
+                    let (entry, name) = (f.entry_point, &f.name);
+                    let mut tags = Vec::new();
+                    if f.no_return {
+                        tags.push((entry, TagKind::NoReturn, format!("{}: no-return", name)));
+                    }
+                    if f.is_thunk {
+                        tags.push((entry, TagKind::Library, format!("{}: thunk", name)));
+                    }
+                    // Standard library names get a `library` tag so users can
+                    // filter their report to "what touches libc?"
+                    if name.contains("@plt") || name.contains("@GLIBC") || name.contains("@GOT") {
+                        tags.push((entry, TagKind::Library, format!("{}: import", name)));
+                    }
+                    tags
                 })
+                .into_iter()
+                .flatten()
                 .collect()
-        };
-
-        // Function-scope tags from Function flags (in parallel, in
-        // function order).
-        let mut function_tags: Vec<(u64, TagKind, String)> = crate::func_lift::map_functions(program, |f| {
-            let (entry, name) = (f.entry_point, &f.name);
-            let mut tags = Vec::new();
-            if f.no_return {
-                tags.push((entry, TagKind::NoReturn, format!("{}: no-return", name)));
-            }
-            if f.is_thunk {
-                tags.push((entry, TagKind::Library, format!("{}: thunk", name)));
-            }
-            // Standard library names get a `library` tag so users can
-            // filter their report to "what touches libc?"
-            if name.contains("@plt") || name.contains("@GLIBC") || name.contains("@GOT") {
-                tags.push((entry, TagKind::Library, format!("{}: import", name)));
-            }
-            tags
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+            },
+        );
 
         // Metadata-derived: SCC cluster members get `recursive`.
         let scc_keys: Vec<String> = program
@@ -135,9 +146,8 @@ impl Analyzer for TagAnalyzer {
                 }
             }
         }
-        // (the address tags grouped here, added at `apply`)
-        let tag_count = derived.len() + function_tags.len();
-        Box::new((AddressTagBatch::new(derived, true), function_tags, tag_count))
+        let tag_count = derived_count + function_tags.len();
+        Box::new((derived, function_tags, tag_count))
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
         type Tags = Vec<(u64, TagKind, String)>;

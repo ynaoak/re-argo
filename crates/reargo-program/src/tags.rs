@@ -135,6 +135,44 @@ impl AddressTagBatch {
         }
         Self::Grouped(grouped.into_iter().collect())
     }
+
+    /// [`Self::new`] of the tags of `parts` in order (a part's, then the
+    /// next one's), grouped part by part on the rayon pool when they come
+    /// sorted by address.
+    pub fn from_parts(parts: Vec<Vec<(u64, TagKind, String)>>, auto: bool) -> Self {
+        use rayon::prelude::*;
+        if !parts.iter().flatten().map(|t| t.0).is_sorted() {
+            return Self::Unsorted(parts.into_iter().flatten().collect(), auto);
+        }
+        let grouped: Vec<Vec<(u64, Vec<Tag>)>> = parts
+            .into_par_iter()
+            .map(|part| {
+                let mut grouped: Vec<(u64, Vec<Tag>)> = Vec::new();
+                for (address, kind, text) in part {
+                    let tag = Tag { kind, text, auto };
+                    match grouped.last_mut() {
+                        Some((a, v)) if *a == address => v.push(tag),
+                        _ => grouped.push((address, vec![tag])),
+                    }
+                }
+                grouped
+            })
+            .collect();
+        // (a part's first address continues the part before's last when
+        // it is the same)
+        let mut all: Vec<(u64, Vec<Tag>)> = Vec::with_capacity(grouped.iter().map(Vec::len).sum());
+        for part in grouped {
+            let mut part = part.into_iter();
+            if let Some((address, tags)) = part.next() {
+                match all.last_mut() {
+                    Some((a, v)) if *a == address => v.extend(tags),
+                    _ => all.push((address, tags)),
+                }
+            }
+            all.extend(part);
+        }
+        Self::Grouped(all.into_iter().collect())
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -318,9 +356,17 @@ mod tests {
                 one.add_address(a, k, t, true);
             }
             let mut batched = fresh(&base);
-            batched.add_address_batch(AddressTagBatch::new(tags, true));
+            batched.add_address_batch(AddressTagBatch::new(tags.clone(), true));
             let flat = |m: &TagManager| -> Vec<(u64, String, bool)> { m.iter_addresses().map(|(a, t)| (a, t.text.clone(), t.auto)).collect() };
             assert_eq!(flat(&batched), flat(&one), "{existing} {items} {sorted}");
+            // in parts (cut anywhere, an address across a cut, empty parts)
+            for cut in [1usize, 7, 64] {
+                let mut parts: Vec<Vec<(u64, TagKind, String)>> = tags.chunks(cut).map(<[_]>::to_vec).collect();
+                parts.insert(parts.len() / 2, Vec::new());
+                let mut in_parts = fresh(&base);
+                in_parts.add_address_batch(AddressTagBatch::from_parts(parts, true));
+                assert_eq!(flat(&in_parts), flat(&one), "{existing} {items} {sorted} parts of {cut}");
+            }
         }
     }
 

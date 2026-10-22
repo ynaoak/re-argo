@@ -31,6 +31,7 @@ use reargo_core::address::SpaceId;
 use reargo_core::pcode::OpCode;
 use reargo_lift::LiftedInstruction;
 use reargo_program::comments::CommentType;
+use rayon::prelude::*;
 use reargo_program::Program;
 
 use crate::analyzer::{AnalysisError, AnalysisResult, Analyzer, State};
@@ -90,21 +91,32 @@ impl Analyzer for ArgumentArityAnalyzer {
         });
         let arities: Vec<(u64, usize)> = jobs.iter().map(|j| j.0).zip(arities).collect();
 
-        let mut annotated = 0usize;
-        for (entry, arity) in arities {
-            program.metadata.set_property(
-                format!("func_{:x}_arity", entry),
-                arity.to_string(),
-            );
-            if program.comments.get(entry, CommentType::Eol).is_none() {
-                program.comments.set(
-                    entry,
-                    CommentType::Eol,
-                    format!("inferred arity: {}", arity),
-                );
-                annotated += 1;
-            }
-        }
+        // (the texts made in parallel; the properties and the comments,
+        // two maps of their own, set at the same time, each in function
+        // order)
+        let (properties, notes): (Vec<(String, String)>, Vec<String>) = arities
+            .par_iter()
+            .with_min_len(512)
+            .map(|&(entry, arity)| ((format!("func_{:x}_arity", entry), arity.to_string()), format!("inferred arity: {}", arity)))
+            .unzip();
+        let Program { metadata, comments, .. } = program;
+        let ((), annotated) = rayon::join(
+            || {
+                for (key, value) in properties {
+                    metadata.set_property(key, value);
+                }
+            },
+            || {
+                let mut annotated = 0usize;
+                for (&(entry, _), text) in arities.iter().zip(notes) {
+                    if comments.get(entry, CommentType::Eol).is_none() {
+                        comments.set(entry, CommentType::Eol, text);
+                        annotated += 1;
+                    }
+                }
+                annotated
+            },
+        );
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),

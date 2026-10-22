@@ -323,33 +323,39 @@ fn present_tags(program: &Program) -> BTreeSet<String> {
 }
 
 fn build_context(program: &Program, present_tags: BTreeSet<String>) -> CapaContext {
-    // Every import name and symbol name (without `@plt`).
-    let names: Vec<&str> = program
-        .info
-        .imports
-        .iter()
-        .map(|imp| imp.name.as_str())
-        .chain(program.symbol_table.iter().map(|sym| sym.name.strip_suffix("@plt").unwrap_or(&sym.name)))
-        .collect();
-    let (imports_lower, original_import) = import_haystack(&names);
-
-    // Pull strings from inline comments / immediate-string annotations
-    // (every string the analyzer cared about flows through these).
-    // (lower-cased in parts in parallel, then joined in order)
-    let texts: Vec<&str> = program.comments.iter_refs().map(|(_, _, text)| text).collect();
-    let parts: Vec<Haystack> = texts
-        .par_chunks(4096)
-        .map(|texts| {
-            let mut part = Haystack::default();
-            for text in texts {
-                let at = part.joined.len();
-                part.push(text.as_bytes());
-                part.joined[at..].make_ascii_lowercase();
-            }
-            part
-        })
-        .collect();
-    let strings_lower = Haystack::concat(parts);
+    // (the two haystacks made at the same time)
+    let ((imports_lower, original_import), strings_lower) = rayon::join(
+        || {
+            // Every import name and symbol name (without `@plt`).
+            let names: Vec<&str> = program
+                .info
+                .imports
+                .iter()
+                .map(|imp| imp.name.as_str())
+                .chain(program.symbol_table.iter().map(|sym| sym.name.strip_suffix("@plt").unwrap_or(&sym.name)))
+                .collect();
+            import_haystack(&names)
+        },
+        || {
+            // Pull strings from inline comments / immediate-string annotations
+            // (every string the analyzer cared about flows through these).
+            // (lower-cased in parts in parallel, then joined in order)
+            let texts: Vec<&str> = program.comments.iter_refs().map(|(_, _, text)| text).collect();
+            let parts: Vec<Haystack> = texts
+                .par_chunks(4096)
+                .map(|texts| {
+                    let mut part = Haystack::default();
+                    for text in texts {
+                        let at = part.joined.len();
+                        part.push(text.as_bytes());
+                        part.joined[at..].make_ascii_lowercase();
+                    }
+                    part
+                })
+                .collect();
+            Haystack::concat(parts)
+        },
+    );
 
     CapaContext {
         imports_lower,
