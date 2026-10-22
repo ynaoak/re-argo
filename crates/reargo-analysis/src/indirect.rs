@@ -104,11 +104,11 @@ impl Analyzer for StringReferenceAnalyzer {
         // Snapshot per-instruction bytes once so the per-instruction
         // scan can run in parallel against an immutable view.
         // (borrowed: the program does not change while it is read)
+        // (the listing's parts in parallel, in order)
         let insn_snapshot: Vec<(u64, &[u8])> = program
             .listing
-            .instructions()
-            .map(|i| (i.address, &i.bytes[..]))
-            .collect();
+            .map_instruction_parts(|insns| insns.map(|i| (i.address, &i.bytes[..])).collect::<Vec<_>>())
+            .concat();
 
         // Phase 1: scan each instruction's bytes against the address
         // hash in parallel; report (insn_addr, string_addr) candidate

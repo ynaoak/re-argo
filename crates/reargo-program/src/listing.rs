@@ -41,13 +41,37 @@ impl std::fmt::Debug for Sorted {
 
 impl Sorted {
     fn of(instructions: &Instructions) -> Self {
-        // (one walk of the map for both)
-        let mut addrs = Vec::with_capacity(instructions.len());
-        let mut insns = Vec::with_capacity(instructions.len());
-        for (&a, b) in instructions.iter() {
-            addrs.push(a);
-            insns.push(std::ptr::NonNull::from(&**b));
+        // (one walk of each map for both, the maps on the rayon pool,
+        // each into its share of the two arrays)
+        use rayon::prelude::*;
+        let n = instructions.len();
+        let mut addrs: Vec<u64> = Vec::with_capacity(n);
+        let mut insns: Vec<&DecodedInstruction> = Vec::with_capacity(n);
+        {
+            let (mut a, mut i) = (&mut addrs.spare_capacity_mut()[..n], &mut insns.spare_capacity_mut()[..n]);
+            let mut shares = Vec::with_capacity(instructions.maps.len());
+            for m in &instructions.maps {
+                let (sa, ra) = std::mem::take(&mut a).split_at_mut(m.len());
+                let (si, ri) = std::mem::take(&mut i).split_at_mut(m.len());
+                shares.push((m, sa, si));
+                (a, i) = (ra, ri);
+            }
+            shares.into_par_iter().for_each(|(m, sa, si)| {
+                for ((&k, b), (sa, si)) in m.iter().zip(sa.iter_mut().zip(si.iter_mut())) {
+                    sa.write(k);
+                    si.write(&**b);
+                }
+            });
         }
+        // SAFETY: the shares cover the first `n` slots of each array (the
+        // maps hold `n` instructions), and each map's walk wrote every
+        // slot of its share.
+        unsafe {
+            addrs.set_len(n);
+            insns.set_len(n);
+        }
+        // (collected in place: the same layout)
+        let insns: Vec<std::ptr::NonNull<DecodedInstruction>> = insns.into_iter().map(std::ptr::NonNull::from).collect();
         Self { addrs: addrs.into_boxed_slice(), insns: insns.into_boxed_slice() }
     }
 
@@ -303,9 +327,9 @@ impl Listing {
     /// listing's maps, see `Instructions`), on the rayon pool; the results
     /// in order. For a scan of every instruction whose result for the
     /// whole is the results of its parts in order.
-    pub fn map_instruction_parts<T: Send>(
-        &self,
-        f: impl Fn(&mut dyn Iterator<Item = &DecodedInstruction>) -> T + Sync,
+    pub fn map_instruction_parts<'a, T: Send>(
+        &'a self,
+        f: impl Fn(&mut dyn Iterator<Item = &'a DecodedInstruction>) -> T + Sync,
     ) -> Vec<T> {
         use rayon::prelude::*;
         self.instructions.maps.par_iter().map(|m| f(&mut m.values().map(|b| &**b))).collect()

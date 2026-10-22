@@ -43,11 +43,11 @@ impl Analyzer for DataReferenceAnalyzer {
         // ScalarReferenceAnalyzer (round 2) and
         // StringReferenceAnalyzer (round 9): per-window pointer
         // detection is read-only and embarrassingly parallel.
+        // (the listing's parts in parallel, in order)
         let instructions: Vec<(u64, &[u8])> = program
             .listing
-            .instructions()
-            .map(|i| (i.address, &i.bytes[..]))
-            .collect();
+            .map_instruction_parts(|insns| insns.map(|i| (i.address, &i.bytes[..])).collect::<Vec<_>>())
+            .concat();
 
         // no section below `lowest` or at / above `highest`: most
         // windows are rejected by these two compares

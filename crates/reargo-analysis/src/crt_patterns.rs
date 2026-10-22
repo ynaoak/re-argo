@@ -75,6 +75,7 @@ impl Analyzer for CrtPatternAnalyzer {
         if !matches!(program.info.arch, reargo_loader::Architecture::X86_64) {
             return Box::new(Found::default());
         }
+        let tt = std::time::Instant::now();
         let matcher = Matcher::new();
         // Walk in 16-byte steps. The linker aligns every CRT helper to
         // 16 bytes, so a candidate that isn't on a 16-byte boundary
@@ -104,7 +105,9 @@ impl Analyzer for CrtPatternAnalyzer {
         // their budgets' floors): their results computed here, from the
         // bytes, with the others'.
         let entries: Vec<u64> = found.iter().map(|&(entry, _)| entry).collect();
-        let ahead = (!entries.is_empty()).then(|| crate::stack::ahead_for_new(program, &entries));
+        crate::tr!(tt, "crt steps {} found {}", steps.len(), entries.len());
+        let ahead = (!entries.is_empty() && std::env::var_os("REARGO_X_NOAHEAD").is_none()).then(|| crate::stack::ahead_for_new(program, &entries));
+        crate::tr!(tt, "crt ahead");
         Box::new(Found { at_steps: found, ahead })
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {

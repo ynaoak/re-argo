@@ -53,11 +53,11 @@ impl Analyzer for InlineMemAnalyzer {
             return Box::new(Vec::<(u64, &'static str)>::new());
         }
 
+        // (the listing's parts in parallel, in order)
         let candidates: Vec<(u64, &'static str)> = program
             .listing
-            .instructions()
-            .filter_map(|i| classify(&i.bytes).map(|c| (i.address, c)))
-            .collect();
+            .map_instruction_parts(|insns| insns.filter_map(|i| classify(&i.bytes).map(|c| (i.address, c))).collect::<Vec<_>>())
+            .concat();
 
         Box::new(candidates)
     }

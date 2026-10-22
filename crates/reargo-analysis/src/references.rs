@@ -63,7 +63,9 @@ impl Analyzer for ScalarReferenceAnalyzer {
         // because `program.listing.instructions()` is a serial
         // iterator; collecting once and then `par_iter`ing is cheaper
         // than locking on every step.
-        let insn_snapshot: Vec<_> = program.listing.instructions().map(|insn| (insn.address, &insn.bytes)).collect();
+        // (the listing's parts in parallel, in order)
+        let insn_snapshot: Vec<_> =
+            program.listing.map_instruction_parts(|insns| insns.map(|insn| (insn.address, &insn.bytes)).collect::<Vec<_>>()).concat();
         // no section below `lowest` or at / above `highest`: most
         // windows are rejected by these two compares
         let lowest = valid_ranges.iter().map(|r| r.0).min().unwrap_or(0);

@@ -53,10 +53,12 @@ impl Analyzer for TlsVariableAnalyzer {
             return Box::new(Vec::<(u64, String)>::new());
         }
 
+        // (the listing's parts in parallel, in order)
         let candidates: Vec<(u64, String)> = program
             .listing
-            .instructions()
-            .filter_map(|i| classify(&i.bytes).map(|c| (i.address, c)))
+            .map_instruction_parts(|insns| insns.filter_map(|i| classify(&i.bytes).map(|c| (i.address, c))).collect::<Vec<_>>())
+            .into_iter()
+            .flatten()
             .collect();
 
         Box::new(candidates)

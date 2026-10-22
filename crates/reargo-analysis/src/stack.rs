@@ -282,19 +282,22 @@ pub(crate) fn ahead_for_new(program: &Program, entries: &[u64]) -> NewAhead {
     let sections = crate::pcoderef::SectionMap::from(program);
     let got = crate::indirect_resolve::GotMap::new(program);
     let plt_of_got = |g: u64| got.as_ref().and_then(|got| got.plt_of_got(g));
+    let scanner = reargo_lift::x86::X86Lifter::new_64();
     let insns = pcode_budget.max(indirect_budget);
     let span = |&entry: &u64| crate::range_lift::Span { entry, insns, work: insns / 4 };
     let out: Vec<(Vec<(u64, u64, reargo_program::RefType)>, Vec<(u64, u64)>)> =
         crate::range_lift::map_with_lazy_lifter(&program.info.memory, entries, span, |&entry, lifter| {
+            // (as the analyzers do: P-code Reference's scan lifts an
+            // instruction only where its decode shows a constant in a
+            // section, the resolver lifts only a range with an indirect
+            // `call`, found by a decode)
             let (mut pcode, mut indirect) = (Vec::new(), Vec::new());
-            lifter.with_budgets_lazy(entry, &[pcode_budget, indirect_budget], |k, insns, shapes| match k {
-                0 => pcode = crate::pcoderef::scan_range(insns, &sections),
-                _ => {
-                    if got.is_some() {
-                        indirect = indirect_of(insns, shapes, &plt_of_got);
-                    }
-                }
-            });
+            lifter.with_budgets_lazy(entry, &[pcode_budget], |_, insns, _| pcode = crate::pcoderef::scan_range(insns, &sections));
+            if got.is_some() && scanner.range_has_indirect_call(&program.info.memory, entry, indirect_budget) {
+                lifter.with_budgets_lazy(entry, &[indirect_budget], |_, insns, shapes| {
+                    indirect = indirect_of(insns, shapes, &plt_of_got);
+                });
+            }
             (pcode, indirect)
         });
     let mut pcode = crate::range_lift::AheadMap::default();

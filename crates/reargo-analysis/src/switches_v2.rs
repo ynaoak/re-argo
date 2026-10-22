@@ -83,12 +83,13 @@ impl Analyzer for SwitchTableOffsetAnalyzer {
         // Walk back from each indirect jump straight through the
         // listing's ordered instruction map (no per-run copy of every
         // instruction).
+        // (the listing's parts in parallel, in order)
         let indirect_jumps: Vec<u64> = program
             .listing
-            .instructions()
-            .filter(|i| i.flow_type == FlowType::IndirectJump)
-            .map(|i| i.address)
-            .collect();
+            .map_instruction_parts(|insns| {
+                insns.filter(|i| i.flow_type == FlowType::IndirectJump).map(|i| i.address).collect::<Vec<_>>()
+            })
+            .concat();
 
         let mut candidates: Vec<(u64, u64)> = Vec::new();
         for jmp_addr in &indirect_jumps {

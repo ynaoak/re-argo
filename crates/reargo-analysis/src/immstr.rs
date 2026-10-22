@@ -62,11 +62,13 @@ impl Analyzer for ImmediateStringAnnotator {
             return Box::new(Vec::<(u64, [u8; 8], usize)>::new());
         }
 
+        // (the listing's parts in parallel, in order)
         let candidates: Vec<(u64, [u8; 8], usize)> = program
             .listing
-            .instructions()
-            .filter_map(|i| extract_imm(&i.bytes).map(|(b, n)| (i.address, b, n)))
-            .collect();
+            .map_instruction_parts(|insns| {
+                insns.filter_map(|i| extract_imm(&i.bytes).map(|(b, n)| (i.address, b, n))).collect::<Vec<_>>()
+            })
+            .concat();
 
         Box::new(candidates)
     }

@@ -30,12 +30,13 @@ impl Analyzer for SwitchTableAnalyzer {
     fn prepare(&self, program: &Program) -> Prepared {
         let ptr_size = (program.info.bits / 8) as u64;
 
+        // (the listing's parts in parallel, in order)
         let indirect_jumps: Vec<u64> = program
             .listing
-            .instructions()
-            .filter(|i| i.flow_type == FlowType::IndirectJump)
-            .map(|i| i.address)
-            .collect();
+            .map_instruction_parts(|insns| {
+                insns.filter(|i| i.flow_type == FlowType::IndirectJump).map(|i| i.address).collect::<Vec<_>>()
+            })
+            .concat();
 
         let valid_code_ranges: Vec<(u64, u64)> = program
             .info
@@ -146,12 +147,13 @@ impl Analyzer for TailCallAnalyzer {
         self.apply(program, prepared)
     }
     fn prepare(&self, program: &Program) -> Prepared {
+        // (the listing's parts in parallel, in order)
         let jumps: Vec<(u64, Option<u64>)> = program
             .listing
-            .instructions()
-            .filter(|i| i.flow_type == FlowType::UnconditionalJump)
-            .map(|i| (i.address, i.branch_target))
-            .collect();
+            .map_instruction_parts(|insns| {
+                insns.filter(|i| i.flow_type == FlowType::UnconditionalJump).map(|i| (i.address, i.branch_target)).collect::<Vec<_>>()
+            })
+            .concat();
 
         // Phase 1: classify each jump in parallel against immutable
         // Program views (function_containing, has_function,
