@@ -91,8 +91,6 @@ pub type RefList = smallvec::SmallVec<[Reference; 2]>;
 /// References by source (or target) address.
 pub type RefMap = BTreeMap<u64, RefList>;
 
-/// Append each of `refs` to `map`'s list at its `key`, in the order of
-/// `refs` (a stable sort by key keeps each list's order).
 /// Sort `order` (keys with their indices, the indices ascending) as
 /// `sort_unstable` does: by key, then index. Many keys within 2^32 of each
 /// other: by a radix sort on the key's bits (stable, so equal keys keep
