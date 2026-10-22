@@ -621,6 +621,74 @@ mod tests {
         assert_eq!(state(&one), state(&cut));
     }
 
+    /// A listing whose instructions are in several maps (a bulk add in
+    /// parts) reads as one map: every lookup, walk and range, an
+    /// instruction listed into any of them afterwards, its serialised and
+    /// debug forms.
+    #[test]
+    fn maps_of_parts_read_as_one_map() {
+        let insn = |a: u64, len: u32| Box::new(DecodedInstruction::new(a, len, "nop".into(), String::new(), smallvec::smallvec![0x90; len as usize], FlowType::Fall, None));
+        let addrs = |p: u64| (0..30_000u64).map(move |k| p * 100_000 + k * 3);
+        let parts: Vec<Vec<InstructionRun>> = (0..4u64).map(|p| vec![addrs(p).map(|a| (a, insn(a, 3))).collect()]).collect();
+        let mut parted = listing(&[(5, 1), (250_001, 1)]);
+        parted.add_unlisted_instructions_cut(&[100_000, 200_000, 300_000], parts);
+        assert_eq!(parted.instructions.maps.len(), 4);
+        let mut one = listing(&[(5, 1), (250_001, 1)]);
+        for a in (0..4).flat_map(addrs) {
+            one.instruction_or_insert_with(a, || Some(*insn(a, 3)));
+        }
+        // listed afterwards, into the first, a middle and the last map
+        for l in [&mut parted, &mut one] {
+            l.add_instruction(*insn(7, 2));
+            l.instruction_or_insert_with(150_001, || Some(*insn(150_001, 2)));
+            l.instruction_or_insert_with(150_000, || Some(*insn(150_000, 9)));
+            l.add_instruction(*insn(u64::MAX - 1, 1));
+        }
+        let state = |l: &Listing| l.instructions().map(|i| (i.address, i.length)).collect::<Vec<_>>();
+        assert_eq!(state(&parted), state(&one));
+        assert_eq!(parted.instruction_count(), one.instruction_count());
+        for a in [0u64, 3, 5, 6, 7, 99_999, 100_000, 100_002, 150_000, 150_001, 250_001, 389_997, 400_000, u64::MAX - 1, u64::MAX] {
+            assert_eq!(parted.has_instruction(a), one.has_instruction(a), "{a}");
+            assert_eq!(parted.get_instruction(a).map(|i| i.length), one.get_instruction(a).map(|i| i.length), "{a}");
+        }
+        for (s, e) in [(0u64, 10u64), (99_990, 100_010), (50_000, 350_000), (0, u64::MAX), (150_000, 150_000), (390_000, 400_000)] {
+            let ranged = |l: &Listing| l.instructions_in_range(s, e).map(|i| i.address).collect::<Vec<_>>();
+            assert_eq!(ranged(&parted), ranged(&one), "{s}..{e}");
+            let back = |l: &Listing| l.instructions_in_range(s, e).rev().map(|i| i.address).collect::<Vec<_>>();
+            assert_eq!(back(&parted), back(&one), "{s}..{e} reversed");
+            let addrs = |l: &Listing| l.instruction_addresses_in_range(s, e).collect::<Vec<_>>();
+            assert_eq!(addrs(&parted), addrs(&one), "{s}..{e} addresses");
+        }
+        // a body across the maps' bounds, walked through the maps (no
+        // sorted copy made yet) and through the sorted copy
+        let r = |off: u64, size: u64| AddressRange::new(Address::new(SpaceId::RAM, off), size);
+        let mut body = AddressSet::new();
+        for range in [r(99_000, 2_000), r(101_000, 50), r(199_990, 120_000), r(399_000, 5_000)] {
+            body.add(range);
+        }
+        let walk = |l: &Listing| {
+            let mut out = Vec::new();
+            l.for_each_body_instruction(&body, |first, i| out.push((first, i.address)));
+            out
+        };
+        assert!(parted.sorted.get().is_none());
+        assert_eq!(walk(&parted), walk(&one));
+        let sorted = |l: &Listing| l.sorted_instructions().iter().map(|i| i.address).collect::<Vec<_>>();
+        assert_eq!(sorted(&parted), sorted(&one));
+        assert_eq!(walk(&parted), walk(&one));
+        let parts = parted.map_instruction_parts(|insns| insns.map(|i| i.address).collect::<Vec<_>>());
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts.concat(), state(&one).into_iter().map(|(a, _)| a).collect::<Vec<_>>());
+        let cached = |l: &Listing| l.cache_parts().0.map(|(&a, i)| (a, i.length)).collect::<Vec<_>>();
+        assert_eq!(cached(&parted), state(&one));
+        assert_eq!(parted.cache_parts().0.len(), one.instruction_count());
+        assert_eq!(format!("{parted:?}"), format!("{one:?}"));
+        let json = |l: &Listing| serde_json::to_string(l).expect("serialises");
+        assert_eq!(json(&parted), json(&one));
+        let back: Listing = serde_json::from_str(&json(&parted)).expect("reads back");
+        assert_eq!(state(&back), state(&one));
+    }
+
     fn listing(insns: &[(u64, u32)]) -> Listing {
         let mut l = Listing::new();
         for &(a, len) in insns {

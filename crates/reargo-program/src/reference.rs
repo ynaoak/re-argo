@@ -398,7 +398,48 @@ mod tests {
 
     use super::*;
 
+        /// References added a batch at a time and all at once (the batches
+    /// joined, as the discovery thread adds the batches waiting) give the
+    /// same lists in the same order and the same jump log, through the few
+    /// and the many path.
     #[test]
+    fn batches_joined_match_batch_by_batch() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let kinds = [RefType::UnconditionalCall, RefType::ConditionalJump, RefType::DataRead, RefType::FallThrough];
+        let batches: Vec<Vec<Reference>> = (0..12)
+            .map(|b| {
+                (0..if b % 4 == 0 { 20_000 } else { 700 })
+                    .map(|_| {
+                        let r = next();
+                        Reference::new(0x1000 + r % 5_000, 0x1000 + (r >> 20) % 9_000, kinds[(r >> 40) as usize % 4])
+                    })
+                    .collect()
+            })
+            .collect();
+        let state = |m: &ReferenceManager| (m.refs_from.clone(), m.refs_to.clone(), m.jumps.clone());
+        let mut one = ReferenceManager::new();
+        for b in &batches {
+            one.add_all_unpooled(b);
+        }
+        for groups in [vec![12], vec![1, 11], vec![3, 3, 6], vec![1; 12]] {
+            let mut joined = ReferenceManager::new();
+            let mut at = 0;
+            for n in groups {
+                let together: Vec<Reference> = batches[at..at + n].concat();
+                joined.add_all_unpooled(&together);
+                at += n;
+            }
+            assert_eq!(state(&joined), state(&one));
+        }
+    }
+
+#[test]
     fn add_and_query_refs() {
         let mut mgr = ReferenceManager::new();
         mgr.add(Reference::new(0x1000, 0x2000, RefType::UnconditionalCall));

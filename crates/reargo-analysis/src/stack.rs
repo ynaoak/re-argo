@@ -423,3 +423,70 @@ fn collect_stack_variables(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What [`ahead_for_new`] computes for functions with no body is what
+    /// P-code Reference and the Indirect Call Resolver compute themselves
+    /// for them (`lift_range` of their budgets).
+    #[test]
+    fn new_function_results_match_the_analyzers_own() {
+        let (code_addr, data_addr) = (0x1000u64, 0x8000u64);
+        let got = data_addr + 0x10;
+        let mut code = Vec::new();
+        for k in 0..40u64 {
+            let at = code_addr + code.len() as u64;
+            let rel = |insn_end: u64, target: u64| ((target as i64 - insn_end as i64) as i32).to_le_bytes();
+            // lea rax, [rip+data]; mov rcx, [rip+got]; call rcx;
+            // mov [rip+data+8], eax; ret (a call or two left out)
+            code.extend([0x48, 0x8d, 0x05]);
+            code.extend(rel(at + 7, data_addr + k));
+            code.extend([0x48, 0x8b, 0x0d]);
+            code.extend(rel(at + 14, got));
+            if k % 3 != 0 {
+                code.extend([0xff, 0xd1]);
+            }
+            let here = code_addr + code.len() as u64;
+            code.extend([0x89, 0x05]);
+            code.extend(rel(here + 6, data_addr + 8));
+            code.push(0xc3);
+            while code.len() % 16 != 0 {
+                code.push(0xcc);
+            }
+        }
+        let mut program = crate::testutil::helpers::make_x86_64_program_with_data(&code, &[0u8; 0x100], code_addr, data_addr);
+        program.info.imports.push(reargo_loader::ImportEntry { name: "puts".into(), plt_address: 0x500, got_address: got });
+        let entries: Vec<u64> = (0..code.len() as u64).step_by(16).map(|o| code_addr + o).collect();
+        let (pcode, indirect) = ahead_for_new(&program, &entries);
+        let indirect = indirect.expect("the program imports something");
+
+        let empty = Function::new(0, String::new());
+        let (pb, ib) = (crate::pcoderef::budget(&empty), crate::indirect_resolve::budget(&empty));
+        let sections = crate::pcoderef::SectionMap::from(&program);
+        let jobs: Vec<(u64, usize)> = entries.iter().map(|&e| (e, pb)).collect();
+        let own_pcode = crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |_, insns| {
+            crate::pcoderef::scan_lifted(insns, &sections)
+        });
+        let gm = crate::indirect_resolve::GotMap::new(&program).expect("an import");
+        let plt_of_got = |g: u64| gm.plt_of_got(g);
+        let scanner = reargo_lift::x86::X86Lifter::new_64();
+        let jobs: Vec<(u64, usize)> = entries.iter().map(|&e| (e, ib)).collect();
+        let own_indirect = crate::range_lift::map_lifted_ranges(&program.info.memory, &jobs, |_, insns| {
+            crate::indirect_resolve::resolve_lifted(insns, &plt_of_got)
+        });
+        let mut seen = (0, 0);
+        for (k, &entry) in entries.iter().enumerate() {
+            assert_eq!(pcode[&(entry, pb)], own_pcode[k], "P-code at {entry:#x}");
+            let has_call = scanner.range_has_indirect_call(&program.info.memory, entry, ib);
+            let own = if has_call { own_indirect[k].clone() } else { Vec::new() };
+            assert_eq!(indirect[&(entry, ib)], own, "indirect at {entry:#x}");
+            seen.0 += own_pcode[k].len();
+            seen.1 += usize::from(has_call);
+        }
+        // (references found; ranges with an indirect call, which this
+        // code's register writes leave unresolved)
+        assert!(seen.0 > 0 && seen.1 > 0, "{seen:?}");
+    }
+}
