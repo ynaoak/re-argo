@@ -146,14 +146,20 @@ impl Analyzer for ComplexityAnalyzer {
             })
             .collect();
         drop(funcs);
+        // (the map of them built here too: one key per function)
+        let computed: BTreeMap<String, String> = computed.into_iter().collect();
         Box::new(computed)
     }
     fn apply(&self, program: &mut Program, prepared: Prepared) -> Result<AnalysisResult, AnalysisError> {
-        let computed: Vec<(String, String)> = crate::analyzer::prepared(prepared);
-        let mut counted = 0usize;
-        for (key, value) in computed {
-            program.metadata.set_property(key, value);
-            counted += 1;
+        let mut computed: BTreeMap<String, String> = crate::analyzer::prepared(prepared);
+        let counted = computed.len();
+        if computed.len() * 4 >= program.metadata.properties.len() {
+            // (merged in one pass over both: as setting each in turn)
+            program.metadata.properties.append(&mut computed);
+        } else {
+            for (key, value) in computed {
+                program.metadata.set_property(key, value);
+            }
         }
 
         Ok(AnalysisResult {
