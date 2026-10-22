@@ -41,9 +41,11 @@ impl std::fmt::Debug for Sorted {
 
 impl Sorted {
     fn of(instructions: &Instructions) -> Self {
-        // (one walk of each map for both, the maps on the rayon pool,
-        // each into its share of the two arrays)
-        use rayon::prelude::*;
+        // (one walk of each map for both, each into its share of the two
+        // arrays; with several maps, on threads of their own — not the
+        // rayon pool's: this runs inside a `OnceLock` initialiser, which a
+        // pool worker waiting on a job could enter again from a job it
+        // took, waiting on itself)
         let n = instructions.len();
         let mut addrs: Vec<u64> = Vec::with_capacity(n);
         let mut insns: Vec<&DecodedInstruction> = Vec::with_capacity(n);
@@ -56,12 +58,26 @@ impl Sorted {
                 shares.push((m, sa, si));
                 (a, i) = (ra, ri);
             }
-            shares.into_par_iter().for_each(|(m, sa, si)| {
+            type Share<'s, 'a> = (&'a InstructionMap, &'s mut [std::mem::MaybeUninit<u64>], &'s mut [std::mem::MaybeUninit<&'a DecodedInstruction>]);
+            fn fill((m, sa, si): Share<'_, '_>) {
                 for ((&k, b), (sa, si)) in m.iter().zip(sa.iter_mut().zip(si.iter_mut())) {
                     sa.write(k);
                     si.write(&**b);
                 }
-            });
+            }
+            if shares.len() > 1 && n >= 1 << 16 {
+                std::thread::scope(|s| {
+                    let mut shares = shares.into_iter();
+                    let last = shares.next_back();
+                    let threads: Vec<_> = shares.map(|share| s.spawn(move || fill(share))).collect();
+                    last.map(fill);
+                    for t in threads {
+                        t.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                    }
+                });
+            } else {
+                shares.into_iter().for_each(fill);
+            }
         }
         // SAFETY: the shares cover the first `n` slots of each array (the
         // maps hold `n` instructions), and each map's walk wrote every

@@ -148,24 +148,40 @@ impl Analyzer for LinearSweepAnalyzer {
         }
 
         if tr { eprintln!("TRACE        ls: sweep {:.1} ({} new)", tt.elapsed().as_secs_f64()*1e3, new_functions.len()); }
-        let mut added = 0usize;
-        for (entry, _end) in &new_functions {
-            if program.listing.has_function(*entry) {
-                continue;
-            }
-            program
-                .listing
-                .add_function(Function::new(*entry, format!("FUN_{:08x}", entry)));
-            if program.symbol_table.primary_at(*entry).is_none() {
-                program.symbol_table.add(Symbol::new(
-                    format!("FUN_{:08x}", entry),
-                    *entry,
-                    SymbolType::Function,
-                    SourceType::Analysis,
-                ));
-            }
-            added += 1;
-        }
+        // The functions not listed yet (each entry once, the first) and
+        // the symbols of those without one, made in parallel; the
+        // function map and the symbol table, apart, filled at the same
+        // time (each in this order).
+        use rayon::prelude::*;
+        let mut seen = rustc_hash::FxHashSet::default();
+        let entries: Vec<u64> = new_functions
+            .iter()
+            .map(|&(entry, _)| entry)
+            .filter(|&entry| !program.listing.has_function(entry) && seen.insert(entry))
+            .collect();
+        let added = entries.len();
+        let (functions, symbols): (Vec<Function>, Vec<Option<Symbol>>) = entries
+            .par_iter()
+            .with_min_len(256)
+            .map(|&entry| {
+                let name = format!("FUN_{:08x}", entry);
+                let symbol = program
+                    .symbol_table
+                    .primary_at(entry)
+                    .is_none()
+                    .then(|| Symbol::new(name.clone(), entry, SymbolType::Function, SourceType::Analysis));
+                (Function::new(entry, name), symbol)
+            })
+            .unzip();
+        let Program { listing, symbol_table, .. } = program;
+        rayon::join(
+            || {
+                for f in functions {
+                    listing.add_function(f);
+                }
+            },
+            || symbol_table.add_all(symbols.into_iter().flatten().collect()),
+        );
 
         Ok(AnalysisResult {
             analyzer_name: self.name().into(),
