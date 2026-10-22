@@ -416,6 +416,12 @@ impl Listing {
         }
     }
 
+    /// The lowest address of each of the maps the instructions are kept
+    /// in (the first 0), ascending: where the last bulk add cut them.
+    pub fn instruction_part_starts(&self) -> &[u64] {
+        &self.instructions.starts
+    }
+
     pub fn instruction_count(&self) -> usize {
         self.instructions.len()
     }
