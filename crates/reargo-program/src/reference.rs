@@ -233,6 +233,45 @@ impl RefParts {
         slices.push(rest);
         // (an estimate: each new key counted, repeats too)
         let share = ((self.len() + order.len()) / PARTS).max(MIN_PART);
+        if slices.iter().any(|s| s.len() > 2 * share) {
+            // A part given more than twice its share (new keys close
+            // together, or the first add): cut first at every share of
+            // them, its old entries split off with them, so the pieces
+            // merge in parallel.
+            let (mut maps, mut starts, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
+            for ((mut map, start), slice) in std::mem::take(&mut self.maps).into_iter().zip(std::mem::take(&mut self.starts)).zip(slices) {
+                let mut cuts = Vec::new();
+                let mut at = share;
+                while at < slice.len() {
+                    // (at a key's first reference)
+                    while at < slice.len() && slice[at].0 == slice[at - 1].0 {
+                        at += 1;
+                    }
+                    if at < slice.len() {
+                        cuts.push(at);
+                    }
+                    at += share;
+                }
+                let mut right = Vec::with_capacity(cuts.len());
+                for &c in cuts.iter().rev() {
+                    right.push((slice[c].0, map.split_off(&slice[c].0)));
+                }
+                maps.push(map);
+                starts.push(start);
+                for (s, m) in right.into_iter().rev() {
+                    maps.push(m);
+                    starts.push(s);
+                }
+                let mut from = 0;
+                for &c in cuts.iter().chain(std::iter::once(&slice.len())) {
+                    pieces.push(&slice[from..c]);
+                    from = c;
+                }
+            }
+            self.maps = maps;
+            self.starts = starts;
+            slices = pieces;
+        }
         let merge = |(map, (start, slice)): (&mut RefMap, (u64, &[(u64, u32)]))| merge_part(map, start, slice, refs, share);
         let parallel = pooled && order.len() >= 1024 && self.maps.len() > 1;
         let parts = self.maps.iter_mut().zip(self.starts.iter().copied().zip(slices));

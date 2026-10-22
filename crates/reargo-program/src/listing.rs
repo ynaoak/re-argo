@@ -271,6 +271,22 @@ impl Listing {
         self.sorted.take();
         let total: usize = parts.iter().flatten().map(Vec::len).sum();
         if total < self.instructions.len() {
+            // (the parts the maps' ranges, many: each part into its map on
+            // a thread of its own)
+            let Instructions { maps, starts } = &mut self.instructions;
+            if parts.len() > 1 && parts.len() == maps.len() && starts[1..] == cuts[..parts.len() - 1] && total >= 1 << 14 {
+                std::thread::scope(|s| {
+                    let mut work = maps.iter_mut().zip(parts);
+                    let last = work.next_back();
+                    for (map, part) in work {
+                        s.spawn(move || list_unlisted(map, part));
+                    }
+                    if let Some((map, part)) = last {
+                        list_unlisted(map, part);
+                    }
+                });
+                return;
+            }
             for (a, i) in parts.into_iter().flatten().flatten() {
                 self.instructions.entry(a).or_insert(i);
             }
@@ -485,6 +501,14 @@ fn for_each_sorted_body_instruction<'a>(
 
 /// The map of a part's instructions: `old` (sorted, the listed ones) and
 /// the runs, each address once ([`put_in_order`]).
+/// List each instruction of `runs` (in order) in `map` unless one is listed
+/// at its address.
+fn list_unlisted(map: &mut InstructionMap, runs: Vec<InstructionRun>) {
+    for (a, i) in runs.into_iter().flatten() {
+        map.entry(a).or_insert(i);
+    }
+}
+
 fn part_map((old, runs): (InstructionRun, Vec<InstructionRun>)) -> InstructionMap {
     let n = old.len() + runs.iter().map(Vec::len).sum::<usize>();
     let mut all: Vec<Slot> = Vec::with_capacity(n);
@@ -658,6 +682,50 @@ mod tests {
         let mut cut = listing(&listed);
         cut.add_unlisted_instructions_cut(&[50_000, 100_000, 200_000], boxed());
         assert_eq!(state(&one), state(&cut));
+    }
+
+    /// Fewer new instructions than listed ones, into a listing in parts:
+    /// cut as its maps are (each part into its map on a thread of its own)
+    /// or not, the same as listing them one by one (the first of a repeat
+    /// kept, a listed one kept).
+    #[test]
+    fn few_unlisted_instructions_into_parts_match_one_by_one() {
+        let insn = |a: u64, len: u32| Box::new(DecodedInstruction::new(a, len, "nop".into(), String::new(), smallvec::smallvec![0x90; len as usize], FlowType::Fall, None));
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let cuts = [100_000u64, 200_000, 300_000];
+        let first: Vec<Vec<InstructionRun>> =
+            (0..4u64).map(|p| vec![(0..30_000u64).map(|k| p * 100_000 + k * 3).map(|a| (a, insn(a, 3))).collect()]).collect();
+        let more: Vec<Vec<(u64, u32)>> =
+            (0..4u64).map(|p| (0..6_000).map(|_| (p * 100_000 + next() % 100_000, 1 + (next() % 7) as u32)).collect()).collect();
+        let runs = || -> Vec<Vec<InstructionRun>> {
+            more.iter().map(|p| vec![p[..2_000].iter().map(|&(a, l)| (a, insn(a, l))).collect(), p[2_000..].iter().map(|&(a, l)| (a, insn(a, l))).collect()]).collect()
+        };
+        let state = |l: &Listing| l.instructions().map(|i| (i.address, i.length)).collect::<Vec<_>>();
+        let mut one = listing(&[]);
+        one.add_unlisted_instructions_cut(&cuts, first.clone());
+        for (a, i) in runs().into_iter().flatten().flatten() {
+            one.instruction_or_insert_with(a, || Some(*i));
+        }
+        for at in [&cuts[..], &[150_000, 200_000, 300_000]] {
+            let mut parted = listing(&[]);
+            parted.add_unlisted_instructions_cut(&cuts, first.clone());
+            assert_eq!(parted.instructions.maps.len(), 4);
+            // (cut at other addresses: one map at a time)
+            let mut parts = runs();
+            if at[0] != cuts[0] {
+                let moved: InstructionRun = parts[0].iter_mut().flat_map(|r| r.extract_if(.., |i| i.0 >= at[0])).collect();
+                parts[1].push(moved);
+            }
+            parted.add_unlisted_instructions_cut(at, parts);
+            assert_eq!(state(&parted), state(&one));
+            assert_eq!(parted.instructions.maps.len(), 4);
+        }
     }
 
     /// A listing whose instructions are in several maps (a bulk add in
